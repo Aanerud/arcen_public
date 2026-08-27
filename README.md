@@ -36,6 +36,11 @@ compiled:
   encode, 1266 frames, still hardware-decoded on the Mac.
 - All three Piers are Active Directory-joined, so the credential crossing the
   wire is a domain credential, not a local account.
+- Resolutions exercised: 1920×1080, 2560×1440 and 2560×1600, plus arbitrary
+  client-matched sizes, since the Pier retargets the host to the Deck's exact
+  resolution rather than scaling. **4K is not a tested claim** — the encoder
+  self-test measures stage-and-encode at 4K against a 6 ms budget, but no
+  sustained live 4K desktop session has been run.
 - Test suites at this release: 957 macOS Deck, 716 Linux Pier, 679 Windows
   Pier, 694 shared-crate.
 
@@ -178,6 +183,14 @@ cadence, so a still desktop stops producing work instead of re-encoding
 identical frames. A machine with no NVIDIA GPU takes a separate path entirely —
 X11 capture into OpenH264 software encode, not NvFBC with a different encoder
 bolted on.
+
+Worth stating plainly, because it is easy to assume otherwise: **10-bit here is
+a 10-bit encode of an 8-bit capture.** NvFBC hands over 8-bit BGRA and the X
+framebuffer is 8-bit, so nothing recovers precision the source never had. What
+10-bit does buy is real, though: the RGB-to-YUV matrix and any range or matrix
+conversion do not round-trip cleanly in 8 bits, so doing that arithmetic into
+10-bit avoids the banding an 8-bit intermediate introduces, and gives the encoder
+headroom. The same is true on Windows.
 
 On **Windows** there is no NvFBC. It is **DXGI Desktop Duplication → D3D11 →
 NVENC**, with **Windows Graphics Capture** as the fallback. WGC is also required
