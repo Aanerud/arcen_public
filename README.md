@@ -47,32 +47,40 @@ Every claim above was tested on real hardware, not merely compiled:
 | **Reconnection** | A dropped connection resumes the same session for up to two hours. The Deck reattaches with a signed grant instead of asking for the password again. |
 | **Deskside privacy** | Off by default. When enabled, the physical screen is blanked and its keyboard and mouse are disabled for the duration of a remote session, so nobody standing at the machine can watch or interfere. Input and display are locked together — you cannot get one without the other. |
 
-A graphics tablet has **two modes in the shipped build**, chosen per connection.
-The choice is really about the network, because it decides where the pen is
-interpreted:
+A graphics tablet has **three modes**, chosen per connection. The choice is
+really about the network, because it decides where the pen is interpreted:
 
 - **Tablet support** — the default, and what you want over Wi-Fi, 5G, or any
   distance. This Mac's own Wacom driver reads the pen and Arcen sends finished
   pen events to the host, so no pen sample waits for a reply and the host needs
-  no Wacom driver. **Pressure, tilt, rotation, eraser, proximity and barrel
-  buttons all work.** Finger touch and the tablet's own buttons stay on the Mac,
+  no Wacom driver at all. Pressure, tilt, rotation, eraser, proximity and barrel
+  buttons all work. Finger touch and the tablet's own buttons stay on the Mac,
   and the tablet keeps working in Mac applications while you are connected.
-- **Mouse compatibility only** — no tablet redirection at all. The pen behaves
-  as a mouse, with no pressure, tilt, eraser or proximity.
+- **Native tablet (USB bridged)** — for a LAN. As close to plugging the tablet
+  into the host as a network allows: a privileged Arcen helper takes the device
+  away from macOS and forwards its raw USB traffic, and the host's own Wacom
+  driver claims it as if it were plugged in there. Arcen never interprets the
+  pen, so the whole device works — including finger touch and the tablet's own
+  buttons. In exchange, every pen sample makes a full round trip, so this is not
+  a WAN mode, and Mac applications cannot use the tablet until you disconnect.
+- **Mouse compatibility only** — no tablet redirection. The pen behaves as a
+  mouse, with no pressure, tilt, eraser or proximity.
 
-Keyboard, pointer and scroll are synthesised the same way on both hosts: they
-arrive as native events the operating system generates on Arcen's behalf. On
-Linux this goes through the kernel's own input layer; on Windows through the
-injection API.
+Native tablet needs a host that can present the tablet on a virtual USB
+controller so the host's own driver can claim it. **Linux hosts can. Windows
+hosts cannot yet** — that needs a signed driver Arcen does not ship, and it is
+planned rather than abandoned; see
+[Where help is wanted](#where-help-is-wanted). Tablet support is unaffected on
+Windows and needs nothing installed there.
 
-There is a third mode in the tree, **Native tablet (USB bridged)**, which hands
-the physical device to the host so its own vendor driver claims it. It is *not*
-compiled into the released binaries, sits behind the `usb-hard-lab` feature, and
-is Linux-host-only. It buys finger touch and the tablet's own buttons — the two
-things the shipped mode leaves on the Mac — at the cost of a full round trip per
-pen sample, so it is a LAN-only idea. It is not a substitute for the default:
-pressure and tilt already work above. See
-[Where help is wanted](#where-help-is-wanted) if you want to take it further.
+On macOS the privileged part is a small root daemon registered through
+`SMAppService`, not the Deck: Arcen Deck itself never runs as root. Installing
+it is one approval in Login Items. See
+[ADR 0011](docs/adr/0011-macos-privileged-usb-helper.md).
+
+Keyboard, pointer and scroll are synthesised on both hosts: they arrive as
+native events the operating system generates on Arcen's behalf. On Linux this
+goes through the kernel's own input layer; on Windows through the injection API.
 
 **Not supported:** webcam redirection of any kind, and USB passthrough for
 anything other than the one tablet class above. Neither is a small gap —

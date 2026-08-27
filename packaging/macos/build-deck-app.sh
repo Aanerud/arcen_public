@@ -21,7 +21,20 @@ REPO="$(cd "$HERE/../.." && pwd)"
 APP="$REPO/Arcen Deck.app"
 BIN="$REPO/target/release/arcen-deck"
 PLIST="$HERE/Deck-Info.plist"
-ENTITLEMENTS="${ARCEN_ENTITLEMENTS_FILE:-$HERE/Deck.entitlements}"
+# Hard USB is a product feature, so the helper is embedded unless someone
+# deliberately opts out with ARCEN_EMBED_USB_HELPER=0. It defaulted to off,
+# and that silently shipped a release whose Input settings read "(not
+# available in this build)" for a mode that was finished and working.
+EMBED_USB_HELPER="${ARCEN_EMBED_USB_HELPER:-1}"
+# Embedding the helper and signing for USB access are the same decision.
+# Choosing them separately produced a bundle carrying a helper it had no
+# entitlement to use.
+if [ "$EMBED_USB_HELPER" = "1" ]; then
+    DEFAULT_ENTITLEMENTS="$HERE/Deck-usb-hard.entitlements"
+else
+    DEFAULT_ENTITLEMENTS="$HERE/Deck.entitlements"
+fi
+ENTITLEMENTS="${ARCEN_ENTITLEMENTS_FILE:-$DEFAULT_ENTITLEMENTS}"
 VALIDATOR="$HERE/validate_release_inputs.py"
 CMS_VERIFIER_SOURCE="$HERE/verify-provisioning-cms.c"
 NO_BUILD=0
@@ -77,7 +90,7 @@ if [ "$NO_BUILD" -eq 0 ]; then
   # whose UI reported "(not available in this build)" while the helper sat
   # right next to it.
   DECK_FEATURES=""
-  if [ "${ARCEN_EMBED_USB_HELPER:-0}" = "1" ]; then
+  if [ "$EMBED_USB_HELPER" = "1" ]; then
     DECK_FEATURES="--features usb-hard-lab"
     echo "==> cargo build --locked --release -p arcen-usb-helper"
     ( cd "$REPO" && "${CARGO[@]}" build --locked --release -p arcen-usb-helper )
@@ -111,8 +124,8 @@ chmod +x "$APP/Contents/MacOS/arcen-deck"
 HELPER_BIN="$REPO/target/release/arcen-usb-helper"
 HELPER_PLIST="$REPO/packaging/macos/tech.arcen.deck.usbhelper.plist"
 EMBED_HELPER=0
-if [ "${ARCEN_EMBED_USB_HELPER:-0}" = "1" ]; then
-  [ -x "$HELPER_BIN" ] || { echo "error: ARCEN_EMBED_USB_HELPER=1 but $HELPER_BIN is missing; cargo build --release -p arcen-usb-helper"; exit 1; }
+if [ "$EMBED_USB_HELPER" = "1" ]; then
+  [ -x "$HELPER_BIN" ] || { echo "error: helper embedding is on but $HELPER_BIN is missing; cargo build --release -p arcen-usb-helper"; exit 1; }
   [ -f "$HELPER_PLIST" ] || { echo "error: helper LaunchDaemon plist not found: $HELPER_PLIST"; exit 1; }
   mkdir -p "$APP/Contents/Library/LaunchDaemons"
   cp "$HELPER_BIN" "$APP/Contents/MacOS/arcen-usb-helper"
