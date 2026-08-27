@@ -166,6 +166,26 @@ quality it wants. The Pier decides, because only the Pier knows which encoder
 its GPU actually has. If the GPU cannot do what you asked, the Pier serves a
 lower-fidelity plan and says so, rather than pretending.
 
+**How frames leave the host.** Capture is a different stack on each platform,
+and neither is a screenshot loop.
+
+On **Linux** it is **NvFBC → CUDA → NVENC**. The frame never leaves the GPU:
+NvFBC captures straight into a CUDA buffer that NVENC encodes in place, with no
+readback to system memory. NvFBC's own `bIsNewFrame` drives the idle cadence, so
+a still desktop stops producing work instead of re-encoding identical frames. A
+machine with no NVIDIA GPU takes a separate path entirely — X11 capture into
+OpenH264 software encode, not NvFBC with a different encoder bolted on.
+
+On **Windows** there is no NvFBC. It is **DXGI Desktop Duplication → D3D11 →
+NVENC**, with **Windows Graphics Capture** as the fallback. WGC is also required
+when the host draws the cursor, because Desktop Duplication delivers the cursor
+as separate metadata rather than composited into the image.
+
+Desktop Duplication is *probed* rather than trusted. On a headless vGPU it will
+open successfully and even hand back cursor-only metadata while no desktop ever
+presents, so Arcen watches for real pixels before accepting it and falls back to
+WGC otherwise. Either backend can be forced if you need to pin one.
+
 **Codec choice follows the hardware — at both ends.** The Pier can only send
 what the Deck can actually decode, so the Deck measures its own capability at
 startup and reports it in the handshake.
