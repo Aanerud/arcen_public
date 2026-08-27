@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Arcen Windows Client"
+    Manufacturer="$(var.ArcenManufacturer)"
+    Version="$(var.ArcenVersion)"
+    UpgradeCode="3D44C4B8-6064-49B0-A694-44DF0B14D2CD"
+    Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer Arcen Windows Client is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Arcen">
+        <Component Id="WindowsClientExecutable" Guid="*">
+          <File
+            Id="ArcenClientWindowsExe"
+            Source="$(var.SourceDir)\arcen-client-windows.exe"
+            KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Arcen Windows Client" Level="1">
+      <ComponentRef Id="WindowsClientExecutable" />
+    </Feature>
+  </Package>
+</Wix>

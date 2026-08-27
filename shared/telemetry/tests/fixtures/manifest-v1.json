@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "component": {
+    "name": "arcen-pier",
+    "version": "0.1.0",
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "generated_at_unix_seconds": 1700000000,
+  "entries": [
+    {
+      "path": "diagnostics/system.json",
+      "source": "diagnostics",
+      "original_size_bytes": 2,
+      "included_size_bytes": 2,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "truncation": null
+    }
+  ],
+  "notices": [
+    {
+      "source": "config/tls/key",
+      "kind": "omitted",
+      "code": "private_key_excluded"
+    }
+  ],
+  "redactions": []
+}

@@ -1,0 +1,23 @@
+diff --git a/build.rs b/build.rs
+--- a/build.rs
++++ b/build.rs
+@@ -126,4 +126,19 @@ fn build() {
+          //Ensure opus's CMake never enables LTO
+          .define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "off");
+ 
++    // Opus's CMakeLists.txt explicitly selects the MSVC runtime under CMP0091,
++    // so drive its option from Cargo's target configuration.
++    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
++    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
++    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
++        let crt_static = std::env::var("CARGO_CFG_TARGET_FEATURE")
++            .unwrap_or_default()
++            .split(',')
++            .any(|feature| feature == "crt-static");
++        cmake.define(
++            "OPUS_STATIC_RUNTIME",
++            if crt_static { "ON" } else { "OFF" },
++        );
++    }
++
+     //Keep this up to date with Cargo.toml

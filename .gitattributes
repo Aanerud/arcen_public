@@ -1,0 +1,3 @@
+third_party/opusic-sys-0.7.3-arcen1/** -text
+hosts/windows/driver/arcen-microphone/*.inf text eol=crlf
+*.jsonl text eol=lf

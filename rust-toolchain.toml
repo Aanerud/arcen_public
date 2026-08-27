@@ -1,0 +1,21 @@
+[toolchain]
+# Pinned exactly, not `stable`.
+#
+# Three machines build the three release artefacts of a single version: this
+# Mac builds the Deck, the Linux host builds its Pier and installer, the Windows
+# host builds its Pier, capenc and credential provider. A floating `stable`
+# means those three can be produced by three different compilers, and that a
+# rebuild from the same tag months later does not reproduce the same binary.
+#
+# Bump deliberately, and re-record `rustc -Vv` from all three hosts when you do.
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
+
+# NOTE FOR WINDOWS BUILDS: this file pins the toolchain *version*, not the host
+# ABI. rustup resolves the host triple separately, and a Windows box whose
+# default host is `x86_64-pc-windows-gnu` will happily build this workspace with
+# the mingw ABI. `arcen-credential-provider` is a COM DLL loaded by LogonUI and
+# must be MSVC. Always build Windows through `hosts\windows\build.cmd`, which
+# reads the version from this file, appends `-x86_64-pc-windows-msvc`, and
+# refuses to continue if the resolved host tuple is not MSVC.

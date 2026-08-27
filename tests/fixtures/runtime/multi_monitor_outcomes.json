@@ -1,0 +1,24 @@
+{
+  "offer": {
+    "max_monitors": 4,
+    "supported_rotations": [
+      "degrees0",
+      "degrees90",
+      "degrees180",
+      "degrees270"
+    ],
+    "carriers": [
+      "muxed_reliable_stream"
+    ]
+  },
+  "outcomes": [
+    "not_requested",
+    "gate_disabled",
+    "no_inventory",
+    "not_advertised",
+    "exceeds_offer",
+    "no_common_carrier",
+    "planning_failed",
+    "planned_carrier_a"
+  ]
+}

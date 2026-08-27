@@ -1,0 +1,34 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -34,3 +34,3 @@
+ default: $(CONF_H)
+-	make -C $(KDIR) SUBDIRS=$(PWD) PWD=$(PWD) BUILD_PREFIX=$(BUILD_PREFIX) KDIR=$(KDIR) KVERSION=$(KVERSION) modules
++	$(MAKE) -C $(KDIR) M=$(PWD) EXTRA_CFLAGS='$(EXTRA_CFLAGS)' modules
+ .PHONY: default
+@@ -58,5 +58,5 @@
+ .PHONY: clean-conf
+ 
+-clean: clean-test clean-conf
++clean: clean-test
+ 	-rm -f *.o *.ko .*.cmd .*.flags *.mod.c Module.symvers Module.markers modules.order
+ 	-rm -rf .tmp_versions/
+diff --git a/usb-vhci-iocifc.c b/usb-vhci-iocifc.c
+--- a/usb-vhci-iocifc.c
++++ b/usb-vhci-iocifc.c
+@@ -596,5 +596,5 @@
+ 		if(likely(iso_count))
+ 		{
+-			if(!access_ok(VERIFY_READ, (void *)iso, iso_count * sizeof(struct usb_vhci_ioc_iso_packet_giveback)))
++			if(!access_ok((void *)iso, iso_count * sizeof(struct usb_vhci_ioc_iso_packet_giveback)))
+ 			{
+ 				retval = -EFAULT;
+@@ -934,6 +934,6 @@
+ 	if(unlikely(_IOC_NR(cmd) > USB_VHCI_HCD_IOC_MAXNR)) return -ENOTTY;
+ 
+-	if(unlikely((_IOC_DIR(cmd) & _IOC_READ) && !access_ok(VERIFY_WRITE, arg, _IOC_SIZE(cmd))))
++	if(unlikely((_IOC_DIR(cmd) & _IOC_READ) && !access_ok((void __user *)arg, _IOC_SIZE(cmd))))
+ 		return -EFAULT;
+-	if(unlikely((_IOC_DIR(cmd) & _IOC_WRITE) && !access_ok(VERIFY_READ, arg, _IOC_SIZE(cmd))))
++	if(unlikely((_IOC_DIR(cmd) & _IOC_WRITE) && !access_ok((void __user *)arg, _IOC_SIZE(cmd))))
+ 		return -EFAULT;

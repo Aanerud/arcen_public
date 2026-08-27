@@ -1,0 +1,15 @@
+[package]
+name = "arcen-pier-linux-installer"
+version = "0.9.8"
+edition.workspace = true
+rust-version.workspace = true
+description = "Single-file Linux installer for Arcen Pier."
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "install-arcen-pier"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true

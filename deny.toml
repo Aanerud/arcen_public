@@ -1,0 +1,51 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+# All entries must be one-way compatible INTO AGPL-3.0-only, which is the
+# licence of every first-party Arcen crate. Permissive licences qualify.
+# MPL-2.0 qualifies via its own section 3.3, which explicitly permits
+# distribution of a Larger Work under a GPL/LGPL/AGPL "Secondary License".
+allow = [
+    # Arcen's own licence. Its absence made `cargo deny check licenses` fail on
+    # this workspace's own crates, so the check could never pass and therefore
+    # was never run — which is a good part of why third-party notices were left
+    # to drift. `[licenses.private] ignore = true` does not cover these, because
+    # that only exempts crates marked `publish = false`.
+    "AGPL-3.0-only",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "NCSA",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+allow-workspace = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

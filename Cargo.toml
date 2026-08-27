@@ -1,0 +1,120 @@
+[workspace]
+# The public workspace is scoped to the components that actually build and run:
+# the shared crates, the Linux and Windows Piers, and the macOS Deck.
+# Internal tools are explicit members for CI but stay out of default/product
+# builds and every product package.
+members = [
+    "tools/region-patch-benchmark",
+    "shared/identity",
+    "shared/input",
+    "shared/media",
+    "shared/protocol",
+    "shared/session",
+    "shared/keel",
+    "shared/observability",
+    "shared/outputs",
+    "shared/telemetry",
+    "shared/transport",
+    "shared/usb-bridge",
+    "clients/macos",
+    "clients/macos/usb-helper",
+    "hosts/linux",
+    "hosts/capenc",
+    "hosts/audiocap",
+    "hosts/input-helper",
+    "hosts/windows",
+    "hosts/windows/cp-ipc",
+    "hosts/windows/credential-provider",
+    "hosts/windows/iddcx-provider",
+    "packaging/linux/installer",
+    "packaging/windows/installer",
+]
+# Plain `cargo build`/`test` (dev machine = macOS) is scoped to what builds
+# anywhere: the pure shared crates + the macOS Deck. Internal tools and host crates are
+# platform-gated and built on their target OS with an explicit `-p <crate>`.
+default-members = [
+    "shared/identity",
+    "shared/input",
+    "shared/media",
+    "shared/protocol",
+    "shared/session",
+    "shared/keel",
+    "shared/observability",
+    "shared/outputs",
+    "shared/telemetry",
+    "shared/transport",
+    "shared/usb-bridge",
+    "clients/macos",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.9.8"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "AGPL-3.0-only"
+repository = "https://github.com/Aanerud/arcen_public"
+
+[workspace.dependencies]
+arcen-identity = { path = "shared/identity", version = "=0.9.8" }
+arcen-input = { path = "shared/input", version = "=0.9.8" }
+arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.9.8" }
+arcen-keel = { path = "shared/keel", version = "=0.9.8" }
+arcen-media = { path = "shared/media", version = "=0.9.8" }
+arcen-observability = { path = "shared/observability", version = "=0.9.8" }
+arcen-outputs = { path = "shared/outputs", version = "=0.9.8" }
+arcen-protocol = { path = "shared/protocol", version = "=0.9.8", default-features = false }
+arcen-session = { path = "shared/session", version = "=0.9.8" }
+arcen-telemetry = { path = "shared/telemetry", version = "=0.9.8" }
+arcen-transport = { path = "shared/transport", version = "=0.9.8", default-features = false }
+arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.9.8" }
+bytes = "1.10.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "rand_core", "std"] }
+ed25519 = { version = "=2.2.3", default-features = false, features = ["pkcs8", "std"] }
+getrandom = "0.2"
+openh264 = { version = "=0.9.7", default-features = false }
+openh264-sys2 = { version = "=0.9.7", default-features = false }
+png = "=0.18.1"
+opusic-c = { version = "=1.6.1", default-features = false, features = ["bundled"] }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+rav1e = { version = "=0.8.1", default-features = false, features = ["threading"] }
+ring = "=0.17.14"
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
+sha2 = "0.10.9"
+subtle = "=2.6.1"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
+x509-parser = "=0.18.1"
+zeroize = "1.8.2"
+zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[patch.crates-io]
+opusic-sys = { path = "third_party/opusic-sys-0.7.3-arcen1" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+# The migrated native engine is heavy FFI (~1,420 unsafe sites: capenc, Piers,
+# Deck). `forbid` was structurally incompatible with the proven code, so the
+# workspace default is `warn`. Pure shared crates (`shared/input`, `shared/protocol`,
+# `shared/session`, `shared/transport`, and `shared/keel`) re-assert crate-level
+# `#![forbid(unsafe_code)]`.
+unsafe_code = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+expect_used = "warn"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,24 @@
+[package]
+name = "arcen-outputs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arcen shared output provider lifecycle, atomic start, fairness, and admission policy."
+
+[lib]
+name = "arcen_outputs"
+path = "src/lib.rs"
+
+# ADR 0010 freezes this dependency set at exactly two entries. No
+# `[dev-dependencies]` and no `[build-dependencies]` may ever be added: the
+# purity gate proves `cargo tree --locked -p arcen-outputs -e all` contains no
+# executor, no runtime, and no product crate.
+[dependencies]
+arcen-media.workspace = true
+arcen-telemetry.workspace = true
+
+[lints]
+workspace = true

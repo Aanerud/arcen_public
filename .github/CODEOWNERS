@@ -1,0 +1,14 @@
+* @Aanerud
+
+/.github/ @Aanerud
+/Cargo.toml @Aanerud
+/Cargo.lock @Aanerud
+/deny.toml @Aanerud
+/LICENSE @Aanerud
+/legal/ @Aanerud
+/shared/ @Aanerud
+/hosts/ @Aanerud
+/clients/ @Aanerud
+/packaging/ @Aanerud
+/docs/security/ @Aanerud
+/docs/operations/ @Aanerud

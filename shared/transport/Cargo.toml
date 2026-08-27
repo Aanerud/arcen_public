@@ -1,0 +1,42 @@
+[package]
+name = "arcen-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+quic = ["dep:bytes", "dep:quinn", "dep:tokio", "dep:tokio-util"]
+# Dormant compatibility policy only. Product Deck/Pier dependencies disable
+# default features and never enable this in shipped binaries.
+wss-compat = ["arcen-protocol/wss-compat", "rustls/tls12"]
+
+[dependencies]
+arcen-identity.workspace = true
+arcen-protocol = { workspace = true, default-features = false }
+bytes = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+rustls.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen = "=0.14.8"
+# Adds `tokio::time::pause`/`#[tokio::test(start_paused = true)]` for test
+# code only (dev-dependencies are never linked into a non-test build of
+# this crate or its dependents): used solely to prove the Carrier A
+# `Notify`-based drain suspends rather than busy-polling while idle.
+tokio = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name = "quic_multi_monitor_carrier_bench"
+required-features = ["quic"]
+
+[lints]
+workspace = true

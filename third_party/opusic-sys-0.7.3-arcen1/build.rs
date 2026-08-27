@@ -1,0 +1,242 @@
+#![allow(clippy::style)]
+
+use std::path;
+
+#[cfg(feature = "build-bindgen")]
+extern crate bindgen;
+
+#[cfg(feature = "build-bindgen")]
+fn generate_lib() {
+    #[derive(Debug)]
+    struct ParseCallbacks;
+
+    impl bindgen::callbacks::ParseCallbacks for ParseCallbacks {
+        fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
+            if name.starts_with("OPUS") {
+                Some(bindgen::callbacks::IntKind::Int)
+            } else {
+                None
+            }
+        }
+    }
+
+    const PREPEND_LIB: &str = "
+#![no_std]
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+";
+
+    let out = path::PathBuf::new().join("src").join("lib.rs");
+
+    let bindings = bindgen::Builder::default().header("src/wrapper.h")
+                                              .raw_line(PREPEND_LIB)
+                                              .parse_callbacks(Box::new(ParseCallbacks))
+                                              .generate_comments(false)
+                                              .layout_tests(false)
+                                              .ctypes_prefix("core::ffi")
+                                              .allowlist_type("[oO]pus.+")
+                                              .allowlist_function("[oO]pus.+")
+                                              .allowlist_var("[oO].+")
+                                              .use_core()
+                                              .generate()
+                                              .expect("Unable to generate bindings");
+
+    bindings.write_to_file(out).expect("Couldn't write bindings!");
+}
+
+#[cfg(not(feature = "build-bindgen"))]
+fn generate_lib() {
+}
+
+#[cfg(feature = "bundled")]
+fn get_android_vars() -> Option<(path::PathBuf, &'static str)> {
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
+
+    if let Ok(android_ndk) = std::env::var("ANDROID_NDK_HOME") {
+        let mut toolchain_file = path::PathBuf::new();
+        toolchain_file.push(android_ndk);
+        toolchain_file.push("build");
+        toolchain_file.push("cmake");
+        toolchain_file.push("android.toolchain.cmake");
+
+        let target = std::env::var("TARGET").unwrap();
+        let abi = match target.as_str() {
+            "armv7-linux-androideabi" => "armeabi-v7a",
+            "aarch64-linux-android" => "arm64-v8a",
+            "i686-linux-android" => "x86",
+            "x86_64-linux-android" => "x86_64",
+            _ => return None,
+        };
+
+        Some((toolchain_file, abi))
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "bundled")]
+fn set_cmake_define_if_present(config: &mut cmake::Config, name: &str) {
+    if let Ok(value) = std::env::var(name) {
+        config.define(name, value);
+    } else if let Ok(value) = std::env::var(format!("CARGO_NDK_{}", name)) {
+        config.define(name, value);
+    } else {
+        println!("cargo:warning=Unable to find Android env variable '{}'. Hope for good default...", name);
+    }
+}
+
+#[cfg(feature = "bundled")]
+fn build() {
+    const CURRENT_DIR: &str = "opus";
+
+    //Disable LTO if someone tries to force it (e.g. Arch makepkg)
+    //This is necessary because cmake crate doesn't pass env variables at configure step, so we will
+    //adjust both configure variables and general build env (just in case)
+    fn fix_build_env(cmake: &mut cmake::Config) {
+        for (var, cmake_var) in [("CFLAGS", "CMAKE_C_FLAGS"), ("CXXFLAGS", "CMAKE_CXX_FLAGS")] {
+            if let Ok(value) = std::env::var(var) {
+                if value.contains("-flto") {
+                    println!("cargo:warning=env::{var} contains LTO option. Overriding it...");
+                    let filtered: String = value
+                        .split_whitespace()
+                        .filter(|f| !f.starts_with("-flto"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    cmake
+                        .configure_arg(format!("-D{cmake_var}={filtered}"))
+                        .env(var, filtered);
+                }
+            }
+        }
+    }
+
+    let mut cmake = cmake::Config::new(CURRENT_DIR);
+    fix_build_env(&mut cmake);
+    cmake.define("OPUS_INSTALL_PKG_CONFIG_MODULE", "OFF")
+         .define("OPUS_INSTALL_CMAKE_CONFIG_MODULE", "OFF")
+         //Defining these variables disable GNUInstallDirs so in addition to /lib
+         //define some commonly build stuff too.
+         .define("CMAKE_INSTALL_BINDIR", "bin")
+         .define("CMAKE_INSTALL_MANDIR", "man")
+         .define("CMAKE_INSTALL_INCLUDEDIR", "include")
+         .define("CMAKE_INSTALL_OLDINCLUDEDIR", "include")
+         .define("CMAKE_INSTALL_LIBDIR", "lib")
+         .define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY")
+         //Ensure opus's CMake never enables LTO
+         .define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "off");
+
+    // Opus's CMakeLists.txt explicitly selects the MSVC runtime under CMP0091,
+    // so drive its option from Cargo's target configuration.
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let crt_static = std::env::var("CARGO_CFG_TARGET_FEATURE")
+            .unwrap_or_default()
+            .split(',')
+            .any(|feature| feature == "crt-static");
+        cmake.define(
+            "OPUS_STATIC_RUNTIME",
+            if crt_static { "ON" } else { "OFF" },
+        );
+    }
+
+    //Keep this up to date with Cargo.toml
+    if cfg!(feature = "dred") {
+        cmake.define("OPUS_DRED", "ON");
+    }
+    if cfg!(feature = "osce") {
+        cmake.define("OPUS_OSCE", "ON");
+    }
+    if cfg!(feature = "no-hardening") {
+        cmake.define("OPUS_HARDENING", "OFF");
+    }
+    if cfg!(feature = "no-stack-protector") {
+        cmake.define("OPUS_STACK_PROTECTOR", "OFF");
+    }
+    if cfg!(feature = "no-fortify-source") {
+        cmake.define("OPUS_FORTIFY_SOURCE", "OFF");
+    }
+    if cfg!(feature = "no-simd") {
+        cmake.define("OPUS_DISABLE_INTRINSICS", "ON");
+    }
+    if cfg!(feature = "fixed-point") {
+        cmake.define("OPUS_FIXED_POINT", "ON");
+    }
+
+    if let Some((toolchain_file, abi)) = get_android_vars() {
+        cmake.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
+        cmake.define("ANDROID_ABI", abi);
+
+        set_cmake_define_if_present(&mut cmake, "ANDROID_PLATFORM");
+        set_cmake_define_if_present(&mut cmake, "ANDROID_STL");
+        set_cmake_define_if_present(&mut cmake, "ANDROID_ARM_MODE");
+        set_cmake_define_if_present(&mut cmake, "ANDROID_ARM_NEON");
+    }
+
+    // Use ninja if present on system
+    if std::process::Command::new("ninja").arg("--version").status().map(|status| status.success()).unwrap_or(false) {
+        cmake.generator("Ninja");
+    }
+
+    let mut out_dir = cmake.build();
+
+    println!("cargo:rustc-link-lib=static=opus");
+
+    out_dir.push("lib");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+
+    // Add lib64 in addition on Linux as some systems may default to lib64
+    #[cfg(target_os = "linux")]
+    {
+        out_dir.pop();
+        out_dir.push("lib64");
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
+}
+
+fn run() {
+    generate_lib();
+
+    //dont use any dynamic linking if bundling is requested
+    #[cfg(feature = "bundled")]
+    build();
+
+    #[cfg(not(feature = "bundled"))]
+    {
+        enum LinkMode {
+            Static,
+            Dynamic,
+        }
+
+        impl core::fmt::Display for LinkMode {
+            fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                match self {
+                    Self::Static => fmt.write_str("static"),
+                    Self::Dynamic => fmt.write_str("dylib"),
+                }
+            }
+        }
+
+        println!("cargo:rerun-if-env-changed=OPUS_LIB_DIR");
+        println!("cargo:rerun-if-env-changed=OPUS_LIB_STATIC");
+
+        let mode = match std::env::var("OPUS_LIB_STATIC") {
+            Ok(is_static) if is_static.eq_ignore_ascii_case("true") => LinkMode::Static,
+            _ => LinkMode::Dynamic
+        };
+
+        if let Ok(dir) = std::env::var("OPUS_LIB_DIR") {
+            if !path::Path::new(&dir).exists() {
+                println!("cargo:warning=env::OPUS_LIB_DIR='{}' does not exist", dir);
+            }
+            println!("cargo:rustc-link-search={}", dir);
+        }
+        //let the linker figure out the library path
+        println!("cargo:rustc-link-lib={mode}=opus");
+    }
+}
+
+fn main() {
+    run()
+}

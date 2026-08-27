@@ -1,0 +1,20 @@
+[package]
+name = "arcen-usb-helper"
+version = "0.9.8"
+edition = "2021"
+publish = false
+license.workspace = true
+description = "Privileged macOS USB capture helper for Arcen Deck Hard USB bridging"
+
+# The root attack surface is this crate. Keep the dependency set minimal and
+# auditable: no async runtime, no transport, no UI, no media, no serialization
+# framework. See docs/adr/0011-macos-privileged-usb-helper.md.
+[dependencies]
+arcen-protocol = { path = "../../../shared/protocol", default-features = false }
+arcen-usb-bridge = { path = "../../../shared/usb-bridge" }
+rusb = { version = "0.9.4", features = ["vendored"] }
+libc = "0.2"
+
+[[bin]]
+name = "arcen-usb-helper"
+path = "src/main.rs"

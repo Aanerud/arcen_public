@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Arcen Deck</title>
+  <desc>A hand-drawn copper span held between two graphite anchors, on the Arcen graphite ground.</desc>
+
+  <!-- Brand ground. Matches the site's graphite (#171918), with a subtle
+       vertical lift so the mark does not sit on a flat block at large sizes. -->
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#222422"/>
+      <stop offset="1" stop-color="#141614"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS squircle proportions: 824x824 content area inside a 1024 canvas. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#ground)"/>
+
+  <!-- The mark, from site/assets/arcen-mark.svg. Scaled 12x and positioned on
+       the art's true bounding box (x 5.8-58.4, y 11.6-52.4, centre 32.1/32.0)
+       rather than the 64x64 viewBox, which is mostly empty above the arch.
+       Stroke widths scale with it, so the hand-drawn weight is preserved
+       rather than re-drawn. -->
+  <g transform="translate(126.8 128) scale(12)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 46.2C14.3 25.4 22.4 15.2 32.1 15.3c9.8.1 17.8 10.2 23.9 30.8" stroke="#c97850" stroke-width="4.8"/>
+    <path d="M8.7 45.4C14.5 26.7 22.6 16.5 32 16.1c9.5-.3 17.5 10.1 23.2 29.5" stroke="#d79a79" stroke-width="1.15" opacity=".72"/>
+    <path d="M7 47.3c12.7-.8 21.1-.5 25.3-.4 7.8.2 15.8-.2 24.7.4" stroke="#f2efe8" stroke-width="3"/>
+    <path d="M7.8 48.4c13.5-.4 22.1 0 25 .1 8 .2 15.8-.2 23.4.1" stroke="#8f8d86" stroke-width="1" opacity=".72"/>
+    <path d="M9 42.8v9.1M11.2 44.5v6.4M55 42.5v9.3M52.8 44.2v6.7" stroke="#f2efe8" stroke-width="2"/>
+    <path d="M5.8 46.1h7.1M51.4 46h7" stroke="#8f8d86" stroke-width="1" opacity=".8"/>
+    <path d="M31.9 11.6v7.1M28.9 15.1h6.1" stroke="#8f8d86" stroke-width=".9" opacity=".65"/>
+  </g>
+</svg>

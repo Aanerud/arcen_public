@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pre-commit gate for the nightly run.
+#
+# Install with:  scripts/review/install-hooks.sh
+#
+# Runs three guards:
+#   1. check-publication-hygiene.sh  nothing unpublishable may enter the tree
+#   2. secret-scan.sh                opt-in local credential scan
+#   3. doc-guard.sh                  no documentation file may lose content
+#
+# secret-scan is opt-in: it matches against literal values supplied in
+# ARCEN_SECRET_VALUES, which is a private, per-machine list and deliberately not
+# in the repository. When it is unset the scan is skipped rather than refused --
+# this is a public repository, and the fail-closed check that actually applies to
+# everyone is the publication-hygiene gate below (plus gitleaks in CI).
+#
+# When it IS armed it must never pass vacuously: a scanner that checks nothing
+# must not report success. That lesson came from this hook's own first version,
+# which used `mapfile` on macOS bash 3.2, scanned an empty list, and reported ok.
+#
+# Override an intentional documentation restructuring with
+# ARCEN_DOC_GUARD_ALLOW=1, and say why in the commit message.
+set -uo pipefail
+
+REPO="$(git rev-parse --show-toplevel)"
+cd "$REPO" || exit 1
+
+FAILED=0
+
+# ---- guard 1: publication hygiene ------------------------------------------
+# Fail-closed, and applies to everyone: no lab infrastructure, no key material,
+# no vendor SDK payload, every first-party crate AGPL.
+if [ -x "$REPO/scripts/ci/check-publication-hygiene.sh" ]; then
+  if ! "$REPO/scripts/ci/check-publication-hygiene.sh"; then
+    echo "pre-commit: BLOCKED by publication hygiene." >&2
+    FAILED=1
+  fi
+fi
+
+# ---- guard 2: secrets (opt-in) ---------------------------------------------
+if [ -n "${ARCEN_SECRET_VALUES:-}" ]; then
+  if ! "$REPO/scripts/review/secret-scan.sh" >/tmp/arcen-secret-scan.$$ 2>&1; then
+    grep -E 'FAIL|credential is present' /tmp/arcen-secret-scan.$$ | head -20
+    echo "pre-commit: BLOCKED, a credential is present in the tree." >&2
+    FAILED=1
+  else
+    tail -1 /tmp/arcen-secret-scan.$$
+  fi
+  rm -f /tmp/arcen-secret-scan.$$
+else
+  echo "pre-commit: ARCEN_SECRET_VALUES unset; local literal-secret scan skipped." >&2
+  echo "  Publication hygiene ran above, and gitleaks runs in CI." >&2
+fi
+
+# ---- guard 3: documentation content ---------------------------------------
+BASE="${ARCEN_DOC_GUARD_BASE:-main}"
+if [ "${ARCEN_DOC_GUARD_ALLOW:-0}" = "1" ]; then
+  echo "pre-commit: NOTE  doc-guard overridden via ARCEN_DOC_GUARD_ALLOW=1" >&2
+elif git rev-parse --verify --quiet "$BASE" >/dev/null; then
+  if ! "$REPO/scripts/review/doc-guard.sh" "$BASE"; then
+    echo "pre-commit: BLOCKED by doc-guard." >&2
+    FAILED=1
+  fi
+fi
+
+[ "$FAILED" -eq 0 ] || echo "pre-commit: commit refused." >&2
+exit "$FAILED"

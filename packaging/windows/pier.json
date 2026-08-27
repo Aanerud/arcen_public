@@ -1,0 +1,85 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18444
+  },
+  "tls": {
+    "mode": "pem",
+    "cert": "tls/host.crt",
+    "key": "tls/host.key",
+    "minimum_version": "TLS1.3",
+    "disabled_cipher_suites": [],
+    "expiry_warning_days": 30,
+    "expected_sans": []
+  },
+  "video": {
+    "bit_depth": "10",
+    "color_range": "full",
+    "color_matrix": "bt709",
+    "color_policy": "default-off",
+    "fps": 60,
+    "encoder": "auto"
+  },
+  "audio": {
+    "enabled": true,
+    "compressed": false
+  },
+  "microphone_input": {
+    "enabled": false
+  },
+  "clipboard": {
+    "direction": "both",
+    "content": "all",
+    "max_bytes": 8388608
+  },
+  "auth": {
+    "disclaimer": {
+      "enabled": false,
+      "locale": "en_US",
+      "directory": "disclaimers"
+    },
+    "reconnect_window_secs": 180
+  },
+  "redirection": {
+    "timezone": false
+  },
+  "logging": {
+    "level": 0,
+    "retention_days": 30,
+    "qos_targets": {
+      "fps_degraded_percent": 90,
+      "fps_critical_percent": 70,
+      "rtt_degraded_ms": 60,
+      "rtt_critical_ms": 150,
+      "drop_degraded_basis_points": 50,
+      "drop_critical_basis_points": 500,
+      "input_degraded_ms": 50,
+      "input_critical_ms": 120,
+      "heartbeat_critical_misses": 3
+    }
+  },
+  "platform": {
+    "desktop": {
+      "output_index": 0,
+      "deskside": {
+        "enabled": false,
+        "monitors": []
+      }
+    },
+    "iddcx": {
+      "enabled": false,
+      "render_adapter": {}
+    },
+    "multi_monitor": {
+      "advertise_enabled": false,
+      "allowed_adapters": [],
+      "max_monitors": null,
+      "nvenc_session_limit": null,
+      "allow_software_fallback": false
+    },
+    "logging": {
+      "rotate_mb": 32
+    },
+    "first_login_timeout_secs": 300
+  }
+}

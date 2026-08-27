@@ -1,0 +1,7 @@
+Executable=/Applications/Arcen Deck.app/Contents/MacOS/arcen-deck
+Identifier=deck.arcen.tech
+Authority=Apple Development: Synthetic Arcen Test (NWR7ZH8L7U)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=NWR7ZH8L7U
+Runtime Version=15.0.0

@@ -1,0 +1,17 @@
+[package]
+name = "arcen-input-helper"
+version = "0.9.8"
+edition = "2021"
+description = "Arcen Linux input helper."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_input_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcen-input-helper"
+path = "src/main.rs"
+
+[dependencies]

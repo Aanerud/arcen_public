@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Application identity — required when a provisioning profile is embedded -->
+    <key>com.apple.application-identifier</key>
+    <string>NWR7ZH8L7U.deck.arcen.tech</string>
+
+    <key>com.apple.developer.team-identifier</key>
+    <string>NWR7ZH8L7U</string>
+
+    <!-- Deck is NOT sandboxed (no com.apple.security.app-sandbox key). The
+         App-Sandbox-only keys com.apple.security.network.client and
+         com.apple.security.device.audio-input are deliberately omitted: without
+         App Sandbox they are no-ops and the real external provisioning profile
+         does not authorize them. Outgoing QUIC and microphone capture work
+         because an unsandboxed app already has full network access and gets
+         explicit TCC consent (see NSMicrophoneUsageDescription in
+         Deck-Info.plist and the runtime AVAudioEngine permission check in
+         microphone.rs) — no entitlement is required for either.
+
+         com.apple.security.device.input-monitoring is also omitted: it is an
+         undocumented, TCC-governed key (Privacy & Security > Input Monitoring),
+         not a documented Apple entitlement, and default in-window AppKit
+         tablet events (NSEvent tabletPoint/tabletProximity) never require it.
+         It would only be relevant to the quarantined, non-default experimental
+         raw-HID/global-input path; it must not be added back to production
+         entitlements for that path without a dedicated Release/Security review. -->
+
+    <!-- Sustained Execution — prevents macOS from CPU-throttling Deck when it is
+         not the front window. Without this, an active remote session in the
+         background gets starved and latency spikes.
+         The protected external profile must authorize this entitlement. -->
+    <key>com.apple.developer.sustained-execution</key>
+    <true/>
+
+    <!-- Associated Domains — enables arcen.tech universal links (e.g. one-click
+         connect from the web dashboard) and web credentials handoff.
+         Profile authorizes wildcard (*); app declares specific domains.
+         Requires apple-app-site-association at https://arcen.tech/.well-known/ -->
+    <key>com.apple.developer.associated-domains</key>
+    <array>
+        <string>applinks:arcen.tech</string>
+        <string>webcredentials:arcen.tech</string>
+    </array>
+
+    <!-- NOT INCLUDED — held back until implementation exists:
+
+         com.apple.developer.networking.networkextension
+           Profile authorizes: packet-tunnel-provider-systemextension,
+           app-proxy-provider-systemextension, content-filter-provider-systemextension,
+           dns-proxy-systemextension, dns-settings, relay, url-filter-provider,
+           hotspot-provider. Add when Span Network Extension bundle ships.
+
+         com.apple.developer.networking.vpn.api (allow-vpn)
+           Companion to networkextension. Add together with above.
+
+         com.apple.developer.kernel.increased-memory-limit
+           NOT in this provisioning profile — requires a new profile revision
+           with this capability added at developer.apple.com.
+
+         com.apple.developer.devicecheck.appattest-environment
+           Requires server-side Pier verification wired in first. Also not in
+           the current profile — add to App ID + regenerate profile when ready. -->
+</dict>
+</plist>

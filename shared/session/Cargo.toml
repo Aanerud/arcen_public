@@ -1,0 +1,23 @@
+[package]
+name = "arcen-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arcen-telemetry.workspace = true
+serde.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

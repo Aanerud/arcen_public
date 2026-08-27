@@ -1,0 +1,24 @@
+[package]
+name = "arcen-region-patch-benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Research-only region patch framing and reconstruction harness."
+
+[dependencies]
+arcen-keel.workspace = true
+arcen-media.workspace = true
+
+[dev-dependencies]
+# Match the existing Keel corpus infrastructure and Rust 1.85 floor.
+criterion = { version = "0.6.0", default-features = false }
+
+[[bench]]
+name = "region_patch"
+harness = false
+
+[lints]
+workspace = true

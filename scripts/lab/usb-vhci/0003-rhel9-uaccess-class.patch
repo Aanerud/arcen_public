@@ -1,0 +1,19 @@
+diff --git a/usb-vhci-iocifc.c b/usb-vhci-iocifc.c
+--- a/usb-vhci-iocifc.c
++++ b/usb-vhci-iocifc.c
+@@ -216,7 +216,7 @@
+ 	if(copy_to_user(arg->bus_id, dname, i))
+ 	{
+ 		vhci_printk(KERN_WARNING, "Failed to copy bus_id to userspace.\n");
+-		__put_user('\0', arg->bus_id);
++		__put_user('\0', &arg->bus_id[0]);
+ 	}
+ 	// make sure the last character is null
+ 	__put_user('\0', arg->bus_id + i);
+@@ -1068,7 +1068,6 @@
+ static int vhci_iocifc_major;
+ 
+ static struct class vhci_iocifc_class = {
+-	.owner = THIS_MODULE,
+ 	.name = driver_name
+ };

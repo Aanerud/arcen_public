@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon for the Arcen privileged USB helper.
+
+  Registered by Deck through SMAppService.daemon(plistName:). launchd starts
+  this as root, which is what removes the recurring `sudo`: the user approves
+  the daemon once in System Settings > General > Login Items, and never types a
+  password per session.
+
+  `BundleProgram` is bundle-relative and is only honoured for plists installed
+  via SMAppService, and it must point into Contents/MacOS. `ProgramArguments`
+  supplies argv; argv[0] is conventional and the rest configure the socket.
+
+  See docs/adr/0011-macos-privileged-usb-helper.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>tech.arcen.deck.usbhelper</string>
+
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/arcen-usb-helper</string>
+
+    <!-- Required by SMAppService: without it registration fails with
+         "Unable to read plist" / notFound. Names the app that owns this
+         daemon. See docs/adr/0011-macos-privileged-usb-helper.md. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>deck.arcen.tech</string>
+    </array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>arcen-usb-helper</string>
+        <string>--socket</string>
+        <string>/var/run/arcen-usb-helper.sock</string>
+    </array>
+
+    <!-- Started on demand and kept alive: the helper holds no device until a
+         client connects, and releases it again on disconnect. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/arcen-usb-helper.log</string>
+</dict>
+</plist>

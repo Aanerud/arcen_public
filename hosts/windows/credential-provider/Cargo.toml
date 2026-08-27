@@ -1,0 +1,52 @@
+[package]
+name = "arcen-credential-provider"
+version = "0.9.8"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Arcen native Windows Credential Provider with sealed broker handoff, canonical Negotiate serialization, and explicit secret zeroization."
+
+# cdylib   -> the registered in-proc COM server DLL (arcen_credential_provider.dll)
+# rlib     -> lets the out-of-proc COM harness bin and unit tests link the pure logic
+# The pure state-machine / serialization-helper / registration modules compile
+# and unit-test on every OS; only the COM + Win32 glue is
+# cfg(windows). This keeps `cargo build --workspace` green off-Windows and lets
+# the pure logic tests run everywhere.
+[lib]
+name = "arcen_credential_provider"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# Out-of-proc COM harness: LoadLibrary + DllGetClassObject + IClassFactory ->
+# ICredentialProvider -> ICredentialProviderCredential, with no LogonUI and no
+# registration. Windows-only; a stub main() keeps it compiling elsewhere.
+[[bin]]
+name = "arcen-cp-harness"
+path = "src/bin/cp_harness.rs"
+
+[dependencies]
+# The pure framing + sealed-credential + autologon-session contract. Used for
+# the one-shot autologon state machine and (on Windows) the pipe client that
+# decrypts a broker-pushed credential. Platform-neutral, so it links on every OS.
+arcen-cp-ipc = { path = "../cp-ipc" }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[target.'cfg(windows)'.dependencies]
+# windows-core is a *direct* dependency because the `#[implement]` macro expands
+# to `::windows_core` paths; it must resolve by that crate name.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",                            # ICredentialProvider*_Impl traits + #[implement]
+    "Win32_Foundation",
+    "Win32_UI_Shell",                       # ICredentialProvider(Credential) and field types
+    "Win32_Graphics_Gdi",                   # required by ICredentialProviderCredential_Impl (HBITMAP)
+    "Win32_System_Com",                     # IClassFactory, CoTaskMemAlloc/Free, GIT marshaling
+    "Win32_Security",                       # server-peer token SID (SYSTEM) verification
+    "Win32_Security_Credentials",           # CredProtectW for Winlogon password serialization
+    "Win32_Security_Authentication_Identity", # LsaConnectUntrusted/LookupAuthenticationPackage
+    "Win32_Storage_FileSystem",             # CreateFileW to open the broker control pipe
+    "Win32_System_LibraryLoader",           # harness: LoadLibraryW/GetProcAddress
+    "Win32_System_Pipes",                   # WaitNamedPipeW/GetNamedPipeServerProcessId
+    "Win32_System_IO",                      # OVERLAPPED type used by ReadFile/WriteFile
+    "Win32_System_Threading",               # OpenProcess/QueryFullProcessImageNameW/GetCurrentProcessId
+    "Win32_System_Diagnostics_Debug",       # OutputDebugStringW — the only log sink inside LogonUI
+] }

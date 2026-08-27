@@ -1,0 +1,17 @@
+/var/log/arcen/arcen-pier.log {
+    daily
+    maxsize 32M
+    rotate 100
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    dateformat -%Y%m%d-%s
+    create 0640 root root
+    su root root
+    sharedscripts
+    postrotate
+        systemctl kill --kill-who=main -s HUP arcen-pier.service >/dev/null 2>&1 || true
+    endscript
+}

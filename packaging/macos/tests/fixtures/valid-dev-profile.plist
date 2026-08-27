@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>ExpirationDate</key>
+  <date>2099-01-01T00:00:00Z</date>
+  <key>TeamIdentifier</key>
+  <array><string>NWR7ZH8L7U</string></array>
+  <key>Entitlements</key>
+  <dict>
+    <key>com.apple.application-identifier</key>
+    <string>NWR7ZH8L7U.deck.arcen.tech</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>NWR7ZH8L7U</string>
+    <key>com.apple.developer.sustained-execution</key><true/>
+    <key>com.apple.developer.associated-domains</key>
+    <array>
+      <string>applinks:arcen.tech</string>
+      <string>webcredentials:arcen.tech</string>
+    </array>
+    <key>get-task-allow</key><true/>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,54 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=MEDIA
+ClassGuid={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%Arcen%
+DriverVer=07/20/2026,1.0.0.0
+CatalogFile=arcen-microphone.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DriverCopy=13
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+arcen-microphone.sys=1
+
+[Manufacturer]
+%Arcen%=ArcenModels,NTamd64.10.0.1.0.17763,NTamd64.10.0.2.0.20348,NTamd64.10.0.3.0.20348
+
+[ArcenModels.NTamd64.10.0.1.0.17763]
+%DeviceDescription%=ArcenMicrophoneInstall,ROOT\ARCENMICROPHONE
+
+[ArcenModels.NTamd64.10.0.2.0.20348]
+%DeviceDescription%=ArcenMicrophoneInstall,ROOT\ARCENMICROPHONE
+
+[ArcenModels.NTamd64.10.0.3.0.20348]
+%DeviceDescription%=ArcenMicrophoneInstall,ROOT\ARCENMICROPHONE
+
+[ArcenMicrophoneInstall]
+CopyFiles=DriverCopy
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
+
+[ArcenMicrophoneInstall.Services]
+AddService=arcen-microphone,0x00000002,ArcenMicrophoneService
+
+[ArcenMicrophoneService]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\arcen-microphone.sys
+LoadOrderGroup=AudioGroup
+
+[DriverCopy]
+arcen-microphone.sys
+
+[Strings]
+Arcen="Arcen"
+DiskName="Arcen Microphone installation media"
+DeviceDescription="Arcen Microphone"
+ServiceDescription="Arcen Microphone PortCls WaveRT Driver"

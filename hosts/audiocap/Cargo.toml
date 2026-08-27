@@ -1,0 +1,22 @@
+[package]
+name = "arcen-audiocap"
+version = "0.9.8"
+edition = "2021"
+description = "Arcen Linux audio capture helper — PulseAudio/PipeWire monitor -> 48 kHz stereo PCM."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_audiocap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcen-audiocap"
+path = "src/main.rs"
+
+[dependencies]
+arcen-telemetry.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pulse = { package = "libpulse-binding", version = "2.29.0" }
+psimple = { package = "libpulse-simple-binding", version = "2.29.0" }

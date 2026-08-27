@@ -1,0 +1,35 @@
+[Unit]
+Description=Arcen Pier (Linux host) - QUIC UDP 18444
+# time-sync.target is ordering only, and on a host without
+# systemd-time-wait-sync.service -- which includes RHEL family, where chronyd
+# does the work -- it is reached long before the clock is actually correct. It
+# is declared because it costs nothing and helps where that unit does exist, but
+# the retry policy below is what actually recovers startup races.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# Bound the retries below: about a hundred seconds of attempts, then stop. Long
+# enough to outlast transient host startup failures, short enough that a broken
+# host stops rather than restarting for ever.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+LogsDirectory=arcen
+LogsDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arcen-pier
+ExecStart=/opt/arcen/bin/arcen-pier \
+  --config /etc/arcen/pier.json
+# on-abnormal covers signals, timeouts and the watchdog, but not a clean
+# non-zero exit. A host that loses a transient startup race would stay down
+# until somebody noticed, on a service whose whole purpose is to be reachable
+# when nobody is at the machine.
+Restart=on-failure
+RestartSec=10
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

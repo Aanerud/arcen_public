@@ -1,0 +1,20 @@
+[package]
+name = "arcen-cp-ipc"
+version = "0.9.8"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Pure-Rust framing + ephemeral authenticated-encryption contract for the Arcen Credential Provider/broker control pipe. The schema carries no plaintext credential; the only credential message is an X25519+HKDF+AES-256-GCM sealed envelope bound to a per-Advise transcript. Transport (a SYSTEM-only named pipe) is implemented by the platform crates, not here."
+
+# Pure Rust, no platform dependencies: this crate is the single source of truth
+# for the CP<->broker framing, the sealed-credential envelope, and the CP-side
+# one-shot autologon state machine. It is compiled and unit-tested on every dev
+# OS so the message contract and crypto stay honest even where the COM provider
+# and the LocalSystem pipe transport cannot build/run.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ring 0.17 is already in the workspace tree (via rustls); it supplies the
+# audited X25519 agreement, HKDF-SHA256, and AES-256-GCM primitives used by the
+# sealed-credential envelope. No bespoke crypto is written here.
+ring = "0.17"
+zeroize = { version = "1", features = ["zeroize_derive"] }

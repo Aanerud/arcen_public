@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>arcen-deck</string>
+    <key>CFBundleIdentifier</key>
+    <string>deck.arcen.tech</string>
+    <key>CFBundleName</key>
+    <string>Arcen Deck</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleDisplayName</key>
+    <string>Arcen Deck</string>
+    <key>CFBundleVersion</key>
+    <string>0.9.8</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.9.8</string>
+    <!-- Shown by the standard About panel. Arcen is remote-access software, so
+         AGPL-3.0 section 13 matters: a user who only ever receives this built
+         bundle must still be able to find the corresponding source. The About
+         box and `--help` are where a person actually looks. Keep this in step
+         with SOURCE_URL in clients/macos/src/lib.rs. -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Free software under the GNU AGPL-3.0. NO WARRANTY. Source: https://github.com/Aanerud/arcen_public</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <!-- Arcen handles the camera-housing area itself: pinned sessions either
+         size the stream to the safe area (default, 1:1 with a black notch
+         strip) or take the whole panel through custom window management when
+         the user opts in. Declaring false stops macOS offering the Finder
+         "scale below the built-in camera" compatibility checkbox, which would
+         silently shrink the display Arcen measured. -->
+    <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
+    <false/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Arcen Deck forwards your microphone to the remote workstation.</string>
+</dict>
+</plist>

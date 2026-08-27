@@ -1,0 +1,22 @@
+[package]
+name = "arcen-pier-windows-installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "install-arcen-pier"
+path = "src/main.rs"
+
+[dependencies]
+rcgen = "=0.14.8"
+serde_json.workspace = true
+# Only for the certificate validity window. Already in the graph via rcgen,
+# whose CertificateParams::not_before/not_after are time::OffsetDateTime and
+# which does not re-export the type.
+time = "=0.3.45"
+
+[lints]
+workspace = true

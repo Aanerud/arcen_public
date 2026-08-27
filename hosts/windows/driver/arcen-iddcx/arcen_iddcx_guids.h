@@ -1,0 +1,13 @@
+#pragma once
+
+#include <guiddef.h>
+
+// {08F053DA-07B3-4219-8860-07DBEAA5E8B4}
+DEFINE_GUID(GUID_DEVINTERFACE_ARCEN_IDDCX_CONTROL,
+            0x08f053da, 0x07b3, 0x4219, 0x88, 0x60, 0x07, 0xdb, 0xea, 0xa5,
+            0xe8, 0xb4);
+
+// {75407A9C-D23D-4C0A-8677-65CAF4462826}
+DEFINE_GUID(GUID_CONTAINER_ARCEN_IDDCX_BASE,
+            0x75407a9c, 0xd23d, 0x4c0a, 0x86, 0x77, 0x65, 0xca, 0xf4, 0x46,
+            0x28, 0x26);

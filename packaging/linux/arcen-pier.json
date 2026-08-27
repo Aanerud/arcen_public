@@ -1,0 +1,89 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18444
+  },
+  "tls": {
+    "mode": "pem",
+    "cert": "/etc/arcen/host.crt",
+    "key": "/etc/arcen/host.key",
+    "minimum_version": "TLS1.3",
+    "disabled_cipher_suites": [],
+    "expiry_warning_days": 30,
+    "expected_sans": []
+  },
+  "capture": {},
+  "video": {
+    "bit_depth": "10",
+    "color_range": "full",
+    "color_matrix": "bt709",
+    "color_policy": "default-off",
+    "fps": 60,
+    "encoder": "auto"
+  },
+  "audio": {
+    "enabled": true,
+    "compressed": false
+  },
+  "microphone_input": {
+    "enabled": false
+  },
+  "clipboard": {
+    "direction": "both",
+    "content": "all",
+    "max_bytes": 8388608
+  },
+  "auth": {
+    "disclaimer": {
+      "enabled": false,
+      "locale": "en_US",
+      "directory": "/etc/arcen/disclaimers"
+    },
+    "reconnect_window_secs": 180
+  },
+  "redirection": {
+    "timezone": false
+  },
+  "logging": {
+    "level": 0,
+    "retention_days": 30
+  },
+  "platform": {
+    "auth": {
+      "mode": "pam",
+      "pam_service": "login"
+    },
+    "capture": {
+      "monitor": 1,
+      "display": ":0",
+      "width": 0,
+      "height": 0
+    },
+    "session": {
+      "desktop": "gnome",
+      "display": ":11",
+      "gpu_head": "DFP-2",
+      "xorg_bin": "/usr/libexec/Xorg",
+      "xorg_config_template": "/etc/arcen/xorg.conf",
+      "runtime_root": "/run/arcen/sessions",
+      "zoneinfo_root": "/usr/share/zoneinfo",
+      "disconnected_idle_timeout_secs": null
+    },
+    "input": {
+      "mode": "uinput"
+    },
+    "audio": {
+      "user": "session",
+      "pactl_binary": "/usr/bin/pactl"
+    },
+    "logging": {
+      "managed_log": "/var/log/arcen/arcen-pier.log"
+    },
+    "deskside": {
+      "enabled": false,
+      "firmware_sha256": "",
+      "input_devices": [],
+      "outputs": []
+    }
+  }
+}

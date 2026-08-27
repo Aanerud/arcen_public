@@ -1,0 +1,185 @@
+name: CI
+
+# Arcen is a public AGPL-3.0 repository with no support commitment, and CI is
+# scoped to match that reality.
+#
+# This workflow is MANUAL ONLY and LINUX ONLY. It deliberately does not build
+# the platform crates:
+#
+# the macOS Deck builds only on macOS, the Linux Pier only on Linux, and the
+# Windows Pier only on Windows/MSVC, so the workspace is intentionally not
+# buildable in one job. All three do build and pass their tests on their own
+# target OS; they are simply not built here.
+#
+# What runs here is the platform-independent subset, so a green run means
+# something. Platform builds are the contributor's responsibility — state in the
+# pull request what you built and ran, and what you did not.
+#
+# (GitHub bills hosted runners at 10x for macOS and 2x for Windows on PRIVATE
+# repositories. Standard runners are free on public repositories, so cost is no
+# longer the constraint here — correctness is.)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Set deliberately, not inherited. actions-rust-lang/setup-rust-toolchain
+  # exports RUSTFLAGS=-D warnings itself unless RUSTFLAGS is already defined,
+  # which meant the repository's strictness was a third-party action's default
+  # rather than a decision recorded here.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  hygiene:
+    name: Publication hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Refuse to publish private infrastructure or non-AGPL crates
+        run: bash scripts/ci/check-publication-hygiene.sh
+
+  doc-guard:
+    name: Documentation content guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse documentation edits that destroy content
+        run: bash scripts/review/doc-guard.sh "origin/${{ github.event.pull_request.base.ref || 'main' }}"
+
+  shared:
+    name: Shared crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Validate synthetic observability conformance
+        run: |
+          python3 -m unittest scripts/test_validate_observability.py
+          python3 -m unittest scripts/test_verify_quic_product_binary.py
+      - name: Verify governed Opus source
+        run: bash scripts/verify-opusic-source.sh
+      - name: Native source-build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm nasm
+          c++ --version
+          nasm -v
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Format check (whole workspace)
+        run: cargo fmt --all --check
+      - name: Test the pure/shared crates
+        run: cargo test --locked -p arcen-identity -p arcen-input -p arcen-media -p arcen-observability -p arcen-outputs -p arcen-protocol -p arcen-session -p arcen-telemetry -p arcen-transport -p arcen-usb-bridge -p arcen-cp-ipc -p arcen-keel
+      - name: Clippy (pure crates, strict)
+        run: cargo clippy --locked -p arcen-identity -p arcen-input -p arcen-media -p arcen-observability -p arcen-outputs -p arcen-protocol -p arcen-session -p arcen-telemetry -p arcen-transport -p arcen-usb-bridge -p arcen-cp-ipc -p arcen-keel -- -D warnings
+      - name: Test optional QUIC adapter
+        run: cargo test --locked -p arcen-transport --features quic
+      - name: Prove product graphs are QUIC and TLS 1.3 only
+        run: |
+          for package in arcen-deck-macos arcen-pier-linux arcen-pier-windows; do
+            feature_tree="$(cargo tree --locked -p "$package" -e features)"
+            rustls_tree="$(cargo tree --locked -p "$package" -e features -i rustls)"
+            if printf '%s\n' "$feature_tree" | grep -E \
+              'wss-compat|tokio-rustls|tungstenite feature "handshake"'; then
+              echo "$package unexpectedly enables dormant WSS networking" >&2
+              exit 1
+            fi
+            if printf '%s\n' "$rustls_tree" | grep -F 'rustls feature "tls12"'; then
+              echo "$package unexpectedly enables TLS 1.2" >&2
+              exit 1
+            fi
+          done
+      - name: Prove default transport excludes the QUIC graph
+        run: |
+          if cargo tree --locked -p arcen-transport -e normal | grep -E '(^|[[:space:]])(quinn|tokio|tokio-util|bytes) v'; then
+            echo "default arcen-transport unexpectedly includes a QUIC dependency"
+            exit 1
+          fi
+      - name: Prove default media excludes optional native codec graphs
+        run: |
+          if cargo tree --locked -p arcen-media -e all | grep -E '(^|[[:space:]])(opusic-c|opusic-sys|cmake|openh264|openh264-sys2|wide|nasm-rs|cc|walkdir) v'; then
+            echo "default arcen-media unexpectedly includes an optional codec/native-build dependency"
+            exit 1
+          fi
+      - name: Prove default arcen-outputs graph is pure
+        run: |
+          product_package_pattern="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              python3 -c '
+          import json
+          import re
+          import sys
+
+          metadata = json.load(sys.stdin)
+          product_roots = {"hosts", "clients", "packaging"}
+          names = sorted(
+              {
+                  package["name"]
+                  for package in metadata["packages"]
+                  if product_roots.intersection(
+                      package["manifest_path"].replace("\\", "/").split("/")[:-1]
+                  )
+              }
+          )
+          print("|".join(re.escape(name) for name in names))
+          '
+          )"
+          forbidden_pattern='(^|[[:space:]])(tokio|tokio-util|quinn|bytes|futures|async-trait) v'
+          if [ -n "$product_package_pattern" ]; then
+            forbidden_pattern="$forbidden_pattern|(^|[[:space:]])($product_package_pattern) v"
+          fi
+          if cargo tree --locked -p arcen-outputs -e all | grep -E "$forbidden_pattern"; then
+            echo "arcen-outputs unexpectedly includes a runtime or product dependency" >&2
+            exit 1
+          fi
+      - name: Test and lint optional Opus adapter
+        run: |
+          cmake --version
+          cargo test --locked -p arcen-media --features audio-opus
+          cargo clippy --locked -p arcen-media --features audio-opus -- -D warnings
+      - name: Verify and test source-only OpenH264 adapter
+        run: |
+          bash scripts/test-openh264-assembly.sh
+          media_tree="$(cargo tree --locked -p arcen-media --features software-h264-source -e features)"
+          grep -F 'openh264 v0.9.7' <<<"$media_tree"
+          grep -F 'openh264-sys2 v0.9.7' <<<"$media_tree"
+          cargo tree --locked -p arcen-media --features software-h264-source \
+            -e features -i openh264@0.9.7 | grep -F 'openh264 feature "source"'
+          cargo tree --locked -p arcen-media --features software-h264-source \
+            -e features -i openh264-sys2@0.9.7 | grep -F 'openh264-sys2 feature "source"'
+          if grep -F 'libloading' <<<"$media_tree"; then
+            echo "source-only media graph unexpectedly enables a runtime loader" >&2
+            exit 1
+          fi
+          cargo test --locked -p arcen-media --features software-h264-source
+          cargo clippy --locked -p arcen-media --features software-h264-source -- -D warnings
+          bash scripts/verify-openh264-assembly.sh target
+
+  secret-scan:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

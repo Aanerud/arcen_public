@@ -1,0 +1,123 @@
+[package]
+name = "arcen-deck-macos"
+version = "0.9.8"
+edition = "2021"
+rust-version = "1.89"
+description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_deck"
+path = "src/lib.rs"
+
+[features]
+# SEC-raw-hid: default-off. Enables the experimental raw-HID-over-IP capture
+# path (Wacom/Huion/XP-Pen/UC-Logic/Gaomon vendor tablets) that forwards raw
+# IOHID reports to the host's `/dev/uhid`. This is NOT enabled in production
+# or default builds. Even when compiled in, the capture path additionally
+# requires an explicit runtime opt-in (env var) plus a mutually negotiated
+# `experimental_raw_hid` wire capability with the host before it will start.
+# This is a raw-input passthrough quarantined behind this feature — it is not
+# USB bridging (no USB transport/enumeration is involved).
+experimental-raw-hid = []
+# Lab-only Hard USB responder. Uses the real AppKit pen source but an
+# independently authored synthetic USB tablet; it does not seize the physical
+# Wacom and is not a production bridge.
+usb-hard-lab = ["dep:rusb", "dep:objc2-service-management"]
+# Developer-only tooling. Default-off and never enabled in release/package
+# builds: it compiles in `crate::ui::virtual_monitor_lab` and the
+# `virtual-monitor-lab` CLI subcommand, which tile several decorated native
+# windows inside one display for single-display multi-monitor regression.
+# Even when compiled in, the lab additionally refuses to run without an
+# explicit runtime opt-in (`ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1`), and it is
+# entirely parallel to the production session/fullscreen paths.
+dev-tools = []
+# Dormant source compatibility only. Release/package builds must not enable
+# this feature; shipped Deck binaries connect over QUIC exclusively.
+wss-compat = [
+    "arcen-protocol/wss-compat",
+    "arcen-transport/wss-compat",
+    "rustls/tls12",
+    "tokio-tungstenite/connect",
+    "tokio-tungstenite/handshake",
+    "tokio-tungstenite/rustls-tls-native-roots",
+]
+
+[[bin]]
+name = "arcen-deck"
+path = "src/main.rs"
+
+[dependencies]
+arcen-input.workspace = true
+arcen-media = { workspace = true, features = ["audio-opus"] }
+arcen-protocol = { path = "../../shared/protocol", default-features = false }
+arcen-observability.workspace = true
+arcen-telemetry.workspace = true
+arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
+arcen-usb-bridge.workspace = true
+cpal = "0.15"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+egui = "0.35"
+# Decodes the embedded app icon at startup. Already present in the dependency
+# graph through arcen-media, so this adds nothing new to a release build.
+png.workspace = true
+futures-util = "0.3"
+getrandom.workspace = true
+nusb = "0.1"
+quinn.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rusb = { version = "0.9.4", features = ["vendored"], optional = true }
+url = "2"
+x509-parser = "0.18.1"
+zeroize = "1.9"
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-cf = "0.9.3"
+block2 = "0.6.2"
+core-graphics = "0.25.0"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
+# w4-dedicated-metal-layer: the dedicated 10-bit `CAMetalLayer` video path
+# (`src/ui/video_metal_layer.rs`). Pinned to the exact versions/feature
+# style `wgpu-hal` 29.0.4 itself already resolves for `objc2-metal`/
+# `objc2-quartz-core` (see `Cargo.lock`), so neither introduces a new
+# package version; `objc2-core-foundation`/`objc2-core-graphics` are new
+# *direct* edges but were already present at 0.3.2 in `Cargo.lock` too
+# (pulled transitively). `objc2-core-graphics` supplies the typed
+# `CGColorSpace` this layer's own `colorspace` uses -- deliberately not
+# reusing `apple_cf::cg::CGColorSpace` (a different wrapper type; see
+# `video_render.rs`'s module doc for why that crate's raw-pointer-based
+# approach was needed for the *pre-existing* wgpu/egui surface) since this
+# layer is typed end to end and needs no raw `msg_send!` at all.
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAMetalLayer", "objc2-metal"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+videotoolbox = "0.18.1"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[dev-dependencies]
+rcgen = "0.14.8"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+arcen-session.workspace = true

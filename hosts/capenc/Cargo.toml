@@ -1,0 +1,91 @@
+[package]
+name = "arcen-capenc"
+version = "0.9.8"
+edition = "2021"
+description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_capenc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcen-capenc"
+path = "src/main.rs"
+
+[[bench]]
+name = "keel_mf"
+path = "benches/keel_mf.rs"
+harness = false
+
+[dependencies]
+arcen-keel = { workspace = true }
+arcen-media.workspace = true
+arcen-protocol.workspace = true
+arcen-telemetry.workspace = true
+# Linux NvFBC/CUDA/NVENC entry points remain dlopen'd with hand-written FFI
+# declarations; dlopen itself comes from glibc.
+
+[target.'cfg(windows)'.dependencies]
+# windows-rs: DXGI + D3D11. Feature-gated to keep the build lean.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",          # HMONITOR in DXGI_OUTPUT_DESC gates GetDesc
+    "Win32_System_Threading",
+    "Win32_System_Power",          # SetThreadExecutionState — keep the display awake
+    "Win32_System_LibraryLoader",  # LoadLibrary/GetProcAddress for nvEncodeAPI64.dll
+    # Windows.Graphics.Capture (WGC) — DWM-based capture that works on headless
+    # NVIDIA vGPU / RDP where DXGI Desktop Duplication delivers no frames.
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # Media Foundation software H.264 encoder MFT — the VMware-SVGA / no-NVENC
+    # fallback encoder path. Gated behind the `mf` cargo feature at module
+    # level so the plain NVENC build stays lean; the windows-crate feature list
+    # is additive and has no runtime cost when `mf` is off.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+x11rb = { version = "=0.13.2", default-features = false, features = ["damage", "randr", "shm"] }
+
+# NVENC: we hand-roll a minimal FFI to nvEncodeAPI64.dll (loaded at runtime via
+# windows-rs LoadLibrary/GetProcAddress) with vendored struct definitions. The
+# crates (nvidia-video-codec-sdk -> cudarc) require nvcc/CUDA at build time and
+# are CUDA-oriented; our DirectX NVENC path needs no CUDA at all, so raw FFI is
+# both lighter and correct for a zero-dependency host agent.
+
+[features]
+# Guards the NVENC module so the capture-only skeleton still builds during
+# incremental bring-up.
+nvenc = []
+# Media Foundation software H.264 encoder path. Selected at runtime when
+# NVENC cannot open a session (e.g. VMware SVGA 3D adapters with no
+# NVIDIA hardware). Both features can be enabled at once so a single
+# capenc binary supports both hardware classes; the runtime picks NVENC
+# first and falls back to MF.
+mf = []
+# Portable OpenH264 path. The shared crate owns the safe wrapper and builds the
+# codec from source; capenc never links a runtime-downloaded binary.
+software-h264 = ["arcen-media/software-h264-source"]
+# Probe-only rav1e source used to measure the software AV1 ceiling. The
+# product runtime does not select it until an interactive 4:2:0 path and
+# software decode have both been proven.
+software-av1 = ["arcen-media/software-av1-source"]
+
+[dev-dependencies]
+criterion = { version = "0.6.0", default-features = false }

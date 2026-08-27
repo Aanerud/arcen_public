@@ -1,0 +1,49 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+*.swp
+*.tmp
+__pycache__/
+*.py[cod]
+# Runtime log of the five-minute disk guardian (scripts/disk-guardian.sh)
+.disk-guardian.log
+# Local reference corpus is never source input and must never be committed.
+refference/
+# Built macOS client bundle (regenerate: packaging/macos/build-deck-app.sh)
+Arcen Deck.app/
+.gstack/
+# Local key material. Never commit.
+/keys/
+# Provisioning profiles contain sensitive team credentials — store outside git or in AppleCerts/
+clients/macos/*.provisionprofile
+
+# Release artefacts assembled by hand; binaries are never committed.
+dist/*
+!dist/README.md
+
+# Lab installer output (built binaries, never committed)
+/dist-installers/
+
+# ---------------------------------------------------------------------------
+# Private, never-published working material.
+#
+# This repository is public. Anything that names real infrastructure, accounts
+# or credentials belongs in one of the paths below, NOT in tracked files:
+#   - test-host inventories and lab addresses
+#   - notary profile names, certificate common names, signing private keys
+#   - deployment runbooks against real machines
+#
+# The signing/notarisation PROCEDURE is documented and tracked in
+# docs/operations/macos-signing.md; only the VALUES live here.
+#
+# Note: these paths are not backed up by git. Keep a second copy of anything
+# you cannot regenerate (certificates and private keys especially).
+#
+# .github/ is deliberately NOT ignored: CODEOWNERS, FUNDING.yml, release.yml and
+# workflows/ are functional configuration that GitHub reads from the repository,
+# so ignoring it would silently disable CI, review routing and the funding link.
+# ---------------------------------------------------------------------------
+.claude/
+.local/
+*.private.md

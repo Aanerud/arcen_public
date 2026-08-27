@@ -1,0 +1,103 @@
+[package]
+name = "arcen-pier-linux"
+version = "0.9.8"
+edition = "2021"
+description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_pier_linux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcen-pier"
+path = "src/main.rs"
+
+[features]
+default = []
+# SEC-001. Restores the unauthenticated listener for an isolated lab network.
+# Never enable this in a release artifact: it disables the product's only trust
+# boundary. There is no runtime flag or config key that can turn it on.
+insecure-lab-no-auth = []
+# SEC-raw-hid. Compiles in the quarantined experimental raw-HID vendor
+# passthrough (Wacom/Huion/XP-Pen/UC-Logic/Gaomon) that creates `/dev/uhid`
+# virtual devices from client-supplied descriptors/reports. Off by default.
+# Even when enabled, nothing runs unless an operator ALSO sets
+# `ARCEN_EXPERIMENTAL_RAW_HID=1` at runtime and the connecting client
+# negotiates the matching `experimental_raw_hid` ClientHello capability. This
+# is not USB bridging; see `docs/architecture` for the true-bridge scope.
+experimental-raw-hid = []
+# Lab-only Hard USB virtual-HCD importer. Production/package builds must not
+# enable this until the kernel-module/signing support boundary is approved.
+usb-hard-lab = []
+# Makes the binary eligible to consider the host-local Wayland/libei provider
+# seams. Their pure models and detection API remain compiled for diagnostics
+# and tests, but this first tranche carries no native Wayland, portal, Mutter,
+# or libei binding; runtime detection therefore remains fail-closed.
+wayland-provider = []
+# Dormant source compatibility only. Release/package builds must not enable
+# this feature; shipped Pier binaries expose QUIC exclusively.
+wss-compat = [
+    "arcen-protocol/wss-compat",
+    "arcen-transport/wss-compat",
+    "dep:tokio-rustls",
+    "rustls/tls12",
+    "tokio-rustls/tls12",
+    "tokio-tungstenite/handshake",
+]
+
+[dependencies]
+arcen-audiocap = { path = "../audiocap" }
+# Both encoders are compiled in so `encoder = "auto"` can actually degrade at
+# runtime. The fused Pier exposes the engine through its `capenc` subcommand.
+arcen-capenc = { path = "../capenc", features = ["nvenc", "software-h264"] }
+arcen-input-helper = { path = "../input-helper" }
+arcen-input.workspace = true
+arcen-media = { workspace = true, features = ["audio-opus"] }
+arcen-protocol = { path = "../../shared/protocol", default-features = false }
+arcen-identity.workspace = true
+arcen-session.workspace = true
+arcen-telemetry.workspace = true
+arcen-observability.workspace = true
+arcen-outputs.workspace = true
+arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
+arcen-usb-bridge.workspace = true
+quinn.workspace = true
+getrandom.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2.workspace = true
+zip.workspace = true
+
+# Logging backbone (mirrors the client's `<crate>::<area>` tracing convention:
+# dual sink = blocking rolling daily file + stderr).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
+tracing-appender = "0.2"
+
+thiserror = "1"
+zeroize = "1"
+
+# Async runtime, QUIC TLS, transport-neutral message framing, and capenc
+# supervision. Tungstenite remains as an internal framing codec; its network
+# handshake and TLS features are enabled only by `wss-compat`.
+tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync", "time", "io-util", "process", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+ring = "0.17"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Maintained fork of pam-client. The dependency is Linux-only so host protocol,
+# transport, and unit tests remain runnable on the macOS development machine.
+pam-client2 = { version = "0.5.5", default-features = false }
+evdev = "0.13.2"
+nix = { version = "0.29", features = ["fs", "ioctl", "process", "signal", "user"] }
+x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes"] }
+
+[dev-dependencies]
+rcgen = "=0.14.8"

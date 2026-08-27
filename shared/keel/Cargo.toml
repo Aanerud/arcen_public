@@ -1,0 +1,28 @@
+[package]
+name = "arcen-keel"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arcen Keel - deterministic content-damage intelligence shared by every Pier."
+
+[lib]
+name = "arcen_keel"
+path = "src/lib.rs"
+
+[dependencies]
+crc32c = { version = "0.6.8", default-features = false }
+xxhash-rust = { version = "0.8.17", default-features = false, features = ["xxh3"] }
+
+[dev-dependencies]
+# Criterion 0.6 retains Rust 1.85 compatibility; 0.8 requires Rust 1.86.
+criterion = { version = "0.6.0", default-features = false }
+
+[[bench]]
+name = "corpus"
+harness = false
+
+[lints]
+workspace = true
