@@ -1427,6 +1427,27 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
     }
 }
 
+/// Tablet modes this build can actually run, in display order.
+///
+/// Settings shows the bridged mode with "(not available in this build)" so its
+/// existence stays discoverable. The connection dialog is a different job: a
+/// connection saved with a mode this build cannot run fails later, at connect
+/// time, for a reason the dialog never mentioned. Offering it there only
+/// manufactures broken configurations.
+#[cfg(feature = "usb-hard-lab")]
+const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
+    TabletModeMsg::LocalTermination,
+    TabletModeMsg::WacomUsbBridge,
+    TabletModeMsg::DisabledMouseCompat,
+];
+
+/// Tablet modes this build can actually run, in display order.
+#[cfg(not(feature = "usb-hard-lab"))]
+const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
+    TabletModeMsg::LocalTermination,
+    TabletModeMsg::DisabledMouseCompat,
+];
+
 const fn tablet_mode_label(mode: TabletModeMsg) -> &'static str {
     match mode {
         TabletModeMsg::LocalTermination => "Tablet support",
@@ -7112,11 +7133,7 @@ impl ArcenApp {
                 egui::ComboBox::from_id_salt("saved_connection_tablet_mode")
                     .selected_text(tablet_mode_label(self.add_connection_tablet_mode_requested))
                     .show_ui(ui, |ui| {
-                        for mode in [
-                            TabletModeMsg::LocalTermination,
-                            TabletModeMsg::WacomUsbBridge,
-                            TabletModeMsg::DisabledMouseCompat,
-                        ] {
+                        for mode in TABLET_MODE_CHOICES.iter().copied() {
                             ui.selectable_value(
                                 &mut self.add_connection_tablet_mode_requested,
                                 mode,
@@ -15140,6 +15157,33 @@ mod tests {
         app.active_swap_cmd_ctrl = false;
         app.update_viewer_keyboard_focus(true);
         (app, receiver)
+    }
+
+    #[test]
+    fn the_connection_dialog_only_offers_tablet_modes_this_build_can_run() {
+        // A connection saved with the bridged mode in a build that lacks
+        // usb-hard-lab fails at connect time, long after the dialog that
+        // offered it. Settings keeps the mode visible and marked
+        // "(not available in this build)"; the creation path must not hand
+        // anyone a configuration that cannot work.
+        assert!(
+            TABLET_MODE_CHOICES.contains(&TabletModeMsg::LocalTermination),
+            "the default tablet mode must always be offered"
+        );
+        assert!(
+            TABLET_MODE_CHOICES.contains(&TabletModeMsg::DisabledMouseCompat),
+            "opting out of tablet redirection must always be offered"
+        );
+        assert_eq!(
+            TABLET_MODE_CHOICES.contains(&TabletModeMsg::WacomUsbBridge),
+            cfg!(feature = "usb-hard-lab"),
+            "the USB-bridged mode must be offered exactly when it is compiled in"
+        );
+        assert_eq!(
+            TABLET_MODE_CHOICES.len(),
+            if cfg!(feature = "usb-hard-lab") { 3 } else { 2 },
+            "released builds expose two tablet modes, not three"
+        );
     }
 
     #[test]

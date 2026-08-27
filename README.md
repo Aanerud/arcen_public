@@ -47,17 +47,32 @@ Every claim above was tested on real hardware, not merely compiled:
 | **Reconnection** | A dropped connection resumes the same session for up to two hours. The Deck reattaches with a signed grant instead of asking for the password again. |
 | **Deskside privacy** | Off by default. When enabled, the physical screen is blanked and its keyboard and mouse are disabled for the duration of a remote session, so nobody standing at the machine can watch or interfere. Input and display are locked together — you cannot get one without the other. |
 
-Two input paths exist, and only one ships:
+A graphics tablet has **two modes in the shipped build**, chosen per connection.
+The choice is really about the network, because it decides where the pen is
+interpreted:
 
-- **Synthesised input** — the default, on both hosts. Keyboard, pointer, scroll
-  and pen arrive as native events the operating system generates on Arcen's
-  behalf. This is what a normal session uses, and it is enough for tablets with
-  pressure and tilt.
-- **Hard USB passthrough** — attaches a physical USB device to the remote
-  session directly, so the host sees the real device and its own vendor driver.
-  Linux host only, and **experimental**: it sits behind the `usb-hard-lab`
-  feature and is *not* compiled into the released binaries. Windows has no
-  equivalent, for reasons in [Where help is wanted](#where-help-is-wanted).
+- **Tablet support** — the default, and what you want over Wi-Fi, 5G, or any
+  distance. This Mac's own Wacom driver reads the pen and Arcen sends finished
+  pen events to the host, so no pen sample waits for a reply and the host needs
+  no Wacom driver. **Pressure, tilt, rotation, eraser, proximity and barrel
+  buttons all work.** Finger touch and the tablet's own buttons stay on the Mac,
+  and the tablet keeps working in Mac applications while you are connected.
+- **Mouse compatibility only** — no tablet redirection at all. The pen behaves
+  as a mouse, with no pressure, tilt, eraser or proximity.
+
+Keyboard, pointer and scroll are synthesised the same way on both hosts: they
+arrive as native events the operating system generates on Arcen's behalf. On
+Linux this goes through the kernel's own input layer; on Windows through the
+injection API.
+
+There is a third mode in the tree, **Native tablet (USB bridged)**, which hands
+the physical device to the host so its own vendor driver claims it. It is *not*
+compiled into the released binaries, sits behind the `usb-hard-lab` feature, and
+is Linux-host-only. It buys finger touch and the tablet's own buttons — the two
+things the shipped mode leaves on the Mac — at the cost of a full round trip per
+pen sample, so it is a LAN-only idea. It is not a substitute for the default:
+pressure and tilt already work above. See
+[Where help is wanted](#where-help-is-wanted) if you want to take it further.
 
 **Not supported:** webcam redirection of any kind, and USB passthrough for
 anything other than the one tablet class above. Neither is a small gap —

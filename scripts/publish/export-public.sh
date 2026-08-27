@@ -13,7 +13,8 @@
 # release snapshots starting at the first published version.
 #
 # Usage:
-#   scripts/publish/export-public.sh --tag v0.9.8 [--into <clone>] [--remote <url>] [--dry-run]
+#   scripts/publish/export-public.sh --tag v0.9.8 [--into <clone>] [--remote <url>]
+#                                    [--no-tag] [--dry-run]
 #
 # The export refuses to run unless the working tree is clean, the hygiene gate
 # passes with the private denylist present, and the third-party inventory
@@ -28,6 +29,7 @@ tag=""
 remote="https://github.com/Aanerud/arcen_public.git"
 into=""
 dry_run=0
+no_tag=0
 while (($#)); do
     case "$1" in
         --tag)
@@ -44,6 +46,15 @@ while (($#)); do
             ;;
         --dry-run)
             dry_run=1
+            shift
+            ;;
+        --no-tag)
+            # A published tag is immutable: the GitHub release and every
+            # checksum a user has already verified point at it. Documentation
+            # corrections after a release therefore ride on main as ordinary
+            # commits, exactly as the operating model says, instead of moving
+            # the tag out from under the artefacts.
+            no_tag=1
             shift
             ;;
         *)
@@ -187,12 +198,16 @@ direct QUIC/TLS 1.3 connection. Free software under the GNU AGPL-3.0.
 
 This repository publishes release snapshots. Development history lives
 elsewhere and is not part of this tree."
-git -C "$public" tag -a "$tag" -m "Arcen $tag"
+if ((no_tag)); then
+    echo "==> --no-tag: leaving $tag where it is"
+else
+    git -C "$public" tag -a "$tag" -m "Arcen $tag"
+fi
 
 echo "==> built $(git -C "$public" rev-parse --short HEAD) in $public"
 echo
 echo "Review it, then publish with:"
 echo "    git -C $public push -u origin main"
-echo "    git -C $public push origin $tag"
+((no_tag)) || echo "    git -C $public push origin $tag"
 echo
 echo "Nothing has been pushed."
