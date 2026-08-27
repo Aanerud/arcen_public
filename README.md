@@ -24,47 +24,36 @@ Read this before you invest time.
 | **macOS Pier** | Does not exist. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
 
-Every claim above was tested on real hardware, not merely compiled:
+Every claim above was tested on real hardware, running real work, not merely
+compiled:
 
-- Linux Pier → macOS Deck: `native-nvenc`, 4:4:4, 893 frames, none dropped.
-- Windows Pier → macOS Deck: `openh264-sw-h264` on a machine with no GPU at
-  all, 1266 frames.
-- 710 Linux, 676 Windows, 926 macOS, 694 shared-crate tests pass.
+- **Linux Pier**, Autodesk Flame workstation, GRID V100D-16Q → macOS Deck:
+  `native-nvenc` hardware encode, 4:4:4, 893 frames, none dropped.
+- **Windows Pier**, DaVinci Resolve grading workstation, GRID V100D-16Q →
+  macOS Deck: `native-nvenc` hardware encode, a live grading session driven
+  through the Deck.
+- **Windows Pier**, no GPU at all → macOS Deck: `openh264-sw-h264` software
+  encode, 1266 frames, still hardware-decoded on the Mac.
+- All three Piers are Active Directory-joined, so the credential crossing the
+  wire is a domain credential, not a local account.
+- Test suites at this release: 957 macOS Deck, 716 Linux Pier, 679 Windows
+  Pier, 694 shared-crate.
 
 ### What a session carries
 
 | | |
 |---|---|
 | **Video** | H.264, HEVC and AV1 on NVENC, up to HEVC 4:4:4 10-bit full range. OpenH264 in software where there is no GPU. The Deck decodes in hardware through VideoToolbox, so an ordinary session is GPU-to-GPU end to end: neither side burns a core on video. |
-| **Multiple monitors** | Up to four, negotiated as one topology. The Deck can match the host's layout to its own windows. |
+| **Multiple monitors** | One to four, negotiated as one topology. The Deck can match the host's layout to its own windows. **Each monitor is its own NVENC session**, and that is the real ceiling: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. Set `nvenc_session_limit` only if policy forces a lower ceiling. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. On a multi-GPU host, pin the streaming card with `allowed_adapters` so a session cannot borrow the GPU you reserved for other work. |
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. |
 | **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Opt-in every launch — consent is deliberately never restored from settings — and the operator must enable it on the host too. Windows needs a signed driver Arcen does not yet ship; see [Where help is wanted](#where-help-is-wanted). |
 | **Keyboard and pointer** | Absolute and relative motion, scroll, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. |
-| **Pen and tablet** | Pressure and tilt, as real pen events rather than mouse clicks. Linux and Windows hosts both. |
+| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
 | **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
 | **Reconnection** | A dropped connection resumes the same session for up to two hours. The Deck reattaches with a signed grant instead of asking for the password again. |
 | **Deskside privacy** | Off by default. When enabled, the physical screen is blanked and its keyboard and mouse are disabled for the duration of a remote session, so nobody standing at the machine can watch or interfere. Input and display are locked together — you cannot get one without the other. |
-
-A graphics tablet has **three modes**, chosen per connection. The choice is
-really about the network, because it decides where the pen is interpreted:
-
-- **Tablet support** — the default, and what you want over Wi-Fi, 5G, or any
-  distance. This Mac's own Wacom driver reads the pen and Arcen sends finished
-  pen events to the host, so no pen sample waits for a reply and the host needs
-  no Wacom driver at all. Pressure, tilt, rotation, eraser, proximity and barrel
-  buttons all work. Finger touch and the tablet's own buttons stay on the Mac,
-  and the tablet keeps working in Mac applications while you are connected.
-- **Native tablet (USB bridged)** — for a LAN. As close to plugging the tablet
-  into the host as a network allows: a privileged Arcen helper takes the device
-  away from macOS and forwards its raw USB traffic, and the host's own Wacom
-  driver claims it as if it were plugged in there. Arcen never interprets the
-  pen, so the whole device works — including finger touch and the tablet's own
-  buttons. In exchange, every pen sample makes a full round trip, so this is not
-  a WAN mode, and Mac applications cannot use the tablet until you disconnect.
-- **Mouse compatibility only** — no tablet redirection. The pen behaves as a
-  mouse, with no pressure, tilt, eraser or proximity.
 
 Native tablet needs a host that can present the tablet on a virtual USB
 controller so the host's own driver can claim it. **Linux hosts can. Windows
@@ -73,9 +62,9 @@ planned rather than abandoned; see
 [Where help is wanted](#where-help-is-wanted). Tablet support is unaffected on
 Windows and needs nothing installed there.
 
-On macOS the privileged part is a small root daemon registered through
-`SMAppService`, not the Deck: Arcen Deck itself never runs as root. Installing
-it is one approval in Login Items. See
+On macOS the privileged part of Native tablet is a small root daemon registered
+through `SMAppService`, not the Deck: Arcen Deck itself never runs as root.
+Installing it is one approval in Login Items. See
 [ADR 0011](docs/adr/0011-macos-privileged-usb-helper.md).
 
 Keyboard, pointer and scroll are synthesised on both hosts: they arrive as
@@ -628,3 +617,8 @@ Development continues while it stays interesting and the tooling bill gets paid.
 **[Buy me a coffee](https://wise.com/pay/me/andreasmartina)**
 
 Optional. It buys no support, no priority, and no influence.
+
+And if Arcen helped make something my kids might actually watch — a name in the
+tech credits of a children's film would mean more than the coffee. **Andreas
+Aanerud.** Entirely optional too, and just as free of obligation, but it would
+be a nice thing to point at over breakfast.
