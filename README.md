@@ -169,17 +169,37 @@ lower-fidelity plan and says so, rather than pretending.
 **How frames leave the host.** Capture is a different stack on each platform,
 and neither is a screenshot loop.
 
-On **Linux** it is **NvFBC → CUDA → NVENC**. The frame never leaves the GPU:
-NvFBC captures straight into a CUDA buffer that NVENC encodes in place, with no
-readback to system memory. NvFBC's own `bIsNewFrame` drives the idle cadence, so
-a still desktop stops producing work instead of re-encoding identical frames. A
-machine with no NVIDIA GPU takes a separate path entirely — X11 capture into
-OpenH264 software encode, not NvFBC with a different encoder bolted on.
+On **Linux** it is **NvFBC → CUDA → NVENC**. At 8-bit the frame never leaves the
+GPU: NvFBC captures straight into a CUDA buffer that NVENC encodes in place,
+with no readback to system memory. **10-bit surfaces are the exception** — they
+currently copy device to host, convert, and copy back, which is
+[worth fixing](#where-help-is-wanted). NvFBC's own `bIsNewFrame` drives the idle
+cadence, so a still desktop stops producing work instead of re-encoding
+identical frames. A machine with no NVIDIA GPU takes a separate path entirely —
+X11 capture into OpenH264 software encode, not NvFBC with a different encoder
+bolted on.
 
 On **Windows** there is no NvFBC. It is **DXGI Desktop Duplication → D3D11 →
 NVENC**, with **Windows Graphics Capture** as the fallback. WGC is also required
 when the host draws the cursor, because Desktop Duplication delivers the cursor
 as separate metadata rather than composited into the image.
+
+Unlike Linux, the Windows path is **not** zero-copy, and that is a deliberate
+trade for colour. The captured texture is copied to a CPU-readable staging
+texture, mapped, converted on the CPU, and written into an NVENC system-memory
+input buffer rather than handed over as a registered GPU-only texture. A
+registered texture would avoid the round trip but takes whatever format the
+driver offers; Arcen needs to choose the pixel format and colour space itself to
+deliver 4:4:4, 10-bit and a specific matrix and range. Doing that conversion on
+the GPU needs a compute shader, which is
+[where help is wanted](#where-help-is-wanted).
+
+Two things keep the cost down. The copy is split from the conversion, so Desktop
+Duplication is held for about a millisecond instead of the whole frame and DXGI
+can accumulate the next one meanwhile. And encode is double-buffered: frame N is
+submitted before frame N−1's bitstream is locked, because that lock is the GPU
+sync point. Doing both synchronously caps out around 45–60 fps at 4K; the
+overlap is what sustains 4K60.
 
 Desktop Duplication is *probed* rather than trusted. On a headless vGPU it will
 open successfully and even hand back cursor-only metadata while no desktop ever
