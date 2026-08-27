@@ -19,7 +19,7 @@ Read this before you invest time.
 |---|---|
 | **Linux Pier** (host) | Works. NVENC hardware encoding up to HEVC 4:4:4 10-bit, or software encoding on a machine with no GPU. |
 | **Windows Pier** (host) | Works. Same range: NVENC up to HEVC 4:4:4 10-bit, or software encoding. |
-| **macOS Deck** (client) | Works. Signed and notarised. |
+| **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox **hardware decode** for H.264 and HEVC, including the 4:4:4 10-bit the hosts encode. AV1 decode needs Apple silicon M3 or later — there is no software AV1 fallback, so AV1 is only negotiated on a Mac that can decode it. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
 | **macOS Pier** | Does not exist. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
@@ -35,7 +35,7 @@ Every claim above was tested on real hardware, not merely compiled:
 
 | | |
 |---|---|
-| **Video** | H.264, HEVC and AV1 on NVENC, up to HEVC 4:4:4 10-bit full range. OpenH264 in software where there is no GPU. |
+| **Video** | H.264, HEVC and AV1 on NVENC, up to HEVC 4:4:4 10-bit full range. OpenH264 in software where there is no GPU. The Deck decodes in hardware through VideoToolbox, so an ordinary session is GPU-to-GPU end to end: neither side burns a core on video. |
 | **Multiple monitors** | Up to four, negotiated as one topology. The Deck can match the host's layout to its own windows. |
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. |
 | **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Opt-in every launch — consent is deliberately never restored from settings — and the operator must enable it on the host too. Windows needs a signed driver Arcen does not yet ship; see [Where help is wanted](#where-help-is-wanted). |
