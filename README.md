@@ -36,11 +36,6 @@ compiled:
   encode, 1266 frames, still hardware-decoded on the Mac.
 - All three Piers are Active Directory-joined, so the credential crossing the
   wire is a domain credential, not a local account.
-- Resolutions exercised: 1920×1080, 2560×1440 and 2560×1600, plus arbitrary
-  client-matched sizes, since the Pier retargets the host to the Deck's exact
-  resolution rather than scaling. **4K is not a tested claim** — the encoder
-  self-test measures stage-and-encode at 4K against a 6 ms budget, but no
-  sustained live 4K desktop session has been run.
 - Test suites at this release: 957 macOS Deck, 716 Linux Pier, 679 Windows
   Pier, 694 shared-crate.
 
@@ -170,54 +165,6 @@ itself, so the encryption is part of the transport rather than bolted on.
 quality it wants. The Pier decides, because only the Pier knows which encoder
 its GPU actually has. If the GPU cannot do what you asked, the Pier serves a
 lower-fidelity plan and says so, rather than pretending.
-
-**How frames leave the host.** Capture is a different stack on each platform,
-and neither is a screenshot loop.
-
-On **Linux** it is **NvFBC → CUDA → NVENC**. At 8-bit the frame never leaves the
-GPU: NvFBC captures straight into a CUDA buffer that NVENC encodes in place,
-with no readback to system memory. **10-bit surfaces are the exception** — they
-currently copy device to host, convert, and copy back, which is
-[worth fixing](#where-help-is-wanted). NvFBC's own `bIsNewFrame` drives the idle
-cadence, so a still desktop stops producing work instead of re-encoding
-identical frames. A machine with no NVIDIA GPU takes a separate path entirely —
-X11 capture into OpenH264 software encode, not NvFBC with a different encoder
-bolted on.
-
-Worth stating plainly, because it is easy to assume otherwise: **10-bit here is
-a 10-bit encode of an 8-bit capture.** NvFBC hands over 8-bit BGRA and the X
-framebuffer is 8-bit, so nothing recovers precision the source never had. What
-10-bit does buy is real, though: the RGB-to-YUV matrix and any range or matrix
-conversion do not round-trip cleanly in 8 bits, so doing that arithmetic into
-10-bit avoids the banding an 8-bit intermediate introduces, and gives the encoder
-headroom. The same is true on Windows.
-
-On **Windows** there is no NvFBC. It is **DXGI Desktop Duplication → D3D11 →
-NVENC**, with **Windows Graphics Capture** as the fallback. WGC is also required
-when the host draws the cursor, because Desktop Duplication delivers the cursor
-as separate metadata rather than composited into the image.
-
-Unlike Linux, the Windows path is **not** zero-copy, and that is a deliberate
-trade for colour. The captured texture is copied to a CPU-readable staging
-texture, mapped, converted on the CPU, and written into an NVENC system-memory
-input buffer rather than handed over as a registered GPU-only texture. A
-registered texture would avoid the round trip but takes whatever format the
-driver offers; Arcen needs to choose the pixel format and colour space itself to
-deliver 4:4:4, 10-bit and a specific matrix and range. Doing that conversion on
-the GPU needs a compute shader, which is
-[where help is wanted](#where-help-is-wanted).
-
-Two things keep the cost down. The copy is split from the conversion, so Desktop
-Duplication is held for about a millisecond instead of the whole frame and DXGI
-can accumulate the next one meanwhile. And encode is double-buffered: frame N is
-submitted before frame N−1's bitstream is locked, because that lock is the GPU
-sync point. Doing both synchronously caps out around 45–60 fps at 4K; the
-overlap is what sustains 4K60.
-
-Desktop Duplication is *probed* rather than trusted. On a headless vGPU it will
-open successfully and even hand back cursor-only metadata while no desktop ever
-presents, so Arcen watches for real pixels before accepting it and falls back to
-WGC otherwise. Either backend can be forced if you need to pin one.
 
 **Codec choice follows the hardware — at both ends.** The Pier can only send
 what the Deck can actually decode, so the Deck measures its own capability at
