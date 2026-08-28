@@ -143,6 +143,16 @@ if [[ -e "$staging/dist" ]]; then
     }
 fi
 
+# Tracked but never published. `docs/internal/` is the one place a document can
+# be versioned and reviewed without being exported: `*.private.md` is gitignored
+# and so survives on exactly one machine, and the guards below only fail on
+# paths that must never be tracked at all. Strip it, then prove the strip
+# worked, because a silent no-op here publishes the thing it was meant to hold
+# back.
+rm -rf "$staging/docs/internal"
+[[ ! -e "$staging/docs/internal" ]] ||
+    fail "docs/internal survived the export strip"
+
 if find "$staging" -name '*.private.md' -print -quit | grep -q .; then
     fail "a *.private.md file reached the export staging directory"
 fi

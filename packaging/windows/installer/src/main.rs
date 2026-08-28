@@ -208,6 +208,55 @@ mod imp {
     fn install(opts: &Options) -> Result<(), String> {
         println!("install prefix: {}", opts.prefix.display());
         println!("programdata: {}", opts.programdata.display());
+        // Windows will not let anyone replace a running executable, so an
+        // upgrade must stop the service first. Refusing and telling the
+        // operator to do it by hand made every upgrade fail for anyone who did
+        // not already know the service name — and this installer is aimed at
+        // people who do not run services for a living. Stop it here, once, and
+        // put it back at the end exactly as it was found.
+        //
+        // Deliberately before the first `create_dir`: the guard that produced
+        // "refusing to replace ... without stopping it first" fires deep inside
+        // the file writes, after directories and ACLs have already been
+        // changed, which left a half-configured machine behind every time.
+        let restart_service = if opts.dry_run {
+            let running = service_running(&opts.service_name).unwrap_or(false);
+            if running {
+                println!(
+                    "dry-run: stop service {} for the upgrade, then start it again",
+                    opts.service_name
+                );
+            }
+            false
+        } else if service_running(&opts.service_name)? {
+            println!(
+                "service {} is running; stopping it to replace the installed files",
+                opts.service_name
+            );
+            println!("any connected session will be disconnected");
+            stop_service_and_wait(opts)?;
+            true
+        } else {
+            false
+        };
+        let outcome = install_files(opts);
+        // A successful install starts the service itself, at the end of
+        // `install_files`. This only has to repair the failure case: leaving a
+        // machine that was serving sessions with a stopped service, because an
+        // unrelated later step failed, is a worse outcome than the failure.
+        if restart_service && outcome.is_err() {
+            println!(
+                "install failed; restarting service {} as it was found",
+                opts.service_name
+            );
+            if let Err(error) = start_service(opts) {
+                println!("warning: could not restart {}: {error}", opts.service_name);
+            }
+        }
+        outcome
+    }
+
+    fn install_files(opts: &Options) -> Result<(), String> {
         let logs = opts.programdata.join("logs");
         let sessions = logs.join("sessions");
         let runtime = opts.programdata.join("runtime");
@@ -847,10 +896,13 @@ mod imp {
         // before reaching the code that would overwrite the file and repair the
         // ACL. A file that cannot be read is simply not known to be identical,
         // so fall through to the rewrite that was going to happen anyway.
+        //
+        // Identical bytes do not imply an up-to-date ACL. ACL policy can change
+        // between releases, and verifying without applying made an otherwise
+        // repairable upgrade fail on the unchanged Credential Provider DLL.
         if path.exists() && fs::read(path).is_ok_and(|existing| existing == bytes) {
             println!("unchanged: {}", path.display());
-            verify_acl(opts, path, acl_class)?;
-            return Ok(());
+            return apply_acl(opts, path, acl_class);
         }
         if executable && service_running(&opts.service_name)? {
             return Err(format!(
@@ -1155,15 +1207,19 @@ mod imp {
             reset.arg(grant);
         }
         run_or_print(opts, &mut reset)?;
-        if acl_class.secret() {
-            // Belt and braces after the grants are already in place: the file
-            // is readable throughout, so an interruption here is recoverable.
-            run_or_print(
-                opts,
-                Command::new("icacls")
-                    .arg(path)
-                    .args(["/remove:g", "*S-1-5-32-545", "*S-1-5-11"]),
-            )?;
+        let revoked = acl_class.revoked_grants();
+        if !revoked.is_empty() {
+            // `/grant:r` replaces only ACEs for trustees named above. Remove
+            // stale broad trustees after the required grants are in place, so
+            // upgrades remain readable throughout and converge on one exact
+            // ACL. This repairs paths that moved between the original manual
+            // AU grant and the first binary installer's BU grant.
+            let mut remove = Command::new("icacls");
+            remove.arg(path).arg("/remove:g");
+            for trustee in revoked {
+                remove.arg(trustee);
+            }
+            run_or_print(opts, &mut remove)?;
         }
         verify_acl(opts, path, acl_class)
     }

@@ -24,9 +24,9 @@ pub(crate) const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
 pub(crate) const SID_USERS: &str = "S-1-5-32-545";
 pub(crate) const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 
-const PUBLIC_DIR_SDDL: &str = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+const PUBLIC_DIR_SDDL: &str = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;AU)";
 const SECRET_DIR_SDDL: &str = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-const PUBLIC_FILE_SDDL: &str = "O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+const PUBLIC_FILE_SDDL: &str = "O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;AU)";
 const SECRET_FILE_SDDL: &str = "O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)";
 /// Writable by the per-session agent, which runs under the signed-in user's
 /// token and is not elevated. `0x1301bf` is the Modify right set.
@@ -63,7 +63,7 @@ impl AclClass {
             Self::PublicDirectory => &[
                 "*S-1-5-18:(OI)(CI)(F)",
                 "*S-1-5-32-544:(OI)(CI)(F)",
-                "*S-1-5-32-545:(OI)(CI)(RX)",
+                "*S-1-5-11:(OI)(CI)(RX)",
             ],
             Self::SecretDirectory => &["*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)"],
             Self::AgentWritableDirectory => &[
@@ -71,8 +71,24 @@ impl AclClass {
                 "*S-1-5-32-544:(OI)(CI)(F)",
                 "*S-1-5-11:(OI)(CI)(M)",
             ],
-            Self::PublicFile => &["*S-1-5-18:(F)", "*S-1-5-32-544:(F)", "*S-1-5-32-545:(RX)"],
+            Self::PublicFile => &["*S-1-5-18:(F)", "*S-1-5-32-544:(F)", "*S-1-5-11:(RX)"],
             Self::SecretFile => &["*S-1-5-18:(F)", "*S-1-5-32-544:(F)"],
+        }
+    }
+
+    /// Broad trustees that an existing ACL may carry but this class forbids.
+    ///
+    /// `icacls /grant:r` replaces ACEs only for trustees named in that command;
+    /// it does not remove an explicit ACE for a different trustee. The first
+    /// binary installer used BUILTIN\Users for public paths while the earlier
+    /// manual install used Authenticated Users, so moving between those paths
+    /// otherwise leaves both ACEs behind and makes strict verification fail.
+    pub(crate) const fn revoked_grants(self) -> &'static [&'static str] {
+        match self {
+            Self::SecretDirectory | Self::SecretFile => &["*S-1-5-32-545", "*S-1-5-11"],
+            Self::PublicDirectory | Self::AgentWritableDirectory | Self::PublicFile => {
+                &["*S-1-5-32-545"]
+            }
         }
     }
 
@@ -82,10 +98,10 @@ impl AclClass {
             SID_SYSTEM.to_string(),
             SID_ADMINISTRATORS.to_string(),
         ]);
-        if matches!(self, Self::PublicDirectory | Self::PublicFile) {
-            sids.insert(SID_USERS.to_string());
-        }
-        if matches!(self, Self::AgentWritableDirectory) {
+        if matches!(
+            self,
+            Self::PublicDirectory | Self::AgentWritableDirectory | Self::PublicFile
+        ) {
             sids.insert(SID_AUTHENTICATED_USERS.to_string());
         }
         sids
@@ -99,10 +115,6 @@ impl AclClass {
             Self::PublicFile => "public file",
             Self::SecretFile => "secret file",
         }
-    }
-
-    pub(crate) const fn secret(self) -> bool {
-        matches!(self, Self::SecretDirectory | Self::SecretFile)
     }
 }
 
@@ -318,6 +330,79 @@ mod tests {
                 "{class:?} grants a different trustee set than it verifies"
             );
         }
+    }
+
+    #[test]
+    fn revocations_remove_only_trustees_the_class_forbids() {
+        for class in ALL_ACL_CLASSES {
+            let expected = class.expected_sids();
+            for revoked in class.revoked_grants() {
+                let sid = revoked.trim_start_matches('*');
+                assert!(
+                    !expected.contains(sid),
+                    "{class:?} revokes required trustee {sid}"
+                );
+            }
+        }
+    }
+
+    /// The manual install predates the binary and grants Authenticated Users
+    /// read/execute on the program tree. Keep the two paths on the same SID so
+    /// an operator can move between them without accumulating a second ACE.
+    #[test]
+    fn public_acl_matches_the_documented_manual_install() {
+        const MANUAL_INSTALL_DOC: &str = include_str!("../../../../hosts/windows/INSTALL.md");
+        let authenticated_users = format!("'*{SID_AUTHENTICATED_USERS}:(OI)(CI)RX'");
+        let builtin_users = format!("'*{SID_USERS}:(OI)(CI)RX'");
+
+        assert!(
+            MANUAL_INSTALL_DOC.contains(&authenticated_users),
+            "hosts/windows/INSTALL.md and the binary installer must grant the same public trustee"
+        );
+        assert!(
+            !MANUAL_INSTALL_DOC.contains(&builtin_users),
+            "the manual install still grants the legacy public trustee"
+        );
+        assert!(
+            AclClass::PublicDirectory
+                .expected_sids()
+                .contains(SID_AUTHENTICATED_USERS),
+            "the binary install must match the documented public trustee"
+        );
+        assert!(
+            AclClass::PublicDirectory
+                .revoked_grants()
+                .contains(&"*S-1-5-32-545"),
+            "upgrades from the shipped BUILTIN\\Users ACL must remove its stale ACE"
+        );
+    }
+
+    /// Captured from the failed 0.9.8 reinstall: the old manual AU entry
+    /// survived while `/grant:r` added BU. The fixed installer converges on AU
+    /// and removes BU instead of accepting the widened descriptor.
+    #[test]
+    fn mixed_public_acl_from_failed_reinstall_is_rejected() {
+        let captured = "O:BAG:S-1-5-21-1000000001-1000000002-1000000003-513D:PAI\
+                        (A;OICI;0x1200a9;;;AU)(A;OICI;FA;;;SY)\
+                        (A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        assert!(
+            assert_acl_sddl(
+                r"C:\Program Files\Arcen\Pier",
+                captured,
+                AclClass::PublicDirectory
+            )
+            .is_err(),
+            "a public directory carrying both old and new trustees must not pass"
+        );
+        assert!(
+            assert_acl_sddl(
+                r"C:\Program Files\Arcen\Pier",
+                &sddl("(A;OICI;0x1200a9;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+                AclClass::PublicDirectory
+            )
+            .is_ok(),
+            "removing the legacy BUILTIN\\Users ACE must produce the canonical ACL"
+        );
     }
 
     #[test]
