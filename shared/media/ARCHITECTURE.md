@@ -254,6 +254,34 @@ platform-free, and free of native handles. Wire messages, chunking, and
 reassembly remain in `arcen-protocol`; AppKit, Win32, and X11 ownership remains
 in product adapters.
 
+## Video source and colour contracts
+
+`arcen-media` is the shared boundary between native capture and native encode.
+It does not choose WGC, DDA, NvFBC, XShm, CUDA, NVENC, VideoToolbox, or Metal.
+It receives an explicitly typed source and owns the portable conversion and
+truth that every platform must use.
+
+| Source representation | Shared conversion |
+| --- | --- |
+| 8-bit BGRA | BGRA → NV12/I420/I444 for the negotiated matrix, range, and depth |
+| Packed depth-30 RGB | Visual-mask-derived RGB10 → P010 or planar I444 P16 |
+| FP16 linear scRGB, SDR contract | Clamp to SDR reference range → BT.709/sRGB OETF → planar I444 P16 |
+| FP16 linear scRGB, HDR contract | Target-primary conversion → absolute ST 2084 PQ using 80-nit scRGB reference white → planar I444 P16 |
+
+These functions are intentionally separate. A wider destination buffer is not
+evidence of a wider source, and a ten-bit BT.709 stream is not HDR.
+`VideoConfiguration` carries codec, chroma, depth, range, matrix, primaries,
+and transfer as independent axes. `PlanDegradation` records every changed axis
+plus fps, geometry, and cursor authority so platform adapters cannot hide a
+fallback.
+
+The production Deck's Auto/Speed/Grading/HDR choices resolve to complete
+configurations before capture starts. Hosts then choose only a native provider
+that can truthfully supply that configuration. Linux Xorg may change an HDR
+request to Grading; a proven future Wayland provider may retain PQ. Windows
+retains PQ only after exact-target HDR proof. Those platform decisions consume
+the shared contract rather than redefining it.
+
 ## Video plan and portable software H.264
 
 `video::{frame,convert,plan}` provides checked NV12/I420 views, allocation-free

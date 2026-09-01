@@ -56,6 +56,14 @@ pub struct DisplayRequest {
     pub scale: f32,
     pub product_id: u16,
     pub serial: u32,
+    /// Advertise HDR10 in the synthesised EDID.
+    ///
+    /// The first link of the chain, and the only one Arcen controls: Windows
+    /// offers Advanced Color only where the sink claims it, composites in FP16
+    /// scRGB only where Advanced Color is on, and a wide capture format
+    /// carries information only where DWM composited wide. Without this the
+    /// whole HDR path runs correctly over an 8-bit desktop.
+    pub hdr10: bool,
 }
 
 impl DisplayRequest {
@@ -68,6 +76,11 @@ impl DisplayRequest {
             scale: 1.0,
             product_id: 0x0001,
             serial: 0,
+            // SDR unless a session asks for HDR. An EDID claiming HDR10 on a
+            // host that never streams it would make Windows offer Advanced
+            // Color for nothing, and change how every ordinary desktop is
+            // composited.
+            hdr10: false,
         })
     }
 }
@@ -878,7 +891,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         result
     }
 
-    fn restore(&mut self) -> Result<(), String> {
+    pub(super) fn restore(&mut self) -> Result<(), String> {
         if self.snapshot.is_none() {
             return Ok(());
         }
@@ -1321,6 +1334,8 @@ impl DisplayManager {
         );
         Ok(DisplayLease {
             inner,
+            #[cfg(windows)]
+            headless: None,
             _permit: permit,
         })
     }
@@ -1383,8 +1398,7 @@ impl DisplayManager {
     pub fn prepare_nvidia_headless_multi(
         &self,
         adapter_name: &str,
-        target_count: usize,
-        provisioning_scale: arcen_media::Scale120,
+        contracts: Vec<crate::nvapi_headless::HeadlessDisplayContract>,
         session_log_id: arcen_telemetry::CorrelationId,
     ) -> Result<HeadlessPlanningLease, String> {
         let dpi_awareness = crate::input::initialize_process_dpi_awareness();
@@ -1402,22 +1416,18 @@ impl DisplayManager {
         #[cfg(windows)]
         let preparation = windows_backend::provision_nvidia_headless_outputs(
             adapter_name,
-            target_count,
-            provisioning_scale,
+            &contracts,
             &session_log_id,
         )?;
         #[cfg(not(windows))]
         let preparation = {
-            let _ = (
-                adapter_name,
-                target_count,
-                provisioning_scale,
-                session_log_id,
-            );
+            let _ = (adapter_name, contracts, session_log_id);
             return Err("NVIDIA headless provisioning is only available on Windows".to_string());
         };
         Ok(HeadlessPlanningLease {
             preparation,
+            adapter_name: adapter_name.to_string(),
+            restore_state: Arc::clone(&self.restore_state),
             _permit: permit,
         })
     }
@@ -1556,6 +1566,8 @@ fn recover_pending_journal(_path: &std::path::Path) -> Result<(), String> {
 
 pub struct DisplayLease {
     inner: DisplayTransaction<NativeBackend>,
+    #[cfg(windows)]
+    headless: Option<windows_backend::HeadlessOutputPreparation>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -1564,10 +1576,82 @@ pub struct HeadlessPlanningLease {
     preparation: Option<windows_backend::HeadlessOutputPreparation>,
     #[cfg(not(windows))]
     preparation: Option<()>,
+    adapter_name: String,
+    restore_state: Arc<Mutex<RestoreJournal>>,
     _permit: OwnedSemaphorePermit,
 }
 
 impl HeadlessPlanningLease {
+    pub fn acquire_single(
+        mut self,
+        selector: OutputSelector,
+        request: DisplayRequest,
+        policy: DisplayPolicy,
+        session_log_id: arcen_telemetry::CorrelationId,
+        deskside: Option<crate::recovery::DesksideRecoveryEntry>,
+    ) -> Result<DisplayLease, String> {
+        #[cfg(windows)]
+        let mut headless = None;
+        let selector = if self.preparation.is_some() {
+            OutputSelector::Adapter {
+                name: self.adapter_name.clone(),
+                // Reconciliation leaves exactly one requested head on this
+                // adapter for the single-display path, so its live DXGI
+                // ordinal is necessarily zero regardless of which stale head
+                // the pre-provision configuration named.
+                output_index: 0,
+            }
+        } else {
+            selector
+        };
+        #[cfg(windows)]
+        if let Some(preparation) = self.preparation.take() {
+            // NVAPI assigns exactly the requested heads, but GRID can leave an
+            // emptied connector as an active CCD path. Isolate the requested
+            // target while the headless recovery journal is still armed, so
+            // Windows Advanced Color and capture both see the same one-display
+            // topology. The normal display transaction below owns in-session
+            // mode changes; the lease retains this pre-provision journal and
+            // restores it after the normal transaction at teardown.
+            let mut isolator =
+                NativeBackend::new(request, session_log_id.clone(), deskside.clone());
+            let target = isolator.select_target(&selector)?;
+            let isolated = isolator.isolate_topology(&target)?;
+            if !isolated.is_isolated_primary_at(request.size) {
+                return Err(format!(
+                    "NVIDIA headless single-display topology did not isolate the requested \
+                     display: mode={} rect={:?} active_outputs={}",
+                    isolated.size, isolated.desktop_rect, isolated.active_outputs
+                ));
+            }
+            headless = Some(preparation);
+            tracing::info!(
+                target: DISPLAY,
+                device = target.device_name,
+                requested = %request.size,
+                "single requested NVIDIA head isolated with pre-session EDID rollback armed"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (&selector, request, policy, &session_log_id, &deskside);
+            return Err("NVIDIA headless provisioning is only available on Windows".to_string());
+        }
+        let inner = DisplayTransaction::acquire_observed(
+            NativeBackend::new(request, session_log_id, deskside),
+            &selector,
+            request.size,
+            policy,
+            Some(Arc::clone(&self.restore_state)),
+        )?;
+        Ok(DisplayLease {
+            inner,
+            #[cfg(windows)]
+            headless,
+            _permit: self._permit,
+        })
+    }
+
     pub fn acquire(
         mut self,
         plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
@@ -1709,7 +1793,23 @@ impl DisplayLease {
     }
 
     pub fn restore(&mut self) -> Result<(), String> {
-        self.inner.restore()?;
+        let display_restore = self.inner.restore();
+        #[cfg(windows)]
+        let headless_restore = self
+            .headless
+            .as_mut()
+            .map_or(Ok(()), windows_backend::HeadlessOutputPreparation::restore);
+        #[cfg(not(windows))]
+        let headless_restore: Result<(), String> = Ok(());
+        match (display_restore, headless_restore) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+            (Err(display_error), Err(headless_error)) => {
+                return Err(format!(
+                    "{display_error}; NVIDIA headless rollback failed: {headless_error}"
+                ));
+            }
+        }
         tracing::info!(
             target: DISPLAY,
             device = %self.inner.report.device_name,
@@ -1735,7 +1835,14 @@ impl DisplayLease {
 
 impl Drop for DisplayLease {
     fn drop(&mut self) {
-        if self.inner.snapshot.is_none() {
+        #[cfg(windows)]
+        let headless_armed = self
+            .headless
+            .as_ref()
+            .is_some_and(windows_backend::HeadlessOutputPreparation::is_armed);
+        #[cfg(not(windows))]
+        let headless_armed = false;
+        if self.inner.snapshot.is_none() && !headless_armed {
             return;
         }
         let restore = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
@@ -1797,6 +1904,24 @@ impl NativeBackend {
             deskside,
             journal_path: crate::recovery::default_path(),
             session_log_id,
+        }
+    }
+
+    fn desired_edid(&self, size: DisplaySize) -> Result<Vec<u8>, String> {
+        let request = crate::edid::EdidRequest {
+            width: size.width,
+            height: size.height,
+            refresh_hz: self.request.refresh_hz.max(1),
+            width_mm: self.request.width_mm,
+            height_mm: self.request.height_mm,
+            scale: self.request.scale,
+            product_id: self.request.product_id,
+            serial: self.request.serial,
+        };
+        if self.request.hdr10 {
+            Ok(crate::edid::generate_hdr10(request)?.to_vec())
+        } else {
+            Ok(crate::edid::generate(request)?.to_vec())
         }
     }
 }
@@ -1932,8 +2057,8 @@ mod windows_backend {
         DisplayScaleReport, DisplaySize, DisplayTarget, ModeState, NativeBackend, OutputSelector,
     };
     use crate::logging::DISPLAY;
+    use crate::nvapi;
     use crate::nvapi::{AdapterLuid, NvapiDriver};
-    use crate::{edid, nvapi};
     use core::future::Future;
     use std::collections::BTreeSet;
     use std::os::windows::process::CommandExt;
@@ -2065,6 +2190,19 @@ mod windows_backend {
     }
 
     impl HeadlessOutputPreparation {
+        pub(super) fn restore(&mut self) -> Result<(), String> {
+            if !self.armed {
+                return Ok(());
+            }
+            restore_from_path(&self.journal_path)?;
+            self.armed = false;
+            Ok(())
+        }
+
+        pub(super) const fn is_armed(&self) -> bool {
+            self.armed
+        }
+
         fn into_parts(
             mut self,
         ) -> (
@@ -2090,15 +2228,13 @@ mod windows_backend {
             if !self.armed {
                 return;
             }
-            if let Err(error) = restore_from_path(&self.journal_path) {
+            if let Err(error) = self.restore() {
                 tracing::error!(
                     target: DISPLAY,
                     %error,
                     journal = %self.journal_path.display(),
                     "NVIDIA headless planning rollback failed; recovery journal remains"
                 );
-            } else {
-                self.armed = false;
             }
         }
     }
@@ -2216,15 +2352,10 @@ mod windows_backend {
 
     pub(super) fn provision_nvidia_headless_outputs(
         adapter_name: &str,
-        target_count: usize,
-        provisioning_scale: arcen_media::Scale120,
+        contracts: &[crate::nvapi_headless::HeadlessDisplayContract],
         session_log_id: &arcen_telemetry::CorrelationId,
     ) -> Result<Option<HeadlessOutputPreparation>, String> {
-        let prepared = crate::nvapi_headless::prepare_provisioning(
-            adapter_name,
-            target_count,
-            provisioning_scale,
-        )?;
+        let prepared = crate::nvapi_headless::prepare_provisioning(adapter_name, contracts)?;
         if prepared.is_empty() {
             return Ok(None);
         }
@@ -2243,7 +2374,7 @@ mod windows_backend {
         tracing::info!(
             target: DISPLAY,
             adapter = adapter_name,
-            requested_outputs = target_count,
+            requested_outputs = contracts.len(),
             changed_edids = entries.len(),
             "NVIDIA headless outputs provisioned before topology planning"
         );
@@ -2386,12 +2517,18 @@ mod windows_backend {
                 headless_entries,
                 applied_dpi_scales: Vec::new(),
             };
-            if let Err(error) = binding.prepare_exact_modes(&plan).and_then(|()| {
-                if binding.apply_headless_nvapi_topology(&plan)? {
-                    Ok(())
-                } else {
-                    binding.apply(&plan)
-                }
+            let prepare_modes = if binding.headless_entries.is_empty() {
+                binding.prepare_exact_modes(&plan)
+            } else {
+                // Headless provisioning already wrote the final per-monitor
+                // EDIDs before topology planning. Re-running apply_exact here
+                // used to replace them with an SDR EDID and custom timing,
+                // which dropped Windows Advanced Color during the session.
+                Ok(())
+            };
+            if let Err(error) = prepare_modes.and_then(|()| {
+                binding.apply_headless_nvapi_topology(&plan)?;
+                binding.apply(&plan)
             }) {
                 return Err(arcen_outputs::BindFailure {
                     source: error,
@@ -2735,10 +2872,9 @@ mod windows_backend {
                         self.nvapi_driver = Some(driver);
                         let cleanup = self.restore_nvapi_modes();
                         return Err(match cleanup {
-                            Ok(()) => format!(
-                                "refresh exact mode for {}: {error}",
-                                monitor.device_name
-                            ),
+                            Ok(()) => {
+                                format!("refresh exact mode for {}: {error}", monitor.device_name)
+                            }
                             Err(cleanup_error) => format!(
                                 "refresh exact mode for {}: {error}; cleanup failed: {cleanup_error}",
                                 monitor.device_name
@@ -3892,16 +4028,17 @@ mod windows_backend {
             ) {
                 return Ok(false);
             }
-            let desired = edid::generate(edid::EdidRequest {
-                width: size.width,
-                height: size.height,
-                refresh_hz: self.request.refresh_hz.max(1),
-                width_mm: self.request.width_mm,
-                height_mm: self.request.height_mm,
-                scale: self.request.scale,
-                product_id: self.request.product_id,
-                serial: self.request.serial,
-            })?;
+            let desired = self.desired_edid(size)?;
+            // The link in the HDR chain that Arcen controls, recorded where it
+            // is made. Windows offers Advanced Color only where the sink
+            // claims HDR10, so an EDID that did not go on explains every
+            // downstream measurement that comes back SDR.
+            tracing::debug!(
+                target: DISPLAY,
+                hdr10 = self.request.hdr10,
+                edid_bytes = desired.len(),
+                "synthesised display EDID"
+            );
             let current = self
                 .nvapi_snapshot
                 .as_ref()
@@ -4002,16 +4139,7 @@ mod windows_backend {
                 self.nvapi.is_some(),
                 self.nvapi_snapshot.is_some(),
             ) {
-                edid::generate(edid::EdidRequest {
-                    width: size.width,
-                    height: size.height,
-                    refresh_hz: self.request.refresh_hz.max(1),
-                    width_mm: self.request.width_mm,
-                    height_mm: self.request.height_mm,
-                    scale: self.request.scale,
-                    product_id: self.request.product_id,
-                    serial: self.request.serial,
-                })?;
+                self.desired_edid(size)?;
                 self.pending_nvapi = true;
                 return Ok(());
             }
@@ -4057,16 +4185,7 @@ mod windows_backend {
             }
             if self.pending_nvapi {
                 self.pending_nvapi = false;
-                let edid = edid::generate(edid::EdidRequest {
-                    width: size.width,
-                    height: size.height,
-                    refresh_hz: self.request.refresh_hz.max(1),
-                    width_mm: self.request.width_mm,
-                    height_mm: self.request.height_mm,
-                    scale: self.request.scale,
-                    product_id: self.request.product_id,
-                    serial: self.request.serial,
-                })?;
+                let edid = self.desired_edid(size)?;
                 let snapshot = self
                     .nvapi_snapshot
                     .as_ref()
@@ -7708,8 +7827,23 @@ mod tests {
         // asked for and did not get.
         const REQUESTED_SCALE_PERCENT: u16 = 200;
         let requested_scale = arcen_media::Scale120::new(240).expect("scale");
+        let contracts = (0..3)
+            .map(|index| crate::nvapi_headless::HeadlessDisplayContract {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 60,
+                width_mm: 0.0,
+                height_mm: 0.0,
+                scale: requested_scale,
+                product_id: 0x0001,
+                serial: index,
+                hdr10: false,
+                primary: index == 0,
+                preferred_output_index: None,
+            })
+            .collect();
         let planning = manager
-            .prepare_nvidia_headless_multi(ADAPTER, 3, requested_scale, owner.clone())
+            .prepare_nvidia_headless_multi(ADAPTER, contracts, owner.clone())
             .expect("provision three V100 outputs");
         let inventory =
             crate::gpu_probe::physical_output_inventory(&[ADAPTER.to_string()]).expect("expanded");

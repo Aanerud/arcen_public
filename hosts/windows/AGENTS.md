@@ -16,6 +16,26 @@ Runtime settings live in `%ProgramData%\Arcen\pier.json`; its common schema is
 identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
 `platform`.
 
+## Capture and HDR pipeline boundaries
+
+- Auto/Speed are the eight-bit path: probe DDA for real desktop images and
+  otherwise use WGC BGRA8. Host cursor authority requires WGC.
+- Every ten-bit contract requires a concrete WGC
+  `R16G16B16A16Float` scRGB pool. Never fall back to BGRA8 and keep claiming a
+  ten-bit stream.
+- Grading and HDR are separate conversions over that FP16 source. Grading
+  clamps to SDR reference range and applies BT.709/sRGB; HDR converts linear
+  scRGB to absolute BT.2020/PQ using 80-nit Windows reference white.
+- HDR additionally requires the final HDR EDID/topology, Windows 11
+  `activeColorMode=HDR`, and DXGI
+  `RGB_FULL_G2084_NONE_P2020` on the exact session-bound display target.
+  Never count or mutate unrelated active outputs.
+- Keep pre-provision NVIDIA EDID recovery armed for the complete display lease
+  and restore it after normal attachment teardown. A remote request must not
+  leave persistent display identity or HDR state behind.
+- On disconnect, atomically close and discard outbound video queues before
+  joining the writer so buffered frames cannot consume the reconnect window.
+
 Escalate shared API or protocol changes to Shared/Architecture; authentication,
 privilege, GPU, signing, packaging, and release changes to Release/Security.
 

@@ -4,6 +4,64 @@ All notable changes to Arcen are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Arcen uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.0] — 2026-09-01
+
+### Streaming presets and pipeline separation
+
+- Replaced independent performance/colour controls with four complete product
+  presets: **Auto**, **Speed**, **Grading**, and **HDR**.
+- Kept the fast 8-bit and fidelity pipelines separate. Auto/Speed do not pay
+  the host-copy or conversion cost required by Grading/HDR.
+- Extended negotiated session truth with primaries and transfer degradation so
+  the Deck can distinguish ten-bit SDR from real HDR and show every fallback.
+
+### Windows
+
+- Added a genuine ten-bit Grading source: WGC
+  `R16G16B16A16Float` scRGB converted to full-range BT.709 I444 P16 before
+  NVENC. FP16 refusal fails closed instead of repacking BGRA8 as ten-bit.
+- Added end-to-end HDR: session-scoped NVIDIA HDR EDIDs, exact topology,
+  Windows 11 distinct HDR state, DXGI PQ/BT.2020 verification, WGC FP16
+  capture, linear-primary conversion, 80-nit-reference absolute ST 2084, and
+  HEVC 4:4:4 10-bit output.
+- Scoped HDR state changes to the exact session display targets and kept the
+  pre-provision EDID recovery journal armed through lease teardown.
+- Fixed forced-loss resume by atomically discarding buffered video before the
+  writer is joined; credential-free reconnect now retains the desktop and
+  returns to healthy media.
+- Fixed Windows installer public ACL convergence on localized or previously
+  installed systems.
+
+### Linux
+
+- Preserved NvFBC → CUDA → NVENC as the device-to-device 8-bit path.
+- Added a separate depth-30 Xorg/MIT-SHM pipeline for genuine RGB10 capture,
+  mask-derived `XBGR2101010` handling, shared P16 conversion, and one CUDA
+  upload before NVENC.
+- Made Xorg HDR requests resolve truthfully to Grading BT.709 SDR. Real Linux
+  HDR remains gated on a future color-managed Wayland provider.
+- Degraded host cursor authority to the Deck-local cursor only for the XShm
+  wide path; NvFBC host cursor behavior is unchanged.
+
+### macOS Deck
+
+- Added native VideoToolbox `xf44` retention and a dedicated
+  `RGB10A2Unorm` Metal presentation layer for Grading and HDR.
+- Enabled ITU-R BT.2100 PQ, HDR10 metadata, and EDR only when the resolved host
+  transfer is PQ. Normalized PQ output uses Apple's 10,000-nit optical scale.
+- Preserved negotiated BT.709, sRGB, PQ, and HLG transfer metadata through
+  VideoToolbox and made every 8-bit presentation fallback permanently visible.
+
+### Release validation
+
+- Completed Windows and Linux Auto/Speed/Grading/HDR matrices with decoded
+  frames, nonzero audio, keyboard/pointer input, cursor authority, display
+  restore, and forced-loss credential-free resume.
+- Rebuilt the Linux and Windows single-file installers and the Developer ID
+  signed, notarized, stapled macOS Deck.
+
 ## [0.9.8] — 2026-08-25
 
 **The first public release.** Arcen was developed privately and is published
@@ -153,4 +211,5 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
+[0.10.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.10.0
 [0.9.8]: https://github.com/Aanerud/arcen_public/releases/tag/v0.9.8

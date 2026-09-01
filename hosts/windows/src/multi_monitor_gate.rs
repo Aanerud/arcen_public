@@ -1595,6 +1595,8 @@ mod tests {
             bit_depth: arcen_media::BitDepth::Eight,
             color_range: arcen_media::ColorRange::Limited,
             color_matrix: arcen_media::ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: arcen_media::EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,

@@ -59,7 +59,7 @@ touch macOS at all. A second client is mostly a decoder and a window.
 | --- | --- |
 | `hosts/linux/` | Linux Pier: Xorg session, PAM, capture supervision |
 | `hosts/windows/` | Windows Pier: WTS sessions, credential provider, capture |
-| `hosts/capenc/` | Capture and encode: NvFBC/DXGI/WGC → NVENC |
+| `hosts/capenc/` | Capture and encode: NvFBC/XShm/DXGI/WGC → explicit conversion → NVENC/MF/OpenH264 |
 | `clients/macos/` | macOS Deck: VideoToolbox decode, egui window |
 | `packaging/` | Installers, signing, release metadata |
 
@@ -72,6 +72,22 @@ touch macOS at all. A second client is mostly a decoder and a window.
   a program that only wanted certificate handling; `arcen-media` must not pull
   in a native codec build. CI inspects the dependency tree rather than trusting
   the author.
+
+## Streaming pipeline boundary
+
+Auto, Speed, Grading, and HDR are complete contracts, not independent switches
+applied to one capture loop. Keep their capture providers separate:
+
+| Contract | Linux Pier | Windows Pier | macOS Deck |
+| --- | --- | --- | --- |
+| Auto / Speed, 8-bit | NvFBC → CUDA → NVENC; preserve the device-to-device fast path | DDA after real-frame proof, otherwise WGC BGRA8 | Ordinary SDR decode/presentation |
+| Grading, 10-bit SDR | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC | WGC FP16 scRGB → shared SDR transfer/matrix → NVENC P16 | Native `xf44` → 10-bit Metal, EDR off |
+| HDR | Xorg downgrades to Grading; only a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
+
+Do not widen or refactor the 8-bit fast path to implement a fidelity path.
+Bit depth does not imply HDR. Capture source, transfer, primaries, matrix,
+cursor capability, copy cost, and degradation must remain explicit in the
+resolved plan, READY/hello truth, frame headers, and Deck presentation.
 
 ---
 
@@ -177,7 +193,9 @@ is a good description. Silence is not.
 ## Current state
 
 All three product crates build and pass their tests on their target OS. Linux
-and Windows Piers both reach HEVC 4:4:4 10-bit on NVENC and fall back to
-OpenH264 in software where there is no GPU. A macOS Pier, a Linux Deck and a
-Windows Deck do not exist; the gateway is not shipped. `README.md` is the
-current status in detail.
+provides a separate zero-copy eight-bit NvFBC path and genuine ten-bit XShm SDR
+path; Xorg HDR requests degrade to Grading. Windows provides separate eight-bit,
+FP16 Grading, and verified FP16 HDR paths. The macOS Deck presents ten-bit
+through a dedicated Metal layer and enables EDR only for PQ. A macOS Pier, a
+Linux Deck and a Windows Deck do not exist; the gateway is not shipped.
+`README.md` is the current status in detail.

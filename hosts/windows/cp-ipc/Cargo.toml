@@ -1,6 +1,6 @@
 [package]
 name = "arcen-cp-ipc"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Pure-Rust framing + ephemeral authenticated-encryption contract for the Arcen Credential Provider/broker control pipe. The schema carries no plaintext credential; the only credential message is an X25519+HKDF+AES-256-GCM sealed envelope bound to a per-Advise transcript. Transport (a SYSTEM-only named pipe) is implemented by the platform crates, not here."

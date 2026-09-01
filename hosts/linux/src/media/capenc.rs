@@ -64,6 +64,15 @@ pub fn parse_encoder_selection(value: &str) -> Result<EncoderSelection, String> 
     }
 }
 
+fn apply_capture_cursor_constraint(mut config: CapencConfig) -> (CapencConfig, bool) {
+    let moved_to_local = matches!(config.cursor_mode, CursorMode::Host)
+        && !arcen_capenc::linux_capture_supports_host_cursor(config.bit_depth);
+    if moved_to_local {
+        config.cursor_mode = CursorMode::Local;
+    }
+    (config, moved_to_local)
+}
+
 #[derive(Debug, Error)]
 pub enum CapencStartError {
     #[error("invalid capenc configuration: {0}")]
@@ -98,6 +107,10 @@ pub struct CapencConfig {
     pub color_range: ColorRange,
     /// Resolved matrix coefficients to request.
     pub color_matrix: ColorMatrix,
+    /// Resolved transfer characteristics to encode and signal.
+    pub transfer: TransferCharacteristics,
+    /// Resolved colour primaries to encode and signal.
+    pub color_primaries: ColorPrimaries,
     /// Whether codec fallback is host-ranked performance or an exact/fidelity
     /// request.
     pub video_selection: VideoSelectionIntent,
@@ -159,8 +172,8 @@ impl CapencConfig {
             bit_depth: self.bit_depth,
             range: self.color_range,
             matrix: self.color_matrix,
-            primaries: ColorPrimaries::Bt709,
-            transfer: TransferCharacteristics::Bt709,
+            primaries: self.color_primaries,
+            transfer: self.transfer,
         }
     }
 
@@ -177,6 +190,8 @@ impl CapencConfig {
         self.bit_depth = plan.video.bit_depth;
         self.color_range = plan.video.range;
         self.color_matrix = plan.video.matrix;
+        self.transfer = plan.video.transfer;
+        self.color_primaries = plan.video.primaries;
         self.fps = plan.fps;
         self.encoder = encoder;
         self.intent = intent;
@@ -218,6 +233,18 @@ impl CapencConfig {
             if variant.is_coherent() {
                 v.push(format!("variant={}", variant.id()));
             }
+        }
+        // Transfer and primaries ride as their own tokens because
+        // `variant=<id>` names codec, chroma, depth, range and matrix and has
+        // no room for them. Emitted only when they are not the BT.709 default,
+        // so every session that never asked for HDR produces the argv it
+        // always did -- and the argv assertions that pin those commands stay
+        // valid.
+        if self.transfer != TransferCharacteristics::Bt709 {
+            v.push(format!("transfer={}", self.transfer.token()));
+        }
+        if self.color_primaries != ColorPrimaries::Bt709 {
+            v.push(format!("primaries={}", self.color_primaries.token()));
         }
         // Only when it is not the default: an absent `intent=` already means
         // `Interactive` to `requested_intent`, so emitting it unconditionally
@@ -299,6 +326,34 @@ where
                         },
                     )
                     .map_err(|error| CapencStartError::ReadyProtocol(error.to_string()))?;
+                    // Level 3. Records the path that *ran*, which is not
+                    // knowable from configuration: the Windows DDA -> WGC
+                    // fallback is silent, and on Linux the NvFBC and XShm
+                    // engines are separate binaries' worth of behaviour behind
+                    // one `backend=` token that names only the *encoder*.
+                    //
+                    // `None` means the capenc predates the field, and is
+                    // reported as such rather than guessed.
+                    match arcen_media::video::parse_ready_capture(&line) {
+                        Some(capture) => tracing::debug!(
+                            target: target::CAPENC,
+                            sid = %config.session_log_id,
+                            event = "capture_path_selected",
+                            capture = capture.ready_token(),
+                            zero_copy = capture.zero_copy(),
+                            encoder = plan.backend.ready_token(),
+                            bit_depth = plan.bit_depth_token(),
+                            "capture path selected",
+                        ),
+                        None => tracing::debug!(
+                            target: target::CAPENC,
+                            sid = %config.session_log_id,
+                            event = "capture_path_selected",
+                            capture = "unreported",
+                            encoder = plan.backend.ready_token(),
+                            "capenc did not name its capture path",
+                        ),
+                    }
                     forward_capenc_line(&line);
                     return Ok(plan);
                 }
@@ -681,26 +736,31 @@ pub async fn preflight(config: CapencConfig) -> Result<(), CapencStartError> {
     }
 }
 
-async fn probe_native(config: &CapencConfig) -> Result<Option<String>, CapencStartError> {
-    let mut attempt = config.clone();
+fn native_probe_attempt(config: &CapencConfig) -> CapencConfig {
+    let (mut attempt, _) = apply_capture_cursor_constraint(config.clone());
     attempt.encoder = EncoderRequest::NativeNvenc;
+    attempt
+}
+
+async fn probe_native(config: &CapencConfig) -> Result<Option<String>, CapencStartError> {
+    let attempt = native_probe_attempt(config);
     let mut args = attempt.argv();
     args.push("probe-v1".to_string());
-    let mut command = crate::command_for_helper(&config.binary, "capenc");
+    let mut command = crate::command_for_helper(&attempt.binary, "capenc");
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    configure_child_environment(&mut command, config)?;
+    configure_child_environment(&mut command, &attempt)?;
     let mut child = command.spawn().map_err(CapencStartError::Spawn)?;
     let stderr = child.stderr.take().ok_or_else(|| {
         CapencStartError::InvalidConfig("native probe has no stderr pipe".to_string())
     })?;
     let expected = format!(
         "[capenc] PROBE version=1 backend=native-nvenc available=true sid={}",
-        config.session_log_id
+        attempt.session_log_id
     );
     let outcome = tokio::time::timeout(CAPENC_PROBE_TIMEOUT, async {
         let mut reader = crate::bounded_io::BoundedLineReader::new(BufReader::new(stderr));
@@ -710,7 +770,7 @@ async fn probe_native(config: &CapencConfig) -> Result<Option<String>, CapencSta
             if bounded.truncated {
                 tracing::warn!(
                     target: target::CAPENC,
-                    sid = %config.session_log_id,
+                    sid = %attempt.session_log_id,
                     "capenc native-probe stderr line exceeded the bounded read limit; \
                      excess bytes discarded"
                 );
@@ -858,6 +918,8 @@ fn software_fallback_config(
     config.bit_depth = plan.video.bit_depth;
     config.color_range = plan.video.range;
     config.color_matrix = plan.video.matrix;
+    config.transfer = plan.video.transfer;
+    config.color_primaries = plan.video.primaries;
     config.fps = plan.fps;
     config.cursor_mode = plan.cursor_mode;
     if geometry_unspecified {
@@ -890,6 +952,17 @@ fn software_fallback_preserves_exact_pins(config: &CapencConfig) -> bool {
 async fn spawn_one(
     config: CapencConfig,
 ) -> Result<(CapencSession, ResolvedMediaPlan), CapencStartError> {
+    let (config, cursor_moved_to_local) = apply_capture_cursor_constraint(config);
+    if cursor_moved_to_local {
+        tracing::warn!(
+            target: target::CAPENC,
+            bit_depth = config.bit_depth.token(),
+            requested_cursor = "host",
+            active_cursor = "local",
+            cursor_moved_to_local = true,
+            "Linux wide capture cannot composite the host cursor; using the Deck-local cursor"
+        );
+    }
     config.media_request()?;
     if matches!(
         config.encoder,
@@ -1024,6 +1097,7 @@ fn configure_child_environment(
 pub(crate) fn admission_probe_command(
     config: &CapencConfig,
 ) -> Result<tokio::process::Command, CapencStartError> {
+    let (config, _) = apply_capture_cursor_constraint(config.clone());
     config.media_request()?;
     if matches!(
         config.encoder,
@@ -1035,7 +1109,7 @@ pub(crate) fn admission_probe_command(
     }
     let mut command = crate::command_for_helper(&config.binary, "capenc");
     command.args(config.argv());
-    configure_child_environment(&mut command, config)?;
+    configure_child_environment(&mut command, &config)?;
     Ok(command)
 }
 
@@ -1232,6 +1306,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
@@ -1259,6 +1335,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
@@ -1303,6 +1381,48 @@ mod tests {
                 "variant=hevc-444-8-limited-bt709",
             ]
         );
+    }
+
+    #[test]
+    fn wide_capture_moves_host_cursor_to_local_before_spawn() {
+        let mut cfg = native_config();
+        cfg.bit_depth = BitDepth::Ten;
+        let (resolved, moved) = apply_capture_cursor_constraint(cfg);
+
+        assert!(moved);
+        assert_eq!(resolved.cursor_mode, CursorMode::Local);
+        assert!(
+            resolved
+                .argv()
+                .iter()
+                .any(|argument| argument == "cursor=local"),
+            "the child must receive the degraded cursor mode"
+        );
+    }
+
+    #[test]
+    fn eight_bit_nvfbc_keeps_the_requested_host_cursor() {
+        let cfg = native_config();
+        let (resolved, moved) = apply_capture_cursor_constraint(cfg);
+
+        assert!(!moved);
+        assert_eq!(resolved.cursor_mode, CursorMode::Host);
+    }
+
+    #[test]
+    fn native_probe_applies_the_same_wide_cursor_constraint_as_live_spawn() {
+        let mut wide = native_config();
+        wide.bit_depth = BitDepth::Ten;
+        assert!(native_probe_attempt(&wide)
+            .argv()
+            .iter()
+            .any(|argument| argument == "cursor=local"));
+
+        let eight_bit = native_config();
+        assert!(native_probe_attempt(&eight_bit)
+            .argv()
+            .iter()
+            .any(|argument| argument == "cursor=host"));
     }
 
     /// The intent token is conditional, and the reason matters: a session that

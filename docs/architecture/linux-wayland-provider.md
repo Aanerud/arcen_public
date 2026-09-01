@@ -71,6 +71,34 @@ shared crates or the wire protocol.
 | Native libei adapter | Not implemented |
 | Mutter virtual output | May report detected-but-unimplemented; never implemented |
 
+## HDR provider requirements
+
+Wayland is also the boundary for future Linux desktop HDR. Selecting the Deck's
+HDR preset must not be enough by itself. A native provider may retain PQ/HLG
+only after it proves all of the following for the captured output:
+
+- the compositor reports an active color-managed HDR output/image description;
+- primaries and transfer characteristics are authoritative, not inferred from
+  ten-bit storage;
+- capture negotiates a format that preserves the compositor's HDR values
+  (FP16 or a documented ten-bit format) rather than an 8-bit PipeWire fallback;
+- SDR reference white and mastering/content-light metadata are available where
+  the transfer requires them; and
+- capture, input/EIS, resize, teardown, and reconnect remain bound to the same
+  compositor output generation.
+
+This future provider is a third Linux capture pipeline, not a replacement for
+the two proven Xorg paths. Auto/Speed must continue to use NvFBC where its
+device-to-device advantage is available, and Xorg Grading must continue to use
+depth-30 XShm. Provider selection happens from explicit session/capability
+truth; adding Wayland HDR must not route all sessions through PipeWire or add a
+host copy to the eight-bit fast path.
+
+Until those facts are implemented and measured, dedicated Xorg resolves HDR
+requests to Grading Reference (HEVC 4:4:4 10-bit full-range BT.709). The Deck
+shows matrix/primaries/transfer degradation and remains in SDR presentation
+mode. Depth 30 proves precision, not HDR.
+
 `WaylandRuntimeFacts::from_process_environment` proves only the Wayland session
 marker and Unix socket. It deliberately leaves protocol state unknown because
 file presence or environment variables cannot prove registry, portal, or EIS

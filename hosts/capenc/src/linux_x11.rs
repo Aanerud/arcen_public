@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use arcen_keel::{ActivityHint, BgraFrame, EmitMode, IdleCadence};
 use arcen_media::video::{
-    convert_bgra_to_i420, convert_bgra_to_i420_rows, EncoderBackend, I420Frame, I420FrameMut,
-    ResolvedMediaPlan, SoftwareH264Config, SoftwareH264Encoder,
+    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_packed_rgb10_to_bgra8, EncoderBackend,
+    I420Frame, I420FrameMut, PackedRgb10Layout, ResolvedMediaPlan, SoftwareH264Config,
+    SoftwareH264Encoder,
 };
 use arcen_media::ForcedKeyframe;
 use x11rb::connection::Connection as _;
@@ -21,8 +22,12 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-const MAX_WIDTH: u32 = 1920;
-const MAX_HEIGHT: u32 = 1200;
+const SOFTWARE_MAX_WIDTH: u32 = 1920;
+const SOFTWARE_MAX_HEIGHT: u32 = 1200;
+const WIDE_MAX_WIDTH: u32 = 3840;
+const WIDE_MAX_HEIGHT: u32 = 2160;
+const SOFTWARE_MAX_CAPTURE_BYTES: usize = 1920 * 1200 * 4;
+const WIDE_MAX_CAPTURE_BYTES: usize = 3840 * 2160 * 4;
 const MAX_FPS: u32 = 30;
 const KEEPALIVE: Duration = Duration::from_secs(1);
 /// Bounded recovery keyframe interval for one region's activity scheduler.
@@ -32,7 +37,6 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 const REGION_KEYFRAME_INTERVAL: Duration = Duration::from_secs(10);
 /// How long input/focus activity keeps a region responsive without new pixels.
 const REGION_INPUT_WAKE_GRACE: Duration = Duration::from_millis(100);
-const MAX_CAPTURE_BYTES: usize = 1920 * 1200 * 4;
 const RED_MASK: u32 = 0x00ff_0000;
 const GREEN_MASK: u32 = 0x0000_ff00;
 const BLUE_MASK: u32 = 0x0000_00ff;
@@ -64,20 +68,73 @@ struct PixelLayout {
     byte_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePurpose {
+    Software,
+    WideNvenc,
+}
+
+impl CapturePurpose {
+    const fn max_dimensions(self) -> (u32, u32) {
+        match self {
+            Self::Software => (SOFTWARE_MAX_WIDTH, SOFTWARE_MAX_HEIGHT),
+            Self::WideNvenc => (WIDE_MAX_WIDTH, WIDE_MAX_HEIGHT),
+        }
+    }
+
+    const fn max_capture_bytes(self) -> usize {
+        match self {
+            Self::Software => SOFTWARE_MAX_CAPTURE_BYTES,
+            Self::WideNvenc => WIDE_MAX_CAPTURE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X11PixelFormat {
+    Bgrx8,
+    Rgb10(PackedRgb10Layout),
+}
+
+impl X11PixelFormat {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Bgrx8 => "bgrx8",
+            Self::Rgb10(layout) if layout == PackedRgb10Layout::XRGB2101010 => "xrgb2101010",
+            Self::Rgb10(layout) if layout == PackedRgb10Layout::XBGR2101010 => "xbgr2101010",
+            Self::Rgb10(_) => "rgb10-visual-masks",
+        }
+    }
+}
+
 fn checked_layout(
     width: u16,
     height: u16,
     depth: u8,
     bits_per_pixel: u8,
     scanline_pad: u8,
+    max_bytes: usize,
 ) -> Result<PixelLayout, String> {
+    // Depth 24 and depth 30 are both stored as 32 bits per pixel, so the
+    // stride arithmetic is identical and only the interpretation of each word
+    // differs. Depth-30 channel shifts come from the root visual masks.
+    //
+    // Depth 30 is the whole point of the ten-bit Linux path: X11 has no
+    // per-application colour depth, so `XShmGetImage` returns the *screen's*
+    // framebuffer format. A depth-24 server can only ever yield eight bits
+    // per channel, whatever the encoder is asked for. Rejecting depth 30
+    // here -- which this function did until ten-bit capture existed -- meant
+    // that configuring the X server for ten bits made capture fail outright
+    // rather than deliver the extra bits.
     if width == 0
         || height == 0
-        || depth != 24
+        || !matches!(depth, 24 | 30)
         || bits_per_pixel != 32
         || !matches!(scanline_pad, 8 | 16 | 32)
     {
-        return Err("unsupported X11 depth, bits-per-pixel, or scanline padding".to_string());
+        return Err(format!(
+            "unsupported X11 geometry: {width}x{height} depth={depth} bpp={bits_per_pixel} pad={scanline_pad}"
+        ));
     }
     let row_bits = usize::from(width)
         .checked_mul(usize::from(bits_per_pixel))
@@ -92,8 +149,10 @@ fn checked_layout(
     let byte_len = stride
         .checked_mul(usize::from(height))
         .ok_or_else(|| "X11 image length overflow".to_string())?;
-    if byte_len == 0 || byte_len > MAX_CAPTURE_BYTES {
-        return Err("X11 image exceeds the bounded software capture buffer".to_string());
+    if byte_len == 0 || byte_len > max_bytes {
+        return Err(format!(
+            "X11 image needs {byte_len} bytes, above the {max_bytes}-byte capture bound"
+        ));
     }
     Ok(PixelLayout {
         depth,
@@ -171,24 +230,88 @@ enum Transfer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Activity {
+pub(crate) enum Activity {
     None,
     Damage,
     Modeset,
 }
 
-struct X11Capture {
+pub(crate) struct WideX11Frame<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) stride: usize,
+    pub(crate) layout: PackedRgb10Layout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Rgb10PrecisionStats {
+    pub(crate) sampled_components: u64,
+    pub(crate) off_eight_bit_grid: u64,
+    pub(crate) minimum: u16,
+    pub(crate) maximum: u16,
+}
+
+impl WideX11Frame<'_> {
+    pub(crate) fn precision_stats(&self, pixel_step: usize) -> Rgb10PrecisionStats {
+        let pixel_step = pixel_step.max(1);
+        let mut stats = Rgb10PrecisionStats {
+            sampled_components: 0,
+            off_eight_bit_grid: 0,
+            minimum: u16::MAX,
+            maximum: 0,
+        };
+        for row in (0..self.height).step_by(pixel_step) {
+            let source = &self.bytes[row * self.stride..row * self.stride + self.width * 4];
+            for column in (0..self.width).step_by(pixel_step) {
+                let offset = column * 4;
+                let components = self.layout.components(u32::from_le_bytes([
+                    source[offset],
+                    source[offset + 1],
+                    source[offset + 2],
+                    source[offset + 3],
+                ]));
+                for component in components {
+                    let reduced =
+                        u16::try_from((u32::from(component) * u32::from(u8::MAX) + 511) / 1023)
+                            .expect("a ten-bit component reduces to at most 255");
+                    let expanded = (reduced << 2) | (reduced >> 6);
+                    stats.sampled_components += 1;
+                    stats.off_eight_bit_grid += u64::from(component != expanded);
+                    stats.minimum = stats.minimum.min(component);
+                    stats.maximum = stats.maximum.max(component);
+                }
+            }
+        }
+        if stats.sampled_components == 0 {
+            stats.minimum = 0;
+        }
+        stats
+    }
+}
+
+pub(crate) struct X11Capture {
     connection: RustConnection,
     root: Window,
     output_index: u32,
     rect: CaptureRect,
     layout: PixelLayout,
+    pixel_format: X11PixelFormat,
+    purpose: CapturePurpose,
     damage: Option<damage::Damage>,
     transfer: Transfer,
 }
 
 impl X11Capture {
-    fn connect(output_index: u32) -> Result<Self, String> {
+    fn connect_software(output_index: u32) -> Result<Self, String> {
+        Self::connect(output_index, CapturePurpose::Software)
+    }
+
+    pub(crate) fn connect_wide(output_index: u32) -> Result<Self, String> {
+        Self::connect(output_index, CapturePurpose::WideNvenc)
+    }
+
+    fn connect(output_index: u32, purpose: CapturePurpose) -> Result<Self, String> {
         let (connection, screen_index) =
             x11rb::connect(None).map_err(|error| format!("connect authenticated X11: {error}"))?;
         let screen = connection
@@ -198,37 +321,46 @@ impl X11Capture {
             .ok_or_else(|| "X11 selected screen is absent".to_string())?;
         let root = screen.root;
         let rect = selected_output_rect(&connection, root, output_index)?;
-        validate_software_geometry(rect)?;
+        validate_capture_geometry(rect, purpose)?;
 
         let setup = connection.setup();
         if setup.image_byte_order != ImageOrder::LSB_FIRST {
-            return Err("X11 image byte order is not little-endian BGRA".to_string());
+            return Err("X11 image byte order is not little-endian".to_string());
         }
         let format = setup
             .pixmap_formats
             .iter()
             .find(|format| format.depth == screen.root_depth)
             .ok_or_else(|| "X11 root depth has no pixmap format".to_string())?;
-        let mut layout = checked_layout(
-            rect.width,
-            rect.height,
-            screen.root_depth,
-            format.bits_per_pixel,
-            format.scanline_pad,
-        )?;
         let visual = screen
             .allowed_depths
             .iter()
             .flat_map(|depth| depth.visuals.iter())
             .find(|visual| visual.visual_id == screen.root_visual)
             .ok_or_else(|| "X11 root visual is absent from allowed depths".to_string())?;
-        if visual.class != VisualClass::TRUE_COLOR
-            || visual.red_mask != RED_MASK
-            || visual.green_mask != GREEN_MASK
-            || visual.blue_mask != BLUE_MASK
+        let pixel_format = classify_pixel_format(
+            screen.root_depth,
+            visual.class,
+            visual.red_mask,
+            visual.green_mask,
+            visual.blue_mask,
+        )?;
+        if purpose == CapturePurpose::WideNvenc && !matches!(pixel_format, X11PixelFormat::Rgb10(_))
         {
-            return Err("X11 root visual is not 8-bit little-endian BGRX".to_string());
+            return Err(format!(
+                "wide NVENC capture requires an X11 depth-30 RGB10 visual, got depth={} format={}",
+                screen.root_depth,
+                pixel_format.token()
+            ));
         }
+        let mut layout = checked_layout(
+            rect.width,
+            rect.height,
+            screen.root_depth,
+            format.bits_per_pixel,
+            format.scanline_pad,
+            purpose.max_capture_bytes(),
+        )?;
         layout.visual = visual.visual_id;
         validate_root_bounds(screen.width_in_pixels, screen.height_in_pixels, rect)?;
 
@@ -260,7 +392,8 @@ impl X11Capture {
             .flush()
             .map_err(|error| format!("flush X11 capture setup: {error}"))?;
         crate::log(&format!(
-            "X11 capture ready: rect={}x{}+{}+{} stride={} depth={} visual={:#x} transfer={}",
+            "X11 capture ready: rect={}x{}+{}+{} stride={} depth={} visual={:#x} \
+             masks={:#010x}/{:#010x}/{:#010x} format={} transfer={}",
             rect.width,
             rect.height,
             rect.x,
@@ -268,6 +401,10 @@ impl X11Capture {
             layout.stride,
             layout.depth,
             layout.visual,
+            visual.red_mask,
+            visual.green_mask,
+            visual.blue_mask,
+            pixel_format.token(),
             if matches!(transfer, Transfer::Shm { .. }) {
                 "mit-shm-1.2"
             } else {
@@ -280,12 +417,38 @@ impl X11Capture {
             output_index,
             rect,
             layout,
+            pixel_format,
+            purpose,
             damage,
             transfer,
         })
     }
 
-    fn poll_activity(&self) -> Result<Activity, String> {
+    pub(crate) fn width(&self) -> u32 {
+        u32::from(self.rect.width)
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        u32::from(self.rect.height)
+    }
+
+    pub(crate) fn has_damage(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    pub(crate) fn pixel_format_token(&self) -> &'static str {
+        self.pixel_format.token()
+    }
+
+    pub(crate) fn transfer_token(&self) -> &'static str {
+        if matches!(&self.transfer, Transfer::Shm { .. }) {
+            "mit-shm-1.2"
+        } else {
+            "get-image"
+        }
+    }
+
+    pub(crate) fn poll_activity(&self) -> Result<Activity, String> {
         let mut result = Activity::None;
         while let Some(event) = self
             .connection
@@ -314,7 +477,7 @@ impl X11Capture {
         Ok(result)
     }
 
-    fn capture(&mut self) -> Result<BgraFrame<'_>, String> {
+    fn capture_bytes(&mut self) -> Result<&[u8], String> {
         let bytes = match &mut self.transfer {
             Transfer::Shm { segment, mapping } => {
                 let reply = self
@@ -366,20 +529,70 @@ impl X11Capture {
                 storage.as_slice()
             }
         };
-        BgraFrame::new(
-            bytes,
-            usize::from(self.rect.width),
-            usize::from(self.rect.height),
-            self.layout.stride,
-        )
-        .map_err(|error| format!("validate captured BGRA frame: {error}"))
+        Ok(bytes)
     }
 
-    fn recreate(self) -> Result<Self, String> {
+    pub(crate) fn capture_wide(&mut self) -> Result<WideX11Frame<'_>, String> {
+        let width = usize::from(self.rect.width);
+        let height = usize::from(self.rect.height);
+        let stride = self.layout.stride;
+        let X11PixelFormat::Rgb10(layout) = self.pixel_format else {
+            return Err(format!(
+                "wide capture expected RGB10, got {}",
+                self.pixel_format.token()
+            ));
+        };
+        let bytes = self.capture_bytes()?;
+        Ok(WideX11Frame {
+            bytes,
+            width,
+            height,
+            stride,
+            layout,
+        })
+    }
+
+    fn capture_bgra<'a>(&'a mut self, scratch: &'a mut Vec<u8>) -> Result<BgraFrame<'a>, String> {
+        let width = usize::from(self.rect.width);
+        let height = usize::from(self.rect.height);
+        let stride = self.layout.stride;
+        let pixel_format = self.pixel_format;
+        let bytes = self.capture_bytes()?;
+        match pixel_format {
+            X11PixelFormat::Bgrx8 => BgraFrame::new(bytes, width, height, stride)
+                .map_err(|error| format!("validate captured BGRA frame: {error}")),
+            X11PixelFormat::Rgb10(layout) => {
+                let destination_stride = width
+                    .checked_mul(4)
+                    .ok_or_else(|| "BGRA conversion stride overflow".to_string())?;
+                let destination_len = destination_stride
+                    .checked_mul(height)
+                    .ok_or_else(|| "BGRA conversion length overflow".to_string())?;
+                if scratch.len() != destination_len {
+                    scratch.resize(destination_len, 0);
+                }
+                convert_packed_rgb10_to_bgra8(
+                    bytes,
+                    stride,
+                    scratch,
+                    destination_stride,
+                    width,
+                    height,
+                    layout,
+                )
+                .map_err(|error| format!("convert X11 RGB10 to BGRA8: {error}"))?;
+                BgraFrame::new(scratch, width, height, destination_stride)
+                    .map_err(|error| format!("validate converted BGRA frame: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn recreate(self) -> Result<Self, String> {
         let expected = self.rect;
         let output_index = self.output_index;
+        let purpose = self.purpose;
         drop(self);
-        let replacement = Self::connect(output_index)?;
+        let replacement = Self::connect(output_index, purpose)?;
         validate_recreated_rect(expected, replacement.rect)?;
         Ok(replacement)
     }
@@ -438,20 +651,56 @@ fn selected_output_rect(
     ))
 }
 
-fn validate_software_geometry(rect: CaptureRect) -> Result<(), String> {
+fn classify_pixel_format(
+    depth: u8,
+    class: VisualClass,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+) -> Result<X11PixelFormat, String> {
+    if class != VisualClass::TRUE_COLOR {
+        return Err(format!("X11 root visual class {class:?} is not TrueColor"));
+    }
+    if depth == 24 && red_mask == RED_MASK && green_mask == GREEN_MASK && blue_mask == BLUE_MASK {
+        return Ok(X11PixelFormat::Bgrx8);
+    }
+    if depth == 30 {
+        let layout =
+            PackedRgb10Layout::from_masks(red_mask, green_mask, blue_mask).ok_or_else(|| {
+                format!(
+                    "X11 depth-30 visual has unsupported RGB masks \
+                     {red_mask:#010x}/{green_mask:#010x}/{blue_mask:#010x}"
+                )
+            })?;
+        return Ok(X11PixelFormat::Rgb10(layout));
+    }
+    Err(format!(
+        "unsupported X11 root visual depth={depth} masks={red_mask:#010x}/{green_mask:#010x}/{blue_mask:#010x}"
+    ))
+}
+
+fn validate_capture_geometry(rect: CaptureRect, purpose: CapturePurpose) -> Result<(), String> {
     let width = u32::from(rect.width);
     let height = u32::from(rect.height);
+    let (max_width, max_height) = purpose.max_dimensions();
     if rect.x < 0
         || rect.y < 0
         || width == 0
         || height == 0
         || (width | height) & 1 != 0
-        || width > MAX_WIDTH
-        || height > MAX_HEIGHT
+        || width > max_width
+        || height > max_height
     {
         return Err(format!(
-            "unsupported software capture rectangle {}x{}+{}+{}",
-            rect.width, rect.height, rect.x, rect.y
+            "unsupported {} capture rectangle {}x{}+{}+{} (maximum {max_width}x{max_height})",
+            match purpose {
+                CapturePurpose::Software => "software",
+                CapturePurpose::WideNvenc => "wide NVENC",
+            },
+            rect.width,
+            rect.height,
+            rect.x,
+            rect.y,
         ));
     }
     Ok(())
@@ -786,7 +1035,7 @@ fn run_inner(args: Vec<String>) -> i32 {
         Err(error) => return failure_code(&error, 2),
     };
     let framed = crate::framed_output_from_args(&args);
-    let capture = match X11Capture::connect(output_index) {
+    let capture = match X11Capture::connect_software(output_index) {
         Ok(capture) => capture,
         Err(error) => {
             return failure_code(&format!("X11 capture initialization failed: {error}"), 3);
@@ -843,6 +1092,7 @@ fn run_inner(args: Vec<String>) -> i32 {
     let mut emitted = 0u64;
     let mut bytes = 0u64;
     let mut modeset_idr = false;
+    let mut bgra_scratch = Vec::new();
     // Region-owned activity scheduler (`arcen_media::RegionActivityScheduler`).
     // It contains the Keel damage tracker that skips unchanged rows during
     // BGRA→I420 conversion — matching the Windows MF path — and additionally
@@ -888,7 +1138,7 @@ fn run_inner(args: Vec<String>) -> i32 {
                 schedule.reset();
             }
             Ok(Activity::None) => {
-                if capture.damage.is_none() {
+                if !capture.has_damage() {
                     cadence.note_frame();
                 }
             }
@@ -905,7 +1155,7 @@ fn run_inner(args: Vec<String>) -> i32 {
                 }
                 let mut service_attempted = false;
                 let encoded = {
-                    let source = match capture.capture() {
+                    let source = match capture.capture_bgra(&mut bgra_scratch) {
                         Ok(source) => source,
                         Err(error) => return failure_code(&error, 3),
                     };
@@ -1014,7 +1264,10 @@ fn run_inner(args: Vec<String>) -> i32 {
                 };
                 if let Some(access_unit) = encoded {
                     if !ready {
-                        if let Err(error) = crate::announce_ready(plan) {
+                        if let Err(error) = crate::announce_ready_from(
+                            plan,
+                            Some(arcen_media::video::CaptureBackend::XShm),
+                        ) {
                             return failure_code(&format!("emit READY: {error}"), 5);
                         }
                         ready = true;
@@ -1043,7 +1296,7 @@ fn run_inner(args: Vec<String>) -> i32 {
             crate::log(&format!(
                 "enc_fps={emitted} kbps={} backend=openh264 damage_source={} keel_enabled={} modeset_idr={modeset_idr} {}",
                 bytes.saturating_mul(8) / 1000,
-                if capture.damage.is_some() {
+                if capture.has_damage() {
                     "xdamage"
                 } else {
                     "full_poll"
@@ -1067,50 +1320,167 @@ mod tests {
 
     #[test]
     fn layout_is_bounded_and_requires_bgra_compatible_depth() {
-        let layout = checked_layout(1920, 1080, 24, 32, 32).expect("layout");
+        let layout =
+            checked_layout(1920, 1080, 24, 32, 32, SOFTWARE_MAX_CAPTURE_BYTES).expect("layout");
         assert_eq!(layout.stride, 1920 * 4);
         assert_eq!(layout.byte_len, 1920 * 1080 * 4);
-        let secondary = checked_layout(1800, 1130, 24, 32, 32).expect("Philips layout");
+        let secondary = checked_layout(1800, 1130, 24, 32, 32, SOFTWARE_MAX_CAPTURE_BYTES)
+            .expect("Philips layout");
         assert_eq!(secondary.byte_len, 1800 * 1130 * 4);
-        assert!(checked_layout(1920, 1080, 30, 32, 32).is_err());
-        assert!(checked_layout(1920, 1080, 24, 24, 32).is_err());
+        assert!(checked_layout(1920, 1080, 24, 24, 32, SOFTWARE_MAX_CAPTURE_BYTES).is_err());
+    }
+
+    /// Depth 30 is accepted and lays out exactly like depth 24, because both
+    /// are 32 bits per pixel.
+    ///
+    /// This is the ten-bit Linux path's entry condition. `XShmGetImage`
+    /// returns the screen's own framebuffer format, so ten-bit capture on
+    /// X11 is reached by running the server at depth 30 and reading it --
+    /// not by asking the capture for more bits. Refusing depth 30 here made
+    /// a correctly configured ten-bit server fail to capture at all.
+    #[test]
+    fn depth_thirty_is_accepted_and_lays_out_like_depth_twenty_four() {
+        let wide =
+            checked_layout(1920, 1080, 30, 32, 32, WIDE_MAX_CAPTURE_BYTES).expect("depth 30");
+        let narrow =
+            checked_layout(1920, 1080, 24, 32, 32, WIDE_MAX_CAPTURE_BYTES).expect("depth 24");
+        assert_eq!(wide.stride, narrow.stride);
+        assert_eq!(wide.byte_len, narrow.byte_len);
+        assert_eq!(wide.depth, 30);
+    }
+
+    #[test]
+    fn live_nvidia_depth_thirty_masks_select_xbgr2101010() {
+        assert_eq!(
+            classify_pixel_format(
+                30,
+                VisualClass::TRUE_COLOR,
+                0x0000_03ff,
+                0x000f_fc00,
+                0x3ff0_0000,
+            ),
+            Ok(X11PixelFormat::Rgb10(PackedRgb10Layout::XBGR2101010))
+        );
+        assert_eq!(
+            classify_pixel_format(
+                30,
+                VisualClass::TRUE_COLOR,
+                0x3ff0_0000,
+                0x000f_fc00,
+                0x0000_03ff,
+            ),
+            Ok(X11PixelFormat::Rgb10(PackedRgb10Layout::XRGB2101010))
+        );
+    }
+
+    #[test]
+    fn visual_classification_rejects_ambiguous_or_non_true_color_layouts() {
+        assert!(classify_pixel_format(
+            30,
+            VisualClass::DIRECT_COLOR,
+            0x0000_03ff,
+            0x000f_fc00,
+            0x3ff0_0000,
+        )
+        .is_err());
+        assert!(classify_pixel_format(
+            30,
+            VisualClass::TRUE_COLOR,
+            0x0000_03ff,
+            0x0000_03ff,
+            0x3ff0_0000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rgb10_precision_stats_detect_values_the_eight_bit_grid_cannot_hold() {
+        let expanded_mid = (128_u32 << 2) | (128_u32 >> 6);
+        let on_grid = (0x3_u32 << 30) | (expanded_mid << 20) | (expanded_mid << 10) | expanded_mid;
+        let off_grid = (0x3_u32 << 30) | (513_u32 << 20);
+        let bytes = [on_grid.to_le_bytes(), off_grid.to_le_bytes()].concat();
+        let frame = WideX11Frame {
+            bytes: &bytes,
+            width: 2,
+            height: 1,
+            stride: 8,
+            layout: PackedRgb10Layout::XBGR2101010,
+        };
+        let stats = frame.precision_stats(1);
+        assert_eq!(stats.sampled_components, 6);
+        assert_eq!(stats.off_eight_bit_grid, 1);
+        assert_eq!(stats.minimum, 0);
+        assert_eq!(stats.maximum, 514);
     }
 
     #[test]
     fn geometry_rejects_negative_odd_and_oversize_rectangles() {
-        assert!(validate_software_geometry(CaptureRect {
-            x: -1,
-            y: 0,
-            width: 1920,
-            height: 1080,
-        })
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: -1,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            CapturePurpose::Software,
+        )
         .is_err());
-        assert!(validate_software_geometry(CaptureRect {
-            x: 0,
-            y: 0,
-            width: 1919,
-            height: 1080,
-        })
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 1919,
+                height: 1080,
+            },
+            CapturePurpose::Software,
+        )
         .is_err());
-        assert!(validate_software_geometry(CaptureRect {
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-        })
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            CapturePurpose::Software,
+        )
         .is_ok());
-        assert!(validate_software_geometry(CaptureRect {
-            x: 0,
-            y: 832,
-            width: 1800,
-            height: 1130,
-        })
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 832,
+                width: 1800,
+                height: 1130,
+            },
+            CapturePurpose::Software,
+        )
+        .is_ok());
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1600,
+            },
+            CapturePurpose::Software,
+        )
+        .is_err());
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1600,
+            },
+            CapturePurpose::WideNvenc,
+        )
         .is_ok());
     }
 
     #[test]
     fn image_reply_validation_detects_layout_drift() {
-        let mut layout = checked_layout(1280, 720, 24, 32, 32).expect("layout");
+        let mut layout =
+            checked_layout(1280, 720, 24, 32, 32, SOFTWARE_MAX_CAPTURE_BYTES).expect("layout");
         layout.visual = 42;
         assert!(validate_image_reply(24, 42, layout.byte_len, layout).is_ok());
         assert!(validate_image_reply(24, 43, layout.byte_len, layout).is_err());

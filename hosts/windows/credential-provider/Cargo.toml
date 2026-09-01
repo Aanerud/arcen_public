@@ -1,6 +1,6 @@
 [package]
 name = "arcen-credential-provider"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Arcen native Windows Credential Provider with sealed broker handoff, canonical Negotiate serialization, and explicit secret zeroization."

@@ -17,9 +17,9 @@ Read this before you invest time.
 
 | | State |
 |---|---|
-| **Linux Pier** (host) | Works. NVENC hardware encoding up to HEVC 4:4:4 10-bit, or software encoding on a machine with no GPU. |
-| **Windows Pier** (host) | Works. Same range: NVENC up to HEVC 4:4:4 10-bit, or software encoding. |
-| **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox **hardware decode** for H.264 and HEVC, including the 4:4:4 10-bit the hosts encode. AV1 decode needs Apple silicon M3 or later — there is no software AV1 fallback, so AV1 is only negotiated on a Mac that can decode it. |
+| **Linux Pier** (host) | Works. Auto/Speed use the existing NvFBC GPU path; Grading uses a separate depth-30 XShm path for genuine 10-bit SDR. Xorg does not claim HDR, so HDR requests visibly resolve to Grading until a colour-managed Wayland provider exists. |
+| **Windows Pier** (host) | Works. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
+| **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. AV1 decode needs Apple silicon M3 or later. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
 | **macOS Pier** | Does not exist. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
@@ -28,22 +28,24 @@ Every claim above was tested on real hardware, running real work, not merely
 compiled:
 
 - **Linux Pier**, Autodesk Flame workstation, GRID V100D-16Q → macOS Deck:
-  `native-nvenc` hardware encode, 4:4:4, 893 frames, none dropped.
+  Auto and Speed stayed on NvFBC; Grading captured real depth-30 pixels through
+  XShm; HDR resolved truthfully to 10-bit BT.709 SDR.
 - **Windows Pier**, DaVinci Resolve grading workstation, GRID V100D-16Q →
-  macOS Deck: `native-nvenc` hardware encode, a live grading session driven
-  through the Deck.
-- **Windows Pier**, no GPU at all → macOS Deck: `openh264-sw-h264` software
-  encode, 1266 frames, still hardware-decoded on the Mac.
+  macOS Deck: Auto, Speed, Grading, and HDR all completed end to end. Grading
+  used WGC FP16 without enabling HDR; HDR used WGC FP16 with verified
+  PQ/BT.2020 output state.
+- **Windows Pier**, no GPU at all → macOS Deck: `openh264-sw-h264`
+  source-built software encode, still hardware-decoded on the Mac.
 - All three Piers are Active Directory-joined, so the credential crossing the
   wire is a domain credential, not a local account.
-- Test suites at this release: 957 macOS Deck, 716 Linux Pier, 679 Windows
-  Pier, 694 shared-crate.
+- The release matrix also covered nonzero audio, keyboard/pointer input, both
+  cursor authorities, display restore, and credential-free reconnect.
 
 ### What a session carries
 
 | | |
 |---|---|
-| **Video** | H.264, HEVC and AV1 on NVENC, up to HEVC 4:4:4 10-bit full range. OpenH264 in software where there is no GPU. The Deck decodes in hardware through VideoToolbox, so an ordinary session is GPU-to-GPU end to end: neither side burns a core on video. |
+| **Video** | Four complete presets: Auto, Speed, Grading, and HDR. They select separate capture/conversion pipelines rather than adding switches to one path. Source-built OpenH264 is the software floor where no supported hardware encoder exists. See [Streaming presets and independent pipelines](#streaming-presets-and-independent-pipelines). |
 | **Multiple monitors** | One to four, negotiated as one topology. The Deck can match the host's layout to its own windows. **Each monitor is its own NVENC session**, and that is the real ceiling: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. Set `nvenc_session_limit` only if policy forces a lower ceiling. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. On a multi-GPU host, pin the streaming card with `allowed_adapters` so a session cannot borrow the GPU you reserved for other work. |
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. |
 | **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Opt-in every launch — consent is deliberately never restored from settings — and the operator must enable it on the host too. Windows needs a signed driver Arcen does not yet ship; see [Where help is wanted](#where-help-is-wanted). |
@@ -54,6 +56,33 @@ compiled:
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
 | **Reconnection** | A dropped connection resumes the same session for up to two hours. The Deck reattaches with a signed grant instead of asking for the password again. |
 | **Deskside privacy** | Off by default. When enabled, the physical screen is blanked and its keyboard and mouse are disabled for the duration of a remote session, so nobody standing at the machine can watch or interfere. Input and display are locked together — you cannot get one without the other. |
+
+### Streaming presets and independent pipelines
+
+Arcen does not take one 8-bit capture path and relabel it for every mode. The
+presets choose complete contracts, and each host selects a capture provider
+that can actually supply that contract.
+
+| Preset | Requested stream | Windows Pier | Linux Pier (Xorg) | Deck presentation |
+|---|---|---|---|---|
+| **Auto** | 30 fps, adaptive 4:2:0 8-bit | DDA when it proves real frames, otherwise WGC BGRA8 | NvFBC → CUDA → NVENC; device-to-device fast path | Ordinary SDR VideoToolbox path |
+| **Speed** | 60 fps, adaptive 4:2:0 8-bit | Same 8-bit capture path at the higher cadence | Same NvFBC fast path at the higher cadence | Ordinary SDR VideoToolbox path |
+| **Grading** | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 | WGC FP16 scRGB → SDR OETF/matrix → NVENC P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC P16 | Native `xf44` → dedicated `RGB10A2Unorm` Metal layer, SDR |
+| **HDR** | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ | HDR EDID/topology → exact-target Windows HDR state → WGC FP16 scRGB → absolute PQ/BT.2020 → NVENC P16 | No Xorg HDR provider: resolves to the Grading pipeline and reports matrix/primaries/transfer degradation | Same 10-bit Metal layer, with PQ colour space and EDR only when the host returns PQ |
+
+The separation is deliberate:
+
+- the Linux 8-bit path keeps its no-host-copy advantage and never pays the
+  XShm/CPU/upload cost;
+- ten-bit SDR is not treated as HDR;
+- Windows Grading uses a genuine FP16 source without changing the desktop into
+  HDR mode;
+- Windows HDR starts only after the requested display itself proves HDR; and
+- a fallback is reported to the Deck instead of being hidden inside a deeper
+  container.
+
+The detailed colour contract and measured evidence are in
+[`docs/architecture/color-fidelity.md`](docs/architecture/color-fidelity.md).
 
 Native tablet needs a host that can present the tablet on a virtual USB
 controller so the host's own driver can claim it. **Linux hosts can. Windows
@@ -161,10 +190,39 @@ decodes it, and sends your keyboard and mouse back. Everything else is detail.
 else. There is no TCP fallback and no unencrypted mode. QUIC carries TLS 1.3
 itself, so the encryption is part of the transport rather than bolted on.
 
-**The client picks nothing.** The Deck reports what it can decode and what
-quality it wants. The Pier decides, because only the Pier knows which encoder
-its GPU actually has. If the GPU cannot do what you asked, the Pier serves a
-lower-fidelity plan and says so, rather than pretending.
+**The client picks a result, not a codec.** The Deck asks for Auto, Speed,
+Grading, or HDR and reports what it can decode. The Pier chooses the concrete
+capture and encoder path, because only the Pier knows what its display and GPU
+can supply. If it cannot serve the requested result, it reports the lower
+fidelity plan rather than pretending.
+
+**How frames leave the host.** Capture is platform-specific and
+contract-specific. The 8-bit, ten-bit SDR, HDR, and software paths are separate
+pipelines with separate admission rules; they are not one screenshot loop with
+different labels.
+
+On **Linux**, Auto and Speed use **NvFBC → CUDA → NVENC**. The frame stays on
+the GPU. Grading cannot use that path because public NvFBC has no ten-bit
+format, so it uses **depth-30 Xorg → MIT-SHM → packed RGB10 conversion → CUDA
+upload → NVENC**. Xorg has no HDR composition contract; an HDR request therefore
+uses that same genuine ten-bit SDR pipeline with an explicit downgrade. A
+machine without usable NVENC takes a third path: checked X11 capture and shared
+conversion into source-built OpenH264.
+
+On **Windows**, Auto and Speed use the 8-bit D3D11 path: Desktop Duplication
+only when it proves real image delivery, otherwise WGC. Grading requires a
+different WGC pool, `R16G16B16A16Float`, and converts linear scRGB into ten-bit
+BT.709. HDR adds another upstream contract: Arcen first provisions the final
+HDR EDID/topology, enables HDR on the exact bound display target, verifies
+PQ/BT.2020, and only then converts the FP16 scRGB source into HDR10. WGC refusing
+the FP16 pool is a hard failure; Arcen never falls back to BGRA8 while claiming
+ten-bit.
+
+**What 10-bit means depends on the source.** Linux Grading reads genuine
+depth-30 Xorg codes. Windows Grading and HDR read FP16 scRGB. An 8-bit source
+encoded into ten bits can still avoid RGB↔YCbCr rounding loss, but Arcen does
+not confuse that mathematical benefit with a genuinely wide capture source,
+and it never treats bit depth alone as proof of HDR.
 
 **Codec choice follows the hardware — at both ends.** The Pier can only send
 what the Deck can actually decode, so the Deck measures its own capability at
@@ -182,7 +240,7 @@ somewhere else.
 | Modern NVIDIA GPU | No AV1 (M1, M2, Intel) | Hardware HEVC |
 | Older NVIDIA GPU | HEVC | Hardware HEVC, then H.264 |
 | Any NVENC GPU | HEVC 4:4:4 10-bit | Hardware HEVC 4:4:4 10-bit, for colour-critical work |
-| No GPU at all | anything | OpenH264 in software, decoded in hardware on the Deck |
+| No GPU at all | H.264 | Source-built OpenH264, decoded in hardware on the Deck |
 
 Note the last row: software encoding on the host still gets **hardware decoding
 on the client**, because the output is ordinary H.264. The cost lands on the
@@ -202,15 +260,17 @@ Hardware encoding is the fast path, but it is not the only intended one.
 10-bit for colour-critical work. Both the Linux and Windows Piers do this.
 
 **On a virtual machine.** Proxmox, VMware, and similar hypervisors usually give
-a guest no encoder at all. Arcen falls back to OpenH264 in software, and this is
-a first-class way to run it rather than a consolation prize: it makes Arcen a
+a guest no encoder at all. Arcen uses source-built OpenH264. This is a
+first-class way to run it rather than a consolation prize: it makes Arcen a
 practical alternative to RDP or VNC on ordinary server hardware, with the same
-QUIC and TLS 1.3 as everywhere else. Desktop work and video playback both hold
-up well. You give up 4:4:4 and 10-bit, not encryption and not the protocol.
+QUIC and TLS 1.3 as everywhere else. You give up 4:4:4 and 10-bit, not
+encryption and not the protocol.
 
 **On a headless host.** Same as above, provided something gives the machine a
 display to capture — a hypervisor's virtual adapter, or an indirect display
-driver. Arcen ships no display driver of its own.
+driver. Arcen ships no display driver of its own. On supported NVIDIA Windows
+hosts it can instead provision unused native display IDs with session-scoped
+EDIDs, including the HDR sink contract, and restores them when the lease ends.
 
 The encryption does not change between these. A software-encoded session on a
 Proxmox guest is protected exactly as a 4:4:4 workstation session is.
@@ -483,10 +543,11 @@ serialisation, ranked here by what a measurement would actually show at 4K60.
   — `wait_for_async_frames` immediately after every submit — which serialises the
   worker behind the decoder and turns any hiccup into a stall. Two frames in
   flight would overlap receive, decode and present without reordering.
-- **GPU-side colour conversion on the host.** Windows maps the capture staging
-  texture and converts BGRA to the encoder's format on the CPU; the Linux 10-bit
-  path copies device to host, converts, and copies back. This is raw-frame
-  traffic, not compressed, so it dominates the fidelity modes.
+- **GPU-side colour conversion on the host.** Windows maps BGRA8 or FP16 WGC
+  staging and performs the negotiated conversion on the CPU. Linux Grading
+  starts in host memory because XShm is the ten-bit source, converts there, then
+  uploads once to CUDA. This is raw-frame traffic, not compressed, so it
+  dominates the fidelity modes without affecting the separate NvFBC fast path.
 - **Binary input encoding.** Every mouse, key and pen event becomes a
   `serde_json::Value` and travels on an unbounded channel. Fine for a mouse;
   questionable for a 1000 Hz pen, where the queue can also become a latency

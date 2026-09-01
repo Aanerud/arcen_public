@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-linux-installer"
-version = "0.9.8"
+version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Single-file Linux installer for Arcen Pier."

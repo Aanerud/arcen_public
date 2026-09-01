@@ -17,6 +17,13 @@ The package ships `logging.level: 0` plus shared QoS defaults. Development
 overrides (currently Level 2 on pier-windows.example.internal) belong in deployment configuration,
 never in this production template.
 
+The single Pier/installer payload includes all Windows streaming pipelines:
+eight-bit DDA/WGC for Auto/Speed, mandatory WGC FP16 scRGB for ten-bit
+Grading, and the exact-target HDR EDID/state plus FP16-to-PQ path for HDR.
+These are runtime-selected paths inside the same signed-in session agent and
+capenc binary, not optional components. Rebuild the Pier before rebuilding the
+embedding installer.
+
 ## Native codec/static-runtime boundary
 
 `hosts\windows\build.cmd` is the active source-build entry point. It requires an

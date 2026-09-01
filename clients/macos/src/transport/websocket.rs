@@ -377,6 +377,14 @@ pub struct StreamProfile {
     pub color_range: String,
     /// Requested matrix coefficients (`bt709`/`identity`/`bt601`/`bt2020ncl`).
     pub color_matrix: String,
+    /// Requested transfer characteristics (`bt709`/`srgb`/`pq`/`hlg`).
+    ///
+    /// **The axis that asks for HDR.** `pq` is what makes a host apply an HDR
+    /// EDID, enable Advanced Color and take a wide capture; depth alone does
+    /// not, because 10-bit BT.709 is an ordinary SDR request.
+    pub transfer: String,
+    /// Requested colour primaries (`bt709`/`bt2020`/`display_p3`).
+    pub color_primaries: String,
     /// What the host's encoder should optimise for (`interactive`/`quality`).
     ///
     /// Not a colour axis: it never changes which pixels are requested, only
@@ -395,6 +403,8 @@ impl Default for StreamProfile {
             bit_depth: "8".to_string(),
             color_range: "limited".to_string(),
             color_matrix: "bt709".to_string(),
+            transfer: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
             encode_intent: "interactive".to_string(),
         }
     }
@@ -1938,20 +1948,35 @@ async fn run_session_correlated(
             validate_server_region_input(&options, &server_hello)?;
             #[cfg(feature = "usb-hard-lab")]
             if options.tablet_mode_requested == TabletModeMsg::WacomUsbBridge {
-                if !server_hello.usb_hard_v1 {
-                    return Err(ConnectSmokeError::TransportUnavailable(
-                        "host does not advertise Hard USB v1".to_owned(),
-                    ));
+                // Requesting the native bridge is a preference, not a
+                // requirement. The tablet is a peripheral the user carries
+                // between locations, and the host may not offer the bridge at
+                // all; neither is a reason to refuse a desktop session. Every
+                // failure here degrades to local termination, which is the
+                // ordinary typed-pen path and always available.
+                //
+                // Degrading is also the safe direction for the failures that
+                // are not merely "absent" -- a device denied by profile, or a
+                // helper without privilege, simply goes un-bridged.
+                let downgrade = if !server_hello.usb_hard_v1 {
+                    Some("host does not advertise Hard USB v1".to_owned())
+                } else {
+                    match crate::usb_bridge::UsbHardResponder::start().await {
+                        Ok(responder) => {
+                            usb_hard_responder = Some(responder);
+                            None
+                        }
+                        Err(error) => Some(error.to_string()),
+                    }
+                };
+                if let Some(reason) = downgrade {
+                    tracing::warn!(
+                        target: crate::logging::target::TRANSPORT,
+                        reason = %reason,
+                        "native tablet bridge unavailable; continuing with local termination",
+                    );
+                    options.tablet_mode_requested = TabletModeMsg::LocalTermination;
                 }
-                usb_hard_responder = Some(
-                    crate::usb_bridge::UsbHardResponder::start()
-                        .await
-                        .map_err(|error| {
-                            ConnectSmokeError::TransportUnavailable(format!(
-                                "physical Hard USB capture failed: {error}"
-                            ))
-                        })?,
-                );
             }
             if fsm.state_id() == "authenticating" {
                 let _ = fsm.send(ClientEvent::AuthOk);
@@ -3506,8 +3531,27 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
         .with_optional_timezone(options.timezone.clone())
         .with_cursor_preference(options.cursor_preference);
     let capabilities = probe_decode_capabilities();
+    let quality = rust_viewer_quality_settings(&options.profile);
+    // The first link of the HDR chain, stated where the ask is actually made.
+    // `transfer` is what carries it: 10-bit BT.709 is an ordinary SDR request
+    // for banding headroom, so depth alone must not read as HDR.
+    let hdr_requested = quality.transfer == "pq" || quality.transfer == "hlg";
+    tracing::info!(
+        target: crate::logging::target::SESSION,
+        event = "deck_color_request",
+        hdr_requested,
+        transfer = %quality.transfer,
+        primaries = %quality.color_primaries,
+        bit_depth = %quality.bit_depth,
+        chroma = %quality.chroma,
+        matrix = %quality.color_matrix,
+        range = %quality.color_range,
+        codec = %quality.codec,
+        main10_decode = capabilities.main10,
+        "Deck colour request",
+    );
     response.initial_video = Some(InitialVideoRequestMsg {
-        quality: rust_viewer_quality_settings(&options.profile),
+        quality,
         capabilities: ClientVideoCapabilitiesMsg {
             h264: capabilities.h264,
             h265: capabilities.h265,
@@ -5052,6 +5096,8 @@ fn rust_viewer_quality_settings(profile: &StreamProfile) -> QualitySettings {
         bit_depth: profile.bit_depth.clone(),
         color_range: profile.color_range.clone(),
         color_matrix: profile.color_matrix.clone(),
+        transfer: profile.transfer.clone(),
+        color_primaries: profile.color_primaries.clone(),
         encode_intent: profile.encode_intent.clone(),
         force_lossless: false,
         intra_refresh: false,
@@ -7050,6 +7096,8 @@ mod tests {
             bit_depth: "10".to_string(),
             color_range: "full".to_string(),
             color_matrix: "bt709".to_string(),
+            transfer: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
             encode_intent: "quality".to_string(),
         });
         assert_eq!(quality.codec, "h265");

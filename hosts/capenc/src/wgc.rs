@@ -48,6 +48,21 @@ pub struct WgcCapture {
     _item: GraphicsCaptureItem,
     frame_pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
+    /// The pool format that was actually created.
+    ///
+    /// Recorded rather than assumed: a wide pool is only useful if it was
+    /// granted, and a caller that converts as if it had one when it does not
+    /// would read 8-bit bytes as half-floats.
+    format: DirectXPixelFormat,
+}
+
+/// Readable name for a pool format, for logs that have to be diffable.
+fn wgc_format_name(format: DirectXPixelFormat) -> &'static str {
+    match format {
+        DirectXPixelFormat::R16G16B16A16Float => "R16G16B16A16Float",
+        DirectXPixelFormat::B8G8R8A8UIntNormalized => "B8G8R8A8UIntNormalized",
+        _ => "other",
+    }
 }
 
 impl WgcCapture {
@@ -55,11 +70,15 @@ impl WgcCapture {
     /// device/context (created on the NVENC adapter in win.rs). The frame pool
     /// is created on the same device so captured textures need no cross-device
     /// copy before encode.
+    /// `wide` asks for an FP16 scRGB pool instead of 8-bit BGRA. That source is
+    /// required for every stream above eight bits; HDR callers separately
+    /// prove that the selected output is compositing PQ/BT.2020.
     pub unsafe fn from_device(
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         monitor: HMONITOR,
         cursor_mode: CursorCaptureMode,
+        wide: bool,
     ) -> windows::core::Result<Self> {
         // WinRT must be initialised on this thread. RPC_E_CHANGED_MODE means it
         // was already initialised in a different apartment — harmless for our
@@ -84,13 +103,25 @@ impl WgcCapture {
         ));
 
         // Free-threaded pool: TryGetNextFrame works without a DispatcherQueue.
-        // BGRA matches the NVENC ARGB register path.
-        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &d3d_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
-            size,
-        )?;
+        // BGRA matches the NVENC ARGB register path; FP16 is the only wide
+        // format WGC offers, and is scRGB (linear, 1.0 = SDR white).
+        //
+        // A refused wide pool fails closed. Falling back to BGRA while keeping
+        // a ten-bit stream contract would only repack eight-bit source values
+        // into a deeper container.
+        let requested = if wide {
+            DirectXPixelFormat::R16G16B16A16Float
+        } else {
+            DirectXPixelFormat::B8G8R8A8UIntNormalized
+        };
+        let frame_pool =
+            Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d_device, requested, 2, size)?;
+        let format = requested;
+        log(&format!(
+            "WGC pool format: {} (requested {})",
+            wgc_format_name(format),
+            wgc_format_name(requested)
+        ));
         let session = frame_pool.CreateCaptureSession(&item)?;
 
         let include_cursor = cursor_mode.include_cursor();
@@ -129,7 +160,17 @@ impl WgcCapture {
             _item: item,
             frame_pool,
             session,
+            format,
         })
+    }
+
+    /// Whether the pool this capture actually created carries wide samples.
+    ///
+    /// The answer to "may I read these bytes as half-floats", which is not the
+    /// same question as "did I ask for a wide pool".
+    #[must_use]
+    pub fn is_wide(&self) -> bool {
+        self.format == DirectXPixelFormat::R16G16B16A16Float
     }
 
     pub fn device(&self) -> &ID3D11Device {

@@ -41,7 +41,9 @@ use arcen_media::{
     SessionMonitorId, TopologyGeneration,
 };
 
-use crate::pipeline::video_decoder::{DecodedVideoFrame, NativeVideoDecoder, VideoDecodeError};
+use crate::pipeline::video_decoder::{
+    DecodedVideoFrame, NativeVideoDecoder, SessionColor, VideoDecodeError,
+};
 use crate::protocol::VideoHeader;
 
 /// The shared route classification (wire `monitor_id` `0` vs. a negotiated
@@ -328,6 +330,16 @@ impl MonitorFrameRouter {
     #[must_use]
     pub fn latest_frame_legacy_primary(&self) -> Option<&DecodedVideoFrame> {
         self.latest_frame_for_route(MonitorRoute::LegacyPrimary)
+    }
+
+    /// Applies the negotiated session-level colour to every admitted
+    /// monitor's decoder, so a secondary display presents the same colour
+    /// truth as the primary rather than falling back to a BT.709 SDR
+    /// assumption of its own.
+    pub fn set_session_color(&mut self, session_color: SessionColor) {
+        for slot in self.slots.values_mut() {
+            slot.decoder.set_session_color(session_color);
+        }
     }
 
     #[must_use]

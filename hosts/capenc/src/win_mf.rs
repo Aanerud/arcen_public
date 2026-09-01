@@ -842,7 +842,16 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
     log(&format!("{backend_label}: bound adapter '{adapter_desc}'"));
 
     let capture = match unsafe {
-        WgcCapture::from_device(device.clone(), context.clone(), monitor, opts.cursor_mode)
+        // Software encode paths stay 8-bit: they have no wide surface
+        // format to hand a wide capture to, so asking for one would cost
+        // bandwidth and buy nothing.
+        WgcCapture::from_device(
+            device.clone(),
+            context.clone(),
+            monitor,
+            opts.cursor_mode,
+            false,
+        )
     } {
         Ok(c) => c,
         Err(e) => {
@@ -1044,7 +1053,13 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
                     if !ready_announced {
                         if bytes.is_empty()
                             || bytes.len() > crate::MAX_ACCESS_UNIT_BYTES
-                            || crate::announce_ready(ready_plan).is_err()
+                            || crate::announce_ready_from(
+                                ready_plan,
+                                // This path builds its source with
+                                // `WgcCapture::from_device` unconditionally.
+                                Some(arcen_media::video::CaptureBackend::WindowsGraphicsCapture),
+                            )
+                            .is_err()
                         {
                             log("could not emit READY after first in-memory access unit");
                             return 5;

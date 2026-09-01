@@ -171,6 +171,9 @@ pub enum ColorPrimariesToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferFunctionToken {
     Bt709,
+    Srgb,
+    Pq,
+    Hlg,
 }
 
 /// Named `kCMFormatDescriptionYCbCrMatrix_*` constant to stamp.
@@ -208,42 +211,28 @@ pub struct ColorExtensionPlan {
     pub matrix_is_knowingly_inaccurate: bool,
 }
 
-/// Pure mapping from the wire's per-frame matrix coefficients (plus the
-/// separately-carried full-range flag) to the colour extensions to stamp.
+/// Pure mapping from the wire's per-frame matrix coefficients, negotiated
+/// transfer characteristic, and separately-carried full-range flag to the
+/// colour extensions to stamp.
 #[must_use]
-pub fn color_extension_plan(matrix: wire::ColorMatrix, full_range: bool) -> ColorExtensionPlan {
-    let (primaries, transfer, matrix_token, matrix_is_knowingly_inaccurate) = match matrix {
-        wire::ColorMatrix::Bt709 => (
-            ColorPrimariesToken::Bt709,
-            TransferFunctionToken::Bt709,
-            YCbCrMatrixToken::Bt709,
-            false,
-        ),
-        wire::ColorMatrix::Bt601 => (
-            ColorPrimariesToken::SmpteC,
-            // BT.601 content carries no transfer characteristic of its own
-            // in this mapping; 709's is the conventional stand-in used when
-            // nothing more specific is known.
-            TransferFunctionToken::Bt709,
-            YCbCrMatrixToken::Bt601,
-            false,
-        ),
-        wire::ColorMatrix::Bt2020Ncl => (
-            ColorPrimariesToken::Bt2020,
-            // Apple's own CMFormatDescription.h recommends the 709 transfer
-            // constant even for 2020 content: "semantically equivalent to
-            // kCMFormatDescriptionTransferFunction_ITU_R_709_2, which is
-            // preferred".
-            TransferFunctionToken::Bt709,
-            YCbCrMatrixToken::Bt2020,
-            false,
-        ),
-        wire::ColorMatrix::Identity => (
-            ColorPrimariesToken::Bt709,
-            TransferFunctionToken::Bt709,
-            YCbCrMatrixToken::Bt709,
-            true,
-        ),
+pub fn color_extension_plan(
+    matrix: wire::ColorMatrix,
+    full_range: bool,
+    transfer: arcen_media::TransferCharacteristics,
+) -> ColorExtensionPlan {
+    let (primaries, matrix_token, matrix_is_knowingly_inaccurate) = match matrix {
+        wire::ColorMatrix::Bt709 => (ColorPrimariesToken::Bt709, YCbCrMatrixToken::Bt709, false),
+        wire::ColorMatrix::Bt601 => (ColorPrimariesToken::SmpteC, YCbCrMatrixToken::Bt601, false),
+        wire::ColorMatrix::Bt2020Ncl => {
+            (ColorPrimariesToken::Bt2020, YCbCrMatrixToken::Bt2020, false)
+        }
+        wire::ColorMatrix::Identity => (ColorPrimariesToken::Bt709, YCbCrMatrixToken::Bt709, true),
+    };
+    let transfer = match transfer {
+        arcen_media::TransferCharacteristics::Bt709 => TransferFunctionToken::Bt709,
+        arcen_media::TransferCharacteristics::Srgb => TransferFunctionToken::Srgb,
+        arcen_media::TransferCharacteristics::Pq => TransferFunctionToken::Pq,
+        arcen_media::TransferCharacteristics::Hlg => TransferFunctionToken::Hlg,
     };
     ColorExtensionPlan {
         primaries,
@@ -329,6 +318,32 @@ fn validate_biplanar_layout(
 pub struct NativeDecodedVideoFrame {
     pub pixel_buffer: apple_cf::cv::CVPixelBuffer,
     pub video: arcen_media::VideoConfiguration,
+}
+
+/// The two colour axes a session negotiates once and a packet header never
+/// carries: colour primaries and transfer characteristics.
+///
+/// Read back from the host's own `ServerColorCaps` (`active_primaries` /
+/// `active_transfer`), so this is what the host says it is *actually*
+/// sending, not what the Deck asked for. `transfer` is the axis that
+/// decides whether presentation is HDR: see
+/// `crate::ui::video_render::presentation_colorspace_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionColor {
+    pub primaries: arcen_media::ColorPrimaries,
+    pub transfer: arcen_media::TransferCharacteristics,
+}
+
+impl Default for SessionColor {
+    /// BT.709 SDR -- `arcen_media::VideoConfiguration::legacy_h264`'s own
+    /// pair, and the correct assumption for any host that does not report
+    /// these axes at all.
+    fn default() -> Self {
+        Self {
+            primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +451,14 @@ pub struct NativeVideoDecoder {
 impl NativeVideoDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records the session-level colour axes the host reported as active,
+    /// so decoded frames carry the stream's real primaries/transfer rather
+    /// than a BT.709 assumption. Idempotent, and safe to call on every
+    /// hello: a session's negotiated colour cannot change mid-stream.
+    pub fn set_session_color(&mut self, session_color: SessionColor) {
+        self.inner.set_session_color(session_color);
     }
 
     pub fn decode(
@@ -1815,8 +1838,8 @@ mod platform {
         validate_biplanar_layout, wants_ten_bit_pixel_format, wire, AnnexBCodec, BufferDepth,
         ChromaSubsampling, ColorExtensionPlan, ColorPrimariesToken, ColorRange, DecodedVideoFrame,
         NalKind, NativeDecodedVideoFrame, ParameterSetCache, PixelBufferFormat, PlaneLayout,
-        SamplePreparationError, StreamCodec, TransferFunctionToken, VideoDecodeError, VideoHeader,
-        VideoStreamKey, YCbCrMatrixToken, BGRA_PIXEL_FORMAT, RGBA_PIXEL_FORMAT,
+        SamplePreparationError, SessionColor, StreamCodec, TransferFunctionToken, VideoDecodeError,
+        VideoHeader, VideoStreamKey, YCbCrMatrixToken, BGRA_PIXEL_FORMAT, RGBA_PIXEL_FORMAT,
     };
 
     const FRAME_TIMESCALE: i32 = 1_000;
@@ -1862,9 +1885,25 @@ mod platform {
         /// supersede counter the overlay reports. Silent discard turned a
         /// timestamp defect into an unexplainable one.
         collapsed_decode_callbacks: u64,
+        /// The negotiated session-level colour axes, as the *host* reported
+        /// them back (`ServerColorCaps::active_primaries`/`active_transfer`).
+        ///
+        /// These two axes are deliberately not read from the packet header:
+        /// [`VideoHeader::flags`] is a full byte carrying keyframe, depth,
+        /// range and matrix already, and primaries/transfer are negotiated
+        /// once for a session rather than varying per frame. Defaulting
+        /// them to BT.709 and never setting them -- which is what this
+        /// decoder did until the transfer axis existed -- silently discards
+        /// a negotiated PQ stream's own identity, so an HDR session is
+        /// presented as SDR while every layer still agrees with itself.
+        session_color: SessionColor,
     }
 
     impl PlatformVideoDecoder {
+        pub fn set_session_color(&mut self, session_color: SessionColor) {
+            self.session_color = session_color;
+        }
+
         pub fn decode(
             &mut self,
             codec: StreamCodec,
@@ -2089,8 +2128,14 @@ mod platform {
             let matrix = header
                 .color_matrix()
                 .map_err(VideoDecodeError::InvalidWireColor)?;
-            let native_video =
-                native_video_configuration(codec, chroma, bit_depth, full_range, matrix);
+            let native_video = native_video_configuration(
+                codec,
+                chroma,
+                bit_depth,
+                full_range,
+                matrix,
+                self.session_color,
+            );
 
             let base_format = match codec {
                 StreamCodec::H264 => {
@@ -2124,7 +2169,7 @@ mod platform {
                 }
             };
 
-            let plan = color_extension_plan(matrix, full_range);
+            let plan = color_extension_plan(matrix, full_range, self.session_color.transfer);
             if plan.matrix_is_knowingly_inaccurate {
                 tracing::warn!(
                     target: crate::logging::target::VIDEO,
@@ -2514,6 +2559,13 @@ mod platform {
             match token {
                 TransferFunctionToken::Bt709 => {
                     raw::kCMFormatDescriptionTransferFunction_ITU_R_709_2
+                }
+                TransferFunctionToken::Srgb => raw::kCMFormatDescriptionTransferFunction_sRGB,
+                TransferFunctionToken::Pq => {
+                    raw::kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+                }
+                TransferFunctionToken::Hlg => {
+                    raw::kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
                 }
             }
         }
@@ -3041,6 +3093,7 @@ mod platform {
         bit_depth: wire::BitDepth,
         full_range: bool,
         matrix: wire::ColorMatrix,
+        session_color: SessionColor,
     ) -> arcen_media::VideoConfiguration {
         arcen_media::VideoConfiguration {
             codec: match codec {
@@ -3069,8 +3122,8 @@ mod platform {
                 wire::ColorMatrix::Bt601 => arcen_media::ColorMatrix::Bt601,
                 wire::ColorMatrix::Bt2020Ncl => arcen_media::ColorMatrix::Bt2020Ncl,
             },
-            primaries: arcen_media::ColorPrimaries::Bt709,
-            transfer: arcen_media::TransferCharacteristics::Bt709,
+            primaries: session_color.primaries,
+            transfer: session_color.transfer,
         }
     }
 
@@ -3264,7 +3317,11 @@ mod platform {
         let pps = super::build_hevc_pps();
         let format =
             make_hevc_format_description(&vps, &sps, &pps).map_err(|error| error.to_string())?;
-        let plan = color_extension_plan(matrix, full_range);
+        let plan = color_extension_plan(
+            matrix,
+            full_range,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         let format = apply_color_extensions(format, StreamCodec::H265, plan);
         let attributes = preferred_pixel_format(profile.chroma(), profile.ten_bit(), full_range)
             .and_then(build_destination_attributes);
@@ -3321,7 +3378,7 @@ mod platform {
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::{DecodedVideoFrame, StreamCodec, VideoDecodeError, VideoHeader};
+    use super::{DecodedVideoFrame, SessionColor, StreamCodec, VideoDecodeError, VideoHeader};
 
     #[derive(Default)]
     pub struct PlatformVideoDecoder {
@@ -3329,6 +3386,11 @@ mod platform {
     }
 
     impl PlatformVideoDecoder {
+        /// No decoder on this platform, so there is nothing for the
+        /// negotiated colour to inform -- accepted and dropped so the
+        /// cross-platform `NativeVideoDecoder` API stays uniform.
+        pub fn set_session_color(&mut self, _session_color: SessionColor) {}
+
         pub fn decode(
             &mut self,
             _codec: StreamCodec,
@@ -3541,6 +3603,7 @@ mod tests {
             wire::BitDepth::Twelve,
             true,
             wire::ColorMatrix::Bt709,
+            SessionColor::default(),
         );
         let actual = platform::actual_native_video_configuration(
             requested,
@@ -3553,6 +3616,66 @@ mod tests {
         assert_eq!(actual.chroma, arcen_media::ChromaSubsampling::Yuv444);
         assert_eq!(actual.codec, arcen_media::VideoCodec::H265);
         assert_eq!(actual.matrix, arcen_media::ColorMatrix::Bt709);
+    }
+
+    /// The negotiated session colour must survive onto the frame's own
+    /// presentation contract, and must survive *unchanged* by the
+    /// CoreVideo-actuals pass.
+    ///
+    /// This is the regression guard for the bug this pair of functions
+    /// carried until HDR existed: `native_video_configuration` hard-coded
+    /// `primaries: Bt709, transfer: Bt709`, so a negotiated PQ stream
+    /// arrived at the presentation layer claiming to be SDR and was
+    /// displayed as SDR -- with every layer still internally consistent,
+    /// which is exactly why it went unnoticed. `actual_*` may only correct
+    /// the axes CoreVideo actually decides (chroma, range, depth); it has
+    /// no opinion on primaries or transfer and must not acquire one.
+    #[test]
+    fn negotiated_session_colour_survives_onto_the_presentation_contract() {
+        let hdr = SessionColor {
+            primaries: arcen_media::ColorPrimaries::Bt2020,
+            transfer: arcen_media::TransferCharacteristics::Pq,
+        };
+        let requested = platform::native_video_configuration(
+            StreamCodec::H265,
+            ChromaSubsampling::Yuv444,
+            wire::BitDepth::Ten,
+            true,
+            wire::ColorMatrix::Bt2020Ncl,
+            hdr,
+        );
+        assert_eq!(requested.primaries, arcen_media::ColorPrimaries::Bt2020);
+        assert_eq!(requested.transfer, arcen_media::TransferCharacteristics::Pq);
+
+        let actual = platform::actual_native_video_configuration(
+            requested,
+            ChromaSubsampling::Yuv444,
+            ColorRange::Full,
+            BufferDepth::Ten,
+        );
+        assert_eq!(actual.primaries, arcen_media::ColorPrimaries::Bt2020);
+        assert_eq!(actual.transfer, arcen_media::TransferCharacteristics::Pq);
+    }
+
+    /// A ten-bit stream is not by itself an HDR stream: Grading Reference
+    /// is 4:4:4 ten-bit BT.709, entirely SDR. Nothing may infer HDR from
+    /// depth.
+    #[test]
+    fn ten_bit_bt709_stays_an_sdr_contract() {
+        let sdr = SessionColor::default();
+        let requested = platform::native_video_configuration(
+            StreamCodec::H265,
+            ChromaSubsampling::Yuv444,
+            wire::BitDepth::Ten,
+            true,
+            wire::ColorMatrix::Bt709,
+            sdr,
+        );
+        assert_eq!(requested.bit_depth, arcen_media::BitDepth::Ten);
+        assert_eq!(
+            requested.transfer,
+            arcen_media::TransferCharacteristics::Bt709
+        );
     }
 
     /// Regression guard for the `kVTParameterErr` (-6661) failure found on
@@ -3574,7 +3697,11 @@ mod tests {
         // Documented as an executable statement of intent: the four keys a
         // colour override touches are all colour keys, and none of them can
         // express geometry.
-        let plan = color_extension_plan(wire::ColorMatrix::Bt709, true);
+        let plan = color_extension_plan(
+            wire::ColorMatrix::Bt709,
+            true,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert_eq!(plan.primaries, ColorPrimariesToken::Bt709);
         assert_eq!(plan.transfer, TransferFunctionToken::Bt709);
         assert_eq!(plan.matrix, YCbCrMatrixToken::Bt709);
@@ -3584,7 +3711,11 @@ mod tests {
 
     #[test]
     fn color_extension_plan_maps_each_wire_matrix_to_its_conventional_pairing() {
-        let bt709 = color_extension_plan(wire::ColorMatrix::Bt709, true);
+        let bt709 = color_extension_plan(
+            wire::ColorMatrix::Bt709,
+            true,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert_eq!(bt709.primaries, ColorPrimariesToken::Bt709);
         assert_eq!(bt709.transfer, TransferFunctionToken::Bt709);
         assert_eq!(bt709.matrix, YCbCrMatrixToken::Bt709);
@@ -3592,15 +3723,27 @@ mod tests {
         assert!(!bt709.matrix_is_knowingly_inaccurate);
 
         // `full_range` is threaded straight through independent of matrix.
-        let bt709_limited = color_extension_plan(wire::ColorMatrix::Bt709, false);
+        let bt709_limited = color_extension_plan(
+            wire::ColorMatrix::Bt709,
+            false,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert!(!bt709_limited.full_range);
 
-        let bt601 = color_extension_plan(wire::ColorMatrix::Bt601, false);
+        let bt601 = color_extension_plan(
+            wire::ColorMatrix::Bt601,
+            false,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert_eq!(bt601.primaries, ColorPrimariesToken::SmpteC);
         assert_eq!(bt601.matrix, YCbCrMatrixToken::Bt601);
         assert!(!bt601.matrix_is_knowingly_inaccurate);
 
-        let bt2020 = color_extension_plan(wire::ColorMatrix::Bt2020Ncl, true);
+        let bt2020 = color_extension_plan(
+            wire::ColorMatrix::Bt2020Ncl,
+            true,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert_eq!(bt2020.primaries, ColorPrimariesToken::Bt2020);
         assert_eq!(bt2020.matrix, YCbCrMatrixToken::Bt2020);
         // Apple's own header recommends the 709 transfer constant even for
@@ -3610,13 +3753,36 @@ mod tests {
     }
 
     #[test]
+    fn color_extension_plan_preserves_negotiated_hdr_transfer() {
+        let pq = color_extension_plan(
+            wire::ColorMatrix::Bt2020Ncl,
+            true,
+            arcen_media::TransferCharacteristics::Pq,
+        );
+        assert_eq!(pq.primaries, ColorPrimariesToken::Bt2020);
+        assert_eq!(pq.transfer, TransferFunctionToken::Pq);
+        assert_eq!(pq.matrix, YCbCrMatrixToken::Bt2020);
+
+        let hlg = color_extension_plan(
+            wire::ColorMatrix::Bt2020Ncl,
+            true,
+            arcen_media::TransferCharacteristics::Hlg,
+        );
+        assert_eq!(hlg.transfer, TransferFunctionToken::Hlg);
+    }
+
+    #[test]
     fn color_extension_plan_flags_identity_matrix_as_knowingly_inaccurate() {
         // CoreVideo/CoreMedia expose no identity/GBR YCbCrMatrix constant,
         // so an identity-matrix stream cannot be described faithfully.
         // Refusing to decode it at all would make the highest-fidelity
         // (zero chroma-conversion-error) mode of this feature undecodable
         // on macOS, so the plan knowingly substitutes BT.709 and flags it.
-        let identity = color_extension_plan(wire::ColorMatrix::Identity, true);
+        let identity = color_extension_plan(
+            wire::ColorMatrix::Identity,
+            true,
+            arcen_media::TransferCharacteristics::Bt709,
+        );
         assert!(identity.matrix_is_knowingly_inaccurate);
         assert_eq!(identity.matrix, YCbCrMatrixToken::Bt709);
         assert_eq!(identity.primaries, ColorPrimariesToken::Bt709);

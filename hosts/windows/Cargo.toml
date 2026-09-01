@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-windows"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 description = "Arcen Pier (Windows) — native Rust QUIC host with LogonUser auth, WTS session attachment, SendInput injection, and DXGI/WGC->NVENC capture."
 publish.workspace = true

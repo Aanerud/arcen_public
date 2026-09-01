@@ -34,7 +34,7 @@ async fn main() {
     // Logging is infrastructure: bring it up before anything else so every
     // subsystem has a sink from the first line. The GUI later re-points the
     // level at the user's saved "Log level" preference; CLI paths keep Info.
-    arcen_deck::logging::init(arcen_deck::logging::default_profile());
+    arcen_deck::logging::init(arcen_deck::logging::startup_profile());
     arcen_deck::logging::diagnostics::log_startup_banner();
 
     let args: Vec<String> = std::env::args().collect();
@@ -152,11 +152,15 @@ async fn main() {
     }
 
     #[cfg(feature = "usb-hard-lab")]
+    const WACOM_VENDOR_ID: u16 = 0x056a;
+
+    #[cfg(feature = "usb-hard-lab")]
     fn usb_claim_probe() -> Result<(), String> {
         let device = nusb::list_devices()
             .map_err(|error| error.to_string())?
-            .find(|device| device.vendor_id() == 0x056a && device.product_id() == 0x0317)
-            .ok_or_else(|| "Wacom Intuos5 touch L (056a:0317) is not attached".to_owned())?;
+            .find(|device| device.vendor_id() == WACOM_VENDOR_ID)
+            .ok_or_else(|| "no Wacom tablet is attached".to_owned())?;
+        let probe_identity = format!("{:04x}:{:04x}", device.vendor_id(), device.product_id());
         let interfaces: Vec<_> = device
             .interfaces()
             .map(|interface| {
@@ -169,7 +173,7 @@ async fn main() {
             })
             .collect();
         println!(
-            "usb-claim-probe device=056a:0317 interfaces={}",
+            "usb-claim-probe device={probe_identity} interfaces={}",
             interfaces.len()
         );
         let opened = device
@@ -220,14 +224,19 @@ async fn main() {
         let device = devices
             .iter()
             .find(|device| {
-                device.device_descriptor().is_ok_and(|descriptor| {
-                    descriptor.vendor_id() == 0x056a && descriptor.product_id() == 0x0317
-                })
+                device
+                    .device_descriptor()
+                    .is_ok_and(|descriptor| descriptor.vendor_id() == WACOM_VENDOR_ID)
             })
-            .ok_or_else(|| "Wacom Intuos5 touch L (056a:0317) is not attached".to_owned())?;
+            .ok_or_else(|| "no Wacom tablet is attached".to_owned())?;
         let descriptor = device
             .device_descriptor()
             .map_err(|error| format!("read device descriptor: {error}"))?;
+        let probe_identity = format!(
+            "{:04x}:{:04x}",
+            descriptor.vendor_id(),
+            descriptor.product_id()
+        );
         let handle = device
             .open()
             .map_err(|error| format!("open physical USB device: {error}"))?;
@@ -236,7 +245,7 @@ async fn main() {
             captured: false,
         };
         println!(
-            "usb-capture-probe device=056a:0317 configurations={}",
+            "usb-capture-probe device={probe_identity} configurations={}",
             descriptor.num_configurations()
         );
 
@@ -306,11 +315,11 @@ async fn main() {
                 "arcen-client protocol_version={}\n\
                 usage:\n\
                   arcen-client\n\
-                  arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
-                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--displays-mode match_layout|single_primary|windowed]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--displays-mode match_layout|single_primary|windowed]\n\
+                  arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
+                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
                   arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--full-color-display ID]\n\
-                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off]\n\
+                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                 {}transport: QUIC/TLS 1.3 over UDP; default port 18444\n\
@@ -796,6 +805,9 @@ fn connect_options_from_parts_with_monitors(
         bit_depth: flag_value(args, "--bit-depth").unwrap_or(default_profile.bit_depth),
         color_range: flag_value(args, "--color-range").unwrap_or(default_profile.color_range),
         color_matrix: flag_value(args, "--color-matrix").unwrap_or(default_profile.color_matrix),
+        transfer: flag_value(args, "--transfer").unwrap_or(default_profile.transfer),
+        color_primaries: flag_value(args, "--color-primaries")
+            .unwrap_or(default_profile.color_primaries),
         encode_intent: flag_value(args, "--encode-intent").unwrap_or(default_profile.encode_intent),
     };
     let fixture_displays = smoke_monitor_fixture(args)?;
@@ -892,7 +904,7 @@ fn connect_options_from_parts_with_monitors(
         // an explicit interactive decision, not an automation default.
         replace_incompatible_desktop: false,
         timezone: arcen_deck::timezone::current_identifier(),
-        cursor_preference: CursorMode::Local,
+        cursor_preference: cursor_mode_from_args(args)?,
         clipboard_enabled: true,
         microphone_enabled: args.iter().any(|arg| arg == "--microphone"),
         tablet_input_enabled: !matches!(tablet_mode_requested, TabletModeMsg::DisabledMouseCompat),
@@ -912,6 +924,16 @@ fn displays_mode_from_args(args: &[String]) -> Result<DisplaysMode, String> {
             DisplaysMode::WIRE_VALUES.join(", ")
         )
     })
+}
+
+fn cursor_mode_from_args(args: &[String]) -> Result<CursorMode, String> {
+    match flag_value(args, "--cursor-mode").as_deref() {
+        None | Some("local") => Ok(CursorMode::Local),
+        Some("host") => Ok(CursorMode::Host),
+        Some(value) => Err(format!(
+            "invalid --cursor-mode '{value}'; accepted values: local, host"
+        )),
+    }
 }
 
 async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
@@ -1202,13 +1224,16 @@ async fn media_smoke(
             }
             SessionEvent::ServerHello(hello) => {
                 println!(
-                    "server={} codec={} bit_depth={} range={} matrix={} pixel_format={} \
-                     encoder={} encoder_class={} size={}x{} supports_audio={} yuv444={} av1={}",
+                    "server={} codec={} bit_depth={} range={} matrix={} primaries={} transfer={} \
+                     pixel_format={} encoder={} encoder_class={} size={}x{} supports_audio={} \
+                     yuv444={} av1={}",
                     hello.server_name,
                     hello.codec,
                     hello.color_caps.active_bit_depth,
                     hello.color_caps.active_range,
                     hello.color_caps.active_matrix,
+                    hello.color_caps.active_primaries,
+                    hello.color_caps.active_transfer,
                     hello.color_caps.advertised_pix_fmt,
                     hello.encoder_backend,
                     hello.encoder_class,
@@ -2114,6 +2139,30 @@ mod tests {
         assert_eq!(
             connect_options_from_cli_args(&args).unwrap_err(),
             "direct QUIC connections require a nonzero UDP port"
+        );
+    }
+
+    #[test]
+    fn smoke_cursor_mode_parses_host_and_defaults_local() {
+        let options =
+            parse_with_monitors(&base_smoke_args(), vec![test_monitor(1, 1920, 1080, true)])
+                .expect("parse default cursor mode");
+        assert_eq!(options.cursor_preference, CursorMode::Local);
+
+        let mut host = base_smoke_args();
+        host.extend(["--cursor-mode".to_string(), "host".to_string()]);
+        let options = parse_with_monitors(&host, vec![test_monitor(1, 1920, 1080, true)])
+            .expect("parse host cursor mode");
+        assert_eq!(options.cursor_preference, CursorMode::Host);
+    }
+
+    #[test]
+    fn smoke_cursor_mode_rejects_unknown_values() {
+        let mut args = base_smoke_args();
+        args.extend(["--cursor-mode".to_string(), "dynamic".to_string()]);
+        assert_eq!(
+            parse_with_monitors(&args, vec![test_monitor(1, 1920, 1080, true)]).unwrap_err(),
+            "invalid --cursor-mode 'dynamic'; accepted values: local, host"
         );
     }
 

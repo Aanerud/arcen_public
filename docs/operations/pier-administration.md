@@ -244,11 +244,24 @@ QoS validation rules: FPS degraded must be 100 or lower and greater than FPS cri
 
 ### Automatic Deck policy and administrator overrides
 
-Production Deck users choose only **Performance Mode** and **Colour Fidelity**.
-They never select codecs. Standard colour authorizes the host to rank AV1,
-HEVC, then H.264 on the approved adapter before OpenH264. Full Colour requests
-4:4:4 8-bit. Grading Reference requests 4:4:4 10-bit and automatically selects
-the quality encoder intent.
+Production Deck users choose one complete streaming preset: **Auto**, **Speed**,
+**Grading**, or **HDR**. They never select codecs or combine frame-rate and
+colour switches independently. Auto and Speed authorize the host to rank AV1,
+HEVC, then H.264 on the approved adapter before OpenH264, at 30 and 60 fps
+respectively. Grading requests HEVC 4:4:4 10-bit BT.709 at 30 fps. HDR requests
+HEVC 4:4:4 10-bit BT.2020/PQ at 30 fps and remains active only when the host
+proves a real HDR desktop source.
+
+The preset also selects a capture pipeline; it is not only an encoder setting:
+
+| Host | Auto / Speed | Grading | HDR |
+| --- | --- | --- | --- |
+| Linux Xorg | NvFBC/CUDA/NVENC, 8-bit device-to-device | Depth-30 XShm RGB10, host conversion and CUDA upload | Resolves to Grading BT.709 and reports transfer/primaries/matrix degradation |
+| Windows | DDA after real-frame proof or WGC BGRA8 | Mandatory WGC FP16 scRGB converted to ten-bit BT.709 | Final HDR EDID/topology, exact-target HDR proof, WGC FP16 scRGB converted to BT.2020/PQ |
+
+Operators should diagnose the capture backend from capenc READY
+(`capture=nvfbc|xshm|dda|wgc`) and `capture_zero_copy`, not infer it from the
+codec alone.
 
 Packaged Piers leave `video.codec` and `video.chroma` absent so this automatic
 policy is active. Advanced administrators may set:
@@ -283,13 +296,13 @@ much say the client gets. This mirrors Amazon DCV's
 `default-on` / `default-off`), adapted to Arcen's negotiate-best model, where
 config is normally a ceiling rather than a forced value:
 
-Current Decks send `AuthResponse.initial_video` with Performance/Colour
-Fidelity intent and measured decode capabilities before the Pier creates its
-display/encoder. Performance preserves these colour axes while ranking AV1,
-HEVC, and H.264 on the operator-approved adapter. Full Colour and Grading
-Reference request HEVC 4:4:4. The first `ServerHello` is therefore the final
-plan; the subsequent `quality_settings` message is a consistency echo. Legacy
-clients that omit `initial_video` retain the single-monitor late-request path.
+Current Decks send `AuthResponse.initial_video` with the selected complete
+streaming preset and measured decode capabilities before the Pier creates its
+display/encoder. Auto and Speed rank AV1, HEVC, and H.264 on the
+operator-approved adapter. Grading and HDR request HEVC 4:4:4 10-bit. The
+first `ServerHello` is therefore the final plan; the subsequent
+`quality_settings` message is a consistency echo. Legacy clients that omit
+`initial_video` retain the single-monitor late-request path.
 A legacy multi-monitor request that would change codec, colour, or encoder
 intent is rejected with an explicit reconnect/upgrade reason; it is never
 silently served with a stale Interactive contract.
@@ -688,7 +701,7 @@ Interpretation: service started, TLS material loaded, OS authentication succeede
 | Login takes about 25 seconds | Windows first-login logs | PERF-365: current Windows first login includes a fixed 15 second post-login desktop-stability wait after WTS first reports the exact unlocked session. This prevents black WGC capture before Explorer/DWM stabilizes. It is expected current behavior. |
 | Resize causes black bars and host does not follow client window | ServerHello has `supports_display_update:false`; session-agent or broker display logs include `retarget custom timing enumeration unavailable; persistent save disabled` | SEC-364: on some GRID vGPU hosts `NvAPI_DISP_EnumCustomDisplay` is unavailable. Display restore backend is not retarget-capable, so Pier advertises no display update and Deck correctly does not request resize. This is a GPU capability limit, not a config fix. |
 | Health reports `overall_state: unavailable` during a working session | Event 1806 `HEALTH_SNAPSHOT` | ERR-366: do not trust `overall_state` yet. Use `SESSION_STREAM_START`, frame/QoS fields, client behavior, and component logs. |
-| Capture or encode fails | capenc READY line and event 1102 fields | Performance mode ranks AV1 → HEVC → H.264 on the approved NVENC adapter, then either host uses source-built OpenH264. Exact codec/variant pins reject substitution. Colour Fidelity targets HEVC 4:4:4 instead of silently becoming AV1. `not_built` means the selected backend was not compiled. `capenc READY protocol error: missing cursor` means an old Pier is deployed. Rebuild/deploy the fused Pier. |
+| Capture or encode fails | capenc READY line and event 1102 fields | Auto/Speed rank AV1 → HEVC → H.264 on the approved NVENC adapter, then either host uses source-built OpenH264. Exact codec/variant pins reject substitution. Grading/HDR target HEVC 4:4:4 instead of silently becoming AV1. `not_built` means the selected backend was not compiled. `capenc READY protocol error: missing cursor` means an old Pier is deployed. Rebuild/deploy the fused Pier. |
 | Audio absent but video works | Logs for WASAPI or audiocap | Windows needs a default render endpoint for loopback. Linux audiocap can wait during idle PulseAudio monitor suspension and report a capture gap rather than killing the helper. |
 | Deck reports Match My Layout unsupported | Host `AuthRequest` has no `multi_monitor_v1`; Windows `diagnose-host` **in an interactive session** | The pre-auth offer is withheld until `platform.multi_monitor.advertise_enabled` is set. If it is set and Deck still refuses, compare Deck's display count against the host's attached-output count: a host advertises `platform.multi_monitor.max_monitors` (default 4) but can only serve one client monitor per attached capture-capable output, and Deck never silently serves a subset. Set `max_monitors` to the host's real output count so the refusal is immediate and honest. |
 | Clipboard absent | ServerHello and session logs | Clipboard starts only after exact clipboard v1 negotiation and authenticated dedicated/user session. No-auth/shared-display sessions advertise disabled. |

@@ -19,8 +19,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const WACOM_VENDOR_ID: u16 = 0x056a;
-const WACOM_INTUOS5_TOUCH_L_PRODUCT_ID: u16 = 0x0317;
-const WACOM_INTUOS5_TOUCH_L_BCD_DEVICE: u16 = 0x0100;
+/// Interface class every bridged interface must report.
+///
+/// This is the invariant that replaced pinning one product id. A vendor id is
+/// only a claim -- anything can assert Wacom's -- so admissibility rests on
+/// what the device *is*: every interface must be HID. Combined with
+/// `evaluate_profile`'s permanently-prohibited class list, that keeps storage,
+/// hubs, smartcard and wireless-controller devices out of the bridge no matter
+/// what identity they present.
+const USB_CLASS_HID: u8 = 0x03;
+/// Reported when no Wacom-vendor device is present at all.
+///
+/// Distinct from an inadmissible device, because absence is the ordinary case
+/// for a user who left the tablet on another desk, and the client turns it into
+/// a quiet downgrade rather than a failure.
+pub const NO_TABLET_ATTACHED: &str = "no Wacom tablet is attached";
 const USB_REQUEST_CLEAR_FEATURE: u8 = 1;
 const USB_REQUEST_SET_ADDRESS: u8 = 5;
 const USB_REQUEST_SET_CONFIGURATION: u8 = 9;
@@ -130,54 +143,58 @@ struct UrbState {
 }
 
 impl PhysicalDevice {
-    /// Captures the one approved physical device.
+    /// Captures an attached Wacom tablet.
+    ///
+    /// Any device presenting Wacom's vendor id is considered, rather than one
+    /// hard-coded model: the tablet on a user's desk is not the tablet the
+    /// bridge happened to be developed against. Admissibility is decided by
+    /// [`admissible_tablet`] -- every interface must be HID -- and by
+    /// `evaluate_profile`'s prohibited-class rules, both evaluated here in the
+    /// privileged process from descriptors it read itself. Deck is not trusted
+    /// to assert any of it.
+    ///
+    /// When several Wacom devices are attached, the first admissible one wins,
+    /// so an inadmissible companion device does not mask a usable tablet.
     ///
     /// # Errors
     ///
-    /// Returns a message when the device is absent, fails the host policy
-    /// profile, reports an unsupported speed, or cannot be captured because the
-    /// process lacks privilege.
+    /// Returns a message when no Wacom device is attached, when none of the
+    /// attached ones is admissible, or when the process lacks the privilege to
+    /// capture it.
     pub fn capture() -> Result<Self, String> {
         use rusb::UsbContext;
 
         let context = rusb::Context::new().map_err(|error| error.to_string())?;
         let devices = context.devices().map_err(|error| error.to_string())?;
-        let device = devices
+        let candidates = devices
             .iter()
-            .find(|device| {
-                device.device_descriptor().is_ok_and(|descriptor| {
-                    descriptor.vendor_id() == WACOM_VENDOR_ID
-                        && descriptor.product_id() == WACOM_INTUOS5_TOUCH_L_PRODUCT_ID
-                })
+            .filter(|device| {
+                device
+                    .device_descriptor()
+                    .is_ok_and(|descriptor| descriptor.vendor_id() == WACOM_VENDOR_ID)
             })
-            .ok_or_else(|| "Wacom Intuos5 touch L (056a:0317) is not attached".to_owned())?;
-        let descriptor = device
-            .device_descriptor()
-            .map_err(|error| format!("read physical USB device descriptor: {error}"))?;
-        let speed = map_speed(device.speed())?;
-        let configuration = device
-            .active_config_descriptor()
-            .map_err(|error| format!("read physical USB configuration: {error}"))?;
-        let parsed = parsed_configuration(&configuration)?;
-        let bcd_device = version_to_bcd(descriptor.device_version())?;
-        let snapshot = DeviceSnapshot {
-            id: UsbDeviceId {
-                vendor_id: descriptor.vendor_id(),
-                product_id: descriptor.product_id(),
-                bcd_device,
-            },
-            device_class: descriptor.class_code(),
-            configuration: parsed,
-        };
-        // Evaluated here, in the privileged process, against descriptors this
-        // process read itself. Deck is not trusted to assert admissibility.
-        evaluate_profile(true, &wacom_profile(), &snapshot)
-            .map_err(|error| format!("physical USB device denied by profile: {error}"))?;
-        if speed != UsbSpeed::Full {
-            return Err(format!(
-                "Wacom 056a:0317 reported unexpected USB speed {speed:?}"
-            ));
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(NO_TABLET_ATTACHED.to_owned());
         }
+
+        let mut rejections: Vec<String> = Vec::new();
+        let mut admitted: Option<(rusb::Device<rusb::Context>, DeviceSnapshot, UsbSpeed)> = None;
+        for device in candidates {
+            match examine_candidate(&device) {
+                Ok((snapshot, speed)) => {
+                    admitted = Some((device, snapshot, speed));
+                    break;
+                }
+                Err(reason) => rejections.push(reason),
+            }
+        }
+        let Some((device, snapshot, speed)) = admitted else {
+            return Err(format!(
+                "no attached Wacom device is admissible: {}",
+                rejections.join("; ")
+            ));
+        };
 
         let handle = device
             .open()
@@ -208,10 +225,10 @@ impl PhysicalDevice {
         }
 
         let identity = DeviceIdentity {
-            vendor_id: descriptor.vendor_id(),
-            product_id: descriptor.product_id(),
-            bcd_device,
-            device_class: descriptor.class_code(),
+            vendor_id: snapshot.id.vendor_id,
+            product_id: snapshot.id.product_id,
+            bcd_device: snapshot.id.bcd_device,
+            device_class: snapshot.device_class,
             speed,
         };
         // Bounded, because this is a root process and the queue is fed by
@@ -684,37 +701,96 @@ fn parsed_configuration(
     })
 }
 
-fn wacom_profile() -> DeviceProfile {
+/// Reads one candidate's descriptors and decides whether it may be bridged.
+///
+/// Every check runs against descriptors read here, in the privileged process.
+fn examine_candidate(
+    device: &rusb::Device<rusb::Context>,
+) -> Result<(DeviceSnapshot, UsbSpeed), String> {
+    let descriptor = device
+        .device_descriptor()
+        .map_err(|error| format!("read physical USB device descriptor: {error}"))?;
+    let identity = format!(
+        "{:04x}:{:04x}",
+        descriptor.vendor_id(),
+        descriptor.product_id()
+    );
+    let speed = map_speed(device.speed()).map_err(|error| format!("{identity}: {error}"))?;
+    let configuration = device
+        .active_config_descriptor()
+        .map_err(|error| format!("{identity}: read physical USB configuration: {error}"))?;
+    let parsed =
+        parsed_configuration(&configuration).map_err(|error| format!("{identity}: {error}"))?;
+    let bcd_device = version_to_bcd(descriptor.device_version())
+        .map_err(|error| format!("{identity}: {error}"))?;
+    let snapshot = DeviceSnapshot {
+        id: UsbDeviceId {
+            vendor_id: descriptor.vendor_id(),
+            product_id: descriptor.product_id(),
+            bcd_device,
+        },
+        device_class: descriptor.class_code(),
+        configuration: parsed,
+    };
+    admissible_tablet(&snapshot).map_err(|error| format!("{identity}: {error}"))?;
+    evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot)
+        .map_err(|error| format!("{identity}: denied by profile: {error}"))?;
+    Ok((snapshot, speed))
+}
+
+fn wacom_profile_for(snapshot: &DeviceSnapshot) -> DeviceProfile {
     DeviceProfile {
-        name: "wacom-intuos5-touch-l-056a-0317".to_owned(),
-        vendor_id: WACOM_VENDOR_ID,
-        product_id: WACOM_INTUOS5_TOUCH_L_PRODUCT_ID,
-        minimum_bcd_device: WACOM_INTUOS5_TOUCH_L_BCD_DEVICE,
-        maximum_bcd_device: WACOM_INTUOS5_TOUCH_L_BCD_DEVICE,
-        interfaces: vec![
-            InterfaceRule {
-                number: InterfaceNumber(0),
-                alternate_setting: AlternateSetting(0),
-                class: 0x03,
-                subclass: 0x00,
-                protocol: 0x00,
-            },
-            InterfaceRule {
-                number: InterfaceNumber(1),
-                alternate_setting: AlternateSetting(0),
-                class: 0x03,
-                subclass: 0x00,
-                protocol: 0x00,
-            },
-            InterfaceRule {
-                number: InterfaceNumber(2),
-                alternate_setting: AlternateSetting(0),
-                class: 0x03,
-                subclass: 0x01,
-                protocol: 0x02,
-            },
-        ],
+        name: format!(
+            "wacom-{:04x}-{:04x}",
+            snapshot.id.vendor_id, snapshot.id.product_id
+        ),
+        vendor_id: snapshot.id.vendor_id,
+        product_id: snapshot.id.product_id,
+        minimum_bcd_device: snapshot.id.bcd_device,
+        maximum_bcd_device: snapshot.id.bcd_device,
+        interfaces: snapshot
+            .configuration
+            .interfaces
+            .iter()
+            .map(|interface| InterfaceRule {
+                number: interface.number,
+                alternate_setting: interface.alternate_setting,
+                class: interface.class,
+                subclass: interface.subclass,
+                protocol: interface.protocol,
+            })
+            .collect(),
     }
+}
+
+/// Rejects a Wacom-vendor device that is not wholly a HID device.
+///
+/// `wacom_profile_for` is derived from the device being examined, so it cannot
+/// by itself reject anything -- it exists to keep `evaluate_profile`'s
+/// prohibited-class and internal-consistency checks in the path. This function
+/// is the part that can say no, and it is deliberately the only place where
+/// admissibility is decided.
+fn admissible_tablet(snapshot: &DeviceSnapshot) -> Result<(), String> {
+    if snapshot.configuration.interfaces.is_empty() {
+        return Err("device exposes no interfaces".to_owned());
+    }
+    // 0x00 means "class is declared per interface", which the loop below then
+    // checks. Any other device-level class must itself be HID.
+    if snapshot.device_class != 0x00 && snapshot.device_class != USB_CLASS_HID {
+        return Err(format!(
+            "device class {:#04x} is not a HID device",
+            snapshot.device_class
+        ));
+    }
+    for interface in &snapshot.configuration.interfaces {
+        if interface.class != USB_CLASS_HID {
+            return Err(format!(
+                "interface {} class {:#04x} is not HID",
+                interface.number.0, interface.class
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -780,13 +856,106 @@ mod tests {
         assert!(version_to_bcd(rusb::Version(100, 0, 0)).is_err());
     }
 
+    fn snapshot_with(
+        product_id: u16,
+        device_class: u8,
+        interfaces: &[(u8, u8, u8, u8)],
+    ) -> DeviceSnapshot {
+        DeviceSnapshot {
+            id: UsbDeviceId {
+                vendor_id: WACOM_VENDOR_ID,
+                product_id,
+                bcd_device: 0x0100,
+            },
+            device_class,
+            configuration: ParsedConfiguration {
+                configuration_value: 1,
+                interfaces: interfaces
+                    .iter()
+                    .map(|&(number, class, subclass, protocol)| InterfaceDescriptor {
+                        number: InterfaceNumber(number),
+                        alternate_setting: AlternateSetting(0),
+                        class,
+                        subclass,
+                        protocol,
+                        endpoints: Vec::new(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
     #[test]
-    fn the_profile_is_the_exact_measured_three_interface_tablet() {
-        let profile = wacom_profile();
-        assert_eq!(profile.vendor_id, 0x056a);
-        assert_eq!(profile.product_id, 0x0317);
-        assert_eq!(profile.interfaces.len(), 3);
-        assert_eq!(profile.interfaces[2].subclass, 0x01);
+    fn the_measured_three_interface_tablet_is_still_admissible() {
+        // The device the bridge was developed against, kept as a regression.
+        let snapshot = snapshot_with(
+            0x0317,
+            0x00,
+            &[
+                (0, 0x03, 0x00, 0x00),
+                (1, 0x03, 0x00, 0x00),
+                (2, 0x03, 0x01, 0x02),
+            ],
+        );
+        assert_eq!(admissible_tablet(&snapshot), Ok(()));
+        assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_ok());
+    }
+
+    #[test]
+    fn a_different_wacom_model_is_admitted_rather_than_pinned_out() {
+        // The point of the change: another product id, another interface count,
+        // another revision. Pinning one model rejected every one of these.
+        for (product_id, interfaces) in [
+            (0x033c_u16, &[(0_u8, 0x03_u8, 0x00_u8, 0x00_u8)][..]),
+            (0x0357, &[(0, 0x03, 0x00, 0x00), (1, 0x03, 0x00, 0x00)][..]),
+            (0x03aa, &[(0, 0x03, 0x01, 0x02)][..]),
+        ] {
+            let snapshot = snapshot_with(product_id, 0x00, interfaces);
+            assert_eq!(
+                admissible_tablet(&snapshot),
+                Ok(()),
+                "product {product_id:#06x} should be admissible"
+            );
+            assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_non_hid_interface_is_refused_even_under_wacoms_vendor_id() {
+        // A vendor id is a claim, not a credential. Mass storage, a hub and a
+        // smartcard reader must not become bridgeable by asserting 056a.
+        for class in [0x08_u8, 0x09, 0x0b, 0x01, 0xe0] {
+            let snapshot = snapshot_with(
+                0x0317,
+                0x00,
+                &[(0, 0x03, 0x00, 0x00), (1, class, 0x00, 0x00)],
+            );
+            assert!(
+                admissible_tablet(&snapshot).is_err(),
+                "interface class {class:#04x} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_hid_device_class_is_refused() {
+        let snapshot = snapshot_with(0x0317, 0x08, &[(0, 0x03, 0x00, 0x00)]);
+        assert!(admissible_tablet(&snapshot).is_err());
+    }
+
+    #[test]
+    fn a_device_without_interfaces_is_refused() {
+        let snapshot = snapshot_with(0x0317, 0x00, &[]);
+        assert!(admissible_tablet(&snapshot).is_err());
+    }
+
+    #[test]
+    fn prohibited_classes_are_still_refused_by_the_shared_policy() {
+        // `wacom_profile_for` is derived from the device, so this proves the
+        // shared prohibited-class rules remain in the path and are not made
+        // vacuous by deriving the profile.
+        let snapshot = snapshot_with(0x0317, 0x09, &[(0, 0x03, 0x00, 0x00)]);
+        assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_err());
     }
 
     #[test]

@@ -1,17 +1,44 @@
 # Colour Fidelity: 10-bit, 4:4:4 and Full Range
 
-**Status: in progress on `feat/color-fidelity-10bit-444`.** The shared
-vocabulary, wire, conversion, NVENC (including its BGRA→YUV444/NV12/P010
-conversion, replacing the old ARGB feed), MF and OpenH264 colour signalling,
-the host colour-policy config surface, and the Deck settings surface (presets,
-Advanced overrides, and a probe-matrix variant picker) have landed. The Deck
-WGSL render path, both matrix tools, and host-side colour config wiring have
-also landed and were compiled on all three target platforms. The final drawable
-is still 8-bit and several live-path gaps remain — see "Outstanding" below.
+**Status: implemented and release-validated on `HDRReady` (2026-09-01).** The
+shared vocabulary, wire, colour conversion, encoder signalling, four-preset
+Deck surface, native capture providers, and ten-bit Deck presentation are
+implemented.
+The measured Windows wide path now captures DWM's FP16 scRGB composition
+through WGC for every ten-bit stream. Grading converts that source to BT.709
+10-bit SDR. HDR additionally provisions an HDR10 headless display before
+capture, enables Advanced Color, proves the output is PQ/BT.2020, converts to
+absolute BT.2020/PQ 10-bit 4:4:4, and presents the native VideoToolbox `xf44`
+result through a dedicated `RGB10A2Unorm` HDR Metal path.
+The measured Linux path now keeps ordinary eight-bit sessions on
+NvFBC→CUDA→NVENC, while every depth above eight uses MIT-SHM against the
+dedicated depth-30 Xorg screen and uploads explicitly converted P16 samples to
+NVENC. That Linux path is genuine 10-bit SDR; HDR requests remain Windows-only
+until the color-managed Wayland provider is implemented. Both current paths
+have been exercised through the deployed Piers and the macOS Deck.
+The manual release matrix covered all four presets on both hosts, nonzero
+audio, input, cursor authority/degradation, restore, and credential-free
+resume. Remaining platform expansion is listed under "Outstanding".
 Findings from real hardware are recorded in
 [`../testing/color-matrix-results.json`](../testing/color-matrix-results.json).
 See [`../testing/README.md`](../testing/README.md) for how to run the probe
 matrix end to end and record findings there.
+
+## Canonical pipeline map
+
+The presets are complete contracts. They do not toggle options inside one
+capture implementation.
+
+| Preset | Windows source pipeline | Linux Xorg source pipeline | Deck presentation |
+| --- | --- | --- | --- |
+| Auto | DDA after real-frame proof, otherwise WGC BGRA8 → negotiated 8-bit encode | NvFBC → CUDA → NVENC | SDR |
+| Speed | Same 8-bit path at 60 fps | Same NvFBC device-to-device path at 60 fps | SDR |
+| Grading | WGC FP16 scRGB → SDR transfer/matrix → HEVC I444 P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → HEVC I444 P16 | Native `xf44`, dedicated 10-bit Metal, EDR off |
+| HDR | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → HEVC I444 P16 | No Xorg HDR provider: resolve to the Grading pipeline and report degradation | Native `xf44`, dedicated 10-bit Metal, PQ/EDR only when the resolved transfer remains PQ |
+
+Software encoding is another separate pipeline. Windows MF consumes WGC BGRA8
+through the shared NV12 conversion; source-built OpenH264 consumes checked
+BGRA/I420. Neither software path silently claims Grading or HDR.
 
 ## Why this exists
 
@@ -22,9 +49,9 @@ properties matter to them, in this order:
    text, node graphs, scopes and thin mattes that produces coloured fringing and
    makes an eyedropper read the wrong value. This is a correctness problem, not
    an aesthetic one.
-2. **10-bit depth.** Not because desktops are 10-bit — they usually are not —
-   but because two extra bits absorb the RGB→YCbCr rounding error, which makes
-   the round trip *exact* for 8-bit sources. See "The 10-bit argument" below.
+2. **10-bit depth.** For SDR desktops, two extra bits absorb RGB→YCbCr rounding
+   error and make the round trip exact. For HDR, they are also required to carry
+   useful PQ precision and highlights above SDR reference white.
 3. **Full range.** Desktop content is natively full-range RGB (0–255). Limited
    range spans only 16–235, discarding roughly 14% of the code values before any
    coding loss, and cannot represent superblacks or superwhites distinctly.
@@ -42,6 +69,130 @@ properties matter to them, in this order:
 - `BitDepth` existed in the vocabulary but was hardcoded to `Eight` at every
   call site and **explicitly rejected** by the plan resolver.
 - `ServerColorCaps.main10` existed on the wire and was hardcoded `false`.
+
+## Capture precision depends on the platform and display state
+
+Encoding an 8-bit source into 10 bits is still valuable, but Windows can now
+provide a genuinely wider source when the requested display is in Advanced
+Color mode.
+
+- **Linux NvFBC** exposes six buffer formats in the public headers through API
+  v1.9 — ARGB, RGB, NV12, YUV444P, RGBA and BGRA. All are 8-bit-class. There is
+  no P010, Y410, RGB10A2 or FP16 to ask for.
+- **Linux XShmGetImage** returns the dedicated Xorg screen's native pixels.
+  With `DefaultDepth 30`, the measured NVIDIA root visual is 32 bpp with ten
+  bits per component. Its masks are
+  `R=0x000003ff/G=0x000ffc00/B=0x3ff00000`, so the live layout is
+  `XBGR2101010` (red low, blue high), not the commonly assumed
+  `XRGB2101010`. Arcen derives the channel shifts from the visual masks and
+  refuses any ambiguous/non-TrueColor layout.
+- **Windows Desktop Duplication** returns `B8G8R8A8_UNORM` whatever format list
+  it is given. Asking for `R16G16B16A16_FLOAT` *exclusively* still returns
+  BGRA8, and the call succeeds — so an implementation must branch on
+  `GetDesc().ModeDesc.Format`, never on what it requested.
+- **Windows Graphics Capture** delivers `R16G16B16A16Float` scRGB. Arcen
+  requires that concrete pool format for every ten-bit Windows contract and
+  fails closed if WGC refuses it; it never repacks a BGRA8 pool and calls the
+  result ten-bit. For Grading, the linear SDR source is clamped to reference
+  range and encoded with the requested SDR transfer. On the measured NVIDIA
+  headless HDR path, the final HDR EDID makes HDR available, entering the
+  distinct Windows HDR colour mode makes DWM compose in FP16 scRGB, and WGC
+  captures that surface before downstream display-link quantisation.
+
+On Windows 11, the legacy `advancedColorEnabled` flag is not an HDR verdict:
+it can also describe WCG. Arcen uses
+`DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2`, requests
+`DISPLAYCONFIG_SET_HDR_STATE`, and starts capture only when
+`activeColorMode == HDR`. Windows 10 retains the legacy API because it predates
+the separate HDR/WCG state.
+
+The NVIDIA headless EDID describes the virtual connector as HDMI-a/10 bpc and
+includes HDMI deep-colour, HDMI Forum SCDC, BT.2020, HDR Static Metadata and an
+explicit 1000/400/0.005-nit mastering envelope. This matters even though the
+GRID virtual scan-out remains 8 bpc: before WGC starts, Arcen independently
+requires `IDXGIOutput6` to report
+`DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`. The link depth stays diagnostic;
+the DWM surface captured upstream is FP16.
+
+Headless EDID mutation remains owned by the display lease. Single-display
+sessions keep the pre-provision recovery journal armed until teardown and
+restore the original topology/EDIDs after the ordinary in-session display
+transaction. HDR enablement is likewise scoped to the exact final
+`(adapter,target)` identities resolved from that lease; an unrelated active HDR
+monitor can neither satisfy the gate nor be toggled by the session.
+
+## Windows FP16 scRGB to ten-bit SDR and HDR10
+
+The WGC buffer is linear scRGB, not an already encoded BT.709 or PQ signal.
+Grading and HDR deliberately use separate transforms.
+
+For Grading, Arcen clamps linear components to `0.0..=1.0`, applies the
+negotiated BT.709 or sRGB OETF, forms BT.709 YCbCr, and writes MSB-aligned
+ten-bit samples. Values above reference white are clipped because the requested
+stream is SDR; they are not mislabeled as HDR.
+
+For HDR, the conversion order is load-bearing:
+
+1. convert linear scRGB/BT.709 primaries to the negotiated linear primaries;
+2. interpret scRGB `1.0` as Windows' 80-nit SDR reference white;
+3. apply the SMPTE ST 2084 inverse EOTF, preserving scRGB values above `1.0`;
+4. form the negotiated nonlinear YCbCr matrix and range; and
+5. store each 10-bit code in the most-significant bits NVENC requires.
+
+Applying an sRGB curve and merely labelling the stream PQ is not HDR: it maps
+ordinary SDR white to PQ peak white and makes the desktop painfully bright.
+Likewise, writing an unshifted code such as `0x0200` where NVENC expects
+`0x8000` collapses neutral chroma towards zero and produces a green frame.
+`ScrgbSdrTransform`, `ScrgbPqTransform`, and the wide-conversion tests pin these
+invariants.
+
+The conversion is a CPU fallback today, but not a per-pixel `powf` path. A
+process-wide table stores the 1023 PQ half-code boundaries, each component uses
+a binary search, and the frame is split across up to eight row workers. On the
+Windows lab, 1800×1130 conversion fell from about 653 ms per fresh frame to
+24.99 ms (40.02 fps) while remaining byte-identical between serial and parallel
+conversion.
+
+## Linux depth-30 capture and the HDR gate
+
+Linux has two deliberately separate native pipelines:
+
+| Requested depth | Capture and staging | Property preserved |
+| --- | --- | --- |
+| 8 bit | NvFBC → CUDA → NVENC | Existing device-to-device path; no host frame copy |
+| 10 bit | XShmGetImage → host RGB10 conversion → CUDA → NVENC | Actual depth-30 source codes |
+
+The split is keyed on bit depth, not transfer. Grading Reference is ten-bit
+BT.709 SDR and needs XShm; otherwise it would receive an eight-bit NvFBC source
+in a ten-bit encode. Conversely, an ordinary eight-bit session never pays the
+XShm or CPU-conversion cost.
+
+X11 defines precision and visual masks, but no desktop HDR composition space
+or HDR metadata protocol. DaVinci Resolve's own Linux manual likewise limits
+native HDR viewers to macOS and Windows. The Xorg provider therefore **does
+not grant PQ or HLG**: an HDR request is resolved to the same HEVC 4:4:4
+10-bit full-range BT.709 contract as Grading Reference, and the Deck reports
+the changed matrix, primaries, and transfer as a permanent colour degradation.
+It must not enter EDR for that session.
+
+Real Linux desktop HDR is reserved for a future color-managed Wayland provider
+that can prove an HDR composition space and capture ten-bit pixels with their
+transfer/primaries metadata. Depth 30 alone is not that proof.
+
+Measured on the Linux GRID V100D lab host:
+
+- Xorg reported root depth 30, 32 bpp, little-endian pixels and MIT-SHM 1.2.
+- A live frame sample contained 95,850 RGB components; 18,124 (18.9%) were
+  outside the 256-value eight-bit expansion grid, proving source precision that
+  an eight-bit capture cannot carry.
+- At 2560×1600 with continuous motion, depth-30 Grading Reference capture
+  sustained 30–31 fps through XShm, host RGB10 conversion/upload, and NVENC.
+- The deployed Pier reports `capture=xshm capture_zero_copy=false`; Deck
+  hardware-decodes the ten-bit 4:4:4 stream as `xf44` while remaining in SDR
+  presentation mode.
+- A separate deployed eight-bit smoke reported
+  `capture=nvfbc capture_zero_copy=true` and decoded `444f`, proving the fast
+  path remained independent.
 
 ## The 10-bit argument, measured
 
@@ -83,9 +234,25 @@ reported separately and must not be conflated.
 Negotiate-best. The Deck states a preference; the host serves the richest plan
 its backend can actually encode and reports precisely what it had to change
 through `PlanDegradation`, which now carries `bit_depth_reduced`,
-`range_changed` and `matrix_changed` alongside the existing fields.
+`range_changed`, `matrix_changed`, `primaries_changed`, and `transfer_changed`
+alongside the existing fields.
 `PlanDegradation::colour_degraded()` separates changes a colourist cares about
 from an fps clamp they may not.
+
+The production Deck exposes four complete presets rather than independent
+performance and colour switches:
+
+| Preset | Contract |
+| --- | --- |
+| Auto | 30 fps, adaptive 4:2:0 8-bit |
+| Speed | 60 fps, adaptive 4:2:0 8-bit |
+| Grading | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 |
+| HDR | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ |
+
+HDR is active only when the host returns PQ. A Linux Xorg Pier resolves the HDR
+request to Grading and the Deck reports that permanent degradation while
+remaining in SDR presentation mode. Legacy Full Colour 4:4:4 8-bit and
+per-axis probe combinations remain developer-only controls.
 
 Depth degrades to the **deepest** depth the backend can serve that is no deeper
 than requested, so a 12-bit request on an NVENC host lands on 10, not on 8.
@@ -106,9 +273,9 @@ than requested, so a 12-bit request on an NVENC host lands on 10, not on 8.
 | `quality_settings` | Consistency echo of the authenticated video request plus audio quality controls; legacy clients still use it as their late request |
 
 For current Decks, codec/colour selection is complete before the first encoder:
-Performance authorizes host-ranked AV1 → HEVC → H.264 while preserving the
-requested colour axes; Full Colour and Grading Reference request HEVC 4:4:4;
-and an explicit variant remains an exact operator pin. Linux/L40S and
+Auto and Speed authorize host-ranked AV1 → HEVC → H.264 for their fixed
+eight-bit contract; Grading and HDR request HEVC 4:4:4 10-bit; and an explicit
+developer variant remains an exact operator pin. Linux/L40S and
 Windows/V100-to-M4 hardware runs prove the first `ServerHello` and the decoded
 frame agree for both ordinary and grading intents.
 
@@ -139,11 +306,11 @@ doing so guarantees two things the old constants only approximated:
 
 ## MSB alignment
 
-Both `NV_ENC_BUFFER_FORMAT_*_10BIT` and CoreVideo's `x`-prefixed formats store
-samples **MSB-aligned** in a 16-bit word: a 10-bit code `v` is stored as
-`v << 6`, giving `0xFFC0` for white, not `0x03FF`. Storing it unshifted
-produces a picture four stops too dark. The shift is derived from the depth in
-one place and pinned by test.
+Both `NV_ENC_BUFFER_FORMAT_*_10BIT` and CoreVideo's ten-bit biplanar formats
+store samples **MSB-aligned** in a 16-bit word: a 10-bit code `v` is stored as
+`v << 6`, giving `0xFFC0` for white, not `0x03FF`. The Deck's live `xf44`
+probe measured neutral chroma at `32768` (`512 << 6`), and the shift is pinned
+by renderer tests.
 
 ## Hardware and OS limits
 
@@ -273,57 +440,28 @@ Linux Rext 10-bit full-range stream therefore reached Deck as the legacy
 The same live Linux stream then delivered `xf44-full`; host READY/hello truth is
 not accepted as evidence without a decoded-frame check.
 
-## Outstanding: the drawable is still 8-bit
+## Deck 10-bit HDR presentation
 
-Everything upstream now works: the host encodes 10-bit 4:4:4 full range, the
-wire carries the colour on every frame, VideoToolbox decodes it, and a WGSL
-shader converts it with the negotiated matrix and range. **The final stage is
-still eight bits**, and it cannot be fixed from inside this crate:
+The Deck leaves egui on its ordinary 8-bit UI surface while rendering video
+into a dedicated `CAMetalLayer`.
+VideoToolbox's native biplanar `CVPixelBuffer` is retained instead of replacing
+it with the CPU BGRA fallback. Metal wraps its luma and interleaved chroma
+planes as `R16Unorm` and `RG16Unorm`, reconstructs the MSB-aligned ten-bit
+codes, and performs the negotiated YCbCr-to-RGB matrix into an
+`RGB10A2Unorm` drawable.
 
-- `wgpu-hal`'s `surface_capabilities()` only conditionally appends
-  `Rgb10a2Unorm`, and only *after* `Bgra8Unorm`.
-- `egui-wgpu` selects the first `Rgba8Unorm`/`Bgra8Unorm` match regardless of
-  what else is offered.
-- `wgpu-hal` then re-asserts `Bgra8Unorm` via `setPixelFormat:` on **every
-  resize**, so even a successful override would not survive.
+For PQ/BT.2020, the layer is tagged `kCGColorSpaceITUR_2100_PQ`, enables
+extended dynamic range and carries HDR10 EDR metadata. Because
+`RGB10A2Unorm` stores normalized PQ signal codes, `CAEDRMetadata` uses Apple's
+required `10_000` optical-output scale: normalized code `1.0` is the ST 2084
+10,000-nit reference peak. The VideoToolbox format description also receives
+the negotiated PQ transfer constant rather than a matrix-derived BT.709
+default, so any pixel-transfer fallback sees the same transfer truth. Ten-bit
+BT.709 remains SDR; EDR is keyed on transfer characteristics, never depth.
+Failure to create the native textures, pipeline, drawable or colour space is
+reported as a typed fallback with a persistent warning for both Grading and
+HDR, rather than silently claiming wide presentation on the 8-bit egui surface.
 
-Verified directly against the vendored `egui-wgpu 0.35.0` source
-(`src/lib.rs`, `preferred_framebuffer_format`, ~line 416): it iterates the
-surface formats and returns the first `Rgba8Unorm` or `Bgra8Unorm`, and only
-falls through to `formats.first()` when **neither** is present. `eframe`'s
-`WgpuConfiguration` exposes `present_mode`, `desired_maximum_frame_latency`,
-`wgpu_setup` and `on_surface_error` — none of which influences format choice.
-
-That fallthrough is the precise unblock: if the Metal surface capabilities did
-not advertise `Bgra8Unorm`, `egui-wgpu` would accept `Rgb10a2Unorm` unchanged.
-So the smallest viable routes are, in increasing order of cost:
-
-1. patch `wgpu-hal` to omit or reorder the 8-bit formats in
-   `surface_capabilities()` (and stop the `setPixelFormat:` reassertion on
-   resize); or
-2. render video into its own `CAMetalLayer` outside `eframe`'s surface
-   management, leaving egui on its 8-bit surface for UI only.
-
-Option 2 is the more honest long-term shape — UI genuinely does not need
-10 bits, and a dedicated video layer also removes egui's compositing from the
-latency path — but both are dependency/architecture decisions rather than
-implementation details.
-
-What *is* done: the `CAMetalLayer`'s `colorspace` is set from the negotiated
-`ColorPrimaries` (sRGB or Display P3), reached by raw `objc2` message sends —
-the same technique `raw-window-metal` uses internally — with six typed
-fail-safe outcomes logged once each rather than per frame. `pixelFormat` is
-deliberately never touched, because `wgpu-hal` owns it.
-
-Getting a true 10-bit drawable requires either a patched/forked `wgpu`, or
-bypassing `eframe`'s surface management for the video layer. That is a
-dependency and architecture decision, not an implementation detail, so it is
-recorded here rather than worked around.
-
-Until then: 10-bit is negotiated, encoded, transported, decoded and converted
-correctly, and is then quantised to 8 bits at presentation. The colour
-*accuracy* work (full range, correct matrix, exact 4:4:4) is fully realised;
-the extra *depth* is not yet visible.
 ## The probe matrix
 
 Uncertainty is resolved by measurement. Every open question is a row that gets
@@ -352,9 +490,10 @@ incoherent, because no encoder Arcen has can produce it.
 
 ## Outstanding
 
-- **The drawable is still 8-bit.** The planar 10-bit frame reaches Deck's
-  WGSL conversion correctly, but `egui-wgpu`/`wgpu-hal` still select and
-  reassert `Bgra8Unorm`; use the two concrete unblock routes documented above.
+- **Linux desktop HDR needs the Wayland provider.** Xorg remains available for
+  genuine 10-bit SDR grading, but PQ/HLG requests are downgraded truthfully.
+  The future provider must prove compositor HDR state plus a ten-bit capture
+  format carrying transfer/primaries metadata before Linux advertises HDR.
 - **4:2:2 is not wired.** NV16/P210 bindings and BGRA conversion are absent,
   so the Blackwell capability question cannot yet be measured.
 - The `rav1e` software tier has a real wrapper

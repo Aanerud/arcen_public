@@ -13,6 +13,11 @@ mutually exclusive modes and never discovers or ranks keychain identities:
   `ARCEN_PROVISIONING_PROFILE`, `ARCEN_CODESIGN_IDENTITY`, and
   `ARCEN_NOTARY_KEYCHAIN_PROFILE`.
 
+The one app contains both presentation pipelines: ordinary SDR video for
+Auto/Speed and a dedicated native ten-bit Metal layer for Grading/HDR. PQ/EDR
+is enabled only when the resolved host transfer remains PQ; no separate HDR
+bundle or entitlement is installed.
+
 The script does not discover, inventory, log, or synthesize profiles, identities, or
 credentials, and never exposes protected profile contents. Before decoding or
 embedding a private snapshot of the profile, a checked-in verifier uses

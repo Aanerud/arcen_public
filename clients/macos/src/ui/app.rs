@@ -138,6 +138,14 @@ pub enum AppScreen {
     Home,
     AddConnection,
     CertificateWarning(ConnectionDraft, CertInfo),
+    /// A *remembered* host identity no longer matches what answered.
+    ///
+    /// Distinct from [`AppScreen::CertificateWarning`], which is the ordinary
+    /// first-use prompt for an unknown host. This one means trust already
+    /// existed and broke, so it never offers plain "trust": the only forward
+    /// move is to forget the old identity deliberately and be re-prompted with
+    /// the new one, which the user then compares as they did the first time.
+    CertificateChanged(ConnectionDraft, crate::ui::trusted_pins::StoredPin),
     Disclaimer(ConnectionDraft, String),
     Credentials(ConnectionDraft),
     Connecting(ConnectionDraft),
@@ -197,10 +205,25 @@ enum CertificateAction {
     TrustAndRemember,
 }
 
+/// What the user chose when a remembered identity turned out not to match.
+///
+/// There is deliberately no "trust the new one" here. Accepting a replacement
+/// in a single click would show the user a fingerprint at the moment they are
+/// most motivated to dismiss it. Forgetting instead drops the stale pin and
+/// nothing more; the next connection raises the ordinary first-use prompt,
+/// where the new fingerprint is displayed for comparison before it is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertificateChangedAction {
+    None,
+    Cancel,
+    ForgetAndReconnect,
+}
+
 /// Which settings panel is showing. Mirrors the reference client's left nav.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     Language,
+    Streaming,
     Displays,
     Microphone,
     Clipboard,
@@ -213,6 +236,7 @@ impl SettingsTab {
     pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsTab::Language => "Language",
+            SettingsTab::Streaming => "Streaming",
             SettingsTab::Displays => "Displays",
             SettingsTab::Microphone => "Microphone",
             SettingsTab::Clipboard => "Clipboard",
@@ -374,6 +398,13 @@ pub enum ColorFidelity {
     /// HEVC 4:4:4 10-bit full range BT.709 -- the grader/VFX-grade target
     /// contract (`arcen_media::VideoConfiguration::grading_reference`).
     GradingReference,
+    /// HEVC 4:4:4 10-bit full range, **PQ over BT.2020** -- the HDR10 ask.
+    ///
+    /// The only preset whose transfer is not an SDR curve, and therefore the
+    /// only one that asks a host to compose, capture and encode the desktop
+    /// wide. `GradingReference` is already 10-bit; depth is not what makes
+    /// this HDR, the transfer is.
+    Hdr10,
 }
 
 impl ColorFidelity {
@@ -382,6 +413,7 @@ impl ColorFidelity {
             ColorFidelity::Standard => "standard",
             ColorFidelity::FullColour => "full_colour",
             ColorFidelity::GradingReference => "grading_reference",
+            ColorFidelity::Hdr10 => "hdr10",
         }
     }
 
@@ -389,6 +421,7 @@ impl ColorFidelity {
         match value {
             "full_colour" => ColorFidelity::FullColour,
             "grading_reference" => ColorFidelity::GradingReference,
+            "hdr10" => ColorFidelity::Hdr10,
             _ => ColorFidelity::Standard,
         }
     }
@@ -400,7 +433,13 @@ impl ColorFidelity {
             ColorFidelity::Standard => "Automatic performance codec, 4:2:0 8-bit limited range",
             ColorFidelity::FullColour => "4:4:4 8-bit full range -- no chroma subsampling",
             ColorFidelity::GradingReference => {
-                "4:4:4 10-bit full range BT.709 -- best image quality, with added latency"
+                "4:4:4 10-bit full range, BT.709 -- highest-fidelity SDR. The extra depth \
+                 absorbs rounding, not brightness; added latency"
+            }
+            ColorFidelity::Hdr10 => {
+                "4:4:4 10-bit, PQ over BT.2020 -- asks the host to compose, capture and \
+                 stream in HDR. Hosts without a proven HDR desktop provider visibly degrade \
+                 to Grading Reference SDR"
             }
         }
     }
@@ -411,8 +450,9 @@ impl ColorFidelity {
     fn title(self) -> &'static str {
         match self {
             ColorFidelity::Standard => "Standard (Adaptive)",
-            ColorFidelity::FullColour => "Full Colour",
-            ColorFidelity::GradingReference => "Grading Reference",
+            ColorFidelity::FullColour => "Full Colour (SDR)",
+            ColorFidelity::GradingReference => "Grading Reference (SDR)",
+            ColorFidelity::Hdr10 => "HDR10 (wide)",
         }
     }
 
@@ -421,7 +461,7 @@ impl ColorFidelity {
     /// quality; ordinary and full-colour work remain latency-first.
     const fn encode_intent(self) -> arcen_media::EncodeIntent {
         match self {
-            Self::GradingReference => arcen_media::EncodeIntent::Quality,
+            Self::GradingReference | Self::Hdr10 => arcen_media::EncodeIntent::Quality,
             Self::Standard | Self::FullColour => arcen_media::EncodeIntent::Interactive,
         }
     }
@@ -442,6 +482,15 @@ impl ColorFidelity {
                 transfer: arcen_media::TransferCharacteristics::Bt709,
             },
             ColorFidelity::GradingReference => arcen_media::VideoConfiguration::grading_reference(),
+            ColorFidelity::Hdr10 => arcen_media::VideoConfiguration {
+                codec: arcen_media::VideoCodec::H265,
+                chroma: arcen_media::ChromaSubsampling::Yuv444,
+                bit_depth: arcen_media::BitDepth::Ten,
+                range: arcen_media::ColorRange::Full,
+                matrix: arcen_media::ColorMatrix::Bt2020Ncl,
+                primaries: arcen_media::ColorPrimaries::Bt2020,
+                transfer: arcen_media::TransferCharacteristics::Pq,
+            },
         }
     }
 }
@@ -526,7 +575,7 @@ impl ColorFidelitySettings {
             ColorFidelity::Standard => {
                 arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
             }
-            ColorFidelity::FullColour | ColorFidelity::GradingReference => {
+            ColorFidelity::FullColour | ColorFidelity::GradingReference | ColorFidelity::Hdr10 => {
                 arcen_protocol::messages::VideoSelectionIntent::ColorFidelity
             }
         }
@@ -554,6 +603,87 @@ impl ColorFidelitySettings {
         }
         let configuration = self.overrides.apply_to(self.preset.preset_configuration());
         arcen_media::video::VideoVariant::new(configuration)
+    }
+}
+
+/// The four ordinary streaming choices shown by the Deck.
+///
+/// The persisted performance and colour settings remain separate for
+/// backwards compatibility and for developer-only axis overrides. This type
+/// is the simple product surface that maps each user choice to one complete,
+/// coherent pair of settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingPreset {
+    Auto,
+    Speed,
+    Grading,
+    Hdr,
+    Custom,
+}
+
+impl StreamingPreset {
+    const PRIMARY: [Self; 4] = [Self::Auto, Self::Speed, Self::Grading, Self::Hdr];
+
+    fn from_settings(
+        performance: PerformanceMode,
+        color: ColorFidelitySettings,
+    ) -> StreamingPreset {
+        if color.overrides != ColorFidelityOverrides::default() || color.variant_override.is_some()
+        {
+            return Self::Custom;
+        }
+        match (performance, color.preset) {
+            (PerformanceMode::Standard, ColorFidelity::Standard) => Self::Auto,
+            (PerformanceMode::High | PerformanceMode::HighLegacy, ColorFidelity::Standard) => {
+                Self::Speed
+            }
+            (PerformanceMode::Standard, ColorFidelity::GradingReference) => Self::Grading,
+            (PerformanceMode::Standard, ColorFidelity::Hdr10) => Self::Hdr,
+            _ => Self::Custom,
+        }
+    }
+
+    fn apply_to(self, performance: &mut PerformanceMode, color: &mut ColorFidelitySettings) {
+        let (next_performance, next_color) = match self {
+            Self::Auto => (PerformanceMode::Standard, ColorFidelity::Standard),
+            Self::Speed => (PerformanceMode::High, ColorFidelity::Standard),
+            Self::Grading => (PerformanceMode::Standard, ColorFidelity::GradingReference),
+            Self::Hdr => (PerformanceMode::Standard, ColorFidelity::Hdr10),
+            Self::Custom => return,
+        };
+        *performance = next_performance;
+        *color = ColorFidelitySettings {
+            preset: next_color,
+            overrides: ColorFidelityOverrides::default(),
+            variant_override: None,
+        };
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Speed => "Speed",
+            Self::Grading => "Grading",
+            Self::Hdr => "HDR",
+            Self::Custom => "Custom",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Auto => "30 fps, adaptive 4:2:0 8-bit. The Pier chooses the best usable codec.",
+            Self::Speed => {
+                "60 fps, adaptive 4:2:0 8-bit. Prioritises responsiveness and GPU-only capture."
+            }
+            Self::Grading => {
+                "30 fps HEVC 4:4:4 10-bit BT.709. Highest-fidelity SDR with a genuine wide source."
+            }
+            Self::Hdr => {
+                "30 fps HEVC 4:4:4 10-bit PQ/BT.2020. Activates only when the Pier proves a real \
+                 HDR desktop; otherwise it degrades visibly to Grading SDR."
+            }
+            Self::Custom => "Developer-defined streaming configuration.",
+        }
     }
 }
 
@@ -593,8 +723,8 @@ fn stream_profile_video_variant(
         bit_depth: arcen_media::BitDepth::from_token(&profile.bit_depth)?,
         range: arcen_media::ColorRange::from_token(&profile.color_range)?,
         matrix: arcen_media::ColorMatrix::from_token(&profile.color_matrix)?,
-        primaries: arcen_media::ColorPrimaries::Bt709,
-        transfer: arcen_media::TransferCharacteristics::Bt709,
+        primaries: arcen_media::ColorPrimaries::from_token(&profile.color_primaries)?,
+        transfer: arcen_media::TransferCharacteristics::from_token(&profile.transfer)?,
     };
     Some(arcen_media::video::VideoVariant::new(configuration))
 }
@@ -1300,6 +1430,13 @@ fn display_fit_gate(
     frame_fresh: bool,
 ) -> bool {
     policy.follows_window() && host_supports_display_update && in_session && frame_fresh
+}
+
+const VIDEO_STALL_OVERLAY_AFTER: Duration = Duration::from_secs(4);
+
+fn video_stream_stalled(last_presented_at: Option<Instant>, now: Instant) -> bool {
+    last_presented_at
+        .is_some_and(|last| now.saturating_duration_since(last) >= VIDEO_STALL_OVERLAY_AFTER)
 }
 
 /// How long to keep re-pinning a notch-covering window to the screen frame.
@@ -2201,6 +2338,12 @@ pub struct ArcenApp {
     /// identity has changed fails terminally instead of re-asking a question
     /// the user has already answered.
     remembered_tls_pins: crate::ui::trusted_pins::TrustedPinStore,
+    /// Ticked by the user on the changed-identity screen.
+    ///
+    /// Held on the app rather than inside the modal so the modal stays a pure
+    /// renderer, and so the tick is cleared whenever that screen is entered or
+    /// left — a confirmation must never survive from one incident to the next.
+    certificate_change_acknowledged: bool,
     pending_connection: Option<ConnectionDraft>,
     last_audio_queued_ms: usize,
     remember_username: bool,
@@ -2658,10 +2801,11 @@ impl ArcenApp {
             connection_search: String::new(),
             accepted_tls_pins: Arc::new(Mutex::new(HashMap::new())),
             remembered_tls_pins,
+            certificate_change_acknowledged: false,
             pending_connection: None,
             last_audio_queued_ms: 0,
             remember_username: true,
-            settings_tab: SettingsTab::Language,
+            settings_tab: SettingsTab::Streaming,
             #[cfg(feature = "usb-hard-lab")]
             usb_helper_state: None,
             #[cfg(feature = "usb-hard-lab")]
@@ -3194,6 +3338,30 @@ impl eframe::App for ArcenApp {
                                 self.trust_certificate_permanently(&draft, &info);
                                 let preloaded_auth = self.deferred_auth.take();
                                 self.start_connection(draft, preloaded_auth, ui.ctx());
+                            }
+                        }
+                    }
+                    AppScreen::CertificateChanged(draft, remembered) => {
+                        let endpoint = connection_endpoint(&draft);
+                        match self.certificate_changed_modal(ui, &endpoint, &remembered) {
+                            CertificateChangedAction::None => {
+                                self.screen = AppScreen::CertificateChanged(draft, remembered);
+                            }
+                            CertificateChangedAction::Cancel => {
+                                self.certificate_change_acknowledged = false;
+                                self.status = "Connection cancelled; this host is still \
+                                               trusted under its previous identity."
+                                    .to_string();
+                                self.screen = AppScreen::Home;
+                            }
+                            CertificateChangedAction::ForgetAndReconnect => {
+                                self.certificate_change_acknowledged = false;
+                                self.forget_remembered_identity(&endpoint);
+                                // Back to Home rather than straight into a
+                                // dial. Reconnecting is the user's second
+                                // deliberate act, and it is the one that shows
+                                // them the replacement fingerprint.
+                                self.screen = AppScreen::Home;
                             }
                         }
                     }
@@ -4019,6 +4187,8 @@ impl ArcenApp {
         self.video_packet_times.clear();
         self.upload_ms_samples.clear();
         self.decode_ms_samples.clear();
+        self.last_decode_at = None;
+        self.last_presented_at = None;
         self.last_wire_frame_age_ms = None;
         self.last_decode_error = None;
         self.media_inbox = IncomingMediaTelemetry::default();
@@ -6806,6 +6976,10 @@ impl ArcenApp {
             }
         }
 
+        // Computed before `end.message` can be moved into the reconnect
+        // scheduler below.
+        let tofu_pin_mismatch = crate::transport::tls::is_tofu_pin_mismatch_message(&end.message);
+
         if end.transient() {
             if let Some(controller) = self
                 .reconnect
@@ -6844,11 +7018,77 @@ impl ArcenApp {
             }
             self.reconnect = None;
             self.reconnect_options = None;
-            self.active_connection = None;
+            let draft = self.active_connection.take();
+
+            // Offer the recovery only for an identity this Deck chose to
+            // remember. A pin supplied by configuration is someone else's
+            // assertion about the host, and the Deck must not offer to discard
+            // it; a session-only pin evaporates on quit and needs no UI. Both
+            // still fail closed, exactly as before.
+            if tofu_pin_mismatch {
+                if let Some(draft) = draft {
+                    let endpoint = connection_endpoint(&draft);
+                    let configured_pin = draft.tls_trust.is_some();
+                    let remembered = self.remembered_tls_pins.pins.get(&endpoint).cloned();
+                    if let (false, Some(remembered)) = (configured_pin, remembered) {
+                        tracing::warn!(
+                            target: crate::logging::target::UI,
+                            %endpoint,
+                            remembered_fingerprint = %remembered.digest,
+                            "a remembered host identity no longer matches; offering to forget it",
+                        );
+                        self.certificate_change_acknowledged = false;
+                        self.status = "This host's identity changed.".to_string();
+                        self.screen = AppScreen::CertificateChanged(draft, remembered);
+                        return;
+                    }
+                }
+            }
             self.screen = AppScreen::Home;
             return;
         }
         self.return_to_credentials();
+    }
+
+    /// Drops the remembered identity for `endpoint` and persists the removal.
+    ///
+    /// Deliberately does not trust anything in its place. The next connection
+    /// finds no pin, runs the ordinary first-use path, and shows the new
+    /// fingerprint for comparison before the user commits to it.
+    fn forget_remembered_identity(&mut self, endpoint: &str) {
+        if !self.remembered_tls_pins.forget(endpoint) {
+            return;
+        }
+        // The session cache would otherwise re-assert the identity that was
+        // just forgotten, and the retry would fail closed all over again.
+        self.accepted_tls_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(endpoint);
+
+        let Some(path) = self.config_repository.trusted_pins_file() else {
+            self.status = "Forgotten for this session only: the settings folder is \
+                           unavailable."
+                .to_string();
+            return;
+        };
+        if let Err(error) = crate::ui::trusted_pins::save(&path, &self.remembered_tls_pins) {
+            tracing::warn!(
+                target: crate::logging::target::UI,
+                %endpoint,
+                %error,
+                "could not persist forgetting this host's identity",
+            );
+            self.status =
+                "Forgotten for this session only: the change could not be saved.".to_string();
+        } else {
+            tracing::info!(
+                target: crate::logging::target::UI,
+                %endpoint,
+                "forgot this host's remembered identity at the user's request",
+            );
+            self.status = "Host identity forgotten. Reconnect to verify the new one.".to_string();
+        }
     }
 
     /// Certificate warning rendered as a centred modal overlay.
@@ -6985,6 +7225,150 @@ impl ArcenApp {
                         .clicked()
                     {
                         action = CertificateAction::Cancel;
+                    }
+                });
+            });
+        action
+    }
+
+    /// Shown when a *remembered* identity no longer matches what answered.
+    ///
+    /// Presents the fingerprint this Deck trusted and when it was trusted, and
+    /// names both explanations without ranking them — the benign one (the host
+    /// was reinstalled or its certificate was regenerated) and the one the
+    /// mechanism exists to catch. The action is gated behind an explicit tick
+    /// so that clearing trust cannot be done by reflex.
+    fn certificate_changed_modal(
+        &mut self,
+        ui: &mut egui::Ui,
+        endpoint: &str,
+        remembered: &crate::ui::trusted_pins::StoredPin,
+    ) -> CertificateChangedAction {
+        let mut action = CertificateChangedAction::None;
+        let screen = ui.clip_rect();
+        ui.painter()
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+
+        let danger = egui::Color32::from_rgb(0xC0, 0x39, 0x2B);
+        let remembered_display = remembered
+            .to_pin()
+            .map(|pin| crate::transport::tls::format_fingerprint(&pin.digest))
+            .unwrap_or_else(|| remembered.digest.clone());
+
+        egui::Window::new("cert_changed_modal")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([560.0, 0.0])
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.5, danger))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::symmetric(36, 30)),
+            )
+            .show(ui.ctx(), |ui| {
+                ui.set_width(488.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⛔").color(danger).size(28.0));
+                    ui.add_space(10.0);
+                    ui.heading(
+                        egui::RichText::new("This host's identity changed")
+                            .color(egui::Color32::BLACK)
+                            .size(22.0),
+                    );
+                });
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Arcen remembered this host's certificate, and the server that \
+                         answered presented a different one. Arcen refused to send your \
+                         credentials.",
+                    )
+                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
+                    .size(14.0),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(
+                        "This happens when the Pier is reinstalled or its certificate is \
+                         regenerated — and it is also what interception looks like. Confirm \
+                         with whoever runs the host before continuing.",
+                    )
+                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
+                    .size(14.0),
+                );
+                ui.add_space(16.0);
+
+                let mono_color = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+                for (label, value) in [
+                    ("Endpoint", endpoint.to_string()),
+                    (
+                        "Trusted as",
+                        remembered.label.clone().unwrap_or_else(|| "—".to_string()),
+                    ),
+                    (
+                        "Trusted on",
+                        remembered
+                            .pinned_at
+                            .clone()
+                            .unwrap_or_else(|| "—".to_string()),
+                    ),
+                    ("Remembered SPKI", remembered_display.clone()),
+                ] {
+                    ui.label(
+                        egui::RichText::new(format!("{label}   {value}"))
+                            .color(mono_color)
+                            .monospace()
+                            .size(12.5),
+                    );
+                }
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Forgetting does not trust the new certificate. The next connection \
+                         will show it to you for comparison first.",
+                    )
+                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
+                    .size(13.0),
+                );
+                ui.add_space(14.0);
+                ui.checkbox(
+                    &mut self.certificate_change_acknowledged,
+                    egui::RichText::new(
+                        "I confirmed with the host administrator that its certificate changed",
+                    )
+                    .color(egui::Color32::BLACK)
+                    .size(13.0),
+                );
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    let armed = self.certificate_change_acknowledged;
+                    if ui
+                        .add_enabled(
+                            armed,
+                            egui::Button::new(
+                                egui::RichText::new("Forget This Identity")
+                                    .color(egui::Color32::WHITE)
+                                    .size(14.0),
+                            )
+                            .fill(danger)
+                            .min_size(egui::vec2(196.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        action = CertificateChangedAction::ForgetAndReconnect;
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Cancel").size(14.0))
+                                .min_size(egui::vec2(96.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        action = CertificateChangedAction::Cancel;
                     }
                 });
             });
@@ -7758,6 +8142,8 @@ impl ArcenApp {
         let mut security = self.security_mode;
         let mut performance = self.performance_mode;
         let mut color_fidelity = self.color_fidelity;
+        let initial_streaming_preset = StreamingPreset::from_settings(performance, color_fidelity);
+        let mut streaming_preset = initial_streaming_preset;
         let mut displays = self.displays_mode;
         let mut hidpi = self.hidpi_streaming;
         let mut use_notch_area = self.fullscreen_uses_notch_area;
@@ -7838,7 +8224,11 @@ impl ArcenApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         settings_nav_section_label(ui, "GENERAL");
-                        for item in [SettingsTab::Language, SettingsTab::Displays] {
+                        for item in [
+                            SettingsTab::Language,
+                            SettingsTab::Streaming,
+                            SettingsTab::Displays,
+                        ] {
                             if settings_nav_item(ui, item.label(), item == tab, accent) {
                                 tab = item;
                             }
@@ -7906,6 +8296,48 @@ impl ArcenApp {
                             .show_ui(ui, |ui| {
                                 let _ = ui.selectable_label(true, "English (US)");
                             });
+                    }
+                    SettingsTab::Streaming => {
+                        ui.label(
+                            egui::RichText::new("Streaming")
+                                .color(heading_col)
+                                .size(30.0),
+                        );
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Choose the result you need. Each preset fixes frame rate, colour \
+                                 fidelity, and encoder intent together so the request cannot \
+                                 become an accidental combination of unrelated switches.",
+                            )
+                            .color(egui::Color32::DARK_GRAY),
+                        );
+                        ui.add_space(16.0);
+                        for preset in StreamingPreset::PRIMARY {
+                            settings_radio(
+                                ui,
+                                &mut streaming_preset,
+                                preset,
+                                (preset == StreamingPreset::Auto).then_some("(Default)"),
+                                preset.title(),
+                                preset.description(),
+                            );
+                        }
+                        if streaming_preset != initial_streaming_preset {
+                            streaming_preset.apply_to(&mut performance, &mut color_fidelity);
+                        }
+                        if initial_streaming_preset == StreamingPreset::Custom
+                            && streaming_preset == StreamingPreset::Custom
+                        {
+                            ui.label(
+                                egui::RichText::new(
+                                    "A developer-defined configuration is active. Choose one of \
+                                     the four presets above to return to the supported product \
+                                     surface.",
+                                )
+                                .color(theme::DANGER),
+                            );
+                        }
                     }
                     SettingsTab::Displays => {
                         ui.label(
@@ -8248,15 +8680,53 @@ impl ArcenApp {
                         );
                     }
                     SettingsTab::Input => {
-                        // One surface owns every input decision. Tablet
-                        // mode and non-HID USB forwarding used to live in
-                        // two different tabs, and the tab named for USB
-                        // was the one that did *not* control the tablet
-                        // bridge, which reliably sent people to the wrong
-                        // place.
-                        ui.add_space(20.0);
                         ui.label(
                             egui::RichText::new("Input")
+                                .color(egui::Color32::BLACK)
+                                .size(30.0),
+                        );
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Mouse, keyboard, and tablet input are sent to the remote \
+                                 computer. Cursor rendering only chooses where the pointer is \
+                                 drawn; it never turns remote mouse control off.",
+                            )
+                            .color(egui::Color32::DARK_GRAY),
+                        );
+                        ui.add_space(24.0);
+                        ui.label(
+                            egui::RichText::new("Pointer and cursor")
+                                .color(egui::Color32::BLACK)
+                                .size(19.0),
+                        );
+                        ui.add_space(10.0);
+                        settings_radio(
+                            ui,
+                            &mut cursor_preference,
+                            CursorMode::Local,
+                            Some("(Recommended)"),
+                            "Client-rendered cursor",
+                            "Your mouse controls Windows while Arcen Deck draws the pointer \
+                             locally for immediate response. Works with every host.",
+                        );
+                        settings_radio(
+                            ui,
+                            &mut cursor_preference,
+                            CursorMode::Host,
+                            None,
+                            "Cursor in remote video",
+                            "Your mouse still controls Windows, but the host draws the pointer \
+                             into the captured video. This can feel less responsive and depends \
+                             on the capture backend including the cursor.",
+                        );
+                        ui.add_space(24.0);
+                        // One surface owns every input decision. Tablet mode
+                        // and non-HID USB forwarding used to live in two
+                        // different tabs, and the tab named for USB was the
+                        // one that did *not* control the tablet bridge.
+                        ui.label(
+                            egui::RichText::new("Tablet")
                                 .color(egui::Color32::BLACK)
                                 .size(19.0),
                         );
@@ -8507,105 +8977,65 @@ impl ArcenApp {
                             "Security mode - Low",
                             "No certificate verification required to connect.",
                         );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Performance mode")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Performance mode sets the frame-rate ceiling. With Standard \
-                                 colour fidelity, the Pier automatically selects the best usable \
-                                 codec on an operator-approved adapter.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(12.0);
-                        settings_radio(
-                            ui,
-                            &mut performance,
-                            PerformanceMode::Standard,
-                            Some("(Default)"),
-                            "Standard performance",
-                            "30 fps ceiling. Trades peak smoothness for a steadier cadence at \
-                             lower bandwidth. Suitable for software with low performance \
-                             requirements, such as task workers, web browsers, or office \
-                             applications.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut performance,
-                            PerformanceMode::High,
-                            None,
-                            "High performance",
-                            "60 fps ceiling. Suitable for 3D modelling, compositing, and \
-                             visual effects, provided Colour fidelity below is set to a \
-                             preset or Advanced combination the host can serve.",
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Colour fidelity")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Colour fidelity sets chroma, bit depth, range and matrix. \
-                                 The Pier selects the compatible codec automatically. Grading \
-                                 Reference also enables the encoder's best-image mode.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(12.0);
-                        settings_radio(
-                            ui,
-                            &mut color_fidelity.preset,
-                            ColorFidelity::Standard,
-                            Some("(Default)"),
-                            ColorFidelity::Standard.title(),
-                            ColorFidelity::Standard.describe(),
-                        );
-                        settings_radio(
-                            ui,
-                            &mut color_fidelity.preset,
-                            ColorFidelity::FullColour,
-                            None,
-                            ColorFidelity::FullColour.title(),
-                            ColorFidelity::FullColour.describe(),
-                        );
-                        settings_radio(
-                            ui,
-                            &mut color_fidelity.preset,
-                            ColorFidelity::GradingReference,
-                            None,
-                            ColorFidelity::GradingReference.title(),
-                            ColorFidelity::GradingReference.describe(),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Grading Reference is measured to be numerically lossless for \
-                                 8-bit desktop content: the extra two bits of depth absorb the \
-                                 RGB-to-YCbCr rounding error that an 8-bit encode cannot, so \
-                                 the round trip back to RGB is exact -- at a fraction of the \
-                                 bitrate of a truly lossless encode. That measured exactness, \
-                                 not a preference for \"more bits\", is why a colourist would \
-                                 pick it.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
                         if cfg!(feature = "dev-tools") {
                             ui.add_space(16.0);
                             egui::CollapsingHeader::new(
-                            egui::RichText::new("Advanced: per-axis overrides")
-                                .color(egui::Color32::BLACK)
-                                .size(16.0),
-                        )
-                        .id_salt("color_fidelity_advanced")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                                egui::RichText::new("Advanced: streaming overrides")
+                                    .color(egui::Color32::BLACK)
+                                    .size(16.0),
+                            )
+                            .id_salt("color_fidelity_advanced")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Frame-rate ceiling")
+                                        .color(egui::Color32::BLACK),
+                                );
+                                egui::ComboBox::from_id_salt("streaming_performance_override")
+                                    .selected_text(match performance {
+                                        PerformanceMode::Standard => "30 fps",
+                                        PerformanceMode::High | PerformanceMode::HighLegacy => {
+                                            "60 fps"
+                                        }
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut performance,
+                                            PerformanceMode::Standard,
+                                            "30 fps",
+                                        );
+                                        ui.selectable_value(
+                                            &mut performance,
+                                            PerformanceMode::High,
+                                            "60 fps",
+                                        );
+                                    });
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("Base colour contract")
+                                        .color(egui::Color32::BLACK),
+                                );
+                                egui::ComboBox::from_id_salt("color_fidelity_preset_override")
+                                    .selected_text(color_fidelity.preset.title())
+                                    .show_ui(ui, |ui| {
+                                        for preset in [
+                                            ColorFidelity::Standard,
+                                            ColorFidelity::FullColour,
+                                            ColorFidelity::GradingReference,
+                                            ColorFidelity::Hdr10,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut color_fidelity.preset,
+                                                preset,
+                                                preset.title(),
+                                            );
+                                        }
+                                    });
+                                ui.label(
+                                    egui::RichText::new(color_fidelity.preset.describe())
+                                        .color(egui::Color32::DARK_GRAY),
+                                );
+                                ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new(
                                     "Pin individual axes on top of the preset above. Each \
@@ -8792,32 +9222,6 @@ impl ArcenApp {
                                 );
                             }
                         }
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Cursor rendering")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Local,
-                            Some("(Default)"),
-                            "Local cursor",
-                            "Render the responsive synthetic cursor in Arcen Deck. Compatible with \
-                             every host and older peers.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Host,
-                            None,
-                            "Host cursor",
-                            "Include the host cursor in captured video. The Deck keeps local \
-                             authority until the host confirms support; changing this setting \
-                             takes effect on the next connection.",
-                        );
                     }
                     }
                 });
@@ -9235,6 +9639,12 @@ impl ArcenApp {
         options.profile.bit_depth = effective_color_fidelity.video.bit_depth.token().to_string();
         options.profile.color_range = effective_color_fidelity.video.range.token().to_string();
         options.profile.color_matrix = effective_color_fidelity.video.matrix.token().to_string();
+        // The two axes that carry an HDR ask. They come from the same resolved
+        // variant as the others, so a preset cannot advertise HDR primaries
+        // while streaming an SDR transfer.
+        options.profile.transfer = effective_color_fidelity.video.transfer.token().to_string();
+        options.profile.color_primaries =
+            effective_color_fidelity.video.primaries.token().to_string();
         options.profile.video_selection = self.color_fidelity.video_selection();
         options.profile.max_fps = self.performance_mode.max_fps();
         options.profile.encode_intent = self
@@ -9713,7 +10123,7 @@ impl ArcenApp {
         // w5-negotiated-truth: degradation is never gated behind the detail
         // panel, but exact sessions do not need a permanent on-video badge.
         self.paint_negotiated_truth_badge(ui, rect);
-        self.paint_grading_reference_presentation_warning(ui, rect, dedicated_presentation);
+        self.paint_wide_presentation_warning(ui, rect, dedicated_presentation);
         if self.negotiated_truth_panel_open {
             self.paint_negotiated_truth_panel(ui, rect);
         }
@@ -9722,7 +10132,7 @@ impl ArcenApp {
             self.paint_exactness_readout_panel(ui, rect);
         }
 
-        if self.last_wire_frame_age_ms.is_some_and(|ms| ms >= 4_000)
+        if video_stream_stalled(self.last_presented_at, Instant::now())
             && self.remote_texture.is_some()
         {
             ui.painter()
@@ -9730,7 +10140,7 @@ impl ArcenApp {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Lost connection, attempting to reconnect",
+                "Video stream stalled",
                 egui::FontId::proportional(20.0),
                 egui::Color32::WHITE,
             );
@@ -10140,19 +10550,17 @@ impl ArcenApp {
         );
     }
 
-    /// Keeps a 10-bit presentation fallback visible for the whole frame in
+    /// Keeps any wide-presentation fallback visible for the whole frame in
     /// which it occurs. This is intentionally independent of negotiated
-    /// colour truth: a Grading Reference stream can negotiate exactly and
-    /// still be displayed through the 8-bit egui surface.
-    fn paint_grading_reference_presentation_warning(
+    /// colour truth: Grading or HDR can negotiate exactly and still be
+    /// displayed through the 8-bit egui surface.
+    fn paint_wide_presentation_warning(
         &self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
         presentation: DedicatedPresentationStatus,
     ) {
-        if self.color_fidelity.preset != ColorFidelity::GradingReference
-            || !presentation.is_eight_bit_fallback()
-        {
+        if !presentation.is_eight_bit_fallback() {
             return;
         }
         let Some(reason) = presentation.fallback_reason() else {
@@ -10171,7 +10579,8 @@ impl ArcenApp {
             warning.center(),
             egui::Align2::CENTER_CENTER,
             format!(
-                "Grading Reference warning: RGB10A2Unorm unavailable; rendering 8-bit fallback ({reason:?})"
+                "Wide-colour warning: RGB10A2Unorm unavailable; rendering 8-bit fallback \
+                 ({reason:?})"
             ),
             egui::FontId::proportional(13.0),
             theme::DANGER,
@@ -12336,6 +12745,11 @@ fn initial_stream_profile() -> crate::transport::websocket::StreamProfile {
         bit_depth: flag("--bit-depth").unwrap_or_else(|| "8".to_string()),
         color_range: flag("--color-range").unwrap_or_else(|| "full".to_string()),
         color_matrix: flag("--color-matrix").unwrap_or_else(|| "bt709".to_string()),
+        // SDR by default. `--transfer pq` is the deliberate HDR ask; nothing
+        // else in this builder implies it, so a 10-bit launch flag still gets
+        // an ordinary BT.709 stream.
+        transfer: flag("--transfer").unwrap_or_else(|| "bt709".to_string()),
+        color_primaries: flag("--color-primaries").unwrap_or_else(|| "bt709".to_string()),
         // Latency-first unless asked otherwise: a launch flag is the only
         // way this default moves, since the GUI's own setting overwrites
         // the whole profile before any real connection.
@@ -15040,6 +15454,20 @@ mod tests {
             true,
             true,
             false
+        ));
+    }
+
+    #[test]
+    fn video_stall_overlay_uses_local_presentation_time_only() {
+        let now = Instant::now();
+        assert!(!video_stream_stalled(None, now));
+        assert!(!video_stream_stalled(
+            Some(now - Duration::from_secs(3)),
+            now
+        ));
+        assert!(video_stream_stalled(
+            Some(now - Duration::from_secs(4)),
+            now
         ));
     }
 
@@ -19427,6 +19855,58 @@ mod tests {
         assert_eq!(options.displays_mode, "windowed");
     }
 
+    /// The HDR10 preset must be the only one whose transfer is not an SDR
+    /// curve. If another preset ever asks for PQ, a host would apply an HDR
+    /// EDID and tone map for a stream that carries no HDR content.
+    #[test]
+    fn hdr10_is_the_only_preset_that_asks_for_a_wide_transfer() {
+        for preset in [
+            ColorFidelity::Standard,
+            ColorFidelity::FullColour,
+            ColorFidelity::GradingReference,
+        ] {
+            let configuration = preset.preset_configuration();
+            assert_ne!(
+                configuration.transfer,
+                arcen_media::TransferCharacteristics::Pq,
+                "{} must not ask for PQ",
+                preset.title()
+            );
+            assert_ne!(
+                configuration.primaries,
+                arcen_media::ColorPrimaries::Bt2020,
+                "{} must not ask for BT.2020 primaries",
+                preset.title()
+            );
+        }
+
+        let hdr = ColorFidelity::Hdr10.preset_configuration();
+        assert_eq!(hdr.transfer, arcen_media::TransferCharacteristics::Pq);
+        assert_eq!(hdr.primaries, arcen_media::ColorPrimaries::Bt2020);
+        assert_eq!(hdr.matrix, arcen_media::ColorMatrix::Bt2020Ncl);
+        assert_eq!(hdr.bit_depth, arcen_media::BitDepth::Ten);
+    }
+
+    /// Grading Reference is 10-bit too. Depth is not what separates them, so
+    /// a host keying on depth would treat a grading session as HDR.
+    #[test]
+    fn depth_alone_does_not_distinguish_hdr_from_grading() {
+        let grading = ColorFidelity::GradingReference.preset_configuration();
+        let hdr = ColorFidelity::Hdr10.preset_configuration();
+        assert_eq!(grading.bit_depth, hdr.bit_depth);
+        assert_ne!(grading.transfer, hdr.transfer);
+    }
+
+    #[test]
+    fn the_hdr_preset_survives_a_settings_round_trip() {
+        assert_eq!(
+            ColorFidelity::from_key(ColorFidelity::Hdr10.key()),
+            ColorFidelity::Hdr10
+        );
+        // An unknown key must still fall back to the conservative default.
+        assert_eq!(ColorFidelity::from_key("nonsense"), ColorFidelity::Standard);
+    }
+
     #[test]
     fn effective_color_fidelity_variant_passes_through_a_coherent_resolution() {
         // Every preset alone is coherent (pinned by
@@ -19979,7 +20459,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("ARCEN_LOG_DIR", &logs);
 
-        crate::logging::init(crate::logging::default_profile()).expect("Deck logging initializes");
+        crate::logging::init(crate::logging::startup_profile()).expect("Deck logging initializes");
         let first = crate::logging::trigger_proof_for_test().expect("initial process proof");
         let app = ArcenApp::from_config_repository(ClientConfigRepository::at(config.clone()));
         let second = crate::logging::trigger_proof_for_test().expect("proof after GUI default");
@@ -21373,6 +21853,75 @@ mod tests {
     }
 
     #[test]
+    fn streaming_presets_map_to_complete_supported_settings() {
+        let cases = [
+            (
+                StreamingPreset::Auto,
+                PerformanceMode::Standard,
+                ColorFidelity::Standard,
+            ),
+            (
+                StreamingPreset::Speed,
+                PerformanceMode::High,
+                ColorFidelity::Standard,
+            ),
+            (
+                StreamingPreset::Grading,
+                PerformanceMode::Standard,
+                ColorFidelity::GradingReference,
+            ),
+            (
+                StreamingPreset::Hdr,
+                PerformanceMode::Standard,
+                ColorFidelity::Hdr10,
+            ),
+        ];
+
+        for (preset, expected_performance, expected_color) in cases {
+            let mut performance = PerformanceMode::HighLegacy;
+            let mut color = ColorFidelitySettings {
+                preset: ColorFidelity::FullColour,
+                overrides: ColorFidelityOverrides {
+                    bit_depth: Some(arcen_media::BitDepth::Twelve),
+                    ..ColorFidelityOverrides::default()
+                },
+                variant_override: None,
+            };
+            preset.apply_to(&mut performance, &mut color);
+
+            assert_eq!(performance, expected_performance);
+            assert_eq!(color.preset, expected_color);
+            assert_eq!(color.overrides, ColorFidelityOverrides::default());
+            assert_eq!(color.variant_override, None);
+            assert_eq!(StreamingPreset::from_settings(performance, color), preset);
+        }
+    }
+
+    #[test]
+    fn legacy_or_developer_stream_combinations_are_reported_as_custom() {
+        let full_colour = ColorFidelitySettings {
+            preset: ColorFidelity::FullColour,
+            ..ColorFidelitySettings::default()
+        };
+        assert_eq!(
+            StreamingPreset::from_settings(PerformanceMode::Standard, full_colour),
+            StreamingPreset::Custom
+        );
+
+        let overridden = ColorFidelitySettings {
+            overrides: ColorFidelityOverrides {
+                range: Some(arcen_media::ColorRange::Full),
+                ..ColorFidelityOverrides::default()
+            },
+            ..ColorFidelitySettings::default()
+        };
+        assert_eq!(
+            StreamingPreset::from_settings(PerformanceMode::Standard, overridden),
+            StreamingPreset::Custom
+        );
+    }
+
+    #[test]
     fn color_fidelity_preset_maps_to_documented_contract() {
         // Standard = H.264 4:2:0 8-bit limited (Arcen's historical contract);
         // Full Colour = HEVC 4:4:4 8-bit full range; Grading Reference = HEVC
@@ -21409,7 +21958,8 @@ mod tests {
         );
         assert_eq!(
             ColorFidelity::GradingReference.describe(),
-            "4:4:4 10-bit full range BT.709 -- best image quality, with added latency"
+            "4:4:4 10-bit full range, BT.709 -- highest-fidelity SDR. The extra depth \
+             absorbs rounding, not brightness; added latency"
         );
         // Every preset, taken alone with no overrides and no explicit
         // variant, must resolve to a coherent, offered variant.
@@ -21440,11 +21990,39 @@ mod tests {
             bit_depth: "8".to_string(),
             color_range: "full".to_string(),
             color_matrix: "bt709".to_string(),
+            transfer: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
             encode_intent: "interactive".to_string(),
         };
         let variant =
             stream_profile_video_variant(&profile).expect("AV1 profile uses known tokens");
         assert_eq!(variant.id(), "av1-420-8-full-bt709");
+    }
+
+    #[test]
+    fn session_truth_preserves_hdr_transfer_and_primaries_outside_variant_id() {
+        let profile = StreamProfile {
+            codec: "h265".to_string(),
+            chroma: "yuv444".to_string(),
+            video_selection: arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+            max_fps: 30,
+            bit_depth: "10".to_string(),
+            color_range: "full".to_string(),
+            color_matrix: "bt2020ncl".to_string(),
+            transfer: "pq".to_string(),
+            color_primaries: "bt2020".to_string(),
+            encode_intent: "quality".to_string(),
+        };
+        let requested =
+            stream_profile_video_variant(&profile).expect("HDR profile uses known tokens");
+        assert_eq!(
+            requested.video.primaries,
+            arcen_media::ColorPrimaries::Bt2020
+        );
+        assert_eq!(
+            requested.video.transfer,
+            arcen_media::TransferCharacteristics::Pq
+        );
     }
 
     #[test]
@@ -21883,6 +22461,121 @@ mod tests {
             .unwrap()
             .contains_key("other.local:18443"));
         assert!(matches!(app.screen, AppScreen::Home));
+    }
+
+    #[test]
+    fn a_changed_remembered_identity_offers_to_forget_it() {
+        // Without this the user is stuck: the pin is durable, it no longer
+        // matches, and nothing in the app can clear it.
+        let dir = test_config_dir("arcen-changed-identity-offer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = ArcenApp::from_config_repository(ClientConfigRepository::at(dir.clone()));
+        app.security_mode = SecurityMode::Medium;
+
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        draft.port = 18_444;
+        let endpoint = connection_endpoint(&draft);
+        let info = certificate_info_fixture(&endpoint);
+        app.trust_certificate_permanently(&draft, &info);
+
+        app.active_connection = Some(draft.clone());
+        app.screen = AppScreen::Connecting(draft);
+        app.handle_connection_closed(
+            Some(SessionEnd {
+                reason: DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity),
+                message: format!(
+                    "TLS error: {}",
+                    crate::transport::tls::TOFU_PIN_MISMATCH_ERROR
+                ),
+                observed_at: Instant::now(),
+            }),
+            0,
+            &egui::Context::default(),
+        );
+
+        assert!(
+            matches!(app.screen, AppScreen::CertificateChanged(..)),
+            "a changed remembered identity should offer a recovery"
+        );
+        // Showing the offer must not itself discard anything.
+        assert_eq!(app.effective_tls_pin(&endpoint), Some(info.spki_sha256));
+        assert!(
+            !app.certificate_change_acknowledged,
+            "confirmation must start unticked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_clears_the_pin_everywhere_and_trusts_nothing_in_its_place() {
+        let dir = test_config_dir("arcen-forget-identity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repository = ClientConfigRepository::at(dir.clone());
+
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        draft.port = 18_444;
+        let endpoint = connection_endpoint(&draft);
+        let info = certificate_info_fixture(&endpoint);
+
+        let mut app = ArcenApp::from_config_repository(repository.clone());
+        app.security_mode = SecurityMode::Medium;
+        app.trust_certificate_permanently(&draft, &info);
+        assert_eq!(app.effective_tls_pin(&endpoint), Some(info.spki_sha256));
+
+        app.forget_remembered_identity(&endpoint);
+
+        // Both stores, or the session cache would re-assert what was forgotten
+        // and the retry would fail closed all over again.
+        assert_eq!(
+            app.effective_tls_pin(&endpoint),
+            None,
+            "forgetting left a pin behind"
+        );
+        // Forgetting is not trusting: nothing takes the old pin's place, so the
+        // next connection runs the ordinary first-use prompt.
+        let reopened = ArcenApp::from_config_repository(repository);
+        assert_eq!(
+            reopened.effective_tls_pin(&endpoint),
+            None,
+            "the removal did not survive a relaunch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_is_scoped_to_the_endpoint_that_changed() {
+        let dir = test_config_dir("arcen-forget-scope");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = ArcenApp::from_config_repository(ClientConfigRepository::at(dir.clone()));
+        app.security_mode = SecurityMode::Medium;
+
+        let mut first = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        first.host = "one.example.internal".to_string();
+        first.port = 18_444;
+        let mut second = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        second.host = "two.example.internal".to_string();
+        second.port = 18_444;
+        let first_endpoint = connection_endpoint(&first);
+        let second_endpoint = connection_endpoint(&second);
+        let first_info = certificate_info_fixture(&first_endpoint);
+        let second_info = certificate_info_fixture(&second_endpoint);
+        app.trust_certificate_permanently(&first, &first_info);
+        app.trust_certificate_permanently(&second, &second_info);
+
+        app.forget_remembered_identity(&first_endpoint);
+
+        assert_eq!(app.effective_tls_pin(&first_endpoint), None);
+        assert_eq!(
+            app.effective_tls_pin(&second_endpoint),
+            Some(second_info.spki_sha256),
+            "an unrelated host lost its remembered identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

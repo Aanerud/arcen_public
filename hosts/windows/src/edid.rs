@@ -440,3 +440,235 @@ mod tests {
             .contains("preferred timing"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// HDR10 signalling
+// ---------------------------------------------------------------------------
+
+/// Length of a full EDID carrying one extension block.
+pub const EDID_HDR10_LEN: usize = 256;
+
+/// Video Input Definition for a 10-bit digital HDMI sink.
+///
+/// The base block ships `0x80`, which says "digital" and leaves colour bit
+/// depth *undefined*. An undefined depth is why nothing downstream can decide
+/// the sink is capable of more than eight bits. Bits 6..4 carry the depth code
+/// (`0b011` = 10 bpc) and bits 3..0 the interface (`0b0010` = HDMI-a).
+///
+/// NVIDIA reports GRID's virtual connector as HDMI, but an EDID without an
+/// HDMI VSDB is classified as a DVI PC display and the control panel exposes
+/// only 8 bpc. The base interface and CTA HDMI blocks must agree.
+const VIDEO_INPUT_10BPC_HDMI: u8 = 0x80 | (0b011 << 4) | 0b0010;
+
+/// Build a 256-byte EDID that advertises HDR10, from the ordinary base block.
+///
+/// Why this exists: capture bit depth is decided by what the *desktop* is
+/// composited at, and Windows only composites wide when an output carries
+/// Advanced Color. An output only offers Advanced Color when its EDID says the
+/// sink can receive it. The 128-byte base block cannot say that at all —
+/// HDR10 is signalled by a CTA-861 extension block, which by definition lives
+/// in a second 128 bytes.
+///
+/// The CTA data-block collection carries the complete sink claim:
+///
+/// - **Colorimetry** (extended tag 0x05) declaring BT.2020 RGB and YCC.
+/// - **HDR Static Metadata** (extended tag 0x06) declaring SMPTE ST 2084 (PQ),
+///   which is the electro-optical transfer function HDR10 *is*, plus Static
+///   Metadata Type 1.
+/// - **HDMI VSDB** declaring HDMI identity and 30-bit deep-colour support.
+/// - **HDMI Forum VSDB** declaring SCDC and a 550 MHz character-rate ceiling.
+/// - **Video Capability** declaring selectable RGB/YCC quantization.
+///
+/// This only makes the offer. Whether Windows accepts it, and whether the
+/// resulting frames carry more than eight bits of real information rather than
+/// SDR content widened into a float buffer, are separate questions — the second
+/// is what `capenc color-probe` measures.
+pub fn generate_hdr10(request: EdidRequest) -> Result<[u8; EDID_HDR10_LEN], String> {
+    let base = generate(request)?;
+    let mut edid = [0u8; EDID_HDR10_LEN];
+    edid[..EDID_LEN].copy_from_slice(&base);
+
+    // Say the sink is 10-bit, not merely digital.
+    edid[20] = VIDEO_INPUT_10BPC_HDMI;
+    // One extension block follows, and the base checksum must be redone
+    // because both of those bytes changed.
+    edid[126] = 1;
+    edid[127] = checksum(&edid[..127]);
+
+    let ext = &mut edid[EDID_LEN..];
+    ext[0] = 0x02; // CTA-861 extension
+    ext[1] = 0x03; // revision 3
+                   // Data blocks occupy bytes 4..34. There are no CTA detailed
+                   // timings, so this points immediately after the collection.
+    ext[2] = 0x22;
+    // No native DTDs, no audio, RGB only.
+    ext[3] = 0x00;
+
+    // HDR Static Metadata Data Block: use-extended-tag (7), 6-byte payload.
+    ext[4] = (7 << 5) | 6;
+    ext[5] = 0x06; // extended tag: HDR static metadata
+                   // Supported EOTFs: bit0 traditional SDR gamma, bit2 SMPTE ST 2084. Bit 2 is
+                   // the one Windows reads to decide an output can carry HDR10; bit 0 keeps
+                   // the sink usable as an ordinary SDR display, which it must remain.
+    ext[6] = 0x05;
+    ext[7] = 0x01; // Static Metadata Type 1
+                   // CTA luminance codes: approximately 1000-nit peak, 400-nit max-frame
+                   // average and 0.005-nit minimum. These match the Deck's HDR10 EDR
+                   // metadata instead of leaving Windows to invent a different mastering
+                   // envelope for the same virtual sink.
+    ext[8] = 138;
+    ext[9] = 96;
+    ext[10] = 6;
+
+    // HDMI Licensing Administrator VSDB, OUI 0x000c03 (least-significant
+    // byte first on the wire). Physical address 0.0.0.0, 30-bit deep colour,
+    // and a 550 MHz maximum TMDS clock. The deep-colour bit is the distinction
+    // NVIDIA Control Panel uses between this HDMI sink and a DVI-class sink.
+    ext[11] = (3 << 5) | 7;
+    ext[12..15].copy_from_slice(&[0x03, 0x0c, 0x00]);
+    ext[15..17].copy_from_slice(&[0x00, 0x00]);
+    ext[17] = 0x10; // DC_30: 10 bpc / 30-bit deep colour.
+    ext[18] = 0x6e; // 550 MHz in 5 MHz units.
+
+    // Colorimetry Data Block: BT.2020 RGB and YCC.
+    ext[19] = (7 << 5) | 3;
+    ext[20] = 0x05;
+    ext[21] = 0xc0;
+    ext[22] = 0x00;
+
+    // HDMI Forum VSDB, OUI 0xc45dd8. Version 1, 550 MHz maximum character
+    // rate, SCDC present. This is the compact block used by working HDR
+    // virtual-display EDIDs and prevents modern HDMI capability from being
+    // inferred from the legacy VSDB alone.
+    ext[23] = (3 << 5) | 7;
+    ext[24..27].copy_from_slice(&[0xd8, 0x5d, 0xc4]);
+    ext[27..31].copy_from_slice(&[0x01, 0x6e, 0x80, 0x00]);
+
+    // Video Capability Data Block. RGB and YCC quantization ranges are
+    // selectable; the remaining scan-behaviour bits mirror a proven HDR
+    // monitor profile rather than leaving range handling undefined.
+    ext[31] = (7 << 5) | 2;
+    ext[32] = 0x00;
+    ext[33] = 0xcb;
+
+    ext[127] = checksum(&ext[..127]);
+    Ok(edid)
+}
+
+#[cfg(test)]
+mod hdr10_tests {
+    use super::*;
+
+    fn request() -> EdidRequest {
+        EdidRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            width_mm: 600.0,
+            height_mm: 340.0,
+            scale: 1.0,
+            product_id: 1,
+            serial: 0x1234_5678,
+        }
+    }
+
+    /// Both blocks must checksum, or the sink is ignored outright rather than
+    /// treated as SDR — a malformed EDID is worse than a conservative one.
+    #[test]
+    fn both_blocks_checksum() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        assert_eq!(
+            edid[..EDID_LEN].iter().fold(0u8, |a, b| a.wrapping_add(*b)),
+            0,
+            "base block checksum"
+        );
+        assert_eq!(
+            edid[EDID_LEN..].iter().fold(0u8, |a, b| a.wrapping_add(*b)),
+            0,
+            "extension block checksum"
+        );
+    }
+
+    /// The whole point: an undefined colour depth cannot advertise anything.
+    #[test]
+    fn the_base_block_declares_ten_bits_per_component() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        assert_eq!(edid[20] & 0x80, 0x80, "must remain a digital input");
+        assert_eq!((edid[20] >> 4) & 0b111, 0b011, "10 bpc");
+        assert_eq!(edid[20] & 0x0f, 0b0010, "HDMI-a interface");
+        // The plain generator must be left alone: SDR outputs still use it.
+        assert_eq!(generate(request()).expect("base")[20], 0x80);
+    }
+
+    #[test]
+    fn one_extension_block_is_declared_and_present() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        assert_eq!(edid[126], 1, "extension count");
+        assert_eq!(edid[EDID_LEN], 0x02, "CTA-861 extension tag");
+        assert_eq!(edid[EDID_LEN + 1], 0x03, "CTA revision 3");
+    }
+
+    /// Windows decides an output can carry HDR10 from the ST 2084 bit. If this
+    /// regresses the EDID still looks valid and HDR silently never appears,
+    /// which is the failure mode worth a dedicated test.
+    #[test]
+    fn the_hdr_block_declares_smpte_st_2084() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        let ext = &edid[EDID_LEN..];
+        assert_eq!(ext[4], (7 << 5) | 6, "use-extended-tag, 6-byte payload");
+        assert_eq!(ext[5], 0x06, "HDR static metadata extended tag");
+        assert_eq!(ext[6] & 0x04, 0x04, "SMPTE ST 2084 (PQ) must be declared");
+        assert_eq!(
+            ext[6] & 0x01,
+            0x01,
+            "the sink must remain usable as plain SDR"
+        );
+        assert_eq!(ext[7] & 0x01, 0x01, "static metadata type 1");
+        assert_eq!(&ext[8..11], &[138, 96, 6], "HDR luminance metadata");
+    }
+
+    #[test]
+    fn the_colorimetry_block_declares_bt2020() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        let ext = &edid[EDID_LEN..];
+        assert_eq!(ext[19], (7 << 5) | 3);
+        assert_eq!(ext[20], 0x05, "colorimetry extended tag");
+        assert_eq!(ext[21] & 0x80, 0x80, "BT.2020 RGB");
+    }
+
+    #[test]
+    fn hdmi_blocks_declare_identity_deep_colour_and_scdc() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        let ext = &edid[EDID_LEN..];
+        assert_eq!(&ext[12..15], &[0x03, 0x0c, 0x00], "HDMI OUI");
+        assert_eq!(ext[17] & 0x10, 0x10, "30-bit deep colour");
+        assert_eq!(&ext[24..27], &[0xd8, 0x5d, 0xc4], "HDMI Forum OUI");
+        assert_eq!(ext[29] & 0x80, 0x80, "SCDC present");
+    }
+
+    /// The data blocks must end exactly where the descriptor offset says, or a
+    /// parser reads padding as a malformed block.
+    #[test]
+    fn the_descriptor_offset_matches_the_data_blocks_written() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        let ext = &edid[EDID_LEN..];
+        let mut offset = 4usize;
+        while offset < ext[2] as usize {
+            offset += 1 + usize::from(ext[offset] & 0x1f);
+        }
+        assert_eq!(ext[2] as usize, offset, "DTD offset must follow the blocks");
+    }
+
+    /// It must still be the display that was asked for.
+    #[test]
+    fn the_base_block_still_validates_for_its_geometry() {
+        let edid = generate_hdr10(request()).expect("hdr10 edid");
+        validate(&edid[..EDID_LEN], 1920, 1080).expect("base block still valid");
+    }
+
+    /// NVAPI carries 256 bytes; anything larger cannot be applied.
+    #[test]
+    fn the_result_fits_the_nvapi_edid_buffer() {
+        assert_eq!(EDID_HDR10_LEN, 256);
+    }
+}

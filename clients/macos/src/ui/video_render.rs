@@ -352,19 +352,25 @@
 //! presenting one) that this pass did not attempt to unblock, and remains
 //! exactly as documented there.
 //!
-//! ## EDR/HDR seam (deliberately not implemented here -- see `w4-edr`)
+//! ## EDR/HDR: implemented, but on the other surface
 //!
-//! [`ReferenceColorSpace`] intentionally has only SDR variants
+//! [`ReferenceColorSpace`] intentionally keeps only SDR variants
 //! (`Srgb`/`DisplayP3`), and [`apply_reference_colorspace`] only ever sends
-//! `setColorspace:`. Extending the presentation layer to HDR/EDR would mean
-//! at minimum also sending `setWantsExtendedDynamicRangeContent:`, reading
-//! `NSScreen.maximumExtendedDynamicRangeColorComponentValue`, and attaching
-//! `CAEDRMetadata` -- a strictly separate, larger change with its own
-//! correctness questions (tone mapping, headroom negotiation) that this
-//! task's own instructions explicitly exclude. `w4-edr` should extend
-//! [`ReferenceColorSpace`] with its own variant(s) and add the EDR-specific
-//! `objc2::msg_send!` calls beside [`apply_reference_colorspace`], reusing
-//! its window/view/layer-finding logic rather than duplicating it.
+//! `setColorspace:`. That is now a deliberate *capability* boundary rather
+//! than an unfinished seam: this module drives `egui`/`wgpu`'s own
+//! `Bgra8Unorm` swapchain (see "swapchain itself stays 8-bit" above), and
+//! tagging an eight-bit SDR drawable as PQ would have macOS tone-map the
+//! whole window -- UI chrome included -- as if its 0-255 codes were
+//! absolute luminance.
+//!
+//! HDR is therefore implemented on the surface that can carry it: the
+//! dedicated `RGB10A2Unorm` `CAMetalLayer` in
+//! [`super::video_metal_layer`], which sends
+//! `setWantsExtendedDynamicRangeContent:` and attaches `CAEDRMetadata`.
+//! [`PresentationColorSpace`] is the vocabulary for that decision and
+//! [`presentation_colorspace_for`] makes it, keyed on the negotiated
+//! transfer function. The two enums stay distinct so the eight-bit path
+//! cannot be handed an HDR variant even by accident.
 //!
 //! # Compile status
 //!
@@ -420,6 +426,16 @@ pub struct VideoColorContract {
     /// working colour space on (see the module doc's "Unblocked 2026-08-14"
     /// section).
     pub primaries: arcen_media::ColorPrimaries,
+    /// Transfer characteristics -- like `primaries`, unused by the
+    /// YCbCr -> RGB math, and like it a presentation-surface input rather
+    /// than a conversion one. This is the *only* axis that separates HDR
+    /// from SDR: `Pq` means the coded values are absolute-luminance PQ
+    /// (HDR10), `Bt709` means they are an SDR curve. Depth does not carry
+    /// this information -- 4:4:4 10-bit BT.709 ("Grading Reference") is a
+    /// real, useful, and entirely SDR configuration -- so anything keying
+    /// HDR behaviour off `depth` would light up EDR for a grading session
+    /// and tone-map it wrongly. See [`presentation_colorspace_for`].
+    pub transfer: arcen_media::TransferCharacteristics,
 }
 
 impl Default for VideoColorContract {
@@ -432,6 +448,7 @@ impl Default for VideoColorContract {
             depth: arcen_media::BitDepth::Eight,
             matrix: arcen_media::ColorMatrix::Bt709,
             primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 }
@@ -444,6 +461,7 @@ impl From<arcen_media::VideoConfiguration> for VideoColorContract {
             depth: configuration.bit_depth,
             matrix: configuration.matrix,
             primaries: configuration.primaries,
+            transfer: configuration.transfer,
         }
     }
 }
@@ -1557,6 +1575,60 @@ pub(crate) fn reference_colorspace_for(
     }
 }
 
+/// What a presentation surface should actually be tagged as, once the
+/// negotiated transfer function is taken into account as well as the
+/// primaries.
+///
+/// Deliberately a *separate* type from [`ReferenceColorSpace`] rather than
+/// another variant on it, because the two presentation surfaces this crate
+/// drives are not equally capable and must not be told the same thing:
+///
+/// - `egui`/`wgpu`'s own surface is an `Bgra8Unorm` swapchain (see the
+///   module doc's "swapchain itself stays 8-bit" section for why that
+///   cannot be changed from here). Tagging an eight-bit SDR drawable as PQ
+///   would have macOS tone-map the entire UI -- window chrome included --
+///   as if its 0-255 codes were absolute luminance. That surface therefore
+///   keeps using [`reference_colorspace_for`] and stays SDR forever, by
+///   construction rather than by remembering to.
+/// - The dedicated `CAMetalLayer` (`super::video_metal_layer`) is a real
+///   `RGB10A2Unorm` drawable carrying only video, which is exactly the
+///   surface HDR10 wants. It is the only caller of this function.
+///
+/// Making the enums distinct means the eight-bit path cannot be handed an
+/// HDR variant even by accident: it does not exist in its vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentationColorSpace {
+    /// Standard dynamic range; the surface is tagged with the given
+    /// SDR working space and EDR stays off.
+    Sdr(ReferenceColorSpace),
+    /// HDR10: BT.2020 primaries with the SMPTE ST 2084 (PQ) transfer,
+    /// tagged `kCGColorSpaceITUR_2100_PQ`, with
+    /// `wantsExtendedDynamicRangeContent` on and `CAEDRMetadata` attached.
+    Hdr10Pq,
+}
+
+/// Chooses the presentation colour space from the two axes that decide it.
+///
+/// **`transfer` is what makes this HDR, not `depth` and not `primaries`.**
+/// BT.2020 primaries with a BT.709 transfer is a wide-gamut *SDR* signal;
+/// ten-bit BT.709 is `Grading Reference`, also SDR (its extra bits buy
+/// banding headroom, not dynamic range). Only [`Pq`][pq] means the coded
+/// values are absolute luminance, so only `Pq` may turn EDR on. Claiming
+/// otherwise makes macOS tone-map an SDR stream against a 1000-nit curve
+/// and the picture comes back visibly wrong -- dark and desaturated --
+/// which is precisely the failure this split exists to prevent.
+///
+/// [pq]: arcen_media::TransferCharacteristics::Pq
+pub(crate) fn presentation_colorspace_for(
+    primaries: arcen_media::ColorPrimaries,
+    transfer: arcen_media::TransferCharacteristics,
+) -> PresentationColorSpace {
+    match transfer {
+        arcen_media::TransferCharacteristics::Pq => PresentationColorSpace::Hdr10Pq,
+        _ => PresentationColorSpace::Sdr(reference_colorspace_for(Some(primaries))),
+    }
+}
+
 /// The result of one attempt to reach and tag the presentation
 /// `CAMetalLayer`'s colour space. Every non-[`Applied`][Self::Applied]
 /// variant is a distinct, precise reason so a fallback is always
@@ -1586,6 +1658,11 @@ enum ColorspaceOutcome {
     /// sublayers is a `CAMetalLayer` (e.g. `wgpu`'s surface has not been
     /// created yet on this frame).
     NoMetalSublayer,
+    /// `CGColorSpaceCreateWithName` returned `nil` for a built-in system
+    /// colour space. Never expected, but that constructor is fallible and
+    /// silently keeping the layer's previous space would be worse than
+    /// saying so.
+    ColorSpaceUnavailable,
 }
 
 /// Tracks whether/what colour space has been successfully applied to the
@@ -1760,19 +1837,34 @@ fn apply_reference_colorspace(colorspace: ReferenceColorSpace) -> ColorspaceOutc
     };
 
     let color_space = match colorspace {
-        ReferenceColorSpace::Srgb => apple_cf::cg::CGColorSpace::srgb(),
-        ReferenceColorSpace::DisplayP3 => apple_cf::cg::CGColorSpace::display_p3(),
+        ReferenceColorSpace::Srgb => objc2_core_graphics::CGColorSpace::with_name(Some(unsafe {
+            objc2_core_graphics::kCGColorSpaceSRGB
+        })),
+        ReferenceColorSpace::DisplayP3 => {
+            objc2_core_graphics::CGColorSpace::with_name(Some(unsafe {
+                objc2_core_graphics::kCGColorSpaceDisplayP3
+            }))
+        }
+    };
+    let Some(color_space) = color_space else {
+        return ColorspaceOutcome::ColorSpaceUnavailable;
     };
     // SAFETY: `metal_layer` is the live `CAMetalLayer` just found above;
-    // `-[CAMetalLayer setColorspace:]` takes one `CGColorSpaceRef` (a
-    // toll-free `*mut c_void`, exactly `CGColorSpace::as_ptr`'s own return
-    // type) and returns nothing. `CALayer.colorspace` is a `retain` property
-    // (Apple's own convention for every Core Foundation-backed Cocoa
-    // setter), so it takes its own reference; `color_space` is safely
-    // dropped (releasing this function's own reference) right after,
-    // exactly like passing any other Cocoa setter an `NSString*`/`NSColor*`
-    // and then releasing the caller's own copy.
-    let _: () = unsafe { msg_send![&*metal_layer, setColorspace: color_space.as_ptr()] };
+    // `-[CAMetalLayer setColorspace:]` takes one `CGColorSpaceRef` and
+    // returns nothing. `CALayer.colorspace` is a `retain` property (Apple's
+    // own convention for every Core Foundation-backed Cocoa setter), so it
+    // takes its own reference; `color_space` is safely dropped (releasing
+    // this function's own reference) right after.
+    //
+    // The argument is a *typed* `&CGColorSpace`, not the untyped
+    // `*mut c_void` this call passed until it was first exercised on
+    // hardware. `objc2`'s `msg_send!` verifies argument type encodings
+    // whenever `debug_assertions` are on, and a raw `c_void` pointer
+    // encodes as `^v` where the selector declares `^{CGColorSpace=}`, so
+    // every debug build panicked the moment a colour space was applied to
+    // a live layer -- and every release build sailed past the same
+    // mismatch silently, which is why it survived this long.
+    let _: () = unsafe { msg_send![&*metal_layer, setColorspace: &*color_space] };
     ColorspaceOutcome::Applied
 }
 
@@ -1807,6 +1899,7 @@ mod tests {
             // specifically exercise `primaries` (below) build their own
             // `VideoColorContract` literal instead of using this helper.
             primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 
@@ -2248,6 +2341,91 @@ mod tests {
         assert_eq!(reference_colorspace_for(None), ReferenceColorSpace::Srgb);
     }
 
+    // ---- PresentationColorSpace: the HDR decision -------------------------
+
+    /// **The axis that decides HDR is `transfer`, and only `transfer`.**
+    ///
+    /// This is the single most load-bearing test in the presentation path.
+    /// Every other axis has, at some point, looked like a reasonable proxy
+    /// for "is this HDR", and each one is wrong:
+    ///
+    /// - `depth`: Grading Reference is 4:4:4 ten-bit BT.709 and entirely
+    ///   SDR. Keying on depth turns EDR on for a colour-critical SDR
+    ///   session and tone-maps it against a 1000-nit curve.
+    /// - `primaries`: BT.2020 with a BT.709 transfer is a wide-gamut SDR
+    ///   signal, which is a real thing a host can send.
+    /// - `matrix`: BT.2020 NCL says nothing about dynamic range either.
+    #[test]
+    fn only_the_pq_transfer_selects_hdr_presentation() {
+        for primaries in [
+            arcen_media::ColorPrimaries::Bt709,
+            arcen_media::ColorPrimaries::DisplayP3,
+            arcen_media::ColorPrimaries::Bt2020,
+        ] {
+            assert_eq!(
+                presentation_colorspace_for(primaries, arcen_media::TransferCharacteristics::Pq),
+                PresentationColorSpace::Hdr10Pq,
+                "PQ must select HDR regardless of primaries ({primaries:?})"
+            );
+            for sdr in [
+                arcen_media::TransferCharacteristics::Bt709,
+                arcen_media::TransferCharacteristics::Srgb,
+            ] {
+                assert_eq!(
+                    presentation_colorspace_for(primaries, sdr),
+                    PresentationColorSpace::Sdr(reference_colorspace_for(Some(primaries))),
+                    "{sdr:?} must stay SDR even with {primaries:?} primaries"
+                );
+            }
+        }
+    }
+
+    /// Wide-gamut BT.2020 on an SDR curve keeps its wide working space but
+    /// must not claim extended dynamic range.
+    #[test]
+    fn bt2020_with_an_sdr_transfer_is_wide_gamut_sdr_not_hdr() {
+        assert_eq!(
+            presentation_colorspace_for(
+                arcen_media::ColorPrimaries::Bt2020,
+                arcen_media::TransferCharacteristics::Bt709,
+            ),
+            PresentationColorSpace::Sdr(ReferenceColorSpace::DisplayP3)
+        );
+    }
+
+    /// HLG is HDR, but it is not the PQ path this layer implements
+    /// (`CAEDRMetadata::HLGMetadata` and a different colour space). Until
+    /// that is built and verified on hardware, HLG must fall back to SDR
+    /// rather than being presented through PQ machinery that would
+    /// misinterpret its codes.
+    #[test]
+    fn hlg_is_not_silently_presented_as_pq() {
+        assert_eq!(
+            presentation_colorspace_for(
+                arcen_media::ColorPrimaries::Bt2020,
+                arcen_media::TransferCharacteristics::Hlg,
+            ),
+            PresentationColorSpace::Sdr(ReferenceColorSpace::DisplayP3)
+        );
+    }
+
+    /// The eight-bit `egui`/`wgpu` swapchain's own chooser has no HDR
+    /// variant in its vocabulary at all, so it cannot be told to tone-map
+    /// the UI even by a caller that wanted to.
+    #[test]
+    fn the_eight_bit_surfaces_chooser_can_never_return_hdr() {
+        for primaries in [
+            arcen_media::ColorPrimaries::Bt709,
+            arcen_media::ColorPrimaries::DisplayP3,
+            arcen_media::ColorPrimaries::Bt2020,
+        ] {
+            assert!(matches!(
+                reference_colorspace_for(Some(primaries)),
+                ReferenceColorSpace::Srgb | ReferenceColorSpace::DisplayP3
+            ));
+        }
+    }
+
     #[test]
     fn reference_colorspace_is_srgb_for_bt709() {
         assert_eq!(
@@ -2290,6 +2468,7 @@ mod tests {
             depth: arcen_media::BitDepth::Ten,
             matrix: arcen_media::ColorMatrix::Bt2020Ncl,
             primaries: arcen_media::ColorPrimaries::DisplayP3,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
         };
         let payload = RawVideoPayload::Planar16 {
             luma,

@@ -109,7 +109,15 @@ EVENT_DEFINITIONS = {
             ("width", INTEGER),
             ("height", INTEGER),
         ),
-        (("fps", INTEGER), ("display_backend", STRING)),
+        (
+            ("fps", INTEGER),
+            ("display_backend", STRING),
+            ("bit_depth", STRING),
+            ("color_range", STRING),
+            ("color_matrix", STRING),
+            ("color_primaries", STRING),
+            ("transfer", STRING),
+        ),
     ),
     1103: _event(
         "SESSION_END",
@@ -131,6 +139,56 @@ EVENT_DEFINITIONS = {
             ("duration_ms", INTEGER),
             ("frames_sent", INTEGER),
             ("frames_dropped", INTEGER),
+        ),
+    ),
+    # Level 3. Records the capture path that *ran*: Windows falls back
+    # DDA -> WGC silently, so a configured value would say otherwise.
+    1105: _event(
+        "CAPTURE_PATH_SELECTED",
+        3,
+        "info",
+        "streaming",
+        "succeeded",
+        (("backend", STRING), ("zero_copy", BOOLEAN)),
+        (
+            ("pixel_format", STRING),
+            ("bytes_per_frame", INTEGER),
+            ("fallback_from", STRING),
+            ("reason", STRING),
+        ),
+    ),
+    1106: _event(
+        "ENCODER_CONFIGURED",
+        3,
+        "info",
+        "streaming",
+        "succeeded",
+        (
+            ("encoder", STRING),
+            ("pixel_format", STRING),
+            ("bit_depth", STRING),
+            ("chroma", STRING),
+        ),
+        (("codec", STRING), ("profile", STRING)),
+    ),
+    # Level 3. Requested versus granted, so a reduction cannot look like a grant.
+    1107: _event(
+        "COLOR_PLAN_RESOLVED",
+        3,
+        "info",
+        "streaming",
+        "succeeded",
+        (
+            ("requested_bit_depth", STRING),
+            ("granted_bit_depth", STRING),
+            ("degraded", BOOLEAN),
+        ),
+        (
+            ("requested_chroma", STRING),
+            ("granted_chroma", STRING),
+            ("requested_codec", STRING),
+            ("granted_codec", STRING),
+            ("reason", STRING),
         ),
     ),
     1200: _event(

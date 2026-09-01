@@ -91,6 +91,33 @@ pub const fn default_profile() -> OperationalProfile {
     }
 }
 
+/// The profile to start with, honouring `ARCEN_LOG_LEVEL` when it names one.
+///
+/// A release Deck logs at `critical`, which is right for ordinary use and
+/// wrong the moment anyone needs to see what a session negotiated: the
+/// records that answer "what did the Deck ask for, and what did it get" are
+/// `info` and `debug`, and there was no way to turn them on without a debug
+/// build. The hosts already take a numeric level from their config; this is
+/// the client's equivalent.
+///
+/// Accepts a level number (`0`..`3`) or a profile name. An unreadable value
+/// falls back to the default rather than failing to start, because losing
+/// logging must never cost someone their session.
+#[must_use]
+pub fn startup_profile() -> OperationalProfile {
+    let Some(raw) = std::env::var_os("ARCEN_LOG_LEVEL") else {
+        return default_profile();
+    };
+    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "0" | "critical" => OperationalProfile::Critical,
+        "1" | "error" => OperationalProfile::Error,
+        "2" | "info" => OperationalProfile::Info,
+        "3" | "debug" => OperationalProfile::Debug,
+        _ => default_profile(),
+    }
+}
+
 pub fn init(profile: OperationalProfile) -> Option<PathBuf> {
     if let Some(state) = STATE.get() {
         return Some(state.dir.clone());

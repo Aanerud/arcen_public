@@ -117,7 +117,12 @@ def rust_event_definitions():
             target[key] = field_type.lower()
         field_sets[name] = (required, optional)
 
-    profile_names = {"Critical": (0, "critical"), "Error": (1, "error"), "Info": (2, "info")}
+    profile_names = {
+        "Critical": (0, "critical"),
+        "Error": (1, "error"),
+        "Info": (2, "info"),
+        "Debug": (3, "debug"),
+    }
     severities = {"Information": "info", "Warning": "warn", "Error": "error"}
 
     def snake_case(name):
@@ -172,12 +177,12 @@ class ObservabilityValidationTests(unittest.TestCase):
                     cross_file=True,
                 )
 
-    def test_static_table_matches_all_47_rust_event_definitions(self):
+    def test_static_table_matches_all_50_rust_event_definitions(self):
         static = {
             event_id: tuple(definition)
             for event_id, definition in VALIDATOR.EVENT_DEFINITIONS.items()
         }
-        self.assertEqual(len(static), 47)
+        self.assertEqual(len(static), 50)
         self.assertEqual(static, rust_event_definitions())
 
     def test_frozen_canonical_record_fixture_conforms(self):
@@ -186,8 +191,8 @@ class ObservabilityValidationTests(unittest.TestCase):
         self.assertEqual(records[0].get("event_id"), 1100)
         VALIDATOR.validate_paths([FROZEN_CANONICAL_FIXTURE])
 
-    def test_all_47_event_definitions_accept_required_and_optional_fields(self):
-        self.assertEqual(len(VALIDATOR.EVENT_DEFINITIONS), 47)
+    def test_all_50_event_definitions_accept_required_and_optional_fields(self):
+        self.assertEqual(len(VALIDATOR.EVENT_DEFINITIONS), 50)
         for event_id in VALIDATOR.EVENT_DEFINITIONS:
             with self.subTest(event_id=event_id):
                 validate_documents(encoded([event_record(event_id)]))

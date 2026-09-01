@@ -5,7 +5,9 @@
 // entry points are loaded at runtime so the binary has no build-time CUDA,
 // NvFBC, or NVENC dependency.
 
-use crate::linux_policy::{RequestedEncoder, SubmissionGate, SubmissionMode};
+use crate::linux_policy::{
+    linux_capture_backend, LinuxCaptureBackend, RequestedEncoder, SubmissionGate, SubmissionMode,
+};
 use crate::log;
 use arcen_media::video::{BackendUnavailableReason, EncoderBackend};
 
@@ -69,6 +71,12 @@ fn log_unavailable(reason: BackendUnavailableReason, detail: &str) {
 struct PipelineStats {
     emitted: u64,
     submitted: u64,
+    capture_samples: u64,
+    capture_ms_sum: f64,
+    capture_ms_max: f64,
+    stage_samples: u64,
+    stage_ms_sum: f64,
+    stage_ms_max: f64,
     encode_ms_sum: f64,
     encode_ms_max: f64,
     bytes: u64,
@@ -86,6 +94,12 @@ impl PipelineStats {
         Self {
             emitted: 0,
             submitted: 0,
+            capture_samples: 0,
+            capture_ms_sum: 0.0,
+            capture_ms_max: 0.0,
+            stage_samples: 0,
+            stage_ms_sum: 0.0,
+            stage_ms_max: 0.0,
             encode_ms_sum: 0.0,
             encode_ms_max: 0.0,
             bytes: 0,
@@ -97,6 +111,18 @@ impl PipelineStats {
             capture_recreates: 0,
             stale_outputs_dropped: 0,
         }
+    }
+
+    fn record_capture(&mut self, capture_ms: f64) {
+        self.capture_samples += 1;
+        self.capture_ms_sum += capture_ms;
+        self.capture_ms_max = self.capture_ms_max.max(capture_ms);
+    }
+
+    fn record_stage(&mut self, stage_ms: f64) {
+        self.stage_samples += 1;
+        self.stage_ms_sum += stage_ms;
+        self.stage_ms_max = self.stage_ms_max.max(stage_ms);
     }
 
     fn record_submission(&mut self, mode: SubmissionMode, encode_ms: f64) {
@@ -125,21 +151,41 @@ impl PipelineStats {
         self.stale_outputs_dropped += 1;
     }
 
-    fn log_and_reset(&mut self, capture: (u64, u64, u64), want_idr: bool) {
-        let average_ms = if self.submitted == 0 {
+    fn log_and_reset(
+        &mut self,
+        capture: (u64, u64, u64),
+        want_idr: bool,
+        capture_backend: &str,
+        damage_source: &str,
+    ) {
+        let average_encode_ms = if self.submitted == 0 {
             0.0
         } else {
             self.encode_ms_sum / self.submitted as f64
         };
+        let average_capture_ms = if self.capture_samples == 0 {
+            0.0
+        } else {
+            self.capture_ms_sum / self.capture_samples as f64
+        };
+        let average_stage_ms = if self.stage_samples == 0 {
+            0.0
+        } else {
+            self.stage_ms_sum / self.stage_samples as f64
+        };
         log(&format!(
-            "enc_fps={} encode_submitted={} avg_encode_ms={average_ms:.2} \
-             max_encode_ms={:.2} kbps={} capture_new={} capture_old={} \
+            "enc_fps={} encode_submitted={} avg_capture_ms={average_capture_ms:.2} \
+             max_capture_ms={:.2} avg_stage_ms={average_stage_ms:.2} max_stage_ms={:.2} \
+             avg_encode_ms={average_encode_ms:.2} max_encode_ms={:.2} kbps={} \
+             capture_backend={capture_backend} capture_new={} capture_old={} \
              capture_direct={} want_idr={want_idr} emit_first={} emit_idr={} \
              emit_activity={} emit_keepalive={} pipeline_flush={} \
              capture_recreated={} stale_outputs_dropped={} \
-             damage_source={NVFBC_DAMAGE_SOURCE}",
+             damage_source={damage_source}",
             self.emitted,
             self.submitted,
+            self.capture_ms_max,
+            self.stage_ms_max,
             self.encode_ms_max,
             self.bytes * 8 / 1000,
             capture.0,
@@ -154,6 +200,39 @@ impl PipelineStats {
             self.stale_outputs_dropped,
         ));
         *self = Self::new();
+    }
+}
+
+fn discard_stale_output<T>(
+    output: Option<T>,
+    stale_outputs_to_drop: &mut usize,
+) -> (Option<T>, bool) {
+    if output.is_some() && *stale_outputs_to_drop != 0 {
+        *stale_outputs_to_drop -= 1;
+        (None, true)
+    } else {
+        (output, false)
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::discard_stale_output;
+
+    #[test]
+    fn source_recreation_discards_every_pre_recreation_output() {
+        let mut stale = 3;
+        assert_eq!(discard_stale_output::<u8>(None, &mut stale), (None, false));
+        assert_eq!(stale, 3, "no output means nothing was drained");
+        for value in 1..=3 {
+            assert_eq!(discard_stale_output(Some(value), &mut stale), (None, true));
+        }
+        assert_eq!(stale, 0);
+        assert_eq!(
+            discard_stale_output(Some(4), &mut stale),
+            (Some(4), false),
+            "the first post-recreation output must be exposed"
+        );
     }
 }
 
@@ -541,6 +620,29 @@ mod nvfbc {
     const CAPTURE_SHARED_CUDA: u32 = 1;
     const TRACKING_OUTPUT: u32 = 1;
     const TRACKING_SCREEN: u32 = 2;
+    // Linux NvFBC has no ten-bit capture format. At all.
+    //
+    // Checked against the current NvFBC header for Linux (2025), not
+    // assumed: `NVFBC_BUFFER_FORMAT` is exactly `ARGB, RGB, NV12, YUV444P,
+    // RGBA, BGRA`, and the header names BGRA as the native format. There is
+    // no `ARGB10` and no other wide member.
+    //
+    // This is worth stating explicitly because the NVIDIA Capture SDK
+    // documentation *does* describe an `ARGB10` output format, and a search
+    // will surface it — but that belongs to the legacy Windows-era
+    // interfaces (`NvFBCToSys`, `NvFBCToDx9Vid`, `NvFBCToCuda`), which are a
+    // different API from the Linux NvFBC used here. Reading that
+    // documentation and concluding Linux NvFBC can capture ten bits is an
+    // easy and expensive mistake.
+    //
+    // The consequence is structural: on Linux, `DefaultDepth 30` in the X
+    // configuration gives a ten-bit *framebuffer*, but capturing it through
+    // NvFBC still yields eight bits per channel, so a PQ-signalled stream
+    // off this path is eight-bit content in a wider container. Genuine
+    // ten-bit Linux capture needs a different backend — `XShmGetImage`
+    // against the depth-30 screen (see `linux_x11`, which now accepts depth
+    // 30) or a DRM/PipeWire path — and that plumbing into NVENC does not
+    // exist yet.
     const BUFFER_FORMAT_BGRA: u32 = 5;
     const BUFFER_FORMAT_YUV444P: u32 = 3;
     const TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY: u32 = 1 << 2;
@@ -1172,11 +1274,9 @@ mod nvfbc {
 struct EncodeOptions<'a> {
     codec: &'a str,
     fps: u32,
-    /// NvFBC's own capture buffer shape (`PixelFormat::nvfbc_capture_is_yuv444`)
-    /// — *not* simply "is the target chroma 4:4:4": 10-bit 4:4:4 still
-    /// captures raw BGRA (`false`) so this file can convert it itself. Used
-    /// here only for diagnostics describing what NvFBC hands the encoder;
-    /// `color` below is the actual target contract.
+    /// NvFBC's own capture buffer shape (`PixelFormat::nvfbc_capture_is_yuv444`).
+    /// Used only by the eight-bit path; the depth-30 XShm path never opens
+    /// NvFBC.
     yuv444: bool,
     framed: bool,
     cursor_mode: crate::CursorCaptureMode,
@@ -1187,6 +1287,12 @@ struct EncodeOptions<'a> {
     color: crate::ColorSpec,
 }
 
+/// The NvFBC encode loop.
+///
+/// This function is intentionally eight-bit-only. `run_with_args` routes every
+/// deeper contract to [`run_wide_encode`] before constructing NvFBC, and this
+/// loop repeats that invariant defensively so an eight-bit source can never be
+/// announced as ten-bit.
 unsafe fn run_encode(
     _cuda_ctx: cuda::Context,
     mut cap: nvfbc::Capture,
@@ -1201,6 +1307,13 @@ unsafe fn run_encode(
         cursor_mode,
         color,
     } = options;
+    if color.bit_depth != arcen_media::BitDepth::Eight {
+        log_error(
+            "NvFBC was selected for a depth above eight; refusing to encode an 8-bit capture \
+             in a wider container",
+        );
+        return 2;
+    }
     log(&format!(
         "NVENC ready: {}x{} codec={} chroma={:?} depth={:?}-bit (NvFBC capture={})",
         cap.width,
@@ -1219,8 +1332,7 @@ unsafe fn run_encode(
     let mut announced_layout = false;
     let mut submission_gate = SubmissionGate::new(IDLE_KEEPALIVE);
     let mut last_emit = Instant::now();
-    let mut encoder_primed = false;
-    let mut drop_next_output = false;
+    let mut stale_outputs_to_drop = 0usize;
     let mut ready_announced = false;
 
     let mut dbg = (0u64, 0u64, 0u64); // new, old/timeout, direct-capture frames
@@ -1250,7 +1362,7 @@ unsafe fn run_encode(
                 latest_frame = None;
                 submission_gate.reset();
                 announced_layout = false;
-                drop_next_output = encoder_primed;
+                stale_outputs_to_drop = encoder.pending_output_count();
                 stats.record_capture_recreate();
             }
             Err(e) => {
@@ -1268,10 +1380,12 @@ unsafe fn run_encode(
                 // through its own input ring. Restage the retained latest frame
                 // into the current slot on every actual submission so static
                 // desktops cannot alternate with stale ring contents.
+                let stage_started = Instant::now();
                 if let Err(e) = encoder.stage(frame.device_ptr, frame.pitch) {
                     log_error(&format!("stage failed: {e}"));
                     return 5;
                 }
+                stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
                 // Consume only the request observed before the cadence
                 // decision. A request racing in later remains pending.
                 let requested_idr = idr_pending && control.take_idr();
@@ -1287,16 +1401,11 @@ unsafe fn run_encode(
                         stats.record_submission(mode, ms);
                         submission_gate.on_submitted(mode, out.is_some());
                         last_emit = now;
-                        encoder_primed = true;
-                        let out = if drop_next_output {
-                            if out.is_some() {
-                                stats.record_stale_output_drop();
-                            }
-                            drop_next_output = false;
-                            None
-                        } else {
-                            out
-                        };
+                        let (out, stale_dropped) =
+                            discard_stale_output(out, &mut stale_outputs_to_drop);
+                        if stale_dropped {
+                            stats.record_stale_output_drop();
+                        }
                         if let Some(au) = out {
                             if !ready_announced {
                                 if let Err(error) = crate::validate_access_unit(&au, framed) {
@@ -1320,7 +1429,10 @@ unsafe fn run_encode(
                                         return 5;
                                     }
                                 };
-                                if let Err(error) = crate::announce_ready(plan) {
+                                if let Err(error) = crate::announce_ready_from(
+                                    plan,
+                                    Some(arcen_media::video::CaptureBackend::NvFbc),
+                                ) {
                                     log_error(&format!("emit READY: {error}"));
                                     return 5;
                                 }
@@ -1345,12 +1457,232 @@ unsafe fn run_encode(
         }
 
         if sec.elapsed().as_secs_f64() >= 1.0 {
-            stats.log_and_reset(dbg, control.idr_pending());
+            stats.log_and_reset(dbg, control.idr_pending(), "nvfbc", NVFBC_DAMAGE_SOURCE);
             dbg = (0, 0, 0);
             sec = Instant::now();
         }
     }
     log("NVENC control closed; dropping encoder and capture before exit");
+    0
+}
+
+/// Native NVENC loop for a genuine depth-30 X11 source.
+///
+/// Unlike [`run_encode`], this path never opens NvFBC. Each serviced frame is
+/// copied by MIT-SHM into host memory, converted from the root visual's actual
+/// RGB10 channel masks into the negotiated ten-bit NVENC surface, then uploaded
+/// to the current CUDA input slot. The existing eight-bit NvFBC path remains
+/// device-to-device and does not execute any of this code.
+unsafe fn run_wide_encode(
+    _cuda_ctx: cuda::Context,
+    mut capture: crate::linux_x11::X11Capture,
+    mut encoder: crate::nvenc_cuda::Encoder,
+    options: EncodeOptions<'_>,
+) -> i32 {
+    let EncodeOptions {
+        codec,
+        fps,
+        framed,
+        cursor_mode,
+        color,
+        ..
+    } = options;
+    let width = capture.width();
+    let height = capture.height();
+    if color.bit_depth == arcen_media::BitDepth::Eight {
+        log_error("XShm wide capture was selected for an eight-bit contract");
+        return 2;
+    }
+    log(&format!(
+        "NVENC wide capture ready: {width}x{height} codec={codec} chroma={:?} \
+         depth={:?}-bit matrix={:?} primaries={:?} transfer={:?} source={} transport={}",
+        color.chroma,
+        color.bit_depth,
+        color.matrix,
+        color.primaries,
+        color.transfer,
+        capture.pixel_format_token(),
+        capture.transfer_token(),
+    ));
+    let control = crate::spawn_control_thread("NVENC-XShm");
+    let mut stdout = std::io::stdout();
+    let target_dt = crate::frame_interval_from_fps(fps);
+    let mut next = Instant::now();
+    let mut submission_gate = SubmissionGate::new(IDLE_KEEPALIVE);
+    submission_gate.note_frame();
+    let mut last_emit = Instant::now();
+    let mut stale_outputs_to_drop = 0usize;
+    let mut ready_announced = false;
+    let mut capture_counts = (0u64, 0u64, 0u64);
+    let mut sec = Instant::now();
+    let mut stats = PipelineStats::new();
+    let mut precision_attempts = 0u8;
+    let mut precision_proven = false;
+
+    while !control.stop_requested() {
+        match capture.poll_activity() {
+            Ok(crate::linux_x11::Activity::Damage) => submission_gate.note_frame(),
+            Ok(crate::linux_x11::Activity::Modeset) => {
+                capture = match capture.recreate() {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        log_error(&format!("X11 modeset recreation failed: {error}"));
+                        return 3;
+                    }
+                };
+                submission_gate.reset();
+                submission_gate.note_frame();
+                stale_outputs_to_drop = encoder.pending_output_count();
+                stats.record_capture_recreate();
+            }
+            Ok(crate::linux_x11::Activity::None) => {
+                capture_counts.1 = capture_counts.1.saturating_add(1);
+                if !capture.has_damage() {
+                    submission_gate.note_frame();
+                }
+            }
+            Err(error) => {
+                log_error(&format!("X11 capture event failed: {error}"));
+                return 3;
+            }
+        }
+
+        let now = Instant::now();
+        if now >= next {
+            let idr_pending = control.idr_pending();
+            let mode = submission_gate.decision(idr_pending, last_emit.elapsed());
+            if let Some(mode) = mode {
+                let capture_started = Instant::now();
+                let frame = match capture.capture_wide() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        log_error(&format!("X11 depth-30 capture failed: {error}"));
+                        return 3;
+                    }
+                };
+                stats.record_capture(capture_started.elapsed().as_secs_f64() * 1000.0);
+                capture_counts.0 = capture_counts.0.saturating_add(1);
+                if frame.width != width as usize || frame.height != height as usize {
+                    log_error("X11 depth-30 frame geometry changed without a modeset");
+                    return 3;
+                }
+                if !precision_proven && precision_attempts < 30 {
+                    let precision = frame.precision_stats(8);
+                    let off_grid_basis_points = if precision.sampled_components == 0 {
+                        0
+                    } else {
+                        precision.off_eight_bit_grid.saturating_mul(10_000)
+                            / precision.sampled_components
+                    };
+                    if precision_attempts == 0 || precision.off_eight_bit_grid != 0 {
+                        log(&format!(
+                            "X11 RGB10 source precision: sampled_components={} \
+                             off_8bit_grid={} off_8bit_grid_bps={} min={} max={}",
+                            precision.sampled_components,
+                            precision.off_eight_bit_grid,
+                            off_grid_basis_points,
+                            precision.minimum,
+                            precision.maximum,
+                        ));
+                    }
+                    precision_proven = precision.off_eight_bit_grid != 0;
+                    precision_attempts = precision_attempts.saturating_add(1);
+                }
+
+                let stage_started = Instant::now();
+                if let Err(error) = encoder.stage_wide_host(frame.bytes, frame.stride, frame.layout)
+                {
+                    log_error(&format!("stage X11 depth-30 frame failed: {error}"));
+                    return 5;
+                }
+                stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
+
+                let requested_idr = idr_pending && control.take_idr();
+                let force = mode == SubmissionMode::FirstFrame || requested_idr;
+                if requested_idr && mode != SubmissionMode::FirstFrame {
+                    log("consuming IDR request");
+                }
+
+                let encode_started = Instant::now();
+                match encoder.encode(force) {
+                    Ok(output) => {
+                        stats.record_submission(
+                            mode,
+                            encode_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        submission_gate.on_submitted(mode, output.is_some());
+                        last_emit = now;
+                        let (output, stale_dropped) =
+                            discard_stale_output(output, &mut stale_outputs_to_drop);
+                        if stale_dropped {
+                            stats.record_stale_output_drop();
+                        }
+                        if let Some(access_unit) = output {
+                            if !ready_announced {
+                                if let Err(error) =
+                                    crate::validate_access_unit(&access_unit, framed)
+                                {
+                                    log_error(&format!(
+                                        "first access unit failed output validation: {error}"
+                                    ));
+                                    return 5;
+                                }
+                                let plan = match crate::resolved_media_plan(
+                                    EncoderBackend::NativeNvenc,
+                                    codec,
+                                    color,
+                                    width,
+                                    height,
+                                    fps,
+                                    cursor_mode,
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(error) => {
+                                        log_error(&error);
+                                        return 5;
+                                    }
+                                };
+                                if let Err(error) = crate::announce_ready_from(
+                                    plan,
+                                    Some(arcen_media::video::CaptureBackend::XShm),
+                                ) {
+                                    log_error(&format!("emit READY: {error}"));
+                                    return 5;
+                                }
+                                ready_announced = true;
+                            }
+                            if crate::write_access_unit(&mut stdout, &access_unit, framed).is_err()
+                            {
+                                return 0;
+                            }
+                            stats.record_emitted(access_unit.len());
+                        }
+                    }
+                    Err(error) => {
+                        log_error(&format!("encode error: {error}"));
+                        return 5;
+                    }
+                }
+            }
+            next += target_dt;
+            if next < now {
+                next = now + target_dt;
+            }
+        }
+
+        if sec.elapsed().as_secs_f64() >= 1.0 {
+            let damage_source = if capture.has_damage() {
+                "xdamage"
+            } else {
+                "full_poll"
+            };
+            stats.log_and_reset(capture_counts, control.idr_pending(), "xshm", damage_source);
+            capture_counts = (0, 0, 0);
+            sec = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    log("NVENC-XShm control closed; dropping encoder and capture before exit");
     0
 }
 
@@ -1569,6 +1901,80 @@ unsafe fn run_admission_probe(
     }
 }
 
+unsafe fn run_wide_admission_probe(
+    cuda_ctx: cuda::Context,
+    mut capture: crate::linux_x11::X11Capture,
+    codec: &str,
+    color: crate::ColorSpec,
+    intent: arcen_media::EncodeIntent,
+    qp_map_policy: crate::qp_map::QpMapPolicy,
+    options: &crate::admission_probe::AdmissionProbeOptions,
+) -> i32 {
+    if capture.width() != options.width || capture.height() != options.height {
+        log_error(&format!(
+            "admission probe geometry {}x{} differs from exact X11 output {}x{}",
+            options.width,
+            options.height,
+            capture.width(),
+            capture.height()
+        ));
+        return 2;
+    }
+    let mut encoder = match crate::nvenc_cuda::Encoder::new(
+        cuda_ctx.as_raw(),
+        options.width,
+        options.height,
+        codec,
+        color,
+        intent,
+        qp_map_policy,
+    ) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            log_error(&format!("wide admission probe NVENC init failed: {error}"));
+            return 4;
+        }
+    };
+    if qp_map_policy.submits_map() {
+        let engaged = encoder.enable_qp_map(
+            qp_map_policy,
+            arcen_media::video::QpBias::default(),
+            arcen_media::VideoCodec::from_token(codec).unwrap_or(arcen_media::VideoCodec::H264),
+        );
+        log(&format!(
+            "wide admission QP map policy={} engaged={engaged}",
+            qp_map_policy.token()
+        ));
+    }
+    let result =
+        crate::admission_probe::run_probe_loop(options, std::io::stdout().lock(), |input| {
+            let started = Instant::now();
+            let frame = capture
+                .capture_wide()
+                .map_err(|error| format!("wide admission XShm capture: {error}"))?;
+            encoder
+                .stage_wide_host(frame.bytes, frame.stride, frame.layout)
+                .map_err(|error| format!("wide admission stage: {error}"))?;
+            let output = encoder
+                .encode(input.force_idr)
+                .map_err(|error| format!("wide admission encode: {error}"))?;
+            Ok(crate::admission_probe::ProbeEncodeResult {
+                encode_latency: started.elapsed(),
+                delivered: output.is_some(),
+            })
+        });
+    drop(encoder);
+    drop(capture);
+    drop(cuda_ctx);
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            log_error(&error);
+            5
+        }
+    }
+}
+
 pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> ! {
     let cursor_mode = match crate::cursor_mode_from_args(&args) {
         Ok(mode) => mode,
@@ -1650,6 +2056,11 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(2);
         }
     };
+    let capture_backend = linux_capture_backend(color.bit_depth);
+    if capture_backend == LinuxCaptureBackend::XShm && cursor_mode.include_cursor() {
+        log_error("Linux depth-30 XShm capture cannot include the host cursor; use cursor=local");
+        std::process::exit(2);
+    }
     let framed = crate::framed_output_from_args(&args);
     let admission_probe = match crate::admission_probe::options_from_args(&args) {
         Ok(options) => options,
@@ -1677,23 +2088,46 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
         };
 
         if let Some(options) = admission_probe.as_ref() {
-            let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
-                Ok(capture) => capture,
-                Err(error) => {
-                    drop(cuda_ctx);
-                    probe_startup_exit(error);
+            let code = match capture_backend {
+                LinuxCaptureBackend::NvFbc => {
+                    let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            drop(cuda_ctx);
+                            probe_startup_exit(error);
+                        }
+                    };
+                    run_admission_probe(
+                        cuda_ctx,
+                        capture,
+                        &codec,
+                        color,
+                        intent,
+                        qp_map_policy,
+                        yuv444,
+                        options,
+                    )
+                }
+                LinuxCaptureBackend::XShm => {
+                    let capture = match crate::linux_x11::X11Capture::connect_wide(output_index) {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            drop(cuda_ctx);
+                            log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
+                            std::process::exit(2);
+                        }
+                    };
+                    run_wide_admission_probe(
+                        cuda_ctx,
+                        capture,
+                        &codec,
+                        color,
+                        intent,
+                        qp_map_policy,
+                        options,
+                    )
                 }
             };
-            let code = run_admission_probe(
-                cuda_ctx,
-                capture,
-                &codec,
-                color,
-                intent,
-                qp_map_policy,
-                yuv444,
-                options,
-            );
             std::process::exit(code);
         }
 
@@ -1712,59 +2146,108 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(code);
         }
 
-        let cap = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
-            Ok(c) => c,
-            Err(error) => {
-                drop(cuda_ctx);
-                fallback_or_exit(args, requested_encoder, error);
-            }
-        };
-        let encoder = match crate::nvenc_cuda::Encoder::new(
-            cuda_ctx.as_raw(),
-            cap.width,
-            cap.height,
-            &codec,
+        let options = EncodeOptions {
+            codec: &codec,
+            fps,
+            yuv444,
+            framed,
+            cursor_mode,
             color,
-            intent,
-            qp_map_policy,
-        ) {
-            Ok(mut encoder) => {
-                // Construction truthfully records whether this selected policy
-                // got a DELTA-capability trial. Engagement additionally needs
-                // a compatible CPU-visible capture format.
-                if qp_map_policy.submits_map() {
-                    let engaged = encoder.enable_qp_map(
-                        qp_map_policy,
-                        arcen_media::video::QpBias::default(),
-                        arcen_media::VideoCodec::from_token(&codec)
-                            .unwrap_or(arcen_media::VideoCodec::H264),
-                    );
-                    crate::log(&format!(
-                        "QP map policy={} engaged={engaged}",
-                        qp_map_policy.token()
-                    ));
-                }
-                encoder
+        };
+        let code = match capture_backend {
+            LinuxCaptureBackend::NvFbc => {
+                let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        drop(cuda_ctx);
+                        fallback_or_exit(args, requested_encoder, error);
+                    }
+                };
+                let encoder = match crate::nvenc_cuda::Encoder::new(
+                    cuda_ctx.as_raw(),
+                    capture.width,
+                    capture.height,
+                    &codec,
+                    color,
+                    intent,
+                    qp_map_policy,
+                ) {
+                    Ok(mut encoder) => {
+                        if qp_map_policy.submits_map() {
+                            let engaged = encoder.enable_qp_map(
+                                qp_map_policy,
+                                arcen_media::video::QpBias::default(),
+                                arcen_media::VideoCodec::from_token(&codec)
+                                    .unwrap_or(arcen_media::VideoCodec::H264),
+                            );
+                            crate::log(&format!(
+                                "QP map policy={} engaged={engaged}",
+                                qp_map_policy.token()
+                            ));
+                        }
+                        encoder
+                    }
+                    Err(error) => {
+                        drop(capture);
+                        drop(cuda_ctx);
+                        fallback_or_exit(args, requested_encoder, error);
+                    }
+                };
+                run_encode(cuda_ctx, capture, encoder, options)
             }
-            Err(error) => {
-                drop(cap);
-                drop(cuda_ctx);
-                fallback_or_exit(args, requested_encoder, error);
+            LinuxCaptureBackend::XShm => {
+                let capture = match crate::linux_x11::X11Capture::connect_wide(output_index) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        drop(cuda_ctx);
+                        log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
+                        std::process::exit(2);
+                    }
+                };
+                let encoder = match crate::nvenc_cuda::Encoder::new(
+                    cuda_ctx.as_raw(),
+                    capture.width(),
+                    capture.height(),
+                    &codec,
+                    color,
+                    intent,
+                    qp_map_policy,
+                ) {
+                    Ok(mut encoder) => {
+                        if qp_map_policy.submits_map() {
+                            let engaged = encoder.enable_qp_map(
+                                qp_map_policy,
+                                arcen_media::video::QpBias::default(),
+                                arcen_media::VideoCodec::from_token(&codec)
+                                    .unwrap_or(arcen_media::VideoCodec::H264),
+                            );
+                            crate::log(&format!(
+                                "wide QP map policy={} engaged={engaged}",
+                                qp_map_policy.token()
+                            ));
+                        }
+                        encoder
+                    }
+                    Err(error) => {
+                        drop(capture);
+                        drop(cuda_ctx);
+                        match error {
+                            NativeStartupError::Unavailable { reason, detail } => {
+                                log_unavailable(reason, &detail);
+                                std::process::exit(2);
+                            }
+                            NativeStartupError::Fatal(detail) => {
+                                log_error(&format!(
+                                    "wide native NVENC startup failed closed: {detail}"
+                                ));
+                                std::process::exit(5);
+                            }
+                        }
+                    }
+                };
+                run_wide_encode(cuda_ctx, capture, encoder, options)
             }
         };
-        let code = run_encode(
-            cuda_ctx,
-            cap,
-            encoder,
-            EncodeOptions {
-                codec: &codec,
-                fps,
-                yuv444,
-                framed,
-                cursor_mode,
-                color,
-            },
-        );
         std::process::exit(code);
     }
 }
@@ -1826,6 +2309,11 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
             std::process::exit(2);
         }
     };
+    let capture_backend = linux_capture_backend(color.bit_depth);
+    if capture_backend == LinuxCaptureBackend::XShm && cursor_mode.include_cursor() {
+        log_error("Linux depth-30 XShm capture cannot include the host cursor; use cursor=local");
+        std::process::exit(2);
+    }
 
     // SAFETY: the backend wrappers validate all dynamically loaded entry points,
     // own every returned handle, and release them in reverse dependency order.
@@ -1837,32 +2325,91 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                 probe_startup_exit(error);
             }
         };
-        let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
-            Ok(capture) => capture,
-            Err(error) => {
-                drop(cuda_context);
-                probe_startup_exit(error);
-            }
-        };
-        let encoder = match crate::nvenc_cuda::Encoder::new(
-            cuda_context.as_raw(),
-            capture.width,
-            capture.height,
-            codec,
-            color,
-            intent,
-            qp_map_policy,
-        ) {
-            Ok(encoder) => encoder,
-            Err(error) => {
+        match capture_backend {
+            LinuxCaptureBackend::NvFbc => {
+                let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        drop(cuda_context);
+                        probe_startup_exit(error);
+                    }
+                };
+                let encoder = match crate::nvenc_cuda::Encoder::new(
+                    cuda_context.as_raw(),
+                    capture.width,
+                    capture.height,
+                    codec,
+                    color,
+                    intent,
+                    qp_map_policy,
+                ) {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        drop(capture);
+                        drop(cuda_context);
+                        probe_startup_exit(error);
+                    }
+                };
+                drop(encoder);
                 drop(capture);
-                drop(cuda_context);
-                probe_startup_exit(error);
             }
-        };
-        drop(encoder);
-        drop(capture);
+            LinuxCaptureBackend::XShm => {
+                let mut capture = match crate::linux_x11::X11Capture::connect_wide(output_index) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        drop(cuda_context);
+                        log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
+                        std::process::exit(2);
+                    }
+                };
+                let mut encoder = match crate::nvenc_cuda::Encoder::new(
+                    cuda_context.as_raw(),
+                    capture.width(),
+                    capture.height(),
+                    codec,
+                    color,
+                    intent,
+                    qp_map_policy,
+                ) {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        drop(capture);
+                        drop(cuda_context);
+                        probe_startup_exit(error);
+                    }
+                };
+                let frame = match capture.capture_wide() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        drop(encoder);
+                        drop(capture);
+                        drop(cuda_context);
+                        log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
+                        std::process::exit(2);
+                    }
+                };
+                if let Err(error) = encoder.stage_wide_host(frame.bytes, frame.stride, frame.layout)
+                {
+                    drop(frame);
+                    drop(encoder);
+                    drop(capture);
+                    drop(cuda_context);
+                    log_error(&format!("wide native probe staging failed: {error}"));
+                    std::process::exit(5);
+                }
+                drop(frame);
+                drop(encoder);
+                drop(capture);
+            }
+        }
         drop(cuda_context);
+        log(&format!(
+            "native probe capture backend={}",
+            match capture_backend {
+                LinuxCaptureBackend::NvFbc => "nvfbc",
+                LinuxCaptureBackend::XShm => "xshm",
+            }
+        ));
         log("PROBE version=1 backend=native-nvenc available=true");
     }
     std::process::exit(0);

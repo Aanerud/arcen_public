@@ -58,6 +58,8 @@ pub struct MonitorPipelineTemplate {
     pub bit_depth: BitDepth,
     pub color_range: ColorRange,
     pub color_matrix: ColorMatrix,
+    pub transfer: arcen_media::TransferCharacteristics,
+    pub color_primaries: arcen_media::ColorPrimaries,
     /// Resolved encoder intent every worker in this session requests.
     pub intent: EncodeIntent,
     /// Damage-driven QP biasing every worker in this session requests.
@@ -276,6 +278,8 @@ pub fn resolve_pipeline_specs(
                 } else {
                     template.color_matrix
                 },
+                transfer: template.transfer,
+                color_primaries: template.color_primaries,
                 intent: template.intent,
                 qp_map: template.qp_map,
                 fps: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
@@ -791,6 +795,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
@@ -1135,6 +1141,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
@@ -1418,6 +1426,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,

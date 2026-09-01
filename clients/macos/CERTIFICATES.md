@@ -7,7 +7,7 @@
 | Apple ID | <APPLE_ID_EMAIL> |
 | Team name | <Your Organization> |
 | Team ID | <APPLE_TEAM_ID> |
-| App ID | com.example.arcen.deck |
+| App ID | deck.arcen.tech |
 | Domain | arcen.tech (DNS controlled by us) |
 
 ---
@@ -103,7 +103,7 @@ ARCEN_NOTARY_KEYCHAIN_PROFILE=<NOTARY_KEYCHAIN_PROFILE> \
   required whenever a provisioning profile is embedded; not a capability grant.
 - `com.apple.developer.sustained-execution` — prevents CPU throttling while
   Deck is backgrounded during a live session. Profile-authorized (restricted
-  entitlement, approved on the `com.example.arcen.deck` App ID).
+  entitlement, approved on the `deck.arcen.tech` App ID).
 - `com.apple.developer.associated-domains` — `applinks:arcen.tech` /
   `webcredentials:arcen.tech`. Profile-authorized (wildcard `*`).
 

@@ -3,6 +3,7 @@ use core::time::Duration;
 
 #[cfg(any(feature = "nvenc", test))]
 use arcen_keel::{EmitMode, IdleCadence};
+use arcen_media::BitDepth;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RequestedEncoder {
@@ -138,6 +139,45 @@ impl SubmissionGate {
     }
 }
 
+/// Which Linux capture backend a colour contract needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxCaptureBackend {
+    /// NVIDIA Frame Buffer Capture straight into CUDA memory. The fast path,
+    /// and eight bits per channel forever.
+    NvFbc,
+    /// X11 MIT-SHM out of a depth-30 root window, into host memory. The only
+    /// way to read more than eight bits per channel on Linux.
+    XShm,
+}
+
+/// Choose the capture backend for a colour contract.
+///
+/// **Keyed on bit depth, not on transfer.** This differs deliberately from
+/// the Windows rule, and the reason is that the two platforms are answering
+/// different questions.
+///
+/// On Windows the question is "is this HDR", because Advanced Color decides
+/// whether the desktop is composited in wide-gamut scRGB at all, and only a
+/// PQ transfer means HDR. On Linux there is no such switch: X11 has one
+/// framebuffer at one depth, and the only question that matters is how many
+/// bits a capture can read out of it. Ten-bit BT.709 -- Grading Reference,
+/// an entirely SDR contract -- needs a wide capture just as much as HDR10
+/// does, because its whole purpose is the extra banding headroom. Keying
+/// this on `transfer` would hand Grading Reference an eight-bit capture and
+/// quietly deliver exactly the thing it exists to avoid.
+///
+/// NvFBC stays the default for eight-bit because it is genuinely faster:
+/// frames land in CUDA memory and NVENC reads them without crossing PCIe.
+/// The XShm path gives that up -- host memory, a CPU conversion, and a copy
+/// back to the device -- so it is taken only when the extra bits are
+/// actually being asked for.
+pub(crate) const fn linux_capture_backend(bit_depth: BitDepth) -> LinuxCaptureBackend {
+    match bit_depth {
+        BitDepth::Eight => LinuxCaptureBackend::NvFbc,
+        BitDepth::Ten | BitDepth::Twelve => LinuxCaptureBackend::XShm,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +304,32 @@ mod tests {
             gate.decision(false, Duration::ZERO),
             Some(SubmissionMode::FirstFrame)
         );
+    }
+
+    /// Eight-bit keeps the zero-copy NvFBC path.
+    #[test]
+    fn eight_bit_stays_on_nvfbc() {
+        assert_eq!(
+            linux_capture_backend(BitDepth::Eight),
+            LinuxCaptureBackend::NvFbc
+        );
+    }
+
+    /// Ten-bit needs XShm regardless of transfer.
+    ///
+    /// This is the regression guard for keying the choice on `transfer`
+    /// instead of depth. Grading Reference is ten-bit BT.709 and entirely
+    /// SDR; a transfer-keyed rule would give it NvFBC, which cannot read
+    /// more than eight bits, and the extra headroom it exists for would
+    /// silently not be there.
+    #[test]
+    fn every_depth_above_eight_needs_the_wide_capture() {
+        for depth in [BitDepth::Ten, BitDepth::Twelve] {
+            assert_eq!(
+                linux_capture_backend(depth),
+                LinuxCaptureBackend::XShm,
+                "{depth:?} cannot be served by NvFBC"
+            );
+        }
     }
 }

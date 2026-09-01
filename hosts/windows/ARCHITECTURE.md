@@ -779,20 +779,81 @@ existed.
 
 ## Resume pointer
 
-- **Status (2026-07-17):** ✅ ALL WINDOWS MILESTONES MERGED TO `main` (PRs #18/#19/#20) and
-  live-confirmed on both lab hosts. `pier-windows.example.internal` (`203.0.113.11`, GRID V100D):
-  cold-boot login + NVENC `ExactIsolated` mirroring + reconnect round-trip.
-  `development workstation` (`203.0.113.12`, VMware SVGA): MF `Negotiated` streaming with idle
-  cadence. `ArcenPier` runs as an automatic LocalSystem SCM service on
-  `:18444/udp` on both;
-  deployed binaries match `main`; the repo carries a single branch. Note: pier-windows.example.internal's
-  original native console mode is lost (journal history began from a mutated state) — the
-  console parks at 1800x1168 until the accept-current-baseline command exists.
-- **Next Windows work:** multi-monitor Match-My-Layout (Milestone 2: per-head arming,
-  per-monitor capenc, `VideoHeader.monitor_id`, Deck multi-stream rendering — seams in
-  place), production Authenticode signing, the parked display items in
-  [`todo_later.md`](todo_later.md) (standard-user path, EDID-purge restore,
-  accept-current-baseline), and MF dirty-block skip / adaptive fps.
+- **Status (2026-09-01):** the `HDRReady` release matrix is green for Auto,
+  Speed, Grading, and HDR; host/local cursor, nonzero audio, input, display
+  restore, and forced-loss credential-free resume were exercised against the
+  packaged Pier. The Windows installer upgrade path was also rerun after the
+  localized ACL fix.
+- **Next Windows work:** production Authenticode and driver signing, broader
+  non-NVIDIA physical acceptance, and optional Media Foundation comparison
+  improvements. These do not merge or replace the three native NVENC capture
+  pipelines documented below.
 - **Cert note:** each Windows Pier needs a TLS certificate whose SAN covers
   every configured connection name; enterprise PEM is administrator-managed,
   while `scripts/new-host-cert.ps1` is the absent-only SMB bootstrap.
+
+## Separate Windows capture pipelines (2026-09-01)
+
+Windows has three native NVENC pipelines. They share display/session
+supervision and the NVENC encoder wrapper, but not source format or colour
+conversion.
+
+| Resolved contract | Capture and conversion | Additional admission |
+| --- | --- | --- |
+| Auto / Speed, 8-bit | Probe Desktop Duplication for a real image; otherwise WGC `B8G8R8A8UIntNormalized`; convert the concrete BGRA8 source to the negotiated encoder format | Host cursor forces WGC |
+| Grading, 10-bit SDR | WGC `R16G16B16A16Float` linear scRGB → clamp to SDR reference range → BT.709 or sRGB OETF → full-range BT.709 I444 P16 → NVENC | FP16 pool is mandatory; HDR state is not enabled |
+| HDR, 10-bit PQ | Final HDR EDID/topology → exact-target Windows HDR state → WGC `R16G16B16A16Float` → linear BT.709-to-BT.2020 primaries → 80-nit-reference absolute PQ → BT.2020 NCL I444 P16 → NVENC | `activeColorMode=HDR` and DXGI `RGB_FULL_G2084_NONE_P2020` are mandatory |
+
+Desktop Duplication remains an eight-bit API here. Asking
+`IDXGIOutput5::DuplicateOutput1` for FP16 can still return
+`B8G8R8A8_UNORM` successfully, so the implementation trusts the texture
+descriptor, never the requested list. Every stream above eight bits bypasses
+DDA and requires a concrete FP16 WGC pool. If WGC refuses that pool, the
+session fails instead of widening BGRA8 into a dishonest ten-bit container.
+
+### Grading is wide SDR, not HDR
+
+WGC supplies linear scRGB for both wide modes. Grading preserves a genuinely
+wide source without changing the Windows desktop into HDR. Components are
+clamped to `0.0..=1.0`, encoded with the requested SDR transfer, converted to
+BT.709 YCbCr, and stored MSB-aligned for NVENC. Values above reference white
+are clipped because the requested contract is SDR.
+
+### HDR display and capture contract
+
+The HDR chain runs in this order:
+
+> final HDR EDID → exact active topology → Windows HDR mode on the same target
+> → DXGI PQ/BT.2020 proof → WGC FP16 scRGB → absolute PQ encode
+
+`edid::generate_hdr10` emits a 256-byte HDMI/10-bpc EDID with deep colour,
+SCDC, BT.2020, HDR Static Metadata, quantization, and a mastering envelope.
+Windows 11 uses `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2` and
+`DISPLAYCONFIG_SET_HDR_STATE`; the legacy Advanced Color bit is insufficient
+because it can describe WCG. Windows 10 keeps the older API.
+
+HDR queries and mutations are scoped to the exact `(adapter,target)` identities
+resolved from the final display lease. Another active HDR monitor cannot
+satisfy this session's gate and is never toggled on its behalf.
+
+The pre-provision NVIDIA EDID recovery journal remains armed for the complete
+single-display lease. Attachment teardown first restores ordinary in-session
+display state and then restores the original EDID/topology. A remote display
+request therefore cannot persist a new sink identity or HDR posture after the
+session ends.
+
+### Copy and reconnect boundaries
+
+Windows colour conversion is CPU-visible: D3D11 copies the captured texture to
+a staging texture, maps it, and writes the explicitly selected NVENC input
+format. That cost belongs only to Windows and does not affect Linux's separate
+NvFBC fast path.
+
+On transport loss, capture producers close first and the complete outbound
+video mux atomically closes and discards buffered frames before the writer is
+joined. This keeps stale writes from consuming the reconnect window; the
+session agent can detach, retain display/input leases, and accept the rotated
+credential-free resume grant.
+
+The full colour and platform comparison is in
+[`../../docs/architecture/color-fidelity.md`](../../docs/architecture/color-fidelity.md).

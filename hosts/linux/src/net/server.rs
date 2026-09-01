@@ -1426,6 +1426,7 @@ fn emit_session_stream_start(
     let _ = fields.insert("height", FieldValue::Integer(i64::from(media_plan.height)));
     let _ = fields.insert("fps", FieldValue::Integer(i64::from(media_plan.fps)));
     let _ = fields.insert("display_backend", FieldValue::String("nvctrl".to_string()));
+    insert_color_identity(&mut fields, media_plan);
     let context = emitter.session_context(
         session_log_id,
         user.map(str::to_string),
@@ -1437,6 +1438,115 @@ fn emit_session_stream_start(
         LifecycleEventKind::SessionStreamStart,
         context,
         fields,
+    );
+}
+
+/// Emits `COLOR_PLAN_RESOLVED` (1107) at level 3: what the client asked for,
+/// what the host granted, and whether anything was reduced.
+///
+/// `QualitySettings::bit_depth` already promises that the host "serves the
+/// deepest depth it can that is no deeper than this, and reports any reduction
+/// rather than applying it silently" — but nothing structured did the
+/// reporting. Without it a session granted exactly what it asked for is
+/// indistinguishable from one that was quietly reduced, which is how an 8-bit
+/// session went unnoticed on a pipeline believed to be 10-bit.
+fn emit_color_plan_resolved(
+    emitter: &LifecycleEmitter,
+    session_log_id: CorrelationId,
+    requested: &arcen_protocol::messages::QualitySettings,
+    media_plan: &ResolvedMediaPlan,
+    user: Option<&str>,
+    peer_addr: Option<&str>,
+) {
+    let granted_depth = media_plan.bit_depth_token();
+    let granted_chroma = media_plan.chroma_token();
+    let granted_codec = media_plan.codec_token();
+    let granted_transfer = media_plan.transfer_token();
+    let granted_primaries = media_plan.primaries_token();
+    // Compared as tokens because that is what both sides speak; an unknown
+    // requested token is a difference, which is the safe reading.
+    //
+    // Transfer and primaries are in this comparison because leaving them out
+    // is how the first version of this event reported `degraded=false` for a
+    // session that asked for PQ over BT.2020 and was served BT.709 -- the
+    // exact silent reduction the event exists to catch, missed by the event
+    // itself.
+    let degraded = requested.bit_depth != granted_depth
+        || requested.chroma != granted_chroma
+        || requested.codec != granted_codec
+        || requested.transfer != granted_transfer
+        || requested.color_primaries != granted_primaries;
+
+    let mut fields = StructuredFields::default();
+    let _ = fields.insert(
+        "requested_bit_depth",
+        FieldValue::String(requested.bit_depth.clone()),
+    );
+    let _ = fields.insert(
+        "granted_bit_depth",
+        FieldValue::String(granted_depth.to_string()),
+    );
+    let _ = fields.insert("degraded", FieldValue::Boolean(degraded));
+    let _ = fields.insert(
+        "requested_chroma",
+        FieldValue::String(requested.chroma.clone()),
+    );
+    let _ = fields.insert(
+        "granted_chroma",
+        FieldValue::String(granted_chroma.to_string()),
+    );
+    let _ = fields.insert(
+        "requested_codec",
+        FieldValue::String(requested.codec.clone()),
+    );
+    let _ = fields.insert(
+        "granted_codec",
+        FieldValue::String(granted_codec.to_string()),
+    );
+    let context = emitter.session_context(
+        session_log_id,
+        user.map(str::to_string),
+        peer_addr.map(str::to_string),
+        None,
+    );
+    crate::emit_lifecycle_event_with_context(
+        emitter,
+        LifecycleEventKind::ColorPlanResolved,
+        context,
+        fields,
+    );
+}
+
+/// Records the colour identity of the stream the host actually configured.
+///
+/// `codec` and `chroma` alone describe a stream that could be 8- or 10-bit,
+/// full or limited range, BT.709 or PQ. Without these, a host log cannot be
+/// used to check any claim about what depth or colour a session ran at — the
+/// answer lived only in the client's log, which is how an 8-bit session went
+/// unnoticed while both ends believed the pipeline was 10-bit capable.
+///
+/// Every value is read from the resolved plan, so this records what was
+/// configured rather than what was requested.
+fn insert_color_identity(fields: &mut StructuredFields, media_plan: &ResolvedMediaPlan) {
+    let _ = fields.insert(
+        "bit_depth",
+        FieldValue::String(media_plan.bit_depth_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_range",
+        FieldValue::String(media_plan.range_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_matrix",
+        FieldValue::String(media_plan.matrix_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_primaries",
+        FieldValue::String(media_plan.primaries_token().to_string()),
+    );
+    let _ = fields.insert(
+        "transfer",
+        FieldValue::String(media_plan.transfer_token().to_string()),
     );
 }
 
@@ -3813,6 +3923,8 @@ async fn run_attachment(
                 bit_depth: initial_capenc.bit_depth,
                 color_range: initial_capenc.color_range,
                 color_matrix: initial_capenc.color_matrix,
+                transfer: initial_capenc.transfer,
+                color_primaries: initial_capenc.color_primaries,
                 intent: initial_capenc.intent,
                 qp_map: initial_capenc.qp_map,
                 video_selection: initial_capenc.video_selection,
@@ -4474,6 +4586,22 @@ async fn run_attachment(
                     };
                     let want_codec_enum =
                         VideoCodec::from_token(stated_codec).unwrap_or(media_plan.video.codec);
+                    // Read from the client rather than hard-coded to BT.709.
+                    // These two axes are how a Deck asks for HDR, and pinning
+                    // them here meant a PQ/BT.2020 request was served as
+                    // BT.709 while depth, chroma and matrix were honoured --
+                    // a stream whose signalling contradicted the ask.
+                    //
+                    // An unknown or absent token falls back to the host's
+                    // current contract, not to a guess: a newer client naming
+                    // a transfer this build does not know must not be served
+                    // something arbitrary.
+                    let requested_transfer =
+                        TransferCharacteristics::from_token(&initial_quality.transfer)
+                            .unwrap_or(media_plan.video.transfer);
+                    let requested_primaries =
+                        ColorPrimaries::from_token(&initial_quality.color_primaries)
+                            .unwrap_or(media_plan.video.primaries);
                     let candidate_video = VideoConfiguration {
                         codec: want_codec_enum,
                         chroma: if final_yuv444 {
@@ -4484,8 +4612,8 @@ async fn run_attachment(
                         bit_depth: resolved_bit_depth,
                         range: resolved_color_range,
                         matrix: resolved_color_matrix,
-                        primaries: ColorPrimaries::Bt709,
-                        transfer: TransferCharacteristics::Bt709,
+                        primaries: requested_primaries,
+                        transfer: requested_transfer,
                     };
                     // Validate coherence and backend capability before ever
                     // forwarding this to capenc: an incoherent request (e.g.
@@ -5088,6 +5216,14 @@ async fn run_attachment(
     emit_session_stream_start(
         emitter,
         session_log_id.clone(),
+        &media_plan,
+        session_user.as_deref(),
+        Some(remote_host),
+    );
+    emit_color_plan_resolved(
+        emitter,
+        session_log_id.clone(),
+        &initial_quality,
         &media_plan,
         session_user.as_deref(),
         Some(remote_host),
@@ -11185,6 +11321,148 @@ mod tests {
             fields.get("codec"),
             Some(&FieldValue::String(plan.codec_token().to_string()))
         );
+    }
+
+    /// The colour identity fields are *optional* in the lifecycle schema, so
+    /// nothing but a test stops this host from silently going quiet about them
+    /// again. Their absence is exactly what made a session unreadable: the
+    /// depth that ran was recoverable only from the client's log.
+    #[test]
+    fn session_stream_start_states_the_colour_identity_it_configured() {
+        let (emitter, recorded) = LifecycleEmitter::recording();
+        let plan = resolved_media_plan();
+
+        emit_session_stream_start(
+            &emitter,
+            test_session_log_id(),
+            &plan,
+            Some("alice"),
+            Some("198.51.100.7"),
+        );
+
+        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
+        let fields = recorded[0].fields().as_map();
+        for (key, expected) in [
+            ("bit_depth", plan.bit_depth_token()),
+            ("color_range", plan.range_token()),
+            ("color_matrix", plan.matrix_token()),
+            ("color_primaries", plan.primaries_token()),
+            ("transfer", plan.transfer_token()),
+        ] {
+            assert_eq!(
+                fields.get(key),
+                Some(&FieldValue::String(expected.to_string())),
+                "SESSION_STREAM_START must state {key}"
+            );
+        }
+    }
+
+    /// The event that answers "was this reduced?" — the question nothing could
+    /// answer from a host log before, which is how an 8-bit session on a
+    /// pipeline believed to be 10-bit went unnoticed.
+    #[test]
+    fn color_plan_resolved_states_requested_against_granted() {
+        let plan = resolved_media_plan();
+        // The fixture plan is h264/yuv420/8-bit; ask for more than that.
+        let requested = QualitySettings {
+            codec: "h265".to_string(),
+            chroma: "yuv444".to_string(),
+            bit_depth: "10".to_string(),
+            ..QualitySettings::default()
+        };
+
+        let (emitter, recorded) = LifecycleEmitter::recording();
+        emit_color_plan_resolved(
+            &emitter,
+            test_session_log_id(),
+            &requested,
+            &plan,
+            Some("alice"),
+            Some("198.51.100.7"),
+        );
+
+        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind(), LifecycleEventKind::ColorPlanResolved);
+        let fields = recorded[0].fields().as_map();
+        assert_eq!(
+            fields.get("requested_bit_depth"),
+            Some(&FieldValue::String("10".to_string()))
+        );
+        assert_eq!(
+            fields.get("granted_bit_depth"),
+            Some(&FieldValue::String(plan.bit_depth_token().to_string()))
+        );
+        assert_eq!(
+            fields.get("degraded"),
+            Some(&FieldValue::Boolean(true)),
+            "a reduction must be reported, not applied silently"
+        );
+    }
+
+    /// A grant must not look like a reduction either, or the flag is noise.
+    /// Measured on the lab host: a session asked for PQ over BT.2020 and was
+    /// served BT.709, and the first version of this event reported
+    /// `degraded=false`. Transfer and primaries must count, or the event
+    /// misses the silent reduction it exists to catch.
+    #[test]
+    fn a_transfer_downgrade_counts_as_degraded() {
+        let plan = resolved_media_plan();
+        let requested = QualitySettings {
+            codec: plan.codec_token().to_string(),
+            chroma: plan.chroma_token().to_string(),
+            bit_depth: plan.bit_depth_token().to_string(),
+            transfer: "pq".to_string(),
+            color_primaries: "bt2020".to_string(),
+            ..QualitySettings::default()
+        };
+        assert_ne!(
+            plan.transfer_token(),
+            "pq",
+            "the fixture must not already serve PQ, or this proves nothing"
+        );
+
+        let (emitter, recorded) = LifecycleEmitter::recording();
+        emit_color_plan_resolved(
+            &emitter,
+            test_session_log_id(),
+            &requested,
+            &plan,
+            Some("alice"),
+            Some("198.51.100.7"),
+        );
+
+        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
+        assert_eq!(
+            recorded[0].fields().as_map().get("degraded"),
+            Some(&FieldValue::Boolean(true)),
+            "an HDR ask served as SDR is a reduction, not a grant"
+        );
+    }
+
+    #[test]
+    fn color_plan_resolved_reports_an_exact_grant_as_undegraded() {
+        let plan = resolved_media_plan();
+        let requested = QualitySettings {
+            codec: plan.codec_token().to_string(),
+            chroma: plan.chroma_token().to_string(),
+            bit_depth: plan.bit_depth_token().to_string(),
+            ..QualitySettings::default()
+        };
+
+        let (emitter, recorded) = LifecycleEmitter::recording();
+        emit_color_plan_resolved(
+            &emitter,
+            test_session_log_id(),
+            &requested,
+            &plan,
+            Some("alice"),
+            Some("198.51.100.7"),
+        );
+
+        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
+        let fields = recorded[0].fields().as_map();
+        assert_eq!(fields.get("degraded"), Some(&FieldValue::Boolean(false)));
     }
 
     #[test]

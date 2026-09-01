@@ -752,6 +752,13 @@ async fn run_correlated_broker(
         return Ok(());
     }
     if let Some(request) = response.initial_video.as_ref() {
+        tracing::debug!(
+            target: SESSION,
+            %peer,
+            requested_transfer = request.quality.transfer.as_str(),
+            requested_primaries = request.quality.color_primaries.as_str(),
+            "auth-time video request received"
+        );
         if let Err(error) = cfg.apply_initial_video_request(request) {
             send_auth_result(&mut ws, false, &format!("Video request rejected: {error}")).await?;
             tracing::warn!(
@@ -762,6 +769,13 @@ async fn run_correlated_broker(
             );
             return Ok(());
         }
+        tracing::debug!(
+            target: SESSION,
+            %peer,
+            resolved_transfer = cfg.transfer.token(),
+            resolved_primaries = cfg.color_primaries.token(),
+            "auth-time video request resolved"
+        );
     }
     // Acquire local product authority before credential verification, CP logon,
     // display mutation, or agent launch. The non-cloneable permit remains owned
@@ -1658,6 +1672,21 @@ impl ActiveDisplayLease {
         matches!(self, Self::Multi(_))
     }
 
+    fn device_names(&self) -> Vec<String> {
+        match self {
+            Self::Single(display) => vec![display.report().device_name.clone()],
+            Self::Multi(display) => display.applied_plan().map_or_else(
+                || vec![display.report().device_name.clone()],
+                |plan| {
+                    plan.monitors
+                        .iter()
+                        .map(|monitor| monitor.device_name.clone())
+                        .collect()
+                },
+            ),
+        }
+    }
+
     fn restore(&mut self) -> Result<(), String> {
         match self {
             Self::Single(display) => display.restore(),
@@ -1694,6 +1723,29 @@ async fn run_authenticated_agent<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // The broker resolved this request during authentication, but capture runs
+    // in this agent -- a different process, which built its config from
+    // pier.json and never saw that resolution. Depth, chroma and matrix cross
+    // the gap through the later quality-settings path; transfer and primaries
+    // had nothing carrying them, so a PQ session reached capenc as BT.709 and
+    // every HDR decision downstream -- the EDID, the FP16 pool, the VUI --
+    // read the wrong value.
+    //
+    // Resolving here rather than plumbing the broker's copy across keeps one
+    // function answering "what did this client ask for", on both sides of the
+    // process boundary.
+    if let Some(request) = response.initial_video.as_ref() {
+        if let Err(error) = cfg.apply_initial_video_request(request) {
+            return Err(format!("agent video request rejected: {error}"));
+        }
+        tracing::debug!(
+            target: SESSION,
+            transfer = cfg.transfer.token(),
+            primaries = cfg.color_primaries.token(),
+            bit_depth = cfg.bit_depth.token(),
+            "agent resolved the auth-time colour request"
+        );
+    }
     let authoritative_timezone = response.timezone.clone();
     let authoritative_cursor = response.cursor_preference;
     let multi_monitor_quality = response
@@ -1757,29 +1809,34 @@ where
                     "NVIDIA headless provisioning has no streaming adapter".to_string()
                 })?;
             let requested_monitors = requested_multi_monitor.requested_topology().monitors();
-            let target_count = requested_monitors.len();
-            // The scale the placeholder EDIDs should imply. Taken from the
-            // primary (falling back to the first monitor), because at this
-            // point the spares are interchangeable and not yet assigned to
-            // client monitors. Monitors that ask for a different scale are
-            // corrected when their own EDID is written on the exact-timing
-            // path; this only has to stop every provisioned output defaulting
-            // to 96 DPI / 100% regardless of what the client asked for.
-            let provisioning_scale = requested_monitors
+            let hdr10 = cfg.transfer == arcen_media::TransferCharacteristics::Pq;
+            let contracts = requested_monitors
                 .iter()
-                .find(|monitor| monitor.is_primary)
-                .or_else(|| requested_monitors.first())
-                .and_then(|monitor| arcen_media::scale120_from_scale(monitor.scale).ok())
-                .unwrap_or_else(|| arcen_media::Scale120::new(120).expect("120 is a valid scale"));
+                .map(|requested| {
+                    Ok(crate::nvapi_headless::HeadlessDisplayContract {
+                        width: requested.width_px,
+                        height: requested.height_px,
+                        refresh_hz: requested.refresh_hz.max(1),
+                        width_mm: requested.width_mm,
+                        height_mm: requested.height_mm,
+                        scale: arcen_media::scale120_from_scale(requested.scale)
+                            .map_err(|error| format!("invalid headless display scale: {error}"))?,
+                        product_id: if requested.model == 0 {
+                            0x0001
+                        } else {
+                            requested.model as u16
+                        },
+                        serial: requested.serial,
+                        hdr10,
+                        primary: requested.is_primary,
+                        preferred_output_index: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             let manager = Arc::clone(&display_manager);
             let owner = session_log_id.clone();
             let lease = tokio::task::spawn_blocking(move || {
-                manager.prepare_nvidia_headless_multi(
-                    &adapter,
-                    target_count,
-                    provisioning_scale,
-                    owner,
-                )
+                manager.prepare_nvidia_headless_multi(&adapter, contracts, owner)
             })
             .await
             .map_err(|error| format!("join NVIDIA headless provisioning: {error}"))?
@@ -1922,6 +1979,54 @@ where
             }
         }
     };
+    if multi_monitor_committed.is_none()
+        && display_encoder == crate::capenc::EncoderSelection::Nvenc
+    {
+        let adapter = match &cfg.output_selector {
+            crate::display::OutputSelector::Adapter { name, .. } => name.clone(),
+            crate::display::OutputSelector::GlobalIndex(_) => {
+                let error = "NVIDIA headless reconciliation requires a resolved adapter selector"
+                    .to_string();
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+        };
+        let scale = arcen_media::scale120_from_scale(request.scale)
+            .map_err(|error| format!("invalid headless display scale: {error}"))?;
+        let contract = crate::nvapi_headless::HeadlessDisplayContract {
+            width: request.size.width,
+            height: request.size.height,
+            refresh_hz: request.refresh_hz.max(1),
+            width_mm: request.width_mm,
+            height_mm: request.height_mm,
+            scale,
+            product_id: request.product_id,
+            serial: request.serial,
+            hdr10: request.hdr10,
+            primary: true,
+            preferred_output_index: match &cfg.output_selector {
+                crate::display::OutputSelector::Adapter { output_index, .. } => Some(*output_index),
+                crate::display::OutputSelector::GlobalIndex(_) => None,
+            },
+        };
+        let manager = Arc::clone(&display_manager);
+        let owner = session_log_id.clone();
+        let adapter_for_task = adapter.clone();
+        let lease = tokio::task::spawn_blocking(move || {
+            manager.prepare_nvidia_headless_multi(&adapter_for_task, vec![contract], owner)
+        })
+        .await
+        .map_err(|error| format!("join NVIDIA headless reconciliation: {error}"))?
+        .map_err(|error| format!("reconcile NVIDIA headless display: {error}"))?;
+        nvidia_headless_planning = Some(lease);
+        // Reconciliation leaves exactly one requested head on the adapter.
+        // Freeze capture to its post-reconciliation ordinal rather than the
+        // stale ordinal from the pre-session inventory.
+        cfg.output_selector = crate::display::OutputSelector::Adapter {
+            name: adapter,
+            output_index: 0,
+        };
+    }
     let mut deskside_protection = None;
     let mut deskside_hooks = None;
     let mut deskside_recovery = None;
@@ -2027,15 +2132,26 @@ where
                 .acquire_multi(&plan, iddcx_config, display_session_log_id)
                 .map(ActiveDisplayLease::Multi),
         },
-        None => display_manager
-            .acquire_with_deskside(
-                output_selector,
-                request,
-                policy,
-                display_session_log_id,
-                display_recovery,
-            )
-            .map(ActiveDisplayLease::Single),
+        None => match headless_planning_for_display {
+            Some(lease) => lease
+                .acquire_single(
+                    output_selector,
+                    request,
+                    policy,
+                    display_session_log_id,
+                    display_recovery,
+                )
+                .map(ActiveDisplayLease::Single),
+            None => display_manager
+                .acquire_with_deskside(
+                    output_selector,
+                    request,
+                    policy,
+                    display_session_log_id,
+                    display_recovery,
+                )
+                .map(ActiveDisplayLease::Single),
+        },
     })
     .await
     {
@@ -2051,6 +2167,9 @@ where
             return Err(error);
         }
     };
+    if multi_monitor_committed.is_none() {
+        cfg.output_index = display.report().capture_output_index;
+    }
     if let (Some(applied_plan), Some((committed_plan, _))) = (
         match &display {
             ActiveDisplayLease::Multi(display) => display.applied_plan().cloned(),
@@ -2077,6 +2196,36 @@ where
                     output_index: primary.adapter_output_index,
                 };
                 cfg.output_index = primary.global_index;
+            }
+        }
+    }
+    #[cfg(windows)]
+    if request.hdr10 {
+        let device_names = display.device_names();
+        let engaged = tokio::task::spawn_blocking(move || {
+            let targets = crate::advanced_color::targets_for_device_names(&device_names)?;
+            crate::advanced_color::engage_required(&targets)
+        })
+        .await;
+        match engaged {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                let restore = display.restore();
+                let error = match restore {
+                    Ok(()) => format!("enable HDR desktop before capture: {error}"),
+                    Err(restore_error) => format!(
+                        "enable HDR desktop before capture: {error}; display restore failed: \
+                         {restore_error}"
+                    ),
+                };
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+            Err(error) => {
+                let error = format!("Advanced Color task failed: {error}");
+                let _ = display.restore();
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
             }
         }
     }
@@ -2672,8 +2821,14 @@ where
         bit_depth: resolved_bit_depth,
         range: resolved_color_range,
         matrix: resolved_color_matrix,
-        primaries: media_plan.video.primaries,
-        transfer: media_plan.video.transfer,
+        // From the client's request, not the host's current plan. Taking
+        // these from `media_plan` is what kept a PQ/BT.2020 ask being served
+        // as BT.709 on this host even after the matrix axis was honoured.
+        // An unrecognised token falls back to the plan rather than a guess.
+        primaries: arcen_media::ColorPrimaries::from_token(&quality.color_primaries)
+            .unwrap_or(media_plan.video.primaries),
+        transfer: arcen_media::TransferCharacteristics::from_token(&quality.transfer)
+            .unwrap_or(media_plan.video.transfer),
     };
     let (resolved_bit_depth, resolved_color_range, resolved_color_matrix) =
         if color_contract_is_servable(resolved_color_video, media_plan) {
@@ -3202,6 +3357,15 @@ fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, S
         }
     }
     let mut request = DisplayRequest::new(response.screen_width, response.screen_height)?;
+    // The EDID is the first link of the HDR chain and the only one this host
+    // controls: Windows offers Advanced Color only where the sink claims it.
+    // Keyed on the transfer the Deck asked for, not on depth -- 10-bit BT.709
+    // is an ordinary SDR contract and advertising HDR10 for it would change
+    // how the whole desktop is composited to no purpose.
+    request.hdr10 = response
+        .initial_video
+        .as_ref()
+        .is_some_and(|video| video.quality.transfer == "pq");
     let Some(monitor) = response
         .monitors
         .iter()
@@ -4628,6 +4792,8 @@ async fn prepare_multi_monitor_media(
         bit_depth: cfg.bit_depth,
         color_range: cfg.color_range,
         color_matrix: cfg.color_matrix,
+        transfer: cfg.transfer,
+        color_primaries: cfg.color_primaries,
         intent: cfg.requested_encode_intent(),
         qp_map: cfg.qp_map,
         fps: template_fps,
@@ -6085,6 +6251,13 @@ where
         pen.release();
     }
     video_pipelines.close_frames();
+    // A detached attachment must stop its writer immediately so the broker
+    // can reunite the agent IPC and accept a resume. Closing only the capture
+    // pipelines leaves already-buffered mux frames available to the writer;
+    // on a dead client transport each can spend a full write timeout and race
+    // the reconnect window. The mux already owns the required atomic
+    // close-and-discard operation -- use it in production as the tests do.
+    video.close_and_clear_all();
     audio.clear();
     if let Some(runtime) = clipboard_runtime.as_mut() {
         runtime.shutdown();
@@ -6348,6 +6521,7 @@ fn emit_session_stream_start(
         "display_backend",
         FieldValue::String(display_report.backend.to_string()),
     );
+    insert_color_identity(&mut fields, media_plan);
     crate::emit_lifecycle_event_with_context(
         emitter,
         LifecycleEventKind::SessionStreamStart,
@@ -6357,6 +6531,39 @@ fn emit_session_stream_start(
         local_hostname(),
         Some(peer.to_owned()),
         None,
+    );
+}
+
+/// Records the colour identity of the stream the host actually configured.
+///
+/// `codec` and `chroma` alone describe a stream that could be 8- or 10-bit,
+/// full or limited range, BT.709 or PQ. Without these, a host log cannot be
+/// used to check any claim about what depth or colour a session ran at — the
+/// answer lived only in the client's log, which is how an 8-bit session went
+/// unnoticed while both ends believed the pipeline was 10-bit capable.
+///
+/// Every value is read from the resolved plan, so this records what was
+/// configured rather than what was requested.
+fn insert_color_identity(fields: &mut StructuredFields, media_plan: &ResolvedMediaPlan) {
+    let _ = fields.insert(
+        "bit_depth",
+        FieldValue::String(media_plan.bit_depth_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_range",
+        FieldValue::String(media_plan.range_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_matrix",
+        FieldValue::String(media_plan.matrix_token().to_string()),
+    );
+    let _ = fields.insert(
+        "color_primaries",
+        FieldValue::String(media_plan.primaries_token().to_string()),
+    );
+    let _ = fields.insert(
+        "transfer",
+        FieldValue::String(media_plan.transfer_token().to_string()),
     );
 }
 
@@ -6562,6 +6769,8 @@ fn start_capture_after_display<I, C, F>(
         bit_depth: cfg.bit_depth,
         color_range: cfg.color_range,
         color_matrix: cfg.color_matrix,
+        transfer: cfg.transfer,
+        color_primaries: cfg.color_primaries,
         intent: cfg.requested_encode_intent(),
         qp_map: cfg.qp_map,
         fps: cfg.fps,
@@ -8855,6 +9064,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
@@ -9747,6 +9958,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::AlwaysOn,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance,
@@ -9787,6 +10000,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
@@ -10403,6 +10618,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
@@ -10561,6 +10778,8 @@ mod tests {
                 bit_depth: BitDepth::Eight,
                 color_range: ColorRange::Limited,
                 color_matrix: ColorMatrix::Bt709,
+                transfer: arcen_media::TransferCharacteristics::Bt709,
+                color_primaries: arcen_media::ColorPrimaries::Bt709,
                 intent: arcen_media::EncodeIntent::default(),
                 qp_map: arcen_media::video::QpMapPolicy::default(),
                 fps: 30,
@@ -10625,6 +10844,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,

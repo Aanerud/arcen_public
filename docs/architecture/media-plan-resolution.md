@@ -1,12 +1,13 @@
 # Media Plan Resolution and Portable Software H.264
 
-**Status: implementation complete for the active direct-connection Linux and
-Windows Piers (updated 2026-08-15); physical acceptance and distribution
-approval remain release gates.** Protocol v4 now carries an additive auth-time
-video intent so both Piers can resolve the final encoder before `ServerHello`.
+**Status: implemented and physically accepted for the active direct-connection
+Linux and Windows Piers (updated 2026-09-01).** Protocol v4 carries auth-time
+video intent so both Piers resolve the final capture provider, conversion,
+encoder, cursor authority, and colour contract before `ServerHello`.
 
-This delivery does **not** implement Audio Input or the Observability Standard.
-It uses the existing bounded `arcen-telemetry` contracts only.
+This document is scoped to video capture/encode plan resolution. Audio,
+microphone, and observability have their own contracts and do not select or
+merge these video pipelines.
 
 ## Shared-first boundary
 
@@ -14,15 +15,30 @@ It uses the existing bounded `arcen-telemetry` contracts only.
 software-encoder contracts:
 
 ```text
-Windows WGC BGRA ─┐
-                  ├─ checked BGRA ── arcen-media ── NV12 ── inbox MF
-Linux X11 BGRA ───┘                    │
-                                      └─ I420 ── source-built OpenH264 ── Annex-B
+Auto / Speed
+  Windows: DDA(real-frame proof) or WGC BGRA8 -> explicit YUV conversion -> NVENC
+  Linux:   NvFBC -> CUDA -> NVENC                         [device-to-device]
 
-Windows Performance: NVENC AV1 -> HEVC -> H.264 -> OpenH264
-Linux Performance:   NVENC AV1 -> HEVC -> H.264 -> OpenH264
-Grading:             HEVC 4:4:4 10-bit full range, truthfully degraded if unavailable
+Grading
+  Windows: WGC FP16 scRGB -> SDR OETF/BT.709 -> I444 P16 -> NVENC
+  Linux:   depth-30 Xorg -> XShm RGB10 -> I444 P16 -> CUDA upload -> NVENC
+
+HDR
+  Windows: HDR EDID/topology/exact-target proof -> WGC FP16 scRGB
+           -> BT.2020/PQ -> I444 P16 -> NVENC
+  Linux:   Xorg cannot prove HDR -> resolve to the Grading pipeline + degradation
+
+Shipped software floor
+  Windows: WGC BGRA8 -> checked I420 -> source-built OpenH264 -> Annex-B
+  Linux:   X11 BGRA -> checked I420 -> source-built OpenH264 -> Annex-B
+
+Comparison-only Windows path
+  WGC BGRA8 -> checked NV12 -> inbox Media Foundation H.264
 ```
+
+The capture provider is part of resolution truth, not an implementation detail.
+The eight-bit fast path is never widened to implement Grading/HDR, and a
+ten-bit container never upgrades an eight-bit source by declaration.
 
 For multi-monitor, each codec is an aggregate candidate spanning the complete
 monitor roster. Admission measures uniform AV1 first, then uniform HEVC, then
@@ -101,13 +117,18 @@ OpenH264 allocations remain opaque.
 For adaptive Performance, Windows `auto` tries AV1, HEVC, and H.264 on the
 selected NVENC adapter before source-built OpenH264.
 Colour-fidelity and exact requests do not silently enter the ordinary codec
-ranking; backend unavailability may still reach the truthful MF floor.
-The shipped Windows graph excludes OpenH264 and rejects
-`encoder=software-h264`.
+ranking; backend unavailability may still reach the truthful OpenH264 floor.
 The host predicts the display policy from the selected adapter, but preserves
 `auto` in the capenc request so a compatible NVENC initialization failure can
-still advance to Media Foundation. Only the resulting canonical READY becomes
+still advance to OpenH264. Only the resulting canonical READY becomes
 the backend advertised in hello and frame headers.
+
+Capture selection is independently constrained by the resolved colour
+contract. Eight-bit requests may probe DDA and fall back to WGC BGRA8. Every
+ten-bit request requires WGC FP16 scRGB. Grading applies an SDR transform and
+does not enable HDR. HDR first provisions the final sink/topology, enables and
+verifies HDR on the exact bound target, and then applies the absolute
+BT.2020/PQ transform. FP16 refusal fails closed.
 
 MF display negotiation carries the macroblock invariant into fixed-mode
 fallback selection. The requested size is aligned first; if the driver rejects
@@ -134,6 +155,14 @@ retains the HEVC retry on older generations; adaptive Performance additionally
 tries hardware H.264 before typed unavailability selects OpenH264. Explicit
 software mode skips the NVIDIA path. Software limits are selected before the
 one display mutation.
+
+Capture selection is keyed on resolved bit depth. Eight-bit requests use
+NvFBC/CUDA and retain the existing device-to-device path. Every deeper request
+uses depth-30 Xorg/MIT-SHM and a host RGB10 conversion plus one CUDA upload.
+Because Xorg supplies no HDR composition/metadata contract, PQ/HLG requests are
+rewritten to the Grading BT.709 contract before capenc starts. XShm cannot
+composite a host cursor, so Host authority degrades to Local only on the wide
+path.
 
 `hosts/capenc/src/linux_x11.rs` owns authenticated X11 connection, XRandR output
 selection, XDamage activity, MIT-SHM 1.2 mapping lifetime, bounded XGetImage

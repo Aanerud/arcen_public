@@ -5,24 +5,26 @@ product surface), spawned as a subprocess by **both** Arcen Piers.
 
 ## What this is
 
-One fused native process that captures the framebuffer and emits an Annex-B H.265/H.264
-stream to stdout. Hardware paths keep capture and encode on one GPU with zero host copies.
-The Windows Media Foundation software fallback deliberately maps WGC BGRA to the CPU,
-converts it to NV12 in Rust, and feeds the inbox H.264 MFT. The fusion (capture and
-encode in one process) is the whole point: it removes the pipe/CPU copies that capped the
-old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
+One fused native process captures the framebuffer and emits Annex-B video to
+stdout. Fusion keeps capture, conversion, encoder lifetime, framing, and
+recovery in one bounded process; it does **not** mean every quality mode shares
+one pixel pipeline.
 
-- **Linux:** NvFBC → CUDA → NVENC (shared CUDA context). `dlopen`'d FFI, no CUDA build dep.
-  New-frame cadence comes from NvFBC `bIsNewFrame`: active frames submit on the next
-  pacing tick and idle falls to a one-second keepalive.
-- **Windows:** DXGI Desktop Duplication **or** Windows.Graphics.Capture (WGC) → NVENC over
-  D3D11 (zero-copy). WGC is the fallback where DXGI yields no frames (headless vGPU/RDP).
-- **Windows software fallback:** exact-output WGC → D3D11 staging readback → Rust
-  BGRA-to-NV12 → Microsoft Media Foundation H.264. Proven on VMware SVGA.
-- **Portable software H.264:** Windows WGC or Linux authenticated dedicated-Xorg
-  BGRA → shared checked I420 conversion → the one source-built
-  `arcen-media::SoftwareH264Encoder`. Windows exposes this explicitly only;
-  Linux auto advances from NVENC only on typed pre-READY unavailability.
+| Contract | Capture → conversion → encode | Copy boundary |
+| --- | --- | --- |
+| Linux Auto/Speed, 8-bit | NvFBC → CUDA → NVENC | Device-to-device; no host frame copy |
+| Linux Grading, 10-bit SDR | Depth-30 Xorg → MIT-SHM packed RGB10 → shared RGB10-to-P16 conversion → CUDA → NVENC | Host capture/conversion plus one host-to-device upload |
+| Linux HDR request on Xorg | Same as Linux Grading after the Pier changes transfer/primaries/matrix to BT.709 | Explicit degradation; capenc refuses PQ/HLG from Xorg |
+| Windows Auto/Speed, 8-bit | DDA after real-image proof, otherwise WGC BGRA8 → D3D11 staging → negotiated YUV → NVENC | CPU-visible conversion path |
+| Windows Grading, 10-bit SDR | WGC FP16 scRGB → shared SDR OETF/matrix → NVENC I444 P16 | CPU-visible FP16 conversion |
+| Windows HDR | Verified HDR display state → WGC FP16 scRGB → shared linear-primary conversion + absolute PQ/BT.2020 → NVENC I444 P16 | CPU-visible FP16 conversion |
+| Windows MF comparison path | Exact-output WGC BGRA8 → shared BGRA-to-NV12 → inbox Media Foundation H.264 | CPU-visible; not selected by the current packaged Pier policy |
+| Portable OpenH264 | Windows WGC or Linux authenticated X11 BGRA → shared checked I420 → source-built OpenH264 | CPU capture/conversion/encode |
+
+The paths stay separate because their source formats and truth differ. A new
+wide path must not add a readback to Linux's eight-bit NvFBC fast path, and an
+8-bit BGRA source must never be accepted as a ten-bit WGC/XShm source merely
+because the destination buffer is wider.
 
 ## How it's grounded
 
@@ -47,6 +49,10 @@ old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
     Always build the Linux engine with `--features nvenc`.
   - Buffer formats: NvFBC `BUFFER_FORMAT_YUV444P = 3` (planar `w*h*3`); NVENC
     `NV_ENC_BUFFER_FORMAT_YUV444`.
+  - **Depth 30 does not imply one packed ordering.** The live GRID Xorg visual
+    exposes red in bits 0–9 and blue in 20–29 (`XBGR2101010`). Derive shifts
+    from the root visual masks; never cast depth-30 bytes to `BgraFrame` or
+    assume `XRGB2101010`.
 
 ## Rules — what it must be (invariants)
 
@@ -54,8 +60,10 @@ old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
    guardrail: keep media relay-able — no client identity/routing baked into capenc output).
 2. `unsafe` FFI is expected here (~1200 sites: NvFBC/CUDA/NVENC/DXGI/WGC/D3D11). This is why
    the workspace `unsafe_code` lint is `warn`, not `forbid`.
-3. Zero host copies on NVENC hot paths. MF and OpenH264 software encoding are
-   bounded CPU paths.
+3. Linux eight-bit NvFBC keeps its device-to-device behavior. Linux depth-30,
+   Windows BGRA/FP16 conversion, MF and OpenH264 are explicit bounded
+   CPU-visible paths and must identify capture backend and copy cost in
+   READY/telemetry.
 4. Platform backends stay behind `cfg`; production Linux capenc uses
    `--features nvenc,software-h264`.
 5. CLI stable: `--display :N`, `--monitor N`, `--fps`, `codec`, `yuv444`,
@@ -70,7 +78,10 @@ old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
    advertise codec/chroma/backend/cursor before validating it.
 9. Windows Host cursor mode is WGC-only. The WGC cursor toggle is strict; DDA is
    local-cursor-only and has no cursor-shape compositor.
-10. The default dependency graph contains no OpenH264/native build graph.
+10. Linux depth-30 XShm has no host-cursor compositor. The Linux Pier resolves
+    Host to Local before native preflight and live spawn; eight-bit NvFBC keeps
+    its existing in-video cursor path.
+11. The default dependency graph contains no OpenH264/native build graph.
     `software-h264` enables only `arcen-media/software-h264-source`; no host
     module calls `openh264-sys2`.
 
@@ -97,13 +108,17 @@ old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
   cadence, INFO pipeline stats, and checked NvFBC 1.7 ToCuda ABI plus
   READY/UNAVAILABLE startup records.
 - `nvenc_cuda.rs` — Linux CUDA↔NVENC staging (**the YUV444 pitch bug lives here**).
-- `win.rs` — DXGI Desktop Duplication capture.
-- `wgc.rs` — Windows.Graphics.Capture with strict fixed cursor inclusion.
+- `win.rs` — Windows capture selection. Eight-bit probes DDA before WGC;
+  every ten-bit contract requires WGC FP16; HDR additionally verifies the
+  bound output's PQ/BT.2020 DXGI state.
+- `wgc.rs` — Windows.Graphics.Capture pool ownership. FP16 requests fail
+  closed rather than becoming BGRA8 in a ten-bit container.
 - `win_mf.rs` / `mf_encoder.rs` / `annexb.rs` — shared WGC staging plus
   Media Foundation or shared OpenH264 software encoding and framing. Portable
   BGRA conversion moved to `arcen-media`.
-- `linux_x11.rs` — XRandR/XDamage/MIT-SHM 1.2 capture, bounded GetImage
-  degradation, checked modeset recreation, and shared OpenH264 loop.
+- `linux_x11.rs` — XRandR/XDamage/MIT-SHM 1.2 capture, depth-24 BGRA and
+  depth-30 mask-derived RGB10 layouts, bounded GetImage degradation, checked
+  modeset recreation, and shared OpenH264 loop.
 - `region_schedule.rs` — host-neutral binding of `arcen-media`'s
   `RegionActivityScheduler` for both software capture loops. It owns the Keel
   damage tracker that already drives selective conversion, so one hash pass per
@@ -114,7 +129,9 @@ old Python+ffmpeg path at ~29 fps @ 4K. Platform backends:
   keyframe deadline, the max-idle refresh, and input/focus wakes are all
   mandatory services it can never skip. Encoder backend, codec/chroma, bitrate,
   and frame-rate policy stay host-authoritative.
-- `nvenc.rs` + `nvenc_sys/{mod,guid,version}.rs` — NVENC FFI + vendored struct defs.
+- `nvenc.rs` + `nvenc_sys/{mod,guid,version}.rs` — Windows NVENC FFI and
+  staging, including separate FP16-scRGB-to-SDR and FP16-scRGB-to-PQ row
+  conversions.
 - `frame_policy.rs` — keyframe/intra-refresh policy.
 - `ARCEN_SESSION_LOG_ID` is an optional validated UUID inherited from the Pier.
   Diagnostics and per-second stats append `sid=<uuid>`; Annex-B stdout and the

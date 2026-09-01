@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-linux"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true

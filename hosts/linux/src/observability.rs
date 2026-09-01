@@ -491,16 +491,28 @@ fn transition_fields(
         return fields;
     }
     unhealthy_since_ms.get_or_insert(timestamp_ms);
-    let side = if assessment.client_experience.state == Some(current) {
-        assessment.client_experience
+    let (side, selected) = if assessment.client_experience.state == Some(current) {
+        (
+            assessment.client_experience,
+            HealthSideKind::ClientExperience,
+        )
     } else {
-        assessment.host_delivery
+        (assessment.host_delivery, HealthSideKind::HostDelivery)
     };
     let cause = side.dominant_cause.unwrap_or(HealthCause::Heartbeat);
-    let (value, threshold) = cause_value_threshold(cause, current, sample, targets);
+    let (value, threshold) = cause_value_threshold(cause, selected, current, sample, targets);
+    // Deliberately no `dominant_side` field. It would be genuinely useful, but
+    // `HEALTH_DEGRADED`/`HEALTH_CRITICAL` carry a *closed* field schema
+    // (`arcen_telemetry::lifecycle`), mirrored in
+    // `scripts/observability_event_definitions.py`, and any undeclared field
+    // makes `ValidatedLifecycleEvent::new` reject the whole event — which
+    // would silently delete every health transition rather than improve one.
+    // The cause name already carries the distinction unambiguously: only the
+    // client side can produce `unpresented`, and only host delivery can
+    // produce `loss`.
     let _ = fields.insert(
         "dominant_cause",
-        FieldValue::String(health_cause_name(cause).to_owned()),
+        FieldValue::String(health_cause_name(cause, selected).to_owned()),
     );
     let _ = fields.insert("value", FieldValue::Integer(i64::from(value)));
     if let Some(threshold) = threshold {
@@ -509,8 +521,44 @@ fn transition_fields(
     fields
 }
 
+/// Which side of the session the reported cause was selected from.
+///
+/// [`HealthCause`] is deliberately shared by both sides, so the cause alone
+/// does not say which counters produced it. Losing that distinction is what
+/// let this host print a client presentation problem using host delivery
+/// numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthSideKind {
+    HostDelivery,
+    ClientExperience,
+}
+
+/// Fraction of decoded frames that never reached the screen, in basis points.
+///
+/// **This is not transport loss**, despite arriving as [`HealthCause::Loss`]:
+/// `assess_presentation_drop` reuses that cause for client supersession. Every
+/// frame counted here arrived intact and decoded successfully before a newer
+/// frame replaced it, which is the normal consequence of a client that always
+/// shows the latest frame.
+///
+/// The Deck already reports exactly this, under the name `unpresented`. This
+/// host did not: it selected the client side's cause and then computed the
+/// value from host `frames_sent`/`frames_dropped`, which for a client-only
+/// sample are absent. A session with real supersession and zero packet drops
+/// therefore logged `dominant_cause=loss value=0`, which reads as a network
+/// fault that does not exist and hides the real presentation problem.
+fn unpresented_basis_points(sample: &QosSample) -> u32 {
+    let decoded = sample.frames_decoded.unwrap_or(0);
+    if decoded == 0 {
+        return 0;
+    }
+    let missed = decoded.saturating_sub(sample.frames_presented.unwrap_or(0));
+    u32::try_from(missed.saturating_mul(10_000) / decoded).unwrap_or(u32::MAX)
+}
+
 fn cause_value_threshold(
     cause: HealthCause,
+    side: HealthSideKind,
     state: HealthState,
     sample: &QosSample,
     targets: &QosTargets,
@@ -536,17 +584,21 @@ fn cause_value_threshold(
             }),
         ),
         HealthCause::Loss => {
-            let (sent, dropped) = (
-                sample.frames_sent.unwrap_or(0),
-                sample.frames_dropped.unwrap_or(0),
-            );
-            let total = sent.saturating_add(dropped);
-            let value = dropped
-                .saturating_mul(10_000)
-                .checked_div(total)
-                .map_or(0, |basis_points| {
-                    u32::try_from(basis_points).unwrap_or(u32::MAX)
-                });
+            let value = match side {
+                HealthSideKind::ClientExperience => unpresented_basis_points(sample),
+                HealthSideKind::HostDelivery => {
+                    let (sent, dropped) = (
+                        sample.frames_sent.unwrap_or(0),
+                        sample.frames_dropped.unwrap_or(0),
+                    );
+                    let total = sent.saturating_add(dropped);
+                    if total == 0 {
+                        0
+                    } else {
+                        u32::try_from(dropped.saturating_mul(10_000) / total).unwrap_or(u32::MAX)
+                    }
+                }
+            };
             (
                 value,
                 Some(u32::from(if state == HealthState::Critical {
@@ -579,11 +631,17 @@ fn health_state_name(state: HealthState) -> &'static str {
     }
 }
 
-fn health_cause_name(cause: HealthCause) -> &'static str {
+fn health_cause_name(cause: HealthCause, side: HealthSideKind) -> &'static str {
     match cause {
         HealthCause::Fps => "fps",
         HealthCause::Rtt => "rtt",
-        HealthCause::Loss => "loss",
+        // Matching the Deck exactly: on the client side this cause carries
+        // presentation supersession, not transport loss. Real packet loss is
+        // reported separately as loss epochs and keeps the name `loss`.
+        HealthCause::Loss => match side {
+            HealthSideKind::HostDelivery => "loss",
+            HealthSideKind::ClientExperience => "unpresented",
+        },
         HealthCause::InputLatency => "input_latency",
         HealthCause::Heartbeat => "heartbeat",
     }
@@ -888,5 +946,130 @@ mod tests {
         assert_ne!(reloaded, QosTargets::default());
         health.set_targets(reloaded);
         assert_eq!(health.targets(), reloaded);
+    }
+
+    /// The exact defect seen in a real session log:
+    /// `dominant_cause=loss threshold=50 value=0`.
+    ///
+    /// Client supersession selected the client side's cause, but the value was
+    /// computed from host `frames_sent`/`frames_dropped`, which are zero for a
+    /// presentation problem. The result read as a network fault that did not
+    /// exist, and hid the real one.
+    #[test]
+    fn client_presentation_loss_reports_unpresented_rather_than_zero_host_loss() {
+        let sample = QosSample {
+            frames_decoded: Some(1_000),
+            frames_presented: Some(700),
+            // No transport loss whatsoever: this is what made the old value 0.
+            frames_sent: Some(1_000),
+            frames_dropped: Some(0),
+            ..QosSample::default()
+        };
+        let targets = QosTargets::default();
+
+        let (value, threshold) = cause_value_threshold(
+            HealthCause::Loss,
+            HealthSideKind::ClientExperience,
+            HealthState::Degraded,
+            &sample,
+            &targets,
+        );
+
+        // 300 of 1000 decoded frames never reached the screen.
+        assert_eq!(value, 3_000, "expected 30% supersession in basis points");
+        assert_eq!(
+            threshold,
+            Some(u32::from(targets.drop_degraded_basis_points()))
+        );
+        assert_eq!(
+            health_cause_name(HealthCause::Loss, HealthSideKind::ClientExperience),
+            "unpresented",
+            "the client side must not call supersession transport loss"
+        );
+    }
+
+    #[test]
+    fn host_delivery_loss_still_reports_transport_counters() {
+        let sample = QosSample {
+            frames_sent: Some(900),
+            frames_dropped: Some(100),
+            // Present, and deliberately different, to prove the host side does
+            // not read the client's counters.
+            frames_decoded: Some(1_000),
+            frames_presented: Some(1_000),
+            ..QosSample::default()
+        };
+
+        let (value, _) = cause_value_threshold(
+            HealthCause::Loss,
+            HealthSideKind::HostDelivery,
+            HealthState::Degraded,
+            &sample,
+            &QosTargets::default(),
+        );
+
+        assert_eq!(value, 1_000, "100 dropped of 1000 total is 10%");
+        assert_eq!(
+            health_cause_name(HealthCause::Loss, HealthSideKind::HostDelivery),
+            "loss"
+        );
+    }
+
+    /// One `HealthCause`, two meanings. If these ever agree, the distinction
+    /// this fix restored has been lost again.
+    #[test]
+    fn the_two_sides_read_different_counters_for_the_same_cause() {
+        let sample = QosSample {
+            frames_sent: Some(1_000),
+            frames_dropped: Some(0),
+            frames_decoded: Some(1_000),
+            frames_presented: Some(500),
+            ..QosSample::default()
+        };
+        let targets = QosTargets::default();
+
+        let client = cause_value_threshold(
+            HealthCause::Loss,
+            HealthSideKind::ClientExperience,
+            HealthState::Degraded,
+            &sample,
+            &targets,
+        )
+        .0;
+        let host = cause_value_threshold(
+            HealthCause::Loss,
+            HealthSideKind::HostDelivery,
+            HealthState::Degraded,
+            &sample,
+            &targets,
+        )
+        .0;
+
+        assert_eq!(client, 5_000);
+        assert_eq!(host, 0);
+        assert_ne!(client, host);
+    }
+
+    #[test]
+    fn unpresented_is_zero_rather_than_dividing_by_no_decoded_frames() {
+        assert_eq!(unpresented_basis_points(&QosSample::default()), 0);
+        assert_eq!(
+            unpresented_basis_points(&QosSample {
+                frames_decoded: Some(0),
+                frames_presented: Some(0),
+                ..QosSample::default()
+            }),
+            0
+        );
+        // Presented may briefly exceed decoded across a window boundary; that
+        // must saturate to zero rather than underflow.
+        assert_eq!(
+            unpresented_basis_points(&QosSample {
+                frames_decoded: Some(10),
+                frames_presented: Some(20),
+                ..QosSample::default()
+            }),
+            0
+        );
     }
 }

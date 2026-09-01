@@ -70,3 +70,21 @@ There is no single-platform `--workspace` build. `arcen-protocol` and
 Escalate public API, wire compatibility, trust-boundary, cryptography, and new
 third-party dependency changes to Release/Security. Notify every affected
 product owner before changing shared behavior.
+
+## Shared video contract
+
+`arcen-media` owns the portable colour vocabulary, complete video
+configuration, degradation taxonomy, conversion maths, and READY/plan truth.
+Platform directories choose and operate native capture APIs; they must not
+duplicate these decisions.
+
+- Keep eight-bit BGRA, packed RGB10, FP16-scRGB-to-SDR, and
+  FP16-scRGB-to-PQ conversions as explicit source-specific functions.
+- Transfer and primaries are first-class axes. Bit depth alone never means
+  HDR, and a host may retain PQ/HLG only when its native provider proves an HDR
+  source.
+- `PlanDegradation` must report changes to matrix, primaries, transfer, range,
+  depth, chroma, codec, fps, geometry, and cursor authority rather than hiding
+  them in a platform adapter.
+- Shared code may describe capture capabilities and conversion contracts, but
+  must not import D3D11/WGC, X11/XShm, CUDA/NVENC, VideoToolbox, or Metal.

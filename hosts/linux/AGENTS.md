@@ -16,6 +16,21 @@ integration coverage.
 Building requires `libpam0g-dev` and `libpulse-dev`. NVENC capture requires an
 NVIDIA GPU and driver on the build/test host.
 
+## Capture pipeline boundaries
+
+- Eight-bit sessions use NvFBC → CUDA → NVENC. Preserve this as the
+  device-to-device fast path; do not route it through XShm or host conversion.
+- Every depth above eight uses the separate depth-30 Xorg/MIT-SHM path. Derive
+  packed RGB10 ordering from the live visual masks, convert in shared media
+  code, then upload once to CUDA/NVENC.
+- Xorg depth 30 is genuine precision but not an HDR composition contract. PQ
+  and HLG requests must resolve to Grading BT.709 SDR until a color-managed
+  Wayland provider proves transfer, primaries, metadata, and capture format.
+- XShm cannot composite the host cursor. Resolve Host to Local before native
+  preflight and live spawn; keep Host unchanged on the eight-bit NvFBC path.
+- READY and session truth must identify `capture=nvfbc
+  capture_zero_copy=true` or `capture=xshm capture_zero_copy=false`.
+
 Escalate shared API or protocol changes to Shared/Architecture; authentication,
 privilege, GPU, signing, packaging, and release changes to Release/Security.
 

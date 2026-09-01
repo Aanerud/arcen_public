@@ -52,22 +52,13 @@
 // texture therefore returns a *normalised* float, not the raw code, and
 // undoing that normalisation is not simply "multiply by the max code":
 //
-//   - **Eight-bit** planes are a native 8-bit-per-component IOSurface
-//     layout (no MSB alignment -- see the "MSB alignment" section of
-//     `docs/architecture/color-fidelity.md`), so `read()` already yields
-//     exactly `code / 255.0`, and `code_unnormalize_scale` is plain `255.0`.
-//   - **Ten/twelve-bit** planes are MSB-aligned inside a 16-bit container
-//     (`raw16 = code << (16 - depth_bits)`, CoreVideo's `x`-prefixed
-//     convention), but Metal's `Unorm` normalisation always divides by the
-//     *full* 16-bit range (`65535.0`), not by the depth's own max code
-//     (`1023`/`4095`). A ten-bit `read()` therefore yields
-//     `code * 64 / 65535`, which tops out at `65472 / 65535 ≈ 0.999039`,
-//     never `1.0`, at the maximum code. `code_unnormalize_scale` is exactly
-//     the factor that undoes this: `65535.0 / 64.0` at ten bits,
-//     `65535.0 / 16.0` at twelve -- see `plane_pixel_formats` in
-//     `video_metal_layer.rs`, which derives and unit-tests this precise
-//     value per depth, including a round-trip sweep over representative
-//     codes.
+//   - **Eight-bit** planes are native 8-bit-per-component IOSurfaces, so
+//     `read()` yields exactly `code / 255.0`.
+//   - **Ten/twelve-bit** planes are MSB-aligned inside a 16-bit container,
+//     while Metal normalises `R16Unorm`/`RG16Unorm` reads by 65535. The CPU
+//     therefore supplies the depth-specific `code_unnormalize_scale` needed
+//     to recover the original code value. See `plane_pixel_formats` in
+//     `video_metal_layer.rs`.
 //
 // Once `luma_code`/`cb_code`/`cr_code` below are reconstructed this way,
 // every remaining line is the *identical* formula `video_render.wgsl`'s

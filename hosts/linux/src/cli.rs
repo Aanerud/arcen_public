@@ -78,6 +78,20 @@ pub enum AudioUserMode {
 
 pub use arcen_media::video::ColorPolicy;
 
+fn xorg_capture_contract(
+    mut video: arcen_media::VideoConfiguration,
+) -> arcen_media::VideoConfiguration {
+    if matches!(
+        video.transfer,
+        arcen_media::TransferCharacteristics::Pq | arcen_media::TransferCharacteristics::Hlg
+    ) {
+        video.matrix = arcen_media::ColorMatrix::Bt709;
+        video.primaries = arcen_media::ColorPrimaries::Bt709;
+        video.transfer = arcen_media::TransferCharacteristics::Bt709;
+    }
+    video
+}
+
 /// Resolved host configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -103,6 +117,15 @@ pub struct Config {
     pub color_range: arcen_media::ColorRange,
     /// Ceiling matrix coefficients used to derive luma/chroma from RGB.
     pub color_matrix: arcen_media::ColorMatrix,
+    /// Transfer characteristics this session will encode and signal.
+    ///
+    /// Resolved from the Deck's request, then constrained by the active Linux
+    /// desktop provider. Dedicated Xorg has no HDR composition space, so PQ
+    /// and HLG requests are truthfully reduced to BT.709; a future
+    /// color-managed Wayland provider may retain them.
+    pub transfer: arcen_media::TransferCharacteristics,
+    /// Colour primaries this session will encode and signal.
+    pub color_primaries: arcen_media::ColorPrimaries,
     /// Governs how far a negotiating client may deviate from `bit_depth`/
     /// `color_range`/`color_matrix`. See [`ColorPolicy::resolve_bit_depth`].
     pub color_policy: ColorPolicy,
@@ -301,6 +324,8 @@ impl Config {
             color_matrix: self
                 .color_policy
                 .resolve_color_matrix(self.color_matrix, None),
+            transfer: self.transfer,
+            color_primaries: self.color_primaries,
             video_selection: self.video_selection,
             codec_pinned: self.codec_pinned,
             variant_pinned: self.variant_pinned,
@@ -335,8 +360,8 @@ impl Config {
             bit_depth: self.bit_depth,
             range: self.color_range,
             matrix: self.color_matrix,
-            primaries: arcen_media::ColorPrimaries::Bt709,
-            transfer: arcen_media::TransferCharacteristics::Bt709,
+            primaries: self.color_primaries,
+            transfer: self.transfer,
         };
         let resolved = arcen_media::video::resolve_host_initial_video(
             client,
@@ -350,12 +375,17 @@ impl Config {
         )
         .map_err(|error| format!("initial video request: {error}"))?;
         self.auth_video_request = Some(request.clone());
+        let video = xorg_capture_contract(resolved.video);
         self.fps = resolved.max_fps;
-        self.codec = resolved.video.codec.token().to_string();
-        self.chroma = resolved.video.chroma.token().to_string();
-        self.bit_depth = resolved.video.bit_depth;
-        self.color_range = resolved.video.range;
-        self.color_matrix = resolved.video.matrix;
+        self.codec = video.codec.token().to_string();
+        self.chroma = video.chroma.token().to_string();
+        self.bit_depth = video.bit_depth;
+        self.color_range = video.range;
+        self.color_matrix = video.matrix;
+        // Written back like every other axis. Omitting these is what made the
+        // host serve BT.709 for a PQ request even once the request carried it.
+        self.transfer = video.transfer;
+        self.color_primaries = video.primaries;
         if !self.variant_pinned {
             self.color_policy = ColorPolicy::AlwaysOn;
         }
@@ -393,6 +423,8 @@ impl Default for Config {
             bit_depth: arcen_media::BitDepth::Eight,
             color_range: arcen_media::ColorRange::Limited,
             color_matrix: arcen_media::ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
@@ -1689,6 +1721,40 @@ mod tests {
         assert_eq!(pinned.chroma, "yuv420");
         assert_eq!(pinned.color_range, arcen_media::ColorRange::Full);
         assert!(pinned.auth_video_request.is_some());
+    }
+
+    #[test]
+    fn xorg_downgrades_hdr_transfer_but_keeps_the_ten_bit_grading_path() {
+        let mut hdr = initial_video(
+            VideoSelectionIntent::ColorFidelity,
+            "h265",
+            "yuv444",
+            "10",
+            "full",
+        );
+        hdr.quality.color_matrix = "bt2020ncl".to_string();
+        hdr.quality.color_primaries = "bt2020".to_string();
+        hdr.quality.transfer = "pq".to_string();
+        let mut config = Config {
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            color_matrix: arcen_media::ColorMatrix::Bt2020Ncl,
+            chroma: "yuv444".to_string(),
+            ..Config::default()
+        };
+        config.apply_initial_video_request(&hdr).unwrap();
+
+        assert_eq!(config.bit_depth, arcen_media::BitDepth::Ten);
+        assert_eq!(config.chroma, "yuv444");
+        assert_eq!(config.color_range, arcen_media::ColorRange::Full);
+        assert_eq!(config.color_matrix, arcen_media::ColorMatrix::Bt709);
+        assert_eq!(config.color_primaries, arcen_media::ColorPrimaries::Bt709);
+        assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Bt709);
+        assert_eq!(
+            config.auth_video_request.as_ref().unwrap().quality.transfer,
+            "pq",
+            "the original request stays available for degradation telemetry"
+        );
     }
 
     #[test]

@@ -32,6 +32,24 @@ pub enum LifecycleEventKind {
     SessionEnd = 1103,
     /// Session ended because a component or transport failed.
     SessionInterrupted = 1104,
+    /// Which capture backend actually served the session.
+    ///
+    /// Level 3. Records the path that *ran*, not the one configured: Windows
+    /// falls back DDA -> WGC silently, which is why WGC is the production path
+    /// on a headless vGPU, and a configured value would have said otherwise.
+    CapturePathSelected = 1105,
+    /// The encoder surface the host actually configured.
+    ///
+    /// Level 3. The 8-bit path is fast because it is zero-copy GPU-direct;
+    /// every wide-source route trades that away. Recording the surface makes
+    /// that trade measurable instead of remembered.
+    EncoderConfigured = 1106,
+    /// What the client asked for, what the host granted, and why they differ.
+    ///
+    /// Level 3. The host had no equivalent of the client's `PlanDegradation`,
+    /// so a session that was granted exactly what it asked for was
+    /// indistinguishable from one that was quietly reduced.
+    ColorPlanResolved = 1107,
     /// Display state was mutated under restore protection.
     DisplayArmed = 1200,
     /// Display state was restored and verified.
@@ -137,45 +155,51 @@ impl LifecycleEventKind {
             Self::SessionStreamStart => &LIFECYCLE_EVENT_DEFINITIONS[5],
             Self::SessionEnd => &LIFECYCLE_EVENT_DEFINITIONS[6],
             Self::SessionInterrupted => &LIFECYCLE_EVENT_DEFINITIONS[7],
-            Self::DisplayArmed => &LIFECYCLE_EVENT_DEFINITIONS[8],
-            Self::DisplayRestored => &LIFECYCLE_EVENT_DEFINITIONS[9],
-            Self::DisplayRestoreDegraded => &LIFECYCLE_EVENT_DEFINITIONS[10],
-            Self::DisplayRestoreFailed => &LIFECYCLE_EVENT_DEFINITIONS[11],
-            Self::WatchdogRestore => &LIFECYCLE_EVENT_DEFINITIONS[12],
-            Self::CpLogonOk => &LIFECYCLE_EVENT_DEFINITIONS[13],
-            Self::CpLogonFail => &LIFECYCLE_EVENT_DEFINITIONS[14],
-            Self::TlsCertificateActive => &LIFECYCLE_EVENT_DEFINITIONS[15],
-            Self::TlsCertificateExpiring => &LIFECYCLE_EVENT_DEFINITIONS[16],
-            Self::TlsCertificateReloaded => &LIFECYCLE_EVENT_DEFINITIONS[17],
-            Self::TlsCertificateReloadFailed => &LIFECYCLE_EVENT_DEFINITIONS[18],
-            Self::TlsCertificateExpired => &LIFECYCLE_EVENT_DEFINITIONS[19],
-            Self::ClientStart => &LIFECYCLE_EVENT_DEFINITIONS[20],
-            Self::ClientStop => &LIFECYCLE_EVENT_DEFINITIONS[21],
-            Self::ClientConnectAttempt => &LIFECYCLE_EVENT_DEFINITIONS[22],
-            Self::ClientConnectOk => &LIFECYCLE_EVENT_DEFINITIONS[23],
-            Self::ClientConnectFail => &LIFECYCLE_EVENT_DEFINITIONS[24],
-            Self::ClientSessionEnd => &LIFECYCLE_EVENT_DEFINITIONS[25],
-            Self::ClientReconnect => &LIFECYCLE_EVENT_DEFINITIONS[26],
-            Self::HidDeviceAttached => &LIFECYCLE_EVENT_DEFINITIONS[27],
-            Self::HidDeviceDetached => &LIFECYCLE_EVENT_DEFINITIONS[28],
-            Self::HidPassthroughStart => &LIFECYCLE_EVENT_DEFINITIONS[29],
-            Self::HidPassthroughEnd => &LIFECYCLE_EVENT_DEFINITIONS[30],
-            Self::HidPassthroughError => &LIFECYCLE_EVENT_DEFINITIONS[31],
-            Self::NetworkPathActive => &LIFECYCLE_EVENT_DEFINITIONS[32],
-            Self::NetworkPathChanged => &LIFECYCLE_EVENT_DEFINITIONS[33],
-            Self::NetworkPathLost => &LIFECYCLE_EVENT_DEFINITIONS[34],
-            Self::NetworkPathRestored => &LIFECYCLE_EVENT_DEFINITIONS[35],
-            Self::HealthOk => &LIFECYCLE_EVENT_DEFINITIONS[36],
-            Self::HealthDegraded => &LIFECYCLE_EVENT_DEFINITIONS[37],
-            Self::HealthCritical => &LIFECYCLE_EVENT_DEFINITIONS[38],
-            Self::HeartbeatLost => &LIFECYCLE_EVENT_DEFINITIONS[39],
-            Self::TelemetryDropped => &LIFECYCLE_EVENT_DEFINITIONS[40],
-            Self::EffectiveProfile => &LIFECYCLE_EVENT_DEFINITIONS[41],
-            Self::HealthSnapshot => &LIFECYCLE_EVENT_DEFINITIONS[42],
-            Self::PermissionGranted => &LIFECYCLE_EVENT_DEFINITIONS[43],
-            Self::PermissionDenied => &LIFECYCLE_EVENT_DEFINITIONS[44],
-            Self::PermissionRevoked => &LIFECYCLE_EVENT_DEFINITIONS[45],
-            Self::PermissionPending => &LIFECYCLE_EVENT_DEFINITIONS[46],
+            // Appended to the array rather than inserted in id order: every
+            // arm here indexes by position, so inserting would silently
+            // renumber every event after it.
+            Self::CapturePathSelected => &LIFECYCLE_EVENT_DEFINITIONS[8],
+            Self::EncoderConfigured => &LIFECYCLE_EVENT_DEFINITIONS[9],
+            Self::ColorPlanResolved => &LIFECYCLE_EVENT_DEFINITIONS[10],
+            Self::DisplayArmed => &LIFECYCLE_EVENT_DEFINITIONS[11],
+            Self::DisplayRestored => &LIFECYCLE_EVENT_DEFINITIONS[12],
+            Self::DisplayRestoreDegraded => &LIFECYCLE_EVENT_DEFINITIONS[13],
+            Self::DisplayRestoreFailed => &LIFECYCLE_EVENT_DEFINITIONS[14],
+            Self::WatchdogRestore => &LIFECYCLE_EVENT_DEFINITIONS[15],
+            Self::CpLogonOk => &LIFECYCLE_EVENT_DEFINITIONS[16],
+            Self::CpLogonFail => &LIFECYCLE_EVENT_DEFINITIONS[17],
+            Self::TlsCertificateActive => &LIFECYCLE_EVENT_DEFINITIONS[18],
+            Self::TlsCertificateExpiring => &LIFECYCLE_EVENT_DEFINITIONS[19],
+            Self::TlsCertificateReloaded => &LIFECYCLE_EVENT_DEFINITIONS[20],
+            Self::TlsCertificateReloadFailed => &LIFECYCLE_EVENT_DEFINITIONS[21],
+            Self::TlsCertificateExpired => &LIFECYCLE_EVENT_DEFINITIONS[22],
+            Self::ClientStart => &LIFECYCLE_EVENT_DEFINITIONS[23],
+            Self::ClientStop => &LIFECYCLE_EVENT_DEFINITIONS[24],
+            Self::ClientConnectAttempt => &LIFECYCLE_EVENT_DEFINITIONS[25],
+            Self::ClientConnectOk => &LIFECYCLE_EVENT_DEFINITIONS[26],
+            Self::ClientConnectFail => &LIFECYCLE_EVENT_DEFINITIONS[27],
+            Self::ClientSessionEnd => &LIFECYCLE_EVENT_DEFINITIONS[28],
+            Self::ClientReconnect => &LIFECYCLE_EVENT_DEFINITIONS[29],
+            Self::HidDeviceAttached => &LIFECYCLE_EVENT_DEFINITIONS[30],
+            Self::HidDeviceDetached => &LIFECYCLE_EVENT_DEFINITIONS[31],
+            Self::HidPassthroughStart => &LIFECYCLE_EVENT_DEFINITIONS[32],
+            Self::HidPassthroughEnd => &LIFECYCLE_EVENT_DEFINITIONS[33],
+            Self::HidPassthroughError => &LIFECYCLE_EVENT_DEFINITIONS[34],
+            Self::NetworkPathActive => &LIFECYCLE_EVENT_DEFINITIONS[35],
+            Self::NetworkPathChanged => &LIFECYCLE_EVENT_DEFINITIONS[36],
+            Self::NetworkPathLost => &LIFECYCLE_EVENT_DEFINITIONS[37],
+            Self::NetworkPathRestored => &LIFECYCLE_EVENT_DEFINITIONS[38],
+            Self::HealthOk => &LIFECYCLE_EVENT_DEFINITIONS[39],
+            Self::HealthDegraded => &LIFECYCLE_EVENT_DEFINITIONS[40],
+            Self::HealthCritical => &LIFECYCLE_EVENT_DEFINITIONS[41],
+            Self::HeartbeatLost => &LIFECYCLE_EVENT_DEFINITIONS[42],
+            Self::TelemetryDropped => &LIFECYCLE_EVENT_DEFINITIONS[43],
+            Self::EffectiveProfile => &LIFECYCLE_EVENT_DEFINITIONS[44],
+            Self::HealthSnapshot => &LIFECYCLE_EVENT_DEFINITIONS[45],
+            Self::PermissionGranted => &LIFECYCLE_EVENT_DEFINITIONS[46],
+            Self::PermissionDenied => &LIFECYCLE_EVENT_DEFINITIONS[47],
+            Self::PermissionRevoked => &LIFECYCLE_EVENT_DEFINITIONS[48],
+            Self::PermissionPending => &LIFECYCLE_EVENT_DEFINITIONS[49],
         }
     }
 }
@@ -304,12 +328,58 @@ const SESSION_STREAM_START_FIELDS: &[LifecycleFieldSpec] = &[
     required("height", LifecycleFieldType::Integer),
     optional("fps", LifecycleFieldType::Integer),
     optional("display_backend", LifecycleFieldType::String),
+    // Colour identity. Optional in the schema so an older emitter's events are
+    // still accepted rather than rejected wholesale, but both Piers always
+    // populate them and have a test saying so.
+    //
+    // Their absence is what made a session unreadable: `chroma` and `codec`
+    // alone describe a stream that could be 8- or 10-bit, BT.709 or PQ, and
+    // the answer lived only in the client's log. A host record that cannot
+    // state the depth it encoded cannot be used to check any claim about it.
+    optional("bit_depth", LifecycleFieldType::String),
+    optional("color_range", LifecycleFieldType::String),
+    optional("color_matrix", LifecycleFieldType::String),
+    optional("color_primaries", LifecycleFieldType::String),
+    optional("transfer", LifecycleFieldType::String),
 ];
 const SESSION_END_FIELDS: &[LifecycleFieldSpec] = &[
     required("reason_class", LifecycleFieldType::String),
     required("duration_ms", LifecycleFieldType::Integer),
     optional("frames_sent", LifecycleFieldType::Integer),
     optional("frames_dropped", LifecycleFieldType::Integer),
+];
+/// Which capture backend served the session, and at what cost.
+///
+/// `zero_copy` is the field that carries the 8-bit speed argument: `NvFBC` and
+/// DDA hand frames to the encoder without a host round trip, and every wide
+/// source route measured so far gives that up.
+const CAPTURE_PATH_SELECTED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("backend", LifecycleFieldType::String),
+    required("zero_copy", LifecycleFieldType::Boolean),
+    optional("pixel_format", LifecycleFieldType::String),
+    optional("bytes_per_frame", LifecycleFieldType::Integer),
+    // What was attempted before this backend won, when anything was.
+    optional("fallback_from", LifecycleFieldType::String),
+    optional("reason", LifecycleFieldType::String),
+];
+const ENCODER_CONFIGURED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("encoder", LifecycleFieldType::String),
+    required("pixel_format", LifecycleFieldType::String),
+    required("bit_depth", LifecycleFieldType::String),
+    required("chroma", LifecycleFieldType::String),
+    optional("codec", LifecycleFieldType::String),
+    optional("profile", LifecycleFieldType::String),
+];
+/// Requested versus granted, so a reduction cannot look like a grant.
+const COLOR_PLAN_RESOLVED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("requested_bit_depth", LifecycleFieldType::String),
+    required("granted_bit_depth", LifecycleFieldType::String),
+    required("degraded", LifecycleFieldType::Boolean),
+    optional("requested_chroma", LifecycleFieldType::String),
+    optional("granted_chroma", LifecycleFieldType::String),
+    optional("requested_codec", LifecycleFieldType::String),
+    optional("granted_codec", LifecycleFieldType::String),
+    optional("reason", LifecycleFieldType::String),
 ];
 const SESSION_INTERRUPTED_FIELDS: &[LifecycleFieldSpec] = &[
     required("stage", LifecycleFieldType::String),
@@ -492,7 +562,7 @@ const PERMISSION_FIELDS: &[LifecycleFieldSpec] = &[
 ];
 
 /// Append-only v1 lifecycle event definitions, sorted by numeric identifier.
-pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 47] = &[
+pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 50] = &[
     LifecycleEventDefinition {
         kind: LifecycleEventKind::ServiceStart,
         name: "SERVICE_START",
@@ -564,6 +634,33 @@ pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 47] = &[
         severity: LifecycleSeverity::Warning,
         minimum_profile: OperationalProfile::Critical,
         fields: SESSION_INTERRUPTED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::CapturePathSelected,
+        name: "CAPTURE_PATH_SELECTED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Debug,
+        fields: CAPTURE_PATH_SELECTED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::EncoderConfigured,
+        name: "ENCODER_CONFIGURED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Debug,
+        fields: ENCODER_CONFIGURED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::ColorPlanResolved,
+        name: "COLOR_PLAN_RESOLVED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Debug,
+        fields: COLOR_PLAN_RESOLVED_FIELDS,
     },
     LifecycleEventDefinition {
         kind: LifecycleEventKind::DisplayArmed,
@@ -930,45 +1027,48 @@ pub const fn lifecycle_event_definition(id: u32) -> Option<&'static LifecycleEve
         1102 => Some(&LIFECYCLE_EVENT_DEFINITIONS[5]),
         1103 => Some(&LIFECYCLE_EVENT_DEFINITIONS[6]),
         1104 => Some(&LIFECYCLE_EVENT_DEFINITIONS[7]),
-        1200 => Some(&LIFECYCLE_EVENT_DEFINITIONS[8]),
-        1201 => Some(&LIFECYCLE_EVENT_DEFINITIONS[9]),
-        1202 => Some(&LIFECYCLE_EVENT_DEFINITIONS[10]),
-        1203 => Some(&LIFECYCLE_EVENT_DEFINITIONS[11]),
-        1204 => Some(&LIFECYCLE_EVENT_DEFINITIONS[12]),
-        1300 => Some(&LIFECYCLE_EVENT_DEFINITIONS[13]),
-        1301 => Some(&LIFECYCLE_EVENT_DEFINITIONS[14]),
-        1400 => Some(&LIFECYCLE_EVENT_DEFINITIONS[15]),
-        1401 => Some(&LIFECYCLE_EVENT_DEFINITIONS[16]),
-        1402 => Some(&LIFECYCLE_EVENT_DEFINITIONS[17]),
-        1403 => Some(&LIFECYCLE_EVENT_DEFINITIONS[18]),
-        1404 => Some(&LIFECYCLE_EVENT_DEFINITIONS[19]),
-        1500 => Some(&LIFECYCLE_EVENT_DEFINITIONS[20]),
-        1501 => Some(&LIFECYCLE_EVENT_DEFINITIONS[21]),
-        1502 => Some(&LIFECYCLE_EVENT_DEFINITIONS[22]),
-        1503 => Some(&LIFECYCLE_EVENT_DEFINITIONS[23]),
-        1504 => Some(&LIFECYCLE_EVENT_DEFINITIONS[24]),
-        1505 => Some(&LIFECYCLE_EVENT_DEFINITIONS[25]),
-        1506 => Some(&LIFECYCLE_EVENT_DEFINITIONS[26]),
-        1600 => Some(&LIFECYCLE_EVENT_DEFINITIONS[27]),
-        1601 => Some(&LIFECYCLE_EVENT_DEFINITIONS[28]),
-        1602 => Some(&LIFECYCLE_EVENT_DEFINITIONS[29]),
-        1603 => Some(&LIFECYCLE_EVENT_DEFINITIONS[30]),
-        1604 => Some(&LIFECYCLE_EVENT_DEFINITIONS[31]),
-        1700 => Some(&LIFECYCLE_EVENT_DEFINITIONS[32]),
-        1701 => Some(&LIFECYCLE_EVENT_DEFINITIONS[33]),
-        1702 => Some(&LIFECYCLE_EVENT_DEFINITIONS[34]),
-        1703 => Some(&LIFECYCLE_EVENT_DEFINITIONS[35]),
-        1800 => Some(&LIFECYCLE_EVENT_DEFINITIONS[36]),
-        1801 => Some(&LIFECYCLE_EVENT_DEFINITIONS[37]),
-        1802 => Some(&LIFECYCLE_EVENT_DEFINITIONS[38]),
-        1803 => Some(&LIFECYCLE_EVENT_DEFINITIONS[39]),
-        1804 => Some(&LIFECYCLE_EVENT_DEFINITIONS[40]),
-        1805 => Some(&LIFECYCLE_EVENT_DEFINITIONS[41]),
-        1806 => Some(&LIFECYCLE_EVENT_DEFINITIONS[42]),
-        1900 => Some(&LIFECYCLE_EVENT_DEFINITIONS[43]),
-        1901 => Some(&LIFECYCLE_EVENT_DEFINITIONS[44]),
-        1902 => Some(&LIFECYCLE_EVENT_DEFINITIONS[45]),
-        1903 => Some(&LIFECYCLE_EVENT_DEFINITIONS[46]),
+        1105 => Some(&LIFECYCLE_EVENT_DEFINITIONS[8]),
+        1106 => Some(&LIFECYCLE_EVENT_DEFINITIONS[9]),
+        1107 => Some(&LIFECYCLE_EVENT_DEFINITIONS[10]),
+        1200 => Some(&LIFECYCLE_EVENT_DEFINITIONS[11]),
+        1201 => Some(&LIFECYCLE_EVENT_DEFINITIONS[12]),
+        1202 => Some(&LIFECYCLE_EVENT_DEFINITIONS[13]),
+        1203 => Some(&LIFECYCLE_EVENT_DEFINITIONS[14]),
+        1204 => Some(&LIFECYCLE_EVENT_DEFINITIONS[15]),
+        1300 => Some(&LIFECYCLE_EVENT_DEFINITIONS[16]),
+        1301 => Some(&LIFECYCLE_EVENT_DEFINITIONS[17]),
+        1400 => Some(&LIFECYCLE_EVENT_DEFINITIONS[18]),
+        1401 => Some(&LIFECYCLE_EVENT_DEFINITIONS[19]),
+        1402 => Some(&LIFECYCLE_EVENT_DEFINITIONS[20]),
+        1403 => Some(&LIFECYCLE_EVENT_DEFINITIONS[21]),
+        1404 => Some(&LIFECYCLE_EVENT_DEFINITIONS[22]),
+        1500 => Some(&LIFECYCLE_EVENT_DEFINITIONS[23]),
+        1501 => Some(&LIFECYCLE_EVENT_DEFINITIONS[24]),
+        1502 => Some(&LIFECYCLE_EVENT_DEFINITIONS[25]),
+        1503 => Some(&LIFECYCLE_EVENT_DEFINITIONS[26]),
+        1504 => Some(&LIFECYCLE_EVENT_DEFINITIONS[27]),
+        1505 => Some(&LIFECYCLE_EVENT_DEFINITIONS[28]),
+        1506 => Some(&LIFECYCLE_EVENT_DEFINITIONS[29]),
+        1600 => Some(&LIFECYCLE_EVENT_DEFINITIONS[30]),
+        1601 => Some(&LIFECYCLE_EVENT_DEFINITIONS[31]),
+        1602 => Some(&LIFECYCLE_EVENT_DEFINITIONS[32]),
+        1603 => Some(&LIFECYCLE_EVENT_DEFINITIONS[33]),
+        1604 => Some(&LIFECYCLE_EVENT_DEFINITIONS[34]),
+        1700 => Some(&LIFECYCLE_EVENT_DEFINITIONS[35]),
+        1701 => Some(&LIFECYCLE_EVENT_DEFINITIONS[36]),
+        1702 => Some(&LIFECYCLE_EVENT_DEFINITIONS[37]),
+        1703 => Some(&LIFECYCLE_EVENT_DEFINITIONS[38]),
+        1800 => Some(&LIFECYCLE_EVENT_DEFINITIONS[39]),
+        1801 => Some(&LIFECYCLE_EVENT_DEFINITIONS[40]),
+        1802 => Some(&LIFECYCLE_EVENT_DEFINITIONS[41]),
+        1803 => Some(&LIFECYCLE_EVENT_DEFINITIONS[42]),
+        1804 => Some(&LIFECYCLE_EVENT_DEFINITIONS[43]),
+        1805 => Some(&LIFECYCLE_EVENT_DEFINITIONS[44]),
+        1806 => Some(&LIFECYCLE_EVENT_DEFINITIONS[45]),
+        1900 => Some(&LIFECYCLE_EVENT_DEFINITIONS[46]),
+        1901 => Some(&LIFECYCLE_EVENT_DEFINITIONS[47]),
+        1902 => Some(&LIFECYCLE_EVENT_DEFINITIONS[48]),
+        1903 => Some(&LIFECYCLE_EVENT_DEFINITIONS[49]),
         _ => None,
     }
 }
@@ -1120,6 +1220,9 @@ mod tests {
         (1102, "SESSION_STREAM_START"),
         (1103, "SESSION_END"),
         (1104, "SESSION_INTERRUPTED"),
+        (1105, "CAPTURE_PATH_SELECTED"),
+        (1106, "ENCODER_CONFIGURED"),
+        (1107, "COLOR_PLAN_RESOLVED"),
         (1200, "DISPLAY_ARMED"),
         (1201, "DISPLAY_RESTORED"),
         (1202, "DISPLAY_RESTORE_DEGRADED"),

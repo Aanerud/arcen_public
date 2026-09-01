@@ -88,7 +88,7 @@ evidence only. There is no longer an open entitlement request.
 
 ### `Claim USB Accessory` experiment (2026-08-13)
 
-The `com.example.arcen.deck` App ID now authorizes Apple's self-service
+The `deck.arcen.tech` App ID now authorizes Apple's self-service
 **Claim USB Accessory** capability. A regenerated Developer ID profile
 (`<Deck USB provisioning profile>`, UUID
 `7d0f9190-c032-405a-8b21-254970eca91e`) contains:
@@ -285,7 +285,7 @@ in `packaging/macos/validate_release_inputs.py` pass against the actual profile.
 
 ## Restricted entitlements currently in `Deck.entitlements`
 
-These were enabled on the `com.example.arcen.deck` App ID on 2026-07-21, are present in the real
+These were enabled on the `deck.arcen.tech` App ID on 2026-07-21, are present in the real
 external provisioning profile, and are the only restricted capability keys the app
 currently requests:
 
@@ -302,7 +302,7 @@ until that work lands.
 
 ## Other capabilities enabled on the App ID but not yet requested as entitlements
 
-These capabilities were enabled on `com.example.arcen.deck` at developer.apple.com. Whether adding
+These capabilities were enabled on `deck.arcen.tech` at developer.apple.com. Whether adding
 the entitlement key today would pass validation against the real external profile depends on
 which group below they fall into.
 

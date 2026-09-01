@@ -1,6 +1,6 @@
 [package]
 name = "arcen-deck-macos"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -108,7 +108,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # approach was needed for the *pre-existing* wgpu/egui surface) since this
 # layer is typed end to end and needs no raw `msg_send!` at all.
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture"] }
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAMetalLayer", "objc2-metal"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CAEDRMetadata", "CALayer", "CAMetalLayer", "objc2-metal"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes"] }

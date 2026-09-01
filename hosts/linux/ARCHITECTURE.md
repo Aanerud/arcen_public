@@ -191,9 +191,12 @@ two-axis synchronized batch, and Relative button/wheel messages omit
 Authenticated cursor preference is fixed before capenc starts and is part of the
 resume topology binding. NvFBC receives `bWithCursor` in its capture-session
 parameters and emits the resolved `cursor=local|host` in READY after the first
-encoded frame. Pier rejects mismatched or missing READY metadata, advertises Host
-only for the proven native NvFBC backend, and sends the cursor result before
-media. No raster compositor or X11 cursor-shape dependency is introduced.
+encoded frame. Depth-30 XShm captures root-window pixels and has no host-cursor
+compositor, so the Pier moves a Host request to Local before both the native
+preflight probe and the live child spawn. Eight-bit NvFBC keeps Host unchanged.
+Pier rejects mismatched or missing READY metadata and sends the degraded cursor
+result before media. No raster compositor or X11 cursor-shape dependency is
+introduced.
 
 ## Region-scoped input
 
@@ -633,3 +636,51 @@ hostname.
   migration port was 18443 and the current QUIC product port is 18444. Build on
   `pier-linux.example.internal` (`root@<your-pier-host>`): `cargo build --release -p arcen-pier-linux`. Deploy to
   `/opt/arcen/bin/` + `arcen-pier.service`.
+
+## Capture colour depth and the two native paths (2026-08-30)
+
+NvFBC's Linux capture ceiling is 8 bits per component. The Linux Pier therefore
+has two separate capture paths rather than widening the existing one.
+
+| Resolved contract | Capture pipeline | Session truth |
+| --- | --- | --- |
+| Auto / Speed, 4:2:0 8-bit | NvFBC → CUDA → NVENC | `capture=nvfbc capture_zero_copy=true` |
+| Developer Full Colour, 4:4:4 8-bit | NvFBC YUV444P → CUDA → NVENC | Same device-to-device path |
+| Grading, 4:4:4 10-bit BT.709 | Depth-30 Xorg → XShm RGB10 → shared P16 conversion → CUDA upload → NVENC | `capture=xshm capture_zero_copy=false` |
+| HDR requested from Xorg | Resolve to the Grading pipeline before capenc starts | Matrix, primaries, and transfer degradation reported; Deck remains SDR |
+
+These are parallel implementations, not stages in one adaptive loop. Changes
+to XShm admission, conversion, cursor handling, or performance must not alter
+the NvFBC path taken by every eight-bit session.
+
+The public NvFBC headers, through API v1.9, define exactly six buffer formats:
+`ARGB` (0), `RGB` (1), `NV12` (2), `YUV444P` (3), `RGBA` (4) and `BGRA` (5).
+All are 8-bit-class. There is no `P010`, `Y410`, `RGB10A2` or FP16 member to
+request. Two independently mirrored copies of the header agree, and the local
+constants `BUFFER_FORMAT_YUV444P = 3` and `BUFFER_FORMAT_BGRA = 5` are not two
+formats chosen from many — they are two of only six that exist.
+
+For an eight-bit contract, `nvfbc_capture_is_yuv444` may ask NvFBC for its
+existing YUV444P output and `nvenc_cuda::Encoder::stage` performs only a
+device-to-device copy into the rotating NVENC input slot. This remains the
+default fast path and reports `capture=nvfbc capture_zero_copy=true`.
+
+For every depth above eight, `linux_capture_backend` selects XShm before NvFBC
+is opened. `linux_x11` reads the authenticated dedicated Xorg root through
+MIT-SHM 1.2, requires depth 30/32 bpp/TrueColor, derives component shifts from
+the actual visual masks, and passes those packed RGB10 words to the CUDA NVENC
+encoder. The measured GRID visual is `XBGR2101010`
+(`R=0x000003ff/G=0x000ffc00/B=0x3ff00000`), demonstrating why a fixed
+`A2R10G10B10` assumption is unsafe.
+
+The wide path converts directly from the host XShm mapping into MSB-aligned
+YUV444 P16 or P010 storage, then performs one host-to-device upload. It reports
+`capture=xshm capture_zero_copy=false`. A 2560×1600 continuous-motion
+Grading Reference run held 30–31 fps on the lab host. Sampling the live source
+found 18,124 of 95,850 RGB components outside the eight-bit expansion grid.
+
+Xorg does not define an HDR composition space, and Resolve's Linux viewer does
+not provide one. The Xorg provider therefore fails closed on PQ/HLG at capenc
+and the Pier resolves an HDR request to HEVC 4:4:4 10-bit full-range BT.709.
+The Deck reports matrix/primaries/transfer degradation and stays in SDR.
+Actual Linux desktop HDR belongs to the future color-managed Wayland provider.

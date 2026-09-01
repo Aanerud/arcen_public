@@ -109,6 +109,71 @@ impl AcceleratorClass {
     }
 }
 
+/// Which capture path actually delivered the desktop image to the encoder.
+///
+/// Deliberately separate from [`EncoderBackend`]: that names what *encoded*
+/// the frame, and the two were conflated in the READY line, which is why a
+/// host log could say `native-nvenc` while saying nothing about whether the
+/// pixels arrived via a zero-copy GPU path or a host round trip.
+///
+/// The distinction is the whole 8-bit speed argument. `NvFBC` and Desktop
+/// Duplication hand frames to the encoder without leaving the GPU; `XShm` is a
+/// host copy, and every wide-source route measured so far gives the zero-copy
+/// path up. A log that cannot name the path cannot price the trade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackend {
+    /// NVIDIA Frame Buffer Capture into CUDA device memory (Linux).
+    NvFbc,
+    /// X11 MIT-SHM into host memory (Linux).
+    XShm,
+    /// DXGI Desktop Duplication (Windows).
+    DesktopDuplication,
+    /// Windows Graphics Capture (Windows).
+    WindowsGraphicsCapture,
+}
+
+impl CaptureBackend {
+    /// Stable wire token. Kept separate from `Debug` so renaming a variant
+    /// cannot silently change the protocol.
+    #[must_use]
+    pub const fn ready_token(self) -> &'static str {
+        match self {
+            Self::NvFbc => "nvfbc",
+            Self::XShm => "xshm",
+            Self::DesktopDuplication => "dxgi-dda",
+            Self::WindowsGraphicsCapture => "wgc",
+        }
+    }
+
+    /// Parse a wire token. Unknown values are `None` rather than a guess: a
+    /// newer capenc naming a path this build does not know must read as
+    /// "unreported", not as some other path.
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        match value {
+            "nvfbc" => Some(Self::NvFbc),
+            "xshm" => Some(Self::XShm),
+            "dxgi-dda" => Some(Self::DesktopDuplication),
+            "wgc" => Some(Self::WindowsGraphicsCapture),
+            _ => None,
+        }
+    }
+
+    /// Whether frames reach the encoder without a host round trip.
+    ///
+    /// `NvFBC` grabs straight into CUDA device memory and Desktop Duplication
+    /// yields a D3D11 texture the encoder can read in place. `XShm` copies
+    /// through shared host memory, and WGC is treated as a copy because the
+    /// production path stages its frames rather than encoding them in place.
+    #[must_use]
+    pub const fn zero_copy(self) -> bool {
+        match self {
+            Self::NvFbc | Self::DesktopDuplication => true,
+            Self::XShm | Self::WindowsGraphicsCapture => false,
+        }
+    }
+}
+
 impl EncoderBackend {
     /// Parses the exact backend token emitted by READY and media rosters.
     #[must_use]
@@ -644,6 +709,8 @@ pub struct PlanDegradation {
     pub bit_depth_reduced: bool,
     pub range_changed: bool,
     pub matrix_changed: bool,
+    pub primaries_changed: bool,
+    pub transfer_changed: bool,
     pub fps_clamped: bool,
     pub geometry_clamped: bool,
     pub cursor_moved_to_local: bool,
@@ -658,6 +725,8 @@ impl PlanDegradation {
             && !self.bit_depth_reduced
             && !self.range_changed
             && !self.matrix_changed
+            && !self.primaries_changed
+            && !self.transfer_changed
             && !self.fps_clamped
             && !self.geometry_clamped
             && !self.cursor_moved_to_local
@@ -675,6 +744,8 @@ impl PlanDegradation {
             || self.bit_depth_reduced
             || self.range_changed
             || self.matrix_changed
+            || self.primaries_changed
+            || self.transfer_changed
     }
 }
 
@@ -1084,6 +1155,13 @@ pub fn parse_ready_v1(
     } else if expectation.session_log_id.is_some() {
         return Err(ReadyProtocolError::MissingField("sid"));
     }
+    // Consumed so a capenc that names its capture path does not trip the
+    // unknown-field check below. The value is deliberately not folded into
+    // `ResolvedMediaPlan`: that struct is the video *contract*, and how the
+    // pixels were captured is not part of it. Callers that want the path read
+    // it with `parse_ready_capture`.
+    let _ = fields.remove("capture");
+    let _ = fields.remove("capture_zero_copy");
     if !fields.is_empty() {
         return Err(ReadyProtocolError::UnknownFields(
             fields.keys().copied().collect::<Vec<_>>().join(","),
@@ -1195,14 +1273,39 @@ pub fn parse_ready_v1(
 }
 
 /// Format the canonical READY line for one resolved plan.
+///
+/// Emits no `capture=` field, so a line built this way stays byte-identical to
+/// what older builds produced. Use [`format_ready_v1_with_capture`] to name
+/// the capture path.
 #[must_use]
 pub fn format_ready_v1(plan: ResolvedMediaPlan, session_log_id: Option<&str>) -> String {
+    format_ready_v1_with_capture(plan, None, session_log_id)
+}
+
+/// Format the canonical READY line, optionally naming the capture path.
+///
+/// `capture` is appended rather than inserted, and omitted entirely when
+/// `None`, because [`parse_ready_v1`] rejects unknown fields: a line is only
+/// safe to extend in a build whose parser already tolerates the addition.
+#[must_use]
+pub fn format_ready_v1_with_capture(
+    plan: ResolvedMediaPlan,
+    capture: Option<CaptureBackend>,
+    session_log_id: Option<&str>,
+) -> String {
     let sid = session_log_id.map_or_else(String::new, |value| format!(" sid={value}"));
+    let capture = capture.map_or_else(String::new, |backend| {
+        format!(
+            " capture={} capture_zero_copy={}",
+            backend.ready_token(),
+            backend.zero_copy()
+        )
+    });
     format!(
         "{READY_PREFIX}version={READY_VERSION} backend={} codec={} chroma={} bit_depth={} \
 range={} matrix={} primaries={} transfer={} width={} height={} fps={} \
 supports_h264={} supports_h265={} supports_yuv444={} supports_main10={} \
-supports_full_range={} cursor={}{}",
+supports_full_range={} cursor={}{}{}",
         plan.backend.ready_token(),
         plan.codec_token(),
         plan.chroma_token(),
@@ -1223,8 +1326,27 @@ supports_full_range={} cursor={}{}",
             CursorMode::Local => "local",
             CursorMode::Host => "host",
         },
+        capture,
         sid
     )
+}
+
+/// Read the capture path named by a READY line, when it names one.
+///
+/// Separate from [`parse_ready_v1`] so that adding it changed no signature and
+/// no caller. `None` means the line came from a capenc that predates the field
+/// or named a path this build does not know — both read as "unreported", never
+/// as a guess.
+///
+/// Does no validation beyond the token: the line's structure is
+/// [`parse_ready_v1`]'s job, and a caller that has not accepted the line
+/// should not be acting on its capture field either.
+#[must_use]
+pub fn parse_ready_capture(line: &str) -> Option<CaptureBackend> {
+    line.strip_prefix(READY_PREFIX)?
+        .split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("capture="))
+        .and_then(CaptureBackend::from_token)
 }
 
 /// Format a canonical typed pre-READY unavailability notice.
@@ -1999,5 +2121,89 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The compatibility contract, in the direction that can break a running
+    /// deployment: a capenc that names its capture path must still be
+    /// understood, because `parse_ready_v1` rejects unknown fields outright.
+    #[test]
+    fn a_ready_line_naming_its_capture_path_still_parses() {
+        let plan = resolve_media_plan(
+            REQUEST,
+            &[BackendCandidate {
+                backend: EncoderBackend::OpenH264,
+                availability: BackendAvailability::Available(SOFTWARE_LIMITS),
+            }],
+        )
+        .expect("plan");
+        let sid = "26e9393f-a45b-4567-b634-6f4d34c58cb9";
+        let line = format_ready_v1_with_capture(plan, Some(CaptureBackend::XShm), Some(sid));
+
+        assert_eq!(
+            parse_ready_v1(
+                &line,
+                ReadyExpectation {
+                    request: REQUEST,
+                    allowed_backends: &[EncoderBackend::OpenH264],
+                    session_log_id: Some(sid),
+                }
+            )
+            .expect("a capture-naming READY line must parse"),
+            plan,
+            "naming the capture path must not change the video contract"
+        );
+        assert_eq!(parse_ready_capture(&line), Some(CaptureBackend::XShm));
+    }
+
+    /// The other direction: an older capenc names nothing, and that must read
+    /// as unreported rather than as a guessed path.
+    #[test]
+    fn a_ready_line_without_a_capture_path_reports_none() {
+        let plan = resolve_media_plan(
+            REQUEST,
+            &[BackendCandidate {
+                backend: EncoderBackend::OpenH264,
+                availability: BackendAvailability::Available(SOFTWARE_LIMITS),
+            }],
+        )
+        .expect("plan");
+        let line = format_ready_v1(plan, None);
+        assert!(
+            !line.contains("capture="),
+            "the no-capture line must stay byte-identical to what older builds emit"
+        );
+        assert_eq!(parse_ready_capture(&line), None);
+        assert_eq!(
+            format_ready_v1_with_capture(plan, None, None),
+            line,
+            "None must produce exactly the legacy line"
+        );
+    }
+
+    #[test]
+    fn an_unknown_capture_token_reads_as_unreported_not_as_another_path() {
+        let line = "[capenc] READY version=1 capture=holodeck";
+        assert_eq!(parse_ready_capture(line), None);
+        assert_eq!(CaptureBackend::from_token("holodeck"), None);
+    }
+
+    #[test]
+    fn capture_tokens_round_trip_and_price_the_zero_copy_trade() {
+        for backend in [
+            CaptureBackend::NvFbc,
+            CaptureBackend::XShm,
+            CaptureBackend::DesktopDuplication,
+            CaptureBackend::WindowsGraphicsCapture,
+        ] {
+            assert_eq!(
+                CaptureBackend::from_token(backend.ready_token()),
+                Some(backend)
+            );
+        }
+        // The distinction the field exists to record.
+        assert!(CaptureBackend::NvFbc.zero_copy());
+        assert!(CaptureBackend::DesktopDuplication.zero_copy());
+        assert!(!CaptureBackend::XShm.zero_copy());
+        assert!(!CaptureBackend::WindowsGraphicsCapture.zero_copy());
     }
 }

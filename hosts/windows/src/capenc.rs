@@ -65,6 +65,10 @@ pub struct CapencConfig {
     pub bit_depth: BitDepth,
     pub color_range: ColorRange,
     pub color_matrix: ColorMatrix,
+    /// Resolved transfer characteristics to encode and signal.
+    pub transfer: TransferCharacteristics,
+    /// Resolved colour primaries to encode and signal.
+    pub color_primaries: ColorPrimaries,
     /// Resolved encoder intent to request.
     pub intent: EncodeIntent,
     /// Damage-driven QP biasing to request. Roster-wide; see
@@ -623,8 +627,8 @@ impl Capenc {
                     bit_depth: cfg.bit_depth,
                     range: cfg.color_range,
                     matrix: cfg.color_matrix,
-                    primaries: ColorPrimaries::Bt709,
-                    transfer: TransferCharacteristics::Bt709,
+                    primaries: cfg.color_primaries,
+                    transfer: cfg.transfer,
                 },
                 width: cfg.width,
                 height: cfg.height,
@@ -745,11 +749,21 @@ impl Capenc {
             bit_depth: cfg.bit_depth,
             range: cfg.color_range,
             matrix: cfg.color_matrix,
-            primaries: ColorPrimaries::Bt709,
-            transfer: TransferCharacteristics::Bt709,
+            primaries: cfg.color_primaries,
+            transfer: cfg.transfer,
         });
         if variant.is_coherent() {
             args.push(format!("variant={}", variant.id()));
+        }
+        // Their own tokens: `variant=<id>` names codec, chroma, depth,
+        // range and matrix and has no room for these. Emitted only when
+        // they differ from BT.709, so a session that never asked for HDR
+        // produces the argv it always did.
+        if cfg.transfer != TransferCharacteristics::Bt709 {
+            args.push(format!("transfer={}", cfg.transfer.token()));
+        }
+        if cfg.color_primaries != ColorPrimaries::Bt709 {
+            args.push(format!("primaries={}", cfg.color_primaries.token()));
         }
         // Only when it is not the default: an absent `intent=` already means
         // `Interactive` to the engine's own parser, so emitting it
@@ -1340,6 +1354,8 @@ mod tests {
             bit_depth: BitDepth::Eight,
             color_range: ColorRange::Limited,
             color_matrix: ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 30,

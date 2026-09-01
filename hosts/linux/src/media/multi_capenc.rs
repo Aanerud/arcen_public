@@ -77,6 +77,8 @@ pub struct MonitorPipelineTemplate {
     pub bit_depth: arcen_media::BitDepth,
     pub color_range: arcen_media::ColorRange,
     pub color_matrix: arcen_media::ColorMatrix,
+    pub transfer: arcen_media::TransferCharacteristics,
+    pub color_primaries: arcen_media::ColorPrimaries,
     /// Encoder intent for the whole roster.
     ///
     /// Roster-wide rather than per monitor, for the same reason the codec is:
@@ -294,6 +296,8 @@ pub fn build_pipeline_specs(
                     bit_depth: template.bit_depth,
                     color_range: template.color_range,
                     color_matrix: template.color_matrix,
+                    transfer: template.transfer,
+                    color_primaries: template.color_primaries,
                     video_selection: template.video_selection,
                     codec_pinned: false,
                     variant_pinned: false,
@@ -729,6 +733,8 @@ mod tests {
             bit_depth: arcen_media::BitDepth::Eight,
             color_range: arcen_media::ColorRange::Limited,
             color_matrix: arcen_media::ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
@@ -801,6 +807,8 @@ mod tests {
             bit_depth: arcen_media::BitDepth::Eight,
             color_range: arcen_media::ColorRange::Limited,
             color_matrix: arcen_media::ColorMatrix::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: arcen_media::EncodeIntent::default(),
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,

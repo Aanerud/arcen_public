@@ -21,7 +21,7 @@ use crate::pipeline::frame_queue::{
     IncomingMediaBatch, IncomingMediaReceiver, IncomingMediaTelemetry,
 };
 use crate::pipeline::monitor_router::{MonitorFrameRouter, MonitorRoute, RouteOutcome};
-use crate::pipeline::video_decoder::{DecodedVideoFrame, NativeVideoDecoder};
+use crate::pipeline::video_decoder::{DecodedVideoFrame, NativeVideoDecoder, SessionColor};
 use crate::protocol::messages::{
     msg_type, AudioStreamResultMsg, AuthRequest, CursorModeResultMsg, CursorShapeMsg,
     DisplayUpdateResultMsg, HealthPongMsg, HealthStatsMsg, ServerHelloMsg, TabletModeResultMsg,
@@ -33,6 +33,8 @@ use crate::transport::tls::CertInfo;
 use crate::transport::websocket::{
     FullFrameRequestGate, SessionAuthentication, SessionCommandSender, SessionEnd, SessionEvent,
 };
+use crate::ui::session_truth::ActiveContract;
+use arcen_media::{ColorPrimaries, TransferCharacteristics};
 
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(2);
 /// How often the worker emits an INFO "stream healthy" heartbeat while frames
@@ -240,6 +242,9 @@ pub fn spawn_media_worker(
             // most once per connection: a one-way `None` -> `Some`
             // transition mirroring "no live topology mutation".
             let mut secondary_router: Option<MonitorFrameRouter> = None;
+            // Seeded by `ServerHello` and applied to every decoder, including
+            // the per-monitor ones the router builds later in the session.
+            let mut session_color = SessionColor::default();
             tracing::info!(target: crate::logging::target::VIDEO, "media worker started");
 
             loop {
@@ -315,9 +320,35 @@ pub fn spawn_media_worker(
                             yuv444 = hello.supports_yuv444,
                             "server hello",
                         );
+                        // Teach every decoder the two colour axes no packet
+                        // header carries. Taken from the host's own
+                        // `active_*` caps rather than from what this Deck
+                        // asked for, so a downgraded session is presented
+                        // as what actually arrives. `None` (a host that
+                        // does not report the axis at all) keeps the
+                        // BT.709 SDR default rather than guessing.
+                        let active = ActiveContract::from_hello(&hello);
                         {
                             let mut state = shared.lock().expect("media state poisoned");
                             state.server_hello = Some(hello);
+                        }
+                        session_color = SessionColor {
+                            primaries: active.primaries.unwrap_or(ColorPrimaries::Bt709),
+                            transfer: active.transfer.unwrap_or(TransferCharacteristics::Bt709),
+                        };
+                        tracing::info!(
+                            target: crate::logging::target::VIDEO,
+                            primaries = session_color.primaries.token(),
+                            transfer = session_color.transfer.token(),
+                            hdr = matches!(
+                                session_color.transfer,
+                                TransferCharacteristics::Pq | TransferCharacteristics::Hlg
+                            ),
+                            "deck resolved session colour from host caps",
+                        );
+                        decoder.set_session_color(session_color);
+                        if let Some(router) = secondary_router.as_mut() {
+                            router.set_session_color(session_color);
                         }
                         full_frame_requests.request();
                         let _ = full_frame_requests.send_due(&commands);
@@ -394,7 +425,11 @@ pub fn spawn_media_worker(
                         repaint.request_repaint();
                     }
                     SessionEvent::MediaReady => {
-                        maybe_commit_secondary_router(&shared, &mut secondary_router);
+                        maybe_commit_secondary_router(
+                            &shared,
+                            &mut secondary_router,
+                            session_color,
+                        );
                         handle_media_batch(
                             &shared,
                             &mut decoder,
@@ -524,6 +559,7 @@ fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
 fn maybe_commit_secondary_router(
     shared: &Arc<Mutex<SharedMediaState>>,
     secondary_router: &mut Option<MonitorFrameRouter>,
+    session_color: SessionColor,
 ) {
     if secondary_router.is_some() {
         return;
@@ -544,6 +580,12 @@ fn maybe_commit_secondary_router(
                 monitors = media_roster.plans().len(),
                 "media worker committed to negotiated multi-monitor routing",
             );
+            // The router is built lazily, long after `ServerHello` resolved
+            // the session's colour, so its freshly created per-monitor
+            // decoders have to be told too -- otherwise every secondary
+            // display silently presents an HDR session as BT.709 SDR.
+            let mut router = router;
+            router.set_session_color(session_color);
             *secondary_router = Some(router);
         }
         Err(error) => {

@@ -1,6 +1,6 @@
 [package]
 name = "arcen-audiocap"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 description = "Arcen Linux audio capture helper — PulseAudio/PipeWire monitor -> 48 kHz stereo PCM."
 publish.workspace = true

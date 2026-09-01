@@ -13,7 +13,7 @@
 # release snapshots starting at the first published version.
 #
 # Usage:
-#   scripts/publish/export-public.sh --tag v0.9.8 [--into <clone>] [--remote <url>]
+#   scripts/publish/export-public.sh --tag v0.10.0 [--into <clone>] [--remote <url>]
 #                                    [--no-tag] [--dry-run]
 #
 # The export refuses to run unless the working tree is clean, the hygiene gate
@@ -65,7 +65,7 @@ while (($#)); do
 done
 
 [[ -n "$tag" ]] || {
-    echo "error: --tag is required, e.g. --tag v0.9.8" >&2
+    echo "error: --tag is required, e.g. --tag v0.10.0" >&2
     exit 2
 }
 

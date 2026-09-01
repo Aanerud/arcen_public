@@ -608,6 +608,26 @@ pub struct QualitySettings {
     /// Requested matrix coefficients (`bt709`/`identity`/`bt601`/`bt2020ncl`).
     #[serde(default = "default_color_matrix")]
     pub color_matrix: String,
+    /// Requested transfer characteristics (`bt709`/`srgb`/`pq`/`hlg`).
+    ///
+    /// **This is the field that asks for HDR.** `pq` (SMPTE ST 2084) is the
+    /// only value that means "compose, capture and encode this desktop wide":
+    /// it is what makes a host apply an HDR EDID, enable Advanced Color, and
+    /// take a wide capture format. Depth alone does not, because 10-bit BT.709
+    /// SDR is an ordinary and useful thing to ask for -- banding headroom
+    /// without any HDR involvement.
+    ///
+    /// Defaults to `bt709` so a client that predates the field, or one that
+    /// simply does not want HDR, is unchanged.
+    #[serde(default = "default_transfer")]
+    pub transfer: String,
+    /// Requested colour primaries (`bt709`/`bt2020`/`display_p3`).
+    ///
+    /// Carried beside `transfer` because HDR10 is both: PQ over BT.2020. A
+    /// host that honoured one and not the other would produce a stream whose
+    /// signalling contradicts its pixels.
+    #[serde(default = "default_color_primaries")]
+    pub color_primaries: String,
     /// What the encoder should optimise for (`interactive`/`quality`).
     ///
     /// `interactive` is latency-first and is what Arcen has always encoded.
@@ -634,6 +654,8 @@ impl Default for QualitySettings {
             bit_depth: default_bit_depth(),
             color_range: default_color_range(),
             color_matrix: default_color_matrix(),
+            transfer: default_transfer(),
+            color_primaries: default_color_primaries(),
             encode_intent: default_encode_intent(),
             force_lossless: false,
             intra_refresh: false,
@@ -3278,6 +3300,49 @@ mod tests {
                 .expect("default client hello remains decodable");
         assert!(!legacy_hello.supports_bt601_matrix);
         assert!(!legacy_hello.supports_bt2020_ncl_matrix);
+    }
+
+    /// The field that asks for HDR. Depth alone must not imply it: 10-bit
+    /// BT.709 SDR is an ordinary request for banding headroom, and a host that
+    /// treated it as HDR would apply an EDID and tone map for no reason.
+    #[test]
+    fn hdr_is_requested_by_transfer_not_by_depth() {
+        let sdr_ten_bit = QualitySettings {
+            bit_depth: "10".to_string(),
+            ..QualitySettings::default()
+        };
+        assert_eq!(sdr_ten_bit.transfer, "bt709");
+        assert_eq!(sdr_ten_bit.color_primaries, "bt709");
+
+        let hdr10 = QualitySettings {
+            bit_depth: "10".to_string(),
+            transfer: "pq".to_string(),
+            color_primaries: "bt2020".to_string(),
+            color_matrix: "bt2020ncl".to_string(),
+            ..QualitySettings::default()
+        };
+        let wire = serde_json::to_value(&hdr10).expect("serialize");
+        assert_eq!(wire.get("transfer").and_then(|v| v.as_str()), Some("pq"));
+        assert_eq!(
+            wire.get("color_primaries").and_then(|v| v.as_str()),
+            Some("bt2020")
+        );
+        let decoded: QualitySettings = serde_json::from_value(wire).expect("round trip");
+        assert_eq!(decoded, hdr10);
+    }
+
+    /// A client that predates the fields must still decode, and must read as
+    /// SDR rather than as an accidental HDR request.
+    #[test]
+    fn a_client_without_the_hdr_fields_reads_as_sdr() {
+        let mut wire = serde_json::to_value(QualitySettings::default()).expect("serialize");
+        let object = wire.as_object_mut().expect("object");
+        object.remove("transfer");
+        object.remove("color_primaries");
+
+        let decoded: QualitySettings = serde_json::from_value(wire).expect("legacy decode");
+        assert_eq!(decoded.transfer, "bt709");
+        assert_eq!(decoded.color_primaries, "bt709");
     }
 
     #[test]

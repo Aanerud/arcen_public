@@ -1004,9 +1004,40 @@ where
         save_error: None,
         custom_snapshot_complete: snapshot.custom_snapshot_complete,
         pre_existing_custom: snapshot.pre_existing_custom.clone(),
-        edid_write_stage: EdidWriteStage::Attempted,
+        edid_write_stage: EdidWriteStage::None,
         intended_edid_sha256: Some(intended_edid_sha256),
     };
+    // Do not rewrite an EDID that is already exactly right.
+    //
+    // Measured, repeatedly: writing the EDID during a session drops the
+    // display's Advanced Color capability for the rest of that session --
+    // `supported=true enabled=true bpc=10` immediately before the write,
+    // `supported=false ... =8` immediately after, and it does not come back
+    // within the session even when polled. Re-enabling is impossible from
+    // there, because enabling HDR requires the very capability the write
+    // destroyed.
+    //
+    // When a display has already been provisioned with the HDR10 EDID for
+    // this exact geometry (`nvapi-provision-arcen-edid --hdr10`), the bytes
+    // this session is about to write are identical to the bytes already on
+    // the display, so the write buys nothing and costs HDR. Skipping it
+    // keeps the desktop in HDR for the whole session.
+    let already_correct = snapshot.original_edid.as_deref() == Some(edid);
+    if already_correct {
+        return apply_exact_topology(driver, snapshot, width, height, active);
+    }
+    if edid.len() > 128 {
+        return Err(ApplyExactError {
+            message: format!(
+                "HDR display EDID is not provisioned before session start on display id \
+                 0x{:08x}; refusing to rewrite it after connection",
+                snapshot.mapping.display_id
+            ),
+            active: None,
+            topology_commit_failed: false,
+        });
+    }
+    active.edid_write_stage = EdidWriteStage::Attempted;
     checkpoint(&active).map_err(|message| ApplyExactError {
         message,
         active: Some(active.clone()),
@@ -2668,6 +2699,59 @@ mod tests {
         snapshot: &ExactModeSnapshot,
     ) -> Result<ActiveExactMode, ApplyExactError> {
         apply_exact(driver, snapshot, &[0x55; 128], 3600, 2338, 60, |_| Ok(()))
+    }
+
+    #[test]
+    fn hdr_exact_apply_requires_the_edid_to_exist_before_session_start() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        driver.calls.clear();
+
+        let error = apply_exact(&mut driver, &snapshot, &[0x55; 256], 3600, 2338, 60, |_| {
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error
+            .message
+            .contains("not provisioned before session start"));
+        assert!(error.active.is_none());
+        assert!(
+            !driver
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::SetEdid(_))),
+            "a connected HDR session must never rewrite the EDID"
+        );
+    }
+
+    #[test]
+    fn preprovisioned_hdr_edid_applies_only_the_requested_topology() {
+        let mut driver = MockDriver::new();
+        let hdr_edid = vec![0x55; 256];
+        driver.current_edid = Some(hdr_edid.clone());
+        let snapshot = snapshot_for(&mut driver);
+        driver.calls.clear();
+
+        apply_exact(
+            &mut driver,
+            &snapshot,
+            &hdr_edid,
+            3600,
+            2338,
+            60,
+            |_| Ok(()),
+        )
+        .expect("preprovisioned HDR display");
+
+        assert!(
+            !driver
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::SetEdid(_) | Call::Timing)),
+            "a preprovisioned HDR display needs no EDID or custom-timing mutation"
+        );
+        assert!(driver.calls.contains(&Call::SetConfig(3600, 2338)));
     }
 
     #[test]

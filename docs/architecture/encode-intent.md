@@ -129,21 +129,22 @@ not of effort.
 ## 4. Path
 
 ```
-Colour Fidelity preset -> quality_settings.encode_intent ("interactive"/"quality")
-              ->  host resolves, spawns capenc with  intent=<token>
-              ->  requested_intent()  ->  preset + tuning + VBV
+Streaming preset -> quality_settings.encode_intent ("interactive"/"quality")
+          ->  host resolves, spawns capenc with  intent=<token>
+          ->  requested_intent()  ->  preset + tuning + VBV
 ```
 
 The `intent=` argv token follows the established `key=value` style of
 `variant=`, `encoder=` and `cursor=`. It is emitted **only when non-default**,
 so every existing interactive session's argv is byte-identical to before.
 
-Production Deck exposes no separate intent control. Standard and Full Colour
-derive `Interactive`; Grading Reference derives `Quality`. Legacy
-`settings.json` values are accepted for migration but ignored. The derived
-token is threaded into `ConnectOptions.profile.encode_intent` and copied into
-the request by `rust_viewer_quality_settings`. Engineering CLI smoke tooling
-retains `--encode-intent interactive|quality`.
+Production Deck exposes no separate intent control. Auto and Speed derive
+`Interactive`; Grading and HDR derive `Quality`. The developer-only Full Colour
+contract remains `Interactive`. Legacy `settings.json` values are accepted for
+migration but ignored. The derived token is threaded into
+`ConnectOptions.profile.encode_intent` and copied into the request by
+`rust_viewer_quality_settings`. Engineering CLI smoke tooling retains
+`--encode-intent interactive|quality`.
 
 An absent token means `Interactive`. An *unknown* token is a hard error, not a
 fallback — deliberately. A session that asked for grading quality and silently

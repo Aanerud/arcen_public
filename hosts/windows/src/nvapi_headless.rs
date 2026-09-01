@@ -31,17 +31,26 @@ use crate::nvapi_inventory::{DisplayIdEntry, GpuEntry, NvapiInventoryReport};
 const JOURNAL_VERSION: u32 = 1;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 const MAX_EDID_BYTES: usize = 256;
-/// Mode advertised by a freshly provisioned spare's placeholder EDID.
-///
-/// Named because it is load-bearing twice over: it is both the mode the
-/// display enumerates and, together with the physical size derived from the
-/// requested scale, the basis Windows uses to compute that display's DPI.
-const PROVISIONING_MODE_WIDTH: u32 = 1920;
-const PROVISIONING_MODE_HEIGHT: u32 = 1080;
-const PROVISIONING_MODE_REFRESH_HZ: u32 = 60;
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(100);
 const MAX_HOLD_MS: u64 = 30_000;
+
+/// Final monitor contract an NVIDIA headless output must advertise before the
+/// session starts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HeadlessDisplayContract {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+    pub width_mm: f32,
+    pub height_mm: f32,
+    pub scale: arcen_media::Scale120,
+    pub product_id: u16,
+    pub serial: u32,
+    pub hdr10: bool,
+    pub primary: bool,
+    pub preferred_output_index: Option<u32>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProbeRequest {
@@ -51,6 +60,14 @@ pub(crate) struct ProbeRequest {
     pub refresh_hz: u32,
     pub hold_ms: u64,
     pub journal: Option<PathBuf>,
+    /// Advertise HDR10 in the probed EDID.
+    ///
+    /// Diagnostic only. Windows will not offer Advanced Color on an output
+    /// whose EDID does not claim it, and without Advanced Color the desktop is
+    /// never composited wider than 8-bit — which is what every capture backend
+    /// then faithfully reports. This makes that first link testable.
+    /// See `docs/internal/ten-bit-source-capture.md`.
+    pub hdr10: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -91,11 +108,21 @@ struct EdidProvisionChange {
 }
 
 #[derive(Clone, Debug)]
+struct ExpectedHeadlessDisplay {
+    display_id: u32,
+    edid_sha256: String,
+    width: u32,
+    height: u32,
+    hdr10: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedEdidProvision {
     adapter_name: String,
     adapter_luid: AdapterLuid,
     target_count: usize,
     changes: Vec<EdidProvisionChange>,
+    expected: Vec<ExpectedHeadlessDisplay>,
     recovery_entries: Vec<HeadlessEdidRecovery>,
 }
 
@@ -385,6 +412,7 @@ fn desired_display_ids(
     report: &NvapiInventoryReport,
     gpu: &GpuEntry,
     target_count: usize,
+    preferred_display_id: Option<u32>,
 ) -> Result<(Vec<u32>, Vec<u32>), String> {
     if !(1..=arcen_media::MAX_MULTI_MONITOR_COUNT).contains(&target_count) {
         return Err(format!(
@@ -406,7 +434,7 @@ fn desired_display_ids(
     let mandatory = connected
         .iter()
         .copied()
-        .filter(|display| !display.edid.written_by_arcen)
+        .filter(|display| !display.edid.written_by_arcen && display.edid.byte_length != 0)
         .collect::<Vec<_>>();
     if mandatory.len() > target_count {
         return Err(format!(
@@ -420,11 +448,30 @@ fn desired_display_ids(
         .iter()
         .map(|display| display.display_id)
         .collect::<Vec<_>>();
+    if let Some(display_id) = preferred_display_id {
+        let preferred = gpu
+            .displays
+            .iter()
+            .find(|display| display.display_id == display_id)
+            .ok_or_else(|| {
+                format!(
+                    "configured NVIDIA display id 0x{display_id:08x} is not on the selected GPU"
+                )
+            })?;
+        if preferred.output_id.is_none() {
+            return Err(format!(
+                "configured NVIDIA display id 0x{display_id:08x} has no addressable output"
+            ));
+        }
+        if keep.len() < target_count && !keep.contains(&display_id) {
+            keep.push(display_id);
+        }
+    }
     for display in &connected {
         if keep.len() == target_count {
             break;
         }
-        if !keep.contains(&display.display_id) {
+        if display.edid.byte_length != 0 && !keep.contains(&display.display_id) {
             keep.push(display.display_id);
         }
     }
@@ -433,10 +480,9 @@ fn desired_display_ids(
             .displays
             .iter()
             .filter(|display| {
-                !display.flags.connected
-                    && !display.flags.active
-                    && display.edid.byte_length == 0
+                !keep.contains(&display.display_id)
                     && display.output_id.is_some()
+                    && (display.edid.byte_length == 0 || display.edid.written_by_arcen)
             })
             .collect::<Vec<_>>();
         spares.sort_by_key(|display| std::cmp::Reverse(display.output_id.unwrap_or(0)));
@@ -454,112 +500,82 @@ fn desired_display_ids(
             keep.len()
         ));
     }
-    let remove = connected
-        .into_iter()
+    let remove = gpu
+        .displays
+        .iter()
         .filter(|display| !keep.contains(&display.display_id))
-        .map(|display| {
-            if display.edid.written_by_arcen {
-                Ok(display.display_id)
-            } else {
-                Err(format!(
-                    "refusing to remove non-Arcen display id 0x{:08x}",
-                    display.display_id
-                ))
-            }
+        .filter(|display| {
+            display.edid.written_by_arcen
+                || (display.flags.connected && display.edid.byte_length == 0)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|display| display.display_id)
+        .collect::<Vec<_>>();
     Ok((keep, remove))
 }
 
 #[cfg(windows)]
 pub(crate) fn prepare_provisioning(
     adapter_name: &str,
-    target_count: usize,
-    provisioning_scale: arcen_media::Scale120,
+    contracts: &[HeadlessDisplayContract],
 ) -> Result<PreparedEdidProvision, String> {
     use crate::nvapi::NvapiDriver as _;
     use sha2::{Digest as _, Sha256};
+
+    if contracts.is_empty() || contracts.len() > arcen_media::MAX_MULTI_MONITOR_COUNT {
+        return Err(format!(
+            "NVIDIA headless display contract count must be 1..={}",
+            arcen_media::MAX_MULTI_MONITOR_COUNT
+        ));
+    }
+    let mut contracts = contracts.to_vec();
+    contracts.sort_by_key(|contract| !contract.primary);
+    if contracts.iter().filter(|contract| contract.primary).count() != 1 {
+        return Err("NVIDIA headless display contracts require exactly one primary".to_string());
+    }
+    for contract in &contracts {
+        crate::display::DisplaySize::validate(contract.width, contract.height)?;
+        if contract.refresh_hz == 0 {
+            return Err("NVIDIA headless display refresh must be nonzero".to_string());
+        }
+    }
 
     let report = crate::nvapi_inventory::inventory()?;
     let gpu = matching_gpu(&report, adapter_name)?;
     let adapter_luid = gpu
         .adapter_luid
         .ok_or_else(|| format!("GPU {adapter_name:?} has no adapter LUID"))?;
-    let (keep, remove) = desired_display_ids(&report, gpu, target_count)?;
-    let connected = gpu
-        .displays
+    let target_count = contracts.len();
+    let preferred_display_id = contracts
         .iter()
-        .filter(|display| display.flags.connected)
-        .map(|display| display.display_id)
-        .collect::<Vec<_>>();
-    let add = keep
-        .iter()
-        .copied()
-        .filter(|display_id| !connected.contains(display_id))
-        .collect::<Vec<_>>();
-    let reactivate = keep
-        .iter()
-        .copied()
-        .filter(|display_id| {
-            gpu.displays
-                .iter()
-                .find(|display| display.display_id == *display_id)
-                .is_some_and(|display| display.flags.connected && !display.flags.active)
-        })
-        .collect::<Vec<_>>();
-
-    let mut driver = crate::nvapi::Nvapi::load()?;
-    let mut changes = Vec::with_capacity(add.len() + reactivate.len() + remove.len());
-    for (display_id, desired_edid) in add
-        .into_iter()
-        .map(|display_id| {
-            let edid = crate::edid::generate(crate::edid::EdidRequest {
-                width: PROVISIONING_MODE_WIDTH,
-                height: PROVISIONING_MODE_HEIGHT,
-                refresh_hz: PROVISIONING_MODE_REFRESH_HZ,
-                width_mm: 0.0,
-                height_mm: 0.0,
-                // Windows derives a display's DPI from its current mode over
-                // the physical size in its EDID, so a placeholder that always
-                // said 96 DPI pinned a provisioned output to 100% whenever
-                // this EDID is the one still in force (that is, whenever the
-                // requested mode happens to be the provisioning mode, so no
-                // custom timing is synthesized and no rewrite occurs).
-                //
-                // One scale for every spare, not one per monitor: at
-                // provisioning time the spares are interchangeable and have
-                // not been assigned to client monitors yet -- `keep` is
-                // ordered mandatory-monitors-first, not roster order -- so
-                // per-output precision here would be invented. Monitors that
-                // genuinely differ are corrected by the exact-timing path,
-                // which rewrites each EDID with that monitor's own scale.
-                scale: crate::display::edid_scale_ratio(provisioning_scale).unwrap_or(1.0),
-                product_id: (display_id & 0xffff) as u16,
-                serial: display_id,
-            })?;
-            Ok((display_id, Some(edid.to_vec())))
-        })
-        .chain(reactivate.into_iter().map(|display_id| {
-            let display = gpu
+        .find(|contract| contract.primary)
+        .and_then(|contract| contract.preferred_output_index)
+        .and_then(|index| {
+            let mut connected = gpu
                 .displays
                 .iter()
-                .find(|display| display.display_id == display_id)
-                .expect("reactivated display came from this GPU");
-            if display.edid.byte_length == 0 || !display.edid.written_by_arcen {
-                return Err(format!(
-                    "refusing to reactivate display id 0x{display_id:08x} without an Arcen EDID"
-                ));
-            }
-            Ok((display_id, Some(Vec::new())))
-        }))
-        .chain(remove.into_iter().map(|display_id| Ok((display_id, None))))
-        .collect::<Result<Vec<_>, String>>()?
-    {
+                .filter(|display| display.flags.connected && display.edid.byte_length != 0)
+                .collect::<Vec<_>>();
+            connected.sort_by_key(|display| std::cmp::Reverse(display.output_id.unwrap_or(0)));
+            connected
+                .get(index as usize)
+                .map(|display| display.display_id)
+        });
+    let (keep, remove) = desired_display_ids(&report, gpu, target_count, preferred_display_id)?;
+
+    let mut driver = crate::nvapi::Nvapi::load()?;
+    let mut changes = Vec::with_capacity(keep.len() + remove.len());
+    let mut expected = Vec::with_capacity(keep.len());
+    let mut recovery_entries = Vec::with_capacity(keep.len() + remove.len());
+
+    for (display_id, contract) in keep.iter().copied().zip(&contracts) {
         let display = gpu
             .displays
             .iter()
             .find(|display| display.display_id == display_id)
             .expect("selected display came from this GPU");
+        if display.flags.connected && !display.edid.written_by_arcen {
+            continue;
+        }
         let output_id = display
             .output_id
             .ok_or_else(|| format!("display id 0x{display_id:08x} has no output ID"))?;
@@ -570,70 +586,84 @@ pub(crate) fn prepare_provisioning(
             ));
         }
         let original_edid = driver.get_edid(mapping)?;
-        let desired_edid = match desired_edid {
-            Some(edid) if edid.is_empty() => Some(original_edid.clone().ok_or_else(|| {
-                format!("display id 0x{display_id:08x} lost its reactivation EDID")
-            })?),
-            other => other,
+        let request = crate::edid::EdidRequest {
+            width: contract.width,
+            height: contract.height,
+            refresh_hz: contract.refresh_hz,
+            width_mm: contract.width_mm,
+            height_mm: contract.height_mm,
+            scale: crate::display::edid_scale_ratio(contract.scale).unwrap_or(1.0),
+            product_id: contract.product_id,
+            serial: contract.serial,
         };
-        let intended_edid_sha256 = format!(
-            "{:x}",
-            Sha256::digest(desired_edid.as_deref().unwrap_or_default())
-        );
-        changes.push(EdidProvisionChange {
-            recovery: HeadlessEdidRecovery {
-                display_id,
-                output_id,
-                adapter_luid,
-                original_edid,
-                intended_edid_sha256,
-            },
-            desired_edid,
+        let desired_edid = if contract.hdr10 {
+            crate::edid::generate_hdr10(request)?.to_vec()
+        } else {
+            crate::edid::generate(request)?.to_vec()
+        };
+        let intended_edid_sha256 = format!("{:x}", Sha256::digest(&desired_edid));
+        let recovery = HeadlessEdidRecovery {
+            display_id,
+            output_id,
+            adapter_luid,
+            original_edid: original_edid.clone(),
+            intended_edid_sha256: intended_edid_sha256.clone(),
+        };
+        expected.push(ExpectedHeadlessDisplay {
+            display_id,
+            edid_sha256: intended_edid_sha256,
+            width: contract.width,
+            height: contract.height,
+            hdr10: contract.hdr10,
         });
-    }
-    let mut recovery_entries = changes
-        .iter()
-        .map(|change| change.recovery.clone())
-        .collect::<Vec<_>>();
-    for display_id in keep {
-        if recovery_entries
-            .iter()
-            .any(|entry| entry.display_id == display_id)
+        recovery_entries.push(recovery.clone());
+        if original_edid.as_deref() != Some(desired_edid.as_slice())
+            || !display.flags.connected
+            || !display.flags.active
         {
-            continue;
+            changes.push(EdidProvisionChange {
+                recovery,
+                desired_edid: Some(desired_edid),
+            });
         }
+    }
+
+    for display_id in remove {
         let display = gpu
             .displays
             .iter()
             .find(|display| display.display_id == display_id)
-            .expect("kept display came from this GPU");
+            .expect("removed display came from this GPU");
         let output_id = display
             .output_id
             .ok_or_else(|| format!("display id 0x{display_id:08x} has no output ID"))?;
         let mapping = driver.map_headless_display_id(display_id, adapter_luid)?;
         if mapping.output_id != output_id {
             return Err(format!(
-                "display id 0x{display_id:08x} changed output identity during snapshot"
+                "display id 0x{display_id:08x} changed output identity during removal preparation"
             ));
         }
         let original_edid = driver.get_edid(mapping)?;
-        let intended_edid_sha256 = format!(
-            "{:x}",
-            Sha256::digest(original_edid.as_deref().unwrap_or_default())
-        );
-        recovery_entries.push(HeadlessEdidRecovery {
+        let recovery = HeadlessEdidRecovery {
             display_id,
             output_id,
             adapter_luid,
             original_edid,
-            intended_edid_sha256,
+            intended_edid_sha256: format!("{:x}", Sha256::digest(b"")),
+        };
+        recovery_entries.push(recovery.clone());
+        changes.push(EdidProvisionChange {
+            recovery,
+            desired_edid: None,
         });
     }
+
     Ok(PreparedEdidProvision {
         adapter_name: adapter_name.to_string(),
         adapter_luid,
         target_count,
         changes,
+        expected,
         recovery_entries,
     })
 }
@@ -641,8 +671,7 @@ pub(crate) fn prepare_provisioning(
 #[cfg(not(windows))]
 pub(crate) fn prepare_provisioning(
     _adapter_name: &str,
-    _target_count: usize,
-    _provisioning_scale: arcen_media::Scale120,
+    _contracts: &[HeadlessDisplayContract],
 ) -> Result<PreparedEdidProvision, String> {
     Err("NVIDIA headless provisioning is available only on Windows".into())
 }
@@ -674,13 +703,344 @@ pub(crate) fn apply_provisioning(prepared: &PreparedEdidProvision) -> Result<(),
                 change.recovery.display_id
             ));
         }
+        tracing::debug!(
+            target: crate::logging::DISPLAY,
+            display_id = format_args!("0x{:08x}", change.recovery.display_id),
+            output_id = format_args!("0x{:08x}", change.recovery.output_id),
+            edid_bytes = change.desired_edid.as_ref().map_or(0, Vec::len),
+            "NVIDIA headless EDID change read back before enumeration settle"
+        );
     }
-    wait_for_provisioned_state(prepared)
+    let requested_display_ids = prepared
+        .expected
+        .iter()
+        .map(|display| display.display_id)
+        .collect::<Vec<_>>();
+    driver
+        .activate_extended_displays(&requested_display_ids)
+        .map_err(|error| format!("activate exact NVIDIA headless display set: {error}"))?;
+    tracing::info!(
+        target: crate::logging::DISPLAY,
+        requested_display_ids = ?requested_display_ids,
+        "exact NVIDIA headless display set activated before Windows topology planning"
+    );
+    // The GRID driver can keep an emptied head marked connected until the
+    // topology no longer references it. Clear removed heads once more after
+    // the exact topology commit so the connector state itself converges, not
+    // only its active bit and EDID byte count.
+    for change in prepared
+        .changes
+        .iter()
+        .filter(|change| change.desired_edid.is_none())
+    {
+        let mapping = driver
+            .map_headless_display_id(change.recovery.display_id, change.recovery.adapter_luid)?;
+        driver.set_edid(mapping, &[])?;
+        tracing::debug!(
+            target: crate::logging::DISPLAY,
+            display_id = format_args!("0x{:08x}", change.recovery.display_id),
+            "removed NVIDIA head cleared again after exact topology activation"
+        );
+    }
+    wait_for_provisioned_state(prepared)?;
+
+    let hdr_display_ids = prepared
+        .expected
+        .iter()
+        .filter(|display| display.hdr10)
+        .map(|display| display.display_id)
+        .collect::<Vec<_>>();
+    if !hdr_display_ids.is_empty() {
+        tracing::info!(
+            target: crate::logging::DISPLAY,
+            display_ids = ?hdr_display_ids,
+            "HDR EDIDs are active; exact-target HDR engagement is deferred until the final \
+             session display lease is bound"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
 pub(crate) fn apply_provisioning(_prepared: &PreparedEdidProvision) -> Result<(), String> {
     Err("NVIDIA headless provisioning is available only on Windows".into())
+}
+
+/// One display carrying an Arcen-written EDID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ArcenEdidDisplay {
+    pub adapter: String,
+    pub display_id: u32,
+    pub output_id: u32,
+    pub in_display_config: bool,
+    pub product_code: Option<u16>,
+}
+
+/// What a clear run did, or would do.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct ClearOutcome {
+    pub dry_run: bool,
+    pub cleared: Vec<ArcenEdidDisplay>,
+    /// Left in place to satisfy the non-headless invariant, or because the
+    /// caller named a different display.
+    pub kept: Vec<ArcenEdidDisplay>,
+}
+
+/// Which Arcen-written EDIDs to remove.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClearRequest {
+    /// Remove only this display id. `None` removes every one it may.
+    pub display_id: Option<u32>,
+    /// Restrict to displays on the adapter whose name contains this, when the
+    /// caller passes one through [`ClearRequest::adapter_filter`].
+    pub dry_run: bool,
+}
+
+impl ClearRequest {
+    pub(crate) const fn adapter_filter(self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Selects the Arcen-written EDIDs a clear run may remove.
+///
+/// **Enforces ADR 0009's non-headless invariant.** A Windows host with no
+/// active display cannot present LogonUI, so the credential provider has
+/// nothing to draw on and the machine is unreachable without a hypervisor
+/// console. At least one display carrying an Arcen EDID and present in the
+/// display configuration is therefore always kept, even when the caller asked
+/// for everything.
+///
+/// Pure so the invariant is testable without a GPU.
+pub(crate) fn plan_clear(
+    displays: &[ArcenEdidDisplay],
+    request: ClearRequest,
+) -> (Vec<ArcenEdidDisplay>, Vec<ArcenEdidDisplay>) {
+    let mut cleared = Vec::new();
+    let mut kept = Vec::new();
+
+    // The display that must survive: prefer one Windows is actually using, so
+    // clearing never trades a live desktop for a spare.
+    let survivor = displays
+        .iter()
+        .position(|display| display.in_display_config)
+        .or(if displays.is_empty() { None } else { Some(0) });
+
+    for (index, display) in displays.iter().enumerate() {
+        let named = request
+            .display_id
+            .is_none_or(|wanted| wanted == display.display_id);
+        if !named || survivor == Some(index) {
+            kept.push(display.clone());
+        } else {
+            cleared.push(display.clone());
+        }
+    }
+    (cleared, kept)
+}
+
+#[cfg(windows)]
+pub(crate) fn arcen_edid_displays() -> Result<Vec<ArcenEdidDisplay>, String> {
+    let report = crate::nvapi_inventory::inventory()?;
+    let mut displays = Vec::new();
+    for gpu in &report.gpus {
+        for display in &gpu.displays {
+            if !display.edid.written_by_arcen {
+                continue;
+            }
+            let Some(output_id) = display.output_id else {
+                continue;
+            };
+            displays.push(ArcenEdidDisplay {
+                adapter: gpu.full_name.clone().unwrap_or_else(|| "unknown".into()),
+                display_id: display.display_id,
+                output_id,
+                in_display_config: display.in_nvapi_display_config,
+                product_code: display.edid.product_code,
+            });
+        }
+    }
+    Ok(displays)
+}
+
+/// Removes Arcen-written EDIDs, keeping at least one so the host stays
+/// reachable. Verifies each removal by reading the EDID back.
+#[cfg(windows)]
+pub(crate) fn clear_arcen_edids(request: ClearRequest) -> Result<ClearOutcome, String> {
+    use crate::nvapi::NvapiDriver as _;
+
+    // A pending journal describes a topology captured before this call. Any
+    // EDID removed underneath it changes the bindings that journal replays
+    // against, and the restore then fails with an ambiguous-path error that
+    // cannot be resolved without knowing the old topology. Refuse, exactly as
+    // the headless probe does, rather than make a recoverable state
+    // unrecoverable. A dry run reads nothing and is always safe.
+    if !request.dry_run {
+        let display_journal = crate::recovery::default_path();
+        if display_journal.exists() {
+            return Err(format!(
+                "refusing to clear EDIDs while display recovery journal {display_journal:?} \
+                 exists; run `arcen-pier restore-display` in the console session first"
+            ));
+        }
+    }
+
+    let displays = arcen_edid_displays()?;
+    let (cleared, kept) = plan_clear(&displays, request);
+    if request.dry_run {
+        return Ok(ClearOutcome {
+            dry_run: true,
+            cleared,
+            kept,
+        });
+    }
+
+    let report = crate::nvapi_inventory::inventory()?;
+    let mut driver = crate::nvapi::Nvapi::load()?;
+    let mut done = Vec::new();
+    for display in &cleared {
+        let adapter_luid = report
+            .gpus
+            .iter()
+            .find(|gpu| {
+                gpu.displays
+                    .iter()
+                    .any(|entry| entry.display_id == display.display_id)
+            })
+            .and_then(|gpu| gpu.adapter_luid)
+            .ok_or_else(|| {
+                format!(
+                    "display id 0x{:08x} has no adapter LUID",
+                    display.display_id
+                )
+            })?;
+        let mapping = driver.map_headless_display_id(display.display_id, adapter_luid)?;
+        if mapping.output_id != display.output_id {
+            return Err(format!(
+                "display id 0x{:08x} changed output identity before clear",
+                display.display_id
+            ));
+        }
+        driver.set_edid(mapping, &[])?;
+        // Read back rather than trust the call: a silent no-op here would
+        // leave the operator believing the host was cleaned.
+        if let Some(remaining) = driver.get_edid(mapping)? {
+            let probe = crate::nvapi_inventory::summarize_edid(&remaining);
+            if probe.written_by_arcen {
+                return Err(format!(
+                    "display id 0x{:08x} still carries an Arcen EDID after clear",
+                    display.display_id
+                ));
+            }
+        }
+        done.push(display.clone());
+    }
+    Ok(ClearOutcome {
+        dry_run: false,
+        cleared: done,
+        kept,
+    })
+}
+
+/// Writes a persistent Arcen EDID to an inactive NVIDIA display id.
+///
+/// The inverse of [`clear_arcen_edids`], and the command that was missing when
+/// that one shipped. Removing a display changes enumeration, so a host pinned
+/// to `platform.desktop.output` can end up resolving nothing -- and with no
+/// way to put a display back, the only recovery was a reboot that fixed the
+/// symptom and not the topology.
+///
+/// # Errors
+///
+/// Returns a message when the display id is unknown, already carries an EDID
+/// this host wrote, or the write does not read back.
+#[cfg(windows)]
+pub(crate) fn provision_arcen_edid(
+    display_id: u32,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    hdr10: bool,
+) -> Result<(), String> {
+    use crate::nvapi::NvapiDriver as _;
+
+    let journal = crate::recovery::default_path();
+    if journal.exists() {
+        return Err(format!(
+            "refusing to provision while display recovery journal {journal:?} exists; \
+             run `arcen-pier restore-display` in the console session first"
+        ));
+    }
+    let report = crate::nvapi_inventory::inventory()?;
+    let (adapter_luid, output_id) = report
+        .gpus
+        .iter()
+        .find_map(|gpu| {
+            gpu.displays
+                .iter()
+                .find(|entry| entry.display_id == display_id)
+                .and_then(|entry| Some((gpu.adapter_luid?, entry.output_id?)))
+        })
+        .ok_or_else(|| format!("display id 0x{display_id:08x} is not in the NVAPI inventory"))?;
+
+    let edid_request = crate::edid::EdidRequest {
+        width,
+        height,
+        refresh_hz: refresh_hz.max(1),
+        width_mm: 0.0,
+        height_mm: 0.0,
+        scale: 1.0,
+        product_id: 0x0001,
+        serial: 0,
+    };
+    // The persistent counterpart to the session-time EDID choice. A session
+    // applies HDR10 only while a Deck asks for PQ and takes it away again
+    // afterwards, which means an operator logging in at the console sees an
+    // SDR display and no "Use HDR" toggle in Windows Display Settings --
+    // Windows only offers HDR where the sink's EDID claims it. Provisioning
+    // the HDR10 EDID makes that claim permanent, so HDR is visible and
+    // selectable outside a session and can be verified independently of
+    // Arcen.
+    let edid = if hdr10 {
+        crate::edid::generate_hdr10(edid_request)?.to_vec()
+    } else {
+        crate::edid::generate(edid_request)?.to_vec()
+    };
+
+    let mut driver = crate::nvapi::Nvapi::load()?;
+    let mapping = driver.map_headless_display_id(display_id, adapter_luid)?;
+    if mapping.output_id != output_id {
+        return Err(format!(
+            "display id 0x{display_id:08x} changed output identity before provisioning"
+        ));
+    }
+    driver.set_edid(mapping, &edid)?;
+    // Read back rather than trust the call, for the same reason the clear does.
+    let written = driver
+        .get_edid(mapping)?
+        .ok_or_else(|| format!("display id 0x{display_id:08x} reports no EDID after write"))?;
+    if !crate::nvapi_inventory::summarize_edid(&written).written_by_arcen {
+        return Err(format!(
+            "display id 0x{display_id:08x} did not accept the Arcen EDID"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn provision_arcen_edid(
+    _display_id: u32,
+    _width: u32,
+    _height: u32,
+    _refresh_hz: u32,
+    _hdr10: bool,
+) -> Result<(), String> {
+    Err("provisioning an Arcen EDID is available only on Windows".into())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn clear_arcen_edids(_request: ClearRequest) -> Result<ClearOutcome, String> {
+    Err("clearing Arcen EDIDs is available only on Windows".into())
 }
 
 #[cfg(windows)]
@@ -705,23 +1065,75 @@ fn wait_for_provisioned_state(prepared: &PreparedEdidProvision) -> Result<(), St
                     .iter()
                     .filter(|display| display.flags.active)
                     .count();
-                let all_changes_match = prepared.changes.iter().all(|change| {
+                let expected_match = prepared.expected.iter().all(|expected| {
                     gpu.displays
                         .iter()
-                        .find(|display| display.display_id == change.recovery.display_id)
-                        .is_some_and(|display| match change.desired_edid.as_deref() {
-                            Some(_) => display.flags.connected && display.edid.byte_length > 0,
-                            None => !display.flags.connected && display.edid.byte_length == 0,
+                        .find(|display| display.display_id == expected.display_id)
+                        .is_some_and(|display| {
+                            display.flags.connected
+                                && display.flags.active
+                                && display.edid.sha256.as_deref()
+                                    == Some(expected.edid_sha256.as_str())
+                                && display.edid.preferred_width == Some(expected.width)
+                                && display.edid.preferred_height == Some(expected.height)
                         })
                 });
-                if connected == prepared.target_count
-                    && active == prepared.target_count
-                    && all_changes_match
-                {
+                let removals_match = prepared
+                    .changes
+                    .iter()
+                    .filter(|change| change.desired_edid.is_none())
+                    .all(|change| {
+                        gpu.displays
+                            .iter()
+                            .find(|display| display.display_id == change.recovery.display_id)
+                            .is_some_and(|display| {
+                                !display.flags.active && display.edid.byte_length == 0
+                            })
+                    });
+                let connected_ids = gpu
+                    .displays
+                    .iter()
+                    .filter(|display| display.flags.connected)
+                    .map(|display| format!("0x{:08x}", display.display_id))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let pending_removals = prepared
+                    .changes
+                    .iter()
+                    .filter(|change| change.desired_edid.is_none())
+                    .filter_map(|change| {
+                        gpu.displays
+                            .iter()
+                            .find(|display| display.display_id == change.recovery.display_id)
+                            .filter(|display| {
+                                display.flags.connected || display.edid.byte_length != 0
+                            })
+                            .map(|display| {
+                                format!(
+                                    "0x{:08x}(connected={},active={},bytes={})",
+                                    display.display_id,
+                                    display.flags.connected,
+                                    display.flags.active,
+                                    display.edid.byte_length
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if active == prepared.target_count && expected_match && removals_match {
+                    if connected != prepared.target_count {
+                        tracing::debug!(
+                            target: crate::logging::DISPLAY,
+                            driver_connected = connected,
+                            active,
+                            requested = prepared.target_count,
+                            "NVIDIA retains connector presence on removed heads; inactive zero-EDID heads are not part of the session display set"
+                        );
+                    }
                     return Ok(());
                 }
                 format!(
-                    "connected={connected}, active={active}, target={}, changes_match={all_changes_match}",
+                    "connected={connected}, active={active}, target={}, expected_match={expected_match}, removals_match={removals_match}, connected_ids=[{connected_ids}], pending_removals=[{pending_removals}]",
                     prepared.target_count,
                 )
             }
@@ -1000,7 +1412,7 @@ pub(crate) fn probe(
         adapter_luid,
         output_id,
     )?;
-    let edid = crate::edid::generate(crate::edid::EdidRequest {
+    let edid_request = crate::edid::EdidRequest {
         width: request.width,
         height: request.height,
         refresh_hz: request.refresh_hz,
@@ -1009,8 +1421,15 @@ pub(crate) fn probe(
         scale: 1.0,
         product_id: (request.display_id & 0xffff) as u16,
         serial: request.display_id,
-    })?;
-    let intended_edid_sha256 = format!("{:x}", Sha256::digest(edid));
+    };
+    // A 256-byte EDID is exactly MAX_EDID_BYTES, so the HDR10 variant is the
+    // largest this path can carry and still journal a recovery entry.
+    let edid: Vec<u8> = if request.hdr10 {
+        crate::edid::generate_hdr10(edid_request)?.to_vec()
+    } else {
+        crate::edid::generate(edid_request)?.to_vec()
+    };
+    let intended_edid_sha256 = format!("{:x}", Sha256::digest(&edid));
 
     let mut driver = crate::nvapi::Nvapi::load()?;
     let mapping = driver.map_headless_display_id(request.display_id, adapter_luid)?;
@@ -1377,7 +1796,7 @@ mod tests {
             1,
         );
         let gpu = matching_gpu(&report, "NVIDIA GRID RTX6000-8Q").expect("GPU");
-        let (keep, remove) = desired_display_ids(&report, gpu, 3).expect("plan");
+        let (keep, remove) = desired_display_ids(&report, gpu, 3, None).expect("plan");
         assert_eq!(keep, vec![1, 2, 3]);
         assert!(remove.is_empty());
     }
@@ -1394,9 +1813,92 @@ mod tests {
             1,
         );
         let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
-        let (keep, remove) = desired_display_ids(&report, gpu, 2).expect("plan");
+        let (keep, remove) = desired_display_ids(&report, gpu, 2, None).expect("plan");
         assert_eq!(keep, vec![1, 2]);
         assert_eq!(remove, vec![3, 4]);
+    }
+
+    #[test]
+    fn provisioning_clears_inactive_stale_arcen_edids_too() {
+        let mut stale = display(3, 0x200, false);
+        stale.edid.status = 0;
+        stale.edid.byte_length = 128;
+        stale.edid.manufacturer = Some("ARN".to_string());
+        stale.edid.written_by_arcen = true;
+        let report = inventory(
+            gpu(vec![
+                display(1, 0x800, true),
+                display(2, 0x400, false),
+                stale,
+                display(4, 0x100, false),
+            ]),
+            1,
+        );
+        let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
+        let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
+        assert_eq!(keep, vec![1]);
+        assert_eq!(remove, vec![3]);
+    }
+
+    #[test]
+    fn zero_edid_connector_is_not_a_mandatory_monitor() {
+        let mut sticky = display(3, 0x200, true);
+        sticky.edid.status = -121;
+        sticky.edid.byte_length = 0;
+        sticky.edid.manufacturer = None;
+        sticky.edid.written_by_arcen = false;
+        let report = inventory(
+            gpu(vec![
+                display(1, 0x800, true),
+                display(2, 0x400, false),
+                sticky,
+                display(4, 0x100, false),
+            ]),
+            1,
+        );
+        let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
+        let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
+        assert_eq!(keep, vec![1]);
+        assert_eq!(remove, vec![3]);
+    }
+
+    #[test]
+    fn configured_display_id_wins_over_inventory_order() {
+        let report = inventory(
+            gpu(vec![
+                display(1, 0x800, true),
+                display(2, 0x400, true),
+                display(3, 0x200, true),
+                display(4, 0x100, false),
+            ]),
+            1,
+        );
+        let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
+        let (keep, remove) = desired_display_ids(&report, gpu, 1, Some(2)).expect("plan");
+        assert_eq!(keep, vec![2]);
+        assert_eq!(remove, vec![1, 3]);
+    }
+
+    #[test]
+    fn zero_edid_gdi_primary_does_not_outrank_a_real_arcen_display() {
+        let mut sticky = display(3, 0x200, true);
+        sticky.edid.status = -121;
+        sticky.edid.byte_length = 0;
+        sticky.edid.manufacturer = None;
+        sticky.edid.written_by_arcen = false;
+        let report = inventory(
+            gpu(vec![
+                display(1, 0x800, true),
+                display(2, 0x400, false),
+                sticky,
+                display(4, 0x100, false),
+            ]),
+            3,
+        );
+        let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
+        let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
+        assert_eq!(keep, vec![1]);
+        assert_eq!(remove, vec![3]);
     }
 
     fn recovery(
@@ -1455,5 +1957,103 @@ mod tests {
         // A rolled-back id whose output identity moved is a hard error, not a
         // "keep waiting" result: the binding the journal recorded is gone.
         assert!(restored_entry_matches(&settled, &recovery(3, 0x100, None)).is_err());
+    }
+
+    fn arcen_display(id: u32, in_config: bool) -> ArcenEdidDisplay {
+        ArcenEdidDisplay {
+            adapter: "NVIDIA GRID V100D-16Q".to_string(),
+            display_id: id,
+            output_id: id,
+            in_display_config: in_config,
+            product_code: Some(0x6100),
+        }
+    }
+
+    fn clear_all() -> ClearRequest {
+        ClearRequest {
+            display_id: None,
+            dry_run: true,
+        }
+    }
+
+    /// ADR 0009's non-headless invariant, as a postcondition on planning: a
+    /// Windows host with no active display cannot present LogonUI, so the
+    /// credential provider has nothing to draw on and the machine is
+    /// unreachable without a hypervisor console.
+    #[test]
+    fn clearing_everything_still_keeps_one_display() {
+        let displays = vec![
+            arcen_display(1, false),
+            arcen_display(2, true),
+            arcen_display(3, false),
+        ];
+        let (cleared, kept) = plan_clear(&displays, clear_all());
+        assert_eq!(kept.len(), 1, "a host must never land on zero displays");
+        assert_eq!(cleared.len(), 2);
+    }
+
+    /// The survivor must be one Windows is actually using, or clearing trades a
+    /// live desktop for a spare and the console goes dark anyway.
+    #[test]
+    fn the_kept_display_is_the_one_in_the_display_config() {
+        let displays = vec![
+            arcen_display(1, false),
+            arcen_display(2, true),
+            arcen_display(3, false),
+        ];
+        let (_, kept) = plan_clear(&displays, clear_all());
+        assert_eq!(kept[0].display_id, 2);
+        assert!(kept[0].in_display_config);
+    }
+
+    #[test]
+    fn a_single_display_is_never_cleared() {
+        let (cleared, kept) = plan_clear(&[arcen_display(7, true)], clear_all());
+        assert!(cleared.is_empty(), "the last display must survive");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn naming_a_display_clears_only_that_one() {
+        let displays = vec![
+            arcen_display(1, true),
+            arcen_display(2, false),
+            arcen_display(3, false),
+        ];
+        let (cleared, kept) = plan_clear(
+            &displays,
+            ClearRequest {
+                display_id: Some(3),
+                dry_run: true,
+            },
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].display_id, 3);
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// Naming the only in-config display must still refuse: the invariant is
+    /// not something an explicit id can opt out of.
+    #[test]
+    fn naming_the_last_display_does_not_override_the_invariant() {
+        let displays = vec![arcen_display(1, true), arcen_display(2, false)];
+        let (cleared, _) = plan_clear(
+            &displays,
+            ClearRequest {
+                display_id: Some(1),
+                dry_run: true,
+            },
+        );
+        assert!(
+            cleared.is_empty(),
+            "the surviving display must not be clearable by naming it"
+        );
+    }
+
+    #[test]
+    fn no_arcen_displays_is_not_an_error_and_clears_nothing() {
+        let (cleared, kept) = plan_clear(&[], clear_all());
+        assert!(cleared.is_empty());
+        assert!(kept.is_empty());
     }
 }

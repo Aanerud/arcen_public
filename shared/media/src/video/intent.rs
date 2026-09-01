@@ -168,14 +168,30 @@ fn resolve_video(
             "initial video request selects BT.2020 NCL matrix without client support",
         ));
     }
+    // Read from the request rather than pinned to BT.709. These two axes are
+    // how a Deck asks for HDR, and discarding them here meant a PQ/BT.2020
+    // request arrived at the host as BT.709 -- the ask never survived its own
+    // parser, so no amount of host work downstream could have honoured it.
+    //
+    // An unknown token is an error rather than a silent BT.709: a client
+    // naming a transfer this build does not know must not be told it was
+    // served, which is the same rule the other colour axes already follow.
+    let primaries = ColorPrimaries::from_token(&quality.color_primaries).ok_or_else(|| {
+        invalid(format!(
+            "unsupported colour primaries {:?}",
+            quality.color_primaries
+        ))
+    })?;
+    let transfer = TransferCharacteristics::from_token(&quality.transfer)
+        .ok_or_else(|| invalid(format!("unsupported transfer {:?}", quality.transfer)))?;
     Ok(VideoConfiguration {
         codec: resolve_codec(quality, capabilities)?,
         chroma,
         bit_depth,
         range,
         matrix,
-        primaries: ColorPrimaries::Bt709,
-        transfer: TransferCharacteristics::Bt709,
+        primaries,
+        transfer,
     })
 }
 

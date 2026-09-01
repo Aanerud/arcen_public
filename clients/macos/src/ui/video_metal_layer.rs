@@ -103,14 +103,20 @@
 //!   used as a compute/blit source, which is the case `framebufferOnly`
 //!   exists to optimise (Apple's own documented guidance: set it whenever
 //!   the drawable's texture is only ever a render-pass attachment).
-//! - `wantsExtendedDynamicRangeContent = false`: **deliberately never
-//!   touched to `true` anywhere in this module.** This is SDR 10-bit
-//!   *reference* viewing -- absorbing RGB<->YCbCr rounding error, not
-//!   displaying a wider dynamic range -- exactly the distinction
-//!   `video_render.rs`'s own "EDR/HDR seam (deliberately not implemented
-//!   here -- see `w4-edr`)" section draws for its own, narrower colour-space
-//!   change. A future `w4-edr` task should extend this layer the same way
-//!   that section says to extend [`super::video_render::ReferenceColorSpace`].
+//! - `wantsExtendedDynamicRangeContent`, and `EDRMetadata`, driven by the
+//!   **negotiated transfer function** and nothing else. `Pq` turns EDR on,
+//!   tags the layer `kCGColorSpaceITUR_2100_PQ`, and attaches
+//!   `CAEDRMetadata.HDR10MetadataWithMinLuminance:maxLuminance:opticalOutputScale:`;
+//!   every other transfer leaves EDR off and the layer on an SDR working
+//!   space. This is SDR 10-bit *reference* viewing by default -- absorbing
+//!   RGB<->YCbCr rounding error, not displaying a wider dynamic range --
+//!   and only becomes HDR when the host says the stream genuinely is.
+//!   Deliberately **not** keyed on bit depth: `Grading Reference` is
+//!   4:4:4 ten-bit BT.709 and entirely SDR, so a depth-keyed rule would
+//!   light EDR up for a colour-critical SDR session and have macOS
+//!   tone-map it against a 1000-nit curve. See
+//!   [`super::video_render::presentation_colorspace_for`], whose own tests
+//!   pin exactly that distinction.
 //! - `colorspace`, from the negotiated [`arcen_media::ColorPrimaries`] via
 //!   [`super::video_render::reference_colorspace_for`] (reused directly, not
 //!   reimplemented, so the two independent presentation paths this crate now
@@ -162,13 +168,10 @@
 //! the same plane. A `read()` from an `Unorm` texture is therefore a
 //! **normalised float**, and undoing that normalisation back to the coded
 //! ITU value is not simply "multiply by the max code" once depth exceeds
-//! eight bits, because CoreVideo's `x`-prefixed 10/12-bit formats MSB-align
+//! eight bits, because CoreVideo's ten/twelve-bit biplanar formats MSB-align
 //! the code inside a 16-bit container while Metal's `Unorm` read always
 //! normalises by the *full* 16-bit range. [`plane_pixel_formats`] derives
-//! the exact factor that undoes this per depth (`code_unnormalize_scale`),
-//! and [`tests`] pins it with both hand-computed literal values and a
-//! round-trip sweep. See `video_metal_layer.metal`'s own module doc for the
-//! full worked derivation and exactly where this feeds into the shader.
+//! and unit-tests the exact scale used to reverse that representation.
 //!
 //! # Cargo dependencies added
 //!
@@ -295,7 +298,9 @@ use core::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{kCGColorSpaceDisplayP3, kCGColorSpaceSRGB, CGColorSpace};
+use objc2_core_graphics::{
+    kCGColorSpaceDisplayP3, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB, CGColorSpace,
+};
 use objc2_foundation::{MainThreadMarker, NSString};
 use objc2_metal::{
     MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -304,11 +309,25 @@ use objc2_metal::{
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLStoreAction,
     MTLTexture,
 };
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{CAEDRMetadata, CAMetalDrawable, CAMetalLayer};
 
 use super::video_render::{
-    reference_colorspace_for, ReferenceColorSpace, VideoColorContract, VideoUniform,
+    presentation_colorspace_for, PresentationColorSpace, ReferenceColorSpace, VideoColorContract,
+    VideoUniform,
 };
+
+/// The mastering luminance HDR10 is signalled against when the stream
+/// carries no ST 2086 mastering-display metadata of its own -- which
+/// Arcen's never does: a desktop is synthetic content with no colourist and
+/// no mastering monitor behind it. These are the reference HDR10 grade, and
+/// also what Windows composites its own `AdvancedColor` desktop against, so
+/// a desktop captured in scRGB and encoded to PQ is already effectively
+/// graded to them.
+const HDR10_MIN_LUMINANCE_NITS: f32 = 0.005;
+const HDR10_MAX_LUMINANCE_NITS: f32 = 1000.0;
+/// Apple requires normalized PQ pixel formats to use the ST 2084 reference
+/// peak as their optical-output scale: normalized code `1.0` means 10,000 nits.
+const HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE: f32 = 10_000.0;
 
 // ============================================================================
 // The seam: a real decoded frame, negotiated contract attached
@@ -363,12 +382,7 @@ pub(crate) fn plane_pixel_formats(depth: arcen_media::BitDepth) -> PlanePixelFor
             chroma_format: MTLPixelFormat::RG8Unorm,
             code_unnormalize_scale: 255.0,
         },
-        // CoreVideo's `x`-prefixed ten-bit formats ('xf44' -- the target
-        // format this whole task exists for -- and friends) MSB-align a
-        // ten-bit code inside a 16-bit container (`raw16 = code << 6`);
-        // Metal's `Unorm` read normalises by the *full* 16-bit range
-        // (65535, not the depth's own max code, 1023), so `65535.0 / 64.0`
-        // is the exact factor that undoes it.
+        // Ten-bit biplanar samples are MSB-aligned: `raw16 = code << 6`.
         arcen_media::BitDepth::Ten => PlanePixelFormatPlan {
             luma_format: MTLPixelFormat::R16Unorm,
             chroma_format: MTLPixelFormat::RG16Unorm,
@@ -591,7 +605,9 @@ pub struct DedicatedVideoLayer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     texture_cache: apple_cf::cv::CVMetalTextureCache,
-    last_colorspace: Option<ReferenceColorSpace>,
+    last_colorspace: Option<PresentationColorSpace>,
+    /// One-shot guard for [`Self::log_plane_statistics`].
+    logged_plane_statistics: bool,
 }
 
 impl DedicatedVideoLayer {
@@ -647,6 +663,7 @@ impl DedicatedVideoLayer {
             pipeline_state,
             texture_cache,
             last_colorspace: None,
+            logged_plane_statistics: false,
         })
     }
 
@@ -689,40 +706,86 @@ impl DedicatedVideoLayer {
         self.layer.setFrame(rect);
     }
 
-    /// Applies the presentation colour space if `primaries` maps to a
-    /// different [`ReferenceColorSpace`] than the one last applied. Unlike
+    /// Applies the presentation colour space, EDR flag and HDR metadata if
+    /// the negotiated primaries/transfer map to a different
+    /// [`PresentationColorSpace`] than the one last applied. Unlike
     /// `video_render::ColorspaceApplication` (which retries every frame
     /// until an implicitly-created layer is even found), this layer is
     /// directly owned from the moment [`Self::attach`] succeeds, so there
     /// is no "not found yet" failure mode to retry against -- only "did the
     /// desired choice change".
-    fn ensure_colorspace(&mut self, primaries: arcen_media::ColorPrimaries) {
-        let desired = reference_colorspace_for(Some(primaries));
+    ///
+    /// Returns the applied space when it changed this call, so the caller
+    /// can log the switch exactly once per change rather than per frame.
+    fn ensure_colorspace(
+        &mut self,
+        primaries: arcen_media::ColorPrimaries,
+        transfer: arcen_media::TransferCharacteristics,
+    ) -> Option<PresentationColorSpace> {
+        let desired = presentation_colorspace_for(primaries, transfer);
         if self.last_colorspace == Some(desired) {
-            return;
+            return None;
         }
-        // SAFETY (not actually unsafe, just worth noting): `kCGColorSpaceSRGB`/
-        // `kCGColorSpaceDisplayP3` are `extern "C"` statics, hence the
-        // `unsafe` block reading them -- reading a well-known, always-valid
-        // system framework constant, not a soundness-sensitive operation.
+        // SAFETY (not actually unsafe, just worth noting): these are all
+        // `extern "C"` statics, hence the `unsafe` blocks reading them --
+        // reading a well-known, always-valid system framework constant, not
+        // a soundness-sensitive operation.
         let colorspace = match desired {
-            ReferenceColorSpace::Srgb => {
+            PresentationColorSpace::Sdr(ReferenceColorSpace::Srgb) => {
                 CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
             }
-            ReferenceColorSpace::DisplayP3 => {
+            PresentationColorSpace::Sdr(ReferenceColorSpace::DisplayP3) => {
                 CGColorSpace::with_name(Some(unsafe { kCGColorSpaceDisplayP3 }))
+            }
+            PresentationColorSpace::Hdr10Pq => {
+                CGColorSpace::with_name(Some(unsafe { kCGColorSpaceITUR_2100_PQ }))
             }
         };
         let Some(colorspace) = colorspace else {
-            // Never expected for these two built-in system spaces, but
+            // Never expected for these built-in system spaces, but
             // `CGColorSpaceCreateWithName` gives no infallible constructor.
             // Deliberately does *not* update `last_colorspace`, so the next
             // frame retries rather than silently keeping a stale colour
             // space forever.
-            return;
+            return None;
         };
         self.layer.setColorspace(Some(&colorspace));
+
+        // Order matters on the way *in* as well as the way out: EDR is only
+        // meaningful once the layer is already tagged with an HDR transfer,
+        // and must be withdrawn before the layer is retagged back to SDR,
+        // or there is a window of frames claiming extended range against an
+        // sRGB curve.
+        match desired {
+            PresentationColorSpace::Hdr10Pq => {
+                self.layer.setWantsExtendedDynamicRangeContent(true);
+                // The mastering luminance HDR10 assumes when the stream
+                // carries no mastering-display metadata of its own -- which
+                // Arcen's does not, because a desktop is synthetic content
+                // with no colourist and no mastering monitor behind it.
+                // 0.005 - 1000 nits is the ST 2086 reference HDR10 grade
+                // and what Windows itself targets for `AdvancedColor`
+                // desktop composition, so a desktop captured in scRGB and
+                // encoded to PQ is already effectively graded to it.
+                // RGB10A2Unorm carries normalized PQ signal codes. Apple's
+                // CAEDRMetadata contract therefore requires 10,000 nits as
+                // the optical-output scale for code 1.0.
+                let metadata =
+                    CAEDRMetadata::HDR10MetadataWithMinLuminance_maxLuminance_opticalOutputScale(
+                        HDR10_MIN_LUMINANCE_NITS,
+                        HDR10_MAX_LUMINANCE_NITS,
+                        HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE,
+                    );
+                self.layer.setEDRMetadata(Some(&metadata));
+            }
+            PresentationColorSpace::Sdr(_) => {
+                self.layer.setEDRMetadata(None);
+                self.layer.setWantsExtendedDynamicRangeContent(false);
+            }
+        }
+
         self.last_colorspace = Some(desired);
+        Some(desired)
     }
 
     /// Wraps one plane of `pixel_buffer` as an `MTLTexture` via
@@ -803,8 +866,144 @@ impl DedicatedVideoLayer {
     /// Renders `frame` into this layer's next drawable and presents it.
     /// See the module doc's "Rendering a frame" section for the full
     /// sequence this follows.
+    /// Report what the decoded planes actually contain, once per layer.
+    ///
+    /// Logs the raw visible sample range once so a new decoder/format can be
+    /// checked against [`plane_pixel_formats`]. A ten-bit neutral chroma
+    /// sample is expected near `512 << 6 = 32768`.
+    fn log_plane_statistics(&mut self, frame: &DedicatedLayerFrame) {
+        if self.logged_plane_statistics {
+            return;
+        }
+        self.logged_plane_statistics = true;
+        let buffer = &frame.pixel_buffer;
+        let plan = plane_pixel_formats(frame.contract.depth);
+        let pixel_format =
+            String::from_utf8_lossy(&buffer.pixel_format().to_be_bytes()).into_owned();
+        let Ok(guard) = buffer.lock(apple_cf::cv::CVPixelBufferLockFlags::READ_ONLY) else {
+            return;
+        };
+        // Sample the vertical centre, not the first rows: the top of a
+        // desktop capture is usually a title bar, and a uniform dark strip
+        // says nothing about whether chroma varies across the picture.
+        let bytes_per_component = if frame.contract.depth == arcen_media::BitDepth::Eight {
+            1
+        } else {
+            2
+        };
+        let storage_shift = 16u32.saturating_sub(u32::from(frame.contract.depth.bits()));
+        let summarise = |data: &[u8],
+                         stride: usize,
+                         width: usize,
+                         height: usize,
+                         label: &str,
+                         interleaved: bool| {
+            let row = height / 2;
+            let start = row * stride;
+            let components = if interleaved { 2 } else { 1 };
+            let visible_bytes = width
+                .saturating_mul(components)
+                .saturating_mul(bytes_per_component);
+            let Some(row_bytes) = data.get(start..start.saturating_add(visible_bytes)) else {
+                return;
+            };
+            let samples: Vec<u16> = if bytes_per_component == 1 {
+                row_bytes.iter().map(|value| u16::from(*value)).collect()
+            } else {
+                row_bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect()
+            };
+            if samples.is_empty() {
+                return;
+            }
+            let stat = |values: &[u16], slot: &str| {
+                let min = values.iter().copied().min().unwrap_or(0);
+                let max = values.iter().copied().max().unwrap_or(0);
+                let mean = values.iter().map(|v| u32::from(*v)).sum::<u32>() / values.len() as u32;
+                let code_mean =
+                    (mean as f32 / 65535.0 * plan.code_unnormalize_scale).round() as u32;
+                let low_bits_nonzero = if storage_shift == 0 {
+                    0
+                } else {
+                    let mask = (1u16 << storage_shift) - 1;
+                    values.iter().filter(|value| **value & mask != 0).count()
+                };
+                tracing::info!(
+                    target: crate::logging::target::VIDEO,
+                    plane = label,
+                    slot,
+                    pixel_format,
+                    width,
+                    height,
+                    stride,
+                    min,
+                    max,
+                    mean,
+                    code_mean,
+                    low_bits_nonzero,
+                    "decoded plane sample statistics",
+                );
+            };
+            if interleaved {
+                let cb: Vec<u16> = samples.iter().copied().step_by(2).collect();
+                let cr: Vec<u16> = samples.iter().copied().skip(1).step_by(2).collect();
+                stat(&cb, "cb");
+                stat(&cr, "cr");
+            } else {
+                stat(&samples, "y");
+            }
+        };
+        if let Some(data) = guard.plane_data(0) {
+            summarise(
+                data,
+                guard.bytes_per_row_of_plane(0),
+                guard.width_of_plane(0),
+                guard.height_of_plane(0),
+                "luma",
+                false,
+            );
+        }
+        if let Some(data) = guard.plane_data(1) {
+            summarise(
+                data,
+                guard.bytes_per_row_of_plane(1),
+                guard.width_of_plane(1),
+                guard.height_of_plane(1),
+                "chroma",
+                true,
+            );
+        }
+    }
+
     pub fn render(&mut self, frame: &DedicatedLayerFrame) -> Result<(), DedicatedLayerOutcome> {
-        self.ensure_colorspace(frame.contract.primaries);
+        self.log_plane_statistics(frame);
+        if let Some(applied) =
+            self.ensure_colorspace(frame.contract.primaries, frame.contract.transfer)
+        {
+            // The fifth and last link in the HDR chain: the Deck saying,
+            // in its own log, what it switched its presentation surface to
+            // on receiving this stream. Logged on change only -- this is a
+            // per-frame path -- and it names the transfer it switched
+            // *because of*, so a reader can line it up against the host's
+            // own "streaming HDR" line and see the two agree.
+            let (mode, colorspace) = match applied {
+                PresentationColorSpace::Hdr10Pq => ("hdr10", "ITUR_2100_PQ"),
+                PresentationColorSpace::Sdr(ReferenceColorSpace::DisplayP3) => ("sdr", "DisplayP3"),
+                PresentationColorSpace::Sdr(ReferenceColorSpace::Srgb) => ("sdr", "sRGB"),
+            };
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                mode,
+                colorspace,
+                transfer = frame.contract.transfer.token(),
+                primaries = frame.contract.primaries.token(),
+                bit_depth = frame.contract.depth.bits(),
+                edr = matches!(applied, PresentationColorSpace::Hdr10Pq),
+                "deck switched video presentation mode",
+            );
+        }
 
         let plan = plane_pixel_formats(frame.contract.depth);
         let pixel_buffer = &frame.pixel_buffer;
@@ -1103,6 +1302,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalized_hdr10_pixels_use_the_pq_reference_peak_as_optical_scale() {
+        assert_eq!(HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE, 10_000.0);
+    }
+
     // ---- plane_pixel_formats: pixel-format constant selection ------------
 
     #[test]
@@ -1131,23 +1335,14 @@ mod tests {
 
     #[test]
     fn code_unnormalize_scale_round_trips_every_representative_code_within_half_a_code() {
-        // Simulates the real path end to end in plain arithmetic: pack a
-        // code MSB-aligned into a 16-bit container exactly like CoreVideo's
-        // `x`-prefixed formats do, normalise it exactly like a Metal
-        // `Unorm` texture read would, then reconstruct it with
-        // `code_unnormalize_scale` and confirm it lands back within half a
-        // code of the original -- i.e. this reconstruction is not merely
-        // algebraically derived but demonstrably correct to the precision
-        // that matters (rounding to the nearest integer code recovers it
-        // exactly).
-        for (depth, msb_shift) in [
+        for (depth, storage_shift) in [
             (arcen_media::BitDepth::Ten, 6u32),
             (arcen_media::BitDepth::Twelve, 4u32),
         ] {
             let plan = plane_pixel_formats(depth);
             let max_code = (1u32 << depth.bits()) - 1;
             for code in [0u32, 1, max_code / 2, max_code - 1, max_code] {
-                let raw16 = code << msb_shift;
+                let raw16 = code << storage_shift;
                 let normalized = f32::from(u16::try_from(raw16).unwrap()) / 65535.0;
                 let reconstructed = normalized * plan.code_unnormalize_scale;
                 assert!(
@@ -1177,6 +1372,7 @@ mod tests {
             depth: arcen_media::BitDepth::Ten,
             matrix: arcen_media::ColorMatrix::Bt709,
             primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 

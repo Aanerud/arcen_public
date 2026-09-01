@@ -24,9 +24,11 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_STAGING,
 };
 #[cfg(feature = "nvenc")]
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO,
 };
@@ -592,6 +594,30 @@ enum Source {
 
 #[cfg(feature = "nvenc")]
 impl Source {
+    /// Which capture path this source is, for the READY line.
+    ///
+    /// Derived from the variant that actually won the probe rather than from
+    /// what was configured: the DDA -> WGC fallback is silent, and on a
+    /// headless vGPU WGC is what really runs.
+    /// Whether this source delivers FP16 scRGB samples.
+    ///
+    /// DDA has no wide path here -- `DuplicateOutput1` returns BGRA8 whatever
+    /// format list it is given -- so only a WGC pool that was actually granted
+    /// FP16 answers true.
+    fn is_wide(&self) -> bool {
+        match self {
+            Source::Dda { .. } => false,
+            Source::Wgc(w) => w.is_wide(),
+        }
+    }
+
+    fn capture_backend(&self) -> arcen_media::video::CaptureBackend {
+        match self {
+            Source::Dda { .. } => arcen_media::video::CaptureBackend::DesktopDuplication,
+            Source::Wgc(_) => arcen_media::video::CaptureBackend::WindowsGraphicsCapture,
+        }
+    }
+
     fn device(&self) -> &ID3D11Device {
         match self {
             Source::Dda { capture, .. } => capture.device(),
@@ -660,19 +686,52 @@ unsafe fn retain_texture(
 /// cursor-only metadata, but no desktop presents. Cursor-only frames do not
 /// prove that usable pixels flow, so only a real image accepts the DDA path.
 #[cfg(feature = "nvenc")]
+const fn wide_capture_required(bit_depth: arcen_media::BitDepth) -> bool {
+    !matches!(bit_depth, arcen_media::BitDepth::Eight)
+}
+
+#[cfg(feature = "nvenc")]
+const fn hdr_output_required(transfer: arcen_media::TransferCharacteristics) -> bool {
+    matches!(transfer, arcen_media::TransferCharacteristics::Pq)
+}
+
+#[cfg(feature = "nvenc")]
+fn wgc_requirement(
+    force_wgc: bool,
+    cursor_mode: crate::CursorCaptureMode,
+    wide_capture: bool,
+) -> Option<&'static str> {
+    if wide_capture {
+        Some("capture backend: WGC (required by FP16 wide capture)")
+    } else if cursor_mode.requires_wgc() {
+        Some("capture backend: WGC (required by host cursor mode)")
+    } else if force_wgc {
+        Some("capture backend: WGC (forced via 'wgc' arg)")
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "nvenc")]
+/// `wide_capture` asks the WGC path for an FP16 scRGB pool. Without it the
+/// desktop arrives as 8-bit BGRA no matter what bit depth the stream is
+/// signalled as. `hdr_required` is stricter: it additionally proves that the
+/// selected output is actually compositing PQ/BT.2020 before capture starts.
 unsafe fn select_source(
     selector: &OutputSelector<'_>,
     force_wgc: bool,
     force_dda: bool,
     cursor_mode: crate::CursorCaptureMode,
+    wide_capture: bool,
+    hdr_required: bool,
 ) -> Source {
-    if force_wgc || cursor_mode.requires_wgc() {
-        log(if cursor_mode.requires_wgc() {
-            "capture backend: WGC (required by host cursor mode)"
-        } else {
-            "capture backend: WGC (forced via 'wgc' arg)"
-        });
-        return build_wgc(selector, cursor_mode);
+    if force_dda && wide_capture {
+        log("ERROR: Desktop Duplication cannot serve an FP16 wide capture");
+        std::process::exit(2);
+    }
+    if let Some(reason) = wgc_requirement(force_wgc, cursor_mode, wide_capture) {
+        log(reason);
+        return build_wgc(selector, cursor_mode, wide_capture, hdr_required);
     }
     match Capture::new(selector) {
         Ok(mut cap) => {
@@ -722,11 +781,11 @@ unsafe fn select_source(
                 dbg.1, dbg.2
             ));
             drop(cap);
-            build_wgc(selector, cursor_mode)
+            build_wgc(selector, cursor_mode, wide_capture, hdr_required)
         }
         Err(e) => {
             log(&format!("DXGI init failed ({e:?}) — falling back to WGC"));
-            build_wgc(selector, cursor_mode)
+            build_wgc(selector, cursor_mode, wide_capture, hdr_required)
         }
     }
 }
@@ -735,6 +794,8 @@ unsafe fn select_source(
 unsafe fn build_wgc(
     selector: &OutputSelector<'_>,
     cursor_mode: crate::CursorCaptureMode,
+    wide_capture: bool,
+    hdr_required: bool,
 ) -> Source {
     let found = match Capture::find_output_device(selector) {
         Ok(found) => found,
@@ -749,11 +810,45 @@ unsafe fn build_wgc(
         found.adapter_index,
         found.adapter_name
     ));
+    let output_colour = match found.output1.cast::<IDXGIOutput6>() {
+        Ok(output) => match output.GetDesc1() {
+            Ok(desc) => {
+                log(&format!(
+                    "WGC output colour: bits_per_color={} color_space={:?} min_luminance={} \
+                     max_luminance={} max_full_frame_luminance={}",
+                    desc.BitsPerColor,
+                    desc.ColorSpace,
+                    desc.MinLuminance,
+                    desc.MaxLuminance,
+                    desc.MaxFullFrameLuminance
+                ));
+                Some(desc.ColorSpace)
+            }
+            Err(error) => {
+                log(&format!("WGC output colour query failed: {error:?}"));
+                None
+            }
+        },
+        Err(error) => {
+            log(&format!(
+                "WGC output has no IDXGIOutput6 colour state: {error:?}"
+            ));
+            None
+        }
+    };
+    if hdr_required && output_colour != Some(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+        log(&format!(
+            "ERROR: HDR capture requires DXGI RGB_FULL_G2084_NONE_P2020 output, got \
+             {output_colour:?}"
+        ));
+        std::process::exit(2);
+    }
     match crate::wgc::WgcCapture::from_device(
         found.device,
         found.context,
         found.monitor,
         cursor_mode,
+        wide_capture,
     ) {
         Ok(w) => Source::Wgc(w),
         Err(e) => {
@@ -791,6 +886,9 @@ unsafe fn create_nvenc_encoder(
         color,
         intent,
         qp_map_policy,
+        // From the pool that was actually created, so staging and conversion
+        // follow the concrete source format rather than the request.
+        cap.is_wide(),
     )
 }
 
@@ -805,15 +903,26 @@ unsafe fn run_encode(
     cursor_mode: crate::CursorCaptureMode,
 ) -> i32 {
     log(&format!(
-        "NVENC ready: {}x{} codec={} chroma={:?} depth={:?} range={:?} matrix={:?}",
+        "NVENC ready: {}x{} codec={} chroma={:?} depth={:?} range={:?} matrix={:?} \
+         primaries={:?} transfer={:?} capture_format={}",
         cap.width(),
         cap.height(),
         codec,
         color.chroma,
         color.bit_depth,
         color.range,
-        color.matrix
+        color.matrix,
+        color.primaries,
+        color.transfer,
+        if cap.is_wide() {
+            "R16G16B16A16Float"
+        } else {
+            "B8G8R8A8UIntNormalized"
+        }
     ));
+    // Captured before the loop borrows `cap` mutably; the variant cannot
+    // change once the source is built.
+    let announced_capture = cap.capture_backend();
     // The exact same `color` this run's `Encoder` was constructed with (see
     // `create_nvenc_encoder`'s caller) — never a separately re-derived
     // `ColorSpec::legacy(...)` — so the READY line this builds and the
@@ -1065,7 +1174,8 @@ unsafe fn run_encode(
                         if !ready_announced {
                             if au.is_empty()
                                 || au.len() > crate::MAX_ACCESS_UNIT_BYTES
-                                || crate::announce_ready(ready_plan).is_err()
+                                || crate::announce_ready_from(ready_plan, Some(announced_capture))
+                                    .is_err()
                             {
                                 log("could not emit READY after first in-memory NVENC access unit");
                                 return 5;
@@ -1371,6 +1481,7 @@ unsafe fn run_selftest(
         // whatever a session happened to request.
         arcen_media::EncodeIntent::default(),
         qp_map_policy,
+        false,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -1531,6 +1642,7 @@ unsafe fn run_admission_probe(
         // An admission probe asks whether the format initialises at all.
         arcen_media::EncodeIntent::default(),
         qp_map_policy,
+        false,
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -1909,6 +2021,7 @@ fn nvenc_attempt_for_row(
             // The matrix probes which colour formats encode, not how well.
             arcen_media::EncodeIntent::default(),
             crate::qp_map::QpMapPolicy::Off,
+            false,
         )
     } {
         Ok(encoder) => encoder,
@@ -2115,6 +2228,7 @@ fn write_roundtrip_bitstream_for_row(
             // The matrix probes which colour formats encode, not how well.
             arcen_media::EncodeIntent::default(),
             crate::qp_map::QpMapPolicy::Off,
+            false,
         )
     }
     .map_err(|error| format!("Encoder::new: {error}"))?;
@@ -2326,6 +2440,15 @@ pub fn run() -> ! {
 /// argument by one. The visible symptom is not an argument error but a codec
 /// read as the output index.
 pub fn run_with_args(args: Vec<String>) -> ! {
+    if args.iter().any(|a| a == "color-probe") {
+        // Research diagnostic: does this host deliver >8bpc from Desktop
+        // Duplication at all? See docs/internal/ten-bit-source-capture.md.
+        let enable_hdr = args.iter().any(|a| a == "--enable-hdr");
+        let disable_hdr = args.iter().any(|a| a == "--disable-hdr");
+        let wgc_only = args.iter().any(|a| a == "--wgc-only");
+        unsafe { crate::win_color_probe::run_with(enable_hdr, disable_hdr, wgc_only) };
+        std::process::exit(0);
+    }
     if args.iter().any(|a| a == "enumouts") {
         unsafe { enum_and_probe() };
         std::process::exit(0);
@@ -2618,7 +2741,30 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             if can_try_nvenc {
                 let force_wgc = args.iter().any(|a| a == "wgc");
                 let force_dda = args.iter().any(|a| a == "ddapi");
-                let source = unsafe { select_source(&selector, force_wgc, force_dda, cursor_mode) };
+                // Every stream above 8-bit needs an FP16 WGC source; otherwise
+                // an 8-bit BGRA desktop would merely be repacked into a deeper
+                // container. HDR additionally requires proof that DWM is
+                // compositing the selected output as PQ/BT.2020.
+                //
+                // An HDR *request* is not an HDR *desktop*. The EDID
+                // makes Windows offer HDR; only `advancedColorEnabled`
+                // makes DWM composite in FP16 scRGB. Enable it here, read
+                // it back, and if it did not engage, stop claiming PQ --
+                // a wide pool over an SDR desktop signalled as PQ tells the
+                // Deck to tone-map SDR against a 1000-nit curve, which is
+                // worse than never asking for HDR at all.
+                let wide_capture = wide_capture_required(color.bit_depth);
+                let hdr_required = hdr_output_required(color.transfer);
+                let source = unsafe {
+                    select_source(
+                        &selector,
+                        force_wgc,
+                        force_dda,
+                        cursor_mode,
+                        wide_capture,
+                        hdr_required,
+                    )
+                };
                 match unsafe { create_nvenc_encoder(&source, &codec, color, intent, qp_map_policy) }
                 {
                     Ok(mut encoder) => unsafe {
@@ -2807,6 +2953,8 @@ mod selector_tests {
     //! Pure-logic tests for `OutputSelector`/`resolve_selector`: no live DXGI
     //! adapter is needed since `OutputCandidate` is plain data, matching this
     //! crate's actual enumeration output field-for-field.
+    #[cfg(feature = "nvenc")]
+    use super::{hdr_output_required, wgc_requirement, wide_capture_required};
     use super::{resolve_selector, OutputCandidate, OutputSelector, SelectorResolution};
 
     fn candidate(
@@ -2830,6 +2978,34 @@ mod selector_tests {
             adapter_output_index: None,
             device_name: None,
         }
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn wide_capture_always_requires_wgc_even_with_a_local_cursor() {
+        assert_eq!(
+            wgc_requirement(false, crate::CursorCaptureMode::Local, true),
+            Some("capture backend: WGC (required by FP16 wide capture)")
+        );
+        assert!(wgc_requirement(false, crate::CursorCaptureMode::Local, false).is_none());
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn ten_bit_sdr_needs_wide_capture_but_not_hdr_output_state() {
+        assert!(wide_capture_required(arcen_media::BitDepth::Ten));
+        assert!(!hdr_output_required(
+            arcen_media::TransferCharacteristics::Bt709
+        ));
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn pq_needs_both_wide_capture_and_hdr_output_state() {
+        assert!(wide_capture_required(arcen_media::BitDepth::Ten));
+        assert!(hdr_output_required(
+            arcen_media::TransferCharacteristics::Pq
+        ));
     }
 
     #[test]

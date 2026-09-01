@@ -11,6 +11,23 @@ Validate on macOS with
 `cargo test --locked -p arcen-deck-macos`, plus the root shared-crate test and
 strict Clippy gates. There is no single-platform `--workspace` build.
 
+## Streaming and presentation boundaries
+
+- Production exposes exactly four complete presets: Auto, Speed, Grading, and
+  HDR. Do not reintroduce independent performance/colour switches as the normal
+  user surface; exact axes remain diagnostic/developer controls.
+- The ordinary 8-bit UI/video path and the dedicated 10-bit Metal video layer
+  are separate presentation pipelines. Do not force Auto/Speed through the
+  wide layer or make Grading/HDR depend on the 8-bit egui surface.
+- Transfer characteristics decide HDR. Ten-bit BT.709 Grading remains SDR;
+  only a host-confirmed PQ stream enables the ITU-R BT.2100 PQ colour space,
+  HDR metadata, and EDR.
+- Preserve native VideoToolbox colour metadata, including PQ/HLG transfer
+  constants. If native 10-bit presentation fails, retain the 8-bit fallback
+  only with a persistent visible warning.
+- Reconnect creates a fresh decoder/inbox and waits for a fresh keyframe.
+  Teardown must discard queued frames rather than let stale data delay resume.
+
 ## Signing and certificates
 
 - Cert inventory and dev-machine setup: `clients/macos/CERTIFICATES.md`

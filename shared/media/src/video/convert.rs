@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use arcen_keel::BgraFrame;
 
 use super::frame::{I420FrameMut, I444FrameMut, I444P16FrameMut, Nv12FrameMut};
-use crate::{BitDepth, ColorMatrix, ColorRange};
+use crate::{BitDepth, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics};
 
 /// Checked conversion failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,72 @@ impl Display for ConversionError {
 }
 
 impl Error for ConversionError {}
+
+/// Channel positions for one packed 32-bit RGB source with ten bits per
+/// colour component.
+///
+/// X11 depth 30 does not mandate one red/blue ordering. The live NVIDIA Xorg
+/// server used by Arcen exposes red in bits 0..=9 and blue in bits 20..=29,
+/// while `XRGB2101010` uses the opposite ordering. Callers must derive this
+/// layout from the visual masks instead of naming the format from memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRgb10Layout {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl PackedRgb10Layout {
+    /// Packed `XRGB2101010`: red high, blue low.
+    pub const XRGB2101010: Self = Self {
+        red: 20,
+        green: 10,
+        blue: 0,
+    };
+
+    /// Packed `XBGR2101010`: blue high, red low.
+    pub const XBGR2101010: Self = Self {
+        red: 0,
+        green: 10,
+        blue: 20,
+    };
+
+    /// Build a layout from three disjoint, contiguous ten-bit channel masks.
+    #[must_use]
+    pub fn from_masks(red: u32, green: u32, blue: u32) -> Option<Self> {
+        fn shift(mask: u32) -> Option<u8> {
+            if mask.count_ones() != 10 {
+                return None;
+            }
+            let shift = mask.trailing_zeros();
+            if 0x3ff_u32.checked_shl(shift)? != mask {
+                return None;
+            }
+            u8::try_from(shift).ok()
+        }
+
+        if red & green != 0 || red & blue != 0 || green & blue != 0 {
+            return None;
+        }
+        Some(Self {
+            red: shift(red)?,
+            green: shift(green)?,
+            blue: shift(blue)?,
+        })
+    }
+
+    /// Extract red, green, and blue from one packed word.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn components(self, word: u32) -> [u16; 3] {
+        let component = |shift| ((word >> shift) & 0x3ff) as u16;
+        [
+            component(self.red),
+            component(self.green),
+            component(self.blue),
+        ]
+    }
+}
 
 /// Fixed-point fractional bits used by the conversion coefficients.
 ///
@@ -101,6 +168,28 @@ impl ColorTransform {
     /// Build a transform for one coded format.
     #[must_use]
     pub fn new(matrix: ColorMatrix, range: ColorRange, depth: BitDepth) -> Self {
+        Self::for_input_max(matrix, range, depth, 255.0)
+    }
+
+    /// Build a transform whose source components span `0..=input_max`.
+    ///
+    /// [`Self::new`] folds `1/255` into every coefficient because its input is
+    /// 8-bit BGRA. A wide source — scRGB half-float promoted to 10-bit RGB
+    /// codes, or a depth-30 X visual — spans a different range, and feeding it
+    /// through the 8-bit coefficients is wrong by exactly the ratio of the two
+    /// maxima. Rather than a second copy of the matrix derivation, which is how
+    /// two conversions drift apart, the normalisation is a parameter and
+    /// `new` is defined in terms of it.
+    ///
+    /// `input_max_8bit_matches_new` asserts the two agree bit for bit at 255,
+    /// so the existing path is provably unchanged by this generalisation.
+    #[must_use]
+    pub fn for_input_max(
+        matrix: ColorMatrix,
+        range: ColorRange,
+        depth: BitDepth,
+        input_max: f64,
+    ) -> Self {
         let (kr, _, kb) = luma_weights(matrix);
         let shift = u32::from(depth.bits()) - 8;
         let max_code = i32::from(depth.max_code());
@@ -116,12 +205,13 @@ impl ColorTransform {
             ColorRange::Full => (max_code, 0, max_code, 1 << (u32::from(depth.bits()) - 1)),
         };
 
-        // Source components are 8-bit, so every coefficient folds in the 1/255
-        // normalisation as well as the matrix and the range scaling.
+        // Every coefficient folds in the source normalisation as well as the
+        // matrix and the range scaling, so the source span is the one thing
+        // that must be right here.
         #[allow(clippy::cast_precision_loss)]
-        let luma_unit = f64::from(luma_scale) / 255.0;
+        let luma_unit = f64::from(luma_scale) / input_max;
         #[allow(clippy::cast_precision_loss)]
-        let chroma_unit = f64::from(chroma_scale) / 255.0;
+        let chroma_unit = f64::from(chroma_scale) / input_max;
 
         // Round the outer two and derive the middle so the triple sums exactly
         // to the luma scale: white must reach the top code exactly.
@@ -250,6 +340,44 @@ impl ColorTransform {
             self.identity_offset
                 + ((self.identity_scale * component + (1 << (COEFF_SHIFT - 1))) >> COEFF_SHIFT),
         )
+    }
+
+    /// Coded luma for a wide source whose components span `0..=WIDE_INPUT_MAX`.
+    ///
+    /// Deliberately separate from [`Self::luma`] rather than a generic over the
+    /// component type: the two take different input scales, and a transform
+    /// built for one will silently produce wrong codes for the other. Two names
+    /// make that a compile-time distinction instead of a runtime surprise.
+    #[inline]
+    #[must_use]
+    pub fn luma_wide(self, b: u16, g: u16, r: u16) -> i32 {
+        let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+        if self.is_identity() {
+            return self.scale_identity(g);
+        }
+        self.apply(self.luma, self.luma_offset, b, g, r)
+    }
+
+    /// Coded Cb for a wide source. See [`Self::luma_wide`].
+    #[inline]
+    #[must_use]
+    pub fn cb_wide(self, b: u16, g: u16, r: u16) -> i32 {
+        let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+        if self.is_identity() {
+            return self.scale_identity(b);
+        }
+        self.apply(self.cb, self.chroma_center, b, g, r)
+    }
+
+    /// Coded Cr for a wide source. See [`Self::luma_wide`].
+    #[inline]
+    #[must_use]
+    pub fn cr_wide(self, b: u16, g: u16, r: u16) -> i32 {
+        let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+        if self.is_identity() {
+            return self.scale_identity(r);
+        }
+        self.apply(self.cr, self.chroma_center, b, g, r)
     }
 
     /// Pack a coded sample into a 16-bit word, MSB-aligned.
@@ -763,11 +891,764 @@ fn convert_rows(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Wide (>8 bpc) source conversion
+// ---------------------------------------------------------------------------
+
+/// The sRGB encoding transfer function: linear light in, signal out.
+///
+/// scRGB carries **linear** light, so a wide capture cannot go straight into
+/// the colour matrix — that expects a nonlinear signal, exactly as the 8-bit
+/// BGRA path supplies. Skipping this step produces a picture several stops too
+/// dark and is the easiest way to get a wide pipeline visibly wrong.
+#[must_use]
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// ITU-R BT.709 OETF: linear light in, nonlinear signal out.
+#[must_use]
+pub fn linear_to_bt709(linear: f32) -> f32 {
+    if linear < 0.018 {
+        4.5 * linear
+    } else {
+        1.099 * linear.powf(0.45) - 0.099
+    }
+}
+
+/// Decode an IEEE-754 binary16 into `f32`.
+#[must_use]
+pub fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let mantissa = u32::from(bits & 0x3ff);
+    let out = match exponent {
+        0 if mantissa == 0 => sign,
+        0 => {
+            let mut e = exponent;
+            let mut m = mantissa;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e = e.wrapping_sub(1);
+            }
+            sign | ((e.wrapping_add(1).wrapping_add(127 - 15)) << 23) | ((m & 0x3ff) << 13)
+        }
+        0x1f => sign | (0xff << 23) | (mantissa << 13),
+        _ => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(out)
+}
+
+/// Source span for a wide RGB signal quantised before the matrix.
+///
+/// Ten bits is the widest depth NVENC accepts here, so carrying more through
+/// the matrix buys nothing the encoder can express.
+pub const WIDE_INPUT_MAX: u16 = 1023;
+
+/// Absolute luminance represented by linear scRGB `1.0` on Windows.
+///
+/// Windows' Advanced Color composition space fixes scRGB reference white at
+/// 80 cd/m². Values above `1.0` therefore carry real HDR headroom and must not
+/// be clamped before the PQ transfer.
+const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+
+const PQ_PEAK_NITS: f32 = 10_000.0;
+const PQ_CODE_COUNT: usize = WIDE_INPUT_MAX as usize + 1;
+
+/// Convert linear-light sRGB/scRGB primaries into the negotiated linear RGB
+/// primaries before applying a nonlinear transfer function.
+fn scrgb_primary_matrix(output: ColorPrimaries) -> [[f32; 3]; 3] {
+    match output {
+        ColorPrimaries::Bt709 => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        // Linear sRGB/BT.709 D65 -> linear BT.2020 D65.
+        ColorPrimaries::Bt2020 => [
+            [0.627_403_9, 0.329_283_03, 0.043_313_07],
+            [0.069_097_29, 0.919_540_4, 0.011_362_32],
+            [0.016_391_44, 0.088_013_31, 0.895_595_25],
+        ],
+        // Linear sRGB/BT.709 D65 -> linear Display P3 D65.
+        ColorPrimaries::DisplayP3 => [
+            [0.822_461_96, 0.177_538_04, 0.0],
+            [0.033_194_2, 0.966_805_8, 0.0],
+            [0.017_082_63, 0.072_397_44, 0.910_519_96],
+        ],
+    }
+}
+
+fn convert_scrgb_primaries(r: f32, g: f32, b: f32, output: ColorPrimaries) -> [f32; 3] {
+    let matrix = scrgb_primary_matrix(output);
+    let apply = |row: [f32; 3]| row[0] * r + row[1] * g + row[2] * b;
+    [apply(matrix[0]), apply(matrix[1]), apply(matrix[2])]
+}
+
+/// SMPTE ST 2084 inverse EOTF: absolute luminance in nits to PQ signal.
+#[must_use]
+pub fn linear_nits_to_pq_signal(nits: f32) -> f32 {
+    if !nits.is_finite() || nits <= 0.0 {
+        return 0.0;
+    }
+    let normalized = (nits / PQ_PEAK_NITS).min(1.0);
+    let m1 = 2610.0 / 16_384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let powered = normalized.powf(m1);
+    ((c1 + c2 * powered) / (1.0 + c3 * powered)).powf(m2)
+}
+
+/// SMPTE ST 2084 EOTF: PQ signal to absolute luminance in nits.
+fn pq_signal_to_linear_nits(signal: f64) -> f64 {
+    if !signal.is_finite() || signal <= 0.0 {
+        return 0.0;
+    }
+    let m1 = 2610.0 / 16_384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let powered = signal.min(1.0).powf(1.0 / m2);
+    let numerator = (powered - c1).max(0.0);
+    let denominator = c2 - c3 * powered;
+    (numerator / denominator).powf(1.0 / m1) * f64::from(PQ_PEAK_NITS)
+}
+
+/// Linear-scRGB thresholds at which nearest-integer ten-bit PQ quantisation
+/// advances to the next code.
+///
+/// The expensive inverse EOTF runs only while this process-wide table is built.
+/// Each hot-path component then needs a ten-comparison binary search rather
+/// than two `powf` calls. Threshold `n` is the exact half-code boundary between
+/// output codes `n` and `n + 1`.
+fn scrgb_pq_code_thresholds() -> &'static [f64; PQ_CODE_COUNT - 1] {
+    static THRESHOLDS: OnceLock<[f64; PQ_CODE_COUNT - 1]> = OnceLock::new();
+    THRESHOLDS.get_or_init(|| {
+        std::array::from_fn(|index| {
+            // `index` is bounded by this 1023-entry array, far below f64's
+            // exact-integer limit.
+            #[allow(clippy::cast_precision_loss)]
+            let signal = (index as f64 + 0.5) / f64::from(WIDE_INPUT_MAX);
+            pq_signal_to_linear_nits(signal) / f64::from(SCRGB_REFERENCE_WHITE_NITS)
+        })
+    })
+}
+
+/// Quantise one linear component in the target primaries to a ten-bit PQ code.
+#[must_use]
+pub fn scrgb_component_to_pq_code(linear: f32) -> u16 {
+    if !linear.is_finite() || linear <= 0.0 {
+        return 0;
+    }
+    let linear = f64::from(linear);
+    let code = scrgb_pq_code_thresholds().partition_point(|threshold| linear >= *threshold);
+    u16::try_from(code).unwrap_or(WIDE_INPUT_MAX)
+}
+
+/// Complete colour transform for Windows FP16 scRGB capture into PQ YCbCr.
+///
+/// Construction binds target primaries, matrix, range and depth together once
+/// so the per-frame conversion cannot accidentally apply PQ with a transform
+/// built for 8-bit RGB input or for a different matrix.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrgbPqTransform {
+    output_primaries: ColorPrimaries,
+    ycbcr: ColorTransform,
+}
+
+impl ScrgbPqTransform {
+    #[must_use]
+    pub fn new(
+        matrix: ColorMatrix,
+        output_primaries: ColorPrimaries,
+        range: ColorRange,
+        depth: BitDepth,
+    ) -> Self {
+        Self {
+            output_primaries,
+            ycbcr: ColorTransform::for_input_max(matrix, range, depth, f64::from(WIDE_INPUT_MAX)),
+        }
+    }
+
+    fn pq_rgb(self, r: f32, g: f32, b: f32) -> [u16; 3] {
+        convert_scrgb_primaries(r, g, b, self.output_primaries).map(scrgb_component_to_pq_code)
+    }
+
+    fn convert_pq_rgb(self, [r, g, b]: [u16; 3]) -> [u16; 3] {
+        [
+            self.ycbcr.pack_p16(self.ycbcr.luma_wide(b, g, r)),
+            self.ycbcr.pack_p16(self.ycbcr.cb_wide(b, g, r)),
+            self.ycbcr.pack_p16(self.ycbcr.cr_wide(b, g, r)),
+        ]
+    }
+
+    fn convert_pixel(self, r: f32, g: f32, b: f32) -> [u16; 3] {
+        self.convert_pq_rgb(self.pq_rgb(r, g, b))
+    }
+}
+
+const HALF_CODE_COUNT: usize = 65_536;
+
+fn scrgb_sdr_code_table(transfer: TransferCharacteristics) -> &'static [u16; HALF_CODE_COUNT] {
+    static BT709: OnceLock<[u16; HALF_CODE_COUNT]> = OnceLock::new();
+    static SRGB: OnceLock<[u16; HALF_CODE_COUNT]> = OnceLock::new();
+    let build = |transfer| {
+        std::array::from_fn(|bits| {
+            let linear = half_to_f32(u16::try_from(bits).unwrap_or(u16::MAX)).clamp(0.0, 1.0);
+            let signal = match transfer {
+                TransferCharacteristics::Bt709 => linear_to_bt709(linear),
+                TransferCharacteristics::Srgb => linear_to_srgb(linear),
+                TransferCharacteristics::Pq | TransferCharacteristics::Hlg => {
+                    unreachable!("SDR lookup tables are built only for SDR transfers")
+                }
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                (signal * f32::from(WIDE_INPUT_MAX))
+                    .round()
+                    .clamp(0.0, f32::from(WIDE_INPUT_MAX)) as u16
+            }
+        })
+    };
+    match transfer {
+        TransferCharacteristics::Bt709 => {
+            BT709.get_or_init(|| build(TransferCharacteristics::Bt709))
+        }
+        TransferCharacteristics::Srgb => SRGB.get_or_init(|| build(TransferCharacteristics::Srgb)),
+        TransferCharacteristics::Pq | TransferCharacteristics::Hlg => {
+            unreachable!("SDR transform refuses HDR transfer characteristics")
+        }
+    }
+}
+
+/// Transform Windows FP16 scRGB capture into ten-bit SDR YCbCr.
+///
+/// The source is linear BT.709/scRGB. Values outside SDR range are clamped,
+/// the requested SDR OETF is applied through a process-wide half-float lookup,
+/// and the result is packed through the negotiated matrix/range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrgbSdrTransform {
+    transfer: TransferCharacteristics,
+    ycbcr: ColorTransform,
+}
+
+impl ScrgbSdrTransform {
+    #[must_use]
+    pub fn new(
+        matrix: ColorMatrix,
+        range: ColorRange,
+        depth: BitDepth,
+        transfer: TransferCharacteristics,
+    ) -> Option<Self> {
+        matches!(
+            transfer,
+            TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb
+        )
+        .then(|| Self {
+            transfer,
+            ycbcr: ColorTransform::for_input_max(matrix, range, depth, f64::from(WIDE_INPUT_MAX)),
+        })
+    }
+
+    fn convert_half_pixel(self, r: u16, g: u16, b: u16) -> [u16; 3] {
+        let table = scrgb_sdr_code_table(self.transfer);
+        let [r, g, b] = [
+            table[usize::from(r)],
+            table[usize::from(g)],
+            table[usize::from(b)],
+        ];
+        [
+            self.ycbcr.pack_p16(self.ycbcr.luma_wide(b, g, r)),
+            self.ycbcr.pack_p16(self.ycbcr.cb_wide(b, g, r)),
+            self.ycbcr.pack_p16(self.ycbcr.cr_wide(b, g, r)),
+        ]
+    }
+}
+
+/// Convert one FP16 scRGB frame into PQ-coded planar 10-bit 4:4:4.
+///
+/// This is the capture half of HDR meeting the encoder. WGC's only wide pool
+/// format is `R16G16B16A16Float`, which carries linear scRGB with 1.0 at SDR
+/// white; NVENC wants `YUV444_10BIT`. Nothing in the 8-bit path can be reused,
+/// because reading half-floats as bytes is not a lossy conversion, it is a
+/// meaningless one.
+///
+/// The conversion is deliberately ordered:
+///
+/// 1. convert linear scRGB/BT.709 primaries into `output_primaries`;
+/// 2. interpret scRGB `1.0` as 80 nits and apply SMPTE ST 2084;
+/// 3. apply the negotiated nonlinear RGB-to-YCbCr matrix; and
+/// 4. store the result MSB-aligned for NVENC.
+///
+/// Values above scRGB `1.0` survive through PQ instead of being clipped at SDR
+/// white. Negative and non-finite target-primary components map to black.
+///
+/// # Errors
+///
+/// [`ConversionError`] when a source row or a destination plane is too small
+/// for the stated geometry, checked before any write.
+pub fn convert_scrgb_to_pq_i444_p16(
+    src: &[u8],
+    src_stride: usize,
+    planes: [&mut [u16]; 3],
+    plane_strides: [usize; 3],
+    width: usize,
+    height: usize,
+    transform: ScrgbPqTransform,
+) -> Result<(), ConversionError> {
+    // Four half-float components per pixel.
+    let row_bytes = width
+        .checked_mul(8)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if src_stride < row_bytes || src.len() < src_stride.saturating_mul(height) {
+        return Err(ConversionError::GeometryMismatch);
+    }
+    let [y_plane, u_plane, v_plane] = planes;
+    for (plane, stride) in [
+        (&*y_plane, plane_strides[0]),
+        (&*u_plane, plane_strides[1]),
+        (&*v_plane, plane_strides[2]),
+    ] {
+        if stride < width || plane.len() < stride.saturating_mul(height) {
+            return Err(ConversionError::GeometryMismatch);
+        }
+    }
+
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + row_bytes];
+        let y_row = &mut y_plane[row * plane_strides[0]..row * plane_strides[0] + width];
+        let u_row = &mut u_plane[row * plane_strides[1]..row * plane_strides[1] + width];
+        let v_row = &mut v_plane[row * plane_strides[2]..row * plane_strides[2] + width];
+        for column in 0..width {
+            let base = column * 8;
+            let half = |offset: usize| {
+                u16::from_le_bytes([src_row[base + offset], src_row[base + offset + 1]])
+            };
+            // scRGB is RGBA order; alpha is ignored, as it is in the 8-bit path.
+            let [y, u, v] = transform.convert_pixel(
+                half_to_f32(half(0)),
+                half_to_f32(half(2)),
+                half_to_f32(half(4)),
+            );
+            y_row[column] = y;
+            u_row[column] = u;
+            v_row[column] = v;
+        }
+    }
+    Ok(())
+}
+
+/// Convert one FP16 scRGB frame into SDR-coded planar 10-bit 4:4:4.
+///
+/// # Errors
+///
+/// Returns [`ConversionError::GeometryMismatch`] when source or destination
+/// geometry cannot cover the complete frame.
+pub fn convert_scrgb_to_sdr_i444_p16(
+    src: &[u8],
+    src_stride: usize,
+    planes: [&mut [u16]; 3],
+    plane_strides: [usize; 3],
+    width: usize,
+    height: usize,
+    transform: ScrgbSdrTransform,
+) -> Result<(), ConversionError> {
+    let row_bytes = width
+        .checked_mul(8)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if src_stride < row_bytes || src.len() < src_stride.saturating_mul(height) {
+        return Err(ConversionError::GeometryMismatch);
+    }
+    let [y_plane, u_plane, v_plane] = planes;
+    for (plane, stride) in [
+        (&*y_plane, plane_strides[0]),
+        (&*u_plane, plane_strides[1]),
+        (&*v_plane, plane_strides[2]),
+    ] {
+        if stride < width || plane.len() < stride.saturating_mul(height) {
+            return Err(ConversionError::GeometryMismatch);
+        }
+    }
+
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + row_bytes];
+        let y_row = &mut y_plane[row * plane_strides[0]..row * plane_strides[0] + width];
+        let u_row = &mut u_plane[row * plane_strides[1]..row * plane_strides[1] + width];
+        let v_row = &mut v_plane[row * plane_strides[2]..row * plane_strides[2] + width];
+        for column in 0..width {
+            let base = column * 8;
+            let half = |offset: usize| {
+                u16::from_le_bytes([src_row[base + offset], src_row[base + offset + 1]])
+            };
+            let [y, u, v] = transform.convert_half_pixel(half(0), half(2), half(4));
+            y_row[column] = y;
+            u_row[column] = u;
+            v_row[column] = v;
+        }
+    }
+    Ok(())
+}
+
+/// Convert a packed RGB10 frame to planar 4:4:4 sixteen-bit.
+///
+/// This is the portable conversion used by the X11 depth-30 capture path.
+/// `XShmGetImage` returns the screen visual's native channel ordering, which
+/// differs across drivers, so `layout` is derived from the visual masks.
+///
+/// No rescaling happens here, deliberately. Each channel already arrives as
+/// a `0..=1023` code, which is precisely the domain
+/// [`ColorTransform::luma_wide`] and friends expect
+/// ([`WIDE_INPUT_MAX`]), so the components are handed over untouched. The
+/// transform must have been built with
+/// [`ColorTransform::for_input_max`] against [`WIDE_INPUT_MAX`]; one built
+/// by `ColorTransform::new` folds a `1/255` factor into every coefficient
+/// and would quietly scale a ten-bit input down by roughly four, worst in
+/// the highlights.
+///
+/// Alpha is discarded, as it is in every other capture path here.
+///
+/// # Errors
+///
+/// [`ConversionError`] when a source row or a destination plane is too small
+/// for the stated geometry, checked before any write.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_packed_rgb10_to_i444_p16(
+    src: &[u8],
+    src_stride: usize,
+    planes: [&mut [u16]; 3],
+    plane_strides: [usize; 3],
+    width: usize,
+    height: usize,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+) -> Result<(), ConversionError> {
+    // One 32-bit word per pixel.
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if src_stride < row_bytes || src.len() < src_stride.saturating_mul(height) {
+        return Err(ConversionError::GeometryMismatch);
+    }
+    let [y_plane, u_plane, v_plane] = planes;
+    for (plane, stride) in [
+        (&*y_plane, plane_strides[0]),
+        (&*u_plane, plane_strides[1]),
+        (&*v_plane, plane_strides[2]),
+    ] {
+        if stride < width || plane.len() < stride.saturating_mul(height) {
+            return Err(ConversionError::GeometryMismatch);
+        }
+    }
+
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + row_bytes];
+        let y_row = &mut y_plane[row * plane_strides[0]..row * plane_strides[0] + width];
+        let u_row = &mut u_plane[row * plane_strides[1]..row * plane_strides[1] + width];
+        let v_row = &mut v_plane[row * plane_strides[2]..row * plane_strides[2] + width];
+        for column in 0..width {
+            let base = column * 4;
+            let word = u32::from_le_bytes([
+                src_row[base],
+                src_row[base + 1],
+                src_row[base + 2],
+                src_row[base + 3],
+            ]);
+            let [r, g, b] = layout.components(word);
+            y_row[column] = transform.pack_p16(transform.luma_wide(b, g, r));
+            u_row[column] = transform.pack_p16(transform.cb_wide(b, g, r));
+            v_row[column] = transform.pack_p16(transform.cr_wide(b, g, r));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn mean_rgb10(a: u16, b: u16, c: u16, d: u16) -> u16 {
+    ((u32::from(a) + u32::from(b) + u32::from(c) + u32::from(d)) / 4) as u16
+}
+
+/// Convert a packed RGB10 frame to MSB-aligned P010.
+///
+/// Luma is converted at full resolution. Each interleaved Cb/Cr pair is
+/// derived from the mean RGB value of its 2×2 source block, matching the
+/// chroma filter used by the existing BGRA-to-4:2:0 paths.
+///
+/// # Errors
+///
+/// Returns [`ConversionError::GeometryMismatch`] for zero or odd dimensions,
+/// overflow, or any source/destination row that is too short.
+#[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
+pub fn convert_packed_rgb10_to_p010(
+    src: &[u8],
+    src_stride: usize,
+    y: &mut [u16],
+    y_stride: usize,
+    uv: &mut [u16],
+    uv_stride: usize,
+    width: usize,
+    height: usize,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+) -> Result<(), ConversionError> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if width == 0
+        || height == 0
+        || width % 2 != 0
+        || height % 2 != 0
+        || src_stride < row_bytes
+        || y_stride < width
+        || uv_stride < width
+        || src.len() < src_stride.saturating_mul(height)
+        || y.len() < y_stride.saturating_mul(height)
+        || uv.len() < uv_stride.saturating_mul(height / 2)
+    {
+        return Err(ConversionError::GeometryMismatch);
+    }
+
+    let pixel = |row: &[u8], column: usize| {
+        let base = column * 4;
+        layout.components(u32::from_le_bytes([
+            row[base],
+            row[base + 1],
+            row[base + 2],
+            row[base + 3],
+        ]))
+    };
+    for row_pair in 0..height / 2 {
+        let top = row_pair * 2;
+        let src0 = &src[top * src_stride..top * src_stride + row_bytes];
+        let src1 = &src[(top + 1) * src_stride..(top + 1) * src_stride + row_bytes];
+        let (y_head, y_tail) = y.split_at_mut((top + 1) * y_stride);
+        let y0 = &mut y_head[top * y_stride..top * y_stride + width];
+        let y1 = &mut y_tail[..width];
+        let uv_row = &mut uv[row_pair * uv_stride..row_pair * uv_stride + width];
+
+        for column in (0..width).step_by(2) {
+            let p00 = pixel(src0, column);
+            let p01 = pixel(src0, column + 1);
+            let p10 = pixel(src1, column);
+            let p11 = pixel(src1, column + 1);
+
+            y0[column] = transform.pack_p16(transform.luma_wide(p00[2], p00[1], p00[0]));
+            y0[column + 1] = transform.pack_p16(transform.luma_wide(p01[2], p01[1], p01[0]));
+            y1[column] = transform.pack_p16(transform.luma_wide(p10[2], p10[1], p10[0]));
+            y1[column + 1] = transform.pack_p16(transform.luma_wide(p11[2], p11[1], p11[0]));
+
+            let r = mean_rgb10(p00[0], p01[0], p10[0], p11[0]);
+            let g = mean_rgb10(p00[1], p01[1], p10[1], p11[1]);
+            let b = mean_rgb10(p00[2], p01[2], p10[2], p11[2]);
+            uv_row[column] = transform.pack_p16(transform.cb_wide(b, g, r));
+            uv_row[column + 1] = transform.pack_p16(transform.cr_wide(b, g, r));
+        }
+    }
+    Ok(())
+}
+
+/// Reduce a packed RGB10 frame to checked 8-bit BGRA.
+///
+/// This exists for the software H.264 fallback on a depth-30 Xorg session.
+/// Hardware eight-bit sessions never use it: they remain on the `NvFBC`
+/// device-to-device path.
+///
+/// # Errors
+///
+/// Returns [`ConversionError::GeometryMismatch`] when either buffer or stride
+/// cannot cover the stated geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_packed_rgb10_to_bgra8(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+    layout: PackedRgb10Layout,
+) -> Result<(), ConversionError> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if src_stride < row_bytes
+        || dst_stride < row_bytes
+        || src.len() < src_stride.saturating_mul(height)
+        || dst.len() < dst_stride.saturating_mul(height)
+    {
+        return Err(ConversionError::GeometryMismatch);
+    }
+
+    let to_u8 = |component: u16| {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            ((u32::from(component) * 255 + 511) / 1023) as u8
+        }
+    };
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + row_bytes];
+        let dst_row = &mut dst[row * dst_stride..row * dst_stride + row_bytes];
+        for column in 0..width {
+            let base = column * 4;
+            let word = u32::from_le_bytes([
+                src_row[base],
+                src_row[base + 1],
+                src_row[base + 2],
+                src_row[base + 3],
+            ]);
+            let [r, g, b] = layout.components(word);
+            dst_row[base] = to_u8(b);
+            dst_row[base + 1] = to_u8(g);
+            dst_row[base + 2] = to_u8(r);
+            dst_row[base + 3] = u8::MAX;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::video::{I420FrameMut, I444FrameMut, I444P16FrameMut, Nv12FrameMut};
+
+    fn half_bits(value: f32) -> [u8; 2] {
+        // Minimal f32 -> binary16 for test fixtures; only needs to be exact
+        // for the handful of values used here.
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let mantissa = ((bits >> 13) & 0x3ff) as u16;
+        let half = if value == 0.0 {
+            sign
+        } else {
+            sign | ((exponent.clamp(0, 31) as u16) << 10) | mantissa
+        };
+        half.to_le_bytes()
+    }
+
+    fn scrgb_pixel(r: f32, g: f32, b: f32) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&half_bits(r));
+        out[2..4].copy_from_slice(&half_bits(g));
+        out[4..6].copy_from_slice(&half_bits(b));
+        out[6..8].copy_from_slice(&half_bits(1.0));
+        out
+    }
+
+    /// The conversion the wide capture path depends on. SDR reference white
+    /// must land at 80-nit PQ while values above 1.0 retain HDR headroom.
+    #[test]
+    fn scrgb_reference_white_and_hdr_highlight_map_to_absolute_pq() {
+        let transform = ScrgbPqTransform::new(
+            ColorMatrix::Bt2020Ncl,
+            ColorPrimaries::Bt2020,
+            ColorRange::Full,
+            BitDepth::Ten,
+        );
+        let mut src = Vec::new();
+        src.extend_from_slice(&scrgb_pixel(0.0, 0.0, 0.0));
+        src.extend_from_slice(&scrgb_pixel(1.0, 1.0, 1.0));
+        src.extend_from_slice(&scrgb_pixel(12.5, 12.5, 12.5));
+        let (mut y, mut u, mut v) = ([0u16; 3], [0u16; 3], [0u16; 3]);
+
+        convert_scrgb_to_pq_i444_p16(
+            &src,
+            24,
+            [&mut y, &mut u, &mut v],
+            [3, 3, 3],
+            3,
+            1,
+            transform,
+        )
+        .expect("geometry is valid");
+
+        assert_eq!(y[0], 0, "scRGB black must reach code 0");
+        assert_eq!(y[1], 497 << 6, "scRGB 1.0 is 80-nit PQ reference white");
+        assert_eq!(y[2], 769 << 6, "scRGB 12.5 is a 1000-nit highlight");
+        assert!(y[2] > y[1], "HDR headroom must survive above SDR white");
+        for plane in [&u, &v] {
+            assert!(
+                plane.iter().all(|sample| *sample == 0x8000),
+                "neutral input must remain neutral"
+            );
+        }
+    }
+
+    #[test]
+    fn scrgb_sdr_conversion_clamps_hdr_headroom_and_preserves_ten_bit_output() {
+        let transform = ScrgbSdrTransform::new(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            TransferCharacteristics::Bt709,
+        )
+        .expect("BT.709 is an SDR transfer");
+        let mut src = Vec::new();
+        src.extend_from_slice(&scrgb_pixel(0.0, 0.0, 0.0));
+        src.extend_from_slice(&scrgb_pixel(0.5, 0.5, 0.5));
+        src.extend_from_slice(&scrgb_pixel(1.0, 1.0, 1.0));
+        src.extend_from_slice(&scrgb_pixel(4.0, 4.0, 4.0));
+        let (mut y, mut u, mut v) = ([0u16; 4], [0u16; 4], [0u16; 4]);
+
+        convert_scrgb_to_sdr_i444_p16(
+            &src,
+            32,
+            [&mut y, &mut u, &mut v],
+            [4, 4, 4],
+            4,
+            1,
+            transform,
+        )
+        .expect("geometry is valid");
+
+        assert_eq!(y[0], 0);
+        assert!(y[1] > 0 && y[1] < 0xffc0);
+        assert_eq!(y[2], 0xffc0);
+        assert_eq!(y[3], 0xffc0, "SDR conversion clamps values above white");
+        assert!(u.iter().all(|sample| *sample == 0x8000));
+        assert!(v.iter().all(|sample| *sample == 0x8000));
+    }
+
+    #[test]
+    fn scrgb_sdr_transform_rejects_hdr_transfer_characteristics() {
+        assert!(
+            ScrgbSdrTransform::new(
+                ColorMatrix::Bt2020Ncl,
+                ColorRange::Full,
+                BitDepth::Ten,
+                TransferCharacteristics::Pq,
+            )
+            .is_none()
+        );
+    }
+
+    /// Geometry is checked before any write, so a short buffer is an error
+    /// rather than a partially converted frame.
+    #[test]
+    fn scrgb_conversion_refuses_geometry_it_cannot_satisfy() {
+        let transform = ScrgbPqTransform::new(
+            ColorMatrix::Bt709,
+            ColorPrimaries::Bt2020,
+            ColorRange::Full,
+            BitDepth::Ten,
+        );
+        let src = [0u8; 8];
+        let (mut y, mut u, mut v) = ([0u16; 1], [0u16; 1], [0u16; 1]);
+        assert!(
+            convert_scrgb_to_pq_i444_p16(
+                &src,
+                8,
+                [&mut y, &mut u, &mut v],
+                [1, 1, 1],
+                2,
+                1,
+                transform
+            )
+            .is_err()
+        );
+    }
 
     fn bgra(r: u8, g: u8, b: u8) -> [u8; 4] {
         [b, g, r, 0xff]
@@ -1405,5 +2286,330 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wide_source_tests {
+    use super::*;
+
+    /// The guard for the generalisation: `new` must be exactly what it was.
+    ///
+    /// `for_input_max` exists so a wide source needs no second copy of the
+    /// matrix derivation — two copies is how conversions drift apart. That is
+    /// only safe if the 8-bit case is provably untouched, so assert the two
+    /// constructions agree on every coded output, not merely on their fields.
+    #[test]
+    fn input_max_255_matches_the_original_constructor() {
+        for matrix in [
+            ColorMatrix::Bt709,
+            ColorMatrix::Bt601,
+            ColorMatrix::Bt2020Ncl,
+            ColorMatrix::Identity,
+        ] {
+            for range in [ColorRange::Limited, ColorRange::Full] {
+                for depth in [BitDepth::Eight, BitDepth::Ten, BitDepth::Twelve] {
+                    let baseline = ColorTransform::new(matrix, range, depth);
+                    let generalised = ColorTransform::for_input_max(matrix, range, depth, 255.0);
+                    for b in [0u8, 1, 17, 128, 254, 255] {
+                        for g in [0u8, 1, 17, 128, 254, 255] {
+                            for r in [0u8, 1, 17, 128, 254, 255] {
+                                assert_eq!(
+                                    baseline.luma(b, g, r),
+                                    generalised.luma(b, g, r),
+                                    "luma drift at {matrix:?}/{range:?}/{depth:?} {b},{g},{r}"
+                                );
+                                assert_eq!(baseline.cb(b, g, r), generalised.cb(b, g, r));
+                                assert_eq!(baseline.cr(b, g, r), generalised.cr(b, g, r));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An 8-bit desktop carried through the wide path must reach the same codes
+    /// the 8-bit path produces. If a wide capture of ordinary content differed
+    /// from an ordinary capture of it, the two pipelines would not be two views
+    /// of one desktop.
+    /// Pack an `A2R10G10B10` pixel the way an X depth-30 framebuffer does.
+    fn a2r10g10b10(r: u16, g: u16, b: u16) -> [u8; 4] {
+        let word = ((u32::from(r) & 0x3ff) << 20)
+            | ((u32::from(g) & 0x3ff) << 10)
+            | (u32::from(b) & 0x3ff)
+            | (0x3 << 30);
+        word.to_le_bytes()
+    }
+
+    fn wide_full_bt709() -> ColorTransform {
+        ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(WIDE_INPUT_MAX),
+        )
+    }
+
+    fn convert_one_a2r10g10b10(r: u16, g: u16, b: u16) -> (u16, u16, u16) {
+        let src = a2r10g10b10(r, g, b);
+        let mut y = [0u16; 1];
+        let mut u = [0u16; 1];
+        let mut v = [0u16; 1];
+        convert_packed_rgb10_to_i444_p16(
+            &src,
+            4,
+            [&mut y, &mut u, &mut v],
+            [1, 1, 1],
+            1,
+            1,
+            PackedRgb10Layout::XRGB2101010,
+            wide_full_bt709(),
+        )
+        .expect("single pixel converts");
+        (y[0], u[0], v[0])
+    }
+
+    /// Black, white and neutral mid-grey land exactly where full-range
+    /// ten-bit says they must.
+    ///
+    /// These three are the whole reason this converter takes its components
+    /// untouched: an `A2R10G10B10` channel is already a `0..=1023` code, so
+    /// white must be 1023 and not 255-scaled-up. A transform built by
+    /// `ColorTransform::new` instead of `for_input_max` would put white at
+    /// roughly a quarter of that, and the error would be invisible in the
+    /// shadows and glaring in the highlights.
+    #[test]
+    fn a2r10g10b10_maps_black_white_and_neutral_exactly() {
+        assert_eq!(convert_one_a2r10g10b10(0, 0, 0).0, 0, "black luma");
+        assert_eq!(
+            convert_one_a2r10g10b10(1023, 1023, 1023).0,
+            0xffc0,
+            "white luma must be MSB-aligned"
+        );
+
+        let (_, u, v) = convert_one_a2r10g10b10(512, 512, 512);
+        assert_eq!((u, v), (0x8000, 0x8000), "neutral grey must not tint");
+    }
+
+    /// The channels are unpacked from the right bit positions.
+    ///
+    /// Getting red and blue the wrong way round produces a picture that is
+    /// obviously wrong but still *works*, so this pins the layout rather
+    /// than trusting it: blue occupies the low ten bits, red the high ones.
+    #[test]
+    fn a2r10g10b10_unpacks_red_green_and_blue_from_the_right_bits() {
+        let (red_y, _, red_v) = convert_one_a2r10g10b10(1023, 0, 0);
+        let (blue_y, blue_u, _) = convert_one_a2r10g10b10(0, 0, 1023);
+        let (green_y, _, _) = convert_one_a2r10g10b10(0, 1023, 0);
+
+        // BT.709 luma weights: green dominates, red is next, blue is least.
+        assert!(
+            green_y > red_y && red_y > blue_y,
+            "luma ordering G({green_y}) > R({red_y}) > B({blue_y}) identifies the channels"
+        );
+        // Pure red pushes Cr up; pure blue pushes Cb up.
+        assert!(red_v > 0x8000, "pure red must raise Cr, got {red_v}");
+        assert!(blue_u > 0x8000, "pure blue must raise Cb, got {blue_u}");
+    }
+
+    /// Ten-bit input carries detail an eight-bit path cannot.
+    ///
+    /// Adjacent ten-bit codes that would collapse to the same eight-bit
+    /// value must stay distinguishable, which is the entire point of running
+    /// the X server at depth 30.
+    #[test]
+    fn a2r10g10b10_preserves_detail_below_the_eight_bit_grid() {
+        let low = convert_one_a2r10g10b10(512, 512, 512).0;
+        let high = convert_one_a2r10g10b10(513, 513, 513).0;
+        assert_ne!(
+            low, high,
+            "codes one apart at ten bits must not collapse to the same luma"
+        );
+    }
+
+    /// Geometry is checked before any write.
+    #[test]
+    fn a2r10g10b10_rejects_a_short_source_row() {
+        let src = [0u8; 4];
+        let mut y = [0u16; 2];
+        let mut u = [0u16; 2];
+        let mut v = [0u16; 2];
+        assert!(
+            convert_packed_rgb10_to_i444_p16(
+                &src,
+                4,
+                [&mut y, &mut u, &mut v],
+                [2, 2, 2],
+                2,
+                1,
+                PackedRgb10Layout::XRGB2101010,
+                wide_full_bt709(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn packed_rgb10_layout_uses_the_visual_masks_not_a_fixed_channel_order() {
+        let nvidia_xorg = PackedRgb10Layout::from_masks(0x0000_03ff, 0x000f_fc00, 0x3ff0_0000)
+            .expect("live NVIDIA depth-30 masks");
+        assert_eq!(nvidia_xorg, PackedRgb10Layout::XBGR2101010);
+        assert_eq!(
+            PackedRgb10Layout::from_masks(0x3ff0_0000, 0x000f_fc00, 0x0000_03ff),
+            Some(PackedRgb10Layout::XRGB2101010)
+        );
+        assert!(PackedRgb10Layout::from_masks(0xff, 0xff00, 0xff0000).is_none());
+        assert!(PackedRgb10Layout::from_masks(0x3ff, 0x3ff, 0x3ff00000).is_none());
+
+        let word = (0x3ff_u32 << 30) | (1023_u32 << 20);
+        let src = word.to_le_bytes();
+        let mut y = [0u16; 1];
+        let mut u = [0u16; 1];
+        let mut v = [0u16; 1];
+        convert_packed_rgb10_to_i444_p16(
+            &src,
+            4,
+            [&mut y, &mut u, &mut v],
+            [1, 1, 1],
+            1,
+            1,
+            nvidia_xorg,
+            wide_full_bt709(),
+        )
+        .expect("NVIDIA depth-30 pixel converts");
+        assert!(u[0] > 0x8000, "blue in bits 20..29 must raise Cb");
+        assert!(v[0] < 0x8000, "blue in bits 20..29 must lower Cr");
+    }
+
+    #[test]
+    fn packed_rgb10_to_bgra8_is_the_inverse_of_eight_bit_expansion() {
+        let layout = PackedRgb10Layout::XBGR2101010;
+        for code in 0u16..=255 {
+            let widened = (code << 2) | (code >> 6);
+            let word = (0x3_u32 << 30)
+                | (u32::from(widened) << 20)
+                | (u32::from(widened) << 10)
+                | u32::from(widened);
+            let mut bgra = [0u8; 4];
+            convert_packed_rgb10_to_bgra8(&word.to_le_bytes(), 4, &mut bgra, 4, 1, 1, layout)
+                .expect("ten-bit pixel reduces");
+            assert_eq!(bgra, [code as u8, code as u8, code as u8, u8::MAX]);
+        }
+    }
+
+    #[test]
+    fn packed_rgb10_to_p010_preserves_full_range_white_and_neutral_chroma() {
+        let pixel = ((0x3_u32 << 30) | 0x3ff | (0x3ff << 10) | (0x3ff << 20)).to_le_bytes();
+        let source = [pixel, pixel, pixel, pixel].concat();
+        let mut y = [0u16; 4];
+        let mut uv = [0u16; 2];
+        convert_packed_rgb10_to_p010(
+            &source,
+            8,
+            &mut y,
+            2,
+            &mut uv,
+            2,
+            2,
+            2,
+            PackedRgb10Layout::XBGR2101010,
+            wide_full_bt709(),
+        )
+        .expect("P010 conversion");
+        assert_eq!(y, [0xffc0; 4]);
+        assert_eq!(uv, [0x8000; 2]);
+    }
+
+    #[test]
+    fn eight_bit_content_agrees_between_the_narrow_and_wide_paths() {
+        let narrow = ColorTransform::new(ColorMatrix::Bt709, ColorRange::Full, BitDepth::Ten);
+        let wide = ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(WIDE_INPUT_MAX),
+        );
+        for code in 0u16..=255 {
+            let narrow_component = u8::try_from(code).expect("8-bit");
+            // The same signal on the wide grid: bit replication, which maps
+            // 0->0 and 255->1023 exactly.
+            let widened = (code << 2) | (code >> 6);
+            let expected = narrow.luma(narrow_component, narrow_component, narrow_component);
+            let actual = wide.luma_wide(widened, widened, widened);
+            assert!(
+                (expected - actual).abs() <= 1,
+                "grey {code}: narrow {expected} vs wide {actual}"
+            );
+        }
+    }
+
+    /// scRGB is absolute linear light at 80 nits per unit. Labelling an sRGB
+    /// signal as PQ would map reference white to 10,000 nits instead.
+    #[test]
+    fn pq_maps_reference_white_to_80_nits_not_peak_white() {
+        assert_eq!(scrgb_component_to_pq_code(1.0), 497);
+        assert!((linear_nits_to_pq_signal(80.0) - 0.485_856_77).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pq_threshold_lookup_stays_within_one_code_of_the_f32_formula() {
+        for bits in 0u16..=u16::MAX {
+            let linear = half_to_f32(bits);
+            let expected = if !linear.is_finite() || linear <= 0.0 {
+                0
+            } else {
+                let signal = linear_nits_to_pq_signal(linear * SCRGB_REFERENCE_WHITE_NITS);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    (signal * f32::from(WIDE_INPUT_MAX))
+                        .round()
+                        .clamp(0.0, f32::from(WIDE_INPUT_MAX)) as u16
+                }
+            };
+            let actual = scrgb_component_to_pq_code(linear);
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "half bits 0x{bits:04x}, linear={linear}, actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrgb_extremes_clamp_rather_than_wrap() {
+        assert_eq!(scrgb_component_to_pq_code(0.0), 0);
+        assert_eq!(scrgb_component_to_pq_code(-4.0), 0);
+        assert_eq!(scrgb_component_to_pq_code(1.0), 497);
+        assert_eq!(scrgb_component_to_pq_code(12.5), 769);
+        assert_eq!(scrgb_component_to_pq_code(125.0), WIDE_INPUT_MAX);
+        assert_eq!(scrgb_component_to_pq_code(500.0), WIDE_INPUT_MAX);
+        assert_eq!(scrgb_component_to_pq_code(f32::NAN), 0);
+    }
+
+    /// The wide path must actually carry more than 8 bits, or it is pointless.
+    #[test]
+    fn sub_eight_bit_differences_survive_quantisation() {
+        let a = scrgb_component_to_pq_code(0.2140);
+        let b = scrgb_component_to_pq_code(0.2180);
+        assert_ne!(a, b, "a sub-8-bit-step difference collapsed to one code");
+    }
+
+    #[test]
+    fn primary_conversion_preserves_white_and_maps_srgb_red_into_bt2020() {
+        let white = convert_scrgb_primaries(1.0, 1.0, 1.0, ColorPrimaries::Bt2020);
+        for component in white {
+            assert!((component - 1.0).abs() < 1e-6);
+        }
+        let red = convert_scrgb_primaries(1.0, 0.0, 0.0, ColorPrimaries::Bt2020);
+        assert!((red[0] - 0.627_403_9).abs() < 1e-6);
+        assert!((red[1] - 0.069_097_29).abs() < 1e-6);
+        assert!((red[2] - 0.016_391_44).abs() < 1e-6);
+    }
+
+    #[test]
+    fn half_decoding_round_trips() {
+        assert!((half_to_f32(0x3C00) - 1.0).abs() < 1e-6);
+        assert!((half_to_f32(0x3800) - 0.5).abs() < 1e-6);
+        assert!(half_to_f32(0x0000).abs() < 1e-9);
     }
 }

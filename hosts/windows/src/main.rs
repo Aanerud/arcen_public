@@ -1,5 +1,6 @@
 //! Pure-Rust Arcen Windows host.
 
+mod advanced_color;
 mod audio;
 mod auth;
 mod capenc;
@@ -363,6 +364,12 @@ pub struct HostConfig {
     pub color_range: ColorRange,
     /// Ceiling matrix coefficients used to derive luma/chroma from RGB.
     pub color_matrix: ColorMatrix,
+    /// Transfer characteristics this session encodes and signals, resolved
+    /// from the Deck's request rather than configured: it is how a client
+    /// asks for HDR, and the host has no independent opinion about it.
+    pub transfer: arcen_media::TransferCharacteristics,
+    /// Colour primaries this session encodes and signals.
+    pub color_primaries: arcen_media::ColorPrimaries,
     /// Governs how far a negotiating client may deviate from `bit_depth`/
     /// `color_range`/`color_matrix`. See [`ColorPolicy::resolve_bit_depth`].
     pub color_policy: ColorPolicy,
@@ -468,8 +475,8 @@ impl HostConfig {
             bit_depth: self.bit_depth,
             range: self.color_range,
             matrix: self.color_matrix,
-            primaries: arcen_media::ColorPrimaries::Bt709,
-            transfer: arcen_media::TransferCharacteristics::Bt709,
+            primaries: self.color_primaries,
+            transfer: self.transfer,
         };
         let resolved = arcen_media::video::resolve_host_initial_video(
             client,
@@ -489,6 +496,10 @@ impl HostConfig {
         self.bit_depth = resolved.video.bit_depth;
         self.color_range = resolved.video.range;
         self.color_matrix = resolved.video.matrix;
+        // Written back like every other axis; omitting these is what kept
+        // the host serving BT.709 for a PQ request.
+        self.transfer = resolved.video.transfer;
+        self.color_primaries = resolved.video.primaries;
         if !self.variant_pinned {
             self.color_policy = ColorPolicy::AlwaysOn;
         }
@@ -573,6 +584,22 @@ enum MaintenanceCommand {
     #[cfg(windows)]
     NvapiHeadlessRestore {
         journal: Option<std::path::PathBuf>,
+    },
+    #[cfg(windows)]
+    NvapiClearArcenEdid {
+        request: nvapi_headless::ClearRequest,
+        json: bool,
+    },
+    #[cfg(windows)]
+    NvapiProvisionArcenEdid {
+        display_id: u32,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        /// Write the HDR10 EDID rather than the SDR one, so the display
+        /// advertises HDR10 permanently and Windows offers its own HDR
+        /// toggle outside an Arcen session.
+        hdr10: bool,
     },
     #[cfg(windows)]
     SupportBundle(support_bundle::SupportBundleOptions),
@@ -868,6 +895,7 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
             let mut width = None;
             let mut height = None;
             let mut refresh_hz = 60;
+            let mut hdr10 = false;
             let mut hold_ms = 2_000;
             let mut journal = None;
             let mut json = false;
@@ -891,6 +919,9 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                             .next()
                             .ok_or_else(|| "--height requires a value".to_string())?;
                         height = Some(parse_u32_argument(&value, "--height")?);
+                    }
+                    "--hdr10" => {
+                        hdr10 = true;
                     }
                     "--refresh-hz" => {
                         let value = arguments
@@ -918,7 +949,7 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                         eprintln!(
                             "USAGE:\n  arcen-pier nvapi-headless-probe \
                              --display-id <ID> --width <PX> --height <PX> \
-                             [--refresh-hz <HZ>] [--hold-ms <MS>] [--journal <PATH>] [--json] \
+                             [--refresh-hz <HZ>] [--hold-ms <MS>] [--journal <PATH>] [--json] [--hdr10] \
                              --acknowledge-temporary-display-mutation\n\n\
                              Lab-only guarded proof. Writes one temporary EDID to an inactive \
                              NVIDIA display ID, verifies Windows enumeration, then removes it. \
@@ -948,6 +979,7 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                     refresh_hz,
                     hold_ms,
                     journal,
+                    hdr10,
                 },
                 json,
             }))
@@ -974,6 +1006,132 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                 }
             }
             Ok(Some(MaintenanceCommand::NvapiHeadlessRestore { journal }))
+        }
+        #[cfg(windows)]
+        "nvapi-provision-arcen-edid" => {
+            let mut display_id = None;
+            let mut width = 1920;
+            let mut height = 1080;
+            let mut refresh_hz = 60;
+            let mut hdr10 = false;
+            let mut acknowledged = false;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--display-id" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| "--display-id requires a value".to_string())?;
+                        display_id = Some(parse_u32_argument(&value, "--display-id")?);
+                    }
+                    "--width" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| "--width requires a value".to_string())?;
+                        width = parse_u32_argument(&value, "--width")?;
+                    }
+                    "--height" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| "--height requires a value".to_string())?;
+                        height = parse_u32_argument(&value, "--height")?;
+                    }
+                    "--refresh-hz" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| "--refresh-hz requires a value".to_string())?;
+                        refresh_hz = parse_u32_argument(&value, "--refresh-hz")?;
+                    }
+                    "--hdr10" => hdr10 = true,
+                    "--acknowledge-temporary-display-mutation" => acknowledged = true,
+                    "-h" | "--help" => {
+                        eprintln!(
+                            "USAGE:\n  arcen-pier nvapi-provision-arcen-edid --display-id <ID> \
+                             [--width <PX>] [--height <PX>] [--refresh-hz <HZ>] [--hdr10] \
+                             --acknowledge-temporary-display-mutation\n\n\
+                             Writes a persistent Arcen EDID to an NVIDIA display id. The inverse \
+                             of nvapi-clear-arcen-edid: use it to put back a display a clear \
+                             removed, when a pinned platform.desktop output no longer resolves.\n\n\
+                             --hdr10 writes the HDR10 EDID instead of the SDR one, so the display \
+                             advertises HDR10 permanently and Windows Display Settings offers a \
+                             \"Use HDR\" toggle outside an Arcen session."
+                        );
+                        std::process::exit(0);
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown nvapi-provision-arcen-edid argument: {other}"
+                        ));
+                    }
+                }
+            }
+            if !acknowledged {
+                return Err(
+                    "nvapi-provision-arcen-edid requires --acknowledge-temporary-display-mutation"
+                        .to_string(),
+                );
+            }
+            Ok(Some(MaintenanceCommand::NvapiProvisionArcenEdid {
+                display_id: display_id.ok_or_else(|| {
+                    "nvapi-provision-arcen-edid requires --display-id".to_string()
+                })?,
+                width,
+                height,
+                refresh_hz,
+                hdr10,
+            }))
+        }
+        #[cfg(windows)]
+        "nvapi-clear-arcen-edid" => {
+            let mut display_id = None;
+            let mut dry_run = false;
+            let mut json = false;
+            let mut acknowledged = false;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--display-id" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| "--display-id requires a value".to_string())?;
+                        display_id = Some(parse_u32_argument(&value, "--display-id")?);
+                    }
+                    "--dry-run" => dry_run = true,
+                    "--json" => json = true,
+                    "--acknowledge-temporary-display-mutation" => acknowledged = true,
+                    "-h" | "--help" => {
+                        eprintln!(
+                            "USAGE:\n  arcen-pier nvapi-clear-arcen-edid [--display-id <ID>] \
+                             [--dry-run] [--json] \
+                             --acknowledge-temporary-display-mutation\n\n\
+                             Removes EDIDs this host previously wrote through NVAPI. Always \
+                             keeps one display that Windows is using: a host with no active \
+                             display cannot present LogonUI and is unreachable without a \
+                             hypervisor console (ADR 0009).\n\n\
+                             Clearing changes display enumeration, which can leave a pinned \
+                             `platform.desktop` adapter/output selector resolving to a display \
+                             that no longer exists -- sessions then fail with \
+                             NVAPI_NVIDIA_DEVICE_NOT_FOUND. Reboot after clearing, and confirm \
+                             a session before leaving the host unattended."
+                        );
+                        std::process::exit(0);
+                    }
+                    other => {
+                        return Err(format!("unknown nvapi-clear-arcen-edid argument: {other}"));
+                    }
+                }
+            }
+            if !dry_run && !acknowledged {
+                return Err(
+                    "nvapi-clear-arcen-edid requires --acknowledge-temporary-display-mutation"
+                        .to_string(),
+                );
+            }
+            Ok(Some(MaintenanceCommand::NvapiClearArcenEdid {
+                request: nvapi_headless::ClearRequest {
+                    display_id,
+                    dry_run,
+                },
+                json,
+            }))
         }
         #[cfg(windows)]
         "support-bundle" => {
@@ -1670,6 +1828,8 @@ where
         bit_depth,
         color_range,
         color_matrix,
+        transfer: arcen_media::TransferCharacteristics::Bt709,
+        color_primaries: arcen_media::ColorPrimaries::Bt709,
         color_policy,
         qp_map,
         video_selection,
@@ -2276,6 +2436,69 @@ fn main() {
                 #[cfg(windows)]
                 MaintenanceCommand::NvapiHeadlessRestore { journal } => {
                     nvapi_headless::restore(journal)
+                }
+                #[cfg(windows)]
+                MaintenanceCommand::NvapiProvisionArcenEdid {
+                    display_id,
+                    width,
+                    height,
+                    refresh_hz,
+                    hdr10,
+                } => match nvapi_headless::provision_arcen_edid(
+                    display_id, width, height, refresh_hz, hdr10,
+                ) {
+                    Ok(()) => {
+                        println!(
+                            "provisioned Arcen EDID on display 0x{display_id:08x} \
+                             ({width}x{height}@{refresh_hz})"
+                        );
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                },
+                #[cfg(windows)]
+                MaintenanceCommand::NvapiClearArcenEdid { request, json } => {
+                    match nvapi_headless::clear_arcen_edids(request) {
+                        Ok(outcome) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&outcome).unwrap_or_else(
+                                        |error| format!("{{\"error\":\"{error}\"}}")
+                                    )
+                                );
+                            } else {
+                                let verb = if outcome.dry_run {
+                                    "would clear"
+                                } else {
+                                    "cleared"
+                                };
+                                for display in &outcome.cleared {
+                                    println!(
+                                        "{verb} display 0x{:08x} on {} (output 0x{:08x})",
+                                        display.display_id, display.adapter, display.output_id
+                                    );
+                                }
+                                for display in &outcome.kept {
+                                    println!(
+                                        "kept    display 0x{:08x} on {}{}",
+                                        display.display_id,
+                                        display.adapter,
+                                        if display.in_display_config {
+                                            " (in display config)"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                }
+                                if outcome.cleared.is_empty() {
+                                    println!("nothing to clear");
+                                }
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 MaintenanceCommand::RestoreWatchdog {
                     resource,

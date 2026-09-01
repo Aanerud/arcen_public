@@ -1,7 +1,7 @@
 # clients/macos — `arcen-deck-macos` (Arcen Deck)
 
-**Delivery:** Arcen Deck, the macOS client. Product surface. Binary `arcen-deck`, app
-`Arcen Deck.app`, bundle id `com.example.arcen.deck`.
+**Delivery:** Arcen Deck, the macOS client. Product surface. Binary
+`arcen-deck`, app `Arcen Deck.app`, bundle id `deck.arcen.tech`.
 
 ## What this is
 
@@ -16,8 +16,10 @@ its platform's decode/render path.
 ## How it's grounded
 
 - Lessons encoded:
-  - **Default profile = HEVC 4:4:4 @ 60fps** (not h264/4:2:0/15) — creative-pro fidelity is
-    the point; CLI flags still override (`initial_stream_profile()` in `ui/app.rs`).
+  - **Production presets are complete contracts.** Auto is 30 fps adaptive
+    4:2:0 8-bit, Speed is the same at 60 fps, Grading is HEVC 4:4:4 10-bit
+    BT.709, and HDR is HEVC 4:4:4 10-bit BT.2020/PQ. Exact axes remain
+    diagnostic-only.
   - **The framed handshake is tolerant.** `transport/websocket.rs::recv_json`
     loops over `Close`/`Ping`/`Pong` control frames on the QUIC stream instead of
     erroring "expected text, got control frame", and surfaces the host's close
@@ -37,15 +39,39 @@ its platform's decode/render path.
 3. Platform code (`objc2`, VideoToolbox, AppKit) stays behind `cfg(target_os = "macos")`;
    the crate must still `cargo check` on non-macos for protocol/transport unit tests.
 4. `unsafe` is allowed (FFI to Apple frameworks, ~20 sites) but scoped and justified.
-5. User-facing strings, window/app/menu titles, bundle id use **Arcen Deck** / `com.example.arcen.deck`.
+5. User-facing strings, window/app/menu titles, bundle id use **Arcen Deck** /
+   `deck.arcen.tech`.
 
 ## Interfaces / boundaries
 
 - **Consumes:** `arcen-input`, `arcen-media`, `arcen-protocol`; a running Arcen
   Pier over QUIC on the configured UDP port (18444 by default).
-- **Exposes:** the `Arcen Deck.app` GUI (Performance Mode + Colour Fidelity)
-  plus the `arcen-deck` diagnostic CLI. Exact codec/chroma/variant flags are
+- **Exposes:** the `Arcen Deck.app` GUI (Auto / Speed / Grading / HDR) plus the
+  `arcen-deck` diagnostic CLI. Exact codec/chroma/variant flags are
   engineering-only, not production user choices.
+
+## Separate decode and presentation pipelines
+
+The Deck does not infer a presentation path from a preset name. It consumes the
+host's resolved frame/header truth and selects one of two concrete surfaces:
+
+| Resolved stream | Decode and presentation |
+| --- | --- |
+| 8-bit SDR | VideoToolbox native decode, with the ordinary SDR UI/video presentation path |
+| 10-bit BT.709 Grading | VideoToolbox native `xf44`, retained `CVPixelBuffer`, `R16Unorm`/`RG16Unorm` plane textures, dedicated `RGB10A2Unorm` Metal layer; EDR off |
+| 10-bit BT.2020/PQ HDR | The same native 10-bit Metal path, plus `kCGColorSpaceITUR_2100_PQ`, HDR10 `CAEDRMetadata`, and EDR |
+
+Transfer is the HDR switch. Bit depth is not: Grading is ten-bit and remains
+SDR. VideoToolbox format descriptions preserve the negotiated BT.709, sRGB, PQ,
+or HLG transfer instead of deriving transfer from matrix. If native 10-bit
+texture/layer creation fails, the existing BGRA/egui fallback remains
+available, but a persistent warning makes the presentation downgrade visible.
+
+The UI and transport preserve the same separation. Selecting a product preset
+sets frame rate, complete colour contract, and encoder intent together.
+`ServerHello`, per-frame flags, and the negotiated primaries/transfer determine
+what is actually displayed; a host downgrade can never leave the HDR control
+looking active while the Deck silently presents SDR.
 
 ## Module map (from the proven source)
 
@@ -60,7 +86,11 @@ its platform's decode/render path.
   `theme.rs`, `keyboard.rs`, `media_worker.rs`, `macos_menu.rs`.
 - `transport/` — `websocket.rs` (QUIC socket plus tolerant framed `recv_json`; the filename reflects the internal tungstenite message-framing codec, not a network WSS connection),
   `connector.rs`, `tls.rs`, `mod.rs`.
-- `pipeline/` — `video_decoder.rs` (VideoToolbox), `frame_queue.rs`, `audio.rs`.
+- `pipeline/` — `video_decoder.rs` (VideoToolbox, native 8/10-bit pixel-buffer
+  metadata), `frame_queue.rs`, `audio.rs`.
+- `ui/video_metal_layer.rs` / `.metal` — the dedicated native ten-bit
+  Grading/HDR presentation pipeline. It is separate from the ordinary egui
+  surface and enables EDR only for PQ.
 - `protocol/` — `keymap.rs` (client-side key mapping), `mod.rs`.
 - `tablet/` — the default, non-experimental typed-pen capture path: `monitor.rs`
   (main-thread AppKit `NSEvent` tabletPoint/tabletProximity local-monitor RAII
@@ -294,17 +324,12 @@ runtime `AVAudioEngine` consent check in `microphone.rs`, with no entitlement
 involved. See `clients/macos/CERTIFICATES.md` for the full cert/profile
 inventory and both explicit signing paths.
 
-Capabilities enabled on the `com.example.arcen.deck` App ID but not yet in the
-provisioning profile or `Deck.entitlements` (Increased Memory Limit,
-Background GPU Access, App Attest, Data Protection) remain pending a
-regenerated profile and an implemented use. Network Extensions
-(`com.apple.developer.networking.networkextension`,
-`com.apple.developer.networking.vpn.api`) and App Groups
-(`com.apple.security.application-groups`) are different: the real external
-profile already authorizes them today, but they are intentionally not
-requested in `Deck.entitlements` because Deck has no Network Extension bundle
-or shared-container use yet — see
-`clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`.
+The active App ID is `deck.arcen.tech`. The release profile and
+`Deck.entitlements` intentionally carry only capabilities Deck implements.
+Portal-side capabilities do not become product behavior by being enabled, and
+must never be added to the executable merely to make a profile look complete.
+See `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md` for the reviewed capability
+boundary.
 
 `validate_release_inputs.py` also enforces an explicit profile class
 (`--profile-class release|development`, threaded through both validator

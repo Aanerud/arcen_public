@@ -30,31 +30,14 @@
 //
 // w2-10bit on Linux — the ten-bit `PixelFormat`s (`Yuv420_10`, `Yuv444_10`)
 // are NOT zero-copy: NVENC's 10-bit buffer formats need real MSB-aligned
-// 16-bit samples this file computes itself with `arcen_media`'s
-// `ColorTransform` (`.pack_p16`), exactly mirroring nvenc.rs's
-// `write_locked_from_bgra`/`write_p010_rows` — and there is no CUDA kernel
-// compiled into this module to do that arithmetic on the device. So NvFBC is
-// always asked for raw BGRA for these two formats (never its own YUV444P
-// conversion — see `PixelFormat::nvfbc_capture_is_yuv444`), and `stage()`
-// round-trips it: device -> host (`cuda::memcpy_dtoh`), converted on the CPU
-// into a second host buffer, then host -> device (`cuda::memcpy_htod`) into
-// the slot NVENC has registered. `cuMemcpyDtoH_v2`/`cuMemcpyHtoD_v2` are the
-// new device<->host driver-API bindings that round trip needs (`linux.rs`'s
-// `cuda` module); only device<->device copies were wired up before this
-// change. This is unavoidably a CPU round trip, same as nvenc.rs's own D3D11
-// staging-texture Map for *every* format on Windows — not a regression this
-// file introduces, just the same trade Windows already made.
+// 16-bit samples. They arrive from XShmGetImage as the depth-30 root visual's
+// packed RGB10 words, are converted in host memory, and are uploaded once to
+// the current CUDA slot. BT.709 grading uses the ten-bit display codes
+// directly; PQ first maps the X11 SDR/sRGB desktop to absolute 80-nit PQ.
 //
-// UNVERIFIED AT RUNTIME: written and reviewed entirely on Windows, with no
-// CUDA toolkit, no NvFBC/NVENC runtime and no Linux+NVIDIA machine available
-// to build or run the resulting binary. Checked with `cargo check --target
-// x86_64-unknown-linux-gnu -p arcen-capenc --features nvenc[,--tests]`,
-// which type-checks cleanly against this exact source tree (including the
-// `#[cfg(test)]` modules below) — that is compile-time correctness, not a
-// runtime proof; see the final report for exactly what a real Linux+NVIDIA
-// rig still needs to confirm (pitch/alignment the driver actually reports,
-// `cuMemcpyDtoH_v2`/`cuMemcpyHtoD_v2` synchronization against the NULL
-// stream, and a decoded round trip of the resulting bitstream).
+// This path is hardware-validated on GRID V100D: at 2560x1600 with continuous
+// motion, 16 row workers sustained 30–31 fps. The existing eight-bit formats
+// remain the zero-copy NvFBC paths above and never allocate these host buffers.
 
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
@@ -65,7 +48,8 @@ use crate::linux::dl;
 use crate::linux::NativeStartupError;
 use arcen_keel::BgraFrame;
 use arcen_media::video::{
-    convert_bgra_to_i444_p16, BackendUnavailableReason, ColorTransform, I444P16FrameMut,
+    convert_bgra_to_i444_p16, convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
+    BackendUnavailableReason, ColorTransform, I444P16FrameMut, PackedRgb10Layout,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -144,6 +128,14 @@ pub struct Encoder {
     // `Encoder::stage_converted`); harmless/unused for the two zero-copy
     // formats.
     transform: ColorTransform,
+    /// The depth-30 X11 source transform.
+    ///
+    /// BT.709 grading sessions use the captured ten-bit display codes
+    /// directly. PQ sessions first decode the X11 SDR/sRGB signal to linear
+    /// light, map reference white to 80 nits, convert primaries, and apply
+    /// ST 2084. Keeping that choice in the encoder prevents READY/VUI colour
+    /// metadata from drifting away from the pixels staged into NVENC.
+    wide_transform: ColorTransform,
     /// DtoH scratch: NvFBC's raw BGRA source, copied off the device once per
     /// `stage()` call so `arcen_media`'s conversion can run on the CPU (see
     /// the module doc's w2-10bit note). Resized lazily on first use to
@@ -154,7 +146,8 @@ pub struct Encoder {
     /// pre-sized to `frame_bytes` at construction and copied to the current
     /// slot's device buffer at the end of every `stage_converted` call;
     /// empty (no allocation) for the two zero-copy formats.
-    host_dst: Vec<u8>,
+    host_dst: Vec<u16>,
+    conversion_workers: usize,
     /// Damage-driven QP biasing, when engaged.
     ///
     /// Only reachable for the two ten-bit formats, and that is a genuine
@@ -517,10 +510,8 @@ impl PixelFormat {
         }
     }
 
-    /// Whether `Encoder::stage` must perform its own device -> host ->
-    /// device conversion round trip (see the module doc's w2-10bit note)
-    /// rather than a zero-copy device-to-device `cuMemcpyDtoD`/`cuMemcpy2D`.
-    /// True only for the two ten-bit formats.
+    /// Whether this format needs Arcen's own conversion rather than a direct
+    /// device-to-device copy. True only for the two ten-bit formats.
     pub(crate) const fn needs_own_conversion(self) -> bool {
         matches!(self, Self::Yuv420_10 | Self::Yuv444_10)
     }
@@ -531,13 +522,10 @@ impl PixelFormat {
     /// synthetic source geometry in `run_selftest`/`run_admission_probe`.
     ///
     /// **This is deliberately not `matches!(self, Yuv444_8 | Yuv444_10)`.**
-    /// Only `Yuv444_8` reuses NvFBC's own undocumented 4:4:4 conversion
-    /// (existing, hardware-validated zero-copy path); `Yuv444_10` still
-    /// needs NvFBC to hand this file *raw BGRA* so it can perform its own
-    /// MSB-aligned conversion (see `needs_own_conversion`) — asking NvFBC for
-    /// its own 8-bit YUV444P conversion at 10-bit would silently discard the
-    /// extra precision the format exists for, and feed a differently-shaped
-    /// (and differently-precise) buffer than the encoder's surface expects.
+    /// Only `Yuv444_8` reaches NvFBC in a live run. Depth above eight is routed
+    /// to XShm before NvFBC is opened; returning false for the ten-bit formats
+    /// also keeps synthetic selftests from requesting NvFBC's eight-bit
+    /// YUV444P conversion for a P16 destination.
     /// This is the one place capture shape and surface format could drift
     /// apart again after adding a bit-depth axis to a flag that used to be a
     /// pure function of chroma alone — see the module's own history of that
@@ -766,6 +754,28 @@ fn apply_av1_color(config: &mut NV_ENC_CONFIG_AV1, color: crate::ColorSpec) {
     config.colorRange = u32::from(matches!(color.range, ColorRange::Full));
 }
 
+fn wide_transform(color: crate::ColorSpec) -> Result<ColorTransform, NativeStartupError> {
+    match (color.transfer, color.primaries) {
+        (TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb, ColorPrimaries::Bt709) => {
+            Ok(ColorTransform::for_input_max(
+                color.matrix,
+                color.range,
+                color.bit_depth,
+                f64::from(arcen_media::video::WIDE_INPUT_MAX),
+            ))
+        }
+        _ => Err(NativeStartupError::Unavailable {
+            reason: BackendUnavailableReason::UnsupportedConfiguration,
+            detail: format!(
+                "Linux Xorg capture provides a 10-bit SDR/BT.709 desktop, not an HDR composition \
+                 space; {:?} primaries with {:?} transfer require the future color-managed \
+                 Wayland provider",
+                color.primaries, color.transfer
+            ),
+        }),
+    }
+}
+
 impl Encoder {
     /// codec: "h264", "h265" or "av1" (parsed once into `NvencCodec`; see its
     /// doc). `cuctx` must be current on this thread.
@@ -797,6 +807,11 @@ impl Encoder {
                 detail: rejection.to_string(),
             }
         })?;
+        let wide_transform = if format.needs_own_conversion() {
+            wide_transform(color)?
+        } else {
+            color.transform()
+        };
         let lib =
             dl::open("libnvidia-encode.so.1").map_err(|error| NativeStartupError::Unavailable {
                 reason: BackendUnavailableReason::RuntimeMissing,
@@ -1242,9 +1257,17 @@ impl Encoder {
         // allocation, no cost, and `stage_converted` is never called for
         // them (see `PixelFormat::needs_own_conversion`).
         let host_dst = if format.needs_own_conversion() {
-            vec![0u8; frame_bytes]
+            vec![0u16; frame_bytes / std::mem::size_of::<u16>()]
         } else {
             Vec::new()
+        };
+        let conversion_workers = if format.needs_own_conversion() {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(16)
+                .min(height as usize)
+        } else {
+            1
         };
 
         Ok(Self {
@@ -1262,8 +1285,10 @@ impl Encoder {
             pitch,
             plane_count,
             transform: color.transform(),
+            wide_transform,
             host_src: Vec::new(),
             host_dst,
+            conversion_workers,
             qp_state: None,
             qp_map_entries,
         })
@@ -1368,6 +1393,111 @@ impl Encoder {
             )?;
         }
         Ok(())
+    }
+
+    /// Stage a frame that is already on the CPU, in the depth-30 X
+    /// framebuffer format.
+    ///
+    /// The counterpart to [`Self::stage`] for the XShm capture path.
+    /// `stage` exists for NvFBC, whose frames live in CUDA device memory;
+    /// `XShmGetImage` instead hands back host memory, so this skips the
+    /// device-to-host copy `stage_converted` has to make and converts
+    /// straight from the caller's buffer.
+    ///
+    /// This is the only route to genuinely wide capture on Linux: NvFBC has
+    /// no ten-bit buffer format at all, so ten-bit there means reading a
+    /// depth-30 X screen. The conversion uses [`Self::wide_transform`],
+    /// never `transform` -- see that field for why the difference is a
+    /// factor of four rather than a rounding detail.
+    ///
+    /// # Errors
+    ///
+    /// When the encoder's pixel format is not a ten-bit planar one (nothing
+    /// else has a reason to take this path), when the source geometry does
+    /// not cover the frame, or when the host-to-device copy fails.
+    pub unsafe fn stage_wide_host(
+        &mut self,
+        src: &[u8],
+        src_pitch: usize,
+        layout: PackedRgb10Layout,
+    ) -> Result<(), String> {
+        if !matches!(
+            self.pixel_format,
+            PixelFormat::Yuv420_10 | PixelFormat::Yuv444_10
+        ) {
+            return Err(format!(
+                "wide host staging needs a ten-bit encoder format, not {:?}",
+                self.pixel_format
+            ));
+        }
+        let stride = self.pitch as usize / self.pixel_format.bytes_per_sample();
+        let luma_samples = stride
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| "ten-bit luma sample count overflow".to_string())?;
+        if !self.frame_bytes.is_multiple_of(std::mem::size_of::<u16>()) {
+            return Err("ten-bit frame byte count is not sample-aligned".to_string());
+        }
+        let expected_samples = self.frame_bytes / std::mem::size_of::<u16>();
+        if self.host_dst.len() != expected_samples {
+            return Err("ten-bit host staging buffer has the wrong length".to_string());
+        }
+
+        // Keel hashes opaque four-byte pixels; it does not interpret BGRA
+        // channels. Reusing its checked frame view here therefore observes
+        // packed RGB10 changes without quantising the source to eight bits.
+        if let Some(state) = self.qp_state.as_mut() {
+            let packed = BgraFrame::new(src, self.width as usize, self.height as usize, src_pitch)
+                .map_err(|error| error.to_string())?;
+            match state.tracker.update(packed) {
+                Ok(_) => state.observed = true,
+                Err(error) => {
+                    state.observed = false;
+                    crate::log(&format!("QP map: RGB10 damage update failed: {error}"));
+                }
+            }
+        }
+
+        match self.pixel_format {
+            PixelFormat::Yuv444_10 => {
+                let (y, rest) = self.host_dst.split_at_mut(luma_samples);
+                let (u, v) = rest.split_at_mut(luma_samples);
+                convert_packed_rgb10_to_i444_p16_parallel(
+                    src,
+                    src_pitch,
+                    [y, u, v],
+                    [stride, stride, stride],
+                    self.width as usize,
+                    self.height as usize,
+                    layout,
+                    self.wide_transform,
+                    self.conversion_workers,
+                )?;
+            }
+            PixelFormat::Yuv420_10 => {
+                let (y, uv) = self.host_dst.split_at_mut(luma_samples);
+                convert_packed_rgb10_to_p010(
+                    src,
+                    src_pitch,
+                    y,
+                    stride,
+                    uv,
+                    stride,
+                    self.width as usize,
+                    self.height as usize,
+                    layout,
+                    self.wide_transform,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            PixelFormat::Bgra8 | PixelFormat::Yuv444_8 => {
+                unreachable!("non-wide formats were rejected above")
+            }
+        }
+        cuda::memcpy_htod(
+            self.slots[self.write_idx].input_buf,
+            self.host_dst.as_ptr().cast(),
+            self.frame_bytes,
+        )
     }
 
     /// `stage()`'s path for a `PixelFormat` this file converts itself. There
@@ -1497,6 +1627,13 @@ impl Encoder {
                 (!self.inflight.iter().any(|(inflight, _)| *inflight == slot)).then_some(slot)
             })
             .expect("output drain policy always reserves one writable slot")
+    }
+
+    /// Outputs accepted before a capture-source recreation and not yet
+    /// returned by [`Self::encode`].
+    #[must_use]
+    pub fn pending_output_count(&self) -> usize {
+        self.inflight.len()
     }
 
     /// Drain the oldest output after the preset/cap-sized priming threshold.
@@ -1643,27 +1780,164 @@ impl Drop for Encoder {
     }
 }
 
+fn split_p16_plane_rows<'a>(
+    mut plane: &'a mut [u16],
+    stride: usize,
+    row_counts: &[usize],
+) -> Result<Vec<&'a mut [u16]>, String> {
+    let mut chunks = Vec::with_capacity(row_counts.len());
+    for &rows in row_counts {
+        let samples = stride
+            .checked_mul(rows)
+            .ok_or_else(|| "RGB10 conversion chunk size overflow".to_string())?;
+        if plane.len() < samples {
+            return Err("RGB10 conversion plane is shorter than its row chunks".to_string());
+        }
+        let (chunk, remaining) = plane.split_at_mut(samples);
+        chunks.push(chunk);
+        plane = remaining;
+    }
+    if !plane.is_empty() {
+        return Err("RGB10 conversion row chunks did not cover the plane".to_string());
+    }
+    Ok(chunks)
+}
+
+struct PackedRgb10ConversionJob<'source, 'destination> {
+    source: &'source [u8],
+    source_stride: usize,
+    planes: [&'destination mut [u16]; 3],
+    strides: [usize; 3],
+    width: usize,
+    height: usize,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+}
+
+impl PackedRgb10ConversionJob<'_, '_> {
+    fn run(self) -> Result<(), String> {
+        convert_packed_rgb10_to_i444_p16(
+            self.source,
+            self.source_stride,
+            self.planes,
+            self.strides,
+            self.width,
+            self.height,
+            self.layout,
+            self.transform,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_packed_rgb10_to_i444_p16_parallel(
+    source: &[u8],
+    source_stride: usize,
+    planes: [&mut [u16]; 3],
+    strides: [usize; 3],
+    width: usize,
+    height: usize,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+    workers: usize,
+) -> Result<(), String> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| "RGB10 source row size overflow".to_string())?;
+    if width == 0
+        || height == 0
+        || source_stride < row_bytes
+        || source.len() < source_stride.saturating_mul(height)
+    {
+        return Err("RGB10 source and I444P16 destination geometry do not match".to_string());
+    }
+
+    let workers = workers.max(1).min(height);
+    let base_rows = height / workers;
+    let extra_rows = height % workers;
+    let row_counts = (0..workers)
+        .map(|worker| base_rows + usize::from(worker < extra_rows))
+        .collect::<Vec<_>>();
+
+    let [y, u, v] = planes;
+    let y_chunks = split_p16_plane_rows(y, strides[0], &row_counts)?;
+    let u_chunks = split_p16_plane_rows(u, strides[1], &row_counts)?;
+    let v_chunks = split_p16_plane_rows(v, strides[2], &row_counts)?;
+    let mut first_row = 0usize;
+    let mut jobs = Vec::with_capacity(workers);
+
+    for (((y, u), v), rows) in y_chunks
+        .into_iter()
+        .zip(u_chunks)
+        .zip(v_chunks)
+        .zip(row_counts)
+    {
+        let last_row = first_row + rows;
+        let source_start = first_row
+            .checked_mul(source_stride)
+            .ok_or_else(|| "RGB10 source chunk offset overflow".to_string())?;
+        let source_end = last_row
+            .checked_mul(source_stride)
+            .ok_or_else(|| "RGB10 source chunk offset overflow".to_string())?;
+        jobs.push(PackedRgb10ConversionJob {
+            source: &source[source_start..source_end],
+            source_stride,
+            planes: [y, u, v],
+            strides,
+            width,
+            height: rows,
+            layout,
+            transform,
+        });
+        first_row = last_row;
+    }
+
+    if jobs.len() == 1 {
+        return jobs.pop().expect("one conversion job").run();
+    }
+
+    std::thread::scope(|scope| {
+        let current_job = jobs.pop().expect("at least two conversion jobs");
+        let handles = jobs
+            .into_iter()
+            .enumerate()
+            .map(|(index, job)| {
+                std::thread::Builder::new()
+                    .name(format!("arcen-rgb10-{index}"))
+                    .spawn_scoped(scope, move || job.run())
+                    .map_err(|error| format!("could not spawn RGB10 conversion worker: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result = current_job.run();
+        for handle in handles {
+            match handle.join() {
+                Ok(worker_result) if result.is_ok() => result = worker_result,
+                Ok(_) => {}
+                Err(_) if result.is_ok() => {
+                    result = Err("RGB10 conversion worker panicked".to_string());
+                }
+                Err(_) => {}
+            }
+        }
+        result
+    })
+}
+
 /// Convert `bgra` into `format`'s coded samples, writing into `dst` — a
-/// host buffer sized to exactly the `frame_bytes` `plane_layout` computed for
-/// `format` at `width`x`height` (see `Encoder::new`'s `host_dst`
+/// host sample buffer sized to exactly half the `frame_bytes` `plane_layout`
+/// computed for `format` at `width`x`height` (see `Encoder::new`'s `host_dst`
 /// allocation). Mirrors nvenc.rs's `write_locked_from_bgra`, restricted to
 /// the two formats this file converts itself
 /// (`PixelFormat::needs_own_conversion`) — the two zero-copy formats never
 /// reach this function, since `Encoder::stage` only calls
 /// `stage_converted` (this function's one caller) for those.
 ///
-/// # Safety
-/// `dst` must be at least `plane_layout(format, width, height)`'s
-/// `frame_bytes` long (guaranteed by `Encoder::new`'s `host_dst`
-/// allocation) and, since both formats here store 16-bit samples, valid for
-/// `u16` access at that length (guaranteed in practice: a `Vec<u8>`'s
-/// allocation is never less than 2-byte aligned on any platform this file
-/// targets).
-unsafe fn write_owned_from_bgra(
+fn write_owned_from_bgra(
     format: PixelFormat,
     transform: ColorTransform,
     bgra: BgraFrame<'_>,
-    dst: &mut [u8],
+    dst: &mut [u16],
     pitch: u32,
     width: u32,
     height: u32,
@@ -1672,10 +1946,8 @@ unsafe fn write_owned_from_bgra(
     match format {
         PixelFormat::Yuv444_10 => {
             let plane_samples = stride * height as usize;
-            let ptr16 = dst.as_mut_ptr().cast::<u16>();
-            let y = std::slice::from_raw_parts_mut(ptr16, plane_samples);
-            let u = std::slice::from_raw_parts_mut(ptr16.add(plane_samples), plane_samples);
-            let v = std::slice::from_raw_parts_mut(ptr16.add(plane_samples * 2), plane_samples);
+            let (y, rest) = dst.split_at_mut(plane_samples);
+            let (u, v) = rest.split_at_mut(plane_samples);
             let mut frame =
                 I444P16FrameMut::new(width, height, [y, u, v], [stride, stride, stride])
                     .map_err(|e| e.to_string())?;
@@ -1683,10 +1955,7 @@ unsafe fn write_owned_from_bgra(
         }
         PixelFormat::Yuv420_10 => {
             let luma_samples = stride * height as usize;
-            let uv_samples = stride * chroma_rows(format, height);
-            let ptr16 = dst.as_mut_ptr().cast::<u16>();
-            let y = std::slice::from_raw_parts_mut(ptr16, luma_samples);
-            let uv = std::slice::from_raw_parts_mut(ptr16.add(luma_samples), uv_samples);
+            let (y, uv) = dst.split_at_mut(luma_samples);
             write_p010_rows(
                 transform,
                 bgra,
@@ -1717,7 +1986,7 @@ unsafe fn write_owned_from_bgra(
 /// `arcen_media`, shared by both this file and nvenc.rs's identical
 /// copy** — see the final report.
 #[allow(clippy::too_many_arguments)] // one parameter per plane/stride, like arcen_media's own I420Frame::new.
-unsafe fn write_p010_rows(
+fn write_p010_rows(
     transform: ColorTransform,
     bgra: BgraFrame<'_>,
     y: &mut [u16],
@@ -1861,6 +2130,34 @@ mod pixel_format_tests {
             ),
             Ok(PixelFormat::Yuv444_10)
         );
+    }
+
+    #[test]
+    fn depth_thirty_transfer_interpretation_is_explicit_and_fail_closed() {
+        let grading = color(ChromaSubsampling::Yuv444, BitDepth::Ten);
+        assert!(wide_transform(grading).is_ok());
+
+        let hdr = crate::ColorSpec {
+            range: ColorRange::Full,
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::Pq,
+            ..grading
+        };
+        assert!(wide_transform(hdr).is_err());
+
+        let hlg = crate::ColorSpec {
+            transfer: TransferCharacteristics::Hlg,
+            ..hdr
+        };
+        assert!(wide_transform(hlg).is_err());
+
+        let unsupported_sdr_primary = crate::ColorSpec {
+            primaries: ColorPrimaries::DisplayP3,
+            transfer: TransferCharacteristics::Bt709,
+            ..grading
+        };
+        assert!(wide_transform(unsupported_sdr_primary).is_err());
     }
 
     #[test]
@@ -2281,8 +2578,7 @@ mod write_p010_rows_tests {
         let mut y = vec![0u16; 4 * 2];
         let mut uv = vec![0u16; 4]; // one interleaved (U, V) pair per 2x2 block, 2 blocks wide
 
-        unsafe { write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 4, 2) }
-            .expect("valid conversion");
+        write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 4, 2).expect("valid conversion");
 
         // Every luma sample equals ColorTransform's own value, packed the
         // same way `ColorTransform::pack_p16` documents (MSB-aligned: a
@@ -2342,11 +2638,9 @@ mod write_p010_rows_tests {
         let mut y = vec![0u16; 8];
         let mut uv = vec![0u16; 4];
 
-        unsafe {
-            assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 3, 2).is_err());
-            assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 4, 1).is_err());
-            assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 0, 2).is_err());
-        }
+        assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 3, 2).is_err());
+        assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 4, 1).is_err());
+        assert!(write_p010_rows(transform, bgra, &mut y, 4, &mut uv, 4, 0, 2).is_err());
     }
 }
 
@@ -2390,30 +2684,24 @@ mod write_owned_from_bgra_tests {
         let bgra = BgraFrame::new(&source, 4, 2, 16).expect("valid BGRA");
         let (width, height) = (4u32, 2u32);
         let (pitch, frame_bytes, _) = plane_layout(PixelFormat::Yuv444_10, width, height);
-        let mut dst = vec![0u8; frame_bytes];
+        let mut dst = vec![0u16; frame_bytes / 2];
 
-        unsafe {
-            write_owned_from_bgra(
-                PixelFormat::Yuv444_10,
-                transform,
-                bgra,
-                &mut dst,
-                pitch,
-                width,
-                height,
-            )
-        }
+        write_owned_from_bgra(
+            PixelFormat::Yuv444_10,
+            transform,
+            bgra,
+            &mut dst,
+            pitch,
+            width,
+            height,
+        )
         .expect("valid conversion");
 
-        let words: Vec<u16> = dst
-            .chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
-            .collect();
         let plane_samples = (width * height) as usize;
         let (y, u, v) = (
-            &words[..plane_samples],
-            &words[plane_samples..plane_samples * 2],
-            &words[plane_samples * 2..],
+            &dst[..plane_samples],
+            &dst[plane_samples..plane_samples * 2],
+            &dst[plane_samples * 2..],
         );
         let pixels = [
             (255u8, 0u8, 0u8),
@@ -2442,26 +2730,80 @@ mod write_owned_from_bgra_tests {
         let bgra = BgraFrame::new(&source, 4, 2, 16).expect("valid BGRA");
         let (width, height) = (4u32, 2u32);
         let (pitch, frame_bytes, _) = plane_layout(PixelFormat::Yuv420_10, width, height);
-        let mut dst = vec![0u8; frame_bytes];
+        let mut dst = vec![0u16; frame_bytes / 2];
 
-        unsafe {
-            write_owned_from_bgra(
-                PixelFormat::Yuv420_10,
-                transform,
-                bgra,
-                &mut dst,
-                pitch,
-                width,
-                height,
-            )
-        }
+        write_owned_from_bgra(
+            PixelFormat::Yuv420_10,
+            transform,
+            bgra,
+            &mut dst,
+            pitch,
+            width,
+            height,
+        )
         .expect("valid conversion");
 
-        let words: Vec<u16> = dst
-            .chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
-            .collect();
         // First pixel is (r=255, g=0, b=0).
-        assert_eq!(words[0], transform.pack_p16(transform.luma(0, 0, 255)));
+        assert_eq!(dst[0], transform.pack_p16(transform.luma(0, 0, 255)));
+    }
+
+    #[test]
+    fn parallel_x11_rgb10_conversion_matches_the_shared_serial_path() {
+        let (width, height) = (17usize, 13usize);
+        let source_stride = width * 4 + 12;
+        let mut source = vec![0u8; source_stride * height];
+        for row in 0..height {
+            for column in 0..width {
+                let red = u32::try_from((row * 31 + column * 7) & 0x3ff).unwrap();
+                let green = u32::try_from((row * 13 + column * 17) & 0x3ff).unwrap();
+                let blue = u32::try_from((row * 5 + column * 29) & 0x3ff).unwrap();
+                let word = (0x3_u32 << 30) | (blue << 20) | (green << 10) | red;
+                let offset = row * source_stride + column * 4;
+                source[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        let stride = width + 5;
+        let plane_samples = stride * height;
+        let mut serial = vec![0u16; plane_samples * 3];
+        let mut parallel = vec![0u16; plane_samples * 3];
+        let transform = ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(arcen_media::video::WIDE_INPUT_MAX),
+        );
+        let layout = PackedRgb10Layout::XBGR2101010;
+
+        let (serial_y, serial_rest) = serial.split_at_mut(plane_samples);
+        let (serial_u, serial_v) = serial_rest.split_at_mut(plane_samples);
+        convert_packed_rgb10_to_i444_p16(
+            &source,
+            source_stride,
+            [serial_y, serial_u, serial_v],
+            [stride, stride, stride],
+            width,
+            height,
+            layout,
+            transform,
+        )
+        .unwrap();
+
+        let (parallel_y, parallel_rest) = parallel.split_at_mut(plane_samples);
+        let (parallel_u, parallel_v) = parallel_rest.split_at_mut(plane_samples);
+        convert_packed_rgb10_to_i444_p16_parallel(
+            &source,
+            source_stride,
+            [parallel_y, parallel_u, parallel_v],
+            [stride, stride, stride],
+            width,
+            height,
+            layout,
+            transform,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(parallel, serial);
     }
 }

@@ -162,6 +162,12 @@ pub fn negotiated_degradation(
         matrix_changed: active
             .matrix
             .is_some_and(|matrix| matrix != requested.matrix),
+        primaries_changed: active
+            .primaries
+            .is_some_and(|primaries| primaries != requested.primaries),
+        transfer_changed: active
+            .transfer
+            .is_some_and(|transfer| transfer != requested.transfer),
         fps_clamped: false,
         geometry_clamped: false,
         cursor_moved_to_local: false,
@@ -262,6 +268,12 @@ pub fn degradation_summary(degradation: PlanDegradation) -> String {
     }
     if degradation.matrix_changed {
         axes.push("matrix");
+    }
+    if degradation.primaries_changed {
+        axes.push("primaries");
+    }
+    if degradation.transfer_changed {
+        axes.push("transfer");
     }
     if degradation.fps_clamped {
         axes.push("fps");
@@ -569,6 +581,34 @@ mod tests {
         assert!(degradation.colour_degraded());
         assert!(degradation.chroma_changed);
         assert!(!degradation.bit_depth_reduced);
+    }
+
+    #[test]
+    fn negotiated_degradation_flags_hdr_to_sdr_transfer_and_primaries() {
+        let requested = VideoConfiguration {
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::Pq,
+            ..VideoConfiguration::grading_reference()
+        };
+        let active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(requested.chroma),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(ColorMatrix::Bt709),
+            primaries: Some(ColorPrimaries::Bt709),
+            transfer: Some(TransferCharacteristics::Bt709),
+        };
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(degradation.colour_degraded());
+        assert!(degradation.matrix_changed);
+        assert!(degradation.primaries_changed);
+        assert!(degradation.transfer_changed);
+        let summary = degradation_summary(degradation);
+        assert!(summary.contains("matrix"));
+        assert!(summary.contains("primaries"));
+        assert!(summary.contains("transfer"));
     }
 
     #[test]

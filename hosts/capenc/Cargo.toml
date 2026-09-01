@@ -1,6 +1,6 @@
 [package]
 name = "arcen-capenc"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -36,6 +36,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",          # HMONITOR in DXGI_OUTPUT_DESC gates GetDesc
+    # QueryDisplayConfig / DisplayConfigGetDeviceInfo: asks Windows whether an
+    # output can carry Advanced Color at all, which is the question an HDR EDID
+    # exists to change. Diagnostic only; see win_color_probe.rs.
+    "Win32_Devices_Display",
     "Win32_System_Threading",
     "Win32_System_Power",          # SetThreadExecutionState — keep the display awake
     "Win32_System_LibraryLoader",  # LoadLibrary/GetProcAddress for nvEncodeAPI64.dll

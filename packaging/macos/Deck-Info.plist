@@ -16,9 +16,9 @@
     <key>CFBundleDisplayName</key>
     <string>Arcen Deck</string>
     <key>CFBundleVersion</key>
-    <string>0.9.8</string>
+    <string>0.10.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.9.8</string>
+    <string>0.10.0</string>
     <!-- Shown by the standard About panel. Arcen is remote-access software, so
          AGPL-3.0 section 13 matters: a user who only ever receives this built
          bundle must still be able to find the corresponding source. The About

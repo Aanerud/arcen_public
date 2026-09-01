@@ -227,6 +227,8 @@ impl AgentConfig {
             bit_depth,
             color_range,
             color_matrix,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy,
             qp_map,
             video_selection: self.video_selection,

@@ -52,6 +52,10 @@ mod qp_map;
 mod wgc;
 #[cfg(windows)]
 mod win;
+/// Research diagnostic for genuine >8bpc source capture. See
+/// `docs/internal/ten-bit-source-capture.md`.
+#[cfg(windows)]
+mod win_color_probe;
 
 #[cfg(all(feature = "mf", windows))]
 mod annexb;
@@ -64,7 +68,13 @@ mod win_mf;
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod linux_policy;
-#[cfg(all(feature = "software-h264", target_os = "linux"))]
+// Compiled for the NVENC build as well as the software one.
+//
+// XShm is the only route to more than eight bits per channel on Linux --
+// NvFBC has no ten-bit buffer format (see `linux::nvfbc`'s own constants) --
+// so the ten-bit NVENC path needs this module too, not just the software
+// encoder it was originally written for.
+#[cfg(all(any(feature = "software-h264", feature = "nvenc"), target_os = "linux"))]
 mod linux_x11;
 #[cfg(all(feature = "nvenc", target_os = "linux"))]
 mod nvenc_cuda;
@@ -93,6 +103,21 @@ use std::io::Write;
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
 ))]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the Linux capture backend selected for `bit_depth` can composite
+/// the host cursor into captured frames.
+///
+/// NvFBC owns the eight-bit fast path and can include the cursor. The
+/// depth-30 XShm path deliberately captures only root-window pixels, so its
+/// cursor must remain client-local.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub const fn linux_capture_supports_host_cursor(bit_depth: arcen_media::BitDepth) -> bool {
+    matches!(
+        linux_policy::linux_capture_backend(bit_depth),
+        linux_policy::LinuxCaptureBackend::NvFbc
+    )
+}
 #[cfg(any(
     windows,
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
@@ -497,7 +522,40 @@ pub(crate) fn requested_qp_map(args: &[String]) -> Result<crate::qp_map::QpMapPo
 /// Propagates `requested_variant`'s error for an unknown or repeated
 /// `variant=`.
 pub(crate) fn requested_color(args: &[String], yuv444: bool) -> Result<ColorSpec, String> {
-    Ok(requested_variant(args)?.map_or_else(|| ColorSpec::legacy(yuv444), ColorSpec::from_variant))
+    let mut color =
+        requested_variant(args)?.map_or_else(|| ColorSpec::legacy(yuv444), ColorSpec::from_variant);
+    // `variant=` names codec, chroma, depth, range and matrix and has no room
+    // for transfer or primaries, so those arrive as their own tokens. Absent
+    // means the variant's own value, which is BT.709 for every variant today.
+    //
+    // An unknown token is an error rather than a silent BT.709: encoding SDR
+    // while the parent believes it asked for PQ is exactly the disagreement
+    // between the READY line and the actual encode that this function exists
+    // to prevent.
+    if let Some(value) = single_token(args, "transfer=")? {
+        color.transfer = TransferCharacteristics::from_token(&value)
+            .ok_or_else(|| format!("unknown transfer {value:?}"))?;
+    }
+    if let Some(value) = single_token(args, "primaries=")? {
+        color.primaries = ColorPrimaries::from_token(&value)
+            .ok_or_else(|| format!("unknown primaries {value:?}"))?;
+    }
+    Ok(color)
+}
+
+/// Reads one `name=value` argv token, refusing a repeat.
+///
+/// A repeated token is a caller bug that would otherwise resolve to whichever
+/// copy happened to be scanned last.
+fn single_token(args: &[String], prefix: &str) -> Result<Option<String>, String> {
+    let mut found: Option<String> = None;
+    for value in args.iter().filter_map(|arg| arg.strip_prefix(prefix)) {
+        if found.is_some() {
+            return Err(format!("repeated {prefix} argument"));
+        }
+        found = Some(value.to_owned());
+    }
+    Ok(found)
 }
 
 /// Resolve what the encoder should optimise for.
@@ -621,6 +679,22 @@ pub(crate) fn resolved_media_plan(
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
 ))]
 pub(crate) fn announce_ready(plan: ResolvedMediaPlan) -> std::io::Result<()> {
+    announce_ready_from(plan, None)
+}
+
+/// Announce READY, naming the capture path that will feed the encoder.
+///
+/// `capture` is `None` only where a path has not been taught to report itself;
+/// the Pier reads an absent field as "unreported" rather than guessing, so a
+/// path that stays silent degrades the log without breaking the handshake.
+#[cfg(any(
+    windows,
+    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
+))]
+pub(crate) fn announce_ready_from(
+    plan: ResolvedMediaPlan,
+    capture: Option<arcen_media::video::CaptureBackend>,
+) -> std::io::Result<()> {
     let session_log_id = SESSION_LOG_ID
         .get()
         .and_then(Option::as_ref)
@@ -628,7 +702,7 @@ pub(crate) fn announce_ready(plan: ResolvedMediaPlan) -> std::io::Result<()> {
     writeln!(
         std::io::stderr(),
         "{}",
-        format_ready_v1(plan, session_log_id)
+        arcen_media::video::format_ready_v1_with_capture(plan, capture, session_log_id)
     )
 }
 

@@ -14,9 +14,13 @@ mod software_h264;
 mod variant;
 
 pub use convert::{
-    ColorTransform, ConversionError, convert_bgra_to_i420, convert_bgra_to_i420_rows,
-    convert_bgra_to_i444, convert_bgra_to_i444_p16, convert_bgra_to_i444_p16_rows,
-    convert_bgra_to_i444_rows, convert_bgra_to_nv12, convert_bgra_to_nv12_rows,
+    ColorTransform, ConversionError, PackedRgb10Layout, ScrgbPqTransform, ScrgbSdrTransform,
+    WIDE_INPUT_MAX, convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i444,
+    convert_bgra_to_i444_p16, convert_bgra_to_i444_p16_rows, convert_bgra_to_i444_rows,
+    convert_bgra_to_nv12, convert_bgra_to_nv12_rows, convert_packed_rgb10_to_bgra8,
+    convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010, convert_scrgb_to_pq_i444_p16,
+    convert_scrgb_to_sdr_i444_p16, half_to_f32, linear_nits_to_pq_signal, linear_to_bt709,
+    linear_to_srgb, scrgb_component_to_pq_code,
 };
 pub use frame::{
     FrameLayoutError, I420Frame, I420FrameMut, I444Frame, I444FrameMut, I444P16FrameMut,
@@ -28,10 +32,11 @@ pub use intent::{
 pub use obu::av1_low_overhead_has_sequence_header;
 pub use plan::{
     AcceleratorClass, BackendAvailability, BackendCandidate, BackendLimits,
-    BackendUnavailableNotice, BackendUnavailableReason, EncoderBackend, EncoderRequest,
-    MediaPlanError, MediaRequest, PlanDegradation, ReadyExpectation, ReadyProtocolError,
-    ResolvedMediaPlan, UnavailableProtocolError, format_ready_v1, format_unavailable_v1,
-    parse_ready_v1, parse_unavailable_v1, resolve_media_plan, resolve_media_plan_degrading,
+    BackendUnavailableNotice, BackendUnavailableReason, CaptureBackend, EncoderBackend,
+    EncoderRequest, MediaPlanError, MediaRequest, PlanDegradation, ReadyExpectation,
+    ReadyProtocolError, ResolvedMediaPlan, UnavailableProtocolError, format_ready_v1,
+    format_ready_v1_with_capture, format_unavailable_v1, parse_ready_capture, parse_ready_v1,
+    parse_unavailable_v1, resolve_media_plan, resolve_media_plan_degrading,
 };
 pub use policy::{
     ClientColorRequest, ColorCeiling, ColorMatrixCapabilities, ColorPolicy, HostInitialVideoError,
