@@ -54,6 +54,9 @@ pub struct WgcCapture {
     /// granted, and a caller that converts as if it had one when it does not
     /// would read 8-bit bytes as half-floats.
     format: DirectXPixelFormat,
+    /// The monitor this captures, for questions about how Windows composes
+    /// it, such as its SDR white level.
+    monitor: HMONITOR,
 }
 
 /// Readable name for a pool format, for logs that have to be diffable.
@@ -161,7 +164,13 @@ impl WgcCapture {
             frame_pool,
             session,
             format,
+            monitor,
         })
+    }
+
+    /// The monitor this captures.
+    pub fn monitor(&self) -> HMONITOR {
+        self.monitor
     }
 
     /// Whether the pool this capture actually created carries wide samples.

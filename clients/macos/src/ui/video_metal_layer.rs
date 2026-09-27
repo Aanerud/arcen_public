@@ -371,6 +371,19 @@ pub(crate) struct PlanePixelFormatPlan {
 /// Derives [`PlanePixelFormatPlan`] for `depth`. See the module doc's
 /// "Unorm reconstruction" section for why eight bits is a distinct case
 /// from ten/twelve.
+/// How often [`DedicatedVideoLayer::log_plane_statistics`] samples again.
+const PLANE_STATISTICS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The number of different codes among `values`, each shifted down by
+/// `storage_shift` from its MSB-aligned storage to its code.
+fn distinct_codes(values: &[u16], storage_shift: u32) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        seen.insert(value >> storage_shift);
+    }
+    seen.len()
+}
+
 pub(crate) fn plane_pixel_formats(depth: arcen_media::BitDepth) -> PlanePixelFormatPlan {
     match depth {
         // CoreVideo's eight-bit biplanar formats ('444v'/'444f' and
@@ -606,8 +619,8 @@ pub struct DedicatedVideoLayer {
     pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     texture_cache: apple_cf::cv::CVMetalTextureCache,
     last_colorspace: Option<PresentationColorSpace>,
-    /// One-shot guard for [`Self::log_plane_statistics`].
-    logged_plane_statistics: bool,
+    /// When the decoded planes were last sampled for the log.
+    plane_statistics_logged_at: Option<std::time::Instant>,
 }
 
 impl DedicatedVideoLayer {
@@ -663,7 +676,7 @@ impl DedicatedVideoLayer {
             pipeline_state,
             texture_cache,
             last_colorspace: None,
-            logged_plane_statistics: false,
+            plane_statistics_logged_at: None,
         })
     }
 
@@ -774,7 +787,14 @@ impl DedicatedVideoLayer {
                     CAEDRMetadata::HDR10MetadataWithMinLuminance_maxLuminance_opticalOutputScale(
                         HDR10_MIN_LUMINANCE_NITS,
                         HDR10_MAX_LUMINANCE_NITS,
-                        HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE,
+                        if cfg!(feature = "dev-tools") {
+                            std::env::var("ARCEN_DECK_PQ_OPTICAL_SCALE")
+                                .ok()
+                                .and_then(|value| value.parse::<f32>().ok())
+                                .unwrap_or(HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE)
+                        } else {
+                            HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE
+                        },
                     );
                 self.layer.setEDRMetadata(Some(&metadata));
             }
@@ -866,16 +886,23 @@ impl DedicatedVideoLayer {
     /// Renders `frame` into this layer's next drawable and presents it.
     /// See the module doc's "Rendering a frame" section for the full
     /// sequence this follows.
-    /// Report what the decoded planes actually contain, once per layer.
+    /// Report what the decoded planes actually contain: on the first frame,
+    /// then every [`PLANE_STATISTICS_INTERVAL`].
     ///
-    /// Logs the raw visible sample range once so a new decoder/format can be
+    /// Logs the raw visible sample range so a new decoder/format can be
     /// checked against [`plane_pixel_formats`]. A ten-bit neutral chroma
-    /// sample is expected near `512 << 6 = 32768`.
+    /// sample is expected near `512 << 6 = 32768`. `distinct_codes` counts
+    /// the different code values along the sampled row: a full-width ramp
+    /// shows about 1024 through a genuine ten-bit path and about 256 through
+    /// an eight-bit one, whatever the container says.
     fn log_plane_statistics(&mut self, frame: &DedicatedLayerFrame) {
-        if self.logged_plane_statistics {
+        if self
+            .plane_statistics_logged_at
+            .is_some_and(|at| at.elapsed() < PLANE_STATISTICS_INTERVAL)
+        {
             return;
         }
-        self.logged_plane_statistics = true;
+        self.plane_statistics_logged_at = Some(std::time::Instant::now());
         let buffer = &frame.pixel_buffer;
         let plan = plane_pixel_formats(frame.contract.depth);
         let pixel_format =
@@ -930,6 +957,7 @@ impl DedicatedVideoLayer {
                     let mask = (1u16 << storage_shift) - 1;
                     values.iter().filter(|value| **value & mask != 0).count()
                 };
+                let distinct_codes = distinct_codes(values, storage_shift);
                 tracing::info!(
                     target: crate::logging::target::VIDEO,
                     plane = label,
@@ -943,6 +971,7 @@ impl DedicatedVideoLayer {
                     mean,
                     code_mean,
                     low_bits_nonzero,
+                    distinct_codes,
                     "decoded plane sample statistics",
                 );
             };
@@ -1281,6 +1310,18 @@ impl DedicatedVideoPresenter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn distinct_codes_tell_a_ten_bit_ramp_from_an_eight_bit_one() {
+        let ten: Vec<u16> = (0..1800u32)
+            .map(|x| ((x * 1023 / 1799) << 6) as u16)
+            .collect();
+        let eight: Vec<u16> = (0..1800u32)
+            .map(|x| (((x * 1023 / 1799) & !3) << 6) as u16)
+            .collect();
+        assert_eq!(super::distinct_codes(&ten, 6), 1024);
+        assert_eq!(super::distinct_codes(&eight, 6), 256);
+    }
+
     use super::*;
 
     // ---- RGB10A2Unorm: the task-brief correction -------------------------

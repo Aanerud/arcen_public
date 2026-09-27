@@ -78,11 +78,11 @@ touch macOS at all. A second client is mostly a decoder and a window.
 Auto, Speed, Grading, and HDR are complete contracts, not independent switches
 applied to one capture loop. Keep their capture providers separate:
 
-| Contract | Linux Pier | Windows Pier | macOS Deck |
-| --- | --- | --- | --- |
-| Auto / Speed, 8-bit | NvFBC → CUDA → NVENC; preserve the device-to-device fast path | DDA after real-frame proof, otherwise WGC BGRA8 | Ordinary SDR decode/presentation |
-| Grading, 10-bit SDR | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC | WGC FP16 scRGB → shared SDR transfer/matrix → NVENC P16 | Native `xf44` → 10-bit Metal, EDR off |
-| HDR | Xorg downgrades to Grading; only a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
+| Contract | Linux Pier | Windows Pier | macOS Pier | macOS Deck |
+| --- | --- | --- | --- | --- |
+| Auto / Speed, 8-bit | NvFBC → CUDA → NVENC; preserve the device-to-device fast path | DDA after real-frame proof, otherwise WGC BGRA8 | ScreenCaptureKit `420v` → VideoToolbox, untouched | Ordinary SDR decode/presentation |
+| Grading, 10-bit SDR | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC | WGC FP16 scRGB → shared SDR transfer/matrix → NVENC P16 | SCK `xf44` → VideoToolbox HEVC Main 4:4:4 10, BT.709 tags, SPS-proven | Native `xf44` → 10-bit Metal, EDR off |
+| HDR | Xorg downgrades to Grading unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`, shared `constrain_to_desktop_encoding`); a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | HDR virtual panel, headroom proof → SCK `xf44` PQ/BT.2020 → Core Image 203-nit white → VideoToolbox Main 4:4:4 10 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
 
 Do not widen or refactor the 8-bit fast path to implement a fidelity path.
 Bit depth does not imply HDR. Capture source, transfer, primaries, matrix,
@@ -192,10 +192,13 @@ is a good description. Silence is not.
 
 ## Current state
 
-All three product crates build and pass their tests on their target OS. Linux
-provides a separate zero-copy eight-bit NvFBC path and genuine ten-bit XShm SDR
-path; Xorg HDR requests degrade to Grading. Windows provides separate eight-bit,
-FP16 Grading, and verified FP16 HDR paths. The macOS Deck presents ten-bit
-through a dedicated Metal layer and enables EDR only for PQ. A macOS Pier, a
-Linux Deck and a Windows Deck do not exist; the gateway is not shipped.
-`README.md` is the current status in detail.
+The released product surfaces are still Linux Pier, Windows Pier, and macOS
+Deck. Linux provides a separate zero-copy eight-bit NvFBC path and genuine
+ten-bit XShm SDR path; Xorg HDR requests degrade to Grading. Windows provides
+separate eight-bit, FP16 Grading, and verified FP16 HDR paths. The macOS Deck
+presents ten-bit through a dedicated Metal layer and enables EDR only for PQ.
+The macOS Pier now exists under active development and can serve a logged-in
+Aqua desktop to a real Deck, but it is not a supported host release: cold-boot
+LoginWindow operation, release packaging, and multi-monitor hardware
+qualification remain open. A Linux Deck and a Windows Deck do not exist; the
+gateway is not shipped. `README.md` is the current status in detail.

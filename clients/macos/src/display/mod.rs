@@ -44,6 +44,30 @@ pub fn enumerate() -> Vec<ClientMonitor> {
     }
 }
 
+/// The gamut and HDR headroom the OS states for `display_id`. `None` off
+/// the main thread and on platforms that do not report them.
+pub fn display_color(display_id: u32) -> Option<arcen_protocol::messages::DisplayColorMsg> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::display_color(display_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = display_id;
+        None
+    }
+}
+
+/// Whether any of this client's displays can show HDR. HDR streaming is
+/// offered only when one can.
+pub fn any_display_is_hdr() -> bool {
+    let colors: Vec<_> = enumerate()
+        .iter()
+        .filter_map(|monitor| monitor.color)
+        .collect();
+    arcen_media::display_color::any_display_is_hdr(&colors)
+}
+
 /// The macOS fullscreen safe-area insets for `display_id`, in points.
 ///
 /// Zero on failure, off the main thread, and on any display without a notch,
@@ -496,6 +520,9 @@ mod macos {
     #[derive(Debug, Clone, Copy)]
     struct AppKitScreenFacts {
         insets: SafeAreaInsets,
+        /// Gamut and HDR headroom, as AppKit states them. `None` when no
+        /// `NSScreen` backs the display.
+        color: Option<arcen_protocol::messages::DisplayColorMsg>,
         /// The screen's frame in the pinned CG top-left/y-down space. `None`
         /// when the primary screen's height could not be read, so the flip
         /// would have been guesswork.
@@ -534,7 +561,29 @@ mod macos {
             // can never leave the stream taller than the viewport.
             let insets = screen.safeAreaInsets();
             let frame = screen.frame();
+            let color = arcen_protocol::messages::DisplayColorMsg {
+                gamut: if screen.canRepresentDisplayGamut(objc2_app_kit::NSDisplayGamut::P3) {
+                    arcen_protocol::messages::DisplayGamutMsg::DisplayP3
+                } else {
+                    arcen_protocol::messages::DisplayGamutMsg::Srgb
+                },
+                // The potential, not the current, headroom: what the panel
+                // can reach, independent of where its brightness is set now.
+                hdr_headroom: {
+                    // SAFETY: a documented `CGFloat` property of a live
+                    // `NSScreen`, read on the main thread.
+                    let headroom: f64 = unsafe {
+                        objc2::msg_send![
+                            &*screen,
+                            maximumPotentialExtendedDynamicRangeColorComponentValue
+                        ]
+                    };
+                    headroom as f32
+                },
+                ..Default::default()
+            };
             return Some(AppKitScreenFacts {
+                color: Some(color),
                 insets: SafeAreaInsets {
                     top: insets.top.max(0.0).ceil() as u32,
                     bottom: insets.bottom.max(0.0).ceil() as u32,
@@ -554,6 +603,7 @@ mod macos {
         }
         Some(AppKitScreenFacts {
             insets: SafeAreaInsets::ZERO,
+            color: None,
             arrangement: None,
         })
     }
@@ -625,6 +675,12 @@ mod macos {
         appkit_screen_facts(id)
             .map(|facts| facts.insets)
             .unwrap_or_default()
+    }
+
+    /// The gamut and HDR headroom AppKit states for the screen backing `id`.
+    /// `None` off the main thread, or when no `NSScreen` backs the display.
+    pub fn display_color(id: u32) -> Option<arcen_protocol::messages::DisplayColorMsg> {
+        appkit_screen_facts(id).and_then(|facts| facts.color)
     }
 
     pub fn enumerate() -> Vec<ClientMonitor> {
@@ -704,6 +760,7 @@ mod macos {
         // same diagnostic value, bounded volume.
         let appkit_arrangement_mismatch = reading.appkit_arrangement_mismatch();
         let rotation_degrees = rotation_degrees(metrics.rotation());
+        let color = display_color(id);
         if super::display_mapping_changed(
             id,
             &super::DisplayMappingSnapshot {
@@ -745,6 +802,17 @@ mod macos {
                 appkit_arrangement_mismatch,
                 "macOS display mapped to stream resolution"
             );
+            // Its own record: the mapping above is at the per-record field cap.
+            tracing::info!(
+                target: crate::logging::target::UI,
+                display_id = id,
+                gamut = ?color.map(|color| color.gamut),
+                hdr_headroom = ?color.map(|color| color.hdr_headroom),
+                hdr = color.is_some_and(|color| {
+                    arcen_media::display_color::DisplayColor::from_msg(&color).is_hdr()
+                }),
+                "macOS display colour"
+            );
         }
 
         Some(ClientMonitor {
@@ -765,6 +833,7 @@ mod macos {
             // Apple Silicon exposes no raw EDID; host synthesizes from the
             // attributes above. Reserved for platforms that provide a blob.
             edid: String::new(),
+            color,
         })
     }
 

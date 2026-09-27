@@ -48,6 +48,8 @@ pub(crate) struct HeadlessDisplayContract {
     pub product_id: u16,
     pub serial: u32,
     pub hdr10: bool,
+    /// The Deck display's gamut and HDR luminance, for the EDID.
+    pub color: Option<arcen_media::display_color::DisplayColor>,
     pub primary: bool,
     pub preferred_output_index: Option<u32>,
 }
@@ -595,6 +597,7 @@ pub(crate) fn prepare_provisioning(
             scale: crate::display::edid_scale_ratio(contract.scale).unwrap_or(1.0),
             product_id: contract.product_id,
             serial: contract.serial,
+            color: contract.color,
         };
         let desired_edid = if contract.hdr10 {
             crate::edid::generate_hdr10(request)?.to_vec()
@@ -992,6 +995,7 @@ pub(crate) fn provision_arcen_edid(
         scale: 1.0,
         product_id: 0x0001,
         serial: 0,
+        color: None,
     };
     // The persistent counterpart to the session-time EDID choice. A session
     // applies HDR10 only while a Deck asks for PQ and takes it away again
@@ -1421,6 +1425,7 @@ pub(crate) fn probe(
         scale: 1.0,
         product_id: (request.display_id & 0xffff) as u16,
         serial: request.display_id,
+        color: None,
     };
     // A 256-byte EDID is exactly MAX_EDID_BYTES, so the HDR10 variant is the
     // largest this path can carry and still journal a recovery entry.

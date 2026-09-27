@@ -632,6 +632,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         RequestedMonitor::new(monitor, width_px, height_px).expect("requested monitor")
     }
@@ -668,6 +669,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         RequestedMonitor::new(monitor, logical_width, logical_height).expect("requested monitor")
     }
@@ -958,6 +960,7 @@ mod tests {
             primary: true,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         let primary = RequestedMonitor::new(primary_monitor, 960, 540).expect("primary");
         let second = requested_monitor("second", 960, 0, 1280, 720, false, Rotation::Degrees0);
@@ -1056,6 +1059,7 @@ mod tests {
             primary: true,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         let primary = RequestedMonitor::new(primary_monitor, 1080, 1920).expect("primary");
         let second = requested_monitor("second", 1080, 0, 1920, 1080, false, Rotation::Degrees0);
@@ -1271,6 +1275,7 @@ mod tests {
             primary: true,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         let requested =
             RequestedMonitorTopology::new(vec![
@@ -1495,6 +1500,7 @@ mod tests {
             primary: true,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         let primary = RequestedMonitor::new(primary_monitor, 1080, 1920).expect("primary");
         let b = scaled_monitor(

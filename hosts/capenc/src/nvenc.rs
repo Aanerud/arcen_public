@@ -1102,6 +1102,20 @@ pub(crate) fn ensure_reconfigure_preserves_pixel_format(
 }
 
 impl Encoder {
+    /// Places SDR content, composed at `sdr_white_nits`, at BT.2408's 203-nit
+    /// graphics white in a PQ stream, the rule every Pier follows
+    /// (`arcen_media::video::pq_white`). Returns the linear gain applied, or
+    /// `None` when this encoder is not converting FP16 scRGB to PQ.
+    pub fn place_sdr_white(&mut self, sdr_white_nits: f64) -> Option<f32> {
+        match self.wide_transform.as_mut() {
+            Some(WideScrgbTransform::Pq(transform)) => {
+                *transform = transform.with_sdr_white_nits(sdr_white_nits);
+                Some(transform.white_gain())
+            }
+            Some(WideScrgbTransform::Sdr(_)) | None => None,
+        }
+    }
+
     /// codec: "h264", "h265" or "av1" (parsed once into `NvencCodec`; see its
     /// doc). `color` selects chroma, bit depth, range and matrix;
     /// `resolve_pixel_format` turns it into a concrete NVENC buffer format
@@ -1634,10 +1648,15 @@ impl Encoder {
         }
         let locked_pitch = locked_pitch.expect("output drain policy always allocates a slot");
         let frame_bytes = frame_bytes(format, locked_pitch, height);
+        // Up to 16 threads: measured on the Windows lab's 32-vCPU EPYC at
+        // 1800x1130, scRGB->PQ takes 27.0 ms with 8 (a 37 fps ceiling, and HDR
+        // sessions ran at 22.7 fps), 14.6 ms with 16, and 9.7 ms with 32.
+        // Sixteen fits a 30 fps frame with room for capture, staging and the
+        // rest of the host; smaller machines use every CPU, as before.
         let i444_conversion_workers = if format == PixelFormat::Yuv444_10 {
             std::thread::available_parallelism()
                 .map_or(1, usize::from)
-                .min(8)
+                .min(16)
                 .min(height as usize)
         } else {
             1
@@ -4061,39 +4080,42 @@ mod pixel_format_tests {
             ColorRange::Full,
             BitDepth::Ten,
         );
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(8);
-        let mut run = || {
-            let (y, rest) = destination.split_at_mut(plane_samples);
-            let (u, v) = rest.split_at_mut(plane_samples);
-            convert_scrgb_to_i444_p16_parallel(
-                &source,
-                source_stride,
-                [y, u, v],
-                [stride, stride, stride],
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        for workers in [1, 4, 8, 12, 16, 24, 32] {
+            if workers > available {
+                break;
+            }
+            let mut run = || {
+                let (y, rest) = destination.split_at_mut(plane_samples);
+                let (u, v) = rest.split_at_mut(plane_samples);
+                convert_scrgb_to_i444_p16_parallel(
+                    &source,
+                    source_stride,
+                    [y, u, v],
+                    [stride, stride, stride],
+                    width,
+                    height,
+                    WideScrgbTransform::Pq(transform),
+                    workers,
+                )
+                .expect("valid throughput fixture");
+            };
+            run();
+            let iterations = 10u32;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                run();
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            println!(
+                "scRGB->PQ I444P16 {}x{} workers={} avg_ms={:.2} fps={:.2}",
                 width,
                 height,
-                WideScrgbTransform::Pq(transform),
                 workers,
-            )
-            .expect("valid throughput fixture");
-        };
-        run();
-        let iterations = 10u32;
-        let started = Instant::now();
-        for _ in 0..iterations {
-            run();
+                elapsed * 1000.0 / f64::from(iterations),
+                f64::from(iterations) / elapsed
+            );
         }
-        let elapsed = started.elapsed().as_secs_f64();
-        println!(
-            "scRGB->PQ I444P16 {}x{} workers={} avg_ms={:.2} fps={:.2}",
-            width,
-            height,
-            workers,
-            elapsed * 1000.0 / f64::from(iterations),
-            f64::from(iterations) / elapsed
-        );
     }
 }
 
@@ -4168,115 +4190,38 @@ mod rate_control_tests {
         );
     }
 
+    /// NVENC encodes to the shared link-capped bill every Pier uses, not a
+    /// formula of its own: the Windows HDR shape was 22.9 Mbps before.
     #[test]
-    fn baseline_8bit_420_matches_the_documented_formula() {
-        let (width, height) = FULL_HD;
-        let sizing = sizing(
-            width,
-            height,
-            60,
-            ChromaSubsampling::Yuv420,
-            BitDepth::Eight,
-        );
-        let expected =
-            (f64::from(width) * f64::from(height) * 60.0 * 1.5 * 1.0 * 0.05).round() as u32;
-        assert_eq!(sizing.average_bitrate_bps, expected);
-        assert_eq!(sizing.max_bitrate_bps, sizing.average_bitrate_bps);
-        // A reasonable, low-latency ballpark: neither a rounding artefact
-        // near zero nor a runaway number.
-        assert!((5_000_000..15_000_000).contains(&sizing.average_bitrate_bps));
-    }
-
-    #[test]
-    fn yuv444_is_exactly_double_yuv420_at_the_same_depth() {
-        for depth in [BitDepth::Eight, BitDepth::Ten] {
-            let (width, height, fps) = (FOUR_K.0, FOUR_K.1, 60);
-            let yuv420 = sizing(width, height, fps, ChromaSubsampling::Yuv420, depth);
-            let yuv444 = sizing(width, height, fps, ChromaSubsampling::Yuv444, depth);
+    fn sizing_is_the_shared_link_capped_bill() {
+        for (width, height, fps, chroma, depth) in [
+            (1800, 1130, 30, ChromaSubsampling::Yuv420, BitDepth::Eight),
+            (1800, 1130, 60, ChromaSubsampling::Yuv420, BitDepth::Eight),
+            (1800, 1130, 30, ChromaSubsampling::Yuv444, BitDepth::Ten),
+            (
+                FOUR_K.0,
+                FOUR_K.1,
+                60,
+                ChromaSubsampling::Yuv444,
+                BitDepth::Ten,
+            ),
+        ] {
+            let sizing = sizing(width, height, fps, chroma, depth);
             assert_eq!(
-                yuv444.average_bitrate_bps,
-                yuv420.average_bitrate_bps * 2,
-                "4:4:4 has exactly 2x 4:2:0's coded samples/pixel (3.0 vs 1.5), so its default \
-                 bitrate must be exactly double at {depth:?}-bit, not the same number"
+                sizing.average_bitrate_bps,
+                arcen_media::video::link_capped_average_bitrate_bps(
+                    width, height, fps, chroma, depth
+                ),
+                "{width}x{height}@{fps} {chroma:?} {depth:?}"
             );
+            assert_eq!(sizing.max_bitrate_bps, sizing.average_bitrate_bps);
         }
-    }
-
-    #[test]
-    fn yuv422_sits_two_thirds_of_the_way_from_420_to_444() {
-        let (width, height, fps) = (FOUR_K.0, FOUR_K.1, 60);
-        let yuv420 = sizing(
-            width,
-            height,
-            fps,
-            ChromaSubsampling::Yuv420,
-            BitDepth::Eight,
-        );
-        let yuv422 = sizing(
-            width,
-            height,
-            fps,
-            ChromaSubsampling::Yuv422,
-            BitDepth::Eight,
-        );
-        let yuv444 = sizing(
-            width,
-            height,
-            fps,
-            ChromaSubsampling::Yuv444,
-            BitDepth::Eight,
-        );
-        // 1.5 (420) < 2.0 (422) < 3.0 (444) samples/pixel.
-        assert!(yuv420.average_bitrate_bps < yuv422.average_bitrate_bps);
-        assert!(yuv422.average_bitrate_bps < yuv444.average_bitrate_bps);
-    }
-
-    #[test]
-    fn ten_bit_scales_up_from_eight_bit_by_the_documented_25_percent() {
-        let (width, height, fps) = (FOUR_K.0, FOUR_K.1, 60);
-        for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
-            let eight = sizing(width, height, fps, chroma, BitDepth::Eight);
-            let ten = sizing(width, height, fps, chroma, BitDepth::Ten);
-            let ratio = f64::from(ten.average_bitrate_bps) / f64::from(eight.average_bitrate_bps);
-            assert!(
-                (ratio - 1.25).abs() < 0.001,
-                "{chroma:?}: expected a 25% bump for ten-bit, got {ratio}"
-            );
-        }
-    }
-
-    #[test]
-    fn four_k_60_yuv444_10bit_is_not_starved_relative_to_the_8bit_420_baseline() {
-        // The scenario the task names directly: the combined chroma+depth
-        // multiplier for the grading-reference row (4:4:4, 10-bit) over the
-        // 4:2:0 8-bit baseline is 2.0 * 1.25 == 2.5x, at the same resolution
-        // and frame rate — never merely "the same bitrate" or less.
-        let (width, height, fps) = (FOUR_K.0, FOUR_K.1, 60);
-        let baseline = sizing(
-            width,
-            height,
-            fps,
-            ChromaSubsampling::Yuv420,
-            BitDepth::Eight,
-        );
-        let target = sizing(width, height, fps, ChromaSubsampling::Yuv444, BitDepth::Ten);
-        let ratio = f64::from(target.average_bitrate_bps) / f64::from(baseline.average_bitrate_bps);
+        let hdr = sizing(1800, 1130, 30, ChromaSubsampling::Yuv444, BitDepth::Ten);
         assert!(
-            (ratio - 2.5).abs() < 0.001,
-            "4:4:4 10-bit must be sized at 2.5x the 4:2:0 8-bit baseline, got {ratio}x"
+            hdr.average_bitrate_bps < 5_000_000,
+            "{}",
+            hdr.average_bitrate_bps
         );
-    }
-
-    #[test]
-    fn scales_linearly_with_resolution_and_frame_rate() {
-        let base = sizing(1920, 1080, 30, ChromaSubsampling::Yuv420, BitDepth::Eight);
-        let double_width = sizing(3840, 1080, 30, ChromaSubsampling::Yuv420, BitDepth::Eight);
-        let double_fps = sizing(1920, 1080, 60, ChromaSubsampling::Yuv420, BitDepth::Eight);
-        assert_eq!(
-            double_width.average_bitrate_bps,
-            base.average_bitrate_bps * 2
-        );
-        assert_eq!(double_fps.average_bitrate_bps, base.average_bitrate_bps * 2);
     }
 
     #[test]

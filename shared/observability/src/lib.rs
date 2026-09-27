@@ -10,7 +10,7 @@ mod sink;
 pub use runtime::{
     BuildError, EffectiveDiagnosticPolicy, EmissionReport, FlushError, GlobalInstallError,
     InstalledObservability, LifecycleContext, ObservabilityBuilder, ObservabilityHandle,
-    ObservabilityRuntime, RuntimeError, ShutdownGuard, SinkFlushFailure,
+    ObservabilityRuntime, RuntimeError, ShutdownGuard, SinkFlushFailure, canonical_timestamp_now,
 };
 pub use sampler::{
     CallerQosSnapshot, HeartbeatCounters, HeartbeatSnapshot, QosCounters, QosSampler,

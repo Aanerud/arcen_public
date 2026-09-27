@@ -942,6 +942,7 @@ mod region_tests {
                 primary,
                 width_mm: 0.0,
                 height_mm: 0.0,
+                color: None,
             },
             1_920,
             1_080,

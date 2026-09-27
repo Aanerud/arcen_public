@@ -6,9 +6,10 @@ use arcen_deck::display::metrics::{DisplayMetrics, LogicalRect, SafeAreaInsets};
 use arcen_deck::pipeline::audio::PcmAudioPlayer;
 use arcen_deck::pipeline::video_decoder::NativeVideoDecoder;
 use arcen_deck::protocol::messages::{
-    msg_type, ClientMonitor, CursorMode, HealthStatsMsg, InputCapabilityAvailability,
-    MicrophoneStreamResultMsg, SafeAreaPolicyMsg, ServerHelloMsg, TabletModeMsg,
-    TabletModeResultMsg, MICROPHONE_STREAM_RESULT, TABLET_MODE_RESULT,
+    msg_type, AudioStreamResultMsg, ClientMonitor, CursorMode, HealthStatsMsg,
+    InputCapabilityAvailability, MicrophoneStreamResultMsg, SafeAreaPolicyMsg, ServerHelloMsg,
+    TabletModeMsg, TabletModeResultMsg, AUDIO_STREAM_RESULT, MICROPHONE_STREAM_RESULT,
+    TABLET_MODE_RESULT,
 };
 use arcen_deck::transport::tls::{parse_fingerprint, TlsTrustConfig};
 use arcen_deck::transport::websocket::{
@@ -759,6 +760,7 @@ fn smoke_monitor_fixture(
                     model: monitor.model,
                     serial: monitor.serial,
                     edid: String::new(),
+                    color: None,
                 },
                 metrics,
             ))
@@ -1155,6 +1157,10 @@ async fn media_smoke(
     let mut health_sequence = 0_u64;
     let mut last_health = None;
     let mut microphone_result_seen = false;
+    // Set when the host answers that this session carries no audio. Without it
+    // the smoke waits out the full media timeout for packets the host has
+    // already said are not coming.
+    let mut audio_refused = false;
     let mut microphone_active = false;
     // ARCEN_MEDIA_DUMP=<path>: skip decoding, write the raw Annex-B
     // video elementary stream to <path> so ffprobe can verify the live wire
@@ -1590,6 +1596,7 @@ async fn media_smoke(
                             verify_audio,
                             server_supports_audio,
                             audio_packets_consumed,
+                            audio_refused,
                         )
                         && (!microphone_requested || microphone_active)
                         && monitors_complete
@@ -1636,6 +1643,13 @@ async fn media_smoke(
                         }
                     }
                     last_health = Some(value);
+                } else if msg_type(&value) == Some(AUDIO_STREAM_RESULT) {
+                    let result = serde_json::from_value::<AudioStreamResultMsg>(value)
+                        .map_err(|error| format!("invalid audio result: {error}"))?;
+                    if !result.enabled {
+                        audio_refused = true;
+                        println!("audio refused by host reason={:?}", result.reason);
+                    }
                 } else if msg_type(&value) == Some(MICROPHONE_STREAM_RESULT) && microphone_requested
                 {
                     let result = serde_json::from_value::<MicrophoneStreamResultMsg>(value)
@@ -1669,13 +1683,25 @@ async fn media_smoke(
     }
 }
 
+/// Whether the smoke has learned everything it needs to about audio.
+///
+/// `audio_refused` is the host having said, in an `audio_stream_result`, that
+/// this session carries no audio. `server_hello` says what the host can do and
+/// the result says what it is doing; only the second one settles this. Without
+/// it the smoke spent the full media timeout rediscovering something it had
+/// been told in the first second.
 const fn audio_requirement_satisfied(
     require_multi_monitor: bool,
     verify_audio: bool,
     server_supports_audio: bool,
     audio_packets_consumed: u64,
+    audio_refused: bool,
 ) -> bool {
-    require_multi_monitor || !verify_audio || !server_supports_audio || audio_packets_consumed > 0
+    require_multi_monitor
+        || !verify_audio
+        || !server_supports_audio
+        || audio_refused
+        || audio_packets_consumed > 0
 }
 
 fn rotate_secondary_for_smoke(
@@ -1863,11 +1889,15 @@ mod tests {
 
     #[test]
     fn video_only_smoke_does_not_wait_for_an_idle_audio_source() {
-        assert!(!audio_requirement_satisfied(false, true, true, 0));
-        assert!(audio_requirement_satisfied(false, false, true, 0));
-        assert!(audio_requirement_satisfied(false, true, false, 0));
-        assert!(audio_requirement_satisfied(false, true, true, 1));
-        assert!(audio_requirement_satisfied(true, true, true, 0));
+        assert!(!audio_requirement_satisfied(false, true, true, 0, false));
+        assert!(audio_requirement_satisfied(false, false, true, 0, false));
+        assert!(audio_requirement_satisfied(false, true, false, 0, false));
+        assert!(audio_requirement_satisfied(false, true, true, 1, false));
+        assert!(audio_requirement_satisfied(true, true, true, 0, false));
+        // A host that advertised audio and then said it is sending none has
+        // answered the question; waiting the timeout out only delays a result
+        // that is already known.
+        assert!(audio_requirement_satisfied(false, true, true, 0, true));
     }
 
     fn test_monitor(id: u32, width_px: u32, height_px: u32, is_primary: bool) -> ClientMonitor {
@@ -1887,6 +1917,7 @@ mod tests {
             model: id,
             serial: id,
             edid: String::new(),
+            color: None,
         }
     }
 

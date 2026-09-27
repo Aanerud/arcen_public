@@ -1447,6 +1447,18 @@ where
         if let Some(value) = file.capture.binary {
             warn_ignored_capenc_binary("capture.binary", &value);
         }
+        // Windows reads HDR state from the OS (Advanced Color); an operator
+        // declaration could only contradict it.
+        if let Some(value) = file.video.desktop_encoding {
+            if arcen_media::video::DesktopSignalEncoding::from_token(&value.to_ascii_lowercase())
+                != Some(arcen_media::video::DesktopSignalEncoding::Sdr)
+            {
+                return Err(format!(
+                    "Pier config video.desktop_encoding {value:?}: Linux Xorg only; Windows \
+                     reads HDR state from the operating system"
+                ));
+            }
+        }
         if let Some(value) = file.video.codec {
             codec =
                 parse_codec(&value).map_err(|error| format!("Pier config video.codec: {error}"))?;

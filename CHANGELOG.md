@@ -6,6 +6,158 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-27
+
+The first release with a macOS Pier package, Linux HDR, and hosts that follow
+the Deck's displays. Every streaming preset was measured end to end on the lab
+hosts with the Deck GUI.
+
+### macOS Pier (preview)
+
+- A working host. A `_arcen` network service (LaunchDaemon: UDP 18444, TLS,
+  admission, relay) and a per-session desktop agent (capture, encode, input,
+  clipboard, audio) share the `arcen_session::agent_relay` contract.
+- The login window streams, and the Deck follows sign-in into the desktop.
+  Input at the login window uses the entitled virtual HID keyboard and
+  absolute pointer (`com.apple.developer.hid.virtual.device`).
+- Speed, Grading and HDR are separate pipelines, proven in the bitstream.
+  Grading is RExt 4:4:4 10-bit BT.709; HDR is RExt 4:4:4 10-bit PQ/BT.2020,
+  claimed only on proven EDR headroom, with SDR white at 203 nits.
+- A signed and notarised installer package with sysadmin-style install and
+  `uninstall.sh --purge`. Privacy permissions must be approved at the Mac, so
+  the command-line `installer` is refused by default.
+- Still preview: no cold-boot LoginWindow path, and multi-monitor is not
+  hardware-qualified.
+
+### Deck
+
+- Each screen's colour facts (P3 gamut support and EDR headroom) are sent to the
+  host, which builds its virtual display from them. HDR is greyed out ("No
+  HDR-capable screen found") when no screen can show it.
+- Command shortcuts reach a macOS host (the Cmd→Ctrl swap is off for Aqua).
+  Holding ⌘Q for 3 s quits the Deck, as in Chrome; a tap goes to the host.
+- Logs the received stream truth (SPS), a per-plane distinct-code census, and
+  a "stream delay" record with video and audio age at p50 and p95.
+
+### Linux Pier
+
+- Added `video.desktop_encoding`. `rec2100-pq` declares that a colour-managed
+  application (Flame's HDR UI) writes Rec.2100 PQ into the depth-30 Xorg
+  desktop, so an HDR request is passed through as PQ / BT.2020 instead of
+  resolving to Grading. The default `sdr` keeps the previous behaviour.
+- A session's virtual head is the Deck's display, by per-session EDID.
+- Audio travels on its own priority QUIC stream, and the frame pump applies
+  backpressure instead of requesting keyframe storms.
+
+### Windows Pier
+
+- HDR EDIDs carry the Deck display's gamut and luminance, and HDR places SDR
+  white at 203 nits, as the macOS Pier does.
+- Audio travels on the shared priority stream; the FP16 scRGB conversion uses
+  up to 16 workers, bringing HDR to its target frame rate.
+- `video.desktop_encoding` is rejected unless `sdr`: Windows reads HDR state
+  from the operating system.
+
+### Shared
+
+- `DisplayColorMsg` and `arcen_media::display_color`; EDIDs carry gamut
+  chromaticity and HDR luminance.
+- `link_capped_average_bitrate_bps` is the one bitrate rule for every Pier.
+- `PriorityAudio` QUIC stream in `arcen-transport`.
+- `hevc_sps` stream truth, `pq_white` 203-nit contract,
+  `DesktopSignalEncoding` / `constrain_to_desktop_encoding`.
+- A host that has not measured its encoders follows the client's codec.
+
+### Fixed
+
+- The Linux and Windows Piers build again (missing hello fields).
+- The shared codec resolver no longer turns Grading into H.264.
+- The Linux and Windows capture encoders no longer overshoot the bitrate cap.
+
+## [0.12.0] — 2026-09-12
+
+### macOS Pier (new, in progress)
+
+A native macOS host now exists as `hosts/macos`. It authenticates through PAM,
+serves QUIC on UDP 18444 with its own certificate lifecycle, captures and
+encodes the desktop through ScreenCaptureKit and VideoToolbox, injects pointer
+and keyboard input, carries typed pen events, sends host audio when consent
+exists, and carries the clipboard. It is not yet a complete Pier: there is no
+published installer, no cold-boot LoginWindow path, no native USB tablet, and
+multi-monitor is implemented but not hardware-qualified.
+
+- **The real Deck now completes an authenticated session against it.** Three
+  defects each ended every real session and none was caught by the tests,
+  because host and test were both hand-written JSON and so agreed with each
+  other rather than with the client: `server_hello` was sent before
+  `auth_request`, which selects the Deck's no-authentication path and zeroizes
+  the password; the password was read from a `password` field when the Deck
+  sends it in `credential`; and `server_hello` omitted `negotiated_transport`,
+  which the Deck requires, while misspelling `supports_h265`. All three are
+  fixed by building the shared message types instead of hand-writing JSON.
+- Clipboard now uses the real framed protocol. The host had invented a
+  text-offer-then-bare-bytes scheme that no Deck speaks; it now sends and
+  receives `FrameType::Clipboard` chunks through the shared
+  `ClipboardReassembler`, and dispatches binary messages by frame type instead
+  of treating every one as a clipboard payload.
+- Host audio capture with a mandatory local-mute lease, built on public Core
+  Audio process taps. Real audio is captured while the host's own speakers stay
+  silent, which is the point of the feature.
+- Host audio negotiation no longer deadlocks on itself. The host advertises
+  from the Screen & System Audio Recording grant, publishes `audio_output`,
+  sends `audio_stream_result`, and starts capture on a separate thread under a
+  1500 ms budget. If consent is missing or Apple's prompt blocks inside tap
+  creation, the Deck is told `CaptureUnavailable` and video continues.
+- The macOS multi-monitor wire path is present: auth-time offer/request,
+  applied topology in `server_hello`, and region video headers carrying monitor
+  id, topology generation, and stream epoch. It is not claimed as proven because
+  the lab Mac used for the latest run had one display attached.
+- `packaging/macos/build-pier-app.sh` now builds the release Pier binary before
+  bundling it, instead of packaging an arbitrary stale file from
+  `target/release`.
+
+### Shared
+
+- `arcen-media` gained `clipboard::policy_message`, moved out of the Linux host
+  before a second copy was written for macOS, and `audio::PcmPacketizer`, which
+  frames arbitrary capture buffer sizes into fixed audio-v1 packets.
+- `arcen-session` gained `audio.local_playback`, defaulting to `muted`. It is
+  deliberately separate from `audio.enabled`: someone beside the host machine
+  hearing the remote user is a privacy failure whether or not audio is being
+  transmitted. Existing configurations parse unchanged and acquire the safe
+  default.
+
+### Fixed
+
+- **Windows certificate renewal replaced the key it promised to preserve.**
+  The migrated provisioning path printed "reissuing the TLS certificate" for
+  renewal and adoption, then generated a new key anyway. Automatic renewal near
+  expiry would have changed the host identity and broken every SPKI-pinned
+  Deck, without the warning a deliberate rekey prints.
+- **Linux `new-host-cert` produced certificates with no subject alternative
+  name.** It parsed `--dns` and `--ip` and discarded them, so every Deck
+  rejected the result during the TLS handshake while the material looked
+  correct on disk. The shell helper in `packaging/linux/` has always done this
+  properly.
+- macOS: a rejected QUIC handshake ended the listener, so one wrong-ALPN
+  connection could take a host offline; closing a stream could deadlock the
+  serving loop; two seconds of desktop idleness ended a session on a
+  damage-driven capture API; the Core Audio callback allocated on the
+  real-time thread; failed audio teardown was recorded as success, which can
+  leave a Mac silent; any authenticated account was served the console user's
+  desktop; clipboard queues were unbounded; and `serve --once` reported
+  success after a stream failure.
+- `PcmPacketizer` accepted a frame specification rounding to zero samples,
+  where `push` emits empty packets forever without consuming input.
+
+### Validated
+
+Linux (Rocky 9.5, 731 tests) and Windows 11 (688 tests) were built and tested
+on their own operating systems after every shared change, rather than
+cross-checked from macOS. The real Deck completes an authenticated session
+against the macOS Pier.
+
+
 ## [0.10.0] — 2026-09-01
 
 ### Streaming presets and pipeline separation

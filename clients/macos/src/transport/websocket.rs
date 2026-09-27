@@ -119,6 +119,63 @@ impl DirectSessionSocket {
             Self::Quic(socket) => Some(socket.get_ref().feedback_snapshot()),
         }
     }
+
+    fn quic_connection(&self) -> Option<quinn::Connection> {
+        match self {
+            #[cfg(feature = "wss-compat")]
+            Self::Wss(_) => None,
+            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
+        }
+    }
+}
+
+/// How many audio frames from the priority stream may wait for the session
+/// loop. Over a second of audio; a loop that far behind has bigger problems,
+/// and the newest frames are the ones worth keeping.
+const PRIORITY_AUDIO_QUEUE: usize = 64;
+
+/// Reads the host's audio priority stream, when it opens one, into `sink`.
+///
+/// The host moves audio there so it never waits behind video the session
+/// stream has already accepted. Frames are the same bytes the session stream
+/// would have carried, so the session feeds them to the same media path.
+async fn read_audio_priority_stream(
+    connection: quinn::Connection,
+    sink: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let mut recv = match arcen_transport::quic::accept_audio_priority_stream(&connection).await {
+        Ok(recv) => recv,
+        Err(error) => {
+            tracing::debug!(
+                target: crate::logging::target::TRANSPORT,
+                %error,
+                "no audio priority stream from this host"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        target: crate::logging::target::TRANSPORT,
+        "audio arrives on its own priority stream"
+    );
+    loop {
+        match arcen_transport::quic::read_priority_frame(&mut recv).await {
+            Ok(Some(frame)) => {
+                // Never blocks the stream: a frame that finds the queue full
+                // is dropped and the jitter buffer conceals it.
+                let _ = sink.try_send(frame);
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    target: crate::logging::target::TRANSPORT,
+                    %error,
+                    "audio priority stream failed"
+                );
+                return;
+            }
+        }
+    }
 }
 
 impl Sink<Message> for DirectSessionSocket {
@@ -399,7 +456,14 @@ impl Default for StreamProfile {
             codec: "h264".to_string(),
             chroma: "yuv420".to_string(),
             video_selection: VideoSelectionIntent::Exact,
-            max_fps: 15,
+            // Thirty, because that is what `PerformanceMode::Standard` asks
+            // for and no preset this client offers is lower. A default of
+            // fifteen silently halved every path that did not set the field
+            // explicitly — including `--connect`, the headless form README
+            // documents — and it looked exactly like a host that could not
+            // keep up: the Pier was asked for 15 fps, served 15 fps, and
+            // ScreenCaptureKit paced at 67 ms because that is 1/15 s.
+            max_fps: 30,
             bit_depth: "8".to_string(),
             color_range: "limited".to_string(),
             color_matrix: "bt709".to_string(),
@@ -819,6 +883,11 @@ impl PendingMicrophoneStart {
             frame_duration_ms = 20u16,
             "Deck microphone capture starting"
         );
+        // The Pier bans this call because a timeout there dropped the join
+        // handle and left a native operation unsupervised. That cannot happen
+        // here: the handle is kept on the struct and the worker watches
+        // `cancel`, so nothing is abandoned.
+        #[allow(clippy::disallowed_methods)]
         let task = tokio::task::spawn_blocking(move || {
             UpstreamMicrophone::start(
                 config,
@@ -1034,6 +1103,10 @@ async fn stop_microphone_runtime(
     deadline: Option<tokio::time::Instant>,
     stop_reason: &'static str,
 ) {
+    // `&mut task` below, so the deadline borrows the handle rather than
+    // consuming it, and an overrun escalates to a deliberate abort instead of
+    // leaving the native stop running unwatched.
+    #[allow(clippy::disallowed_methods)]
     let mut task = tokio::task::spawn_blocking(move || runtime.stop(stop_reason));
     if let Some(deadline) = deadline {
         if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
@@ -1948,34 +2021,22 @@ async fn run_session_correlated(
             validate_server_region_input(&options, &server_hello)?;
             #[cfg(feature = "usb-hard-lab")]
             if options.tablet_mode_requested == TabletModeMsg::WacomUsbBridge {
-                // Requesting the native bridge is a preference, not a
-                // requirement. The tablet is a peripheral the user carries
-                // between locations, and the host may not offer the bridge at
-                // all; neither is a reason to refuse a desktop session. Every
-                // failure here degrades to local termination, which is the
-                // ordinary typed-pen path and always available.
-                //
-                // Degrading is also the safe direction for the failures that
-                // are not merely "absent" -- a device denied by profile, or a
-                // helper without privilege, simply goes un-bridged.
-                let downgrade = if !server_hello.usb_hard_v1 {
-                    Some("host does not advertise Hard USB v1".to_owned())
-                } else {
-                    match crate::usb_bridge::UsbHardResponder::start().await {
-                        Ok(responder) => {
-                            usb_hard_responder = Some(responder);
-                            None
-                        }
-                        Err(error) => Some(error.to_string()),
-                    }
-                };
-                if let Some(reason) = downgrade {
+                if !server_hello.usb_hard_v1 {
                     tracing::warn!(
                         target: crate::logging::target::TRANSPORT,
-                        reason = %reason,
-                        "native tablet bridge unavailable; continuing with local termination",
+                        "native tablet bridge unavailable; preserving the requested mode for host negotiation",
                     );
-                    options.tablet_mode_requested = TabletModeMsg::LocalTermination;
+                } else {
+                    match crate::usb_bridge::UsbHardResponder::start().await {
+                        Ok(responder) => usb_hard_responder = Some(responder),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: crate::logging::target::TRANSPORT,
+                                %error,
+                                "native tablet bridge helper unavailable; preserving the requested mode for host negotiation",
+                            );
+                        }
+                    }
                 }
             }
             if fsm.state_id() == "authenticating" {
@@ -2090,6 +2151,11 @@ async fn run_session_correlated(
     .then(|| crate::hid::HidSession::start(hid_tx.clone()));
     #[cfg(feature = "experimental-raw-hid")]
     let mut hid_devices = HashMap::<u8, (u16, u16, u64, u64)>::new();
+    let (priority_audio_tx, mut priority_audio_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(PRIORITY_AUDIO_QUEUE);
+    let priority_audio_reader = ws
+        .quic_connection()
+        .map(|connection| tokio::spawn(read_audio_priority_stream(connection, priority_audio_tx)));
     let outcome = async {
       loop {
         if clipboard.policy().is_none() {
@@ -2268,6 +2334,21 @@ async fn run_session_correlated(
                     &mut close_receiver,
                 )
                 .await?;
+            }
+            Some(frame) = priority_audio_rx.recv() => {
+                last_received = tokio::time::Instant::now();
+                match media.enqueue_bytes(&frame) {
+                    Ok(outcome) if outcome.notify => {
+                        let _ = tx.send(SessionEvent::MediaReady);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let message = format!("{error:?}");
+                        if media.record_malformed(&frame, message).notify {
+                            let _ = tx.send(SessionEvent::MediaReady);
+                        }
+                    }
+                }
             }
             message = ws.next() => {
                 last_received = tokio::time::Instant::now();
@@ -2835,6 +2916,9 @@ async fn run_session_correlated(
       }
     }
     .await;
+    if let Some(reader) = priority_audio_reader {
+        reader.abort();
+    }
 
     #[cfg(feature = "experimental-raw-hid")]
     for (device_id, (vendor_id, product_id, reports, errors)) in hid_devices.drain() {
@@ -3744,6 +3828,8 @@ fn client_hello_with_usb_device(
         tablet_mode_requested: options.tablet_mode_requested,
         tablet_mode_capabilities: macos_tablet_mode_capabilities(options.tablet_input_enabled),
         transport_capabilities: vec![selected_transport_capability(options).to_string()],
+        audio_priority_stream_v1: selected_transport_capability(options)
+            == arcen_protocol::CAPABILITY_TRANSPORT_QUIC,
         // SEC-raw-hid: advertises only this client's own local runtime
         // opt-in for the experimental raw-HID tablet capture path. This is
         // one half of a mutual negotiation — the host independently decides
@@ -5259,6 +5345,7 @@ mod tests {
                     primary: index == 0,
                     width_mm: 300.0,
                     height_mm: 200.0,
+                    color: None,
                 };
                 RequestedMonitor::new(monitor, 960, 540).expect("valid requested monitor")
             })
@@ -5302,6 +5389,7 @@ mod tests {
                     primary: index == 0,
                     width_mm,
                     height_mm,
+                    color: None,
                 };
                 RequestedMonitor::new(monitor, 960, 540).expect("valid requested monitor")
             })
@@ -6401,6 +6489,7 @@ mod tests {
         let task_cancel = Arc::clone(&cancel);
         let task_slot = Arc::clone(&cancel_slot);
         let task_lifecycle = Arc::clone(&session_cancellation.microphone_lifecycle);
+        #[allow(clippy::disallowed_methods)]
         let task = tokio::task::spawn_blocking(move || {
             Ok(UpstreamMicrophone {
                 capture,
@@ -7072,7 +7161,7 @@ mod tests {
     #[test]
     fn rust_viewer_quality_caps_native_stream_for_websocket_mvp() {
         let quality = rust_viewer_quality_settings(&StreamProfile::default());
-        assert_eq!(quality.max_fps, 15);
+        assert_eq!(quality.max_fps, 30);
         assert_eq!(quality.chroma, "yuv420");
         assert_eq!(quality.codec, "h264");
         assert_eq!(quality.bit_depth, "8");
@@ -7212,7 +7301,7 @@ mod tests {
             };
             let json: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(json.get("type").unwrap(), "quality_settings");
-            assert_eq!(json.get("max_fps").unwrap(), 15);
+            assert_eq!(json.get("max_fps").unwrap(), 30);
         });
 
         let result = connect_smoke(ConnectOptions {

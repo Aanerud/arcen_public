@@ -721,6 +721,7 @@ mod tests {
             model: 0,
             serial: 0,
             edid: String::new(),
+            color: None,
             safe_area_policy: arcen_protocol::messages::SafeAreaPolicyMsg::StandardFullscreen,
             quality_intent: arcen_protocol::messages::MonitorQualityIntentMsg::HostDefault,
         }

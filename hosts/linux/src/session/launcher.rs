@@ -118,7 +118,7 @@ struct OwnedAuthenticateRequest {
     remote_host: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct OpenRequest {
     command: String,
@@ -135,6 +135,85 @@ struct OpenRequest {
     /// switch (`media::multi_capenc::MULTI_MONITOR_CARRIER_READY` is `true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     multi_monitor: Option<MultiHeadPlanMsg>,
+    /// The Deck display a single-head session stands for. The launcher
+    /// synthesizes that head's EDID from it with the shared generator, so
+    /// the head's native mode, physical size and gamut are the Deck
+    /// display's. `None` keeps the template's EDID-less head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<SessionDisplayMsg>,
+}
+
+/// A served Deck display's facts, carried to the privileged launcher.
+///
+/// Facts rather than EDID bytes: the launcher builds the EDID itself with
+/// `arcen_outputs::edid::generate`, so what reaches a root-owned Xorg
+/// configuration is always a validated, generated block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SessionDisplayMsg {
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    width_mm: f32,
+    height_mm: f32,
+    scale: f32,
+    product_id: u16,
+    serial: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<arcen_protocol::messages::DisplayColorMsg>,
+}
+
+impl SessionDisplayMsg {
+    /// The served display, at the size the session streams.
+    pub(crate) fn served(
+        monitor: &arcen_protocol::messages::ClientMonitor,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let finite = |value: f32| {
+            if value.is_finite() && value > 0.0 {
+                value
+            } else {
+                0.0
+            }
+        };
+        Self {
+            width,
+            height,
+            refresh_hz: monitor.refresh_hz.clamp(1, 240),
+            width_mm: finite(monitor.width_mm),
+            height_mm: finite(monitor.height_mm),
+            scale: if monitor.scale.is_finite() && monitor.scale > 0.0 {
+                monitor.scale
+            } else {
+                1.0
+            },
+            // The same identity the Windows Pier gives a Deck display.
+            product_id: if monitor.model == 0 {
+                0x0001
+            } else {
+                monitor.model as u16
+            },
+            serial: monitor.serial,
+            color: monitor.color,
+        }
+    }
+
+    fn edid(&self) -> Result<[u8; 128], String> {
+        arcen_outputs::edid::generate(arcen_outputs::edid::EdidRequest {
+            width: self.width,
+            height: self.height,
+            refresh_hz: self.refresh_hz,
+            width_mm: self.width_mm,
+            height_mm: self.height_mm,
+            scale: self.scale,
+            product_id: self.product_id,
+            serial: self.serial,
+            color: self
+                .color
+                .as_ref()
+                .map(arcen_media::display_color::DisplayColor::from_msg),
+        })
+    }
 }
 
 /// Wire-serializable mirror of a committed
@@ -290,12 +369,14 @@ impl OpenRequest {
         timezone: Option<IanaTimeZone>,
         deskside: crate::deskside::LinuxDesksideConfig,
         multi_monitor: Option<MultiHeadPlanMsg>,
+        display: Option<SessionDisplayMsg>,
     ) -> Self {
         Self {
             command: "open".to_string(),
             timezone,
             deskside,
             multi_monitor,
+            display,
         }
     }
 }
@@ -409,6 +490,7 @@ pub struct AuthenticatedLauncher {
     timezone: Option<IanaTimeZone>,
     deskside: crate::deskside::LinuxDesksideConfig,
     multi_monitor_plan: Option<MultiHeadPlanMsg>,
+    session_display: Option<SessionDisplayMsg>,
 }
 
 impl AuthenticatedLauncher {
@@ -440,6 +522,13 @@ impl AuthenticatedLauncher {
         plan: Option<&crate::display::topology::LinuxTopologyPlan>,
     ) {
         self.multi_monitor_plan = plan.map(MultiHeadPlanMsg::from_plan);
+    }
+
+    /// Attaches the Deck display a single-head session stands for, so its
+    /// head gets that display's EDID. Must be called before
+    /// [`AuthenticatedLauncher::open`] to take effect.
+    pub(crate) fn set_session_display(&mut self, display: Option<SessionDisplayMsg>) {
+        self.session_display = display;
     }
 
     pub async fn authenticate(
@@ -524,6 +613,7 @@ impl AuthenticatedLauncher {
                 timezone: None,
                 deskside: config.deskside.clone(),
                 multi_monitor_plan: None,
+                session_display: None,
             }),
             "rejected" => Err(LauncherError::Rejected),
             _ => Err(LauncherError::Protocol),
@@ -544,6 +634,7 @@ impl AuthenticatedLauncher {
             self.timezone.clone(),
             self.deskside.clone(),
             self.multi_monitor_plan.clone(),
+            self.session_display.clone(),
         );
         let mut request_json = serde_json::to_vec(&request).map_err(|_| LauncherError::Protocol)?;
         if request_json.len() > MAX_OPEN_REQUEST_BYTES {
@@ -991,6 +1082,26 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         .clone()
         .map(MultiHeadPlanMsg::into_plan)
         .transpose()?;
+    // A display the generator refuses keeps the template's EDID-less head,
+    // as every session had before: the EDID refines the session, it is not
+    // a condition of it.
+    let session_edid = open
+        .display
+        .as_ref()
+        .and_then(|served| match served.edid() {
+            Ok(edid) => Some(edid),
+            Err(error) => {
+                tracing::warn!(
+                    target: target::SESSION,
+                    %error,
+                    width = served.width,
+                    height = served.height,
+                    refresh_hz = served.refresh_hz,
+                    "the Deck display's EDID could not be generated; the head keeps no EDID"
+                );
+                None
+            }
+        });
     let provider = DedicatedXorgProvider::new(
         &xorg_binary,
         &xorg_config_template,
@@ -999,6 +1110,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         &gpu_head,
         &session_id,
         &identity,
+        session_edid.as_ref(),
     );
     let transaction = arcen_outputs::OutputTransaction::acquire(
         provider,
@@ -1160,6 +1272,8 @@ async fn wait_for_deskside_failure(deskside: &mut Option<crate::deskside::LinuxD
 struct PreparedDedicatedXorg {
     display_number: u16,
     config_text: String,
+    /// The EDID the configuration's `CustomEDID` names, written beside it.
+    edid: Option<Vec<u8>>,
     /// The topology this attempt applies, cloned out of the caller's plan so
     /// the binding -- not the provider -- owns it for `verify`.
     plan: super::output_provider::DedicatedXorgPlan,
@@ -1201,6 +1315,8 @@ struct DedicatedXorgProvider<'a> {
     gpu_head: &'a str,
     session_id: &'a str,
     identity: &'a UserIdentity,
+    /// The single-head session's EDID, generated from the Deck display.
+    edid: Option<&'a [u8; 128]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1214,6 +1330,7 @@ impl<'a> DedicatedXorgProvider<'a> {
         gpu_head: &'a str,
         session_id: &'a str,
         identity: &'a UserIdentity,
+        edid: Option<&'a [u8; 128]>,
     ) -> Self {
         Self {
             binary,
@@ -1223,6 +1340,7 @@ impl<'a> DedicatedXorgProvider<'a> {
             gpu_head,
             session_id,
             identity,
+            edid,
         }
     }
 }
@@ -1275,9 +1393,23 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
             }
             None => render_xorg_config(&template_text, self.gpu_head)?,
         };
+        let (config_text, edid) = match (plan.as_ref(), self.edid) {
+            (None, Some(edid)) => {
+                let path = self
+                    .runtime_root
+                    .join(self.session_id)
+                    .join(SESSION_EDID_FILE);
+                (
+                    with_custom_edid(&config_text, self.gpu_head, &path)?,
+                    Some(edid.to_vec()),
+                )
+            }
+            _ => (config_text, None),
+        };
         Ok(PreparedDedicatedXorg {
             display_number,
             config_text,
+            edid,
             plan: plan.clone(),
             session_log_id: context.session_log_id().clone(),
         })
@@ -1466,6 +1598,11 @@ impl DedicatedXorg {
         let config_path = session_dir.join("xorg.conf");
         std::fs::write(&config_path, &prepared.config_text)?;
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(edid) = &prepared.edid {
+            let edid_path = session_dir.join(SESSION_EDID_FILE);
+            std::fs::write(&edid_path, edid)?;
+            std::fs::set_permissions(&edid_path, std::fs::Permissions::from_mode(0o600))?;
+        }
 
         let xauthority = session_dir.join("Xauthority");
         create_xauthority(&xauthority, x_display, identity)?;
@@ -1725,6 +1862,41 @@ fn read_secure_xorg_template(path: &Path) -> Result<String, LauncherError> {
     let mut template = String::new();
     file.read_to_string(&mut template)?;
     Ok(template)
+}
+
+/// The session EDID's file name in the session directory.
+const SESSION_EDID_FILE: &str = "edid.bin";
+
+/// Names `edid` as `head`'s EDID, beside the `ConnectedMonitor` line that
+/// forces the head on. The template keeps `AllowNonEdidModes`, so the
+/// NV-CONTROL `ViewPortIn` resize still works on an EDID-backed head.
+#[cfg(any(target_os = "linux", test))]
+fn with_custom_edid(config: &str, head: &str, edid: &Path) -> Result<String, LauncherError> {
+    let edid = edid.to_str().ok_or(LauncherError::XorgConfig)?;
+    if edid.contains('"') || head.contains('"') || edid.contains(';') {
+        return Err(LauncherError::XorgConfig);
+    }
+    let mut hits = 0usize;
+    let mut out = Vec::with_capacity(config.lines().count() + 1);
+    for line in config.lines() {
+        out.push(line.to_owned());
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Option") && trimmed.contains("\"ConnectedMonitor\"") {
+            hits += 1;
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push(format!(
+                "{indent}Option         \"CustomEDID\" \"{head}:{edid}\""
+            ));
+        }
+    }
+    if hits != 1 || config.contains("\"CustomEDID\"") {
+        return Err(LauncherError::XorgConfig);
+    }
+    let mut rendered = out.join("\n");
+    if config.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 #[cfg(target_os = "linux")]
@@ -2370,11 +2542,17 @@ mod tests {
             Some(timezone.clone()),
             crate::deskside::LinuxDesksideConfig::default(),
             None,
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(parse_open_request(&json).unwrap(), request);
 
-        let request = OpenRequest::new(None, crate::deskside::LinuxDesksideConfig::default(), None);
+        let request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+        );
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(parse_open_request(&json).unwrap(), request);
         assert!(!json.contains("timezone"));
@@ -2405,6 +2583,7 @@ mod tests {
                     primary: true,
                     width_mm: 0.0,
                     height_mm: 0.0,
+                    color: None,
                 },
                 1920,
                 1080,
@@ -2427,6 +2606,7 @@ mod tests {
                     primary: false,
                     width_mm: 0.0,
                     height_mm: 0.0,
+                    color: None,
                 },
                 1280,
                 720,
@@ -2459,15 +2639,83 @@ mod tests {
             None,
             crate::deskside::LinuxDesksideConfig::default(),
             Some(wire),
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("multi_monitor"));
         assert_eq!(parse_open_request(&json).unwrap(), request);
     }
 
+    fn xdr_monitor() -> arcen_protocol::messages::ClientMonitor {
+        arcen_protocol::messages::ClientMonitor {
+            width_px: 3600,
+            height_px: 2338,
+            scale: 2.0,
+            refresh_hz: 120,
+            is_primary: true,
+            name: "Built-in Display".to_string(),
+            width_mm: 344.0,
+            height_mm: 223.0,
+            model: 40_968,
+            serial: 7,
+            color: Some(arcen_protocol::messages::DisplayColorMsg {
+                gamut: arcen_protocol::messages::DisplayGamutMsg::DisplayP3,
+                hdr_headroom: 16.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn open_request_carries_the_served_deck_display_and_its_edid_is_that_display() {
+        let served = SessionDisplayMsg::served(&xdr_monitor(), 1800, 1168);
+        let request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            Some(served.clone()),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(parse_open_request(&json).unwrap(), request);
+
+        let edid = served.edid().expect("generated");
+        arcen_outputs::edid::validate(&edid, 1800, 1168).expect("its preferred mode is the stream");
+        assert_eq!(u16::from_le_bytes([edid[10], edid[11]]), 40_968_u16);
+        let red_x = (u16::from(edid[27]) << 2) | u16::from(edid[25] >> 6);
+        assert_eq!(red_x, 696, "Display P3 red, not sRGB");
+        assert_eq!(
+            (edid[21], edid[22]),
+            (34, 22),
+            "the Deck panel's centimetres"
+        );
+    }
+
+    #[test]
+    fn custom_edid_joins_the_forced_head_and_nothing_else() {
+        let config = "Section \"Device\"\n    Option         \"ConnectedMonitor\" \"DFP-2\"\n    Option         \"MetaModes\" \"DFP-2: nvidia-auto-select +0+0\"\nEndSection\n";
+        let path = Path::new("/run/arcen/sessions/7/edid.bin");
+        let rendered = with_custom_edid(config, "DFP-2", path).expect("rendered");
+        assert!(rendered.contains(
+            "    Option         \"ConnectedMonitor\" \"DFP-2\"\n    Option         \"CustomEDID\" \"DFP-2:/run/arcen/sessions/7/edid.bin\"\n"
+        ));
+        assert!(rendered.ends_with("EndSection\n"));
+        assert!(
+            with_custom_edid(&rendered, "DFP-2", path).is_err(),
+            "never twice"
+        );
+        assert!(with_custom_edid("EndSection\n", "DFP-2", path).is_err());
+        assert!(with_custom_edid(config, "DFP-2", Path::new("/tmp/a\"b")).is_err());
+    }
+
     #[test]
     fn open_request_omits_multi_monitor_when_absent() {
-        let request = OpenRequest::new(None, crate::deskside::LinuxDesksideConfig::default(), None);
+        let request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+        );
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("multi_monitor"));
     }

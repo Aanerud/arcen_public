@@ -800,6 +800,46 @@ pub struct ClientMonitor {
     /// platforms that expose a real blob.
     #[serde(default)]
     pub edid: String,
+    /// What this display can show: gamut and HDR. Absent from a Deck that
+    /// predates it, and then a host falls back to its own defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<DisplayColorMsg>,
+}
+
+/// The widest standard gamut a client display can show.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayGamutMsg {
+    /// sRGB / BT.709 primaries.
+    #[default]
+    Srgb,
+    /// Display P3 (DCI-P3 primaries, D65 white).
+    DisplayP3,
+    /// BT.2020 primaries.
+    Bt2020,
+}
+
+/// A client display's colour capability, as its operating system states it.
+///
+/// Only facts the client actually read are sent. `hdr_headroom` is how far
+/// above SDR white the display can reach (macOS:
+/// `maximumPotentialExtendedDynamicRangeColorComponentValue`); `1.0` means
+/// SDR only and `0.0` unknown. The luminance fields are present only when
+/// the platform states them, for example from the display's EDID HDR static
+/// metadata; macOS exposes none, and a host derives them from the headroom
+/// with the shared rule in `arcen_media::display_color`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct DisplayColorMsg {
+    #[serde(default)]
+    pub gamut: DisplayGamutMsg,
+    #[serde(default)]
+    pub hdr_headroom: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_nits: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_average_nits: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_nits: Option<f32>,
 }
 
 #[non_exhaustive]
@@ -1410,6 +1450,13 @@ pub struct ClientHelloMsg {
     /// authoritative and old/default clients send false.
     #[serde(default)]
     pub usb_hard_v1: bool,
+    /// The client accepts audio frames on a separate, higher-priority QUIC
+    /// stream ([`crate::AUDIO_PRIORITY_STREAM_V1`]). Audio on the one session
+    /// stream waits behind every video byte the transport has already
+    /// accepted; on its own stream it does not. Absent/false on old clients,
+    /// which keep receiving audio on the session stream.
+    #[serde(default)]
+    pub audio_priority_stream_v1: bool,
     /// Exact device facts for the captured Hard USB attachment. Absent on old
     /// clients and whenever capture was not completed before `client_hello`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1487,6 +1534,7 @@ impl Default for ClientHelloMsg {
             supports_pen: true,
             experimental_raw_hid: false,
             usb_hard_v1: false,
+            audio_priority_stream_v1: false,
             usb_hard_device: None,
             decoder_backend: String::new(),
             capture_mode: "mirror_all".to_string(),
@@ -1512,6 +1560,15 @@ impl Default for ClientHelloMsg {
 }
 
 impl ClientHelloMsg {
+    /// Whether a session text message is a `client_hello` that accepts audio
+    /// on the priority stream. A relay reads the Deck's messages as text and
+    /// asks this before moving audio off the session stream.
+    #[must_use]
+    pub fn text_accepts_audio_priority_stream(text: &str) -> bool {
+        text.contains(CLIENT_HELLO)
+            && serde_json::from_str::<Self>(text).is_ok_and(|hello| hello.audio_priority_stream_v1)
+    }
+
     #[must_use]
     pub fn with_build_identity(mut self, identity: BuildIdentityMsg) -> Self {
         attach_build_identity(&mut self.device_capabilities, identity);
@@ -1782,6 +1839,23 @@ pub struct ServerHelloMsg {
     /// is true.
     #[serde(default)]
     pub supports_display_update: bool,
+    /// Host injects point-unit, phased scrolling (`ScrollUnitMsg::Point`),
+    /// which is what makes a trackpad feel local: pixel-precise travel,
+    /// momentum and rubber-banding. Absent/false on hosts that only take
+    /// wheel notches; a client must send notches to them.
+    #[serde(default)]
+    pub precise_scroll_v1: bool,
+    /// This session shows the operating system's sign-in screen rather than a
+    /// signed-in desktop.
+    ///
+    /// Signing in there ends it: the sign-in screen belongs to no user and
+    /// goes away when someone logs in, and that user's desktop is a different
+    /// session. So a client that sees this session close has not lost its
+    /// connection; it should hold the last frame and connect again to the
+    /// desktop that replaces it. Absent/false for a signed-in desktop and on
+    /// hosts that do not report it.
+    #[serde(default)]
+    pub login_window: bool,
     #[serde(default)]
     pub requires_auth: bool,
     #[serde(default)]
@@ -1825,6 +1899,16 @@ pub struct ServerHelloMsg {
 }
 
 impl ServerHelloMsg {
+    /// Whether this host is a macOS desktop (an Aqua session).
+    ///
+    /// A macOS host has a Command key of its own, so a client must send its
+    /// Command key as Command rather than swapping it for Control as it does
+    /// for Linux and Windows hosts, where Control is the shortcut key.
+    #[must_use]
+    pub fn host_is_macos(&self) -> bool {
+        self.session_type.eq_ignore_ascii_case("aqua")
+    }
+
     /// Attaches additive multi-monitor-v1 capability metadata while preserving
     /// the existing top-level `server_hello.monitors` schema unchanged.
     ///
@@ -2925,6 +3009,43 @@ impl Default for MouseButtonMsg {
     }
 }
 
+/// What a scroll delta measures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollUnitMsg {
+    /// Wheel notches: what every host has always understood.
+    #[default]
+    Line,
+    /// Points of continuous travel, from a trackpad or precise wheel. Sent
+    /// only to a host that advertised `precise_scroll_v1`.
+    Point,
+}
+
+/// Where a continuous scroll is in its gesture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollPhaseMsg {
+    /// Not part of a gesture: a plain wheel notch.
+    #[default]
+    None,
+    /// Fingers touched down and started moving.
+    Began,
+    /// The gesture continues.
+    Changed,
+    /// Fingers lifted.
+    Ended,
+    /// The gesture was interrupted.
+    Cancelled,
+}
+
+const fn is_line_unit(unit: &ScrollUnitMsg) -> bool {
+    matches!(unit, ScrollUnitMsg::Line)
+}
+
+const fn is_no_phase(phase: &ScrollPhaseMsg) -> bool {
+    matches!(phase, ScrollPhaseMsg::None)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MouseScrollMsg {
     #[serde(rename = "type", default = "default_mouse_scroll_type")]
@@ -2951,6 +3072,12 @@ pub struct MouseScrollMsg {
     pub coalescable: bool,
     #[serde(default, skip_serializing_if = "is_absolute_motion_mode")]
     pub motion_mode: PointerMotionMode,
+    /// What `dx`/`dy` measure. Absent means wheel notches.
+    #[serde(default, skip_serializing_if = "is_line_unit")]
+    pub unit: ScrollUnitMsg,
+    /// Where a continuous scroll is in its gesture. Absent for a wheel.
+    #[serde(default, skip_serializing_if = "is_no_phase")]
+    pub phase: ScrollPhaseMsg,
 }
 
 fn default_mouse_scroll_type() -> String {
@@ -2975,6 +3102,8 @@ impl Default for MouseScrollMsg {
             timestamp_ns: 0,
             coalescable: false,
             motion_mode: PointerMotionMode::Absolute,
+            unit: ScrollUnitMsg::Line,
+            phase: ScrollPhaseMsg::None,
         }
     }
 }
@@ -3265,6 +3394,54 @@ pub fn msg_type(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_opted_in_client_hello_accepts_the_audio_priority_stream() {
+        let hello = |flag: bool| {
+            serde_json::to_string(&ClientHelloMsg {
+                audio_priority_stream_v1: flag,
+                ..ClientHelloMsg::default()
+            })
+            .expect("json")
+        };
+        assert!(ClientHelloMsg::text_accepts_audio_priority_stream(&hello(
+            true
+        )));
+        assert!(!ClientHelloMsg::text_accepts_audio_priority_stream(&hello(
+            false
+        )));
+        assert!(!ClientHelloMsg::text_accepts_audio_priority_stream(
+            "not json client_hello"
+        ));
+        assert!(!ClientHelloMsg::text_accepts_audio_priority_stream(
+            r#"{"type":"quality_settings","audio_priority_stream_v1":true}"#
+        ));
+        assert!(crate::wire::is_audio_frame(&[0x10, 1]));
+        assert!(!crate::wire::is_audio_frame(&[0x04, 1]));
+        assert!(!crate::wire::is_audio_frame(&[]));
+    }
+
+    #[test]
+    fn precise_scroll_fields_are_additive() {
+        let old: MouseScrollMsg =
+            serde_json::from_str(r#"{"type":"mouse_scroll","x":0.5,"y":0.5,"dx":0,"dy":1}"#)
+                .expect("old message");
+        assert_eq!(old.unit, ScrollUnitMsg::Line);
+        assert_eq!(old.phase, ScrollPhaseMsg::None);
+        let plain = serde_json::to_string(&MouseScrollMsg::default()).expect("encode");
+        assert!(
+            !plain.contains("unit") && !plain.contains("phase"),
+            "{plain}"
+        );
+        let precise = serde_json::to_string(&MouseScrollMsg {
+            dy: 3.25,
+            unit: ScrollUnitMsg::Point,
+            phase: ScrollPhaseMsg::Began,
+            ..MouseScrollMsg::default()
+        })
+        .expect("encode");
+        assert!(precise.contains(r#""unit":"point""#) && precise.contains(r#""phase":"began""#));
+    }
+
     use super::*;
 
     #[test]
@@ -4020,6 +4197,7 @@ mod tests {
                 model: 0xa05e,
                 serial: 0xfd626d62,
                 edid: String::new(),
+                color: None,
             },
             ClientMonitor {
                 id: 2,

@@ -227,6 +227,7 @@ mod tests {
             primary,
             width_mm: 300.0,
             height_mm: 200.0,
+            color: None,
         }
     }
 

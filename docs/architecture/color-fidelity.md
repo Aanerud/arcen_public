@@ -34,7 +34,7 @@ capture implementation.
 | Auto | DDA after real-frame proof, otherwise WGC BGRA8 → negotiated 8-bit encode | NvFBC → CUDA → NVENC | SDR |
 | Speed | Same 8-bit path at 60 fps | Same NvFBC device-to-device path at 60 fps | SDR |
 | Grading | WGC FP16 scRGB → SDR transfer/matrix → HEVC I444 P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → HEVC I444 P16 | Native `xf44`, dedicated 10-bit Metal, EDR off |
-| HDR | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → HEVC I444 P16 | No Xorg HDR provider: resolve to the Grading pipeline and report degradation | Native `xf44`, dedicated 10-bit Metal, PQ/EDR only when the resolved transfer remains PQ |
+| HDR | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → HEVC I444 P16 | Declared `rec2100-pq` desktop: depth-30 XShm → BT.2020 NCL matrix → NVENC PQ; otherwise resolve to the Grading pipeline and report degradation | Native `xf44`, dedicated 10-bit Metal, PQ/EDR only when the resolved transfer remains PQ |
 
 Software encoding is another separate pipeline. Windows MF consumes WGC BGRA8
 through the shared NV12 conversion; source-built OpenH264 consumes checked
@@ -98,6 +98,13 @@ Color mode.
   headless HDR path, the final HDR EDID makes HDR available, entering the
   distinct Windows HDR colour mode makes DWM compose in FP16 scRGB, and WGC
   captures that surface before downstream display-link quantisation.
+
+The current NVIDIA headless path performs `NvAPI_GPU_SetEDID` in the signed-in
+session agent. Hardware validation proved the path with an account in the
+host's local Administrators group; a standard local account failed closed with
+`NVAPI_INVALID_USER_PRIVILEGE` before capture started. This is an admission
+limit on automatic headless EDID provisioning, not a requirement imposed on
+attached-display capture.
 
 On Windows 11, the legacy `advancedColorEnabled` flag is not an HDR verdict:
 it can also describe WCG. Arcen uses
@@ -175,9 +182,24 @@ not grant PQ or HLG**: an HDR request is resolved to the same HEVC 4:4:4
 the changed matrix, primaries, and transfer as a permanent colour degradation.
 It must not enter EDR for that session.
 
-Real Linux desktop HDR is reserved for a future color-managed Wayland provider
-that can prove an HDR composition space and capture ten-bit pixels with their
-transfer/primaries metadata. Depth 30 alone is not that proof.
+Depth 30 alone is not HDR proof, but an application can make it HDR. A
+colour-managed application such as Autodesk Flame in "HDR UI" mode, with its
+graphics monitor set to `Rec.2100-PQ`, writes Rec.2100 PQ code values straight
+into its depth-30 window and relies on the monitor being in PQ mode. Xorg
+cannot report that, so the operator declares it: `video.desktop_encoding =
+rec2100-pq`. Then a ten-bit PQ request keeps PQ / BT.2020 / BT.2020 NCL, capenc
+encodes the XShm frames as `WideSource::XorgDeclaredPq` (matrix only, no
+transfer change), and the Deck enters EDR because the host returned PQ. The
+rule is shared (`arcen_media::video::constrain_to_desktop_encoding`): HLG and
+eight-bit PQ still resolve to Grading, SDR requests are never changed, and an
+SDR session on a declared PQ desktop logs a warning because it shows PQ codes
+as SDR, as an SDR monitor would. Measured on the Linux lab with a depth-30 PQ
+ramp: the Deck received `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`, 950 distinct
+luma codes, neutral chroma exactly 512.
+
+General Linux desktop HDR, where the compositor rather than one application
+owns the transfer, is reserved for the colour-managed Wayland provider
+(`linux-wayland-provider.md`).
 
 Measured on the Linux GRID V100D lab host:
 
@@ -490,10 +512,12 @@ incoherent, because no encoder Arcen has can produce it.
 
 ## Outstanding
 
-- **Linux desktop HDR needs the Wayland provider.** Xorg remains available for
-  genuine 10-bit SDR grading, but PQ/HLG requests are downgraded truthfully.
-  The future provider must prove compositor HDR state plus a ten-bit capture
-  format carrying transfer/primaries metadata before Linux advertises HDR.
+- **General Linux desktop HDR needs the Wayland provider.** Xorg serves
+  genuine 10-bit SDR grading, and PQ only for a desktop the operator declares
+  Rec.2100 PQ (`video.desktop_encoding`). Compositor-owned HDR still needs the
+  provider to prove compositor HDR state plus a ten-bit capture format carrying
+  transfer/primaries metadata. A PQ-to-SDR conversion for SDR sessions on a
+  declared PQ desktop is not built.
 - **4:2:2 is not wired.** NV16/P210 bindings and BGRA conversion are absent,
   so the Blackwell capability question cannot yet be measured.
 - The `rav1e` software tier has a real wrapper

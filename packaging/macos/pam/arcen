@@ -1,0 +1,43 @@
+# arcen: auth account
+#
+# The PAM policy the macOS Pier authenticates connecting clients against.
+# Installed as /etc/pam.d/arcen, owned by root, mode 0644.
+#
+# This is deliberately Arcen's own service rather than a borrowed one. Reusing
+# `login` or `sshd` would inherit their session modules, so a password check
+# would start a launchd session and mount a home directory as a side effect.
+# Arcen wants the question answered, not the consequences.
+#
+# `pam_opendirectory` is what actually answers it, so local accounts, directory
+# accounts, disabled accounts and password policy all behave exactly as they do
+# for any other macOS login, without Arcen reimplementing any of it.
+#
+# If this file is missing, PAM falls back to `other`, which on macOS is
+# `pam_deny`. A host with no policy installed refuses everyone rather than
+# admitting everyone, which is the correct direction to fail.
+auth       required       pam_opendirectory.so
+# `pam_nologin` honours /etc/nologin, so an administrator closing the machine
+# for maintenance closes it to Arcen too.
+account    required       pam_nologin.so
+account    required       pam_opendirectory.so
+#
+# Deliberately no `pam_sacl` line.
+#
+# Two versions of this file tried one and both were wrong on a real machine.
+# `sacl_service=ssh` required every Arcen user to also hold Remote Login
+# rights, so a directory account entitled to use the Mac was refused. Changing
+# it to `screensharing` did not help either: when no Service Access Control
+# List group exists — which is the default on a freshly bound machine —
+# `pam_sacl` *denies* rather than admitting everyone. A domain account with
+# valid credentials was told "this account may not sign in here", which reads
+# like a password problem and is not one.
+#
+# Access control therefore rests on the directory itself: `pam_opendirectory`
+# applies the account's real status, expiry and password policy, and
+# `pam_nologin` lets an administrator close the machine. An operator who wants
+# to narrow Arcen to a named group can create the SACL group and add:
+#
+#     account    required       pam_sacl.so sacl_service=screensharing
+#
+# That is an explicit decision with a group behind it, rather than a default
+# that locks out the people it was meant to admit.

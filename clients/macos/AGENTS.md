@@ -28,6 +28,28 @@ strict Clippy gates. There is no single-platform `--workspace` build.
 - Reconnect creates a fresh decoder/inbox and waits for a fresh keyframe.
   Teardown must discard queued frames rather than let stale data delay resume.
 
+## Following a sign-in screen into the desktop
+
+A host that serves its operating system's sign-in screen says so in its hello
+(`ServerHelloMsg::login_window`). Signing in there ends that session by
+design. The Deck therefore treats that close as a hand-over, not a lost
+connection. This behaviour is agreed and measured on the lab Mac: about 4.5 s
+from sign-in to the new desktop's hello. Keep it:
+
+- Credentials outlive the hello **only** for a sign-in screen
+  (`note_hello_desktop`). A signed-in desktop's hello, a manual disconnect, and
+  running out of attempts all drop them. `AuthSubmission` wipes itself on drop.
+- On close, `follow_login_window` holds the last frame under "Signing in…" and
+  reconnects on the shared schedule (`arcen_session::login_window_handover`:
+  2.5 s, then 2 s, five attempts). It never follows a manual disconnect or a
+  TLS identity change.
+- `start_connection` calls `disconnect()`, which drops the hand-over, so
+  `drive_login_window_handover` carries it across the start. An attempt that
+  lands on a sign-in screen again keeps counting; it does not restart.
+- Tests: `a_closed_sign_in_screen_is_followed_holding_the_last_frame` and
+  `only_a_sign_in_screen_keeps_credentials_past_its_hello`. Change the
+  behaviour only on purpose, and change these tests with it.
+
 ## Signing and certificates
 
 - Cert inventory and dev-machine setup: `clients/macos/CERTIFICATES.md`

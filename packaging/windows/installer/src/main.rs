@@ -34,6 +34,10 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    use arcen_transport::cert_marker::{self, OwnershipMarker};
+    use arcen_transport::cert_provisioning::{
+        MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRequest, plan,
+    };
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
     use time::{Duration, OffsetDateTime};
 
@@ -904,16 +908,16 @@ mod imp {
             println!("unchanged: {}", path.display());
             return apply_acl(opts, path, acl_class);
         }
+        if opts.dry_run {
+            println!("dry-run: write {} bytes to {}", bytes.len(), path.display());
+            return Ok(());
+        }
         if executable && service_running(&opts.service_name)? {
             return Err(format!(
                 "service {} is running; refusing to replace {} without stopping it first",
                 opts.service_name,
                 path.display()
             ));
-        }
-        if opts.dry_run {
-            println!("dry-run: write {} bytes to {}", bytes.len(), path.display());
-            return Ok(());
         }
         let parent = path
             .parent()
@@ -1104,33 +1108,140 @@ mod imp {
         Ok(params)
     }
 
+    /// Reads the TLS directory into the shared provisioning input.
+    ///
+    /// The decision itself belongs to `arcen_transport::cert_provisioning`, so
+    /// Windows, Linux and macOS answer create/keep/renew/rekey/adopt
+    /// identically rather than each installer inventing its own rules.
+    fn inspect_tls(tls: &Path) -> MaterialState {
+        let cert = tls.join("host.crt");
+        let key = tls.join("host.key");
+        let certificate_present = cert.is_file();
+        let key_present = key.is_file();
+        if !certificate_present && !key_present {
+            return MaterialState::absent();
+        }
+
+        let bytes = std::fs::read(&cert).ok();
+        let ownership = bytes.as_ref().map(|bytes| {
+            if marker_matches(tls, bytes) {
+                MaterialOwnership::Owned
+            } else {
+                MaterialOwnership::Foreign
+            }
+        });
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (certificate_valid, expiring_or_expired) = bytes
+            .as_ref()
+            .and_then(|bytes| cert_marker::validity_from_pem(bytes))
+            .map_or((false, false), |window| {
+                (
+                    window.is_current(now),
+                    window.is_due_for_renewal(now, RENEW_WITHIN_SECONDS),
+                )
+            });
+
+        MaterialState {
+            certificate_present,
+            key_present,
+            ownership,
+            certificate_valid,
+            expiring_or_expired,
+            stale_staging_present: false,
+        }
+    }
+
+    /// Returns whether the ownership marker describes the certificate on disk.
+    fn marker_matches(tls: &Path, certificate_bytes: &[u8]) -> bool {
+        let Ok(recorded) = std::fs::read_to_string(tls.join(MARKER_FILE)) else {
+            return false;
+        };
+        let Ok(marker) = OwnershipMarker::parse(&recorded) else {
+            return false;
+        };
+        let Some(pins) = cert_marker::pins_from_pem(certificate_bytes) else {
+            return false;
+        };
+        marker.matches(&pins.certificate, &pins.spki)
+    }
+
+    /// Writes the pin files and ownership marker beside the certificate.
+    fn write_pins_and_marker(opts: &Options, tls: &Path) -> Result<(), String> {
+        let bytes = std::fs::read(tls.join("host.crt"))
+            .map_err(|error| format!("read host.crt: {error}"))?;
+        let pins = cert_marker::pins_from_pem(&bytes)
+            .ok_or_else(|| "cannot pin the generated certificate".to_string())?;
+        let marker = OwnershipMarker::new(&pins.certificate, &pins.spki)
+            .map_err(|error| format!("ownership marker: {error}"))?;
+        atomic_write(
+            opts,
+            &tls.join("host.cert-sha256"),
+            format!(
+                "sha256 Fingerprint={}\n",
+                cert_marker::colon_hex(&pins.certificate)
+            )
+            .as_bytes(),
+            false,
+        )?;
+        atomic_write(
+            opts,
+            &tls.join("host.spki-sha256"),
+            format!("{}\n", pins.spki).as_bytes(),
+            false,
+        )?;
+        atomic_write(
+            opts,
+            &tls.join(MARKER_FILE),
+            marker.render().as_bytes(),
+            false,
+        )
+    }
+
+    /// Ownership marker name, shared with the Linux helper and the macOS host.
+    const MARKER_FILE: &str = "host.generated-by-arcen";
+    /// How close to expiry counts as due for renewal.
+    const RENEW_WITHIN_SECONDS: i64 = 30 * 24 * 60 * 60;
+
     fn ensure_tls(opts: &Options, tls: &Path) -> Result<(), String> {
         let cert = tls.join("host.crt");
         let key = tls.join("host.key");
-        // `--force` replaces the certificate, matching the Linux installer.
-        //
-        // Without the force check this returned early whenever a certificate
-        // existed, so there was no way to change the names it covers short of
-        // deleting the files by hand -- and `--uninstall` does not help either,
-        // because it deliberately keeps ProgramData. An operator adding
-        // `--extra-san` to a host that is already installed therefore saw the
-        // option accepted, the install succeed, and the Deck keep rejecting the
-        // same certificate.
-        if cert.exists() && key.exists() && !opts.force {
-            println!(
-                "keeping existing TLS material in {} (pass --force to replace it, \
-                 for example after adding --extra-san)",
-                tls.display()
-            );
-            apply_secret_file_acl(opts, &key)?;
-            return Ok(());
+        // `--force` means "replace the key too", which is what lets an operator
+        // change the names the certificate covers after installation. Without
+        // it, existing material is kept or renewed, never silently replaced.
+        let request = if opts.force {
+            ProvisioningRequest::Rekey
+        } else {
+            ProvisioningRequest::Ensure
+        };
+        let state = inspect_tls(tls);
+        let decided = plan(request, state)
+            .map_err(|refusal| format!("{}: {}", refusal.as_str(), refusal.guidance()))?;
+
+        match decided.action {
+            ProvisioningAction::KeepExisting => {
+                println!(
+                    "keeping existing TLS material in {} (pass --force to replace it, \
+                     for example after adding --extra-san)",
+                    tls.display()
+                );
+                return apply_secret_file_acl(opts, &key);
+            }
+            ProvisioningAction::RenewPreservingKey | ProvisioningAction::AdoptAndRenew => {
+                // Reissuing over the existing key keeps every pinned Deck
+                // working, so it is done without a warning.
+                println!("reissuing the TLS certificate in {}", tls.display());
+            }
+            ProvisioningAction::CreateNew | ProvisioningAction::ReplaceKeyAndCertificate => {
+                if decided.invalidates_pins && (cert.exists() || key.exists()) {
+                    println!(
+                        "--force: replacing the TLS key and certificate in {}. \
+                         Every Deck that pinned the previous certificate must re-pin.",
+                        tls.display()
+                    );
+                }
+            }
         }
-        if cert.exists() || key.exists() {
-            println!(
-                "--force: replacing the TLS certificate in {}",
-                tls.display()
-            );
-        }
+
         let mut names = subject_alt_names();
         // Operator-supplied names last, so a duplicate of something discovered
         // locally does not appear twice; rcgen would emit both.
@@ -1141,18 +1252,42 @@ mod imp {
         }
         println!("TLS certificate covers: {}", names.join(", "));
         let params = certificate_params(names)?;
-        let keypair = KeyPair::generate().map_err(|e| format!("generate TLS key: {e}"))?;
+
+        // Whether the key survives is the whole difference between renewal and
+        // rekey. Generating unconditionally here would make "reissuing over the
+        // existing key" a lie and silently break every SPKI-pinned Deck at the
+        // moment the host renewed itself — the least convenient moment to
+        // discover it.
+        let preserve_key = matches!(
+            decided.action,
+            ProvisioningAction::RenewPreservingKey | ProvisioningAction::AdoptAndRenew
+        );
+        let keypair = if preserve_key {
+            let existing = std::fs::read_to_string(&key)
+                .map_err(|e| format!("read existing TLS key {}: {e}", key.display()))?;
+            KeyPair::from_pem(&existing)
+                .map_err(|e| format!("reuse existing TLS key {}: {e}", key.display()))?
+        } else {
+            KeyPair::generate().map_err(|e| format!("generate TLS key: {e}"))?
+        };
         let certificate = params
             .self_signed(&keypair)
             .map_err(|e| format!("self-sign TLS cert: {e}"))?;
         atomic_write(opts, &cert, certificate.pem().as_bytes(), false)?;
-        atomic_write_with_acl(
-            opts,
-            &key,
-            keypair.serialize_pem().as_bytes(),
-            false,
-            AclClass::SecretFile,
-        )
+        // Rewriting an unchanged key would churn its ACL and mtime for no
+        // reason, and a failure there would destroy material that was fine.
+        if !preserve_key {
+            atomic_write_with_acl(
+                opts,
+                &key,
+                keypair.serialize_pem().as_bytes(),
+                false,
+                AclClass::SecretFile,
+            )?;
+        }
+        // The marker is what stops a later run replacing material an operator
+        // installed themselves, and the pins are what they compare against.
+        write_pins_and_marker(opts, tls)
     }
 
     /// A directory whose contents users must read and execute but never write.
@@ -1716,6 +1851,75 @@ mod imp {
             let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
             assert!(args.contains(&"-NoProfile".into()));
             assert!(args.contains(&"-NonInteractive".into()));
+        }
+
+        #[test]
+        fn dry_run_does_not_query_the_live_service_before_simulating_a_write() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "arcen-windows-installer-dry-run-{}-{unique}",
+                std::process::id()
+            ));
+            let path = root.join("payload.exe");
+            let opts = Options {
+                prefix: root.join("prefix"),
+                programdata: root.join("programdata"),
+                dry_run: true,
+                uninstall: false,
+                purge: false,
+                version: false,
+                force: false,
+                service_name: "invalid\0service".to_string(),
+                extra_sans: Vec::new(),
+            };
+
+            atomic_write_with_acl(&opts, &path, b"replacement", true, AclClass::PublicFile)
+                .expect("dry-run must not query or require stopping the live service");
+            assert!(!path.exists(), "dry-run must not write the payload");
+        }
+
+        #[test]
+        fn a_lone_certificate_is_refused_rather_than_regenerated() {
+            // The bug this migration fixes. `ensure_tls` previously returned
+            // early only when both files existed, so a directory holding just
+            // `host.crt` fell through and regenerated both, replacing a
+            // certificate whose key had gone missing.
+            let state = MaterialState {
+                certificate_present: true,
+                key_present: false,
+                ..MaterialState::absent()
+            };
+            assert!(plan(ProvisioningRequest::Ensure, state).is_err());
+            assert!(plan(ProvisioningRequest::Rekey, state).is_err());
+        }
+
+        #[test]
+        fn material_the_installer_did_not_issue_is_not_replaced() {
+            // Without an ownership marker the installer could overwrite an
+            // enterprise certificate an operator placed deliberately.
+            let foreign = MaterialState {
+                ownership: Some(MaterialOwnership::Foreign),
+                ..MaterialState::owned_valid()
+            };
+            assert!(plan(ProvisioningRequest::Ensure, foreign).is_err());
+            assert!(plan(ProvisioningRequest::Rekey, foreign).is_err());
+        }
+
+        #[test]
+        fn force_replaces_the_key_and_plain_install_keeps_material() {
+            let owned = MaterialState::owned_valid();
+            let kept = plan(ProvisioningRequest::Ensure, owned).expect("keep");
+            assert_eq!(kept.action, ProvisioningAction::KeepExisting);
+            assert!(!kept.invalidates_pins);
+
+            let forced = plan(ProvisioningRequest::Rekey, owned).expect("rekey");
+            assert_eq!(forced.action, ProvisioningAction::ReplaceKeyAndCertificate);
+            assert!(
+                forced.invalidates_pins,
+                "--force must be reported as breaking pins"
+            );
         }
 
         #[test]

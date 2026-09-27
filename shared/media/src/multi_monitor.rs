@@ -685,6 +685,7 @@ impl RequestedMonitor {
             model: monitor.identity.model,
             serial: monitor.identity.serial,
             edid: String::new(),
+            color: monitor.color,
             safe_area_policy,
             quality_intent,
         })
@@ -827,6 +828,7 @@ impl TryFrom<&RequestedMonitorDescriptorMsg> for RequestedMonitor {
             primary: descriptor.is_primary,
             width_mm: descriptor.width_mm,
             height_mm: descriptor.height_mm,
+            color: descriptor.color,
         };
         Self::new(monitor, descriptor.logical_width, descriptor.logical_height)
     }
@@ -1205,6 +1207,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         }
     }
 
@@ -1253,6 +1256,7 @@ mod tests {
                     primary: true,
                     width_mm: 598.0,
                     height_mm: 336.0,
+                    color: None,
                 },
                 2048,
                 1152,

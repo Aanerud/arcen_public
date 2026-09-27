@@ -1,0 +1,201 @@
+#!/bin/bash
+# Runs as root after the payload is in place.
+#
+# Puts every file under the account that needs it and nobody else, provisions
+# the host identity once, starts the network service for the machine and one
+# desktop agent for every graphical session, and then checks that what it
+# started is actually running. An installer that reports success for a host
+# that never listens has happened here three times; this one says so.
+set -u
+
+# shellcheck source=packaging/macos/pier/common.sh
+. "$(dirname "$0")/common.sh"
+
+fail() {
+  arcen_log "$*" >&2
+}
+
+GROUP_ADMIN="admin"
+
+# --- Configuration: the machine's, not a person's --------------------------
+#
+# An earlier package handed the whole support directory, key included, to
+# whoever was at the console during install. Every other account's agent then
+# failed to read the key, and the console user could read — and copy — the
+# identity every Deck had pinned. Nothing here belongs to a person any more.
+mkdir -p "$ARCEN_SUPPORT"
+chown root:wheel "$ARCEN_SUPPORT"
+chmod 755 "$ARCEN_SUPPORT"
+
+# Written only when absent, so an upgrade never replaces an edited file.
+# Without it the host falls back to fail-safe defaults — loopback only — and is
+# unreachable from another machine.
+if [ ! -f "$ARCEN_CONFIG" ]; then
+  cp "$ARCEN_PIER_APP/Contents/Resources/pier.json" "$ARCEN_CONFIG"
+fi
+for file in "$ARCEN_CONFIG" "$ARCEN_CONFIG.bak"; do
+  [ -f "$file" ] || continue
+  chown root:wheel "$file"
+  chmod 644 "$file"
+done
+
+mkdir -p "$ARCEN_RUN"
+chown "$ARCEN_ACCOUNT":wheel "$ARCEN_RUN"
+chmod 755 "$ARCEN_RUN"
+
+# --- Host identity: readable by the service alone --------------------------
+mkdir -p "$ARCEN_TLS"
+if [ -d "$ARCEN_TLS" ]; then
+  # Refuse links inside the identity directory rather than follow them as
+  # root: a planted `host.key` link is how a person who once owned this
+  # directory could have steered a root install into another file.
+  if find "$ARCEN_TLS" -mindepth 1 -type l | grep -q .; then
+    fail "refusing to continue: $ARCEN_TLS contains symbolic links"
+    exit 1
+  fi
+fi
+chown -R "$ARCEN_ACCOUNT":"$GROUP_ADMIN" "$ARCEN_TLS"
+chmod 750 "$ARCEN_TLS"
+
+if [ ! -f "$ARCEN_TLS/host.crt" ]; then
+  NAME="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  set -- --directory "$ARCEN_TLS" --dns "$NAME.local"
+  for interface in en0 en1; do
+    ADDRESS="$(ipconfig getifaddr "$interface" 2>/dev/null || true)"
+    [ -n "$ADDRESS" ] && set -- "$@" --ip "$ADDRESS"
+  done
+  # As the service account: the key is born with the owner that reads it, so
+  # no later ownership change is needed for it to be private.
+  if ! OUTPUT="$(/usr/bin/sudo -u "$ARCEN_ACCOUNT" "$ARCEN_PIER_BIN" new-host-cert "$@" 2>&1)"; then
+    fail "could not create this host's TLS identity:"
+    echo "$OUTPUT" >&2
+    exit 1
+  fi
+  arcen_log "created this host's TLS identity"
+fi
+[ -f "$ARCEN_TLS/host.crt" ] || { fail "no certificate after provisioning"; exit 1; }
+find "$ARCEN_TLS" -mindepth 1 -maxdepth 1 -type f -exec chown "$ARCEN_ACCOUNT":"$GROUP_ADMIN" {} +
+find "$ARCEN_TLS" -mindepth 1 -maxdepth 1 -type f -exec chmod 644 {} +
+find "$ARCEN_TLS" -mindepth 1 -maxdepth 1 -type f -name '*.key*' -exec chmod 600 {} +
+
+# --- Logs --------------------------------------------------------------------
+# The service writes here; administrators can read it without sudo; agents,
+# which run as people, write under their own ~/Library/Logs instead.
+mkdir -p "$ARCEN_LOGS"
+chown root:wheel "$(dirname "$ARCEN_LOGS")"
+chmod 755 "$(dirname "$ARCEN_LOGS")"
+chown -R "$ARCEN_ACCOUNT":"$GROUP_ADMIN" "$ARCEN_LOGS"
+chmod 750 "$ARCEN_LOGS"
+find "$ARCEN_LOGS" -mindepth 1 -type f -exec chmod 640 {} +
+chown root:wheel "$ARCEN_NEWSYSLOG" 2>/dev/null
+chmod 644 "$ARCEN_NEWSYSLOG" 2>/dev/null
+chown root:wheel "$ARCEN_PAM"
+chmod 644 "$ARCEN_PAM"
+
+# --- What earlier builds left behind ----------------------------------------
+rm -f "$ARCEN_LEGACY_AGENT_PLIST" "$ARCEN_LEGACY_SERVICE_PLIST"
+rm -f /tmp/arcen-pier.out.log /tmp/arcen-pier.err.log
+rm -rf "$ARCEN_PIER_APP.prev" "$ARCEN_PIER_APP.prev2" "$ARCEN_AGENT_APP.prev" "$ARCEN_AGENT_APP.prev2"
+
+# --- Firewall ----------------------------------------------------------------
+# Only when it is on: an operator who turned it off made that decision.
+if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q "enabled"; then
+  /usr/libexec/ApplicationFirewall/socketfilterfw --add "$ARCEN_PIER_BIN" >/dev/null 2>&1 || true
+  /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$ARCEN_PIER_BIN" >/dev/null 2>&1 || true
+  arcen_log "allowed incoming connections to the Pier service through the firewall"
+fi
+
+# --- Start -------------------------------------------------------------------
+launchctl enable "system/$ARCEN_SERVICE_LABEL" 2>/dev/null || true
+if ! OUTPUT="$(launchctl bootstrap system "$ARCEN_SERVICE_PLIST" 2>&1)"; then
+  if printf '%s' "$OUTPUT" | grep -qi "already"; then
+    launchctl kickstart -k "system/$ARCEN_SERVICE_LABEL" >/dev/null 2>&1 || true
+  else
+    fail "the network service could not be started: $OUTPUT"
+  fi
+fi
+
+AGENT_UIDS=""
+for uid in $(arcen_gui_uids); do
+  [ "$uid" -eq 0 ] && continue
+  AGENT_UIDS="$AGENT_UIDS $uid"
+  launchctl enable "gui/$uid/$ARCEN_AGENT_LABEL" 2>/dev/null || true
+  if ! OUTPUT="$(launchctl bootstrap "gui/$uid" "$ARCEN_AGENT_PLIST" 2>&1)"; then
+    if printf '%s' "$OUTPUT" | grep -qi "already"; then
+      launchctl kickstart -k "gui/$uid/$ARCEN_AGENT_LABEL" >/dev/null 2>&1 || true
+    else
+      fail "the desktop agent could not be started for uid $uid: $OUTPUT"
+    fi
+  fi
+done
+
+# --- Check -------------------------------------------------------------------
+running() {
+  launchctl print "$1" 2>/dev/null | grep -q "state = running"
+}
+LISTENING=""
+for _ in $(seq 1 15); do
+  if running "system/$ARCEN_SERVICE_LABEL" && arcen_port_in_use; then
+    LISTENING="yes"
+    break
+  fi
+  sleep 1
+done
+if [ -n "$LISTENING" ]; then
+  arcen_log "network service running and listening on UDP $ARCEN_PORT"
+else
+  fail "the network service is not listening on UDP $ARCEN_PORT; see $ARCEN_LOGS/service.log"
+fi
+for uid in $AGENT_UIDS; do
+  STARTED=""
+  for _ in $(seq 1 10); do
+    if running "gui/$uid/$ARCEN_AGENT_LABEL"; then
+      STARTED="yes"
+      break
+    fi
+    sleep 1
+  done
+  USER_NAME="$(id -un "$uid" 2>/dev/null || echo "uid $uid")"
+  if [ -n "$STARTED" ]; then
+    arcen_log "desktop agent running for $USER_NAME"
+  else
+    fail "the desktop agent is not running for $USER_NAME; see ~$USER_NAME/Library/Logs/Arcen/Pier/agent.log"
+  fi
+done
+if [ -z "$AGENT_UIDS" ]; then
+  # Nobody is logged in, so the login window is on screen. Its agents are
+  # loaded when a login-window session starts, and launchctl offers no domain
+  # to bootstrap one into; restarting the login window loads the new agent.
+  # Safe only here: with no user session there is nothing to lose.
+  if [ "$(stat -f%Su /dev/console 2>/dev/null)" = "root" ]; then
+    for pid in $(pgrep -x loginwindow); do kill "$pid"; done
+    arcen_log "nobody is logged in; restarted the login window so it is served"
+  else
+    arcen_log "nobody is logged in; each user's desktop agent starts when they log in"
+  fi
+fi
+
+cat <<'NOTE'
+
+Arcen Pier is installed.
+
+Each person who will be served needs to allow, once, in their own session:
+  System Settings > Privacy & Security > Screen & System Audio Recording
+      "Arcen Agent Helper"
+  System Settings > Privacy & Security > Accessibility
+      "Arcen Agent Helper"   (keyboard input)
+Until then a Deck can sign in and will be told the picture is unavailable.
+The login window asks separately: the first time a Deck connects before
+anyone has signed in, someone at this Mac must allow screen capture there.
+
+To remove Arcen Pier:
+  sudo "/Applications/Arcen Pier.app/Contents/Resources/uninstall.sh"
+  (add --purge to also remove the host identity, configuration, logs and the
+   _arcen service account)
+
+NOTE
+
+# A failed start is reported but does not fail the package: the files are in
+# place and correct, and the message above says exactly what is not running.
+# Failing here would leave Installer claiming nothing changed.
+exit 0

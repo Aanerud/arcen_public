@@ -260,6 +260,7 @@ pub fn build_requested_topology_from(
             primary: client_monitor.is_primary,
             width_mm: client_monitor.width_mm,
             height_mm: client_monitor.height_mm,
+            color: client_monitor.color,
         };
         let requested_monitor =
             RequestedMonitor::new(monitor, arrangement.width(), arrangement.height())
@@ -347,6 +348,7 @@ mod tests {
             model: 40_968,
             serial: 0,
             edid: String::new(),
+            color: None,
         }
     }
 

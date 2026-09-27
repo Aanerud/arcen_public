@@ -75,9 +75,38 @@ pub struct VideoConfig {
     /// within a frame without changing the format a client decodes, so there
     /// is nothing to negotiate. See `docs/architecture/qp-maps.md`.
     pub qp_map: Option<String>,
+    /// How the captured desktop's pixels are encoded where the platform
+    /// cannot report it (Linux Xorg): `sdr` (default) or `rec2100-pq`, the
+    /// operator's promise that a colour-managed application writes Rec.2100
+    /// PQ code values into the desktop.
+    pub desktop_encoding: Option<String>,
     pub variant: Option<String>,
     pub fps: Option<u32>,
     pub encoder: Option<String>,
+}
+
+/// Whether a remote session leaves the host's own speakers audible.
+///
+/// This is separate from whether audio is *transmitted*. Someone sitting at
+/// the host machine hearing the remote user's audio is a privacy failure
+/// regardless of what the network is carrying, so the default silences local
+/// playback for the whole session even when redirection is switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPlayback {
+    /// Local speakers stay silent for the duration of the session.
+    #[default]
+    Muted,
+    /// Local speakers keep working. The operator asked for this explicitly.
+    Audible,
+}
+
+impl LocalPlayback {
+    /// Returns whether the host must hold a mute lease for the session.
+    #[must_use]
+    pub const fn requires_mute(self) -> bool {
+        matches!(self, Self::Muted)
+    }
 }
 
 /// Required host authority for host-to-Deck audio.
@@ -87,6 +116,13 @@ pub struct AudioConfig {
     pub enabled: bool,
     /// `true` forces the documented Opus policy; `false` forces PCM.
     pub compressed: bool,
+    /// Whether the host's own speakers stay audible during a session.
+    ///
+    /// Absent in existing configurations, which is why it carries a default
+    /// rather than becoming a required field: an operator upgrading a host
+    /// must not have it refuse to start. The default is the safe direction.
+    #[serde(default)]
+    pub local_playback: LocalPlayback,
 }
 
 /// Required host authority for Deck-to-host microphone publication.
@@ -275,6 +311,59 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<PierConfig<TestPlatform>>(document).is_err());
         }
+    }
+
+    #[test]
+    fn local_playback_defaults_to_muted_for_configurations_that_predate_it() {
+        // An operator upgrading a host must not have it refuse to start, and
+        // the value it silently acquires must be the safe one: someone at the
+        // host machine hearing the remote user is a privacy failure whether or
+        // not the operator has heard of this setting.
+        let config: PierConfig<TestPlatform> = serde_json::from_str(
+            r#"{"audio":{"enabled":true,"compressed":false},
+                "microphone_input":{"enabled":false},
+                "platform":{"name":"test"}}"#,
+        )
+        .expect("an existing configuration still parses");
+        assert_eq!(config.audio.local_playback, LocalPlayback::Muted);
+        assert!(config.audio.local_playback.requires_mute());
+    }
+
+    #[test]
+    fn local_playback_is_host_authoritative_and_explicit() {
+        let audible: PierConfig<TestPlatform> = serde_json::from_str(
+            r#"{"audio":{"enabled":false,"compressed":false,"local_playback":"audible"},
+                "microphone_input":{"enabled":false},
+                "platform":{"name":"test"}}"#,
+        )
+        .expect("parse");
+        assert_eq!(audible.audio.local_playback, LocalPlayback::Audible);
+        assert!(!audible.audio.local_playback.requires_mute());
+
+        // Mute is required even when nothing is transmitted, which is the
+        // whole point of keeping it separate from `enabled`.
+        let muted_but_disabled: PierConfig<TestPlatform> = serde_json::from_str(
+            r#"{"audio":{"enabled":false,"compressed":false,"local_playback":"muted"},
+                "microphone_input":{"enabled":false},
+                "platform":{"name":"test"}}"#,
+        )
+        .expect("parse");
+        assert!(!muted_but_disabled.audio.enabled);
+        assert!(muted_but_disabled.audio.local_playback.requires_mute());
+    }
+
+    #[test]
+    fn an_unrecognised_local_playback_value_is_refused() {
+        // Silently treating a typo as "audible" would leave a host audible
+        // when its operator asked for silence.
+        assert!(
+            serde_json::from_str::<PierConfig<TestPlatform>>(
+                r#"{"audio":{"enabled":true,"compressed":false,"local_playback":"quiet"},
+                "microphone_input":{"enabled":false},
+                "platform":{"name":"test"}}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

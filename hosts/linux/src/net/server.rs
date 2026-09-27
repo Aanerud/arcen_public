@@ -2570,7 +2570,7 @@ struct SessionAdmissionGuard {
 impl Drop for SessionAdmissionGuard {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            self.runtime.complete(lease);
+            let _ = self.runtime.complete(&lease);
         }
     }
 }
@@ -2800,11 +2800,29 @@ async fn run_ws(
             Some(authenticated) => {
                 let AuthenticatedConnection {
                     response,
-                    launcher,
+                    mut launcher,
                     multi_monitor_outcome,
                     session_config: authenticated_config,
+                    display_plan,
                     ..
                 } = authenticated;
+                // A single-head session's head takes the served Deck
+                // display's EDID; a multi-head plan keeps its own heads.
+                if !matches!(
+                    multi_monitor_outcome,
+                    multi_monitor::MultiMonitorOutcome::Planned { .. }
+                ) {
+                    let served = display_plan
+                        .served_monitor_id
+                        .and_then(|id| response.monitors.iter().find(|monitor| monitor.id == id));
+                    launcher.set_session_display(served.map(|monitor| {
+                        crate::session::launcher::SessionDisplayMsg::served(
+                            monitor,
+                            display_plan.width,
+                            display_plan.height,
+                        )
+                    }));
+                }
                 let admitted_monitor_count = match &multi_monitor_outcome {
                     multi_monitor::MultiMonitorOutcome::Planned { plan, .. } => {
                         Some(plan.monitors.len())
@@ -3834,6 +3852,7 @@ async fn run_attachment(
         .as_ref()
         .is_some_and(|resources| resources.can_reassign())
         && display_mode.allows_live_resize();
+    let priority_audio = ws.priority_audio();
     let (mut sink, mut stream) = ws.split();
     // Recovery is tied to the authenticated user environment, not to current
     // microphone negotiation or media startup.
@@ -4297,6 +4316,9 @@ async fn run_attachment(
             return handshake_receive_attachment_end(&error, refresh.as_ref());
         }
     };
+    // Audio moves to its own priority stream only when the Deck says it reads
+    // one; otherwise it stays on the session stream.
+    let priority_audio = priority_audio.filter(|_| client_hello.audio_priority_stream_v1);
     if let Some(initial) = cfg.auth_video_request.as_ref() {
         let echoed =
             arcen_protocol::messages::ClientVideoCapabilitiesMsg::from_client_hello(&client_hello);
@@ -5455,6 +5477,7 @@ async fn run_attachment(
             sender_audio_control,
             refresh,
             write_timeout,
+            priority_audio,
         )
         .instrument(tracing::Span::current()),
     );
@@ -6875,7 +6898,11 @@ fn concrete_encoder_for(plan: ResolvedMediaPlan) -> Option<EncoderRequest> {
     match plan.backend {
         EncoderBackend::NativeNvenc => Some(EncoderRequest::NativeNvenc),
         EncoderBackend::OpenH264 => Some(EncoderRequest::SoftwareH264),
-        EncoderBackend::WindowsMediaFoundation => None,
+        // Neither can be opened on this host: Media Foundation is Windows and
+        // VideoToolbox is macOS. Both are in the shared vocabulary because
+        // another Pier reports them, and neither is a request this one can
+        // turn into a concrete encoder.
+        EncoderBackend::WindowsMediaFoundation | EncoderBackend::VideoToolbox => None,
         EncoderBackend::Rav1e => Some(EncoderRequest::SoftwareAv1),
     }
 }
@@ -6950,6 +6977,9 @@ fn spawn_frame_pump(
                         }
                     }
                 } else {
+                    if !au.is_keyframe {
+                        queue.wait_for_room(crate::session::client::ROOM_WAIT).await;
+                    }
                     queue.enqueue_classified(frame, au.is_keyframe, generation_recovery);
                 }
             }
@@ -7598,6 +7628,32 @@ async fn disable_audio_after_codec_failure(
     send_audio_result_required(control, stream).await
 }
 
+/// Sends one audio frame on the Deck's priority stream, logging when the
+/// stream opens and when it fails. Returns whether the frame went; a frame
+/// that did not goes on the session stream.
+async fn send_priority_audio(
+    priority: &mut arcen_transport::quic::PriorityAudio,
+    frame: &[u8],
+) -> bool {
+    let outcome = priority.send(frame).await;
+    match &outcome {
+        arcen_transport::quic::PriorityAudioSend::Opened => {
+            info!(target: SESSION, "audio moved to its own priority stream");
+        }
+        arcen_transport::quic::PriorityAudioSend::OpenFailed(error)
+        | arcen_transport::quic::PriorityAudioSend::WriteFailed(error) => {
+            warn!(
+                target: SESSION,
+                %error,
+                "audio priority stream unavailable; audio stays on the session stream"
+            );
+        }
+        arcen_transport::quic::PriorityAudioSend::Sent
+        | arcen_transport::quic::PriorityAudioSend::Unusable => {}
+    }
+    outcome.delivered()
+}
+
 #[allow(clippy::too_many_arguments)] // Per-connection sender context: mux source plus audio/clipboard/control/resume wiring.
 async fn sender_loop<S>(
     mut sink: S,
@@ -7608,6 +7664,9 @@ async fn sender_loop<S>(
     audio_control: AudioControl,
     refresh: Option<ResumeRefreshContext>,
     write_timeout: Duration,
+    // The Deck's audio priority stream, when it accepted one: audio then
+    // never queues behind video this sink has already accepted.
+    mut priority_audio: Option<arcen_transport::quic::PriorityAudio>,
 ) -> SessionEndReason
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -7706,6 +7765,12 @@ where
                         &packet.payload,
                         packet.timestamp_ms,
                     );
+                    if let Some(priority) = priority_audio.as_mut().filter(|priority| priority.usable()) {
+                        if send_priority_audio(priority, &bytes).await {
+                            audio_control.record_sent(payload_bytes);
+                            continue;
+                        }
+                    }
                     if !send_ws_with_timeout(
                         &mut sink,
                         Message::Binary(bytes),
@@ -10060,6 +10125,7 @@ mod tests {
                     window_secs: 0,
                 }),
                 Duration::from_millis(5),
+                None,
             ),
         )
         .await
@@ -10181,6 +10247,7 @@ mod tests {
             test_audio_control(),
             None,
             Duration::from_millis(20),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -10238,6 +10305,7 @@ mod tests {
                 test_audio_control(),
                 None,
                 Duration::from_millis(5),
+                None,
             ),
         )
         .await
@@ -11768,6 +11836,7 @@ mod tests {
             test_audio_control(),
             None,
             Duration::from_millis(100),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_millis(100), async {

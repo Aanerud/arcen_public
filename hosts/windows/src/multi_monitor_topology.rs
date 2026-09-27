@@ -1204,6 +1204,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         RequestedMonitor::new(monitor, logical_width, logical_height).expect("requested monitor")
     }
@@ -1831,6 +1832,7 @@ mod tests {
             primary: true,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         let requested_monitor =
             RequestedMonitor::new(rotated, 1_920, 1_080).expect("requested monitor");
@@ -2507,6 +2509,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         RequestedMonitor::new(monitor, width_px, height_px).expect("requested monitor")
     }

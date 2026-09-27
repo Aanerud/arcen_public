@@ -87,6 +87,13 @@ pub enum FrameType {
     UsbBridgeUrbComplete = 0x42,
 }
 
+/// Whether a binary session message is a host audio frame: the frames a Pier
+/// moves to the audio priority stream when the Deck accepts one.
+#[must_use]
+pub fn is_audio_frame(message: &[u8]) -> bool {
+    message.first().copied() == Some(FrameType::Audio as u8)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum VideoCodec {
@@ -103,6 +110,27 @@ pub enum ChromaSubsampling {
     Yuv420 = 0x00,
     Yuv422 = 0x01,
     Yuv444 = 0x02,
+}
+
+/// The wire clock: epoch milliseconds truncated to 32 bits.
+///
+/// Every header's `timestamp_ms` is on this clock, and a receiver reads age as
+/// `now.wrapping_sub(timestamp_ms)`. That only works if both ends agree on the
+/// origin, and "milliseconds" alone does not settle it: a host that sent
+/// milliseconds since its own session start produced frames the Deck read as
+/// twenty-three days old, because subtracting a small number from the current
+/// epoch is not an age.
+///
+/// Truncation is the format, not an accident — it wraps every 49.7 days and
+/// `wrapping_sub` reads correctly across the wrap. Saturating instead would
+/// freeze the clock at the boundary and report every later frame as the same
+/// instant.
+#[must_use]
+pub fn now_wire_timestamp_ms() -> u32 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    (millis & u128::from(u32::MAX)) as u32
 }
 
 /// Coded component depth carried in [`VideoHeader::flags`].
@@ -1080,6 +1108,31 @@ fn urb_status_from_byte(value: u8) -> Result<UrbStatus, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_wire_clock_is_the_epoch_truncated_not_a_session_offset() {
+        // A receiver reads age as `now.wrapping_sub(timestamp_ms)`. That is
+        // only an age if both ends share an origin. A host sending
+        // milliseconds since its own session start made the Deck compute
+        // roughly minus twenty-three days for a frame that was twenty
+        // milliseconds old.
+        let now = now_wire_timestamp_ms();
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis();
+        let expected = (epoch_ms & u128::from(u32::MAX)) as u32;
+        assert!(
+            now.wrapping_sub(expected) < 5_000,
+            "the wire clock must track the epoch, not an arbitrary origin",
+        );
+
+        // Ages read correctly across the 49.7-day wrap, which is why the
+        // format truncates rather than saturating.
+        let before_wrap = u32::MAX - 10;
+        let after_wrap = 9_u32;
+        assert_eq!(after_wrap.wrapping_sub(before_wrap), 20);
+    }
     use super::*;
 
     #[test]

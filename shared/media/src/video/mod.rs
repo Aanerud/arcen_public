@@ -1,18 +1,23 @@
 //! Pure video frame, conversion, backend-plan, and optional software-codec APIs.
 
+mod bitrate;
 mod convert;
+mod desktop_encoding;
 mod frame;
 mod intent;
 mod obu;
 mod plan;
 mod policy;
+pub mod pq_white;
 mod qpmap;
 #[cfg(feature = "software-av1-source")]
 mod software_av1;
 #[cfg(feature = "software-h264-source")]
 mod software_h264;
 mod variant;
+mod wire_frame;
 
+pub use bitrate::{average_bitrate_bps, link_capped_average_bitrate_bps};
 pub use convert::{
     ColorTransform, ConversionError, PackedRgb10Layout, ScrgbPqTransform, ScrgbSdrTransform,
     WIDE_INPUT_MAX, convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i444,
@@ -22,6 +27,7 @@ pub use convert::{
     convert_scrgb_to_sdr_i444_p16, half_to_f32, linear_nits_to_pq_signal, linear_to_bt709,
     linear_to_srgb, scrgb_component_to_pq_code,
 };
+pub use desktop_encoding::{DesktopSignalEncoding, constrain_to_desktop_encoding};
 pub use frame::{
     FrameLayoutError, I420Frame, I420FrameMut, I444Frame, I444FrameMut, I444P16FrameMut,
     Nv12FrameMut,
@@ -43,6 +49,7 @@ pub use policy::{
     HostInitialVideoPolicy, ResolvedHostInitialVideo, adaptive_codec_ladder,
     cap_bit_depth_to_client, color_contract_is_servable, resolve_client_color_request,
     resolve_client_color_request_with_matrix_caps, resolve_host_initial_video,
+    resolve_host_initial_video_with_supported_codecs,
 };
 pub use qpmap::{
     KEEL_BLOCK_SIZE, MAX_ABS_QP_DELTA, QpBias, QpDeltaMapBuilder, QpMapError, QpMapGeometry,
@@ -59,3 +66,7 @@ pub use software_h264::{
     SoftwareH264Encoder, SoftwareH264Error, SoftwareH264Stats,
 };
 pub use variant::{PROBE_MATRIX, VariantIdError, VideoVariant};
+pub use wire_frame::{
+    FramedVideoCodec, VideoWireProfile, VideoWireRoute, video_frame_message, video_header,
+    wire_bit_depth, wire_chroma, wire_matrix, wire_range,
+};

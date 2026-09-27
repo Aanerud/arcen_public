@@ -5,6 +5,7 @@ use arcen_protocol::AudioCodec;
 mod microphone;
 #[cfg(feature = "audio-opus")]
 mod opus;
+pub mod playout;
 use arcen_protocol::messages::{
     AUDIO_PROTOCOL_VERSION, AudioBitrateTierMsg, AudioOutputCapabilitiesMsg, AudioStreamConfigMsg,
     AudioStreamReason, AudioStreamResultMsg,
@@ -41,6 +42,46 @@ pub const JITTER_TARGET_MS: u16 = 60;
 pub const JITTER_TRIM_THRESHOLD_MS: u16 = 110;
 /// Hard Deck decoded-audio bound.
 pub const JITTER_MAX_MS: u16 = 200;
+
+/// How many encoded audio packets a host may hold for one Deck before the
+/// oldest stop being worth sending.
+///
+/// Eight packets is 160 ms at [`AUDIO_V1_FRAME_DURATION_MS`], which sits under
+/// the [`JITTER_MAX_MS`] a Deck will hold. Audio older than that cannot be
+/// played in time whatever the host does with it, so sending it costs the
+/// writer without buying the listener anything.
+pub const AUDIO_SEND_BACKLOG_PACKETS: usize = 8;
+
+/// Drops the oldest packets from a backlog that has outgrown what is still
+/// live, and reports how many were dropped.
+///
+/// A host draining a backlog writes each packet to the same connection its
+/// video uses. Draining without a bound therefore lets a burst of stale audio
+/// hold the writer while frames wait behind it — the listener gets sound that
+/// is already too late to play, and the person watching gets a visible stall
+/// in exchange.
+///
+/// Dropping the oldest rather than refusing the newest is the same choice the
+/// capture side makes: what a listener wants is the sound happening now.
+///
+/// # Examples
+///
+/// ```
+/// # use arcen_media::audio::trim_audio_backlog;
+/// let mut packets = vec![1, 2, 3, 4, 5];
+/// assert_eq!(trim_audio_backlog(&mut packets, 2), 3);
+/// assert_eq!(packets, vec![4, 5]);
+/// ```
+pub fn trim_audio_backlog<T>(packets: &mut Vec<T>, capacity: usize) -> usize {
+    let Some(excess) = packets.len().checked_sub(capacity) else {
+        return 0;
+    };
+    if excess == 0 {
+        return 0;
+    }
+    packets.drain(..excess);
+    excess
+}
 
 /// Exact interleaved signed-PCM frame shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,8 +560,191 @@ impl AudioJitterBuffer {
     }
 }
 
+/// Turns a stream of float samples into fixed-size PCM packets.
+///
+/// Capture hardware delivers whatever buffer size its clock happens to
+/// produce — 512 frames here, 480 there, varying with the device. The wire
+/// format is fixed at one 20 ms frame, so something has to hold the remainder
+/// between callbacks. Doing that in the platform adapter means writing it
+/// again for every platform and getting the boundary arithmetic wrong in a
+/// different way each time.
+///
+/// Samples are clamped before conversion. Float audio is nominally
+/// -1.0..=1.0, but a device can exceed it, and letting that wrap an `i16`
+/// turns a loud passage into a burst of noise at the opposite polarity.
+#[derive(Debug, Clone)]
+pub struct PcmPacketizer {
+    spec: AudioFrameSpec,
+    samples_per_packet: usize,
+    pending: Vec<i16>,
+}
+
+impl PcmPacketizer {
+    /// Creates a packetizer for `spec`.
+    ///
+    /// Returns `None` for a specification that does not describe a whole
+    /// number of samples.
+    #[must_use]
+    pub fn new(spec: AudioFrameSpec) -> Option<Self> {
+        let samples_per_packet = spec.interleaved_samples()?;
+        // A specification that rounds down to no samples — a 1 ms frame at
+        // 1 Hz, say — would make `push` emit empty packets forever without
+        // consuming input. Refusing it here is the only place that is cheap.
+        if samples_per_packet == 0 {
+            return None;
+        }
+        Some(Self {
+            spec,
+            samples_per_packet,
+            pending: Vec::with_capacity(samples_per_packet * 2),
+        })
+    }
+
+    /// Returns the specification being produced.
+    #[must_use]
+    pub const fn spec(&self) -> AudioFrameSpec {
+        self.spec
+    }
+
+    /// Returns how many samples are held back, waiting to complete a packet.
+    #[must_use]
+    pub fn pending_samples(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Accepts interleaved float samples and appends any completed packets.
+    ///
+    /// Each completed packet is exactly [`AudioFrameSpec::interleaved_samples`]
+    /// long, so a caller can hand it straight to an encoder or to the PCM wire
+    /// format without checking again.
+    pub fn push(&mut self, samples: &[f32], packets: &mut Vec<Vec<i16>>) {
+        self.pending
+            .extend(samples.iter().map(|&sample| to_i16(sample)));
+        while self.pending.len() >= self.samples_per_packet {
+            let rest = self.pending.split_off(self.samples_per_packet);
+            packets.push(std::mem::replace(&mut self.pending, rest));
+        }
+    }
+
+    /// Discards anything held back.
+    ///
+    /// Used when a stream is replaced: carrying samples across a generation
+    /// boundary would splice one session's audio onto another's.
+    pub fn reset(&mut self) {
+        self.pending.clear();
+    }
+}
+
+/// Converts one float sample to the wire's 16-bit integer form.
+///
+/// Clamped rather than wrapped, and NaN becomes silence rather than an
+/// arbitrary value.
+#[must_use]
+fn to_i16(sample: f32) -> i16 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    // `i16::MAX` rather than 32768: scaling by the larger value lets a sample
+    // of exactly 1.0 overflow, which is the classic way this conversion
+    // produces a click at full scale.
+    let scaled = sample.clamp(-1.0, 1.0) * f32::from(i16::MAX);
+    // The clamp above bounds this to +/-32767, well inside `i16`.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        scaled as i16
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn packets_are_exactly_one_frame_and_the_remainder_is_kept() {
+        // Capture hardware delivers whatever its clock produces, never
+        // conveniently aligned to the wire's frame. Losing the remainder would
+        // drop a few milliseconds of audio on every callback.
+        let spec = AudioFrameSpec::V1;
+        let wanted = spec.interleaved_samples().expect("v1 is valid");
+        let mut packetizer = PcmPacketizer::new(spec).expect("v1 is valid");
+        let mut packets = Vec::new();
+
+        packetizer.push(&vec![0.5; wanted + 100], &mut packets);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].len(), wanted);
+        assert_eq!(packetizer.pending_samples(), 100);
+
+        // The held-back samples complete the next packet rather than being
+        // dropped or duplicated.
+        packetizer.push(&vec![0.5; wanted - 100], &mut packets);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[1].len(), wanted);
+        assert_eq!(packetizer.pending_samples(), 0);
+    }
+
+    #[test]
+    fn several_packets_can_complete_in_one_push() {
+        let spec = AudioFrameSpec::V1;
+        let wanted = spec.interleaved_samples().expect("valid");
+        let mut packetizer = PcmPacketizer::new(spec).expect("valid");
+        let mut packets = Vec::new();
+        packetizer.push(&vec![0.0; wanted * 3], &mut packets);
+        assert_eq!(packets.len(), 3);
+        assert!(packets.iter().all(|packet| packet.len() == wanted));
+        assert_eq!(packetizer.pending_samples(), 0);
+    }
+
+    #[test]
+    fn full_scale_does_not_wrap_to_the_opposite_polarity() {
+        // Scaling by 32768 lets exactly 1.0 overflow to -32768, which is heard
+        // as a click at the loudest moment of the audio.
+        assert_eq!(to_i16(1.0), i16::MAX);
+        assert_eq!(to_i16(-1.0), -i16::MAX);
+        assert_eq!(to_i16(2.0), i16::MAX, "over-range clamps, never wraps");
+        assert_eq!(to_i16(-2.0), -i16::MAX);
+        assert_eq!(to_i16(0.0), 0);
+        assert_eq!(to_i16(f32::NAN), 0, "a bad sample becomes silence");
+        assert_eq!(to_i16(f32::INFINITY), 0);
+    }
+
+    #[test]
+    fn a_reset_does_not_splice_one_session_onto_another() {
+        let spec = AudioFrameSpec::V1;
+        let wanted = spec.interleaved_samples().expect("valid");
+        let mut packetizer = PcmPacketizer::new(spec).expect("valid");
+        let mut packets = Vec::new();
+        packetizer.push(&vec![1.0; 100], &mut packets);
+        assert_eq!(packetizer.pending_samples(), 100);
+
+        packetizer.reset();
+        assert_eq!(packetizer.pending_samples(), 0);
+
+        // The next packet is made entirely of new samples.
+        packetizer.push(&vec![0.0; wanted], &mut packets);
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
+    fn a_specification_with_no_samples_is_refused() {
+        // This rounds down to zero samples per packet. Accepting it makes
+        // `push` emit empty packets forever without consuming input, which
+        // hangs whichever thread called it — in the macOS host, the Core Audio
+        // real-time thread.
+        let degenerate = AudioFrameSpec {
+            sample_rate_hz: 1,
+            channels: 1,
+            frame_duration_ms: 1,
+        };
+        assert_eq!(degenerate.interleaved_samples(), Some(0));
+        assert!(PcmPacketizer::new(degenerate).is_none());
+    }
+
+    #[test]
+    fn a_v1_packet_matches_the_documented_wire_size() {
+        let spec = AudioFrameSpec::V1;
+        assert_eq!(spec.interleaved_samples(), Some(1_920));
+        assert_eq!(spec.pcm_bytes(), Some(3_840));
+    }
     use super::*;
 
     #[test]
@@ -665,5 +889,59 @@ mod tests {
         assert!(reset.reset);
         assert!(reset.rebuffer);
         assert_eq!(jitter.queued_frames(), 0);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::{AUDIO_SEND_BACKLOG_PACKETS, trim_audio_backlog};
+
+    #[test]
+    fn a_backlog_within_the_bound_is_left_alone() {
+        let mut packets = vec![1, 2, 3];
+        assert_eq!(trim_audio_backlog(&mut packets, 8), 0);
+        assert_eq!(packets, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_backlog_exactly_at_the_bound_is_left_alone() {
+        let mut packets: Vec<u8> = (0..8).collect();
+        assert_eq!(trim_audio_backlog(&mut packets, 8), 0);
+        assert_eq!(packets.len(), 8);
+    }
+
+    #[test]
+    fn an_overlong_backlog_keeps_the_newest_packets() {
+        // The listener wants the sound happening now, so the oldest go.
+        let mut packets: Vec<u8> = (0..20).collect();
+        assert_eq!(trim_audio_backlog(&mut packets, 8), 12);
+        assert_eq!(packets, (12..20).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn an_empty_backlog_drops_nothing() {
+        let mut packets: Vec<u8> = Vec::new();
+        assert_eq!(trim_audio_backlog(&mut packets, 8), 0);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn a_zero_bound_drops_everything() {
+        let mut packets = vec![1, 2, 3];
+        assert_eq!(trim_audio_backlog(&mut packets, 0), 3);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn the_bound_stays_under_what_a_deck_will_hold() {
+        // Eight 20 ms packets is 160 ms, which must stay under JITTER_MAX_MS or
+        // the host would be sending audio the Deck has already given up on.
+        let held_ms =
+            AUDIO_SEND_BACKLOG_PACKETS as u32 * u32::from(super::AUDIO_V1_FRAME_DURATION_MS);
+        assert!(
+            held_ms < u32::from(super::JITTER_MAX_MS),
+            "a {held_ms} ms backlog is not worth sending to a Deck holding {} ms",
+            super::JITTER_MAX_MS
+        );
     }
 }

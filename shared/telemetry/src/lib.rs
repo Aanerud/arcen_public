@@ -11,10 +11,12 @@ use serde::Serialize;
 
 mod health;
 mod lifecycle;
+pub mod lifecycle_fields;
 mod log_policy;
 pub mod names;
 mod network;
 mod schema;
+mod stream_stats;
 mod support_bundle;
 
 pub use health::{
@@ -40,6 +42,9 @@ pub use schema::{
     CANONICAL_SCHEMA_VERSION, CanonicalRecord, EventSeverity, MAX_IDENTITY_BYTES,
     MAX_MESSAGE_BYTES, SchemaValidationError, TelemetryComponent, TelemetryPlatform, TelemetryRole,
     TelemetryTarget,
+};
+pub use stream_stats::{
+    DEFAULT_SNAPSHOT_INTERVAL_SECS, SnapshotCadence, StageAverages, StageTotals, stage_averages,
 };
 pub use support_bundle::{
     BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey,

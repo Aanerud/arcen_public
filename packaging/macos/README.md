@@ -72,3 +72,31 @@ default-off, explicitly negotiated microphone feature. Hosted CI can assemble
 and inspect the bundle but does not claim a
 Developer ID signature, notarization, or staple; release provenance, upgrades,
 and uninstall behavior remain Release/Security work.
+
+
+Building, signing and notarizing the Pier package, and the install-time
+traps that go with it, are documented in
+[`hosts/macos/PACKAGING.md`](../../hosts/macos/PACKAGING.md).
+
+## macOS Pier packaging status
+
+This directory now contains development packaging for the macOS Pier:
+`build-pier-app.sh` assembles `Arcen Pier.app` and `Arcen Agent Helper.app`, and
+`build-pier-pkg.sh` builds a `.pkg` around them. It is not a published host
+release and must not be described as one.
+
+One packaging bug is worth keeping visible. `build-pier-app.sh` used to check
+that `target/release/arcen-pier-macos` existed and then package whatever file
+was there. That shipped bundles older than their source: a fix could be
+written, tested, packaged, signed, installed, and then measured still failing
+because the binary inside the package predated the fix. The script now runs
+`cargo build --locked --release -p arcen-pier-macos` before assembly.
+
+macOS still does not have the Linux/Windows host install contract. The package
+is a development artefact, not a Release/Security-reviewed distribution with
+completed cold-boot LoginWindow qualification, upgrade/rollback acceptance,
+permission onboarding, and uninstall cleanup. Do not describe the Deck package
+as a Pier installer, and do not use this development package as evidence that
+pre-login operation is shipped. It must not run the network or media stack as
+root, and it must preserve the FileVault pre-boot boundary documented in
+`docs/todo/macos-pier.md`.

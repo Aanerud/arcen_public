@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, sans-serif; line-height: 1.45; margin: 0 4px; }
+  h1 { font-size: 17px; margin: 0 0 10px; }
+  h2 { font-size: 13px; margin: 16px 0 4px; }
+  ol { padding-left: 20px; margin: 4px 0; }
+  li { margin: 3px 0; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+  .note { color: #555; }
+</style>
+</head>
+<body>
+<h1>Arcen Pier is installed</h1>
+<p>The Pier service is running and listening for Decks. Before it can show
+this Mac's screen and take keyboard input, macOS needs your approval. Only
+someone at this Mac can give it.</p>
+
+<h2>Approve, once, for each person who will be served</h2>
+<ol>
+  <li><b>System Settings &gt; Privacy &amp; Security &gt; Screen &amp; System
+      Audio Recording</b>: turn on <b>Arcen Agent Helper</b>.</li>
+  <li><b>System Settings &gt; Privacy &amp; Security &gt; Accessibility</b>:
+      turn on <b>Arcen Agent Helper</b>.</li>
+</ol>
+<p class="note">macOS may ask for these itself when the helper starts. Choose
+Allow, or open System Settings to allow it.</p>
+
+<h2>The login window</h2>
+<p>The login window asks separately. The first time a Deck connects before
+anyone has signed in, someone at this Mac must allow screen capture there.</p>
+
+<h2>To remove Arcen Pier</h2>
+<p><code>sudo "/Applications/Arcen Pier.app/Contents/Resources/uninstall.sh"</code><br>
+<span class="note">Add <code>--purge</code> to also remove the host identity,
+configuration, logs and the <code>_arcen</code> service account.</span></p>
+</body>
+</html>

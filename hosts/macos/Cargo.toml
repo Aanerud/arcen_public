@@ -1,0 +1,72 @@
+[package]
+name = "arcen-pier-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Arcen Pier (macOS) — native host control plane and shared session policy."
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcen_pier_macos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcen-pier-macos"
+path = "src/main.rs"
+
+[dependencies]
+arcen-observability.workspace = true
+arcen-input.workspace = true
+arcen-keel = { workspace = true }
+arcen-media = { workspace = true, features = ["audio-opus"] }
+arcen-outputs.workspace = true
+arcen-protocol = { path = "../../shared/protocol", default-features = false }
+arcen-session.workspace = true
+arcen-telemetry.workspace = true
+arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom.workspace = true
+quinn.workspace = true
+rcgen = "=0.14.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
+tokio-tungstenite = { version = "0.24", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror = "1"
+time = { version = "0.3", default-features = false, features = ["std"] }
+x509-parser.workspace = true
+zip.workspace = true
+
+# Native capture and encode. `apple-cf` is pinned to the version `videotoolbox`
+# links against so `IOSurface` is the same type across the hand-off.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-cf = "0.9.3"
+block2 = "0.6.2"
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSCursor", "NSImage", "NSResponder", "NSApplication", "NSRunningApplication", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFDictionary", "CFString"] }
+# Core Audio process taps: the public route for capturing system output while
+# muting it locally (macOS 14.2+). `AudioHardwareDeprecated` is deliberately
+# left off; only the current tap and aggregate-device API is used.
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation", "objc2-core-audio-types", "block2", "dispatch2"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "objc2"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGError", "CGColorSpace", "CGDisplayStream"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "CMFormatDescription"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject", "NSGeometry", "NSValue", "NSDictionary", "NSData"] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "SCError", "SCStream", "SCShareableContent"] }
+videotoolbox = { version = "0.18.1", features = ["async"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

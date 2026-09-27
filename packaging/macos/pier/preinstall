@@ -1,0 +1,50 @@
+#!/bin/bash
+# Runs as root before the payload is laid down.
+#
+# Creates the service account and stops whatever version is running, so no
+# file is replaced under a live process and no old agent keeps the port.
+set -u
+
+# shellcheck source=packaging/macos/pier/common.sh
+. "$(dirname "$0")/common.sh"
+
+# A daemon id below 500: hidden from the login window and from System
+# Settings, and outside the range macOS hands to people.
+arcen_free_id() {
+  local id
+  for (( id = 499; id >= 200; id-- )); do
+    if dscl . -search /Users UniqueID "$id" 2>/dev/null | grep -q .; then
+      continue
+    fi
+    if dscl . -search /Groups PrimaryGroupID "$id" 2>/dev/null | grep -q .; then
+      continue
+    fi
+    echo "$id"
+    return 0
+  done
+  return 1
+}
+
+if ! dscl . -read "/Users/$ARCEN_ACCOUNT" UniqueID >/dev/null 2>&1; then
+  ID="$(arcen_free_id)" || { arcen_log "no free system id for $ARCEN_ACCOUNT" >&2; exit 1; }
+  arcen_log "creating service account $ARCEN_ACCOUNT ($ID)"
+  if ! dscl . -read "/Groups/$ARCEN_ACCOUNT" >/dev/null 2>&1; then
+    dscl . -create "/Groups/$ARCEN_ACCOUNT"
+    dscl . -create "/Groups/$ARCEN_ACCOUNT" PrimaryGroupID "$ID"
+    dscl . -create "/Groups/$ARCEN_ACCOUNT" RealName "$ARCEN_ACCOUNT_REALNAME"
+    dscl . -create "/Groups/$ARCEN_ACCOUNT" Password '*'
+  fi
+  GID="$(dscl . -read "/Groups/$ARCEN_ACCOUNT" PrimaryGroupID | awk '{ print $2 }')"
+  dscl . -create "/Users/$ARCEN_ACCOUNT"
+  dscl . -create "/Users/$ARCEN_ACCOUNT" UniqueID "$ID"
+  dscl . -create "/Users/$ARCEN_ACCOUNT" PrimaryGroupID "$GID"
+  dscl . -create "/Users/$ARCEN_ACCOUNT" RealName "$ARCEN_ACCOUNT_REALNAME"
+  dscl . -create "/Users/$ARCEN_ACCOUNT" NFSHomeDirectory /var/empty
+  dscl . -create "/Users/$ARCEN_ACCOUNT" UserShell /usr/bin/false
+  dscl . -create "/Users/$ARCEN_ACCOUNT" Password '*'
+  dscl . -create "/Users/$ARCEN_ACCOUNT" IsHidden 1
+fi
+
+arcen_log "stopping any running version"
+arcen_stop_everything
+exit 0

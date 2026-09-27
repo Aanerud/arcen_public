@@ -154,6 +154,9 @@ pub enum AppScreen {
     InSession,
     Reconnecting(ReconnectOverlay),
     Resuming(ReconnectOverlay),
+    /// The host's sign-in screen closed because somebody signed in. The last
+    /// frame stays up while the Deck connects to the desktop that replaced it.
+    SigningIn,
     /// The host refused because the persistent desktop it would reattach to
     /// was created without the requested multi-monitor topology.
     ///
@@ -181,6 +184,62 @@ pub struct ReconnectOverlay {
     pub next_retry: Option<Duration>,
     pub deadline: Duration,
     pub last_error: String,
+}
+
+/// How long Cmd+Q must be held in a session to quit the Deck.
+const QUIT_HOLD: Duration = Duration::from_secs(3);
+
+/// Why HDR cannot be chosen.
+const NO_HDR_SCREEN: &str =
+    "No HDR-capable screen found. Connect an HDR display to use this preset.";
+
+/// How long a reading of whether any screen can show HDR is trusted.
+const HDR_SCREEN_REFRESH: Duration = Duration::from_secs(2);
+
+/// The settings to use instead when HDR is chosen and no screen can show it:
+/// Grading, the highest-fidelity SDR preset. `None` when nothing changes.
+fn without_unavailable_hdr(
+    performance: PerformanceMode,
+    color: ColorFidelitySettings,
+    hdr_screen: bool,
+) -> Option<(PerformanceMode, ColorFidelitySettings)> {
+    if hdr_screen || color.preset != ColorFidelity::Hdr10 {
+        return None;
+    }
+    let (mut performance, mut color) = (performance, color);
+    StreamingPreset::Grading.apply_to(&mut performance, &mut color);
+    Some((performance, color))
+}
+
+/// What a held Cmd+Q does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitHoldStep {
+    /// Still held, not long enough yet.
+    Holding,
+    /// Held for [`QUIT_HOLD`]: the Deck quits.
+    Quit,
+    /// Let go sooner: the tap was for the host.
+    SendToHost,
+}
+
+const fn quit_hold_step(held: bool, elapsed: Duration) -> QuitHoldStep {
+    if !held {
+        QuitHoldStep::SendToHost
+    } else if elapsed.as_millis() >= QUIT_HOLD.as_millis() {
+        QuitHoldStep::Quit
+    } else {
+        QuitHoldStep::Holding
+    }
+}
+
+/// A sign-in screen the Deck will follow into the desktop that replaces it.
+///
+/// The schedule is shared (`arcen_session::login_window_handover`); what
+/// signs in again is this Deck's own. `AuthSubmission` wipes itself when
+/// dropped, so every copy made for an attempt is wiped too.
+struct LoginWindowHandover {
+    schedule: arcen_session::login_window_handover::HandoverSchedule,
+    auth: crate::transport::websocket::AuthSubmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1473,13 +1532,28 @@ fn pinned_image_offset(surface: [f32; 2], stream: [f32; 2]) -> Option<[f32; 2]> 
     if stream_w > surface_w + SLACK || stream_h > surface_h + SLACK {
         return None;
     }
+    let leftover_x = (surface_w - stream_w).max(0.0);
     let leftover_y = (surface_h - stream_h).max(0.0);
+    // A gap wider than the notch strip is not a near-miss, it is a host whose
+    // desktop is simply smaller than this screen. Drawing that 1:1 leaves the
+    // desktop as a small island with a black border on every side, which is
+    // what it looks like: a session that failed to open properly.
+    //
+    // Aspect-fit instead, which scales it up to fill. The alternative is to
+    // make the host encode an enlarged picture, and that is strictly worse —
+    // it spends bandwidth on pixels an interpolator invented, then encodes
+    // them, then transmits them, to arrive at an image this machine could have
+    // produced for free at the last step with more information about the
+    // screen it is drawing onto.
+    if leftover_x > NOTCH_STRIP_MAX_POINTS || leftover_y > NOTCH_STRIP_MAX_POINTS {
+        return None;
+    }
     let y = if leftover_y <= NOTCH_STRIP_MAX_POINTS {
         leftover_y
     } else {
         leftover_y / 2.0
     };
-    Some([((surface_w - stream_w) / 2.0).max(0.0), y])
+    Some([(leftover_x / 2.0).max(0.0), y])
 }
 
 /// Whether this session negotiates typed pen input: local setting on, host
@@ -2025,6 +2099,8 @@ pub struct ArcenApp {
     dedicated_video_frame: Option<DedicatedLayerFrame>,
     dedicated_video_presenter: DedicatedVideoPresenter,
     remote_frame_size: Option<[usize; 2]>,
+    /// The host injects point-unit, phased scrolling (`precise_scroll_v1`).
+    host_precise_scroll: bool,
     /// Everything this session's `server_hello` says is actually happening,
     /// versus what `color_fidelity` asked for (w5-negotiated-truth).
     /// Computed once at hello arrival (`sync_media_state`) and cached: the
@@ -2390,6 +2466,24 @@ pub struct ArcenApp {
     /// Consumed by whichever recovery choice is taken, and dropped if the
     /// user cancels.
     recovery_auth: Option<crate::transport::websocket::AuthSubmission>,
+    /// Credentials typed on the credentials screen, kept only until the
+    /// host's hello says whether this session is its sign-in screen. Sent
+    /// directly, they are otherwise gone by then, and the sign-in hand-over
+    /// needs them.
+    submitted_auth: Option<crate::transport::websocket::AuthSubmission>,
+    /// Following the host's sign-in screen into the desktop that replaces it.
+    /// Holds the credentials only while the session is a sign-in screen or is
+    /// being followed out of one; dropped, and wiped, as soon as a signed-in
+    /// desktop's hello arrives, the user disconnects, or the attempts run out.
+    login_window_handover: Option<LoginWindowHandover>,
+    /// Whether Cmd+Q and Cmd+H currently go to the remote desktop.
+    app_shortcuts_forwarded: bool,
+    /// When a Cmd+Q began to be held in a session, until it is let go (and
+    /// sent to the host) or held for [`QUIT_HOLD`] (and the Deck quits).
+    quit_hold: Option<Instant>,
+    /// Whether any local screen can show HDR, and when that was last read.
+    /// HDR streaming is offered only when one can.
+    hdr_screen: Option<(Instant, bool)>,
     cursor_preference: CursorMode,
     clipboard_enabled: bool,
     microphone_enabled: bool,
@@ -2699,13 +2793,23 @@ impl ArcenApp {
             dedicated_video_frame: None,
             dedicated_video_presenter: DedicatedVideoPresenter::new(),
             remote_frame_size: None,
+            host_precise_scroll: false,
             negotiated_truth: None,
             requested_video_variant: None,
             requested_video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             negotiated_truth_panel_open: false,
             decoder_backend_name: "",
             decoder_hardware_accelerated: None,
-            test_pattern_selected: None,
+            // A measurement run can name its pattern up front, so a scripted
+            // session measures from its first frame instead of waiting for
+            // someone to cycle the menu.
+            test_pattern_selected: if cfg!(feature = "dev-tools") {
+                std::env::var("ARCEN_DECK_TEST_PATTERN")
+                    .ok()
+                    .and_then(|token| arcen_media::test_pattern::TestPattern::from_token(&token))
+            } else {
+                None
+            },
             pattern_accuracy: None,
             multi_window: MultiWindowSessionState::Inactive,
             region_runtime: None,
@@ -2817,6 +2921,11 @@ impl ArcenApp {
             active_displays_mode: None,
             pending_displays_override: None,
             recovery_auth: None,
+            submitted_auth: None,
+            login_window_handover: None,
+            app_shortcuts_forwarded: false,
+            quit_hold: None,
+            hdr_screen: None,
             cursor_preference: settings.cursor_preference,
             clipboard_enabled: settings.clipboard_enabled,
             microphone_enabled: settings.microphone_enabled,
@@ -3000,17 +3109,36 @@ impl eframe::App for ArcenApp {
             self.tablet_runtime = crate::tablet::TabletRuntime::install();
             self.native_menu_refreshed = true;
         }
-        if self.session_commands.is_some() || self.reconnect.is_some() {
+        if self.session_commands.is_some()
+            || self.reconnect.is_some()
+            || self.login_window_handover.is_some()
+        {
             ctx.request_repaint_after(UI_REPAINT_INTERVAL);
         }
         for command in macos_menu::drain_menu_commands() {
             self.handle_menu_command(command, ctx);
+        }
+        // A remote desktop on screen owns Cmd+Q and Cmd+H: they are for the
+        // application the person is using on the host, not for this one.
+        let forward_shortcuts = matches!(
+            self.screen,
+            AppScreen::InSession
+                | AppScreen::Reconnecting(_)
+                | AppScreen::Resuming(_)
+                | AppScreen::SigningIn
+        );
+        if forward_shortcuts != self.app_shortcuts_forwarded {
+            macos_menu::forward_app_shortcuts_to_host(forward_shortcuts);
+            self.app_shortcuts_forwarded = forward_shortcuts;
         }
         self.poll_microphone_teardown();
         self.sync_media_state(ctx);
         self.sync_session_fullscreen(ctx);
         self.clipboard_controller.sync(Instant::now());
         self.drive_reconnect(ctx);
+        self.drive_login_window_handover(ctx);
+        self.drive_quit_hold(ctx);
+        self.paint_quit_hold_notice(ctx);
         self.drain_pending_viewport_closes(ctx);
         self.drain_pending_root_restore(ctx);
         self.drive_multi_window(ctx);
@@ -3023,7 +3151,10 @@ impl eframe::App for ArcenApp {
             .fill(
                 if matches!(
                     self.screen,
-                    AppScreen::InSession | AppScreen::Reconnecting(_) | AppScreen::Resuming(_)
+                    AppScreen::InSession
+                        | AppScreen::Reconnecting(_)
+                        | AppScreen::Resuming(_)
+                        | AppScreen::SigningIn
                 ) {
                     if matches!(self.screen, AppScreen::InSession)
                         && self.dedicated_video_frame.is_some()
@@ -3044,6 +3175,7 @@ impl eframe::App for ArcenApp {
                     AppScreen::InSession
                         | AppScreen::Reconnecting(_)
                         | AppScreen::Resuming(_)
+                        | AppScreen::SigningIn
                         | AppScreen::Settings
                 ) {
                     self.launcher_top_bar(ui);
@@ -3411,6 +3543,7 @@ impl eframe::App for ArcenApp {
                     AppScreen::InSession => self.in_session_screen(ui),
                     AppScreen::Reconnecting(overlay) => self.reconnect_screen(ui, &overlay, false),
                     AppScreen::Resuming(overlay) => self.reconnect_screen(ui, &overlay, true),
+                    AppScreen::SigningIn => self.signing_in_screen(ui),
                     AppScreen::TopologyConflict(draft) => {
                         self.topology_conflict_screen(ui, &draft);
                     }
@@ -3569,7 +3702,7 @@ impl ArcenApp {
         // Server hello (once): set the status line and advance the launch flow.
         if let Some(hello) = hello {
             self.remember_authenticated_username();
-            self.deferred_auth = None;
+            self.note_hello_desktop(hello.login_window);
             self.session_hello_handled = true;
             // A fresh hello means a fresh decode session (this session's
             // negotiated contract may differ from the last one this
@@ -3579,6 +3712,18 @@ impl ArcenApp {
             // reconnect: it is a manual declaration, not session state.
             self.pattern_accuracy = None;
             self.host_supports_display_update = hello.supports_display_update;
+            self.host_precise_scroll = hello.precise_scroll_v1;
+            // A Mac host's shortcuts are Command shortcuts. The Cmd-to-Ctrl
+            // swap is for hosts whose shortcut key is Control; applied to a
+            // Mac it turned Cmd+A, Cmd+C and Cmd+V into Ctrl+A, Ctrl+C and
+            // Ctrl+V, measured on the lab, and every shortcut appeared dead.
+            if hello.host_is_macos() && self.active_swap_cmd_ctrl {
+                tracing::info!(
+                    target: crate::logging::target::INPUT,
+                    "macOS host: Command is sent as Command"
+                );
+                self.active_swap_cmd_ctrl = false;
+            }
             self.host_build_identity = hello.build_identity().ok().flatten();
             self.relative_pointer_confirmed = hello.input_protocol_version
                 >= crate::protocol::messages::RELATIVE_POINTER_INPUT_PROTOCOL_VERSION
@@ -3822,6 +3967,8 @@ impl ArcenApp {
             }
             if matches!(self.screen, AppScreen::Resuming(_)) {
                 self.status = "Resume authenticated; waiting for a fresh keyframe".to_string();
+            } else if matches!(self.screen, AppScreen::SigningIn) {
+                // The last frame stays up until the new desktop's first one.
             } else if let Some(draft) = self.pending_connection.clone() {
                 self.screen = AppScreen::LaunchingSession(draft);
             }
@@ -4160,6 +4307,7 @@ impl ArcenApp {
         self.relative_pointer_confirmed = false;
         self.region_input_confirmed = false;
         self.host_supports_display_update = false;
+        self.host_precise_scroll = false;
         self.display_fit.reset();
         self.active_cursor_mode = CursorMode::Local;
         self.cursor_mode_confirmed = false;
@@ -5553,6 +5701,7 @@ impl ArcenApp {
     /// Tear down the active session: signal the worker/transport to close and
     /// drop the UI-side handles so `sync_media_state` becomes a no-op.
     fn disconnect(&mut self) {
+        self.login_window_handover = None;
         if let Some(controller) = &mut self.reconnect {
             controller.manual_cancel();
         }
@@ -5686,6 +5835,7 @@ impl ArcenApp {
         self.session_hello_handled = false;
         self.pending_connection = None;
         self.deferred_auth = None;
+        self.submitted_auth = None;
     }
 
     fn poll_microphone_teardown(&mut self) {
@@ -5770,13 +5920,17 @@ impl ArcenApp {
     fn handle_menu_command(&mut self, command: macos_menu::MenuCommand, ctx: &egui::Context) {
         use macos_menu::MenuCommand;
         match command {
+            MenuCommand::Quit { from_keyboard } => self.request_quit(ctx, from_keyboard),
             MenuCommand::ToggleHealth => {
                 self.show_health_overlay = !self.show_health_overlay;
             }
             MenuCommand::Disconnect => {
                 if matches!(
                     self.screen,
-                    AppScreen::InSession | AppScreen::Reconnecting(_) | AppScreen::Resuming(_)
+                    AppScreen::InSession
+                        | AppScreen::Reconnecting(_)
+                        | AppScreen::Resuming(_)
+                        | AppScreen::SigningIn
                 ) {
                     self.disconnect();
                     self.status = "Disconnected".to_string();
@@ -6349,6 +6503,7 @@ impl ArcenApp {
         ctx: &egui::Context,
     ) {
         draft.password.zeroize();
+        self.turn_off_unavailable_hdr();
         // Saved-connection deferred-auth race fix: `preloaded_auth` is the
         // caller's own *explicit* argument for this exact attempt (quick-
         // connect with a saved password, or a certificate/disclaimer retry
@@ -6764,6 +6919,7 @@ impl ArcenApp {
 
     fn submit_auth_submission(&mut self, draft: ConnectionDraft, submission: AuthSubmission) {
         let submitted_username = submission.username.clone();
+        self.submitted_auth = Some(submission.clone());
         self.credentials_note = None;
         let mut active = draft.clone();
         active.password.zeroize();
@@ -6924,6 +7080,10 @@ impl ArcenApp {
         // path drops it here, unchanged from before.
         let recovery_auth = self.deferred_auth.take();
         self.drop_session_handles();
+
+        if self.follow_login_window(&end, ctx) {
+            return;
+        }
 
         // The host could not serve this connection's requested layout on the
         // persistent desktop it would have reattached to. Both recoveries are
@@ -8144,6 +8304,10 @@ impl ArcenApp {
         let mut color_fidelity = self.color_fidelity;
         let initial_streaming_preset = StreamingPreset::from_settings(performance, color_fidelity);
         let mut streaming_preset = initial_streaming_preset;
+        let hdr_screen = self.hdr_screen_available();
+        if !hdr_screen && streaming_preset == StreamingPreset::Hdr {
+            streaming_preset = StreamingPreset::Grading;
+        }
         let mut displays = self.displays_mode;
         let mut hidpi = self.hidpi_streaming;
         let mut use_notch_area = self.fullscreen_uses_notch_area;
@@ -8314,14 +8478,21 @@ impl ArcenApp {
                         );
                         ui.add_space(16.0);
                         for preset in StreamingPreset::PRIMARY {
-                            settings_radio(
-                                ui,
-                                &mut streaming_preset,
-                                preset,
-                                (preset == StreamingPreset::Auto).then_some("(Default)"),
-                                preset.title(),
-                                preset.description(),
-                            );
+                            let available = preset != StreamingPreset::Hdr || hdr_screen;
+                            ui.add_enabled_ui(available, |ui| {
+                                settings_radio(
+                                    ui,
+                                    &mut streaming_preset,
+                                    preset,
+                                    (preset == StreamingPreset::Auto).then_some("(Default)"),
+                                    preset.title(),
+                                    if available {
+                                        preset.description()
+                                    } else {
+                                        NO_HDR_SCREEN
+                                    },
+                                );
+                            });
                         }
                         if streaming_preset != initial_streaming_preset {
                             streaming_preset.apply_to(&mut performance, &mut color_fidelity);
@@ -8707,7 +8878,7 @@ impl ArcenApp {
                             CursorMode::Local,
                             Some("(Recommended)"),
                             "Client-rendered cursor",
-                            "Your mouse controls Windows while Arcen Deck draws the pointer \
+                            "Your mouse controls the remote computer while Arcen Deck draws the pointer \
                              locally for immediate response. Works with every host.",
                         );
                         settings_radio(
@@ -8716,7 +8887,7 @@ impl ArcenApp {
                             CursorMode::Host,
                             None,
                             "Cursor in remote video",
-                            "Your mouse still controls Windows, but the host draws the pointer \
+                            "Your mouse still controls the remote computer, but the host draws the pointer \
                              into the captured video. This can feel less responsive and depends \
                              on the capture backend including the cursor.",
                         );
@@ -9923,6 +10094,149 @@ impl ArcenApp {
         self.viewer_input_surface(ui);
     }
 
+    /// Holds the last frame while the host's sign-in screen gives way to the
+    /// signed-in desktop.
+    fn signing_in_screen(&mut self, ui: &mut egui::Ui) {
+        let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
+        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+        if let Some(texture) = &self.remote_texture {
+            texture.paint(ui.painter(), rect);
+        }
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+        ui.painter().text(
+            rect.center() - egui::vec2(0.0, 20.0),
+            egui::Align2::CENTER_CENTER,
+            "Signing in…",
+            egui::FontId::proportional(22.0),
+            egui::Color32::WHITE,
+        );
+        ui.painter().text(
+            rect.center() + egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            "Connecting to your desktop",
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_gray(200),
+        );
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.bottom() - 44.0),
+            egui::vec2(120.0, 34.0),
+        );
+        if ui.put(btn_rect, egui::Button::new("Disconnect")).clicked() {
+            self.disconnect();
+            self.status = "Disconnected".to_string();
+            self.screen = AppScreen::Home;
+        }
+    }
+
+    /// Keeps or drops this attempt's credentials by what the hello says the
+    /// desktop is.
+    ///
+    /// A sign-in screen closes when someone signs in, and is followed into the
+    /// desktop that replaces it, so its credentials are kept for that. A
+    /// signed-in desktop's hello ends any hand-over and drops them, which is
+    /// what every hello did before sign-in screens were followed.
+    fn note_hello_desktop(&mut self, login_window: bool) {
+        let auth = self
+            .deferred_auth
+            .take()
+            .or_else(|| self.submitted_auth.take());
+        if login_window {
+            if let Some(auth) = auth {
+                tracing::info!(
+                    target: crate::logging::target::SESSION,
+                    "host is showing its sign-in screen; will follow it into the desktop",
+                );
+                // A fresh schedule unless this is an attempt of a hand-over
+                // already running, which keeps counting its attempts: a host
+                // that never leaves its sign-in screen is not retried forever.
+                let schedule = self
+                    .login_window_handover
+                    .take()
+                    .map(|handover| handover.schedule)
+                    .unwrap_or_default();
+                self.login_window_handover = Some(LoginWindowHandover { schedule, auth });
+            }
+        } else if self.login_window_handover.take().is_some() {
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                "followed the sign-in screen into the signed-in desktop",
+            );
+        }
+    }
+
+    /// Decides whether a closed session was a sign-in screen giving way to a
+    /// desktop, and if so schedules the reconnect and holds the last frame.
+    ///
+    /// Returns whether it did. A deliberate disconnect and a host whose
+    /// identity changed are never followed, and neither is anything once the
+    /// shared schedule has run out of attempts.
+    fn follow_login_window(&mut self, end: &SessionEnd, ctx: &egui::Context) -> bool {
+        let Some(handover) = self.login_window_handover.as_mut() else {
+            return false;
+        };
+        let followable = !matches!(
+            end.reason,
+            DisconnectReason::Terminal(
+                TerminalDisconnect::Manual | TerminalDisconnect::TlsIdentity
+            )
+        ) && self.active_connection.is_some();
+        let due = if followable {
+            handover
+                .schedule
+                .session_ended(self.reconnect_clock.observed_at(end.observed_at))
+        } else {
+            None
+        };
+        let Some(due) = due else {
+            self.login_window_handover = None;
+            return false;
+        };
+        tracing::info!(
+            target: crate::logging::target::SESSION,
+            attempt = handover.schedule.attempts_made() + 1,
+            reason = %end.message,
+            reconnect_in_ms = due.saturating_sub(self.reconnect_clock.now()).as_millis(),
+            "sign-in screen closed; reconnecting to the desktop that replaces it",
+        );
+        self.status = "Signing in…".to_string();
+        self.screen = AppScreen::SigningIn;
+        ctx.request_repaint();
+        true
+    }
+
+    /// Starts the hand-over's reconnect once it is due.
+    fn drive_login_window_handover(&mut self, ctx: &egui::Context) {
+        let now = self.reconnect_clock.now();
+        let Some(handover) = self.login_window_handover.as_mut() else {
+            return;
+        };
+        if !handover.schedule.take_due(now) {
+            return;
+        }
+        let auth = handover.auth.clone();
+        let Some(draft) = self.active_connection.clone() else {
+            self.login_window_handover = None;
+            return;
+        };
+        // Starting a connection disconnects the previous one, which drops the
+        // hand-over. It is carried across the start so a desktop that is not
+        // ready yet is tried again, rather than only once.
+        let handover = self.login_window_handover.take();
+        self.begin_connection_flow(draft, Some(auth), ctx);
+        // The launcher would replace the frame being held. Anything else the
+        // attempt asks for -- a certificate prompt, say -- is left to show,
+        // and ends the hand-over: the attempt did not simply start.
+        if matches!(
+            self.screen,
+            AppScreen::Connecting(_) | AppScreen::LaunchingSession(_)
+        ) {
+            self.screen = AppScreen::SigningIn;
+            self.login_window_handover = handover;
+        }
+    }
+
     fn reconnect_screen(&mut self, ui: &mut egui::Ui, overlay: &ReconnectOverlay, resuming: bool) {
         let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
         let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
@@ -10251,8 +10565,51 @@ impl ArcenApp {
             }
         }
 
-        if response.hovered() || self.pointer_lock {
-            let scroll = ui.input(|input| input.smooth_scroll_delta());
+        let smooth_scroll = ui.input(egui::InputState::smooth_scroll_delta);
+        let wheel_events: Vec<(egui::MouseWheelUnit, egui::Vec2, egui::TouchPhase)> =
+            ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::MouseWheel {
+                            unit, delta, phase, ..
+                        } => Some((*unit, *delta, *phase)),
+                        _ => None,
+                    })
+                    .collect()
+            });
+        if !wheel_events.is_empty() || smooth_scroll != egui::Vec2::ZERO {
+            // What the platform actually hands the Deck for a scroll, recorded
+            // because a trackpad session once delivered hundreds of pointer
+            // events and not one scroll, and nothing said why.
+            tracing::debug!(
+                target: crate::logging::target::INPUT,
+                wheel = ?wheel_events,
+                smooth_x = smooth_scroll.x,
+                smooth_y = smooth_scroll.y,
+                hovered = response.hovered(),
+                pointer_lock = self.pointer_lock,
+                accum_x = self.root_scroll_accum.x,
+                accum_y = self.root_scroll_accum.y,
+                "scroll input"
+            );
+        }
+        // A trackpad on a host that takes it: forward each event's own travel
+        // and phase, so the host's applications run their own momentum and
+        // elastic edges. The notch path below quantised a trackpad to 120-point
+        // ticks and dropped its phase, which is why scrolling felt like a
+        // wheel, and a gentle drag could produce nothing at all.
+        let precise = self.host_precise_scroll && !self.uses_region_input_wire();
+        if precise {
+            if response.hovered() || self.pointer_lock {
+                if let Some(pos) = pointer_pos.or(self.last_pointer_view_pos) {
+                    self.send_wheel_events_precisely(image_rect, pos, &wheel_events);
+                }
+            }
+            self.root_scroll_accum = egui::Vec2::ZERO;
+        } else if response.hovered() || self.pointer_lock {
+            let scroll = smooth_scroll;
             if scroll != egui::Vec2::ZERO {
                 let (dx, dy, remainder) = accumulate_scroll_ticks(self.root_scroll_accum, scroll);
                 self.root_scroll_accum = remainder;
@@ -11148,6 +11505,153 @@ impl ArcenApp {
         rebuilt
     }
 
+    /// Whether any local screen can show HDR, read at most every
+    /// [`HDR_SCREEN_REFRESH`] so the settings page does not enumerate
+    /// displays on every frame.
+    fn hdr_screen_available(&mut self) -> bool {
+        if let Some((read_at, available)) = self.hdr_screen {
+            if read_at.elapsed() < HDR_SCREEN_REFRESH {
+                return available;
+            }
+        }
+        let available = crate::display::any_display_is_hdr();
+        self.hdr_screen = Some((Instant::now(), available));
+        available
+    }
+
+    /// HDR cannot stay chosen without a screen that can show it: the saved
+    /// choice becomes Grading, and says why, before a connection asks a host
+    /// for a desktop the Deck could not present.
+    fn turn_off_unavailable_hdr(&mut self) {
+        self.hdr_screen = None;
+        let hdr_screen = self.hdr_screen_available();
+        let Some((performance, color)) =
+            without_unavailable_hdr(self.performance_mode, self.color_fidelity, hdr_screen)
+        else {
+            return;
+        };
+        self.performance_mode = performance;
+        self.color_fidelity = color;
+        self.encode_intent = color.preset.encode_intent();
+        tracing::info!(
+            target: crate::logging::target::UI,
+            "HDR streaming turned off: no HDR-capable screen found; using Grading"
+        );
+        self.status = format!("{NO_HDR_SCREEN} Streaming uses Grading instead.");
+        if let Err(error) = self.persist_settings() {
+            tracing::warn!(%error, "could not save the change from HDR to Grading");
+        }
+    }
+
+    /// Handles Quit from the menu or Cmd+Q.
+    ///
+    /// Outside a session the Deck quits at once. In one, Cmd+Q is Chrome's
+    /// hold-to-quit: a tap belongs to the application on the host, and only a
+    /// deliberate hold quits the Deck. A menu click quits.
+    fn request_quit(&mut self, ctx: &egui::Context, from_keyboard: bool) {
+        let in_session = matches!(
+            self.screen,
+            AppScreen::InSession
+                | AppScreen::Reconnecting(_)
+                | AppScreen::Resuming(_)
+                | AppScreen::SigningIn
+        );
+        if in_session && from_keyboard {
+            if self.quit_hold.is_none() {
+                self.quit_hold = Some(Instant::now());
+            }
+            ctx.request_repaint();
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Follows a held Cmd+Q: quits after [`QUIT_HOLD`], or sends the tap to
+    /// the host when it is let go sooner.
+    fn drive_quit_hold(&mut self, ctx: &egui::Context) {
+        let Some(started) = self.quit_hold else {
+            return;
+        };
+        match quit_hold_step(macos_menu::quit_chord_held(), started.elapsed()) {
+            QuitHoldStep::Holding => ctx.request_repaint_after(Duration::from_millis(50)),
+            QuitHoldStep::Quit => {
+                tracing::info!(
+                    target: crate::logging::target::INPUT,
+                    "Cmd+Q held; quitting the Deck"
+                );
+                self.quit_hold = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            QuitHoldStep::SendToHost => {
+                self.quit_hold = None;
+                self.send_command_q_to_host();
+            }
+        }
+    }
+
+    /// Sends a whole Command+Q to the host: the menu consumed the key, so the
+    /// host has seen at most the Command key. Command is pressed around Q
+    /// only if it is no longer physically held, so a person still holding it
+    /// for the next shortcut keeps it held on the host too.
+    fn send_command_q_to_host(&mut self) {
+        let (command_key, command_bit) = if self.active_swap_cmd_ctrl {
+            (
+                crate::protocol::keymap::QT_KEY_CTRL,
+                u32::from(crate::protocol::keymap::MODIFIER_BIT_CTRL),
+            )
+        } else {
+            (
+                crate::protocol::keymap::QT_KEY_META,
+                u32::from(crate::protocol::keymap::MODIFIER_BIT_META),
+            )
+        };
+        let wrap_command = !macos_menu::command_held();
+        if wrap_command {
+            self.send_key_event(command_key, true, command_bit);
+        }
+        self.send_key_event(0x51, true, command_bit);
+        self.send_key_event(0x51, false, command_bit);
+        if wrap_command {
+            self.send_key_event(command_key, false, 0);
+        }
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            wrap_command,
+            "Cmd+Q tapped; sent to the host"
+        );
+    }
+
+    /// The notice shown while Cmd+Q is held.
+    fn paint_quit_hold_notice(&self, ctx: &egui::Context) {
+        let Some(started) = self.quit_hold else {
+            return;
+        };
+        let remaining = QUIT_HOLD.saturating_sub(started.elapsed()).as_secs_f32();
+        egui::Area::new(egui::Id::new("arcen-quit-hold"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(210))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Hold ⌘Q to quit Arcen Deck  ({remaining:.0}s)"
+                            ))
+                            .size(16.0)
+                            .color(egui::Color32::WHITE),
+                        );
+                        ui.label(
+                            egui::RichText::new("Let go to send ⌘Q to the remote Mac")
+                                .size(12.0)
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                    });
+            });
+    }
+
     fn process_keyboard_event(&mut self, event: &egui::Event) {
         if matches!(
             event,
@@ -11621,6 +12125,130 @@ impl ArcenApp {
                 *slot = pressed;
             }
             self.record_input_sent("mouse_button");
+        }
+    }
+
+    /// Sends one frame's wheel events to a host that takes precise scroll.
+    ///
+    /// Point events keep their fractional travel and phase. Line events — a
+    /// physical wheel — are sent as whole notches, exactly as before.
+    fn send_wheel_events_precisely(
+        &mut self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        events: &[(egui::MouseWheelUnit, egui::Vec2, egui::TouchPhase)],
+    ) {
+        // Deck points to host pixels, so a finger's travel moves the host's
+        // content by the distance it moves on screen here.
+        let scale = self
+            .remote_frame_size
+            .filter(|_| rect.width() > 0.0)
+            .map_or(1.0, |[width, _]| width as f64 / f64::from(rect.width()));
+        for &(unit, delta, phase) in events {
+            match unit {
+                egui::MouseWheelUnit::Point => {
+                    let phase = match phase {
+                        egui::TouchPhase::Start => arcen_protocol::messages::ScrollPhaseMsg::Began,
+                        egui::TouchPhase::Move => arcen_protocol::messages::ScrollPhaseMsg::Changed,
+                        egui::TouchPhase::End => arcen_protocol::messages::ScrollPhaseMsg::Ended,
+                        egui::TouchPhase::Cancel => {
+                            arcen_protocol::messages::ScrollPhaseMsg::Cancelled
+                        }
+                    };
+                    // The same signs as the notch path: x as delivered, y
+                    // inverted.
+                    let dx = f64::from(delta.x) * scale;
+                    let dy = -f64::from(delta.y) * scale;
+                    self.send_precise_scroll(rect, pos, dx, dy, phase);
+                }
+                egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                    let lines = if unit == egui::MouseWheelUnit::Page {
+                        delta * 10.0
+                    } else {
+                        delta
+                    };
+                    let accum = self.root_scroll_accum + egui::vec2(lines.x, -lines.y);
+                    let (dx, dy) = (accum.x.trunc() as i32, accum.y.trunc() as i32);
+                    self.root_scroll_accum = accum - egui::vec2(dx as f32, dy as f32);
+                    if dx != 0 || dy != 0 {
+                        self.send_mouse_scroll(rect, pos, dx, dy);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends one point-unit scroll with its phase through the region runtime,
+    /// so it takes the session's input sequence and pointer position like any
+    /// other pointer event.
+    fn send_precise_scroll(
+        &mut self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        dx: f64,
+        dy: f64,
+        phase: arcen_protocol::messages::ScrollPhaseMsg,
+    ) {
+        let motion_mode = if self.pointer_lock {
+            PointerMotionMode::Relative
+        } else {
+            PointerMotionMode::Absolute
+        };
+        let Some(local_fraction) = Self::viewport_local_fraction(rect, pos) else {
+            return;
+        };
+        let Some(viewport) = self.primary_region_viewport() else {
+            return;
+        };
+        if motion_mode == PointerMotionMode::Absolute {
+            self.last_pointer_view_pos = Some(Self::clamp_to_rect(rect, pos));
+        }
+        let units =
+            |value: f64| (value * arcen_media::LOGICAL_UNITS_PER_PIXEL as f64).round() as i64;
+        // A zero-travel event still matters when it carries a phase: the end
+        // of a gesture is what lets the host start its own momentum.
+        let (ux, uy) = (units(dx), units(dy));
+        let (ux, uy) =
+            if ux == 0 && uy == 0 && phase != arcen_protocol::messages::ScrollPhaseMsg::Changed {
+                (0, 1)
+            } else {
+                (ux, uy)
+            };
+        if ux == 0 && uy == 0 {
+            return;
+        }
+        let timestamp_ns = Self::now_epoch_ns();
+        let result = {
+            let Some(runtime) = self.region_runtime.as_mut() else {
+                return;
+            };
+            runtime.pointer_scroll_units(
+                viewport,
+                local_fraction,
+                ux,
+                uy,
+                &mut self.input_sequence,
+                timestamp_ns,
+            )
+        };
+        let Ok(messages) = result else {
+            return;
+        };
+        for mut message in self.adapt_region_messages(&messages, motion_mode) {
+            if message.input_type == "mouse_scroll" {
+                if let Some(object) = message.value.as_object_mut() {
+                    object.insert(
+                        "unit".to_owned(),
+                        serde_json::to_value(arcen_protocol::messages::ScrollUnitMsg::Point)
+                            .unwrap_or_default(),
+                    );
+                    object.insert(
+                        "phase".to_owned(),
+                        serde_json::to_value(phase).unwrap_or_default(),
+                    );
+                }
+            }
+            self.send_legacy_region_message(message);
         }
     }
 
@@ -12175,13 +12803,30 @@ impl ArcenApp {
                 .negotiated_truth
                 .as_ref()
                 .and_then(|truth| truth.active.color_transform());
-            self.pattern_accuracy = Some(session_truth::measure_exactness(
+            let readout = session_truth::measure_exactness(
                 pattern,
                 frame.width,
                 frame.height,
                 &frame.rgba,
                 active_transform,
-            ));
+            );
+            // Logged so a scripted run has evidence, not just an overlay.
+            if self.video_frames_decoded % 30 == 0 {
+                let end_to_end = readout.end_to_end;
+                tracing::info!(
+                    target: crate::logging::target::SESSION,
+                    pattern = pattern.token(),
+                    width = frame.width,
+                    height = frame.height,
+                    pixel_format = %frame.pixel_format,
+                    end_to_end_max = end_to_end.map(|accuracy| accuracy.max_error),
+                    end_to_end_mean = end_to_end.map(|accuracy| accuracy.mean_error),
+                    worst_at = ?end_to_end.map(|accuracy| accuracy.worst_at),
+                    colour_only_max = readout.colour_only.map(|accuracy| accuracy.max_error),
+                    "pattern exactness"
+                );
+            }
+            self.pattern_accuracy = Some(readout);
         }
         self.dedicated_video_frame = frame
             .native
@@ -14017,6 +14662,7 @@ fn client_monitors_from_topology(
                 model: monitor.identity.model,
                 serial: monitor.identity.serial,
                 edid: String::new(),
+                color: monitor.color,
             }
         })
         .collect()
@@ -14555,6 +15201,7 @@ mod tests {
             model: id,
             serial: id + 100,
             edid: String::new(),
+            color: None,
         }
     }
 
@@ -14597,6 +15244,7 @@ mod tests {
             primary: true,
             width_mm: 300.0,
             height_mm: 200.0,
+            color: None,
         };
         let requested =
             arcen_media::RequestedMonitor::new(monitor, 960, 540).expect("valid requested monitor");
@@ -14812,17 +15460,42 @@ mod tests {
         );
     }
 
-    /// A host with no exact-mode capability serves whatever it can — measured
-    /// 2026-08-03 on a software-encoder host, which answered a 1800x1169
-    /// request with 1280x800. Anchoring that to the bottom looked like the
-    /// desktop had slid off the screen, so a large gap is centred instead.
+    /// A host whose desktop is smaller than this screen is scaled up to fill
+    /// it, not drawn 1:1 with a border on every side.
+    ///
+    /// This used to be centred at 1:1, decided when the only hosts that sent a
+    /// smaller picture were failing to serve the requested one — a software
+    /// encoder answering a 1800x1169 request with 1280x800, measured
+    /// 2026-08-03. A host now sends its desktop's real size on purpose,
+    /// because encoding an enlarged picture spends bandwidth on interpolated
+    /// detail that this machine can add at the end for free and with more
+    /// information about the screen it is drawing onto. Drawing that 1:1 left
+    /// the desktop as a small island in a black field, which reads as a
+    /// session that failed to open rather than as a deliberate choice.
     #[test]
-    fn a_host_that_could_not_match_is_centred_rather_than_bottom_anchored() {
-        let offset =
-            pinned_image_offset([1800.0, 1169.0], [1280.0, 800.0]).expect("1:1 must still apply");
-        assert_eq!(offset, [260.0, 184.5]);
-        // Still exactly 1:1 — the promise holds, only the placement changed.
-        assert!(offset[1] > 0.0 && offset[1] < 1169.0 - 800.0);
+    fn a_desktop_smaller_than_the_screen_is_scaled_up_rather_than_bordered() {
+        // Falling through to the caller's aspect-fit is what fills the screen.
+        assert_eq!(pinned_image_offset([1800.0, 1169.0], [1280.0, 800.0]), None);
+        // The reported case: a 1920x1080 desktop on a 2560x1440 panel.
+        assert_eq!(
+            pinned_image_offset([2560.0, 1440.0], [1920.0, 1080.0]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_near_miss_is_still_drawn_one_to_one() {
+        // The notch case must survive: a gap this small is the safe area, not
+        // a smaller desktop, and scaling for it would blur a pixel-exact
+        // picture for nothing.
+        assert_eq!(
+            pinned_image_offset([1800.0, 1169.0], [1800.0, 1130.0]),
+            Some([0.0, 39.0])
+        );
+        assert_eq!(
+            pinned_image_offset([1800.0, 1130.0], [1800.0, 1130.0]),
+            Some([0.0, 0.0])
+        );
     }
 
     #[test]
@@ -14999,6 +15672,7 @@ mod tests {
             primary,
             width_mm,
             height_mm,
+            color: None,
         };
         arcen_media::RequestedMonitor::new(monitor, width_px, height_px)
             .expect("valid requested monitor")
@@ -16016,6 +16690,92 @@ mod tests {
         assert!(release["sequence"].as_u64().unwrap() > press["sequence"].as_u64().unwrap());
         assert!(
             release["timestamp_ns"].as_u64().unwrap() > press["timestamp_ns"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_held_cmd_q_quits_only_after_the_hold_and_a_tap_goes_to_the_host() {
+        let step = quit_hold_step;
+        assert_eq!(step(true, Duration::ZERO), QuitHoldStep::Holding);
+        assert_eq!(
+            step(true, Duration::from_millis(2_999)),
+            QuitHoldStep::Holding
+        );
+        assert_eq!(step(true, QUIT_HOLD), QuitHoldStep::Quit);
+        assert_eq!(
+            step(false, Duration::from_millis(200)),
+            QuitHoldStep::SendToHost
+        );
+        assert_eq!(
+            step(false, Duration::from_secs(10)),
+            QuitHoldStep::SendToHost,
+            "let go is let go, however late it is noticed"
+        );
+    }
+
+    #[test]
+    fn a_tapped_cmd_q_reaches_a_mac_host_as_command_q() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.active_swap_cmd_ctrl = false;
+        app.send_command_q_to_host();
+        let mut sent = Vec::new();
+        while !receiver.is_empty() {
+            let json = receive_json(&mut receiver);
+            sent.push((
+                json["scan_code"].as_u64().unwrap(),
+                json["pressed"].as_bool().unwrap(),
+                json["modifiers"].as_u64().unwrap(),
+            ));
+        }
+        // Command is not physically held while the tests run, so it is
+        // pressed around Q.
+        assert_eq!(
+            sent,
+            vec![
+                (0x0100_0022, true, 0x08),
+                (0x51, true, 0x08),
+                (0x51, false, 0x08),
+                (0x0100_0022, false, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn hdr_cannot_stay_chosen_without_an_hdr_screen() {
+        let mut performance = PerformanceMode::Standard;
+        let mut hdr = ColorFidelitySettings::default();
+        StreamingPreset::Hdr.apply_to(&mut performance, &mut hdr);
+        let (performance_after, grading) =
+            without_unavailable_hdr(performance, hdr, false).expect("HDR is turned off");
+        assert_eq!(
+            StreamingPreset::from_settings(performance_after, grading),
+            StreamingPreset::Grading
+        );
+        assert_eq!(without_unavailable_hdr(performance, hdr, true), None);
+        let mut speed = ColorFidelitySettings::default();
+        let mut sixty = PerformanceMode::Standard;
+        StreamingPreset::Speed.apply_to(&mut sixty, &mut speed);
+        assert_eq!(
+            without_unavailable_hdr(sixty, speed, false),
+            None,
+            "only HDR depends on the screen"
+        );
+    }
+
+    #[test]
+    fn a_mac_host_turns_the_cmd_ctrl_swap_off() {
+        let hello = |session_type: &str| -> arcen_protocol::messages::ServerHelloMsg {
+            serde_json::from_str(&format!(
+                r#"{{"type":"server_hello","session_type":"{session_type}"}}"#
+            ))
+            .expect("hello")
+        };
+        assert!(hello("aqua").host_is_macos());
+        assert!(!hello("x11").host_is_macos());
+        assert!(
+            !hello("").host_is_macos(),
+            "an old host that says nothing keeps the swap"
         );
     }
 
@@ -18275,6 +19035,7 @@ mod tests {
             primary: false,
             width_mm: 300.0,
             height_mm: 200.0,
+            color: None,
         };
         arcen_media::RequestedMonitor::new(monitor, 1280, 1024).expect("valid requested monitor")
     }
@@ -18303,6 +19064,7 @@ mod tests {
             primary: true,
             width_mm: 300.0,
             height_mm: 200.0,
+            color: None,
         };
         let primary = arcen_media::RequestedMonitor::new(primary_monitor, 960, 540)
             .expect("valid requested monitor");
@@ -19377,6 +20139,135 @@ mod tests {
             matches!(app.screen, AppScreen::DisplaysUnsupported(_)),
             "the single-display retry must survive transport wrapping too",
         );
+    }
+
+    #[test]
+    fn a_closed_sign_in_screen_is_followed_holding_the_last_frame() {
+        let armed = || {
+            let mut app = ArcenApp::default();
+            app.active_connection = Some(ConnectionDraft::new(ConnectionKind::DirectMachine));
+            app.connection_generation = 5;
+            app.login_window_handover = Some(LoginWindowHandover {
+                schedule: arcen_session::login_window_handover::HandoverSchedule::new(),
+                auth: AuthSubmission {
+                    username: "someone".to_string(),
+                    password: "secret".to_string(),
+                },
+            });
+            app
+        };
+        let end = |reason| SessionEnd {
+            reason,
+            message: "WebSocket protocol error: Connection reset without closing handshake"
+                .to_string(),
+            observed_at: Instant::now(),
+        };
+        let ctx = egui::Context::default();
+
+        // Signing in resets the connection. That is followed, not reported.
+        let mut app = armed();
+        app.handle_connection_closed(
+            Some(end(DisconnectReason::Terminal(
+                TerminalDisconnect::Protocol,
+            ))),
+            5,
+            &ctx,
+        );
+        assert!(matches!(app.screen, AppScreen::SigningIn));
+        let handover = app.login_window_handover.as_ref().expect("still following");
+        assert!(
+            handover.schedule.pending().is_some(),
+            "a reconnect is scheduled"
+        );
+
+        // The user leaving is never followed, and the credentials go with it.
+        let mut app = armed();
+        app.handle_connection_closed(
+            Some(end(DisconnectReason::Terminal(TerminalDisconnect::Manual))),
+            5,
+            &ctx,
+        );
+        assert!(!matches!(app.screen, AppScreen::SigningIn));
+        assert!(app.login_window_handover.is_none());
+
+        // Once the attempts run out it is an ordinary lost connection.
+        let mut app = armed();
+        let handover = app.login_window_handover.as_mut().expect("armed");
+        for _ in 0..arcen_session::login_window_handover::MAX_ATTEMPTS {
+            let due = handover
+                .schedule
+                .session_ended(Duration::ZERO)
+                .expect("attempts");
+            assert!(handover.schedule.take_due(due));
+        }
+        app.handle_connection_closed(
+            Some(end(DisconnectReason::Terminal(
+                TerminalDisconnect::Protocol,
+            ))),
+            5,
+            &ctx,
+        );
+        assert!(!matches!(app.screen, AppScreen::SigningIn));
+        assert!(app.login_window_handover.is_none());
+    }
+
+    #[test]
+    fn only_a_sign_in_screen_keeps_credentials_past_its_hello() {
+        let submission = || AuthSubmission {
+            username: "someone".to_string(),
+            password: "secret".to_string(),
+        };
+
+        // A signed-in desktop: the credentials are gone at its hello, as ever.
+        let mut app = ArcenApp::default();
+        app.deferred_auth = Some(submission());
+        app.note_hello_desktop(false);
+        assert!(app.deferred_auth.is_none());
+        assert!(app.login_window_handover.is_none());
+
+        // A sign-in screen, whether the password was preloaded or typed.
+        for typed in [false, true] {
+            let mut app = ArcenApp::default();
+            if typed {
+                app.submitted_auth = Some(submission());
+            } else {
+                app.deferred_auth = Some(submission());
+            }
+            app.note_hello_desktop(true);
+            assert!(app.deferred_auth.is_none() && app.submitted_auth.is_none());
+            let handover = app.login_window_handover.as_ref().expect("armed");
+            assert_eq!(handover.auth.password, "secret");
+
+            // The desktop that replaces it ends the hand-over.
+            app.note_hello_desktop(false);
+            assert!(app.login_window_handover.is_none());
+        }
+
+        // An attempt that lands on a sign-in screen again keeps counting, so
+        // a host that never leaves it cannot be retried forever.
+        let mut app = ArcenApp::default();
+        app.deferred_auth = Some(submission());
+        app.note_hello_desktop(true);
+        let handover = app.login_window_handover.as_mut().expect("armed");
+        let due = handover
+            .schedule
+            .session_ended(Duration::ZERO)
+            .expect("attempt");
+        assert!(handover.schedule.take_due(due));
+        app.deferred_auth = Some(submission());
+        app.note_hello_desktop(true);
+        assert_eq!(
+            app.login_window_handover
+                .as_ref()
+                .expect("still armed")
+                .schedule
+                .attempts_made(),
+            1
+        );
+
+        // Leaving drops it.
+        app.disconnect();
+        assert!(app.login_window_handover.is_none());
     }
 
     #[test]

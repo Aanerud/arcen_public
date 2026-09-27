@@ -8,24 +8,6 @@ pub(crate) struct RateControlSizing {
     pub(crate) vbv_buffer_size_bits: u32,
 }
 
-const fn samples_per_pixel(chroma: ChromaSubsampling) -> f64 {
-    match chroma {
-        ChromaSubsampling::Yuv420 => 1.5,
-        ChromaSubsampling::Yuv422 => 2.0,
-        ChromaSubsampling::Yuv444 => 3.0,
-    }
-}
-
-const fn depth_scale(depth: BitDepth) -> f64 {
-    match depth {
-        BitDepth::Eight => 1.0,
-        BitDepth::Ten => 1.25,
-        BitDepth::Twelve => 1.5,
-    }
-}
-
-const BASE_BITS_PER_SAMPLE: f64 = 0.05;
-
 /// The bounded number of input/output slots NVENC may retain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputDrainPolicy {
@@ -134,6 +116,9 @@ pub(crate) const fn vbv_buffer_frames(intent: EncodeIntent) -> f64 {
     }
 }
 
+/// NVENC rate control for a session: the shared link-capped average
+/// (`arcen_media::video::link_capped_average_bitrate_bps`), the same bill
+/// every Pier encodes to, with a VBV buffer of a few frames of it.
 pub(crate) fn rate_control_sizing(
     width: u32,
     height: u32,
@@ -142,18 +127,15 @@ pub(crate) fn rate_control_sizing(
     depth: BitDepth,
     intent: EncodeIntent,
 ) -> RateControlSizing {
-    let pixels_per_second = f64::from(width) * f64::from(height) * f64::from(fps.max(1));
-    let samples_per_second = pixels_per_second * samples_per_pixel(chroma);
-    let bits_per_second = samples_per_second * depth_scale(depth) * BASE_BITS_PER_SAMPLE;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let average_bitrate_bps = bits_per_second.round().clamp(0.0, f64::from(u32::MAX)) as u32;
-    let max_bitrate_bps = average_bitrate_bps;
-    let vbv_buffer_bits = bits_per_second / f64::from(fps.max(1)) * vbv_buffer_frames(intent);
+    let average_bitrate_bps =
+        arcen_media::video::link_capped_average_bitrate_bps(width, height, fps, chroma, depth);
+    let vbv_buffer_bits =
+        f64::from(average_bitrate_bps) / f64::from(fps.max(1)) * vbv_buffer_frames(intent);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let vbv_buffer_size_bits = vbv_buffer_bits.round().clamp(0.0, f64::from(u32::MAX)) as u32;
     RateControlSizing {
         average_bitrate_bps,
-        max_bitrate_bps,
+        max_bitrate_bps: average_bitrate_bps,
         vbv_buffer_size_bits,
     }
 }

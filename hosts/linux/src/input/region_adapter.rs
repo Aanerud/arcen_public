@@ -349,6 +349,7 @@ mod tests {
                 primary,
                 width_mm: 0.0,
                 height_mm: 0.0,
+                color: None,
             },
             logical_width,
             logical_height,

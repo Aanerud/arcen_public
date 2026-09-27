@@ -28,6 +28,17 @@ use crate::media::capenc::IdrRequester;
 /// larger queue prevents spurious IDR storms during CWND expansion.
 pub const CAPACITY: usize = 8;
 
+/// How long the frame pump waits for room before it lets an AU be dropped.
+///
+/// Waiting instead of dropping is backpressure: the pump stops taking AUs,
+/// capenc's pipe fills, and capenc encodes fewer frames, each a valid P-frame
+/// of the last one sent, so a brief stall costs frames, not the prediction
+/// chain. At 60 fps the eight-frame queue is only 133 ms, and the lab link's
+/// hiccups overflowed it: each loss meant an IDR, whose size caused the next
+/// loss (27 IDRs in 50 s, 800 ms p50 frame age). Past this bound the link is
+/// not hiccupping but gone, and drop-and-IDR recovery takes over as before.
+pub const ROOM_WAIT: Duration = Duration::from_millis(500);
+
 /// At most one IDR request per second while a drop streak persists
 /// (`KEYFRAME_REQUEST_MIN_INTERVAL_S = 1.0`).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -49,6 +60,8 @@ struct Inner {
 pub struct FrameQueue {
     inner: Mutex<Inner>,
     notify: Notify,
+    /// Signalled whenever the writer takes a frame, for [`Self::wait_for_room`].
+    room: Notify,
     idr: IdrRequester,
     frames_sent: AtomicU64,
     frames_dropped: AtomicU64,
@@ -73,6 +86,7 @@ impl FrameQueue {
                 closed: false,
             }),
             notify: Notify::new(),
+            room: Notify::new(),
             idr,
             frames_sent: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
@@ -272,6 +286,7 @@ impl FrameQueue {
                         self.frames_sent.fetch_add(1, Ordering::Relaxed);
                         self.bytes_sent
                             .fetch_add(item.len() as u64, Ordering::Relaxed);
+                        self.room.notify_waiters();
                         return Some(item);
                     }
                 }
@@ -280,6 +295,34 @@ impl FrameQueue {
                 }
             }
             notified.await;
+        }
+    }
+
+    /// Waits until an ordinary enqueue would not overflow, for at most
+    /// `max_wait` (see [`ROOM_WAIT`]). Returns immediately when the queue is
+    /// paused, recovering or closed: those states have their own rules.
+    /// Returns whether there is room.
+    pub async fn wait_for_room(&self, max_wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let room = self.room.notified();
+            {
+                let g = self.inner.lock().unwrap();
+                let ordinary = !g.closed
+                    && !g.paused
+                    && !g.awaiting_keyframe
+                    && !g.generation_chain
+                    && !g.protected_front;
+                if !ordinary {
+                    return false;
+                }
+                if g.deque.len() < CAPACITY {
+                    return true;
+                }
+            }
+            if tokio::time::timeout_at(deadline, room).await.is_err() {
+                return false;
+            }
         }
     }
 
@@ -296,6 +339,7 @@ impl FrameQueue {
             g.closed = true;
         }
         self.notify.notify_one();
+        self.room.notify_waiters();
     }
 
     /// Close the queue **and discard any buffered frames immediately**, so
@@ -401,6 +445,54 @@ fn idr_request_due(inner: &mut Inner, now: Instant) -> bool {
 mod tests {
     use super::*;
     use crate::media::capenc::test_support::fake_idr;
+
+    #[tokio::test]
+    async fn a_full_queue_makes_the_pump_wait_for_the_writer_instead_of_dropping() {
+        let (idr, mut rx) = fake_idr();
+        let q = std::sync::Arc::new(FrameQueue::new(idr));
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        let writer = {
+            let q = std::sync::Arc::clone(&q);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                q.dequeue().await
+            })
+        };
+        assert!(
+            q.wait_for_room(Duration::from_secs(2)).await,
+            "the writer made room"
+        );
+        assert!(
+            q.enqueue(vec![0xAA], false),
+            "the next P-frame fits: no loss"
+        );
+        assert_eq!(writer.await.unwrap(), Some(vec![0]));
+        assert!(!q.awaiting_keyframe());
+        assert_eq!(q.frames_dropped(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "no IDR for a stall the queue absorbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_never_drains_bounds_the_wait() {
+        let (idr, _rx) = fake_idr();
+        let q = FrameQueue::new(idr);
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        let started = tokio::time::Instant::now();
+        assert!(!q.wait_for_room(Duration::from_millis(60)).await);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        q.close();
+        assert!(
+            !q.wait_for_room(Duration::from_secs(5)).await,
+            "closed returns at once"
+        );
+    }
 
     #[tokio::test]
     async fn dropped_p_frame_clears_descendants_and_awaits_idr() {

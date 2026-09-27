@@ -2,7 +2,10 @@ use std::fmt::{Display, Formatter};
 
 use arcen_protocol::messages::VideoSelectionIntent;
 
-use crate::{BitDepth, ColorMatrix, ColorRange, EncodeIntent, VideoCodec, VideoConfiguration};
+use crate::{
+    BitDepth, ChromaSubsampling, CodecSet, ColorMatrix, ColorRange, EncodeIntent, VideoCodec,
+    VideoConfiguration,
+};
 
 use super::{ResolvedClientVideoRequest, ResolvedMediaPlan, VideoVariant};
 
@@ -265,7 +268,47 @@ fn client_can_decode(
     codec && chroma && depth && range && matrix
 }
 
-/// Apply host colour policy and exact pins to a validated client request.
+fn codec_supported_by_client(
+    codec: VideoCodec,
+    capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg,
+) -> bool {
+    match codec {
+        VideoCodec::Av1 => capabilities.av1,
+        VideoCodec::H265 => capabilities.h265,
+        VideoCodec::H264 => capabilities.h264,
+        VideoCodec::Jpeg | VideoCodec::Vp9 => false,
+    }
+}
+
+fn resolve_codec(
+    requested: VideoCodec,
+    policy: HostInitialVideoPolicy,
+    supported_codecs: CodecSet,
+    capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg,
+) -> Option<VideoCodec> {
+    if policy.codec_pinned {
+        return (supported_codecs.contains(policy.current.codec)
+            && codec_supported_by_client(policy.current.codec, capabilities))
+        .then_some(policy.current.codec);
+    }
+    adaptive_codec_ladder(requested)
+        .iter()
+        .copied()
+        .find(|codec| {
+            supported_codecs.contains(*codec) && codec_supported_by_client(*codec, capabilities)
+        })
+}
+
+/// Apply host colour policy and exact pins to a validated client request,
+/// for a host that has not measured its encoders.
+///
+/// Without a measurement the client's codec is followed, and the host's
+/// encoder preflight is what refuses one it cannot run. Only a pinned codec
+/// or variant is held to the configured codec: an unpinned configured codec
+/// is a default, not a measurement, and treating it as one turned every HEVC
+/// Grading request on the Linux and Windows Piers into H.264. A host that has
+/// measured its encoders calls
+/// [`resolve_host_initial_video_with_supported_codecs`] instead.
 ///
 /// The active product hosts permit 4:4:4 only with HEVC. Probe-only H.264
 /// 4:4:4 remains available below the product host layer.
@@ -279,7 +322,32 @@ pub fn resolve_host_initial_video(
     request: ResolvedClientVideoRequest,
     policy: HostInitialVideoPolicy,
 ) -> Result<ResolvedHostInitialVideo, HostInitialVideoError> {
+    let codecs = if policy.codec_pinned || policy.variant_pinned {
+        CodecSet::from_slice(&[policy.current.codec])
+    } else {
+        CodecSet::from_slice(&[VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1])
+    };
+    resolve_host_initial_video_with_supported_codecs(request, policy, codecs)
+}
+
+/// Apply host policy while intersecting the measured host codecs with the client.
+///
+/// # Errors
+///
+/// Returns an error when exact administrator pins are unsupported, or no
+/// measured host codec is compatible with the client.
+pub fn resolve_host_initial_video_with_supported_codecs(
+    request: ResolvedClientVideoRequest,
+    policy: HostInitialVideoPolicy,
+    supported_codecs: CodecSet,
+) -> Result<ResolvedHostInitialVideo, HostInitialVideoError> {
     if policy.variant_pinned {
+        if !supported_codecs.contains(policy.current.codec) {
+            return Err(HostInitialVideoError(format!(
+                "administrator video.variant {} requires an encoder the host probe did not make available",
+                VideoVariant::new(policy.current).id()
+            )));
+        }
         if !client_can_decode(policy.current, request.capabilities) {
             return Err(HostInitialVideoError(format!(
                 "administrator video.variant {} is incompatible with the client decode capabilities",
@@ -315,25 +383,41 @@ pub fn resolve_host_initial_video(
             bt2020_ncl: request.capabilities.bt2020_ncl_matrix,
         },
     );
+    let codec = resolve_codec(
+        request.video.codec,
+        policy,
+        supported_codecs,
+        request.capabilities,
+    )
+    .ok_or_else(|| {
+        HostInitialVideoError(format!(
+            "no measured encoder codec can satisfy client preference {}",
+            request.video.codec.token()
+        ))
+    })?;
+    // A codec the ladder fell back to serves 4:2:0 and says so; a codec an
+    // administrator pinned is refused instead, because the pin is a promise
+    // the request cannot be kept within.
+    let chroma = if request.video.chroma == ChromaSubsampling::Yuv444 && codec != VideoCodec::H265 {
+        if policy.codec_pinned {
+            return Err(HostInitialVideoError(format!(
+                "administrator codec pin {} cannot serve the requested yuv444 contract",
+                codec.token()
+            )));
+        }
+        ChromaSubsampling::Yuv420
+    } else {
+        request.video.chroma
+    };
     let video = VideoConfiguration {
-        codec: if policy.codec_pinned {
-            policy.current.codec
-        } else {
-            request.video.codec
-        },
-        chroma: request.video.chroma,
+        codec,
+        chroma,
         bit_depth,
         range,
         matrix,
         primaries: request.video.primaries,
         transfer: request.video.transfer,
     };
-    if video.chroma == crate::ChromaSubsampling::Yuv444 && video.codec != VideoCodec::H265 {
-        return Err(HostInitialVideoError(format!(
-            "administrator codec pin {} cannot serve the requested yuv444 contract",
-            video.codec.token()
-        )));
-    }
     let variant = VideoVariant::new(video);
     if !variant.is_coherent() {
         return Err(HostInitialVideoError(format!(
@@ -412,12 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_codec_pin_rejects_incompatible_full_colour() {
+    fn fidelity_request_degrades_chroma_after_h264_codec_fallback() {
         let request = ResolvedClientVideoRequest {
             selection: VideoSelectionIntent::ColorFidelity,
             video: VideoConfiguration {
                 codec: VideoCodec::H265,
                 chroma: ChromaSubsampling::Yuv444,
+                bit_depth: BitDepth::Ten,
                 ..video(VideoCodec::H265)
             },
             encode_intent: EncodeIntent::Quality,
@@ -425,27 +510,104 @@ mod tests {
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,
                 h265: true,
-                av1: true,
                 yuv444: true,
                 main10: true,
-                main12: false,
-                full_range: true,
-                identity_matrix: true,
-                bt601_matrix: true,
-                bt2020_ncl_matrix: true,
+                ..Default::default()
             },
         };
-        let error = resolve_host_initial_video(
+        let resolved = resolve_host_initial_video_with_supported_codecs(
             request,
             HostInitialVideoPolicy {
-                current: video(VideoCodec::Av1),
+                current: video(VideoCodec::H264),
                 color_policy: ColorPolicy::DefaultOff,
-                codec_pinned: true,
+                codec_pinned: false,
                 variant_pinned: false,
                 max_fps: 60,
             },
+            CodecSet::from_slice(&[VideoCodec::H264]),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("yuv444"));
+        .expect("H.264 fallback should degrade before validation");
+
+        assert_eq!(resolved.video.codec, VideoCodec::H264);
+        assert_eq!(resolved.video.chroma, ChromaSubsampling::Yuv420);
+    }
+
+    #[test]
+    fn an_unmeasured_host_follows_the_requested_codec_unless_it_is_pinned() {
+        let request = ResolvedClientVideoRequest {
+            selection: VideoSelectionIntent::ColorFidelity,
+            video: VideoConfiguration {
+                chroma: ChromaSubsampling::Yuv444,
+                bit_depth: BitDepth::Ten,
+                ..video(VideoCodec::H265)
+            },
+            encode_intent: EncodeIntent::Quality,
+            max_fps: 30,
+            capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                yuv444: true,
+                main10: true,
+                ..Default::default()
+            },
+        };
+        let policy = HostInitialVideoPolicy {
+            current: VideoConfiguration {
+                bit_depth: BitDepth::Ten,
+                ..video(VideoCodec::H264)
+            },
+            color_policy: ColorPolicy::AlwaysOn,
+            codec_pinned: false,
+            variant_pinned: false,
+            max_fps: 60,
+        };
+        let resolved = resolve_host_initial_video(request, policy).expect("follows the client");
+        assert_eq!(
+            (
+                resolved.video.codec,
+                resolved.video.chroma,
+                resolved.video.bit_depth
+            ),
+            (VideoCodec::H265, ChromaSubsampling::Yuv444, BitDepth::Ten),
+            "an unpinned H.264 default is not a measurement"
+        );
+
+        let pinned = resolve_host_initial_video(
+            request,
+            HostInitialVideoPolicy {
+                codec_pinned: true,
+                ..policy
+            },
+        )
+        .expect_err("a pinned H.264 cannot keep a 4:4:4 request");
+        assert!(pinned.to_string().contains("yuv444"));
+    }
+
+    #[test]
+    fn production_resolver_never_selects_a_codec_the_host_probe_rejected() {
+        let request = ResolvedClientVideoRequest {
+            selection: VideoSelectionIntent::AdaptivePerformance,
+            video: video(VideoCodec::H265),
+            encode_intent: EncodeIntent::Interactive,
+            max_fps: 60,
+            capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                ..Default::default()
+            },
+        };
+        let resolved = resolve_host_initial_video_with_supported_codecs(
+            request,
+            HostInitialVideoPolicy {
+                current: video(VideoCodec::H264),
+                color_policy: ColorPolicy::DefaultOff,
+                codec_pinned: false,
+                variant_pinned: false,
+                max_fps: 60,
+            },
+            CodecSet::from_slice(&[VideoCodec::H264]),
+        )
+        .expect("H.264 is measured and client-supported");
+        assert_eq!(resolved.video.codec, VideoCodec::H264);
     }
 }

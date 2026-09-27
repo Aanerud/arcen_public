@@ -15,7 +15,7 @@ Arcen has two active operator surfaces today:
 
 Installing Pier changes the blast radius of the workstation. Linux Pier runs as root, uses PAM, creates a dedicated Xorg session, starts user-context helpers, and can inject input through uinput. Windows Pier runs as LocalSystem, uses `LogonUserW`, can drive an additive Credential Provider at LogonUI for first login, mutates display topology under a recovery journal, launches a user-session agent on `winsta0\default`, and injects input with `SendInput`.
 
-Arcen Span gateway, multi-stream/datagram QUIC optimization, federated identity, MFA, Windows Deck, Linux Deck, macOS Pier, and web account management are roadmap or dormant in this repository. Do not plan production procedures around them.
+Arcen Span gateway, multi-stream/datagram QUIC optimization, federated identity, MFA, Windows Deck, Linux Deck, and web account management are roadmap or dormant in this repository. The macOS Pier is active development rather than an operator surface: the logged-in Aqua path can serve a real Deck, but cold-boot LoginWindow operation, release packaging, and two-display multi-monitor qualification are not production procedures.
 
 ## 2. Installation
 
@@ -212,6 +212,7 @@ Packaged services pass only `--config`, so the JSON file is the operator surface
 | `video.color_range` | string | Built-in `limited`; packages `full` | Both | Ceiling coded sample range: `limited` or `full`. Existing hand-written deployments that omit it retain `limited`; packaged hosts expose the full-range ceiling under `default-off`. | Restart |
 | `video.color_matrix` | string | `bt709` | Both | Ceiling matrix coefficients used to derive luma/chroma from RGB: `identity`, `bt709`, `bt601`, or `bt2020ncl`. | Restart |
 | `video.color_policy` | string | `default-off` | Both | `always-on`, `always-off`, `default-on`, or `default-off`. Governs how `bit_depth`/`color_range`/`color_matrix` interact with a negotiating client. See "Colour fidelity policy" below. | Restart |
+| `video.desktop_encoding` | string | `sdr` | Linux | What the Xorg desktop's code values mean, which Xorg cannot report: `sdr` or `rec2100-pq`. Set `rec2100-pq` only when a colour-managed application writes Rec.2100 PQ into the desktop (for example Flame's HDR UI with graphics monitor `Rec.2100-PQ`); a ten-bit HDR request then stays PQ / BT.2020 instead of resolving to Grading, and SDR sessions log a warning. Windows rejects any value but `sdr` because it reads HDR state from the OS. | Restart |
 | `video.variant` | string or absent | absent | Both | Strongest exact administrator pin: a complete probe-matrix variant id such as `hevc-444-10-full-bt709`. It overrides the individual format keys and the Deck's automatic codec choice. | Restart |
 | `audio.enabled` | bool | Required. Linux built-in `false`, packages `true`; Windows `true` | Both | Enables host-to-Deck audio. | Restart |
 | `audio.compressed` | bool | Required. `false` in packages | Both | `false` selects PCM; `true` selects fixed Opus policy. | Restart |

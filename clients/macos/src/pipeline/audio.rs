@@ -12,14 +12,16 @@ use crate::protocol::{AudioCodec, AudioHeader};
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 const BYTES_PER_SAMPLE: usize = 2;
-/// Steady-state playback backlog we trim back to.
-const TARGET_LATENCY_MS: usize = 70;
-/// Backlog to build after an underrun before resuming playback.
-const RECOVERY_LATENCY_MS: usize = 110;
-/// Backlog level that triggers a trim (hysteresis above target so bursty
-/// WebSocket delivery doesn't cause a glitch every chunk).
-const TRIM_THRESHOLD_MS: usize = 150;
-const MAX_BUFFER_MS: usize = 260;
+/// How far above the playout target a trim brings the queue back to.
+///
+/// The target itself now follows the path (see
+/// `arcen_media::audio::playout`): a fixed 70 ms, 110 ms after a rebuffer,
+/// underran nine times a minute on a WAN even with a still desktop.
+const TRIM_TO_ABOVE_TARGET_MS: usize = 30;
+/// Hard bound: the largest adaptive target plus its trim headroom.
+const MAX_BUFFER_MS: usize = 360;
+/// Samples played between calm updates to the playout target (100 ms).
+const CALM_UPDATE_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize / 10;
 const INTERLEAVED_FRAME_SAMPLES: usize = 1_920;
 const MAX_TRIM_SAMPLES_PER_PUSH: usize = INTERLEAVED_FRAME_SAMPLES * 3;
 const PCM_FRAME_BYTES: usize = INTERLEAVED_FRAME_SAMPLES * BYTES_PER_SAMPLE;
@@ -375,6 +377,8 @@ struct PlaybackQueue {
     underruns: u64,
     trim_events: u64,
     trimmed_samples: u64,
+    playout: arcen_media::audio::playout::PlayoutTarget,
+    played_since_calm_update: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -410,6 +414,10 @@ impl CpalOutput {
             underruns: 0,
             trim_events: 0,
             trimmed_samples: 0,
+            playout: arcen_media::audio::playout::PlayoutTarget::new(
+                arcen_media::audio::playout::PlayoutPolicy::default(),
+            ),
+            played_since_calm_update: 0,
         }));
         let err_fn = |error| {
             tracing::warn!(target: crate::logging::target::AUDIO, %error, "audio stream error");
@@ -521,6 +529,17 @@ fn pop_sample(queue: &mut PlaybackQueue) -> i16 {
         queue.prebuffering = true;
         queue.recovering = true;
         queue.underruns = queue.underruns.saturating_add(1);
+        // The reserve was too small for this path; hold more from now on.
+        queue.playout.record_underrun();
+        queue.played_since_calm_update = 0;
+    } else {
+        queue.played_since_calm_update += 1;
+        if queue.played_since_calm_update >= CALM_UPDATE_SAMPLES {
+            queue.played_since_calm_update = 0;
+            queue
+                .playout
+                .record_calm(std::time::Duration::from_millis(100));
+        }
     }
     sample
 }
@@ -534,11 +553,12 @@ fn trim_excess(queue: &mut PlaybackQueue) {
     // and create a trim/underrun oscillation. Trim toward the recovery reserve
     // (not the steady-state floor) and bound each correction so catch-up is
     // audible-safe even during packet bursts.
-    if queue.samples.len() > trim_threshold_samples() {
+    if queue.samples.len() > trim_threshold_samples(queue) {
+        let keep = ms_to_samples(usize::from(queue.playout.target_ms()) + TRIM_TO_ABOVE_TARGET_MS);
         let trimmed = queue
             .samples
             .len()
-            .saturating_sub(recovery_latency_samples())
+            .saturating_sub(keep)
             .min(MAX_TRIM_SAMPLES_PER_PUSH);
         queue.samples.drain(0..trimmed);
         queue.trim_events = queue.trim_events.saturating_add(1);
@@ -589,24 +609,18 @@ const fn max_samples() -> usize {
     SAMPLE_RATE as usize * CHANNELS as usize * MAX_BUFFER_MS / 1000
 }
 
-const fn target_latency_samples() -> usize {
-    SAMPLE_RATE as usize * CHANNELS as usize * TARGET_LATENCY_MS / 1000
+const fn ms_to_samples(ms: usize) -> usize {
+    SAMPLE_RATE as usize * CHANNELS as usize * ms / 1000
 }
 
-const fn recovery_latency_samples() -> usize {
-    SAMPLE_RATE as usize * CHANNELS as usize * RECOVERY_LATENCY_MS / 1000
-}
-
+/// How much to build before playing: the adaptive target, which an underrun
+/// has already raised by the time recovery begins.
 fn prebuffer_target_samples(queue: &PlaybackQueue) -> usize {
-    if queue.recovering {
-        recovery_latency_samples()
-    } else {
-        target_latency_samples()
-    }
+    ms_to_samples(usize::from(queue.playout.target_ms()))
 }
 
-const fn trim_threshold_samples() -> usize {
-    SAMPLE_RATE as usize * CHANNELS as usize * TRIM_THRESHOLD_MS / 1000
+fn trim_threshold_samples(queue: &PlaybackQueue) -> usize {
+    ms_to_samples(usize::from(queue.playout.trim_threshold_ms()))
 }
 
 #[cfg(test)]
@@ -780,7 +794,24 @@ mod tests {
             underruns: 0,
             trim_events: 0,
             trimmed_samples: 0,
+            playout: arcen_media::audio::playout::PlayoutTarget::new(
+                arcen_media::audio::playout::PlayoutPolicy::default(),
+            ),
+            played_since_calm_update: 0,
         }
+    }
+
+    fn target_samples(queue: &PlaybackQueue) -> usize {
+        ms_to_samples(usize::from(queue.playout.target_ms()))
+    }
+
+    #[test]
+    fn an_underrun_raises_the_reserve_for_the_next_rebuffer() {
+        let mut queue = playback_queue([1], false);
+        let before = prebuffer_target_samples(&queue);
+        let _ = pop_sample(&mut queue);
+        assert_eq!(queue.underruns, 1);
+        assert!(prebuffer_target_samples(&queue) > before);
     }
 
     #[test]
@@ -816,12 +847,13 @@ mod tests {
 
     #[test]
     fn latency_trim_is_counted_without_counting_reset() {
-        let original = trim_threshold_samples() + 2;
+        let probe = playback_queue([], false);
+        let original = trim_threshold_samples(&probe) + 2;
         let mut queue = playback_queue(std::iter::repeat_n(7, original), false);
         trim_excess(&mut queue);
 
-        let expected_trimmed =
-            (original - recovery_latency_samples()).min(MAX_TRIM_SAMPLES_PER_PUSH);
+        let keep = target_samples(&queue) + ms_to_samples(TRIM_TO_ABOVE_TARGET_MS);
+        let expected_trimmed = (original - keep).min(MAX_TRIM_SAMPLES_PER_PUSH);
         assert_eq!(queue.samples.len(), original - expected_trimmed);
         assert_eq!(queue.trim_events, 1);
         assert_eq!(queue.trimmed_samples, expected_trimmed as u64);
@@ -833,7 +865,8 @@ mod tests {
 
     #[test]
     fn bursty_delivery_keeps_jitter_reserve_while_bounding_latency() {
-        let mut queue = playback_queue(std::iter::repeat_n(7, target_latency_samples()), false);
+        let probe = playback_queue([], false);
+        let mut queue = playback_queue(std::iter::repeat_n(7, target_samples(&probe)), false);
 
         for _ in 0..8 {
             trim_excess(&mut queue);
@@ -842,8 +875,8 @@ mod tests {
                 .extend(std::iter::repeat_n(7, INTERLEAVED_FRAME_SAMPLES));
         }
 
-        assert!(queue.samples.len() >= trim_threshold_samples());
-        assert!(queue.samples.len() <= trim_threshold_samples() + INTERLEAVED_FRAME_SAMPLES);
+        assert!(queue.samples.len() >= trim_threshold_samples(&queue) - MAX_TRIM_SAMPLES_PER_PUSH);
+        assert!(queue.samples.len() <= trim_threshold_samples(&queue) + INTERLEAVED_FRAME_SAMPLES);
         assert!(queue.trim_events > 0);
         assert!(queue.trimmed_samples >= queue.trim_events);
         assert!(queue.trimmed_samples <= (queue.trim_events * MAX_TRIM_SAMPLES_PER_PUSH as u64));
@@ -862,7 +895,7 @@ mod tests {
         queue.prebuffering = true;
         queue.samples.extend(std::iter::repeat_n(
             7,
-            trim_threshold_samples() + INTERLEAVED_FRAME_SAMPLES,
+            trim_threshold_samples(&queue) + INTERLEAVED_FRAME_SAMPLES,
         ));
         let before = queue.samples.len();
         trim_excess(&mut queue);

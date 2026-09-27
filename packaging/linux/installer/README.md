@@ -15,6 +15,6 @@ That one embedded Pier contains both Linux native capture pipelines:
 - ten-bit Grading through depth-30 Xorg → XShm → RGB10/P16 conversion → CUDA
   upload → NVENC.
 
-Xorg HDR requests resolve to the Grading pipeline; no separate HDR payload is
-installed. Rebuild `arcen-pier-linux` before the installer or the single-file
+Xorg HDR requests resolve to the Grading pipeline unless `video.desktop_encoding`
+declares a Rec.2100 PQ desktop; no separate HDR payload is installed. Rebuild `arcen-pier-linux` before the installer or the single-file
 artifact will silently embed an older pipeline implementation.

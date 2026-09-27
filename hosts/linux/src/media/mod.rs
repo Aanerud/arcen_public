@@ -49,70 +49,36 @@ pub fn build_video_frame(
     topology_generation: u64,
     stream_epoch: u64,
 ) -> Vec<u8> {
-    let region = monitor_id != 0;
-    let (frame_type, vcodec) = match plan.video.codec {
-        arcen_media::VideoCodec::H265 => (
-            if region {
-                FrameType::RegionVideoH265
-            } else {
-                FrameType::VideoH265
-            },
-            VideoCodec::H265,
-        ),
-        arcen_media::VideoCodec::Av1 => (
-            if region {
-                FrameType::RegionVideoAv1
-            } else {
-                FrameType::VideoAv1
-            },
-            VideoCodec::Av1,
-        ),
-        _ => (
-            if region {
-                FrameType::RegionVideoH264
-            } else {
-                FrameType::VideoH264
-            },
-            VideoCodec::H264,
-        ),
+    // Frame type, colour translation and header layout live in
+    // `arcen_media::video`, beside the same decisions the other Piers make.
+    // Written out here, the chroma arm collapsed anything that was not 4:4:4
+    // into 4:2:0 — including 4:2:2, which the wire has always been able to
+    // carry — so a 4:2:2 frame would have been labelled as something it is not
+    // rather than refused.
+    //
+    // A codec with no video frame type produces no frame. That was previously
+    // spelled as "anything else is H.264", which would have described a JPEG
+    // or VP9 payload as H.264 and handed the Deck something undecodable.
+    let Some(codec) = arcen_media::video::FramedVideoCodec::from_codec(plan.video.codec) else {
+        return Vec::new();
     };
-    let chroma = if matches!(plan.video.chroma, arcen_media::ChromaSubsampling::Yuv444) {
-        ChromaSubsampling::Yuv444
-    } else {
-        ChromaSubsampling::Yuv420
-    };
-    let bit_depth = match plan.video.bit_depth {
-        arcen_media::BitDepth::Eight => BitDepth::Eight,
-        arcen_media::BitDepth::Ten => BitDepth::Ten,
-        arcen_media::BitDepth::Twelve => BitDepth::Twelve,
-    };
-    let range = match plan.video.range {
-        arcen_media::ColorRange::Limited => ColorRange::Limited,
-        arcen_media::ColorRange::Full => ColorRange::Full,
-    };
-    let matrix = match plan.video.matrix {
-        arcen_media::ColorMatrix::Bt709 => ColorMatrix::Bt709,
-        arcen_media::ColorMatrix::Identity => ColorMatrix::Identity,
-        arcen_media::ColorMatrix::Bt601 => ColorMatrix::Bt601,
-        arcen_media::ColorMatrix::Bt2020Ncl => ColorMatrix::Bt2020Ncl,
-    };
-    let flags = VideoHeader::encode_flags(au.is_keyframe, bit_depth, range, matrix);
-
-    let header = encode_video_header(VideoHeader {
-        frame_type,
-        codec: vcodec,
-        chroma,
-        flags,
+    arcen_media::video::video_frame_message(
+        arcen_media::video::VideoWireProfile {
+            codec,
+            chroma: plan.video.chroma,
+            bit_depth: plan.video.bit_depth,
+            range: plan.video.range,
+            matrix: plan.video.matrix,
+        },
+        arcen_media::video::VideoWireRoute {
+            monitor_id,
+            topology_generation,
+            stream_epoch,
+        },
+        au.is_keyframe,
         timestamp_ms,
-        monitor_id,
-        topology_generation,
-        stream_epoch,
-    });
-
-    let mut out = Vec::with_capacity(header.len() + au.data.len());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&au.data);
-    out
+        &au.data,
+    )
 }
 
 #[cfg(test)]

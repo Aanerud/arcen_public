@@ -49,6 +49,7 @@
 pub mod admission;
 pub mod applied;
 pub mod atomic_start;
+pub mod edid;
 pub mod fairness;
 pub mod provider;
 
@@ -64,6 +65,10 @@ pub use applied::{
     assemble_applied_regions,
 };
 pub use atomic_start::{AtomicStartFailure, RollbackFailure, start_all_or_rollback};
+pub use edid::{
+    DetailedTiming, EDID_HDR10_LEN, EdidRequest, cvt_reduced_blanking, generate, generate_hdr10,
+    validate,
+};
 pub use fairness::{FairRoster, RosterError, ServiceOrder};
 pub use provider::{
     BindFailure, CapabilityMismatch, CapabilityRangeError, CommittedOutput, OutputCapabilities,

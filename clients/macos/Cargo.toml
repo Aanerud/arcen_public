@@ -1,6 +1,6 @@
 [package]
 name = "arcen-deck-macos"
-version = "0.10.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -53,6 +53,7 @@ arcen-input.workspace = true
 arcen-media = { workspace = true, features = ["audio-opus"] }
 arcen-protocol = { path = "../../shared/protocol", default-features = false }
 arcen-observability.workspace = true
+arcen-session.workspace = true
 arcen-telemetry.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 arcen-usb-bridge.workspace = true
@@ -93,7 +94,7 @@ apple-cf = "0.9.3"
 block2 = "0.6.2"
 core-graphics = "0.25.0"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-quartz-core"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
 # w4-dedicated-metal-layer: the dedicated 10-bit `CAMetalLayer` video path
 # (`src/ui/video_metal_layer.rs`). Pinned to the exact versions/feature
@@ -118,6 +119,3 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [dev-dependencies]
 rcgen = "0.14.8"
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-arcen-session.workspace = true

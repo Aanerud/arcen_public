@@ -17,11 +17,11 @@ Read this before you invest time.
 
 | | State |
 |---|---|
-| **Linux Pier** (host) | Works. Auto/Speed use the existing NvFBC GPU path; Grading uses a separate depth-30 XShm path for genuine 10-bit SDR. Xorg does not claim HDR, so HDR requests visibly resolve to Grading until a colour-managed Wayland provider exists. |
+| **Linux Pier** (host) | Works. Auto/Speed use the existing NvFBC GPU path; Grading uses a separate depth-30 XShm path for genuine 10-bit SDR. Xorg cannot report HDR, so HDR requests visibly resolve to Grading, unless the operator declares the desktop Rec.2100 PQ (`video.desktop_encoding`, for applications such as Flame's HDR UI) and PQ / BT.2020 is passed through. General desktop HDR awaits a colour-managed Wayland provider. |
 | **Windows Pier** (host) | Works. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
 | **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. AV1 decode needs Apple silicon M3 or later. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
-| **macOS Pier** | Does not exist. |
+| **macOS Pier** | In development. A logged-in Aqua user can serve a real Deck today: PAM authentication, QUIC, ScreenCaptureKit → VideoToolbox video, pointer/keyboard/pen input, clipboard both directions, and host audio when the separate System Audio Recording grant exists. Cold-boot login from the macOS login screen is not supported: it needs a virtual-HID entitlement Apple has not granted, and no Apple contract covers third-party capture of the login window. FileVault's pre-boot disk-unlock screen is not supported. No usable host release exists yet. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
 
 Every claim above was tested on real hardware, running real work, not merely
@@ -36,21 +36,37 @@ compiled:
   PQ/BT.2020 output state.
 - **Windows Pier**, no GPU at all → macOS Deck: `openh264-sw-h264`
   source-built software encode, still hardware-decoded on the Mac.
-- All three Piers are Active Directory-joined, so the credential crossing the
-  wire is a domain credential, not a local account.
+- **macOS Pier**, one-display lab Mac → macOS Deck: authenticated as the
+  console owner, streamed an Aqua desktop, proved clipboard in both directions,
+  and verified `adaptive-performance` as `420v`/`Yuv420` and
+  `color-fidelity` as `x444`/`Yuv444`. Host-audio end-to-end tests pass on a
+  machine with consent; without consent the host reports `CaptureUnavailable`
+  and keeps streaming video without sound.
+- The Linux and Windows Piers in the release matrix are Active
+  Directory-joined, so the credential crossing the wire is a domain credential,
+  not a local account. The macOS Pier evidence above is a development host, not
+  a release qualification matrix.
 - The release matrix also covered nonzero audio, keyboard/pointer input, both
   cursor authorities, display restore, and credential-free reconnect.
+
+**Windows headless HDR account requirement.** The account being signed in must
+currently be a member of the host's local Administrators group when Arcen has
+to provision an unused NVIDIA display ID. NVIDIA NVAPI rejects that
+session-scoped EDID mutation for a standard account. This limitation is
+specific to the automatic NVIDIA headless-display path; it does not imply that
+an attached display or the ordinary eight-bit pipeline needs an administrator
+account.
 
 ### What a session carries
 
 | | |
 |---|---|
 | **Video** | Four complete presets: Auto, Speed, Grading, and HDR. They select separate capture/conversion pipelines rather than adding switches to one path. Source-built OpenH264 is the software floor where no supported hardware encoder exists. See [Streaming presets and independent pipelines](#streaming-presets-and-independent-pipelines). |
-| **Multiple monitors** | One to four, negotiated as one topology. The Deck can match the host's layout to its own windows. **Each monitor is its own NVENC session**, and that is the real ceiling: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. Set `nvenc_session_limit` only if policy forces a lower ceiling. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. On a multi-GPU host, pin the streaming card with `allowed_adapters` so a session cannot borrow the GPU you reserved for other work. |
-| **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. |
+| **Multiple monitors** | One to four, negotiated as one topology. The Deck can match the host's layout to its own windows. **Each monitor is its own NVENC session** on Linux and Windows, and that is the real ceiling there: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. Set `nvenc_session_limit` only if policy forces a lower ceiling. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. On a multi-GPU host, pin the streaming card with `allowed_adapters` so a session cannot borrow the GPU you reserved for other work. macOS Pier has the region-frame wire path, but it is not qualified on hardware yet. |
+| **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. On macOS Pier this now negotiates honestly: the host publishes `audio_output`, sends `audio_stream_result`, and starts capture on a separate thread under a 1500 ms budget so Apple's consent prompt cannot hold the desktop hostage. Note that macOS gates Core Audio process taps behind **System Audio Recording**, a different permission from the **Screen & System Audio Recording** one that gates video — a host can hold the second and none of the first, and then stream a picture in silence. |
 | **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Opt-in every launch — consent is deliberately never restored from settings — and the operator must enable it on the host too. Windows needs a signed driver Arcen does not yet ship; see [Where help is wanted](#where-help-is-wanted). |
 | **Keyboard and pointer** | Absolute and relative motion, scroll, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. |
-| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse. |
+| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike — and that entitlement has been requested and not granted. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
 | **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
@@ -63,12 +79,12 @@ Arcen does not take one 8-bit capture path and relabel it for every mode. The
 presets choose complete contracts, and each host selects a capture provider
 that can actually supply that contract.
 
-| Preset | Requested stream | Windows Pier | Linux Pier (Xorg) | Deck presentation |
-|---|---|---|---|---|
-| **Auto** | 30 fps, adaptive 4:2:0 8-bit | DDA when it proves real frames, otherwise WGC BGRA8 | NvFBC → CUDA → NVENC; device-to-device fast path | Ordinary SDR VideoToolbox path |
-| **Speed** | 60 fps, adaptive 4:2:0 8-bit | Same 8-bit capture path at the higher cadence | Same NvFBC fast path at the higher cadence | Ordinary SDR VideoToolbox path |
-| **Grading** | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 | WGC FP16 scRGB → SDR OETF/matrix → NVENC P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC P16 | Native `xf44` → dedicated `RGB10A2Unorm` Metal layer, SDR |
-| **HDR** | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ | HDR EDID/topology → exact-target Windows HDR state → WGC FP16 scRGB → absolute PQ/BT.2020 → NVENC P16 | No Xorg HDR provider: resolves to the Grading pipeline and reports matrix/primaries/transfer degradation | Same 10-bit Metal layer, with PQ colour space and EDR only when the host returns PQ |
+| Preset | Requested stream | Windows Pier | Linux Pier (Xorg) | macOS Pier (development) | Deck presentation |
+|---|---|---|---|---|---|
+| **Auto** | 30 fps, adaptive 4:2:0 8-bit | DDA when it proves real frames, otherwise WGC BGRA8 | NvFBC → CUDA → NVENC; device-to-device fast path | ScreenCaptureKit → VideoToolbox; hand-qualified as `420v`/`Yuv420` on one lab Mac | Ordinary SDR VideoToolbox path |
+| **Speed** | 60 fps, adaptive 4:2:0 8-bit | Same 8-bit capture path at the higher cadence | Same NvFBC fast path at the higher cadence | Same macOS 8-bit path at the higher cadence; not a release qualification | Ordinary SDR VideoToolbox path |
+| **Grading** | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 | WGC FP16 scRGB → SDR OETF/matrix → NVENC P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC P16 | ScreenCaptureKit 10-bit 4:4:4 → VideoToolbox; hand-qualified as `x444`/`Yuv444` on one lab Mac | Native `xf44` → dedicated `RGB10A2Unorm` Metal layer, SDR |
+| **HDR** | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ | HDR EDID/topology → exact-target Windows HDR state → WGC FP16 scRGB → absolute PQ/BT.2020 → NVENC P16 | Declared `rec2100-pq` desktop: depth-30 XShm → BT.2020 NCL → NVENC PQ. Otherwise resolves to the Grading pipeline and reports matrix/primaries/transfer degradation | Not advertised. No macOS HDR host output has been proven; ten bits alone is not HDR. | Same 10-bit Metal layer, with PQ colour space and EDR only when the host returns PQ |
 
 The separation is deliberate:
 
@@ -96,9 +112,11 @@ through `SMAppService`, not the Deck: Arcen Deck itself never runs as root.
 Installing it is one approval in Login Items. See
 [ADR 0011](docs/adr/0011-macos-privileged-usb-helper.md).
 
-Keyboard, pointer and scroll are synthesised on both hosts: they arrive as
+Keyboard, pointer and scroll are synthesised by the hosts: they arrive as
 native events the operating system generates on Arcen's behalf. On Linux this
-goes through the kernel's own input layer; on Windows through the injection API.
+goes through the kernel's own input layer; on Windows through the injection API;
+on the development macOS Pier, pointer/scroll injection is proven without
+Accessibility and keyboard is proven when the Accessibility grant exists.
 
 **Not supported:** webcam redirection of any kind, and USB passthrough for
 anything other than the one tablet class above. Neither is a small gap —
@@ -132,6 +150,13 @@ the folder you downloaded it to:
 .\install-arcen-pier.exe
 ```
 
+**macOS** — no Pier installer is published yet. The repository contains
+development `build-pier-app.sh` and `build-pier-pkg.sh` scripts, and the app
+script now builds `arcen-pier-macos` before assembling the bundle instead of
+packaging whatever binary happened to be in `target/release`. That is build
+hygiene, not a release claim: the macOS Pier package still has not completed
+Release/Security review or the cold-boot LoginWindow qualification.
+
 The installer creates the directories, generates a TLS certificate, registers
 and starts the service, and opens **UDP 18444** on a firewall it recognises.
 
@@ -141,7 +166,7 @@ installed stays invisible until the machine restarts. Skip the reboot and your
 first remote sign-in fails, asking you to install something that is already
 installed.
 
-Useful flags on both: `--dry-run` shows what would happen and changes nothing;
+Useful flags on Linux and Windows: `--dry-run` shows what would happen and changes nothing;
 `--uninstall --purge` removes everything.
 
 ### The client (Deck)
@@ -178,6 +203,26 @@ It reads the username and password from standard input, two lines, so neither
 appears in your shell history. Progress goes to
 `~/Library/Logs/Arcen/`. Look for `stream healthy` and a rising
 `frames_decoded`.
+
+### If it feels slow, ask for sixty
+
+The Deck's **Standard** performance mode requests 30 fps. **High** requests 60,
+and on a macOS Pier that is worth far more than the name suggests — measured
+against the same host over the same link, changing only the requested rate:
+
+| | 30 fps | 60 fps |
+| --- | --- | --- |
+| frames actually delivered | 29 | 57 |
+| age of a frame on arrival | 27 ms | 6 ms |
+| time a change waits to be captured | ~17 ms | ~8.7 ms |
+
+About 59 ms of pipeline becomes 27 ms. Roughly two thirds of that is not the
+encoder at all: at 60 fps the host photographs the screen twice as often, so a
+change waits half as long to be seen in the first place.
+
+It costs bandwidth — about 7.4 Mbps against 4.6 — and on anything faster than a
+domestic uplink that is a trade worth making. From the terminal, add
+`--max-fps 60`.
 
 ---
 
@@ -271,6 +316,8 @@ display to capture — a hypervisor's virtual adapter, or an indirect display
 driver. Arcen ships no display driver of its own. On supported NVIDIA Windows
 hosts it can instead provision unused native display IDs with session-scoped
 EDIDs, including the HDR sink contract, and restores them when the lease ends.
+That NVIDIA provisioning path currently requires the Windows account being
+signed in to belong to the local Administrators group.
 
 The encryption does not change between these. A software-encoded session on a
 Proxmox guest is protected exactly as a 4:4:4 workstation session is.
@@ -495,8 +542,23 @@ AGPL-3.0, and confirm whether its signature satisfies the Windows editions you
 care about, since community code-signing is not the same as Microsoft WHQL
 attestation.
 
-**A macOS Pier.** Nobody has started. macOS screen capture and session handling
-differ enough from Linux and Windows to need real design work first.
+**A macOS Pier.** It is in development as a native Rust host. The host is being
+built around the existing Deck/shared contracts, with native display creation,
+login/session activation, capture, input, clipboard, tablet, audio, and
+packaging adapters kept separate from shared policy. The logged-in Aqua path is
+real enough to drive by hand from the Deck, including two-way clipboard and
+host audio when consent exists. Multi-monitor has a wire implementation but has
+not been qualified on hardware with more than one attached display. Cold-boot
+remote login from the macOS login screen is **not supported**, and research has
+now established why rather than leaving it as unfinished work: the login window
+needs a `LoginWindow` launch agent, an authorization plug-in registered against
+`system.login.console`, and virtual-HID input because `CGEvent` posting does not
+reach that screen. Every piece is documented by Apple individually, but Apple
+publishes no contract that third-party code may capture the login window, and
+the virtual-HID entitlement it requires has been requested and not granted.
+FileVault's pre-boot disk-unlock screen is not supported either, for a different
+and simpler reason: macOS is not running yet. No usable macOS host release
+exists yet.
 
 **The gateway.** Today a Deck must reach a Pier directly, which in practice
 means the same network or a VPN. The gateway would carry traffic between them

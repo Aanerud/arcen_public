@@ -22,9 +22,16 @@ shared crates never consume products; products never consume one another.
 
 ## Product topology
 
-- **Hosts:** Linux and Windows workstation agents
+- **Hosts:** Linux and Windows workstation agents; macOS host in active
+  development
 - **Clients:** macOS desktop application
-- **Deferred:** macOS host, Linux and Windows clients
+- **Deferred:** Linux and Windows clients
+
+The [macOS Pier implementation plan](../todo/macos-pier.md) defines a proposed
+shared-first host, native boot/login feasibility gates, and signed-package
+acceptance criteria. The logged-in Aqua host path now exists, but this is not a
+release claim: cold-boot LoginWindow operation is still target work, and
+multi-monitor is not qualified on two-display hardware.
 
 ## Transport direction
 
