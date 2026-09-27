@@ -160,7 +160,11 @@ Capture selection is keyed on resolved bit depth. Eight-bit requests use
 NvFBC/CUDA and retain the existing device-to-device path. Every deeper request
 uses depth-30 Xorg/MIT-SHM and a host RGB10 conversion plus one CUDA upload.
 Because Xorg supplies no HDR composition/metadata contract, PQ/HLG requests are
-rewritten to the Grading BT.709 contract before capenc starts. XShm cannot
+rewritten to the Grading BT.709 contract before capenc starts, unless the
+operator declared the desktop Rec.2100 PQ (`video.desktop_encoding`): then a
+ten-bit PQ request keeps PQ / BT.2020 and capenc receives
+`desktop-encoding=rec2100-pq`. The rule is
+`arcen_media::video::constrain_to_desktop_encoding`. XShm cannot
 composite a host cursor, so Host authority degrades to Local only on the wide
 path.
 

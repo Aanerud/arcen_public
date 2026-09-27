@@ -8,6 +8,11 @@ use std::sync::Mutex;
 /// duplicate in-app menu bar in the viewer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// Quit, from the app menu or Cmd+Q. `from_keyboard` is decided when
+    /// the menu fires: a Cmd+Q in a session is hold-to-quit, a click quits.
+    Quit {
+        from_keyboard: bool,
+    },
     ToggleHealth,
     Disconnect,
     ReleaseModifiers,
@@ -56,7 +61,8 @@ mod platform {
     use objc2::sel;
     use objc2::{define_class, msg_send, AnyThread, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags, NSMenu, NSMenuItem,
+        NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags, NSEventType, NSMenu,
+        NSMenuItem,
     };
     use objc2_foundation::{MainThreadMarker, NSActivityOptions, NSProcessInfo, NSString};
 
@@ -73,6 +79,18 @@ mod platform {
         struct MenuTarget;
 
         impl MenuTarget {
+            #[unsafe(method(arcenQuit:))]
+            fn quit(&self, _sender: *mut AnyObject) {
+                // Asked here, while the event that fired the item is still
+                // current: by the next frame a quick tap is already let go.
+                let from_keyboard = MainThreadMarker::new().is_some_and(|mtm| {
+                    NSApplication::sharedApplication(mtm)
+                        .currentEvent()
+                        .is_some_and(|event| event.r#type() == NSEventType::KeyDown)
+                });
+                push_menu_command(MenuCommand::Quit { from_keyboard });
+            }
+
             #[unsafe(method(arcenToggleHealth:))]
             fn toggle_health(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::ToggleHealth);
@@ -154,6 +172,59 @@ mod platform {
         std::mem::forget(token);
     }
 
+    thread_local! {
+        /// The app-menu items whose shortcuts belong to the remote desktop
+        /// while a session is on screen, with the key each normally carries.
+        static HOST_SHORTCUT_ITEMS: std::cell::RefCell<Vec<(Retained<NSMenuItem>, &'static str)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Gives Cmd+H and Cmd+Option+H to the remote desktop, or back to this
+    /// app. Main thread only; a no-op elsewhere.
+    ///
+    /// With them left on the menu, AppKit acts on them before the window sees
+    /// the key, and hides the Deck instead of the application on the host.
+    /// The menu items stay, so hiding is still a click. Cmd+Q is not here:
+    /// it stays on Quit, which asks the app rather than terminating, so it
+    /// can be hold-to-quit in a session.
+    pub fn forward_app_shortcuts_to_host(forward: bool) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        HOST_SHORTCUT_ITEMS.with(|items| {
+            for (item, key) in items.borrow().iter() {
+                item.setKeyEquivalent(&ns(if forward { "" } else { key }));
+            }
+        });
+    }
+
+    /// Whether Command and Q are both physically held right now.
+    ///
+    /// Read from the window server's combined state rather than from events:
+    /// Cmd+Q is consumed by the menu, so its key-down never reaches the
+    /// window, and the question each frame is simply whether it is still
+    /// down.
+    pub fn quit_chord_held() -> bool {
+        command_held() && {
+            // SAFETY: a plain query; 0 is the combined session state and 12
+            // the Q key's virtual key code.
+            unsafe { CGEventSourceKeyState(0, 12) }
+        }
+    }
+
+    /// Whether Command is physically held right now.
+    pub fn command_held() -> bool {
+        const COMMAND: u64 = 1 << 20;
+        // SAFETY: a plain query of the combined session state.
+        unsafe { CGEventSourceFlagsState(0) & COMMAND != 0 }
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+        fn CGEventSourceFlagsState(state: i32) -> u64;
+    }
+
     pub fn install() {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
@@ -182,7 +253,7 @@ mod platform {
         services_item.setSubmenu(Some(&services_menu));
         app_menu.addItem(&services_item);
         app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        app_menu.addItem(&menu_item(
+        let hide = menu_item(
             mtm,
             &format!("Hide {APP_NAME}"),
             Some(sel!(hide:)),
@@ -190,8 +261,9 @@ mod platform {
                 key: "h",
                 modifiers: None,
             }),
-        ));
-        app_menu.addItem(&menu_item(
+        );
+        app_menu.addItem(&hide);
+        let hide_others = menu_item(
             mtm,
             "Hide Others",
             Some(sel!(hideOtherApplications:)),
@@ -199,7 +271,8 @@ mod platform {
                 key: "h",
                 modifiers: Some(NSEventModifierFlags::Option | NSEventModifierFlags::Command),
             }),
-        ));
+        );
+        app_menu.addItem(&hide_others);
         app_menu.addItem(&menu_item(
             mtm,
             "Show All",
@@ -207,15 +280,23 @@ mod platform {
             None,
         ));
         app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        app_menu.addItem(&menu_item(
+        // Not `terminate:`: the app decides. Outside a session it quits at
+        // once; in one, Cmd+Q is Chrome's hold-to-quit, and a tap goes to the
+        // host. A menu key equivalent is matched before the window ever sees
+        // the key, so this item is what receives every Cmd+Q.
+        app_menu.addItem(&action_item(
             mtm,
+            &menu_target,
             &format!("Quit {APP_NAME}"),
-            Some(sel!(terminate:)),
+            sel!(arcenQuit:),
             Some(KeyEquivalent {
                 key: "q",
                 modifiers: None,
             }),
         ));
+        HOST_SHORTCUT_ITEMS.with(|items| {
+            *items.borrow_mut() = vec![(hide, "h"), (hide_others, "h")];
+        });
         add_submenu(mtm, &menubar, APP_NAME, &app_menu);
 
         let connection_menu = make_menu(mtm, "Connection");
@@ -390,10 +471,32 @@ mod platform {
 mod platform {
     pub fn install() {}
     pub fn disable_app_nap() {}
+    pub fn forward_app_shortcuts_to_host(_forward: bool) {}
+    pub fn quit_chord_held() -> bool {
+        false
+    }
+    pub fn command_held() -> bool {
+        false
+    }
 }
 
 pub fn install() {
     platform::install();
+}
+
+/// See `platform::quit_chord_held`.
+pub fn quit_chord_held() -> bool {
+    platform::quit_chord_held()
+}
+
+/// See `platform::command_held`.
+pub fn command_held() -> bool {
+    platform::command_held()
+}
+
+/// See `platform::forward_app_shortcuts_to_host`.
+pub fn forward_app_shortcuts_to_host(forward: bool) {
+    platform::forward_app_shortcuts_to_host(forward);
 }
 
 pub fn disable_app_nap() {

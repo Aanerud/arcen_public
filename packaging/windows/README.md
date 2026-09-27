@@ -96,7 +96,10 @@ test subkey, never the real registration).
 
 The Windows installer creates the protected `%ProgramData%\Arcen` tree, the
 runtime/log/TLS/support directories, and the service registration. There is no
-offline entitlement setup step.
+offline entitlement setup step. An in-place upgrade stops a running
+`ArcenPier` before executable replacement and restarts it when installation
+completes; `--dry-run` simulates that lifecycle without requiring a manual
+service stop.
 
 ## Support bundles
 

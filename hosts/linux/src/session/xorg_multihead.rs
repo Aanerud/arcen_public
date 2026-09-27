@@ -231,6 +231,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         };
         RequestedMonitor::new(monitor, width_px, height_px).expect("requested monitor")
     }

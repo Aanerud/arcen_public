@@ -11,6 +11,9 @@ be embedded accidentally.
 Upgrades retain rollback payloads and atomically migrate an existing
 `%ProgramData%\Arcen\pier.json` from the legacy direct listener and TLS 1.2
 floor to QUIC/UDP 18444 and TLS 1.3 while preserving unrelated fields.
+If `ArcenPier` is running, a real upgrade stops it before replacing executable
+payloads and starts it after installation. `--dry-run` reports that same plan
+without requiring the operator to stop the live service first.
 
 The future GUI and signed-driver-capable installer should present one explicit
 optional component: **Arcen Microphone input driver**. The current CLI installer
@@ -41,6 +44,18 @@ SID-matching locked `Active` physical console may use
 `CPUS_UNLOCK_WORKSTATION`. Another account, RDP,
 disconnected/stale state, old CP generation, or ambiguity must fail closed.
 Autologon must remain disabled.
+
+## Runtime account boundary
+
+Installer elevation does not make the later signed-in session agent elevated.
+The current automatic NVIDIA headless-display path calls
+`NvAPI_GPU_SetEDID` from that agent. Hardware validation succeeded for an
+account in the host's local Administrators group; a standard local account
+failed closed with `NVAPI_INVALID_USER_PRIVILEGE` before capture. Rerunning the
+installer does not change that runtime boundary. Until the mutation is moved
+behind a narrowly scoped LocalSystem broker operation, use an administrator
+test account for automatic NVIDIA headless HDR or provide an already attached
+HDR display.
 
 | Operator choice | Installer behavior | Generated config |
 | --- | --- | --- |

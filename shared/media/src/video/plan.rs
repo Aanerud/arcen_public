@@ -66,6 +66,7 @@ impl EncoderRequest {
 pub enum EncoderBackend {
     NativeNvenc,
     WindowsMediaFoundation,
+    VideoToolbox,
     OpenH264,
     /// Pure-Rust AV1 software encoder. The only backend with a 12-bit path.
     Rav1e,
@@ -130,6 +131,8 @@ pub enum CaptureBackend {
     DesktopDuplication,
     /// Windows Graphics Capture (Windows).
     WindowsGraphicsCapture,
+    /// A colour-managed compositor's `PipeWire` screencast (Linux Wayland).
+    PipeWire,
 }
 
 impl CaptureBackend {
@@ -142,6 +145,7 @@ impl CaptureBackend {
             Self::XShm => "xshm",
             Self::DesktopDuplication => "dxgi-dda",
             Self::WindowsGraphicsCapture => "wgc",
+            Self::PipeWire => "pipewire",
         }
     }
 
@@ -155,6 +159,7 @@ impl CaptureBackend {
             "xshm" => Some(Self::XShm),
             "dxgi-dda" => Some(Self::DesktopDuplication),
             "wgc" => Some(Self::WindowsGraphicsCapture),
+            "pipewire" => Some(Self::PipeWire),
             _ => None,
         }
     }
@@ -169,7 +174,9 @@ impl CaptureBackend {
     pub const fn zero_copy(self) -> bool {
         match self {
             Self::NvFbc | Self::DesktopDuplication => true,
-            Self::XShm | Self::WindowsGraphicsCapture => false,
+            // The PipeWire path proven so far copies frames through host
+            // memory; DMA-BUF import into CUDA is what would make it zero-copy.
+            Self::XShm | Self::WindowsGraphicsCapture | Self::PipeWire => false,
         }
     }
 }
@@ -181,6 +188,7 @@ impl EncoderBackend {
         match value {
             "native-nvenc" => Some(Self::NativeNvenc),
             "media-foundation-sw-h264" => Some(Self::WindowsMediaFoundation),
+            "videotoolbox" => Some(Self::VideoToolbox),
             "openh264-sw-h264" => Some(Self::OpenH264),
             "rav1e-sw-av1" => Some(Self::Rav1e),
             _ => None,
@@ -192,6 +200,7 @@ impl EncoderBackend {
         match self {
             Self::NativeNvenc => "native-nvenc",
             Self::WindowsMediaFoundation => "media-foundation-sw-h264",
+            Self::VideoToolbox => "videotoolbox",
             Self::OpenH264 => "openh264-sw-h264",
             Self::Rav1e => "rav1e-sw-av1",
         }
@@ -204,7 +213,7 @@ impl EncoderBackend {
     #[must_use]
     pub const fn accelerator_class(self) -> AcceleratorClass {
         match self {
-            Self::NativeNvenc => AcceleratorClass::Hardware,
+            Self::NativeNvenc | Self::VideoToolbox => AcceleratorClass::Hardware,
             Self::WindowsMediaFoundation | Self::OpenH264 | Self::Rav1e => {
                 AcceleratorClass::Software
             }
@@ -294,6 +303,20 @@ impl EncoderBackend {
                 max_width: 4096,
                 max_height: 4096,
                 max_fps: 60,
+                cursor_in_video: false,
+            },
+            Self::VideoToolbox => BackendLimits {
+                codecs: CodecSet::from_slice(&[VideoCodec::H264, VideoCodec::H265]),
+                chroma: ChromaSet::from_slice(&[
+                    ChromaSubsampling::Yuv420,
+                    ChromaSubsampling::Yuv444,
+                ]),
+                bit_depths: BitDepthSet::from_slice(&[BitDepth::Eight, BitDepth::Ten]),
+                ranges: ColorRangeSet::from_slice(&[ColorRange::Limited]),
+                identity_matrix: false,
+                max_width: 8192,
+                max_height: 8192,
+                max_fps: 120,
                 cursor_in_video: false,
             },
             // The portable OpenH264 contract: H.264 Baseline, 4:2:0, 8-bit,
@@ -1090,6 +1113,7 @@ pub fn parse_ready_v1(
     let backend = match take(&mut fields, "backend")? {
         "native-nvenc" => EncoderBackend::NativeNvenc,
         "media-foundation-sw-h264" => EncoderBackend::WindowsMediaFoundation,
+        "videotoolbox" => EncoderBackend::VideoToolbox,
         "openh264-sw-h264" => EncoderBackend::OpenH264,
         "rav1e-sw-av1" => EncoderBackend::Rav1e,
         _ => return Err(ReadyProtocolError::UnsupportedBackend),
@@ -1404,6 +1428,7 @@ pub fn parse_unavailable_v1(
     let backend = match take_unavailable_field(&mut fields, "backend")? {
         "native-nvenc" => EncoderBackend::NativeNvenc,
         "media-foundation-sw-h264" => EncoderBackend::WindowsMediaFoundation,
+        "videotoolbox" => EncoderBackend::VideoToolbox,
         "openh264-sw-h264" => EncoderBackend::OpenH264,
         _ => return Err(UnavailableProtocolError::UnsupportedBackend),
     };
@@ -2194,6 +2219,7 @@ mod tests {
             CaptureBackend::XShm,
             CaptureBackend::DesktopDuplication,
             CaptureBackend::WindowsGraphicsCapture,
+            CaptureBackend::PipeWire,
         ] {
             assert_eq!(
                 CaptureBackend::from_token(backend.ready_token()),
@@ -2205,5 +2231,6 @@ mod tests {
         assert!(CaptureBackend::DesktopDuplication.zero_copy());
         assert!(!CaptureBackend::XShm.zero_copy());
         assert!(!CaptureBackend::WindowsGraphicsCapture.zero_copy());
+        assert!(!CaptureBackend::PipeWire.zero_copy());
     }
 }

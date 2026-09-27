@@ -26,6 +26,22 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
 - Grading and HDR are separate conversions over that FP16 source. Grading
   clamps to SDR reference range and applies BT.709/sRGB; HDR converts linear
   scRGB to absolute BT.2020/PQ using 80-nit Windows reference white.
+- HDR places the desktop's SDR white at BT.2408's 203 nits, as every Pier
+  does: capenc reads the captured output's `DISPLAYCONFIG_SDR_WHITE_LEVEL`
+  (Windows composes SDR there; 240 nits by default) and the shared
+  `ScrgbPqTransform::with_sdr_white_nits` rescales in linear light, keeping
+  highlights in proportion. The helper logs `HDR SDR white: host N nits ...`.
+- The broker relay moves the agent's audio frames onto the Deck's priority
+  stream (`arcen_transport::quic::PriorityAudio`) once the Deck's
+  `client_hello` opts in, per attachment.
+- Bitrate is the shared `link_capped_average_bitrate_bps` (capenc
+  `rate_control_sizing`); 22.9 Mbps uncapped HDR made sessions sluggish and
+  starved audio on the lab link.
+- FP16 scRGB conversion uses up to 16 threads (14.6 ms at 1800x1130 on the
+  lab EPYC; 8 threads capped HDR at 22.7 fps). GPU conversion is the durable fix.
+- The HDR EDID carries the Deck display's own gamut and luminance
+  (`ClientMonitor.color` through `arcen_outputs::edid`); the fixed reference
+  grade is only for a Deck that reports nothing.
 - HDR additionally requires the final HDR EDID/topology, Windows 11
   `activeColorMode=HDR`, and DXGI
   `RGB_FULL_G2084_NONE_P2020` on the exact session-bound display target.

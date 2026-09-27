@@ -2259,6 +2259,7 @@ mod tests {
             scale: 1.0,
             product_id: 0x0000,
             serial: 1,
+            color: None,
         })
         .expect("generate an Arcen EDID");
         let probe = summarize_edid(&edid);
@@ -2309,6 +2310,7 @@ mod tests {
             scale: 1.0,
             product_id: 0x0001,
             serial: 0x0dad_beef,
+            color: None,
         })
         .expect("generate an Arcen EDID");
         let mut probe = summarize_edid(&edid);

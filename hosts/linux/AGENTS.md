@@ -30,6 +30,21 @@ NVIDIA GPU and driver on the build/test host.
   preflight and live spawn; keep Host unchanged on the eight-bit NvFBC path.
 - READY and session truth must identify `capture=nvfbc
   capture_zero_copy=true` or `capture=xshm capture_zero_copy=false`.
+- A single-head session's head takes the served Deck display's EDID: the
+  launcher generates it with `arcen_outputs::edid::generate` from the facts in
+  the open request and names it with `CustomEDID` beside `ConnectedMonitor`.
+  Never pass EDID bytes across the launcher boundary; pass facts. A display
+  the generator refuses keeps the EDID-less head rather than failing.
+- Capture reports what it encoded: capenc logs `encoded stream truth` from
+  each new HEVC SPS, to compare with the Deck's `received stream truth`.
+- Never drop an encoded P-frame to relieve a full send queue while waiting
+  would do: the frame pump waits for room (`FrameQueue::wait_for_room`,
+  bounded by `ROOM_WAIT`) so capenc slows instead of breaking the prediction
+  chain. Drop-and-IDR is only for a link that stays blocked past the bound.
+- Audio goes on the Deck's priority stream (`arcen_transport::quic::PriorityAudio`)
+  when the Deck's `client_hello` opts in; never back onto the video sink.
+- Bitrate is the shared `link_capped_average_bitrate_bps`; do not size NVENC
+  from a local formula.
 
 Escalate shared API or protocol changes to Shared/Architecture; authentication,
 privilege, GPU, signing, packaging, and release changes to Release/Security.

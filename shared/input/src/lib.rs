@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+pub mod hid_reports;
+mod pen_edges;
 mod region;
 mod region_emitter;
 mod region_pipeline;
 mod region_state;
 mod region_wire;
 
+pub use pen_edges::{MAX_BARREL_BUTTONS, PenEdge, PenToolState, plan_pen_edges};
 pub use region::{CoordinateTransformError, RegionCoordinateTransformer};
 pub use region_emitter::{RegionInputEmitError, RegionInputEmitter};
 pub use region_pipeline::{
@@ -320,6 +323,36 @@ pub struct PointerButton {
     pub position: PointerMotion,
 }
 
+/// What a scroll delta measures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollUnit {
+    /// Wheel notches.
+    #[default]
+    Line,
+    /// Points of continuous travel, from a trackpad or precise wheel.
+    Point,
+}
+
+/// Where a continuous scroll is in its gesture.
+///
+/// A host that forwards this lets applications run their own momentum and
+/// elastic-edge behaviour, which is most of what makes a trackpad feel like a
+/// trackpad rather than a wheel that happens to be smooth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollPhase {
+    /// A plain wheel notch, not part of a gesture.
+    #[default]
+    None,
+    /// The gesture started.
+    Began,
+    /// The gesture continues.
+    Changed,
+    /// Fingers lifted.
+    Ended,
+    /// The gesture was interrupted.
+    Cancelled,
+}
+
 /// Pointer scroll delta.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PointerScroll {
@@ -327,6 +360,12 @@ pub struct PointerScroll {
     pub delta_x: f64,
     /// Vertical wheel or trackpad delta.
     pub delta_y: f64,
+    /// What the deltas measure.
+    #[serde(default)]
+    pub unit: ScrollUnit,
+    /// Where a continuous scroll is in its gesture.
+    #[serde(default)]
+    pub phase: ScrollPhase,
     /// Whether the position is authoritative for this scroll edge.
     #[serde(default)]
     pub motion_mode: PointerMotionMode,

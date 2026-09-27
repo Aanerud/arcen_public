@@ -223,13 +223,15 @@ macOS 27 and later.
 ## `com.apple.developer.hid.virtual.device`
 
 **Target app:** Arcen Pier (macOS host, not Deck)
-**Bundle ID:** (TBD — macOS Pier not yet packaged; will be `pier.arcen.tech` or similar)
-**Status:** Not yet submitted. Submit when macOS Pier is being packaged for distribution.
+**Bundle ID:** `pier.arcen.tech`
+**Status:** Not submitted. This is retained as old research, not the current
+macOS Pier Native Tablet request; the current conclusion is in
+[`hosts/macos/SIGNING.md`](../../hosts/macos/SIGNING.md).
 
 ### Use case description (submit this text to Apple)
 
 Arcen Pier is a remote desktop host application for macOS, allowing users to access
-their Mac workstation from another device over an encrypted WebSocket connection.
+their Mac workstation from another device over an encrypted direct QUIC connection.
 
 We are implementing HID device passthrough ("HoIP" — HID over IP): a connected client
 (Arcen Deck) reads the raw USB HID report descriptor and input reports from a physically

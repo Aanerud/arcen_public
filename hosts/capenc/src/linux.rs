@@ -1334,6 +1334,7 @@ unsafe fn run_encode(
     let mut last_emit = Instant::now();
     let mut stale_outputs_to_drop = 0usize;
     let mut ready_announced = false;
+    let mut stream_truth = crate::StreamTruthLog::new(codec);
 
     let mut dbg = (0u64, 0u64, 0u64); // new, old/timeout, direct-capture frames
     let mut sec = Instant::now();
@@ -1438,6 +1439,7 @@ unsafe fn run_encode(
                                 }
                                 ready_announced = true;
                             }
+                            stream_truth.observe(&au);
                             if crate::write_access_unit(&mut stdout, &au, framed).is_err() {
                                 return 0;
                             }
@@ -1513,6 +1515,7 @@ unsafe fn run_wide_encode(
     let mut last_emit = Instant::now();
     let mut stale_outputs_to_drop = 0usize;
     let mut ready_announced = false;
+    let mut stream_truth = crate::StreamTruthLog::new(codec);
     let mut capture_counts = (0u64, 0u64, 0u64);
     let mut sec = Instant::now();
     let mut stats = PipelineStats::new();
@@ -1651,6 +1654,7 @@ unsafe fn run_wide_encode(
                                 }
                                 ready_announced = true;
                             }
+                            stream_truth.observe(&access_unit);
                             if crate::write_access_unit(&mut stdout, &access_unit, framed).is_err()
                             {
                                 return 0;
@@ -1804,6 +1808,237 @@ unsafe fn run_selftest(
         if next < now {
             next = now + target_dt;
         }
+    }
+}
+
+/// The operator's declaration of what the Xorg desktop's code values mean
+/// (`desktop-encoding=`, from `video.desktop_encoding`). Absent means SDR; an
+/// unknown token fails closed rather than guessing.
+fn desktop_encoding_from_args(
+    args: &[String],
+) -> Result<arcen_media::video::DesktopSignalEncoding, String> {
+    match args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("desktop-encoding="))
+    {
+        None => Ok(arcen_media::video::DesktopSignalEncoding::Sdr),
+        Some(token) => arcen_media::video::DesktopSignalEncoding::from_token(token)
+            .ok_or_else(|| format!("unknown desktop-encoding={token}")),
+    }
+}
+
+/// One frame of the experimental colour-managed capture pipe: the header a
+/// compositor capture helper writes before each ten-bit packed RGB frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rgb10PipeHeader {
+    width: u32,
+    height: u32,
+    stride: u32,
+    layout: arcen_media::video::PackedRgb10Layout,
+    /// SPA transfer function and primaries the compositor tagged the frame
+    /// with (`spa_video_transfer_function`, `spa_video_color_primaries`).
+    spa_transfer: u32,
+    spa_primaries: u32,
+}
+
+const RGB10_PIPE_MAGIC: &[u8; 8] = b"ARGB10F1";
+const RGB10_PIPE_HEADER_BYTES: usize = 32;
+const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
+const SPA_VIDEO_COLOR_PRIMARIES_BT2020: u32 = 7;
+
+fn parse_rgb10_pipe_header(
+    bytes: &[u8; RGB10_PIPE_HEADER_BYTES],
+) -> Result<Rgb10PipeHeader, String> {
+    if &bytes[0..8] != RGB10_PIPE_MAGIC {
+        return Err("rgb10 pipe frame has no ARGB10F1 magic".to_string());
+    }
+    let word = |index: usize| {
+        u32::from_le_bytes([
+            bytes[8 + index * 4],
+            bytes[9 + index * 4],
+            bytes[10 + index * 4],
+            bytes[11 + index * 4],
+        ])
+    };
+    let (width, height, stride, layout) = (word(0), word(1), word(2), word(3));
+    let layout = match layout {
+        0 => arcen_media::video::PackedRgb10Layout::XRGB2101010,
+        1 => arcen_media::video::PackedRgb10Layout::XBGR2101010,
+        other => return Err(format!("rgb10 pipe layout {other} is not XRGB/XBGR2101010")),
+    };
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || stride < width * 4 {
+        return Err(format!(
+            "rgb10 pipe geometry {width}x{height} stride {stride} is invalid"
+        ));
+    }
+    Ok(Rgb10PipeHeader {
+        width,
+        height,
+        stride,
+        layout,
+        spa_transfer: word(4),
+        spa_primaries: word(5),
+    })
+}
+
+/// Encodes ten-bit packed RGB frames from a colour-managed compositor capture
+/// helper (experimental: the PipeWire HDR spike for the future Wayland
+/// provider). Every frame must say PQ / BT.2020, and the session contract
+/// must be PQ / BT.2020, or nothing is encoded.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_rgb10_pipe(
+    cuda_ctx: cuda::Context,
+    path: &std::path::Path,
+    codec: &str,
+    color: crate::ColorSpec,
+    intent: arcen_media::EncodeIntent,
+    qp_map_policy: crate::qp_map::QpMapPolicy,
+    framed: bool,
+    fps: u32,
+    cursor_mode: crate::CursorCaptureMode,
+) -> i32 {
+    use std::io::Read as _;
+    let mut pipe = match std::fs::File::open(path) {
+        Ok(pipe) => std::io::BufReader::with_capacity(1 << 20, pipe),
+        Err(error) => {
+            log_error(&format!("open rgb10 pipe {}: {error}", path.display()));
+            return 2;
+        }
+    };
+    let mut header_bytes = [0u8; RGB10_PIPE_HEADER_BYTES];
+    let mut read_frame = |pipe: &mut std::io::BufReader<std::fs::File>,
+                          frame: &mut Vec<u8>|
+     -> Result<Option<Rgb10PipeHeader>, String> {
+        match pipe.read_exact(&mut header_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(format!("read rgb10 pipe header: {error}")),
+        }
+        let header = parse_rgb10_pipe_header(&header_bytes)?;
+        if header.spa_transfer != SPA_VIDEO_TRANSFER_SMPTE2084
+            || header.spa_primaries != SPA_VIDEO_COLOR_PRIMARIES_BT2020
+        {
+            return Err(format!(
+                "rgb10 pipe frame is not PQ / BT.2020 (SPA transfer {}, primaries {})",
+                header.spa_transfer, header.spa_primaries
+            ));
+        }
+        frame.resize(header.stride as usize * header.height as usize, 0);
+        pipe.read_exact(frame)
+            .map_err(|error| format!("read rgb10 pipe frame: {error}"))?;
+        Ok(Some(header))
+    };
+    let mut frame = Vec::new();
+    let first = match read_frame(&mut pipe, &mut frame) {
+        Ok(Some(header)) => header,
+        Ok(None) => {
+            log_error("rgb10 pipe closed before the first frame");
+            return 2;
+        }
+        Err(error) => {
+            log_error(&error);
+            return 2;
+        }
+    };
+    let mut encoder = match crate::nvenc_cuda::Encoder::new_for_source(
+        cuda_ctx.as_raw(),
+        first.width,
+        first.height,
+        codec,
+        color,
+        intent,
+        qp_map_policy,
+        crate::nvenc_cuda::WideSource::ColorManagedPq,
+    ) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            log_error(&format!("rgb10 pipe NVENC startup: {error}"));
+            return 4;
+        }
+    };
+    log(&format!(
+        "rgb10 pipe ready: {}x{} {:?} PQ/BT.2020 -> codec={codec} chroma={:?} depth={:?}-bit \
+         matrix={:?} transfer={:?} primaries={:?}",
+        first.width,
+        first.height,
+        first.layout,
+        color.chroma,
+        color.bit_depth,
+        color.matrix,
+        color.transfer,
+        color.primaries
+    ));
+    let mut stdout = std::io::stdout();
+    let mut stream_truth = crate::StreamTruthLog::new(codec);
+    let mut header = first;
+    let mut frames = 0u64;
+    let mut ready_announced = false;
+    // The Deck asks for a keyframe whenever it joins after the first one or
+    // loses decoder state; without the control thread it would wait forever.
+    let control = crate::spawn_control_thread("NVENC-pipe");
+    loop {
+        if header.width != first.width || header.height != first.height {
+            log_error("rgb10 pipe frame geometry changed");
+            return 3;
+        }
+        if let Err(error) = encoder.stage_wide_host(&frame, header.stride as usize, header.layout) {
+            log_error(&format!("stage rgb10 pipe frame: {error}"));
+            return 5;
+        }
+        let requested_idr = control.idr_pending() && control.take_idr();
+        if requested_idr && frames != 0 {
+            log("consuming IDR request");
+        }
+        match encoder.encode(frames == 0 || requested_idr) {
+            Ok(Some(au)) => {
+                if !ready_announced {
+                    let plan = match crate::resolved_media_plan(
+                        EncoderBackend::NativeNvenc,
+                        codec,
+                        color,
+                        first.width,
+                        first.height,
+                        fps,
+                        cursor_mode,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            log_error(&error);
+                            return 5;
+                        }
+                    };
+                    if let Err(error) = crate::announce_ready_from(
+                        plan,
+                        Some(arcen_media::video::CaptureBackend::PipeWire),
+                    ) {
+                        log_error(&format!("emit READY: {error}"));
+                        return 5;
+                    }
+                    ready_announced = true;
+                }
+                stream_truth.observe(&au);
+                if crate::write_access_unit(&mut stdout, &au, framed).is_err() {
+                    return 0;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log_error(&format!("encode rgb10 pipe frame: {error}"));
+                return 5;
+            }
+        }
+        frames += 1;
+        header = match read_frame(&mut pipe, &mut frame) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                log(&format!("rgb10 pipe ended after {frames} frames"));
+                return 0;
+            }
+            Err(error) => {
+                log_error(&error);
+                return 3;
+            }
+        };
     }
 }
 
@@ -2005,6 +2240,13 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(2);
         }
     };
+    let desktop_encoding = match desktop_encoding_from_args(&args) {
+        Ok(encoding) => encoding,
+        Err(error) => {
+            log_error(&error);
+            std::process::exit(2);
+        }
+    };
     let intent = match crate::requested_intent(&args) {
         Ok(intent) => intent,
         Err(error) => {
@@ -2131,6 +2373,21 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(code);
         }
 
+        if let Some(path) = args.iter().find_map(|arg| arg.strip_prefix("rgb10-pipe=")) {
+            let code = run_rgb10_pipe(
+                cuda_ctx,
+                std::path::Path::new(path),
+                &codec,
+                color,
+                intent,
+                qp_map_policy,
+                framed,
+                fps,
+                cursor_mode,
+            );
+            std::process::exit(code);
+        }
+
         if selftest {
             let code = run_selftest(
                 cuda_ctx,
@@ -2204,7 +2461,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         std::process::exit(2);
                     }
                 };
-                let encoder = match crate::nvenc_cuda::Encoder::new(
+                let encoder = match crate::nvenc_cuda::Encoder::new_for_source(
                     cuda_ctx.as_raw(),
                     capture.width(),
                     capture.height(),
@@ -2212,6 +2469,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                     color,
                     intent,
                     qp_map_policy,
+                    crate::nvenc_cuda::WideSource::xorg(desktop_encoding),
                 ) {
                     Ok(mut encoder) => {
                         if qp_map_policy.submits_map() {
@@ -2271,6 +2529,13 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
     // `yuv444` flag derived from it, never two independently-derived values.
     let color = match crate::requested_color(&args, yuv444_token) {
         Ok(color) => color,
+        Err(error) => {
+            log_error(&error);
+            std::process::exit(2);
+        }
+    };
+    let desktop_encoding = match desktop_encoding_from_args(&args) {
+        Ok(encoding) => encoding,
         Err(error) => {
             log_error(&error);
             std::process::exit(2);
@@ -2362,7 +2627,10 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                         std::process::exit(2);
                     }
                 };
-                let mut encoder = match crate::nvenc_cuda::Encoder::new(
+                // A colour-managed pipe source is probed as what the live
+                // session will encode, not as the Xorg framebuffer it bypasses.
+                let pipe_source = args.iter().any(|arg| arg.starts_with("rgb10-pipe="));
+                let mut encoder = match crate::nvenc_cuda::Encoder::new_for_source(
                     cuda_context.as_raw(),
                     capture.width(),
                     capture.height(),
@@ -2370,6 +2638,11 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                     color,
                     intent,
                     qp_map_policy,
+                    if pipe_source {
+                        crate::nvenc_cuda::WideSource::ColorManagedPq
+                    } else {
+                        crate::nvenc_cuda::WideSource::xorg(desktop_encoding)
+                    },
                 ) {
                     Ok(encoder) => encoder,
                     Err(error) => {
@@ -2378,6 +2651,14 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                         probe_startup_exit(error);
                     }
                 };
+                if pipe_source {
+                    drop(encoder);
+                    drop(capture);
+                    drop(cuda_context);
+                    log("native probe capture backend=pipewire");
+                    log("PROBE version=1 backend=native-nvenc available=true");
+                    std::process::exit(0);
+                }
                 let frame = match capture.capture_wide() {
                     Ok(frame) => frame,
                     Err(error) => {

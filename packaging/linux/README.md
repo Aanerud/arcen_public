@@ -9,7 +9,8 @@ Release/Security work.
 The fused Pier contains both native capture pipelines. Eight-bit Auto/Speed
 stay on NvFBC/CUDA/NVENC; ten-bit Grading uses the separate depth-30
 Xorg/XShm conversion and upload path. Xorg HDR requests resolve to Grading
-BT.709. Deployment must install the matching depth-30 Xorg configuration and
+BT.709 unless `video.desktop_encoding` declares the desktop Rec.2100 PQ (for
+example Flame's HDR UI), when they stay PQ / BT.2020 on the same XShm path. Deployment must install the matching depth-30 Xorg configuration and
 must not package a second capenc binary or a separate HDR component.
 
 The deployment builds Pier with embedded NVENC and software-H.264 capenc

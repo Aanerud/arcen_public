@@ -97,12 +97,78 @@ host copy to the eight-bit fast path.
 Until those facts are implemented and measured, dedicated Xorg resolves HDR
 requests to Grading Reference (HEVC 4:4:4 10-bit full-range BT.709). The Deck
 shows matrix/primaries/transfer degradation and remains in SDR presentation
-mode. Depth 30 proves precision, not HDR.
+mode. Depth 30 proves precision, not HDR. The one exception is a desktop the
+operator declares Rec.2100 PQ (`video.desktop_encoding`), where an
+application such as Flame writes PQ itself; see `color-fidelity.md`.
 
 `WaylandRuntimeFacts::from_process_environment` proves only the Wayland session
 marker and Unix socket. It deliberately leaves protocol state unknown because
 file presence or environment variables cannot prove registry, portal, or EIS
 capability.
+
+## Headless HDR spike result (2026-09-27)
+
+A headless GNOME 50 session delivered a bit-exact PQ / BT.2020 ten-bit
+desktop through PipeWire on the Linux lab (NVIDIA GRID V100D-16Q, driver
+570.172.08, Rocky Linux 9.5 host, no display connectors). This is evidence
+for the future provider, not a shipped pipeline.
+
+Pipeline measured:
+
+- **Session:** Mutter 50.5 (Fedora 44 container, podman with NVIDIA CDI)
+  in headless mode on the NVIDIA render node through GBM, with one virtual
+  monitor in `bt2100` colour mode (`gdctl set ... --color-mode bt2100`).
+  The host needed `nvidia-drm modeset=1`; the Xorg pipelines were
+  re-measured unchanged with it.
+- **Content:** a Wayland client presenting an `XRGB2101010` shared-memory
+  buffer tagged PQ / BT.2020 through `wp_color_management_v1`, carrying a
+  0..1023 ramp.
+- **Capture:** `org.gnome.Mutter.ScreenCast` `RecordMonitor`; the PipeWire
+  stream advertises `xRGB_210LE`, `xBGR_210LE` and `RGBA_F16`, each tagged
+  `colorPrimaries=BT2020` and `transferFunction=SMPTE2084`, as DMA-BUF and
+  shared memory; a consumer asking for ten-bit PQ negotiated `xRGB_210LE`.
+- **Result:** the captured frame held all 1024 codes, exactly, grey, and up
+  to PQ 1023 (10,000 nits), so highlights above the 203-nit SDR white
+  survive.
+
+Stock Mutter 50.5 does not get there. Four changes were needed, each small,
+and two of them are defects that label eight-bit pixels as ten-bit HDR:
+
+1. Virtual outputs declare no colour spaces or HDR transfer functions, so a
+   virtual monitor never offers `bt2100`. Declaring BT.2020 and PQ on them
+   enables it.
+2. A virtual monitor composites into a default eight-bit texture, where a KMS
+   output prefers ten-bit scanout; it must composite into ten-bit.
+3. The shared-memory screencast path paints every frame as eight-bit ARGB
+   whatever format was negotiated, so an `xRGB_210LE` PQ stream carried
+   256-level pixels. It must paint in the negotiated format.
+4. The paint-to-buffer helper renders through a default eight-bit texture
+   before reading back; it must render at the requested precision.
+
+Arcen must not depend on a privately patched compositor: these belong
+upstream, and the product capture should use DMA-BUF (the zero-copy route
+into CUDA/NVENC), which does not pass through defects 3 and 4. KWin was not
+chosen: its virtual backend sets no HDR capability and its HDR output
+screencast change (plasma/kwin!9843) is closed unmerged. gamescope's
+PipeWire output is eight-bit only.
+
+### End to end to a Deck (2026-09-27)
+
+A lab-only lever, `ARCEN_EXPERIMENTAL_RGB10_PIPE=<fifo>` (default off, a
+systemd drop-in on the lab only), serves an HDR request from a FIFO that a
+PipeWire consumer inside the container fills with tagged PQ / BT.2020 frames
+(`capenc rgb10-pipe=`, `WideSource::ColorManagedPq`, READY capture backend
+`pipewire`). A real Deck showed HDR: `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`,
+950-970 distinct luma codes, and 27.8-28 fps sustained for 120 s with no
+dropped frames. Two defects found on the way are fixed: the pipe loop never
+started the keyframe control thread (a late Deck waited forever), and the
+consumer must open its FIFO before connecting the stream, not inside a
+process callback. Input still reached Xorg, so this measures the provider's
+video path only.
+
+A host process can consume the container's PipeWire directly (host
+libpipewire 1.0.1 against the container's 1.6.9 server over a shared runtime
+directory), which is the route for in-process capture without a helper.
 
 ## Detection evidence and the later shared contract
 

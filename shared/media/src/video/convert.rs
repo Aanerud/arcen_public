@@ -1057,6 +1057,9 @@ pub fn scrgb_component_to_pq_code(linear: f32) -> u16 {
 pub struct ScrgbPqTransform {
     output_primaries: ColorPrimaries,
     ycbcr: ColorTransform,
+    /// Linear-light gain applied before PQ, placing the host's SDR white at
+    /// BT.2408's 203 nits (`super::pq_white`). `1.0` keeps scRGB as composed.
+    white_gain: f32,
 }
 
 impl ScrgbPqTransform {
@@ -1070,11 +1073,32 @@ impl ScrgbPqTransform {
         Self {
             output_primaries,
             ycbcr: ColorTransform::for_input_max(matrix, range, depth, f64::from(WIDE_INPUT_MAX)),
+            white_gain: 1.0,
         }
     }
 
+    /// Places SDR content, composed at `sdr_white_nits`, at BT.2408's 203-nit
+    /// graphics white, scaling HDR highlights in proportion, as every Pier
+    /// does. Windows composes SDR at the output's SDR white level
+    /// ([`super::pq_white::windows_sdr_white_level_nits`]); a non-positive or
+    /// unknown white leaves the frame as composed.
+    #[must_use]
+    pub fn with_sdr_white_nits(self, sdr_white_nits: f64) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let white_gain = super::pq_white::reference_white_gain(sdr_white_nits) as f32;
+        Self { white_gain, ..self }
+    }
+
+    /// The linear-light gain this transform applies before PQ.
+    #[must_use]
+    pub const fn white_gain(self) -> f32 {
+        self.white_gain
+    }
+
     fn pq_rgb(self, r: f32, g: f32, b: f32) -> [u16; 3] {
-        convert_scrgb_primaries(r, g, b, self.output_primaries).map(scrgb_component_to_pq_code)
+        let gain = self.white_gain;
+        convert_scrgb_primaries(r * gain, g * gain, b * gain, self.output_primaries)
+            .map(scrgb_component_to_pq_code)
     }
 
     fn convert_pq_rgb(self, [r, g, b]: [u16; 3]) -> [u16; 3] {
@@ -1539,6 +1563,46 @@ mod tests {
 
     /// The conversion the wide capture path depends on. SDR reference white
     /// must land at 80-nit PQ while values above 1.0 retain HDR headroom.
+    #[test]
+    fn a_windows_sdr_white_is_placed_at_the_bt2408_graphics_white() {
+        // Windows' default SDR white on an HDR output: level 3000, 240 nits,
+        // which is 3.0 in scRGB (80 nits per 1.0). Measured on the lab.
+        let white_nits = super::super::pq_white::windows_sdr_white_level_nits(3000).expect("nits");
+        assert!((white_nits - 240.0).abs() < 1e-9);
+        let transform = ScrgbPqTransform::new(
+            ColorMatrix::Bt2020Ncl,
+            ColorPrimaries::Bt2020,
+            ColorRange::Full,
+            BitDepth::Ten,
+        )
+        .with_sdr_white_nits(white_nits);
+        let white = transform.pq_rgb(3.0, 3.0, 3.0);
+        let nits = super::super::pq_white::pq_code_to_nits(white[0]);
+        assert!(
+            (nits - 203.0).abs() < 3.0,
+            "SDR white lands at {nits:.1} nits"
+        );
+        assert_eq!(white[0], white[1]);
+        // A highlight keeps its ratio to white: 4x white stays 4x, about 812 nits.
+        let highlight =
+            super::super::pq_white::pq_code_to_nits(transform.pq_rgb(12.0, 12.0, 12.0)[0]);
+        assert!(
+            (highlight / nits - 4.0).abs() < 0.1,
+            "{highlight:.0} / {nits:.0}"
+        );
+        // Unknown white changes nothing.
+        let untouched = ScrgbPqTransform::new(
+            ColorMatrix::Bt2020Ncl,
+            ColorPrimaries::Bt2020,
+            ColorRange::Full,
+            BitDepth::Ten,
+        );
+        assert_eq!(
+            untouched.with_sdr_white_nits(0.0).pq_rgb(1.0, 1.0, 1.0),
+            untouched.pq_rgb(1.0, 1.0, 1.0)
+        );
+    }
+
     #[test]
     fn scrgb_reference_white_and_hdr_highlight_map_to_absolute_pq() {
         let transform = ScrgbPqTransform::new(
@@ -2426,6 +2490,59 @@ mod wide_source_tests {
             low, high,
             "codes one apart at ten bits must not collapse to the same luma"
         );
+    }
+
+    /// The Linux Grading path's whole conversion, on the layout the lab's
+    /// NVIDIA Xorg measures: every one of the 1024 grey codes becomes its own
+    /// luma code, in order, with neutral chroma. The same ramp on the eight-bit
+    /// grid keeps only 256. This is the host half of the on-screen ramp test,
+    /// whose Deck half counts `distinct_codes` after decode.
+    #[test]
+    fn a_full_ten_bit_grey_ramp_keeps_every_code_through_the_xshm_conversion() {
+        let convert = |codes: &[u16]| -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+            let src: Vec<u8> = codes
+                .iter()
+                .flat_map(|&code| {
+                    let word = u32::from(code) | (u32::from(code) << 10) | (u32::from(code) << 20);
+                    word.to_le_bytes()
+                })
+                .collect();
+            let width = codes.len();
+            let (mut y, mut u, mut v) = (vec![0; width], vec![0; width], vec![0; width]);
+            convert_packed_rgb10_to_i444_p16(
+                &src,
+                width * 4,
+                [&mut y, &mut u, &mut v],
+                [width; 3],
+                width,
+                1,
+                PackedRgb10Layout::XBGR2101010,
+                wide_full_bt709(),
+            )
+            .expect("ramp converts");
+            (y, u, v)
+        };
+        let distinct = |plane: &[u16]| {
+            plane
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+
+        let ramp: Vec<u16> = (0..1024).collect();
+        let (y, u, v) = convert(&ramp);
+        assert_eq!(distinct(&y), 1024);
+        assert!(
+            y.windows(2).all(|pair| pair[0] < pair[1]),
+            "luma rises with the ramp"
+        );
+        assert!(
+            u.iter().chain(&v).all(|&code| code >> 6 == 512),
+            "grey has no chroma"
+        );
+
+        let eight_bit_grid: Vec<u16> = ramp.iter().map(|code| code & !3).collect();
+        assert_eq!(distinct(&convert(&eight_bit_grid).0), 256);
     }
 
     /// Geometry is checked before any write.

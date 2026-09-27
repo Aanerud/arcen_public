@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod cert_marker;
+pub mod cert_provisioning;
+pub mod cert_transaction;
 #[cfg(feature = "wss-compat")]
 pub mod fallback;
 #[cfg(feature = "quic")]

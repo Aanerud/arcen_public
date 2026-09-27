@@ -48,6 +48,17 @@ pub use wire::{
 pub const CAPABILITY_TRANSPORT_WSS: &str = "transport:wss-v1";
 /// Canonical transport capability: QUIC profile.
 pub const CAPABILITY_TRANSPORT_QUIC: &str = "transport:quic-v1";
+/// Preface a host writes first on the audio priority stream, so a client can
+/// tell that unidirectional stream from any other before trusting its frames.
+///
+/// After the preface the stream carries binary media frames exactly as the
+/// session stream does — each one the same bytes a `Message::Binary` would —
+/// each prefixed by its length as a big-endian `u32`. Only
+/// [`wire::FrameType::Audio`] frames are sent on it today.
+pub const AUDIO_PRIORITY_STREAM_V1: &[u8; 16] = b"ARCEN-AUDIO-PRI1";
+/// Largest frame the audio priority stream carries.
+pub const AUDIO_PRIORITY_MAX_FRAME_BYTES: usize = 64 * 1024;
+
 /// Maximum transport capability identifiers accepted from one hello.
 pub const MAX_TRANSPORT_CAPABILITIES: usize = 8;
 /// Maximum byte length of a transport capability identifier.

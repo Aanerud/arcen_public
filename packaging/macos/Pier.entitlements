@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    The Pier's DriverKit entitlements, used only by build-pier-app.sh when
+	    it is asked for them explicitly (see its `with-driverkit-hid` flag).
+
+	    Every key here is authorized by the pier.arcen.tech provisioning
+	    profile, and every key here requires that profile to be embedded in
+	    the bundle. That is not a style preference. Signing this set without
+	    an embedded profile produces a binary the kernel kills with SIGKILL
+	    before main; measured on a machine with no profiles installed, the
+	    same binary returns 137 with no output without the profile and runs
+	    normally with it. A development Mac hides this, because profiles
+	    installed system wide satisfy the check on that machine and nowhere
+	    else.
+
+	    These three authorize a *driver*. Apple's wording is "whether the
+	    driver provides a HID-related service"; they belong on a DriverKit
+	    extension, and an app that installs one needs
+	    com.apple.developer.system-extension.install, which this profile does
+	    not carry. The Pier ships no dext today, so the default build omits
+	    this file: an entitlement that grants nothing still costs a hard
+	    dependency on a file someone can forget.
+
+	    Basic Tablet needs none of this. CGEvent carries tablet subtypes and
+	    the pressure, tilt, rotation and proximity fields directly, with no
+	    entitlement and no driver.
+	-->
+	<key>com.apple.application-identifier</key>
+	<string>NWR7ZH8L7U.pier.arcen.tech</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>NWR7ZH8L7U</string>
+	<key>com.apple.developer.driverkit.family.hid.device</key>
+	<true/>
+	<key>com.apple.developer.driverkit.family.hid.eventservice</key>
+	<true/>
+	<key>com.apple.developer.driverkit.transport.hid</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Arcen Pier installer's definition: what Installer.app shows, and what
+  it checks before anything is installed. build-pier-pkg.sh fills in the
+  version, architecture and minimum-macOS placeholders.
+
+  It is meant to be opened on the Mac it installs, by the person who will
+  approve its privacy permissions. The installation check refuses the
+  command-line `installer` unless the administrator asks for it explicitly,
+  because a Terminal or SSH install finishes with a host that can't show a
+  picture or take a key until someone at the Mac approves Screen Recording
+  and Accessibility.
+-->
+<installer-gui-script minSpecVersion="2">
+  <title>Arcen Pier</title>
+  <organization>tech.arcen</organization>
+  <options customize="never" require-scripts="true"
+           hostArchitectures="@HOST_ARCHITECTURES@"/>
+  <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+  <allowed-os-versions>
+    <os-version min="@MINIMUM_SYSTEM_VERSION@"/>
+  </allowed-os-versions>
+  <conclusion file="conclusion.html" mime-type="text/html"/>
+  <installation-check script="arcen_installation_check()"/>
+  <script><![CDATA[
+function arcen_installation_check() {
+  // Set by the command-line installer. Measured on the lab Mac: Installer.app
+  // does not set it, `installer -pkg` does, and this check sees the caller's
+  // environment where the package scripts do not.
+  var commandLine = system.env.COMMAND_LINE_INSTALL == "1";
+  var allowed = system.env.ARCEN_ALLOW_COMMAND_LINE_INSTALL == "1";
+  if (commandLine && !allowed) {
+    my.result.type = "Fatal";
+    my.result.title = "Install Arcen Pier on the Mac itself";
+    my.result.message =
+      "Arcen Pier must be installed with Installer.app on this Mac, not from Terminal. " +
+      "It needs privacy permissions that macOS only lets someone at the Mac approve: " +
+      "Screen & System Audio Recording and Accessibility for Arcen Agent Helper. " +
+      "Open the package in Finder and follow the steps. " +
+      "Administrators whose Macs get these permissions some other way, such as an MDM " +
+      "privacy profile, can install from Terminal on purpose with: " +
+      "sudo ARCEN_ALLOW_COMMAND_LINE_INSTALL=1 installer -pkg <package> -target /";
+    return false;
+  }
+  if (commandLine) {
+    system.log("Arcen Pier: command-line install allowed by ARCEN_ALLOW_COMMAND_LINE_INSTALL");
+  }
+  return true;
+}
+  ]]></script>
+  <choices-outline>
+    <line choice="pier"/>
+  </choices-outline>
+  <choice id="pier" title="Arcen Pier" visible="false">
+    <pkg-ref id="pier.arcen.tech"/>
+  </choice>
+  <pkg-ref id="pier.arcen.tech" version="@VERSION@" onConclusion="none">@COMPONENT@</pkg-ref>
+</installer-gui-script>

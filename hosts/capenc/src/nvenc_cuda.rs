@@ -754,15 +754,67 @@ fn apply_av1_color(config: &mut NV_ENC_CONFIG_AV1, color: crate::ColorSpec) {
     config.colorRange = u32::from(matches!(color.range, ColorRange::Full));
 }
 
-fn wide_transform(color: crate::ColorSpec) -> Result<ColorTransform, NativeStartupError> {
+/// Where a wide (ten-bit packed RGB) frame comes from, which decides what it
+/// can truthfully be encoded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WideSource {
+    /// A depth-30 Xorg framebuffer: precise SDR, BT.709, no HDR composition.
+    XorgDepth30,
+    /// A colour-managed compositor stream that states it is PQ with BT.2020
+    /// primaries (a PipeWire `xRGB_210LE`/`xBGR_210LE` screencast tagged
+    /// SMPTE 2084 / BT.2020). Its codes are already PQ R'G'B', so only the
+    /// matrix is applied, and only a PQ / BT.2020 contract may carry it.
+    ColorManagedPq,
+    /// A depth-30 Xorg framebuffer the operator declared Rec.2100 PQ
+    /// (`video.desktop_encoding = rec2100-pq`): a colour-managed application
+    /// writes PQ R'G'B' into it. The same codes as [`Self::ColorManagedPq`],
+    /// vouched for by the operator instead of the compositor.
+    XorgDeclaredPq,
+}
+
+impl WideSource {
+    /// The source for an Xorg framebuffer under the declared desktop encoding.
+    pub(crate) const fn xorg(encoding: arcen_media::video::DesktopSignalEncoding) -> Self {
+        match encoding {
+            arcen_media::video::DesktopSignalEncoding::Sdr => Self::XorgDepth30,
+            arcen_media::video::DesktopSignalEncoding::Rec2100Pq => Self::XorgDeclaredPq,
+        }
+    }
+}
+
+fn wide_transform(
+    color: crate::ColorSpec,
+    source: WideSource,
+) -> Result<ColorTransform, NativeStartupError> {
+    let transform = || {
+        ColorTransform::for_input_max(
+            color.matrix,
+            color.range,
+            color.bit_depth,
+            f64::from(arcen_media::video::WIDE_INPUT_MAX),
+        )
+    };
+    if matches!(
+        source,
+        WideSource::ColorManagedPq | WideSource::XorgDeclaredPq
+    ) {
+        return match (color.transfer, color.primaries, color.matrix) {
+            (TransferCharacteristics::Pq, ColorPrimaries::Bt2020, ColorMatrix::Bt2020Ncl) => {
+                Ok(transform())
+            }
+            _ => Err(NativeStartupError::Unavailable {
+                reason: BackendUnavailableReason::UnsupportedConfiguration,
+                detail: format!(
+                    "a PQ / BT.2020 compositor stream can only be encoded as PQ / BT.2020 / \
+                     BT.2020 NCL, not {:?} / {:?} / {:?}",
+                    color.transfer, color.primaries, color.matrix
+                ),
+            }),
+        };
+    }
     match (color.transfer, color.primaries) {
         (TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb, ColorPrimaries::Bt709) => {
-            Ok(ColorTransform::for_input_max(
-                color.matrix,
-                color.range,
-                color.bit_depth,
-                f64::from(arcen_media::video::WIDE_INPUT_MAX),
-            ))
+            Ok(transform())
         }
         _ => Err(NativeStartupError::Unavailable {
             reason: BackendUnavailableReason::UnsupportedConfiguration,
@@ -795,6 +847,30 @@ impl Encoder {
         intent: EncodeIntent,
         qp_map_policy: crate::qp_map::QpMapPolicy,
     ) -> Result<Self, NativeStartupError> {
+        Self::new_for_source(
+            cuctx,
+            width,
+            height,
+            codec,
+            color,
+            intent,
+            qp_map_policy,
+            WideSource::XorgDepth30,
+        )
+    }
+
+    /// [`Self::new`] for a wide source that is not a depth-30 Xorg framebuffer.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn new_for_source(
+        cuctx: *mut c_void,
+        width: u32,
+        height: u32,
+        codec: &str,
+        color: crate::ColorSpec,
+        intent: EncodeIntent,
+        qp_map_policy: crate::qp_map::QpMapPolicy,
+        wide_source: WideSource,
+    ) -> Result<Self, NativeStartupError> {
         let nvenc_codec = NvencCodec::parse(codec).ok_or_else(|| NativeStartupError::Unavailable {
             reason: BackendUnavailableReason::UnsupportedConfiguration,
             detail: format!(
@@ -808,7 +884,7 @@ impl Encoder {
             }
         })?;
         let wide_transform = if format.needs_own_conversion() {
-            wide_transform(color)?
+            wide_transform(color, wide_source)?
         } else {
             color.transform()
         };
@@ -2135,7 +2211,7 @@ mod pixel_format_tests {
     #[test]
     fn depth_thirty_transfer_interpretation_is_explicit_and_fail_closed() {
         let grading = color(ChromaSubsampling::Yuv444, BitDepth::Ten);
-        assert!(wide_transform(grading).is_ok());
+        assert!(wide_transform(grading, WideSource::XorgDepth30).is_ok());
 
         let hdr = crate::ColorSpec {
             range: ColorRange::Full,
@@ -2144,20 +2220,45 @@ mod pixel_format_tests {
             transfer: TransferCharacteristics::Pq,
             ..grading
         };
-        assert!(wide_transform(hdr).is_err());
+        assert!(wide_transform(hdr, WideSource::XorgDepth30).is_err());
 
         let hlg = crate::ColorSpec {
             transfer: TransferCharacteristics::Hlg,
             ..hdr
         };
-        assert!(wide_transform(hlg).is_err());
+        assert!(wide_transform(hlg, WideSource::XorgDepth30).is_err());
+
+        // A colour-managed PQ stream may be encoded as exactly PQ / BT.2020,
+        // and never relabelled as SDR, nor Xorg's SDR as PQ.
+        assert!(wide_transform(hdr, WideSource::ColorManagedPq).is_ok());
+        assert!(wide_transform(hlg, WideSource::ColorManagedPq).is_err());
+        assert!(wide_transform(grading, WideSource::ColorManagedPq).is_err());
+        let wrong_matrix = crate::ColorSpec {
+            matrix: ColorMatrix::Bt709,
+            ..hdr
+        };
+        assert!(wide_transform(wrong_matrix, WideSource::ColorManagedPq).is_err());
+
+        // A declared PQ desktop obeys the same rule, and only a declaration
+        // turns Xorg's codes into PQ.
+        assert!(wide_transform(hdr, WideSource::XorgDeclaredPq).is_ok());
+        assert!(wide_transform(grading, WideSource::XorgDeclaredPq).is_err());
+        assert!(wide_transform(hlg, WideSource::XorgDeclaredPq).is_err());
+        assert_eq!(
+            WideSource::xorg(arcen_media::video::DesktopSignalEncoding::Sdr),
+            WideSource::XorgDepth30
+        );
+        assert_eq!(
+            WideSource::xorg(arcen_media::video::DesktopSignalEncoding::Rec2100Pq),
+            WideSource::XorgDeclaredPq
+        );
 
         let unsupported_sdr_primary = crate::ColorSpec {
             primaries: ColorPrimaries::DisplayP3,
             transfer: TransferCharacteristics::Bt709,
             ..grading
         };
-        assert!(wide_transform(unsupported_sdr_primary).is_err());
+        assert!(wide_transform(unsupported_sdr_primary, WideSource::XorgDepth30).is_err());
     }
 
     #[test]

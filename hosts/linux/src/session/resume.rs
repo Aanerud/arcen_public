@@ -57,6 +57,18 @@ impl DirectSessionSocket {
         Self::Quic(socket)
     }
 
+    /// The Deck's audio priority stream on this connection, not yet opened.
+    /// `None` on a transport without one.
+    pub(crate) fn priority_audio(&self) -> Option<arcen_transport::quic::PriorityAudio> {
+        match self {
+            #[cfg(feature = "wss-compat")]
+            Self::Wss(_) => None,
+            Self::Quic(socket) => Some(arcen_transport::quic::PriorityAudio::new(
+                socket.get_ref().connection_handle(),
+            )),
+        }
+    }
+
     pub(crate) const fn transport_capability(&self) -> &'static str {
         match self {
             #[cfg(feature = "wss-compat")]
@@ -1934,6 +1946,7 @@ mod tests {
             model: 0,
             serial: 0,
             edid: String::new(),
+            color: None,
             safe_area_policy,
             quality_intent: arcen_protocol::messages::MonitorQualityIntentMsg::HostDefault,
         }

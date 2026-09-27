@@ -277,8 +277,10 @@ fallback.
 
 The production Deck's Auto/Speed/Grading/HDR choices resolve to complete
 configurations before capture starts. Hosts then choose only a native provider
-that can truthfully supply that configuration. Linux Xorg may change an HDR
-request to Grading; a proven future Wayland provider may retain PQ. Windows
+that can truthfully supply that configuration. Linux Xorg changes an HDR
+request to Grading unless the operator declared the desktop Rec.2100 PQ
+(`DesktopSignalEncoding`, `constrain_to_desktop_encoding`); a proven future
+Wayland provider may retain PQ. Windows
 retains PQ only after exact-target HDR proof. Those platform decisions consume
 the shared contract rather than redefining it.
 

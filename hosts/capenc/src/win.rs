@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO,
 };
-use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
 };
@@ -890,6 +890,117 @@ unsafe fn create_nvenc_encoder(
         // follow the concrete source format rather than the request.
         cap.is_wide(),
     )
+    .map(|mut encoder| {
+        place_hdr_sdr_white(cap, &mut encoder, color);
+        encoder
+    })
+}
+
+/// Puts the desktop's SDR white at 203 nits in an HDR stream.
+///
+/// Windows composes SDR content in scRGB at the output's SDR white level,
+/// set by its "SDR content brightness" slider: 240 nits by default, measured
+/// on the lab. The macOS Pier places the same content at BT.2408's 203 nits,
+/// and a Deck should see one host's desktop as bright as another's. An
+/// unreadable level leaves the frame as composed, and says so.
+#[cfg(feature = "nvenc")]
+unsafe fn place_hdr_sdr_white(
+    cap: &Source,
+    encoder: &mut crate::nvenc::Encoder,
+    color: crate::ColorSpec,
+) {
+    if color.transfer != arcen_media::TransferCharacteristics::Pq || !cap.is_wide() {
+        return;
+    }
+    let Source::Wgc(wgc) = cap else {
+        return;
+    };
+    match sdr_white_level(wgc.monitor()) {
+        Ok(level) => {
+            let Some(nits) = arcen_media::video::pq_white::windows_sdr_white_level_nits(level)
+            else {
+                log("HDR SDR white: Windows reported level 0; frame left as composed");
+                return;
+            };
+            if let Some(gain) = encoder.place_sdr_white(nits) {
+                log(&format!(
+                    "HDR SDR white: host {nits:.0} nits (level {level}) placed at {:.0} nits, \
+                     linear gain {gain:.3}",
+                    arcen_media::video::pq_white::GRAPHICS_WHITE_NITS
+                ));
+            }
+        }
+        Err(error) => log(&format!(
+            "HDR SDR white: level unreadable ({error}); frame left as composed"
+        )),
+    }
+}
+
+/// The SDR white level Windows composes `monitor` at, as
+/// `DISPLAYCONFIG_SDR_WHITE_LEVEL` states it (1000 = 80 nits).
+///
+/// The monitor's GDI device name is matched to an active display path's
+/// source, and that path's target is asked.
+#[cfg(feature = "nvenc")]
+unsafe fn sdr_white_level(monitor: HMONITOR) -> Result<u32, String> {
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    };
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()).as_bool() {
+        return Err("GetMonitorInfoW failed".to_string());
+    }
+    let device = decode_wide_z(&info.szDevice);
+
+    let (mut path_count, mut mode_count) = (0u32, 0u32);
+    let status =
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count);
+    if status.is_err() {
+        return Err(format!("GetDisplayConfigBufferSizes: {status:?}"));
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    let status = QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut path_count,
+        paths.as_mut_ptr(),
+        &mut mode_count,
+        modes.as_mut_ptr(),
+        None,
+    );
+    if status.is_err() {
+        return Err(format!("QueryDisplayConfig: {status:?}"));
+    }
+    paths.truncate(path_count as usize);
+    for path in &paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if DisplayConfigGetDeviceInfo(&mut source.header) != 0 {
+            continue;
+        }
+        if !decode_wide_z(&source.viewGdiDeviceName).eq_ignore_ascii_case(&device) {
+            continue;
+        }
+        let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+        white.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
+        white.header.adapterId = path.targetInfo.adapterId;
+        white.header.id = path.targetInfo.id;
+        let status = DisplayConfigGetDeviceInfo(&mut white.header);
+        return if status == 0 {
+            Ok(white.SDRWhiteLevel)
+        } else {
+            Err(format!("GET_SDR_WHITE_LEVEL status {status} for {device}"))
+        };
+    }
+    Err(format!("no active display path for {device}"))
 }
 
 #[cfg(feature = "nvenc")]

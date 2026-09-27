@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    The Pier's virtual HID entitlement, used by build-pier-app.sh with
+	    `with-virtual-hid` and the pier.arcen.tech Developer ID profile that
+	    authorizes it. Signing it without that profile embedded yields a
+	    binary AMFI kills before main.
+
+	    com.apple.developer.hid.virtual.device is what IOHIDUserDevice checks
+	    before it will publish a device. A device published this way is input
+	    macOS treats as hardware: it reaches the login window, which CGEvent
+	    posting does not, and it is how the Pier signs somebody in when nobody
+	    is logged in at the machine.
+	-->
+	<key>com.apple.application-identifier</key>
+	<string>NWR7ZH8L7U.pier.arcen.tech</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>NWR7ZH8L7U</string>
+	<key>com.apple.developer.hid.virtual.device</key>
+	<true/>
+</dict>
+</plist>

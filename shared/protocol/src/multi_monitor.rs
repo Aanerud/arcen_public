@@ -200,6 +200,9 @@ pub struct RequestedMonitorDescriptorMsg {
     pub serial: u32,
     #[serde(default)]
     pub edid: String,
+    /// See [`ClientMonitor::color`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<crate::messages::DisplayColorMsg>,
     #[serde(default)]
     pub safe_area_policy: SafeAreaPolicyMsg,
     #[serde(default)]
@@ -225,6 +228,7 @@ impl RequestedMonitorDescriptorMsg {
             model: self.model,
             serial: self.serial,
             edid: self.edid.clone(),
+            color: self.color,
         }
     }
 }
@@ -443,7 +447,7 @@ impl std::fmt::Display for MultiMonitorValidationError {
             Self::InvalidAppliedEncoderClass(id) => {
                 write!(
                     formatter,
-                    "applied monitor {id} media plan encoder_class must be hardware or software"
+                    "applied monitor {id} media plan encoder_class must be empty, hardware or software"
                 )
             }
             Self::InvalidAppliedCodec(id, codec) => {
@@ -579,7 +583,7 @@ fn validate_applied_monitor_descriptor(
     }
     if !matches!(
         monitor.media_plan.encoder_class.as_str(),
-        "hardware" | "software"
+        "" | "hardware" | "software"
     ) {
         return Err(MultiMonitorValidationError::InvalidAppliedEncoderClass(
             display_id.to_owned(),
@@ -2103,6 +2107,7 @@ mod tests {
                 model: 0xa05e,
                 serial: 0xfd626d62,
                 edid: String::new(),
+                color: None,
                 safe_area_policy: SafeAreaPolicyMsg::StandardFullscreen,
                 quality_intent: MonitorQualityIntentMsg::HostDefault,
             },
@@ -2126,6 +2131,7 @@ mod tests {
                 model: 0x3333,
                 serial: 0x4444,
                 edid: "base64-edid".to_string(),
+                color: None,
                 safe_area_policy: SafeAreaPolicyMsg::FullFrame,
                 quality_intent: MonitorQualityIntentMsg::FullColorRequired,
             },
@@ -2238,6 +2244,7 @@ mod tests {
         let mut monitors = sample_applied_monitors();
         monitors[0].media_plan.codec = "h265".to_string();
         monitors[0].media_plan.chroma = "yuv420".to_string();
+        monitors[0].media_plan.encoder_class = String::new();
         monitors[1].media_plan.codec = "h264".to_string();
         monitors[1].media_plan.chroma = "yuv420".to_string();
         let topology = AppliedMonitorTopologyMsg::new(
@@ -2256,6 +2263,7 @@ mod tests {
         let decoded: AppliedMonitorTopologyMsg =
             serde_json::from_value(json).expect("deserialize roster");
         assert_eq!(decoded.monitors()[0].media_plan.codec, "h265");
+        assert!(decoded.monitors()[0].media_plan.encoder_class.is_empty());
         assert_eq!(decoded.monitors()[0].media_plan.stream_epoch, 9);
         assert_eq!(decoded.monitors()[1].media_plan.codec, "h264");
         assert_eq!(decoded.monitors()[1].media_plan.stream_epoch, 10);

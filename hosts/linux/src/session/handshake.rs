@@ -176,6 +176,10 @@ pub fn build_server_hello(
         clipboard: Some(crate::clipboard::advertised_policy(cfg, session)),
         device_capabilities: Default::default(),
         negotiated_transport: None, // set from the active socket before transmission
+        // This host takes wheel notches only, and always serves a signed-in
+        // desktop: never a login window that sign-in replaces.
+        precise_scroll_v1: false,
+        login_window: false,
     }
     .with_build_identity(crate::build_identity())
 }

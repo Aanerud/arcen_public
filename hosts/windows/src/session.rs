@@ -153,7 +153,7 @@ impl std::fmt::Debug for BrokerAgentPermit {
 impl Drop for BrokerAgentPermit {
     fn drop(&mut self) {
         if let Some(lease) = self.admission.take() {
-            self.admission_runtime.complete(lease);
+            let _ = self.admission_runtime.complete(&lease);
         }
     }
 }
@@ -1222,6 +1222,7 @@ async fn run_correlated_broker(
             )
             .await
         } else {
+            let priority_audio = ws.priority_audio();
             relay_client_and_agent(
                 &mut ws,
                 &mut agent_ws,
@@ -1229,6 +1230,7 @@ async fn run_correlated_broker(
                 native_user_sid,
                 &mut agent_controls,
                 &mut session_shutdown,
+                priority_audio,
             )
             .await
         };
@@ -1828,6 +1830,10 @@ where
                         },
                         serial: requested.serial,
                         hdr10,
+                        color: requested
+                            .color
+                            .as_ref()
+                            .map(arcen_media::display_color::DisplayColor::from_msg),
                         primary: requested.is_primary,
                         preferred_output_index: None,
                     })
@@ -2003,6 +2009,7 @@ where
             product_id: request.product_id,
             serial: request.serial,
             hdr10: request.hdr10,
+            color: request.color,
             primary: true,
             preferred_output_index: match &cfg.output_selector {
                 crate::display::OutputSelector::Adapter { output_index, .. } => Some(*output_index),
@@ -3403,6 +3410,10 @@ fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, S
         monitor.model as u16
     };
     request.serial = monitor.serial;
+    request.color = monitor
+        .color
+        .as_ref()
+        .map(arcen_media::display_color::DisplayColor::from_msg);
     Ok(SessionDisplayPlan {
         monitors: vec![MonitorPlan {
             request,
@@ -3606,7 +3617,11 @@ fn resize_encoder_for(media_plan: &ResolvedMediaPlan) -> Option<crate::capenc::E
     match media_plan.backend {
         EncoderBackend::NativeNvenc => Some(crate::capenc::EncoderSelection::Nvenc),
         EncoderBackend::OpenH264 => Some(crate::capenc::EncoderSelection::SoftwareH264),
-        EncoderBackend::WindowsMediaFoundation | EncoderBackend::Rav1e => None,
+        // VideoToolbox is macOS and cannot be opened here; it is in the shared
+        // vocabulary because another Pier reports it.
+        EncoderBackend::WindowsMediaFoundation
+        | EncoderBackend::Rav1e
+        | EncoderBackend::VideoToolbox => None,
     }
 }
 
@@ -3924,6 +3939,10 @@ fn build_server_hello(
             ),
         ]),
         negotiated_transport: None, // set from the active socket before transmission
+        // This host takes wheel notches only, and always serves a signed-in
+        // desktop: never a login window that sign-in replaces.
+        precise_scroll_v1: false,
+        login_window: false,
     }
     .with_build_identity(windows_build_identity())
 }
@@ -7140,37 +7159,30 @@ fn frame_message(
     topology_generation: u64,
     stream_epoch: u64,
 ) -> Vec<u8> {
-    let codec = crate::capenc::protocol_codec(plan.video.codec);
-    let chroma = crate::capenc::protocol_chroma(plan.video.chroma);
-    let region = monitor_id != 0;
-    let frame_type = match codec {
-        VideoCodec::H264 if region => FrameType::RegionVideoH264,
-        VideoCodec::H265 if region => FrameType::RegionVideoH265,
-        VideoCodec::Av1 if region => FrameType::RegionVideoAv1,
-        VideoCodec::H264 => FrameType::VideoH264,
-        VideoCodec::H265 => FrameType::VideoH265,
-        VideoCodec::Av1 => FrameType::VideoAv1,
-        VideoCodec::Jpeg | VideoCodec::Vp9 => return Vec::new(),
+    // Frame type, colour translation and header layout live in
+    // `arcen_media::video`, beside the same decisions the other Piers make.
+    // Three hosts wrote this out separately against one decoder that has to
+    // accept all of them.
+    let Some(codec) = arcen_media::video::FramedVideoCodec::from_codec(plan.video.codec) else {
+        return Vec::new();
     };
-    let header = encode_video_header(VideoHeader {
-        frame_type,
-        codec,
-        chroma,
-        flags: VideoHeader::encode_flags(
-            frame.keyframe,
-            crate::capenc::protocol_bit_depth(plan.video.bit_depth),
-            crate::capenc::protocol_color_range(plan.video.range),
-            crate::capenc::protocol_color_matrix(plan.video.matrix),
-        ),
-        timestamp_ms: frame.timestamp_ms,
-        monitor_id,
-        topology_generation,
-        stream_epoch,
-    });
-    let mut message = Vec::with_capacity(header.len() + frame.data.len());
-    message.extend_from_slice(&header);
-    message.extend_from_slice(&frame.data);
-    message
+    arcen_media::video::video_frame_message(
+        arcen_media::video::VideoWireProfile {
+            codec,
+            chroma: plan.video.chroma,
+            bit_depth: plan.video.bit_depth,
+            range: plan.video.range,
+            matrix: plan.video.matrix,
+        },
+        arcen_media::video::VideoWireRoute {
+            monitor_id,
+            topology_generation,
+            stream_epoch,
+        },
+        frame.keyframe,
+        frame.timestamp_ms,
+        &frame.data,
+    )
 }
 
 struct AudioWireEncoder {
@@ -7954,6 +7966,7 @@ where
     .map_err(|_| "timed out waiting for text message".to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_client_and_agent<C, CE, A>(
     client: &mut C,
     agent: &mut WebSocketStream<A>,
@@ -7961,6 +7974,7 @@ async fn relay_client_and_agent<C, CE, A>(
     native_user_sid: String,
     controls: &mut watch::Receiver<AgentControl>,
     session_shutdown: &mut watch::Receiver<bool>,
+    priority_audio: Option<arcen_transport::quic::PriorityAudio>,
 ) -> Result<(), String>
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -7976,6 +7990,7 @@ where
         controls,
         None,
         session_shutdown,
+        priority_audio,
     )
     .await
     {
@@ -7987,6 +8002,32 @@ where
         }
     }
 }
+/// Sends one audio frame on the Deck's priority stream, logging when the
+/// stream opens and when it fails. Returns whether the frame went; a frame
+/// that did not goes on the session stream.
+async fn send_priority_audio(
+    priority: &mut arcen_transport::quic::PriorityAudio,
+    frame: &[u8],
+) -> bool {
+    let outcome = priority.send(frame).await;
+    match &outcome {
+        arcen_transport::quic::PriorityAudioSend::Opened => {
+            tracing::info!(target: SESSION, "audio moved to its own priority stream");
+        }
+        arcen_transport::quic::PriorityAudioSend::OpenFailed(error)
+        | arcen_transport::quic::PriorityAudioSend::WriteFailed(error) => {
+            tracing::warn!(
+                target: SESSION,
+                %error,
+                "audio priority stream unavailable; audio stays on the session stream"
+            );
+        }
+        arcen_transport::quic::PriorityAudioSend::Sent
+        | arcen_transport::quic::PriorityAudioSend::Unusable => {}
+    }
+    outcome.delivered()
+}
+
 enum RelayOutcome {
     ExplicitClose,
     BrokerShutdown,
@@ -8037,6 +8078,8 @@ where
     let mut reconnect = DirectReconnect::new(policy);
     let result = async {
         'session: loop {
+        // Per attachment: a resumed Deck arrives on a new connection.
+        let priority_audio = client.priority_audio();
         match relay_one_attachment(
             &mut client,
             agent,
@@ -8052,6 +8095,7 @@ where
                 },
             }),
             session_shutdown,
+            priority_audio,
         )
         .await
         {
@@ -8372,6 +8416,7 @@ where
     .map_err(|_| "session agent attachment control timed out".to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_one_attachment<C, CE, A>(
     client: &mut C,
     agent: &mut WebSocketStream<A>,
@@ -8380,6 +8425,10 @@ async fn relay_one_attachment<C, CE, A>(
     controls: &mut watch::Receiver<AgentControl>,
     mut resumable: Option<ResumableAttachment<'_>>,
     session_shutdown: &mut watch::Receiver<bool>,
+    // The Deck's audio priority stream, used once its `client_hello` opts in:
+    // audio then never queues behind video already accepted on the session
+    // stream. `None` keeps every frame on the session stream.
+    mut priority_audio: Option<arcen_transport::quic::PriorityAudio>,
 ) -> RelayOutcome
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -8391,6 +8440,7 @@ where
     session_monitor.tick().await;
     let mut refresh_interval: Option<tokio::time::Interval> = None;
     let mut agent_streaming = false;
+    let mut deck_accepts_priority_audio = false;
     let require_active_session = resumable.is_some();
     let write_timeout = resumable
         .as_ref()
@@ -8439,6 +8489,11 @@ where
                         return RelayOutcome::AgentFailure(
                             "client attempted to send reserved broker-agent control".to_string()
                         );
+                    }
+                    if arcen_protocol::messages::ClientHelloMsg::text_accepts_audio_priority_stream(
+                        text.as_ref(),
+                    ) {
+                        deck_accepts_priority_audio = priority_audio.is_some();
                     }
                     if send_ws_with_timeout(agent, Message::Text(text), write_timeout).await.is_err() {
                         return RelayOutcome::AgentFailure("session agent IPC send failed".to_string());
@@ -8522,6 +8577,13 @@ where
                     }
                 }
                 Some(Ok(Message::Binary(bytes))) => {
+                    if deck_accepts_priority_audio && arcen_protocol::wire::is_audio_frame(&bytes) {
+                        if let Some(priority) = priority_audio.as_mut().filter(|priority| priority.usable()) {
+                            if send_priority_audio(priority, &bytes).await {
+                                continue;
+                            }
+                        }
+                    }
                     if send_ws_with_timeout(client, Message::Binary(bytes), write_timeout).await.is_err() {
                         return RelayOutcome::UnexpectedLoss("client_transport");
                     }

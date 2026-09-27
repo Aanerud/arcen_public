@@ -12,11 +12,15 @@ __pycache__/
 refference/
 # Built macOS client bundle (regenerate: packaging/macos/build-deck-app.sh)
 Arcen Deck.app/
+Arcen Pier.app/
+Arcen Agent Helper.app/
 .gstack/
 # Local key material. Never commit.
 /keys/
 # Provisioning profiles contain sensitive team credentials — store outside git or in AppleCerts/
-clients/macos/*.provisionprofile
+# The rule is deliberately unanchored: the Pier has its own profile now, and a
+# path-specific pattern only protects the one directory someone thought of.
+*.provisionprofile
 
 # Release artefacts assembled by hand; binaries are never committed.
 dist/*

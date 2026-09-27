@@ -78,18 +78,18 @@ pub enum AudioUserMode {
 
 pub use arcen_media::video::ColorPolicy;
 
-fn xorg_capture_contract(
-    mut video: arcen_media::VideoConfiguration,
-) -> arcen_media::VideoConfiguration {
-    if matches!(
-        video.transfer,
-        arcen_media::TransferCharacteristics::Pq | arcen_media::TransferCharacteristics::Hlg
-    ) {
-        video.matrix = arcen_media::ColorMatrix::Bt709;
-        video.primaries = arcen_media::ColorPrimaries::Bt709;
-        video.transfer = arcen_media::TransferCharacteristics::Bt709;
-    }
-    video
+/// Lab lever, default off: the named pipe a colour-managed compositor
+/// capture helper writes PQ / BT.2020 ten-bit frames into.
+///
+/// When set, an HDR request is served from that pipe instead of being
+/// resolved to Grading, so the headless Wayland HDR spike reaches a real
+/// Deck. The pipe carries the lab's headless session, not the user's Xorg
+/// desktop, and input still goes to Xorg: it measures the future Wayland
+/// provider's video path and is not a product path.
+pub(crate) fn experimental_rgb10_pipe() -> Option<std::path::PathBuf> {
+    std::env::var_os("ARCEN_EXPERIMENTAL_RGB10_PIPE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Resolved host configuration.
@@ -146,6 +146,11 @@ pub struct Config {
     ///
     /// See `docs/architecture/qp-maps.md` for how to benchmark it.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    /// `video.desktop_encoding`: what the Xorg desktop's code values mean.
+    /// Xorg cannot say, so only the operator can; `rec2100-pq` lets an HDR
+    /// request keep PQ / BT.2020 (a colour-managed application such as Flame
+    /// in HDR UI mode writes PQ into the desktop). Default `sdr`.
+    pub desktop_encoding: arcen_media::video::DesktopSignalEncoding,
     /// An explicit `video.variant` is an operator pin and cannot be replaced by
     /// a client's adaptive request.
     pub variant_pinned: bool,
@@ -375,7 +380,24 @@ impl Config {
         )
         .map_err(|error| format!("initial video request: {error}"))?;
         self.auth_video_request = Some(request.clone());
-        let video = xorg_capture_contract(resolved.video);
+        // The lab pipe carries compositor-tagged PQ, so it vouches for itself.
+        let desktop = if experimental_rgb10_pipe().is_some() {
+            arcen_media::video::DesktopSignalEncoding::Rec2100Pq
+        } else {
+            self.desktop_encoding
+        };
+        let video = arcen_media::video::constrain_to_desktop_encoding(resolved.video, desktop);
+        if !desktop.sdr_sessions_are_faithful()
+            && video.transfer != arcen_media::TransferCharacteristics::Pq
+        {
+            tracing::warn!(
+                target: crate::logging::target::MEDIA,
+                desktop_encoding = desktop.token(),
+                transfer = video.transfer.token(),
+                "the desktop carries Rec.2100 PQ code values but this session is SDR; \
+                 the Deck will see them as SDR, as an SDR monitor would"
+            );
+        }
         self.fps = resolved.max_fps;
         self.codec = video.codec.token().to_string();
         self.chroma = video.chroma.token().to_string();
@@ -429,6 +451,7 @@ impl Default for Config {
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::default(),
             variant_pinned: false,
             auth_video_request: None,
             fps: 60,
@@ -1162,6 +1185,18 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
                 format!("Pier config video.qp_map {value:?}: expected one of {known}")
             })?;
     }
+    if let Some(value) = file.video.desktop_encoding {
+        cfg.desktop_encoding =
+            arcen_media::video::DesktopSignalEncoding::from_token(&value.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    let known = arcen_media::video::DesktopSignalEncoding::ALL
+                        .iter()
+                        .map(|encoding| encoding.token())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("Pier config video.desktop_encoding {value:?}: expected one of {known}")
+                })?;
+    }
     if let Some(value) = file.video.variant {
         apply_variant(cfg, &value)
             .map_err(|error| format!("Pier config video.variant: {error}"))?;
@@ -1755,6 +1790,104 @@ mod tests {
             "pq",
             "the original request stays available for degradation telemetry"
         );
+    }
+
+    #[test]
+    fn declared_pq_desktop_keeps_an_hdr_request_and_tells_capenc() {
+        let mut hdr = initial_video(
+            VideoSelectionIntent::ColorFidelity,
+            "h265",
+            "yuv444",
+            "10",
+            "full",
+        );
+        hdr.quality.color_matrix = "bt2020ncl".to_string();
+        hdr.quality.color_primaries = "bt2020".to_string();
+        hdr.quality.transfer = "pq".to_string();
+        let mut config = Config {
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            color_matrix: arcen_media::ColorMatrix::Bt2020Ncl,
+            chroma: "yuv444".to_string(),
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Rec2100Pq,
+            ..Config::default()
+        };
+        config.apply_initial_video_request(&hdr).unwrap();
+        assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Pq);
+        assert_eq!(config.color_primaries, arcen_media::ColorPrimaries::Bt2020);
+        assert_eq!(config.color_matrix, arcen_media::ColorMatrix::Bt2020Ncl);
+        let argv = config
+            .capenc_config(
+                PathBuf::from("arcen-pier"),
+                None,
+                arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+                arcen_protocol::messages::CursorMode::Local,
+            )
+            .argv();
+        assert!(argv.iter().any(|arg| arg == "transfer=pq"), "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == "desktop-encoding=rec2100-pq"),
+            "{argv:?}"
+        );
+
+        let mut grading = initial_video(
+            VideoSelectionIntent::ColorFidelity,
+            "h265",
+            "yuv444",
+            "10",
+            "full",
+        );
+        grading.quality.color_matrix = "bt709".to_string();
+        let mut sdr = Config {
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            chroma: "yuv444".to_string(),
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Rec2100Pq,
+            ..Config::default()
+        };
+        sdr.apply_initial_video_request(&grading).unwrap();
+        assert_eq!(sdr.transfer, arcen_media::TransferCharacteristics::Bt709);
+        let argv = sdr
+            .capenc_config(
+                PathBuf::from("arcen-pier"),
+                None,
+                arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+                arcen_protocol::messages::CursorMode::Local,
+            )
+            .argv();
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("desktop-encoding=")),
+            "an SDR session never carries the declaration: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn desktop_encoding_is_read_from_the_pier_file_and_unknown_tokens_fail() {
+        let file_with = |token: &str| -> crate::config::PierFileConfig {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "video":{{"desktop_encoding":"{token}"}},
+                    "platform": {{}}
+                }}"#
+            ))
+            .expect("config")
+        };
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.desktop_encoding,
+            arcen_media::video::DesktopSignalEncoding::Sdr
+        );
+        apply_file_config(&mut cfg, file_with("rec2100-pq")).expect("apply file config");
+        assert_eq!(
+            cfg.desktop_encoding,
+            arcen_media::video::DesktopSignalEncoding::Rec2100Pq
+        );
+
+        let error = apply_file_config(&mut Config::default(), file_with("hdr"))
+            .expect_err("unknown token must fail");
+        assert!(error.contains("video.desktop_encoding"), "{error}");
     }
 
     #[test]

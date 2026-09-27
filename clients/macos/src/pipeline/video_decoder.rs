@@ -639,6 +639,78 @@ fn nals_to_avcc(nals: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Reports what an HEVC stream's SPS says it carries, as it arrives.
+///
+/// The hello says what the host meant to send; this says what came. The Pier
+/// logs the same reading of the same bytes as it encodes them, so the two
+/// ends can be compared line for line.
+fn log_received_stream_truth(sps: &[u8]) {
+    match arcen_media::hevc_sps::parse_sps(sps) {
+        Ok(truth) => {
+            let colour = truth.colour;
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                summary = %truth.summary(),
+                chroma_format_idc = truth.chroma_format_idc,
+                bit_depth = truth.bit_depth_luma,
+                primaries = colour.map(|colour| colour.primaries),
+                transfer = colour.map(|colour| colour.transfer),
+                matrix = colour.map(|colour| colour.matrix),
+                full_range = colour.map(|colour| colour.full_range),
+                "received stream truth",
+            );
+        }
+        Err(error) => tracing::warn!(
+            target: crate::logging::target::SESSION,
+            %error,
+            "received an HEVC SPS this Deck could not read"
+        ),
+    }
+}
+
+/// Compares what an HEVC stream's SPS carries with what its frame header
+/// claims, and says so when they differ.
+///
+/// The header is the host's claim; the SPS is what the decoder obeys. They
+/// disagreed for every Grading session a macOS host once served — header
+/// 4:4:4 10-bit, bitstream Main 4:2:0 8-bit — and nothing noticed, because
+/// this decoder converts whatever arrives into the format it was asked for.
+fn warn_when_the_stream_contradicts_its_header(stream: VideoStreamKey, sps: &[u8]) {
+    if let Some(truth) = stream_contradicting_header(stream, sps) {
+        tracing::warn!(
+            target: crate::logging::target::VIDEO,
+            stream = %truth.summary(),
+            header_chroma = ?stream.chroma,
+            header_bit_depth = ?stream.bit_depth,
+            header_full_range = stream.full_range,
+            "the stream is not what its header says; the host is sending less than it claims"
+        );
+    }
+}
+
+/// The SPS reading when it contradicts the header's chroma, depth or range.
+fn stream_contradicting_header(
+    stream: VideoStreamKey,
+    sps: &[u8],
+) -> Option<arcen_media::hevc_sps::HevcStreamTruth> {
+    let truth = arcen_media::hevc_sps::parse_sps(sps).ok()?;
+    let chroma_idc = match stream.chroma {
+        ChromaSubsampling::Yuv420 => 1,
+        ChromaSubsampling::Yuv422 => 2,
+        ChromaSubsampling::Yuv444 => 3,
+    };
+    let depth = match stream.bit_depth {
+        wire::BitDepth::Eight => 8,
+        wire::BitDepth::Ten => 10,
+        wire::BitDepth::Twelve => 12,
+    };
+    let range_matches = truth
+        .colour
+        .is_none_or(|colour| colour.full_range == stream.full_range);
+    (truth.chroma_format_idc != chroma_idc || truth.bit_depth_luma != depth || !range_matches)
+        .then_some(truth)
+}
+
 #[derive(Debug, Default)]
 struct ParameterSetCache {
     codec: Option<AnnexBCodec>,
@@ -696,6 +768,9 @@ impl ParameterSetCache {
         }
         if let Some(sps) = incoming_sps {
             if self.sps.as_deref() != Some(sps) {
+                if codec == AnnexBCodec::H265 {
+                    log_received_stream_truth(sps);
+                }
                 self.sps = Some(sps.to_vec());
                 changed = true;
             }
@@ -1933,6 +2008,12 @@ mod platform {
                 VideoDecodeError::Backend(error)
             })?;
             let format_changed = self.parameter_sets.observe(annex_b_codec, &nals);
+            if format_changed && annex_b_codec == AnnexBCodec::H265 {
+                if let (Some(stream), Some(sps)) = (self.stream, self.parameter_sets.sps.as_deref())
+                {
+                    super::warn_when_the_stream_contradicts_its_header(stream, sps);
+                }
+            }
             if format_changed {
                 self.format = None;
                 self.session = None;
@@ -4148,6 +4229,29 @@ mod tests {
     }
 
     // ---- w3-real-caps: synthetic parameter-set builders ----
+
+    #[test]
+    fn a_stream_that_is_less_than_its_header_is_caught() {
+        let grading_header = VideoStreamKey {
+            codec: StreamCodec::H265,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: wire::BitDepth::Ten,
+            full_range: false,
+            matrix: wire::ColorMatrix::Bt709,
+        };
+        // What every macOS Grading session once was: a 4:4:4 10-bit header
+        // over a Main 4:2:0 8-bit bitstream.
+        let main = build_hevc_sps(HevcProbeProfile {
+            chroma_format_idc: 1,
+            bit_depth: 8,
+        });
+        assert!(stream_contradicting_header(grading_header, &main).is_some());
+        let rext = build_hevc_sps(HevcProbeProfile {
+            chroma_format_idc: 3,
+            bit_depth: 10,
+        });
+        assert!(stream_contradicting_header(grading_header, &rext).is_none());
+    }
 
     #[test]
     fn hevc_nal_headers_match_the_canonical_two_byte_prefixes() {

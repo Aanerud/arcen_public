@@ -12,15 +12,20 @@ use std::fmt::{Display, Formatter};
 pub use arcen_keel::{
     ActivityClass, ActivityDiagnostics, ActivityHint, CadenceRecommendation, DirtyRatio,
 };
+pub mod annexb;
 mod applied_topology;
 pub mod audio;
 pub mod clipboard;
+pub mod display_color;
 mod encoder_admission;
+pub mod hevc_sps;
 mod multi_monitor;
+pub mod rate_control;
 mod region;
 mod region_activity;
 mod region_frame;
 mod region_schedule;
+pub mod session_plan;
 pub mod test_pattern;
 mod topology_placement;
 pub mod video;
@@ -1020,6 +1025,9 @@ pub struct Monitor {
     /// Physical height in millimetres, or zero when unknown.
     #[serde(default)]
     pub height_mm: f32,
+    /// What the display can show: gamut and HDR. `None` when not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<arcen_protocol::messages::DisplayColorMsg>,
 }
 
 /// A validated endpoint monitor roster.
@@ -1452,6 +1460,7 @@ mod tests {
             primary,
             width_mm: 0.0,
             height_mm: 0.0,
+            color: None,
         }
     }
 

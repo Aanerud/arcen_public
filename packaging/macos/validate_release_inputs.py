@@ -15,6 +15,13 @@ TEAM_ID = "NWR7ZH8L7U"
 BUNDLE_ID = "deck.arcen.tech"
 APPLICATION_ID = f"{TEAM_ID}.{BUNDLE_ID}"
 
+# The Deck and the Pier are separate products with separate App IDs, and each
+# has its own profile authorizing its own entitlements. The checks below are
+# identical for both, so the product is a parameter rather than a second copy
+# of this file; `BUNDLE_ID` remains the default so existing Deck callers and
+# their fixtures are unaffected.
+PIER_BUNDLE_ID = "pier.arcen.tech"
+
 
 class ValidationError(ValueError):
     pass
@@ -71,6 +78,7 @@ def validate_profile(
     *,
     now: dt.datetime | None = None,
     profile_class: str = "release",
+    application_id: str = APPLICATION_ID,
 ) -> None:
     if profile_class not in _PROFILE_CLASSES:
         raise ValidationError(f"unknown profile class {profile_class!r}")
@@ -91,7 +99,7 @@ def validate_profile(
     allowed = profile.get("Entitlements")
     if not isinstance(allowed, dict):
         raise ValidationError("provisioning profile has no entitlement dictionary")
-    if allowed.get("com.apple.application-identifier") != APPLICATION_ID:
+    if allowed.get("com.apple.application-identifier") != application_id:
         raise ValidationError("provisioning profile application identifier does not match")
     if allowed.get("com.apple.developer.team-identifier") != TEAM_ID:
         raise ValidationError("provisioning profile entitlement team does not match")
@@ -187,12 +195,23 @@ def main() -> int:
             "unnotarized builds"
         ),
     )
+    parser.add_argument(
+        "--bundle-id",
+        choices=(BUNDLE_ID, PIER_BUNDLE_ID),
+        default=BUNDLE_ID,
+        help=(
+            "product whose App ID the profile must match: "
+            f"'{BUNDLE_ID}' for the Deck (default) or '{PIER_BUNDLE_ID}' "
+            "for the Pier"
+        ),
+    )
     args = parser.parse_args()
 
     validate_profile(
         load_plist(args.profile),
         load_plist(args.entitlements),
         profile_class=args.profile_class,
+        application_id=f"{TEAM_ID}.{args.bundle_id}",
     )
     if args.signature:
         validate_signature(

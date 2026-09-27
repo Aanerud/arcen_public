@@ -1,0 +1,61 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18444
+  },
+  "tls": {
+    "mode": "pem",
+    "cert": "/Library/Application Support/Arcen/tls/host.crt",
+    "key": "/Library/Application Support/Arcen/tls/host.key",
+    "minimum_version": "TLS1.3",
+    "disabled_cipher_suites": [],
+    "expiry_warning_days": 30,
+    "expected_sans": []
+  },
+  "capture": {},
+  "video": {
+    "bit_depth": "8",
+    "color_range": "limited",
+    "color_matrix": "bt709",
+    "color_policy": "default-off",
+    "fps": 60,
+    "encoder": "auto"
+  },
+  "audio": {
+    "enabled": true,
+    "compressed": false,
+    "local_playback": "muted"
+  },
+  "microphone_input": {
+    "enabled": false
+  },
+  "clipboard": {
+    "direction": "both",
+    "content": "all",
+    "max_bytes": 8388608
+  },
+  "auth": {
+    "disclaimer": {
+      "enabled": false,
+      "locale": "en_US",
+      "directory": "/Library/Application Support/Arcen/disclaimers"
+    },
+    "reconnect_window_secs": 180
+  },
+  "redirection": {
+    "timezone": false
+  },
+  "logging": {
+    "level": 0,
+    "retention_days": 30
+  },
+  "platform": {
+    "privileged_broker_enabled": false,
+    "native_login_enabled": false,
+    "virtual_display_enabled": false,
+    "input_backend": "auto",
+    "multi_monitor": {
+      "advertise_enabled": false
+    }
+  }
+}

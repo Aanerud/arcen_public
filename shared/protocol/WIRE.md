@@ -416,6 +416,18 @@ described below — it is never a "non-sensitive facts only" channel.
 (+ `color_caps`), `health_pong`, `health_stats`, `mouse_move`, `mouse_move_relative`, `mouse_button`,
 `key_event`, `broker_machine_request`.
 
+### Display colour (additive)
+
+`ClientMonitor.color` and `RequestedMonitorDescriptorMsg.color` optionally carry
+a `DisplayColorMsg` for each client display: `gamut` (`srgb`, `display_p3`,
+`bt2020`), `hdr_headroom` (how far above SDR white the display reaches, `1.0`
+SDR, `0.0` unknown), and `peak_nits`, `max_frame_average_nits` and `min_nits`
+only when the client's OS states them. Absent from older clients; hosts that
+predate it ignore it. Hosts interpret it only through
+`arcen_media::display_color` (stated luminance first, otherwise headroom × 100
+nits) and turn it into EDID bytes only through `arcen_outputs::edid`, so every
+host describes the same display the same way.
+
 ### Tablet mode split (additive, reconnect-scoped)
 
 - `ClientHelloMsg` adds:

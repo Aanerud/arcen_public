@@ -192,6 +192,40 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
     config
 }
 
+/// Smallest send window [`interactive_send_window`] returns.
+///
+/// Measured, in both directions, on a 34 ms WAN path under full-screen motion:
+/// 256 KiB kept 26 fps with frame age p95 under a second; 64 KiB left the
+/// sender application-limited, the congestion window never grew, and the
+/// stream fell to 2 fps with frames 10–24 s old.
+pub const ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW: u64 = 256 * 1024;
+/// Largest send window [`interactive_send_window`] returns.
+pub const ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// A send window that keeps interactive media from queueing inside QUIC.
+///
+/// The connection send window bounds bytes accepted from the application and
+/// not yet acknowledged — in flight *plus* waiting behind the congestion
+/// window. At the default 16 MiB, and with a 1 MiB stream window, a sender on
+/// a 4 Mbit/s path could accept two seconds of video the network could not
+/// carry. The application saw every write complete at once and could neither
+/// prioritise audio nor drop a stale picture: measured on a WAN session,
+/// frames arrived 2.2 s late with a 36 ms RTT, and 13 s late under motion.
+///
+/// Sized from the live congestion window instead: what the path can hold in
+/// flight, plus half again as headroom so the pipe never idles between
+/// writes. Anything beyond that waits in the application, where the host
+/// decides what is worth sending. Pure, so every host applies the same rule.
+#[must_use]
+pub fn interactive_send_window(congestion_window: u64) -> u64 {
+    congestion_window
+        .saturating_add(congestion_window / 2)
+        .clamp(
+            ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
+            ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW,
+        )
+}
+
 /// Wraps a `quinn::TransportConfig` for callers that want the recommended
 /// defaults as an `Arc` ready for `ServerConfig::transport_config`/
 /// `ClientConfig::transport_config`.
@@ -247,4 +281,29 @@ pub fn apply_direct_server_limits(config: &mut quinn::ServerConfig) {
 /// Compatibility alias for the refusal-only migration scaffold.
 pub fn apply_migration_stub_server_limits(config: &mut quinn::ServerConfig) {
     apply_direct_server_limits(config);
+}
+
+#[cfg(test)]
+mod interactive_window_tests {
+    use super::{
+        ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW, ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
+        interactive_send_window,
+    };
+
+    #[test]
+    fn the_interactive_window_follows_the_path_within_bounds() {
+        assert_eq!(
+            interactive_send_window(0),
+            ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW
+        );
+        assert_eq!(
+            interactive_send_window(12_000),
+            ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW
+        );
+        assert_eq!(interactive_send_window(1_000_000), 1_500_000);
+        assert_eq!(
+            interactive_send_window(u64::MAX),
+            ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW
+        );
+    }
 }

@@ -580,6 +580,36 @@ impl DeckRegionRuntime {
         })
     }
 
+    /// Emits a continuous scroll whose deltas are already in wire units — the
+    /// same fixed point [`Self::pointer_scroll`] produces from whole ticks,
+    /// but carrying a trackpad's fractional travel instead of rounding it to
+    /// notches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::pointer_scroll`].
+    pub fn pointer_scroll_units(
+        &mut self,
+        viewport: RegionViewport,
+        local_fraction: (f64, f64),
+        delta_x_units: i64,
+        delta_y_units: i64,
+        sequence: &mut u64,
+        timestamp_ns: u64,
+    ) -> Result<Vec<RegionInputWireMessage>, DeckRegionRuntimeError> {
+        let bound = |delta: i64| {
+            i32::try_from(delta)
+                .map(i64::from)
+                .map_err(|_| DeckRegionRuntimeError::ScrollDeltaOverflow(delta))
+        };
+        let delta_x = bound(delta_x_units)?;
+        let delta_y = bound(delta_y_units)?;
+        let position = self.logical_position(viewport, local_fraction)?;
+        self.emit(sequence, |emitter, regions| {
+            emitter.pointer_scroll(regions, position, delta_x, delta_y, timestamp_ns)
+        })
+    }
+
     /// Emits one Wacom pen sample through its authoritative region.
     ///
     /// The tablet pipeline already allocated this sample's sequence from the
@@ -891,6 +921,7 @@ mod tests {
                 primary,
                 width_mm: 0.0,
                 height_mm: 0.0,
+                color: None,
             },
             logical_width,
             logical_height,
@@ -1455,6 +1486,7 @@ mod tests {
                 primary: true,
                 width_mm: 0.0,
                 height_mm: 0.0,
+                color: None,
             },
             1080,
             1920,

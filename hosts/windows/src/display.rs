@@ -64,6 +64,10 @@ pub struct DisplayRequest {
     /// carries information only where DWM composited wide. Without this the
     /// whole HDR path runs correctly over an 8-bit desktop.
     pub hdr10: bool,
+    /// What the Deck display this stands for can show. Its gamut and HDR
+    /// luminance go into the EDID, through the shared rule, instead of a
+    /// fixed grade. `None` from a Deck that does not report it.
+    pub color: Option<arcen_media::display_color::DisplayColor>,
 }
 
 impl DisplayRequest {
@@ -81,6 +85,7 @@ impl DisplayRequest {
             // Color for nothing, and change how every ordinary desktop is
             // composited.
             hdr10: false,
+            color: None,
         })
     }
 }
@@ -1917,6 +1922,7 @@ impl NativeBackend {
             scale: self.request.scale,
             product_id: self.request.product_id,
             serial: self.request.serial,
+            color: self.request.color,
         };
         if self.request.hdr10 {
             Ok(crate::edid::generate_hdr10(request)?.to_vec())
@@ -2903,6 +2909,7 @@ mod windows_backend {
                     scale: super::edid_scale_ratio(monitor.scale).unwrap_or(1.0),
                     product_id: u16::try_from(monitor.target_id).unwrap_or(0),
                     serial: monitor.target_id,
+                    color: None,
                 })
                 .map_err(|error| {
                     format!("generate exact EDID for {}: {error}", monitor.device_name)
@@ -7838,6 +7845,7 @@ mod tests {
                 product_id: 0x0001,
                 serial: index,
                 hdr10: false,
+                color: None,
                 primary: index == 0,
                 preferred_output_index: None,
             })
@@ -7883,6 +7891,7 @@ mod tests {
                             primary: index == 0,
                             width_mm: 0.0,
                             height_mm: 0.0,
+                            color: None,
                         },
                         1280,
                         720,

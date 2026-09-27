@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "use arcen_pier_macos::blocking so a timed-out future cannot leave a native call unsupervised" },
+]

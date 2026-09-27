@@ -372,6 +372,56 @@ pub fn log(msg: &str) {
     );
 }
 
+/// Logs what an HEVC stream's SPS says it carries, whenever that changes.
+///
+/// The plan says what was asked for; the SPS is what the Deck's decoder
+/// obeys. The Deck logs "received stream truth" from the same bytes, so the
+/// two ends compare line for line, as they do for the macOS Pier.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct StreamTruthLog {
+    hevc: bool,
+    last: Option<arcen_media::hevc_sps::HevcStreamTruth>,
+}
+
+/// Parameter sets lead an access unit; an SPS never needs more than this.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PARAMETER_SET_WINDOW: usize = 1024;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl StreamTruthLog {
+    pub(crate) fn new(codec: &str) -> Self {
+        Self {
+            hevc: arcen_media::VideoCodec::from_token(codec) == Some(arcen_media::VideoCodec::H265),
+            last: None,
+        }
+    }
+
+    /// Reads the SPS at the head of `access_unit`, if it carries one, and
+    /// returns it when it differs from the last one seen.
+    pub(crate) fn observe(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Option<arcen_media::hevc_sps::HevcStreamTruth> {
+        if !self.hevc {
+            return None;
+        }
+        let head = &access_unit[..access_unit.len().min(PARAMETER_SET_WINDOW)];
+        let truth = arcen_media::hevc_sps::stream_truth_in_access_unit(head).ok()?;
+        if self.last == Some(truth) {
+            return None;
+        }
+        self.last = Some(truth);
+        log(&format!(
+            "encoded stream truth: {} profile_idc={} chroma_format_idc={} bit_depth={}",
+            truth.summary(),
+            truth.profile_idc,
+            truth.chroma_format_idc,
+            truth.bit_depth_luma,
+        ));
+        Some(truth)
+    }
+}
+
 /// The colour half of a capenc request, separate from codec and geometry.
 ///
 /// Bundled rather than passed as five more positional arguments because the
@@ -633,6 +683,16 @@ pub(crate) fn resolved_media_plan(
         EncoderBackend::WindowsMediaFoundation => EncoderRequest::WindowsMediaFoundation,
         EncoderBackend::OpenH264 => EncoderRequest::SoftwareH264,
         EncoderBackend::Rav1e => EncoderRequest::SoftwareAv1,
+        // VideoToolbox exists in the shared vocabulary because the macOS Pier
+        // reports it. This helper runs on Linux and Windows, where no such
+        // encoder can be opened, so a READY naming it is a host describing a
+        // backend this machine cannot have rather than a codec question.
+        EncoderBackend::VideoToolbox => {
+            return Err(format!(
+                "unsupported READY encoder backend {:?} on this platform",
+                backend.ready_token()
+            ));
+        }
     };
     let contract = backend.contract();
     let request = MediaRequest {
@@ -909,6 +969,48 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SPS NVENC wrote for a 640x360 HEVC 4:4:4 10-bit full-range BT.709
+    /// self-test on the Linux lab's V100 (ffprobe: Rext, yuv444p10le, pc).
+    const NVENC_REXT_444_10_SPS: &str = "4201010408000003009c0800000300005a9000a040303e196cb5a5212c97180b7010101040000003004000000f02";
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn stream_truth_reads_an_nvenc_keyframe_once_and_ignores_other_codecs() {
+        let mut access_unit = vec![0, 0, 0, 1, 0x46, 0x01, 0x10];
+        access_unit.extend_from_slice(&[0, 0, 0, 1]);
+        access_unit.extend_from_slice(&hex(NVENC_REXT_444_10_SPS));
+        access_unit.extend_from_slice(&[0, 0, 0, 1, 0x26, 0x01, 0xaf]);
+        access_unit.extend(std::iter::repeat_n(0x55, 4096));
+
+        let mut hevc = StreamTruthLog::new("h265");
+        let truth = hevc.observe(&access_unit).expect("the keyframe's SPS");
+        assert_eq!(
+            (
+                truth.profile_idc,
+                truth.chroma_format_idc,
+                truth.bit_depth_luma
+            ),
+            (4, 3, 10)
+        );
+        assert!(truth
+            .summary()
+            .starts_with("rext 4:4:4 10-bit bt709/bt709/bt709 full"));
+        assert_eq!(
+            hevc.observe(&access_unit),
+            None,
+            "logged once, not per frame"
+        );
+        assert_eq!(hevc.observe(&[0, 0, 0, 1, 0x02, 0x01, 0xd0]), None);
+
+        assert_eq!(StreamTruthLog::new("h264").observe(&access_unit), None);
+    }
 
     #[test]
     fn raw_output_remains_backward_compatible_default() {

@@ -1,14 +1,14 @@
 //! Dedicated-Xorg clipboard policy, bounded relay state, and user-agent supervision.
 
 use arcen_media::clipboard::{
-    ClipboardContent, ClipboardDirection, ClipboardFlow, ClipboardKind, ClipboardPolicy,
-    HARD_MAX_CLIPBOARD_BYTES,
+    ClipboardDirection, ClipboardFlow, ClipboardKind, ClipboardPolicy, HARD_MAX_CLIPBOARD_BYTES,
 };
+use arcen_protocol::clipboard::{ClipboardCursor, ClipboardTransfer, ClipboardWireMessage};
 use arcen_protocol::messages::{
-    ClientHelloMsg, ClipboardContentKind, ClipboardContentMsg, ClipboardDataMsg,
-    ClipboardDirectionMsg, ClipboardPolicyMsg, CLIPBOARD_PROTOCOL_VERSION,
+    ClientHelloMsg, ClipboardContentKind, ClipboardDataMsg, ClipboardPolicyMsg,
+    CLIPBOARD_PROTOCOL_VERSION,
 };
-use arcen_protocol::{encode_clipboard_chunk, ClipboardChunkHeader, CHUNK_BYTES};
+use arcen_protocol::CHUNK_BYTES;
 use arcen_telemetry::CorrelationId;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -54,25 +54,11 @@ pub fn advertised_policy(cfg: &Config, session: Option<&SessionMetadata>) -> Cli
     policy_message(policy)
 }
 
-#[must_use]
-pub fn policy_message(policy: ClipboardPolicy) -> ClipboardPolicyMsg {
-    ClipboardPolicyMsg {
-        protocol_version: CLIPBOARD_PROTOCOL_VERSION,
-        direction: match policy.direction {
-            ClipboardDirection::Both => ClipboardDirectionMsg::Both,
-            ClipboardDirection::ClientToHost => ClipboardDirectionMsg::ClientToHost,
-            ClipboardDirection::HostToClient => ClipboardDirectionMsg::HostToClient,
-            ClipboardDirection::Disabled => ClipboardDirectionMsg::Disabled,
-        },
-        content: match policy.content {
-            ClipboardContent::All => ClipboardContentMsg::All,
-            ClipboardContent::Text => ClipboardContentMsg::Text,
-            ClipboardContent::Image => ClipboardContentMsg::Image,
-        },
-        max_bytes: u32::try_from(policy.max_bytes)
-            .expect("validated clipboard policy always fits u32"),
-    }
-}
+/// Renders a policy as the wire message that advertises it.
+///
+/// The translation itself lives in `arcen_media`, so every Pier advertises the
+/// same policy for the same configuration.
+pub use arcen_media::clipboard::policy_message;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClipboardNegotiation {
@@ -170,6 +156,22 @@ impl ClipboardItem {
         self.bytes.zeroize();
         self.bytes.clear();
     }
+
+    /// Converts this item into the shared transfer that knows how to send it.
+    ///
+    /// Takes the bytes rather than copying them so the payload exists once:
+    /// the shared transfer scrubs it on drop exactly as this item does, and a
+    /// second copy would be one this host could not scrub.
+    ///
+    /// Returns `None` only for a payload the wire cannot describe, which
+    /// [`Self::new`] has already ruled out.
+    fn into_transfer(mut self) -> Option<ClipboardTransfer> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let truncated = self.truncated;
+        ClipboardTransfer::new(self.sequence, self.kind, bytes)
+            .ok()
+            .map(|transfer| transfer.with_truncated(truncated))
+    }
 }
 
 impl Debug for ClipboardItem {
@@ -190,50 +192,20 @@ impl Drop for ClipboardItem {
     }
 }
 
-struct Transfer {
-    item: ClipboardItem,
-    offer_sent: bool,
-    offset: usize,
-}
+/// One clipboard transfer in flight, as a cursor over its wire messages.
+///
+/// The ordering, the chunk boundary and the offset arithmetic live in
+/// [`ClipboardCursor`], beside the reassembly that has to accept them. This
+/// host only decides how the two message kinds reach its socket.
+type Transfer = ClipboardCursor;
 
-impl Transfer {
-    fn next_message(&mut self) -> Result<Message, String> {
-        if !self.offer_sent {
-            self.offer_sent = true;
-            let offer = ClipboardDataMsg::new(
-                self.item.sequence,
-                self.item.kind,
-                u32::try_from(self.item.bytes.len())
-                    .map_err(|_| "clipboard payload size exceeds u32".to_string())?,
-                self.item.truncated,
-            );
-            return serde_json::to_string(&offer)
-                .map(|text| Message::Text(text.into()))
-                .map_err(|error| format!("serialize clipboard offer: {error}"));
-        }
-        let end = self
-            .offset
-            .checked_add(CHUNK_BYTES)
-            .unwrap_or(self.item.bytes.len())
-            .min(self.item.bytes.len());
-        let frame = encode_clipboard_chunk(
-            ClipboardChunkHeader {
-                kind: self.item.kind,
-                sequence: self.item.sequence,
-                total_size: u32::try_from(self.item.bytes.len())
-                    .map_err(|_| "clipboard payload size exceeds u32".to_string())?,
-                offset: u32::try_from(self.offset)
-                    .map_err(|_| "clipboard offset exceeds u32".to_string())?,
-            },
-            &self.item.bytes[self.offset..end],
-        )
-        .map_err(|error| format!("encode clipboard frame: {error:?}"))?;
-        self.offset = end;
-        Ok(Message::Binary(frame.into()))
-    }
-
-    const fn finished(&self) -> bool {
-        self.offer_sent && self.offset == self.item.bytes.len()
+/// Maps one shared clipboard message onto this host's transport.
+fn wire_message(message: ClipboardWireMessage) -> Result<Message, String> {
+    match message {
+        ClipboardWireMessage::Offer(offer) => serde_json::to_string(&offer)
+            .map(|text| Message::Text(text.into()))
+            .map_err(|error| format!("serialize clipboard offer: {error}")),
+        ClipboardWireMessage::Chunk(frame) => Ok(Message::Binary(frame.into())),
     }
 }
 
@@ -292,23 +264,33 @@ impl ClipboardWriterQueue {
                     .pending
                     .as_ref()
                     .zip(state.active.as_ref())
-                    .is_some_and(|(pending, active)| pending.sequence > active.item.sequence)
+                    .is_some_and(|(pending, active)| {
+                        pending.sequence > active.transfer().sequence()
+                    })
                 {
                     state.active = None;
                 }
                 if state.active.is_none() {
-                    state.active = state.pending.take().map(|item| Transfer {
-                        item,
-                        offer_sent: false,
-                        offset: 0,
-                    });
+                    state.active = state
+                        .pending
+                        .take()
+                        .and_then(ClipboardItem::into_transfer)
+                        .map(ClipboardTransfer::into_cursor);
                 }
                 if let Some(active) = state.active.as_mut() {
-                    let message = active.next_message()?;
-                    if active.finished() {
-                        state.active = None;
+                    let next = active
+                        .next_message()
+                        .transpose()
+                        .map_err(|error| format!("frame clipboard transfer: {error}"))?;
+                    if let Some(message) = next {
+                        let message = wire_message(message)?;
+                        if active.finished() {
+                            state.active = None;
+                        }
+                        return Ok(Some(message));
                     }
-                    return Ok(Some(message));
+                    state.active = None;
+                    continue;
                 }
                 if state.closed {
                     return Ok(None);
@@ -710,6 +692,8 @@ mod native;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_media::clipboard::ClipboardContent;
+    use arcen_protocol::messages::ClipboardDirectionMsg;
 
     fn policy() -> ClipboardPolicy {
         ClipboardPolicy::new(

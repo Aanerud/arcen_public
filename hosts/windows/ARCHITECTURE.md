@@ -842,6 +842,14 @@ display state and then restores the original EDID/topology. A remote display
 request therefore cannot persist a new sink identity or HDR posture after the
 session ends.
 
+`NvAPI_GPU_SetEDID` currently runs in the signed-in session agent. The hardware
+matrix proves automatic headless HDR for an account in the host's local
+Administrators group. A standard local account is rejected by NVAPI with
+`NVAPI_INVALID_USER_PRIVILEGE`, and the session fails before capture rather
+than continuing without the requested display contract. Moving this mutation
+behind a narrowly scoped LocalSystem broker operation is required before the
+headless path can claim standard-user support.
+
 ### Copy and reconnect boundaries
 
 Windows colour conversion is CPU-visible: D3D11 copies the captured texture to

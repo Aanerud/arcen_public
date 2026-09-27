@@ -144,6 +144,11 @@ pub struct SharedMediaState {
     pub decode_ms_samples: VecDeque<f64>,
     pub video_packet_times: VecDeque<Instant>,
     pub last_wire_frame_age_ms: Option<i32>,
+    /// Recent wire ages of video and audio frames at arrival, for the
+    /// "stream delay" heartbeat. Both use the host's wire clock, so they
+    /// are only as exact as the two clocks agree.
+    pub video_wire_age_samples: VecDeque<f64>,
+    pub audio_wire_age_samples: VecDeque<f64>,
     pub waiting_for_keyframe: bool,
     pub inbox: IncomingMediaTelemetry,
     pub ingress_idr_requests: u64,
@@ -523,6 +528,20 @@ fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
         malformed_audio_packets = state.inbox.malformed_audio_packets,
         "stream healthy",
     );
+    // Its own record: the heartbeat above is at the per-record field cap.
+    // Audio heard = its wire age + what waits in the playout queue.
+    let video_age = percentiles(&state.video_wire_age_samples);
+    let audio_age = percentiles(&state.audio_wire_age_samples);
+    tracing::info!(
+        target: crate::logging::target::VIDEO,
+        video_age_p50_ms = ?video_age.map(|(p50, _)| p50),
+        video_age_p95_ms = ?video_age.map(|(_, p95)| p95),
+        audio_age_p50_ms = ?audio_age.map(|(p50, _)| p50),
+        audio_age_p95_ms = ?audio_age.map(|(_, p95)| p95),
+        audio_queued_ms = state.last_audio_queued_ms,
+        audio_heard_ms = ?audio_age.map(|(p50, _)| p50 + state.last_audio_queued_ms as i64),
+        "stream delay",
+    );
     // One bounded record per negotiated monitor (never more than
     // `MAX_MULTI_MONITOR_COUNT`), emitted only for multi-monitor sessions.
     // Without this, a session-wide aggregate cannot say which viewport was
@@ -633,7 +652,9 @@ fn handle_media_batch(
             push_instant_sample(&mut state.video_packet_times, now);
         }
         if let Some((header, payload)) = batch.video.last() {
-            state.last_wire_frame_age_ms = Some(wire_frame_age_ms(header.timestamp_ms));
+            let age = wire_frame_age_ms(header.timestamp_ms);
+            state.last_wire_frame_age_ms = Some(age);
+            push_ms_sample(&mut state.video_wire_age_samples, f64::from(age));
             state.last_wire_video_summary = format!(
                 "{:?} {:?} {:?} monitor={} ts={} payload={} bytes",
                 header.frame_type,
@@ -654,8 +675,10 @@ fn handle_media_batch(
     }
 
     for (header, payload) in batch.audio {
+        let age = wire_frame_age_ms(header.timestamp_ms);
         let status = audio.feed(header, &payload);
         let mut state = shared.lock().expect("media state poisoned");
+        push_ms_sample(&mut state.audio_wire_age_samples, f64::from(age));
         let previous_underruns = state.audio_playback_underruns;
         let previous_trim_events = state.audio_buffer_trim_events;
         let previous_trimmed_samples = state.audio_buffer_trimmed_samples;
@@ -1231,6 +1254,20 @@ fn push_ms_sample(samples: &mut VecDeque<f64>, value: f64) {
     }
 }
 
+/// The median and 95th percentile of `samples`, rounded to milliseconds.
+fn percentiles(samples: &VecDeque<f64>) -> Option<(i64, i64)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = samples.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        sorted[index].round() as i64
+    };
+    Some((at(0.5), at(0.95)))
+}
+
 fn wire_frame_age_ms(timestamp_ms: u32) -> i32 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1243,6 +1280,13 @@ fn wire_frame_age_ms(timestamp_ms: u32) -> i32 {
 mod tests {
     use super::*;
     use crate::protocol::{ChromaSubsampling, FrameType, VideoCodec, VIDEO_KEYFRAME_FLAG};
+
+    #[test]
+    fn delay_percentiles_are_the_median_and_the_tail() {
+        let samples: VecDeque<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(percentiles(&samples), Some((51, 95)));
+        assert_eq!(percentiles(&VecDeque::new()), None);
+    }
 
     #[test]
     fn rejected_keyframe_rearms_full_frame_recovery() {

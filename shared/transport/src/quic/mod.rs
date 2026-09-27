@@ -35,6 +35,7 @@ mod identity;
 mod monitor;
 mod monitor_registry;
 mod peer;
+mod priority;
 
 pub use carrier_bench::{
     ALLOWED_MONITOR_COUNTS, ActivePattern, AggregateMetrics, BENCH_COMPLETION_DRAIN_ALLOWANCE,
@@ -50,7 +51,8 @@ pub use carrier_bench::{
     run_carrier_b, scheduler_weight_for, tick_pacing_for,
 };
 pub use config::{
-    apply_direct_server_limits, apply_migration_stub_server_limits,
+    ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW, ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
+    apply_direct_server_limits, apply_migration_stub_server_limits, interactive_send_window,
     monitor_carrier_transport_config, monitor_carrier_transport_config_arc,
     recommended_transport_config, recommended_transport_config_arc,
 };
@@ -73,6 +75,11 @@ pub use monitor::{
 };
 pub use monitor_registry::{ExpectedMonitorStream, MonitorRosterError, MonitorStreamRoster};
 pub use peer::{AsyncTransportPeer, BoxFuture, QuicPeer, QuicPeerCounters, QuicRuntimeConfig};
+pub use priority::{
+    AUDIO_PRIORITY_STREAM_PRIORITY, PriorityAudio, PriorityAudioSend, PriorityStreamError,
+    accept_audio_priority_stream, open_audio_priority_stream, read_priority_frame,
+    write_priority_frame,
+};
 
 use std::net::SocketAddr;
 

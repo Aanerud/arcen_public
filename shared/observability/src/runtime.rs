@@ -11,6 +11,7 @@ use arcen_telemetry::{
     CanonicalRecord, CorrelationId, EventSeverity, FieldValue, HealthState, LevelSpec,
     LifecycleEventKind, OperationalProfile, SchemaValidationError, StructuredFields,
     TelemetryComponent, TelemetryPlatform, TelemetryRole, TelemetryTarget, ValidatedLifecycleEvent,
+    names,
 };
 use tracing::{Dispatch, Event, Subscriber};
 use tracing_subscriber::filter::{EnvFilter, ParseError};
@@ -666,6 +667,52 @@ impl ObservabilityHandle {
         })
     }
 
+    /// Emits the mandatory effective-profile lifecycle record.
+    ///
+    /// The record is always routed at the critical profile floor so operators
+    /// can identify the active policy even when ordinary diagnostics are
+    /// filtered.
+    ///
+    /// # Errors
+    ///
+    /// Returns schema, clock, sequence, or sink-routing errors.
+    pub fn emit_effective_profile(
+        &self,
+        profile: OperationalProfile,
+        source: impl Into<String>,
+        context: LifecycleContext,
+    ) -> Result<EmissionReport, RuntimeError> {
+        let mut fields = StructuredFields::default();
+        fields
+            .insert(
+                "profile_level",
+                FieldValue::Integer(i64::from(u8::from(profile))),
+            )
+            .map_err(|error| RuntimeError::Lifecycle(error.to_string()))?;
+        fields
+            .insert(
+                "profile_name",
+                FieldValue::String(profile.as_str().to_owned()),
+            )
+            .map_err(|error| RuntimeError::Lifecycle(error.to_string()))?;
+        fields
+            .insert("profile_source", FieldValue::String(source.into()))
+            .map_err(|error| RuntimeError::Lifecycle(error.to_string()))?;
+        let event = ValidatedLifecycleEvent::new(
+            LifecycleEventKind::EffectiveProfile,
+            context.sid.clone(),
+            fields,
+        )
+        .map_err(|error| RuntimeError::Lifecycle(error.to_string()))?;
+        self.emit_lifecycle(
+            &event,
+            context,
+            canonical_now().map_err(|()| RuntimeError::TimestampUnavailable)?,
+            TelemetryTarget::new(names::target::TELEMETRY).map_err(RuntimeError::Schema)?,
+            "effective operational logging profile",
+        )
+    }
+
     /// Bridges one validated lifecycle event and explicit top-level context.
     ///
     /// # Errors
@@ -1117,6 +1164,24 @@ where
     }
 }
 
+/// Returns the current time as a canonical record timestamp.
+///
+/// Every host needs this string and none of them can usefully produce a
+/// different one: a canonical record's `timestamp` is part of the format
+/// readers parse, so a host that formats its own has forked the format. The
+/// Linux Pier already carries a private copy of this function for want of a
+/// public one, which is the second copy; this is the answer rather than a
+/// third.
+///
+/// Returns `None` when the system clock is before the Unix epoch or beyond
+/// year 9999, which a canonical timestamp cannot express. Callers should treat
+/// that as "do not emit" rather than substituting a guess, because a record
+/// with an invented time is worse than a missing record.
+#[must_use]
+pub fn canonical_timestamp_now() -> Option<String> {
+    canonical_now().ok()
+}
+
 fn canonical_now() -> Result<String, ()> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1454,6 +1519,10 @@ mod tests {
         fn is_empty(&self) -> bool {
             self.0.lock().expect("writer lock").is_empty()
         }
+
+        fn contents(&self) -> Vec<u8> {
+            self.0.lock().expect("writer lock").clone()
+        }
     }
 
     impl Write for SharedWriter {
@@ -1468,6 +1537,47 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn effective_profile_is_mandatory_and_carries_source() {
+        let writer = SharedWriter::default();
+        let runtime = ObservabilityBuilder::new(
+            TelemetryRole::Host,
+            TelemetryComponent::new("pier").expect("component"),
+            TelemetryPlatform::Macos,
+            OperationalProfile::Critical,
+        )
+        .arcen_log(Some("off"))
+        .canonical_writer("json", writer.clone())
+        .build()
+        .expect("runtime");
+        let handle = runtime.handle();
+        let sid = CorrelationId::new("macos-pier-startup").expect("correlation");
+        let report = handle
+            .emit_effective_profile(
+                OperationalProfile::Debug,
+                "config_level",
+                LifecycleContext {
+                    sid,
+                    user: None,
+                    host: None,
+                    peer_addr: None,
+                    health_state: None,
+                },
+            )
+            .expect("effective profile");
+        assert_eq!(report.enqueued, 1);
+        handle.flush(Duration::from_secs(1)).expect("flush");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&writer.contents()).expect("canonical JSON");
+        assert_eq!(value["event_name"], "EFFECTIVE_PROFILE");
+        assert_eq!(value["profile_level"], 0);
+        assert_eq!(value["profile_name"], "critical");
+        assert_eq!(value["fields"]["profile_level"], 3);
+        assert_eq!(value["fields"]["profile_name"], "debug");
+        assert_eq!(value["fields"]["profile_source"], "config_level");
     }
 
     #[test]

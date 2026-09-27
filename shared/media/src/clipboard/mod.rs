@@ -1,6 +1,7 @@
 //! Clipboard policy, sequence, echo-suppression, and raster contracts.
 
 mod image;
+pub mod latest;
 
 pub use image::{
     ClipboardImageError, ImageInfo, ImageLimits, dibv5_to_png, png_to_dibv5, validate_png,
@@ -380,8 +381,200 @@ impl Debug for EchoSuppressor {
     }
 }
 
+/// A host policy narrowed by what the client actually asked for.
+///
+/// The host's configuration says what it is willing to carry; the client's
+/// hello says what it wants carried. Serving the intersection is the whole
+/// point, and a host that consults only its own half reads the local
+/// pasteboard and puts it on the wire for a user who switched clipboard off.
+/// The receiver discarding it afterwards is not a defence — the contents have
+/// already left the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardNegotiation {
+    policy: ClipboardPolicy,
+    text: ClipboardDirections,
+    image: ClipboardDirections,
+}
+
+/// Which way one kind of clipboard content may travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipboardDirections {
+    /// The client may paste into the host.
+    pub client_to_host: bool,
+    /// The host may paste into the client.
+    pub host_to_client: bool,
+}
+
+impl ClipboardDirections {
+    /// Both directions.
+    #[must_use]
+    pub const fn both() -> Self {
+        Self {
+            client_to_host: true,
+            host_to_client: true,
+        }
+    }
+
+    /// Whether this flow is permitted.
+    #[must_use]
+    pub const fn allows(self, flow: ClipboardFlow) -> bool {
+        match flow {
+            ClipboardFlow::ClientToHost => self.client_to_host,
+            ClipboardFlow::HostToClient => self.host_to_client,
+        }
+    }
+}
+
+/// What a client said it wants its clipboard to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardRequest {
+    /// The clipboard protocol version the client speaks.
+    pub protocol_version: u16,
+    /// Which directions may carry text.
+    pub text: ClipboardDirections,
+    /// Which directions may carry images.
+    pub image: ClipboardDirections,
+}
+
+impl ClipboardNegotiation {
+    /// Narrows a host policy by the client's request.
+    ///
+    /// Returns `None` when this session carries no clipboard at all: the host
+    /// is not eligible, the protocol versions differ, the host has it
+    /// disabled, or the intersection is empty. A `None` here must mean no
+    /// pasteboard is read and nothing is sent.
+    #[must_use]
+    pub fn resolve(
+        policy: ClipboardPolicy,
+        eligible: bool,
+        request: ClipboardRequest,
+    ) -> Option<Self> {
+        if !eligible
+            || request.protocol_version != arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION
+            || matches!(policy.direction, ClipboardDirection::Disabled)
+        {
+            return None;
+        }
+        let resolved = Self {
+            policy,
+            text: request.text,
+            image: request.image,
+        };
+        (resolved.allows(ClipboardFlow::ClientToHost, ClipboardKind::TextUtf8)
+            || resolved.allows(ClipboardFlow::ClientToHost, ClipboardKind::ImagePng)
+            || resolved.allows(ClipboardFlow::HostToClient, ClipboardKind::TextUtf8)
+            || resolved.allows(ClipboardFlow::HostToClient, ClipboardKind::ImagePng))
+        .then_some(resolved)
+    }
+
+    /// Returns the host policy this negotiation narrowed.
+    #[must_use]
+    pub const fn policy(self) -> ClipboardPolicy {
+        self.policy
+    }
+
+    /// Whether this flow and content kind may cross.
+    #[must_use]
+    pub fn allows(self, flow: ClipboardFlow, kind: ClipboardKind) -> bool {
+        if !self.policy.allows(flow, kind) {
+            return false;
+        }
+        match kind {
+            ClipboardKind::TextUtf8 => self.text.allows(flow),
+            ClipboardKind::ImagePng => self.image.allows(flow),
+        }
+    }
+}
+
+/// Renders a policy as the wire message that advertises it.
+///
+/// This is pure mapping between two shared vocabularies, so it lives here
+/// rather than in a host. Every Pier must describe its clipboard policy to a
+/// Deck, and a platform-local copy of this translation is how two hosts end up
+/// advertising different policies for the same configuration.
+#[must_use]
+pub fn policy_message(policy: ClipboardPolicy) -> arcen_protocol::messages::ClipboardPolicyMsg {
+    use arcen_protocol::messages::{
+        CLIPBOARD_PROTOCOL_VERSION, ClipboardContentMsg, ClipboardDirectionMsg, ClipboardPolicyMsg,
+    };
+
+    ClipboardPolicyMsg {
+        protocol_version: CLIPBOARD_PROTOCOL_VERSION,
+        direction: match policy.direction {
+            ClipboardDirection::Both => ClipboardDirectionMsg::Both,
+            ClipboardDirection::ClientToHost => ClipboardDirectionMsg::ClientToHost,
+            ClipboardDirection::HostToClient => ClipboardDirectionMsg::HostToClient,
+            ClipboardDirection::Disabled => ClipboardDirectionMsg::Disabled,
+        },
+        content: match policy.content {
+            ClipboardContent::All => ClipboardContentMsg::All,
+            ClipboardContent::Text => ClipboardContentMsg::Text,
+            ClipboardContent::Image => ClipboardContentMsg::Image,
+        },
+        // A validated policy always fits, but saturating keeps a
+        // misconfiguration from taking down a session.
+        max_bytes: u32::try_from(policy.max_bytes).unwrap_or(u32::MAX),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_client_that_switched_the_clipboard_off_gets_no_clipboard() {
+        // The host reading its own pasteboard and putting it on the wire for a
+        // user who disabled clipboard is the failure this exists to prevent.
+        // The Deck discarding it afterwards is not a defence: the contents
+        // have already left the machine.
+        let off = ClipboardRequest {
+            protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+            text: ClipboardDirections::default(),
+            image: ClipboardDirections::default(),
+        };
+        assert!(ClipboardNegotiation::resolve(ClipboardPolicy::default(), true, off).is_none());
+    }
+
+    #[test]
+    fn each_direction_is_narrowed_on_its_own() {
+        let text_out_only = ClipboardRequest {
+            protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+            text: ClipboardDirections {
+                client_to_host: false,
+                host_to_client: true,
+            },
+            image: ClipboardDirections::default(),
+        };
+        let resolved =
+            ClipboardNegotiation::resolve(ClipboardPolicy::default(), true, text_out_only)
+                .expect("one direction is still a clipboard");
+        assert!(resolved.allows(ClipboardFlow::HostToClient, ClipboardKind::TextUtf8));
+        assert!(!resolved.allows(ClipboardFlow::ClientToHost, ClipboardKind::TextUtf8));
+        assert!(!resolved.allows(ClipboardFlow::HostToClient, ClipboardKind::ImagePng));
+    }
+
+    #[test]
+    fn a_version_the_host_does_not_speak_carries_nothing() {
+        let mismatched = ClipboardRequest {
+            protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION + 1,
+            text: ClipboardDirections::both(),
+            image: ClipboardDirections::both(),
+        };
+        assert!(
+            ClipboardNegotiation::resolve(ClipboardPolicy::default(), true, mismatched).is_none()
+        );
+    }
+
+    #[test]
+    fn an_ineligible_host_carries_nothing_however_willing_the_client_is() {
+        let everything = ClipboardRequest {
+            protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+            text: ClipboardDirections::both(),
+            image: ClipboardDirections::both(),
+        };
+        assert!(
+            ClipboardNegotiation::resolve(ClipboardPolicy::default(), false, everything).is_none()
+        );
+    }
     use super::*;
 
     #[test]

@@ -210,7 +210,7 @@ impl CapencConfig {
     /// handing capenc something it would reject outright; `media_request`
     /// still fails this config before capenc would otherwise be asked to
     /// serve it.
-    fn argv(&self) -> Vec<String> {
+    pub(crate) fn argv(&self) -> Vec<String> {
         let mut v = vec![
             self.output_index.to_string(),
             self.codec.clone(),
@@ -242,6 +242,19 @@ impl CapencConfig {
         // valid.
         if self.transfer != TransferCharacteristics::Bt709 {
             v.push(format!("transfer={}", self.transfer.token()));
+        }
+        // PQ survives resolution only when something vouched for it: the lab
+        // pipe, or the operator's `video.desktop_encoding`. capenc refuses PQ
+        // from the Xorg framebuffer unless told which one it is.
+        if self.transfer == TransferCharacteristics::Pq {
+            if let Some(pipe) = crate::cli::experimental_rgb10_pipe() {
+                v.push(format!("rgb10-pipe={}", pipe.display()));
+            } else {
+                v.push(format!(
+                    "desktop-encoding={}",
+                    arcen_media::video::DesktopSignalEncoding::Rec2100Pq.token()
+                ));
+            }
         }
         if self.color_primaries != ColorPrimaries::Bt709 {
             v.push(format!("primaries={}", self.color_primaries.token()));
