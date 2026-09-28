@@ -1737,8 +1737,10 @@ where
     // function answering "what did this client ask for", on both sides of the
     // process boundary.
     if let Some(request) = response.initial_video.as_ref() {
-        if let Err(error) = cfg.apply_initial_video_request(request) {
-            return Err(format!("agent video request rejected: {error}"));
+        if let Err(error) = cfg.apply_initial_video_request_for_encoder(request, display_encoder) {
+            let error = format!("agent video request rejected: {error}");
+            send_agent_failure(&mut ws, &error).await;
+            return Err(error);
         }
         tracing::debug!(
             target: SESSION,
@@ -2316,7 +2318,7 @@ where
         }
         media
     } else {
-        let (prepared, selected_encoder) = prepare_attachment_media(
+        let (prepared, selected_encoder) = match prepare_attachment_media(
             &cfg,
             display_encoder,
             display
@@ -2327,7 +2329,16 @@ where
             deskside_capture_binding,
             true,
         )
-        .await?;
+        .await
+        {
+            Ok(prepared) => prepared,
+            // Without this the agent exited, the broker saw the IPC close and
+            // dropped the Deck's stream with no reason at all.
+            Err(error) => {
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+        };
         display_encoder = selected_encoder;
         prepared
     };

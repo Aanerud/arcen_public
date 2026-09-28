@@ -463,6 +463,22 @@ impl HostConfig {
                         .max_fps)
     }
 
+    /// Applies the client's auth-time request and then the limits of the
+    /// encoder that will actually serve it.
+    ///
+    /// The request is resolved without knowing the encoder, so a Deck asking
+    /// Auto (which prefers H.265 or AV1) moved an OpenH264 host off
+    /// H.264 4:2:0 8-bit, and capenc then refused the plan and the session
+    /// ended before READY.
+    pub(crate) fn apply_initial_video_request_for_encoder(
+        &mut self,
+        request: &InitialVideoRequestMsg,
+        encoder: crate::capenc::EncoderSelection,
+    ) -> Result<(), String> {
+        self.apply_initial_video_request(request)?;
+        self.apply_software_h264_backend(encoder)
+    }
+
     pub(crate) fn apply_initial_video_request(
         &mut self,
         request: &InitialVideoRequestMsg,
@@ -4162,6 +4178,56 @@ mod tests {
         assert!(pinned
             .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
             .is_err());
+    }
+
+    #[test]
+    fn an_adaptive_request_on_a_software_host_stays_h264_420_8bit() {
+        let mut software = parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+                "--encoder",
+                "software-h264",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .config;
+        let request = initial_video_request(VideoSelectionIntent::AdaptivePerformance);
+        software
+            .apply_initial_video_request_for_encoder(
+                &request,
+                crate::capenc::EncoderSelection::SoftwareH264,
+            )
+            .unwrap();
+        assert_eq!(software.codec, VideoCodec::H264);
+        assert_eq!(software.chroma, ChromaSubsampling::Yuv420);
+        assert_eq!(software.bit_depth, BitDepth::Eight);
+
+        let mut hardware = parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .config;
+        hardware
+            .apply_initial_video_request_for_encoder(
+                &request,
+                crate::capenc::EncoderSelection::Nvenc,
+            )
+            .unwrap();
+        assert_eq!(hardware.codec, VideoCodec::Av1);
     }
 
     #[test]

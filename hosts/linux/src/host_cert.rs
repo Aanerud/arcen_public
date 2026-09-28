@@ -150,6 +150,9 @@ fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> MaterialState {
         // The helper script owns transaction recovery on this platform, so
         // this path does not claim to detect its staging files.
         stale_staging_present: false,
+        self_signed: certificate_bytes
+            .as_ref()
+            .is_some_and(|bytes| cert_marker::is_self_signed_pem(bytes)),
     }
 }
 

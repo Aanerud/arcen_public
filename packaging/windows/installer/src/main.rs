@@ -14,6 +14,11 @@ mod acl;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod diagnosis;
 
+/// Not `#[cfg(windows)]` for the same reason as `acl`: uninstall must not
+/// delete a binary whose service is still starting.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod scm_state;
+
 #[cfg(windows)]
 #[path = "../../../quic_config_migration.rs"]
 mod quic_config_migration;
@@ -36,13 +41,32 @@ mod imp {
 
     use arcen_transport::cert_marker::{self, OwnershipMarker};
     use arcen_transport::cert_provisioning::{
-        MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRequest, plan,
+        MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRefusal,
+        ProvisioningRequest, plan,
     };
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
     use time::{Duration, OffsetDateTime};
 
-    use crate::acl::{AclClass, OWNER_SID, assert_acl_sddl};
+    use crate::acl::{AclClass, OWNER_SID, assert_acl_sddl, unexpected_trustees};
     use crate::diagnosis::is_tls_failure;
+    use crate::scm_state::{ScmState, parse_state};
+
+    /// Set by `--verbose`. Off by default, so an administrator sees what
+    /// changed, not every icacls and reg.exe line behind it.
+    static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn verbose() -> bool {
+        VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Prints only with `--verbose`.
+    macro_rules! detail {
+        ($($arg:tt)*) => {
+            if verbose() {
+                println!($($arg)*);
+            }
+        };
+    }
 
     const PIER_BYTES: &[u8] = include_bytes!(env!("ARCEN_EMBED_PIER_EXE"));
     const CP_BYTES: &[u8] = include_bytes!(env!("ARCEN_EMBED_CP_DLL"));
@@ -85,6 +109,9 @@ mod imp {
         purge: bool,
         version: bool,
         force: bool,
+        /// Take ownership of a certificate an earlier installer left without
+        /// an ownership marker, keeping its key so paired Decks still trust it.
+        adopt_legacy: bool,
         service_name: String,
         /// Extra names or addresses to place in the generated TLS certificate.
         ///
@@ -108,6 +135,7 @@ mod imp {
                 purge: false,
                 version: false,
                 force: false,
+                adopt_legacy: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -127,6 +155,10 @@ mod imp {
                     "--purge" => opts.purge = true,
                     "--version" => opts.version = true,
                     "--force" => opts.force = true,
+                    "--adopt-legacy" => opts.adopt_legacy = true,
+                    "--verbose" | "-v" => {
+                        VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     "--service-name" => {
                         opts.service_name = args.next().ok_or("--service-name requires a name")?
                     }
@@ -147,6 +179,16 @@ mod imp {
                     }
                     other => return Err(format!("unknown argument: {other}")),
                 }
+            }
+            if opts.adopt_legacy && opts.force {
+                return Err(
+                    "--adopt-legacy keeps the existing key and --force replaces it; \
+                     pass one of them"
+                        .to_owned(),
+                );
+            }
+            if opts.adopt_legacy && opts.uninstall {
+                return Err("--adopt-legacy applies to an install, not --uninstall".to_owned());
             }
             Ok(opts)
         }
@@ -183,8 +225,17 @@ mod imp {
     fn print_usage() {
         println!(
             "USAGE: install-arcen-pier [--prefix <dir>] [--programdata <dir>] [--dry-run]\n\
-             \x20                        [--uninstall] [--purge] [--version] [--force]\n\
+             \x20                        [--uninstall] [--purge] [--version]\n\
+             \x20                        [--force | --adopt-legacy] [--verbose]\n\
              \x20                        [--service-name <name>] [--extra-san <name-or-ip>]\n\
+             \n\
+             --adopt-legacy  Not needed any more: a self-signed key pair an older Arcen\n\
+             \x20            install left behind is taken over automatically, keeping the\n\
+             \x20            key so paired Decks keep trusting the host. Accepted so\n\
+             \x20            existing scripts keep working.\n\
+             --force      Replace the TLS key and certificate. Every paired Deck must\n\
+             \x20            re-pin the host.\n\
+             --verbose    Show every command and access-control check as it runs.\n\
              \n\
              --extra-san  Add a DNS name or IP address to the generated TLS certificate.\n\
              \x20            Repeatable, or comma-separated. Use this when the host is\n\
@@ -198,8 +249,12 @@ mod imp {
     }
 
     fn require_elevated() -> Result<(), String> {
+        // `net session` prints "There are no entries in the list" in the
+        // console's language; only its exit status matters here.
         let status = Command::new("net")
             .arg("session")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("check Administrator elevation: {e}"))?;
         if status.success() {
@@ -210,8 +265,12 @@ mod imp {
     }
 
     fn install(opts: &Options) -> Result<(), String> {
-        println!("install prefix: {}", opts.prefix.display());
-        println!("programdata: {}", opts.programdata.display());
+        println!(
+            "Installing Arcen Pier {} into {} (data in {})",
+            env!("CARGO_PKG_VERSION"),
+            opts.prefix.display(),
+            opts.programdata.display()
+        );
         // Windows will not let anyone replace a running executable, so an
         // upgrade must stop the service first. Refusing and telling the
         // operator to do it by hand made every upgrade fail for anyone who did
@@ -261,6 +320,7 @@ mod imp {
     }
 
     fn install_files(opts: &Options) -> Result<(), String> {
+        remove_set_aside_credential_providers(opts);
         let logs = opts.programdata.join("logs");
         let sessions = logs.join("sessions");
         let runtime = opts.programdata.join("runtime");
@@ -372,16 +432,10 @@ mod imp {
         start_service(opts)?;
         if !opts.dry_run && !opts.staging() {
             println!();
-            println!("=====================================================================");
-            println!(" REBOOT REQUIRED before the first remote sign-in.");
-            println!();
-            println!(" Windows enumerates credential providers only when LogonUI starts,");
-            println!(" so the provider registered just now is not visible to the running");
-            println!(" logon session. Until this machine reboots, a remote sign-in fails");
-            println!(" with a message asking you to install the credential provider that");
-            println!(" is in fact already installed.");
-            println!("=====================================================================");
-            println!();
+            println!(
+                "Restart Windows once before the first remote sign-in: the sign-in screen \
+                 picks up Arcen's credential provider only when it starts."
+            );
             println!(
                 "Administration guide: {}",
                 opts.programdata.join("pier-administration.md").display()
@@ -610,31 +664,41 @@ mod imp {
 
     /// Open the Pier's listening port. Best effort: an unrecognised or absent
     /// firewall is not an install failure, but the operator is told.
+    const FIREWALL_RULE: &str = "Arcen Pier QUIC 18444";
+
+    /// Deletes every inbound rule with this name; netsh reports "No rules
+    /// match" when there is none, which is not an error here.
+    fn delete_firewall_rule(name: &str) {
+        let _ = Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule"])
+            .arg(format!("name={name}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     fn open_firewall(opts: &Options) {
         if opts.dry_run || opts.staging() {
             return;
         }
-        let _ = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Arcen Pier 18443",
-            ])
-            .status();
+        delete_firewall_rule("Arcen Pier 18443");
+        // netsh adds a new rule on every call, so an upgrade or repair that
+        // only added one left a duplicate per run.
+        delete_firewall_rule(FIREWALL_RULE);
         let status = Command::new("netsh")
             .args([
                 "advfirewall",
                 "firewall",
                 "add",
                 "rule",
-                "name=Arcen Pier QUIC 18444",
+                &format!("name={FIREWALL_RULE}"),
                 "dir=in",
                 "action=allow",
                 "protocol=UDP",
                 "localport=18444",
             ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         if matches!(status, Ok(status) if status.success()) {
             println!("firewall: opened 18444/udp");
@@ -710,24 +774,43 @@ mod imp {
             println!("dry-run: would stop {}", opts.service_name);
             return Ok(());
         }
+        let query = |name: &str| {
+            Command::new("sc.exe")
+                .arg("query")
+                .arg(name)
+                .output()
+                .ok()
+                .and_then(|output| parse_state(&String::from_utf8_lossy(&output.stdout)))
+        };
+        // A service that is still starting refuses a stop request (1052) and
+        // does not read as RUNNING, so stopping it straight away deleted a
+        // service whose binary was still in use. Wait out the start first,
+        // for as long as the SCM itself allows a start to take.
+        let mut state = query(&opts.service_name);
+        for _ in 0..60 {
+            if !state.is_some_and(ScmState::is_transitional) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            state = query(&opts.service_name);
+        }
+        if matches!(state, None | Some(ScmState::Stopped)) {
+            return Ok(());
+        }
         let _ = Command::new("sc.exe")
             .arg("stop")
             .arg(&opts.service_name)
+            .stdout(std::process::Stdio::null())
             .status();
-        for _ in 0..30 {
-            let running = Command::new("sc.exe")
-                .arg("query")
-                .arg(&opts.service_name)
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).contains("RUNNING"))
-                .unwrap_or(false);
-            if !running {
+        for _ in 0..60 {
+            state = query(&opts.service_name);
+            if matches!(state, None | Some(ScmState::Stopped)) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         Err(format!(
-            "{} did not stop within 15 seconds; stop it and retry the uninstall",
+            "{} did not stop within 30 seconds (state: {state:?}); stop it and retry",
             opts.service_name
         ))
     }
@@ -773,6 +856,12 @@ mod imp {
             unregister_credential_provider(opts)?;
         } else {
             println!("staging mode: skipped live Credential Provider registry removal");
+        }
+        if opts.dry_run {
+            println!("dry-run: would delete firewall rule {FIREWALL_RULE}");
+        } else if !opts.staging() {
+            delete_firewall_rule(FIREWALL_RULE);
+            println!("firewall: closed 18444/udp ({FIREWALL_RULE})");
         }
         remove_file(opts, &opts.prefix.join("arcen-pier.exe"))?;
         // LogonUI can pin the Credential Provider DLL until the next reboot.
@@ -905,7 +994,7 @@ mod imp {
         // between releases, and verifying without applying made an otherwise
         // repairable upgrade fail on the unchanged Credential Provider DLL.
         if path.exists() && fs::read(path).is_ok_and(|existing| existing == bytes) {
-            println!("unchanged: {}", path.display());
+            detail!("unchanged: {}", path.display());
             return apply_acl(opts, path, acl_class);
         }
         if opts.dry_run {
@@ -955,7 +1044,7 @@ mod imp {
                     backup.display()
                 )
             })?;
-            println!("rollback backup: {}", backup.display());
+            detail!("rollback backup: {}", backup.display());
         }
         fs::rename(&tmp, path).map_err(|e| format!("publish {}: {e}", path.display()))?;
         apply_acl(opts, path, acl_class)
@@ -1148,6 +1237,9 @@ mod imp {
             certificate_valid,
             expiring_or_expired,
             stale_staging_present: false,
+            self_signed: bytes
+                .as_ref()
+                .is_some_and(|bytes| cert_marker::is_self_signed_pem(bytes)),
         }
     }
 
@@ -1210,12 +1302,25 @@ mod imp {
         // it, existing material is kept or renewed, never silently replaced.
         let request = if opts.force {
             ProvisioningRequest::Rekey
+        } else if opts.adopt_legacy {
+            ProvisioningRequest::AdoptLegacy
         } else {
             ProvisioningRequest::Ensure
         };
         let state = inspect_tls(tls);
-        let decided = plan(request, state)
-            .map_err(|refusal| format!("{}: {}", refusal.as_str(), refusal.guidance()))?;
+        let decided = plan(request, state).map_err(|refusal| {
+            let hint = if refusal == ProvisioningRefusal::ForeignMaterial {
+                format!(
+                    "\n  To keep this key so paired Decks still trust the host, re-run with \
+                     --adopt-legacy.\n  Only do that if {} was created by an earlier Arcen \
+                     installer; otherwise move it aside and re-run to create a new one.",
+                    tls.display()
+                )
+            } else {
+                String::new()
+            };
+            format!("{}: {}{hint}", refusal.as_str(), refusal.guidance())
+        })?;
 
         match decided.action {
             ProvisioningAction::KeepExisting => {
@@ -1276,7 +1381,11 @@ mod imp {
         atomic_write(opts, &cert, certificate.pem().as_bytes(), false)?;
         // Rewriting an unchanged key would churn its ACL and mtime for no
         // reason, and a failure there would destroy material that was fine.
-        if !preserve_key {
+        if preserve_key {
+            // A kept key still gets the secret-file ACL: an adopted key from an
+            // older install, or one restored by hand, may carry inherited access.
+            apply_secret_file_acl(opts, &key)?;
+        } else {
             atomic_write_with_acl(
                 opts,
                 &key,
@@ -1310,7 +1419,7 @@ mod imp {
     }
 
     fn apply_acl(opts: &Options, path: &Path, acl_class: AclClass) -> Result<(), String> {
-        println!(
+        detail!(
             "applying {} SDDL to {}: {}",
             acl_class.label(),
             path.display(),
@@ -1356,7 +1465,40 @@ mod imp {
             }
             run_or_print(opts, &mut remove)?;
         }
+        remove_unexpected_trustees(opts, path, acl_class)?;
         verify_acl(opts, path, acl_class)
+    }
+
+    /// Removes every trustee the class does not allow.
+    ///
+    /// `/grant:r` only replaces the trustees it names. Opening a protected
+    /// folder in Explorer and accepting "You don't currently have permission"
+    /// adds the signed-in user with full control, and the installer then
+    /// refused to run until someone repaired the ACL by hand.
+    fn remove_unexpected_trustees(
+        opts: &Options,
+        path: &Path,
+        acl_class: AclClass,
+    ) -> Result<(), String> {
+        if opts.dry_run {
+            return Ok(());
+        }
+        let sddl = read_sddl(path)?;
+        let extra = unexpected_trustees(&sddl, acl_class)?;
+        if extra.is_empty() {
+            return Ok(());
+        }
+        println!(
+            "removing access this installer does not grant from {}: {}",
+            path.display(),
+            extra.join(", ")
+        );
+        let mut remove = Command::new("icacls");
+        remove.arg(path).arg("/remove");
+        for sid in &extra {
+            remove.arg(format!("*{sid}"));
+        }
+        run_or_print(opts, &mut remove)
     }
 
     fn verify_acl(opts: &Options, path: &Path, acl_class: AclClass) -> Result<(), String> {
@@ -1373,7 +1515,7 @@ mod imp {
         // name comparison passes on English Windows and fails on every other
         // localization. SDDL carries SIDs, which are identical everywhere.
         let sddl = read_sddl(path)?;
-        println!("ACL {} {}", path.display(), sddl);
+        detail!("ACL {} {}", path.display(), sddl);
         assert_acl_sddl(&path.to_string_lossy(), &sddl, acl_class)
     }
 
@@ -1454,9 +1596,10 @@ mod imp {
                     .arg("LocalSystem"),
             )?;
         }
-        println!(
+        detail!(
             "service {} BinaryPathName: {}",
-            opts.service_name, binary_path
+            opts.service_name,
+            binary_path
         );
         Ok(())
     }
@@ -1673,7 +1816,7 @@ mod imp {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.trim().is_empty() {
-                println!("{}", stdout.trim_end());
+                detail!("{}", stdout.trim_end());
             }
             Ok(())
         } else {
@@ -1705,13 +1848,51 @@ mod imp {
         }
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
-                "Credential Provider is still loaded by LogonUI and cannot be removed yet: {}. \
-                 Reboot Windows, then rerun this same --uninstall{} command",
-                path.display(),
-                if opts.purge { " --purge" } else { "" }
-            )),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The sign-in screen keeps the DLL loaded until it restarts.
+                // It is already unregistered, so after a reboot nothing loads
+                // it; a loaded DLL can still be renamed, which frees its name
+                // and lets the uninstall finish instead of demanding a reboot
+                // and a second run. The next install or --purge removes it.
+                let aside = path.with_extension(format!("dll.pending-delete-{}", timestamp()));
+                match fs::rename(path, &aside) {
+                    Ok(()) => {
+                        println!(
+                            "The sign-in screen still has the credential provider loaded; it is \
+                             unregistered and set aside as {}. Restart Windows to unload it.",
+                            aside.display()
+                        );
+                        Ok(())
+                    }
+                    Err(_) => Err(format!(
+                        "Credential Provider is still loaded by LogonUI and cannot be removed \
+                         yet: {}. Reboot Windows, then rerun this same --uninstall{} command",
+                        path.display(),
+                        if opts.purge { " --purge" } else { "" }
+                    )),
+                }
+            }
             Err(error) => Err(format!("remove {}: {error}", path.display())),
+        }
+    }
+
+    /// Deletes credential provider DLLs an earlier uninstall set aside while
+    /// the sign-in screen still had them loaded. One that is still loaded
+    /// stays until a later run.
+    fn remove_set_aside_credential_providers(opts: &Options) {
+        if opts.dry_run {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&opts.prefix) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| {
+                name.starts_with("arcen_credential_provider.dll.pending-delete-")
+            }) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 
@@ -1774,6 +1955,7 @@ mod imp {
                 purge: true,
                 version: false,
                 force: false,
+                adopt_legacy: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -1824,6 +2006,7 @@ mod imp {
                 purge: true,
                 version: false,
                 force: false,
+                adopt_legacy: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -1871,6 +2054,7 @@ mod imp {
                 purge: false,
                 version: false,
                 force: false,
+                adopt_legacy: false,
                 service_name: "invalid\0service".to_string(),
                 extra_sans: Vec::new(),
             };
@@ -1901,9 +2085,13 @@ mod imp {
             // enterprise certificate an operator placed deliberately.
             let foreign = MaterialState {
                 ownership: Some(MaterialOwnership::Foreign),
+                self_signed: false,
                 ..MaterialState::owned_valid()
             };
-            assert!(plan(ProvisioningRequest::Ensure, foreign).is_err());
+            assert_eq!(
+                plan(ProvisioningRequest::Ensure, foreign).map(|plan| plan.action),
+                Ok(ProvisioningAction::KeepExisting)
+            );
             assert!(plan(ProvisioningRequest::Rekey, foreign).is_err());
         }
 
