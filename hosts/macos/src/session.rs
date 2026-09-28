@@ -27,6 +27,15 @@ use std::time::Duration;
 
 use crate::net::{self, PierSocket};
 
+use arcen_input::{
+    CapabilityAvailability as InputCapabilityTruth, CursorMode as InputCursorMode,
+    TabletMode as InputTabletMode, resolve_cursor_mode, resolve_tablet_mode,
+};
+use arcen_protocol::messages::{
+    CursorModeReason, CursorModeResultMsg, InputCapabilityAvailability, TabletModeReason,
+    TabletModeResultMsg,
+};
+
 /// How long a client has to answer the credential prompt.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the whole application handshake may occupy the one session slot.
@@ -188,6 +197,8 @@ pub struct Handshake {
     /// The frame rate this session will serve, resolved from the client's
     /// request against this host's ceiling.
     pub fps: u32,
+    /// Shared detail/motion preference for later encoder/rate-control choices.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// The codec this session will encode with.
     ///
     /// Negotiated, not assumed. The encoder was pinned to HEVC while the
@@ -239,11 +250,16 @@ pub struct Handshake {
     pub requested_width: u32,
     /// See [`Handshake::requested_width`].
     pub requested_height: u32,
-    /// A display arranged for this session, held so it lives exactly as long.
+    /// A display arranged for a legacy primary-only session, held so it lives exactly as long.
     ///
     /// `None` means the host's own display was already the right size, or none
     /// could be arranged. Dropping this removes the display.
     pub arranged_display: Option<crate::virtual_display::VirtualDisplay>,
+    /// Displays arranged for a Match My Layout session, one per Deck monitor.
+    ///
+    /// Dropping this removes every virtual display, including after any stream
+    /// or session failure.
+    pub multi_monitor_displays: Option<crate::multi_monitor::MacOsVirtualDisplays>,
     /// Who draws the pointer for this session.
     ///
     /// [`CursorMode::Local`] means the Deck draws its own, which moves at the
@@ -256,6 +272,8 @@ pub struct Handshake {
     /// There is no third option that is better than both, so the person
     /// chooses.
     pub cursor_mode: arcen_protocol::messages::CursorMode,
+    /// Authoritative cursor/tablet negotiation results, sent before input begins.
+    pub input_mode_results: crate::stream::InputModeResults,
 }
 
 /// The desktop size the Deck asked to be sent.
@@ -293,6 +311,8 @@ fn panel_identity(
         scale: monitor.scale,
         product_id: 0,
         serial: 0,
+        // shared-contract colourless-edid: `physical_size_mm` ignores colour;
+        // panel selection consumes the Deck display's colour contract separately.
         color: None,
     });
     crate::virtual_display::PanelIdentity {
@@ -302,6 +322,11 @@ fn panel_identity(
         } else {
             monitor.name.trim().to_owned()
         },
+        color: monitor
+            .color
+            .as_ref()
+            .map(arcen_media::display_color::DisplayColor::from_msg),
+        serial: 0x4152_4345,
     }
 }
 
@@ -918,7 +943,12 @@ pub fn server_hello_json_for_multi(
             // activation policy, which is why Apple deprecated that reader in
             // favour of compositing.
             host_cursor: available,
-            region_input: unavailable,
+            region_input: if multi_monitor.is_some() {
+                available
+            } else {
+                unavailable
+            },
+            gestures: available,
             // Basic Tablet terminates locally: the Deck's Wacom driver reads
             // the pen and this host injects finished samples as CGEvent
             // tablet events. Every field below is one the injector actually
@@ -967,7 +997,11 @@ pub fn server_hello_json_for_multi(
         // rejects a hello that names a different transport than the one it
         // dialled.
         negotiated_transport: Some(arcen_transport::CAPABILITY_TRANSPORT_QUIC.to_owned()),
-    };
+    }
+    .with_build_identity(arcen_protocol::build_identity::this_build(
+        "arcen-pier-macos",
+        crate::VERSION,
+    ));
 
     if let Some(multi_monitor) = multi_monitor {
         hello = match hello.with_multi_monitor_v1(&multi_monitor.server_capability) {
@@ -1229,25 +1263,42 @@ async fn perform_application_handshake(
     // the first time this was wired: the hello said 1920x1080 while the
     // capture was 2560x1440, and every click landed three quarters of the way
     // to where it was aimed.
-    // An HDR request is served on a panel that can show it: the virtual display
-    // is made an HDR one, and HDR is then claimed only if the display the
-    // session will capture actually reports headroom above SDR white.
-    let hdr_requested = initial_video.as_ref().is_some_and(requests_hdr);
+    // An HDR request is served on an HDR panel only when the Deck display it
+    // represents is also HDR. A bright SDR Deck panel may state luminance but
+    // must not make the host create a PQ/BT.2020 desktop.
+    let pq_requested = initial_video.as_ref().is_some_and(requests_pq);
     // `ARCEN_HDR_PANEL=sdr` is a measurement lever: it serves an HDR request
     // on an SDR panel, which is how the degradation path is exercised on a
     // host that could otherwise prove HDR.
     let force_sdr_panel = std::env::var("ARCEN_HDR_PANEL").as_deref() == Ok("sdr");
-    let panel = if hdr_requested && !force_sdr_panel {
-        crate::virtual_display::VirtualPanel::Hdr
+    let panel = select_virtual_panel(pq_requested, force_sdr_panel, client_display.as_ref());
+    if let Some(client_monitor) = client_display.as_ref() {
+        let color = client_monitor
+            .color
+            .as_ref()
+            .map(arcen_media::display_color::DisplayColor::from_msg);
+        tracing::info!(
+            target: arcen_telemetry::names::target::MEDIA,
+            client_display_id = client_monitor.id,
+            client_display_name = %client_monitor.name,
+            panel = ?panel,
+            color_gamut = ?color.map(arcen_media::display_color::DisplayColor::gamut),
+            color_headroom = ?color.and_then(arcen_media::display_color::DisplayColor::hdr_headroom),
+            color_hdr = color.is_some_and(arcen_media::display_color::DisplayColor::is_hdr),
+            "client display colour contract"
+        );
+    }
+    let single_monitor_session = requested_multi_monitor.is_none();
+    let arranged = if single_monitor_session {
+        requested_desktop.arrange(
+            advertised.display_id,
+            fps_hint(initial_video.as_ref()),
+            panel,
+            client_display.as_ref(),
+        )
     } else {
-        crate::virtual_display::VirtualPanel::Sdr
+        None
     };
-    let arranged = requested_desktop.arrange(
-        advertised.display_id,
-        fps_hint(initial_video.as_ref()),
-        panel,
-        client_display.as_ref(),
-    );
     let (capture_width, capture_height) = arranged.as_ref().map_or_else(
         || requested_desktop.resolve(advertised.width, advertised.height),
         crate::virtual_display::VirtualDisplay::size,
@@ -1265,8 +1316,14 @@ async fn perform_application_handshake(
     // this session will actually be served. Resolving after would let the host
     // advertise one contract and start another.
     let headroom = crate::displays::potential_headroom(display_id);
-    let hdr_output = hdr_is_proven(hdr_requested, headroom);
-    if hdr_requested {
+    let mut hdr_output = hdr_is_proven(pq_requested, headroom);
+    if requested_multi_monitor.is_some() {
+        // In Match My Layout every monitor gets its own virtual display and HDR
+        // proof is per display after creation, so the primary physical display
+        // must not decide the session's video tier.
+        hdr_output = pq_requested;
+    }
+    if pq_requested {
         tracing::info!(
             target: arcen_telemetry::names::target::MEDIA,
             display_id,
@@ -1283,15 +1340,21 @@ async fn perform_application_handshake(
     // wire carried H264 and the hello had promised H265.
     let codec = resolved_video.codec;
     let fps = resolved_video.fps;
-    let multi_monitor = crate::multi_monitor::admit_request(
-        &advertised.displays,
+    let motion_priority = resolved_video.motion_priority;
+    let multi_monitor = crate::multi_monitor::admit_virtual_request(
         advertised.multi_monitor_v1.as_ref(),
         requested_multi_monitor.as_ref(),
         plan,
         codec,
         fps,
+        pq_requested,
+        force_sdr_panel,
     )
     .map_err(|error| HandshakeError::MultiMonitor(error.to_string()))?;
+    let (multi_monitor, multi_monitor_displays) = match multi_monitor {
+        Some((plan, displays)) => (Some(plan), Some(displays)),
+        None => (None, None),
+    };
 
     net::send_json(
         socket,
@@ -1338,6 +1401,24 @@ async fn perform_application_handshake(
     // tap is ever created.
     let client_hello =
         serde_json::from_str::<arcen_protocol::messages::ClientHelloMsg>(&reply).ok();
+    let input_mode_results = client_hello.as_ref().map_or_else(
+        || {
+            input_mode_results(
+                cursor_mode,
+                arcen_protocol::messages::TabletModeMsg::LocalTermination,
+                arcen_protocol::messages::TabletModeCapabilitiesMsg::default(),
+                host_tablet_mode_capabilities(),
+            )
+        },
+        |hello| {
+            input_mode_results(
+                cursor_mode,
+                hello.tablet_mode_requested,
+                hello.effective_tablet_mode_capabilities(),
+                host_tablet_mode_capabilities(),
+            )
+        },
+    );
     let client_audio = client_hello
         .as_ref()
         .and_then(|hello| hello.audio_output.clone());
@@ -1357,6 +1438,7 @@ async fn perform_application_handshake(
 
     Ok(Handshake {
         fps,
+        motion_priority,
         user,
         display_id,
         advertised,
@@ -1372,10 +1454,104 @@ async fn perform_application_handshake(
         requested_width,
         requested_height,
         arranged_display: arranged,
+        multi_monitor_displays,
         cursor_mode,
+        input_mode_results,
         admission,
         login_window: policy.login_window,
     })
+}
+
+fn host_tablet_mode_capabilities() -> arcen_protocol::messages::TabletModeCapabilitiesMsg {
+    arcen_protocol::messages::TabletModeCapabilitiesMsg {
+        local_termination: InputCapabilityAvailability::Available,
+        wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+        disabled_mouse_compat: InputCapabilityAvailability::Available,
+    }
+}
+
+fn input_mode_results(
+    requested_cursor: arcen_protocol::messages::CursorMode,
+    requested_tablet: arcen_protocol::messages::TabletModeMsg,
+    client_capabilities: arcen_protocol::messages::TabletModeCapabilitiesMsg,
+    host_capabilities: arcen_protocol::messages::TabletModeCapabilitiesMsg,
+) -> crate::stream::InputModeResults {
+    let cursor = resolve_cursor_mode(
+        cursor_mode_to_input(requested_cursor),
+        InputCapabilityTruth::Available,
+    );
+    let tablet = resolve_tablet_mode(
+        tablet_mode_to_input(requested_tablet),
+        capability_to_input(client_capabilities.local_termination),
+        capability_to_input(host_capabilities.local_termination),
+        capability_to_input(client_capabilities.wacom_usb_bridge),
+        capability_to_input(host_capabilities.wacom_usb_bridge),
+    );
+    crate::stream::InputModeResults {
+        cursor: CursorModeResultMsg {
+            requested: requested_cursor,
+            active: cursor_mode_from_input(cursor.active),
+            accepted: cursor.accepted,
+            reason: CursorModeReason::try_from(cursor.reason.as_str().to_owned())
+                .unwrap_or_default(),
+            ..CursorModeResultMsg::default()
+        },
+        tablet: TabletModeResultMsg {
+            requested: requested_tablet,
+            active: tablet_mode_from_input(tablet.active),
+            accepted: tablet.accepted,
+            reason: TabletModeReason::try_from(tablet.reason.as_str().to_owned())
+                .unwrap_or_default(),
+            reconnect_required: tablet.reconnect_required,
+            ..TabletModeResultMsg::default()
+        },
+    }
+}
+
+const fn cursor_mode_to_input(mode: arcen_protocol::messages::CursorMode) -> InputCursorMode {
+    match mode {
+        arcen_protocol::messages::CursorMode::Local => InputCursorMode::Local,
+        arcen_protocol::messages::CursorMode::Host => InputCursorMode::Host,
+    }
+}
+
+const fn cursor_mode_from_input(mode: InputCursorMode) -> arcen_protocol::messages::CursorMode {
+    match mode {
+        InputCursorMode::Local => arcen_protocol::messages::CursorMode::Local,
+        InputCursorMode::Host => arcen_protocol::messages::CursorMode::Host,
+    }
+}
+
+const fn tablet_mode_to_input(mode: arcen_protocol::messages::TabletModeMsg) -> InputTabletMode {
+    match mode {
+        arcen_protocol::messages::TabletModeMsg::LocalTermination => {
+            InputTabletMode::LocalTermination
+        }
+        arcen_protocol::messages::TabletModeMsg::WacomUsbBridge => InputTabletMode::WacomUsbBridge,
+        arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat => {
+            InputTabletMode::DisabledMouseCompat
+        }
+    }
+}
+
+const fn tablet_mode_from_input(mode: InputTabletMode) -> arcen_protocol::messages::TabletModeMsg {
+    match mode {
+        InputTabletMode::LocalTermination => {
+            arcen_protocol::messages::TabletModeMsg::LocalTermination
+        }
+        InputTabletMode::WacomUsbBridge => arcen_protocol::messages::TabletModeMsg::WacomUsbBridge,
+        InputTabletMode::DisabledMouseCompat => {
+            arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat
+        }
+    }
+}
+
+const fn capability_to_input(availability: InputCapabilityAvailability) -> InputCapabilityTruth {
+    match availability {
+        InputCapabilityAvailability::Available => InputCapabilityTruth::Available,
+        InputCapabilityAvailability::Unavailable => InputCapabilityTruth::Unavailable,
+        InputCapabilityAvailability::Unknown => InputCapabilityTruth::Unknown,
+    }
 }
 
 /// Narrows this host's clipboard policy by what the client asked for.
@@ -1467,6 +1643,7 @@ struct ResolvedInitialVideo {
     plan: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
     fps: u32,
+    motion_priority: arcen_media::video::MotionPriority,
 }
 
 /// Whether an HDR request may be served as HDR: only when the display the
@@ -1478,12 +1655,29 @@ const fn hdr_is_proven(requested: bool, headroom: Option<f32>) -> bool {
     }
 }
 
-/// Whether an auth-time video request asks for an HDR transfer.
-fn requests_hdr(video: &arcen_protocol::messages::InitialVideoRequestMsg) -> bool {
+fn select_virtual_panel(
+    pq_requested: bool,
+    force_sdr_panel: bool,
+    client_display: Option<&arcen_protocol::messages::ClientMonitor>,
+) -> crate::virtual_display::VirtualPanel {
+    let client_hdr = client_display
+        .and_then(|monitor| monitor.color.as_ref())
+        .map(arcen_media::display_color::DisplayColor::from_msg)
+        .is_some_and(arcen_media::display_color::DisplayColor::is_hdr);
+    if pq_requested && !force_sdr_panel && client_hdr {
+        crate::virtual_display::VirtualPanel::Hdr
+    } else {
+        crate::virtual_display::VirtualPanel::Sdr
+    }
+}
+
+/// Whether an auth-time video request asks specifically for the PQ HDR
+/// transfer this Pier can serve.
+fn requests_pq(video: &arcen_protocol::messages::InitialVideoRequestMsg) -> bool {
     arcen_media::video::resolve_client_video_request(video).is_ok_and(|client| {
         matches!(
             client.video.transfer,
-            arcen_media::TransferCharacteristics::Pq | arcen_media::TransferCharacteristics::Hlg
+            arcen_media::TransferCharacteristics::Pq
         )
     })
 }
@@ -1516,6 +1710,7 @@ fn resolve_initial_video(
                 crate::encode::EncoderCodec::H264
             },
             fps: 60,
+            motion_priority: arcen_media::video::MotionPriority::Detail,
         });
     };
 
@@ -1612,6 +1807,7 @@ fn resolve_initial_video(
             }
         },
         fps: host_resolved.max_fps,
+        motion_priority: client.motion_priority,
     })
 }
 
@@ -1748,6 +1944,7 @@ async fn authenticate(
         resume_window_secs: None,
         resumed: false,
         error_code: None,
+        session_setup_failed: false,
     };
     let result = serde_json::to_string(&result)
         .map_err(|error| HandshakeError::Transport(format!("encode auth_result: {error}")))?;
@@ -1926,6 +2123,19 @@ mod tests {
     }
 
     #[test]
+    fn the_server_hello_says_which_build_is_serving() {
+        let json = server_hello_json(&capabilities(), "someone");
+        let hello: arcen_protocol::messages::ServerHelloMsg =
+            serde_json::from_str(&json).expect("Deck must be able to parse this");
+        let identity = hello
+            .build_identity()
+            .expect("identity decodes")
+            .expect("the macOS Pier advertises its build");
+        assert_eq!(identity.product, "arcen-pier-macos");
+        assert_eq!(identity.version, crate::VERSION);
+    }
+
+    #[test]
     fn the_arranged_panel_takes_the_deck_displays_size_and_name() {
         let monitor = |width_mm: f32, height_mm: f32| arcen_protocol::messages::ClientMonitor {
             id: 1,
@@ -1948,6 +2158,7 @@ mod tests {
         let reported = panel_identity(&monitor(302.0, 196.0), 1800, 1130);
         assert_eq!(reported.size_mm, (302, 196));
         assert_eq!(reported.name, "Built-in Retina Display");
+        assert_eq!(reported.color, None);
         // Without millimetres, the shared rule derives them from the scale.
         let derived = panel_identity(&monitor(0.0, 0.0), 1800, 1130);
         assert_eq!(
@@ -1972,6 +2183,54 @@ mod tests {
         assert!(!hdr_is_proven(true, Some(1.0)), "an SDR display");
         assert!(!hdr_is_proven(true, None), "no reading is not a proof");
         assert!(!hdr_is_proven(false, Some(16.0)), "HDR nobody asked for");
+    }
+
+    #[test]
+    fn hdr_panel_requires_the_deck_display_to_be_hdr() {
+        let monitor_with_color = |color| arcen_protocol::messages::ClientMonitor {
+            id: 1,
+            x: 0,
+            y: 0,
+            width_px: 3600,
+            height_px: 2260,
+            scale: 2.0,
+            refresh_hz: 120,
+            is_primary: true,
+            name: "Deck".to_owned(),
+            width_mm: 0.0,
+            height_mm: 0.0,
+            vendor: 0,
+            model: 0,
+            serial: 0,
+            edid: String::new(),
+            color,
+        };
+        let hdr = monitor_with_color(Some(arcen_protocol::messages::DisplayColorMsg {
+            gamut: arcen_protocol::messages::DisplayGamutMsg::DisplayP3,
+            hdr_headroom: 16.0,
+            ..Default::default()
+        }));
+        let bright_sdr = monitor_with_color(Some(arcen_protocol::messages::DisplayColorMsg {
+            peak_nits: Some(500.0),
+            hdr_headroom: 1.0,
+            ..Default::default()
+        }));
+        assert_eq!(
+            select_virtual_panel(true, false, Some(&hdr)),
+            crate::virtual_display::VirtualPanel::Hdr
+        );
+        assert_eq!(
+            select_virtual_panel(true, false, Some(&bright_sdr)),
+            crate::virtual_display::VirtualPanel::Sdr
+        );
+        assert_eq!(
+            select_virtual_panel(true, false, None),
+            crate::virtual_display::VirtualPanel::Sdr
+        );
+        assert_eq!(
+            select_virtual_panel(true, true, Some(&hdr)),
+            crate::virtual_display::VirtualPanel::Sdr
+        );
     }
 
     #[test]

@@ -508,11 +508,21 @@ fn desired_display_ids(
         .filter(|display| !keep.contains(&display.display_id))
         .filter(|display| {
             display.edid.written_by_arcen
-                || (display.flags.connected && display.edid.byte_length == 0)
+                || (display.flags.connected
+                    && display.edid.byte_length == 0
+                    && !display.flags.physically_connected)
         })
         .map(|display| display.display_id)
         .collect::<Vec<_>>();
     Ok((keep, remove))
+}
+
+fn keep_display_needs_edid_change(
+    display: &DisplayIdEntry,
+    original_edid: Option<&[u8]>,
+    desired_edid: &[u8],
+) -> bool {
+    original_edid != Some(desired_edid) || !display.flags.connected || !display.flags.active
 }
 
 #[cfg(windows)]
@@ -619,11 +629,8 @@ pub(crate) fn prepare_provisioning(
             height: contract.height,
             hdr10: contract.hdr10,
         });
-        recovery_entries.push(recovery.clone());
-        if original_edid.as_deref() != Some(desired_edid.as_slice())
-            || !display.flags.connected
-            || !display.flags.active
-        {
+        if keep_display_needs_edid_change(display, original_edid.as_deref(), &desired_edid) {
+            recovery_entries.push(recovery.clone());
             changes.push(EdidProvisionChange {
                 recovery,
                 desired_edid: Some(desired_edid),
@@ -995,6 +1002,9 @@ pub(crate) fn provision_arcen_edid(
         scale: 1.0,
         product_id: 0x0001,
         serial: 0,
+        // shared-contract colourless-edid: operator provisioning has no Deck
+        // display to lend a per-display colour contract; keep the shared EDID
+        // default.
         color: None,
     };
     // The persistent counterpart to the session-time EDID choice. A session
@@ -1425,6 +1435,9 @@ pub(crate) fn probe(
         scale: 1.0,
         product_id: (request.display_id & 0xffff) as u16,
         serial: request.display_id,
+        // shared-contract colourless-edid: the standalone probe is
+        // operator-driven and not tied to a Deck monitor report, so no client
+        // colour exists to propagate.
         color: None,
     };
     // A 256-byte EDID is exactly MAX_EDID_BYTES, so the HDR10 variant is the
@@ -1852,6 +1865,7 @@ mod tests {
         sticky.edid.byte_length = 0;
         sticky.edid.manufacturer = None;
         sticky.edid.written_by_arcen = false;
+        sticky.flags.physically_connected = false;
         let report = inventory(
             gpu(vec![
                 display(1, 0x800, true),
@@ -1865,6 +1879,32 @@ mod tests {
         let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
         assert_eq!(keep, vec![1]);
         assert_eq!(remove, vec![3]);
+    }
+
+    #[test]
+    fn physical_zero_edid_connector_is_not_removed() {
+        let mut physical = display(3, 0x200, true);
+        physical.edid.status = -121;
+        physical.edid.byte_length = 0;
+        physical.edid.manufacturer = None;
+        physical.edid.written_by_arcen = false;
+        physical.flags.physically_connected = true;
+        let report = inventory(
+            gpu(vec![
+                display(1, 0x800, true),
+                display(2, 0x400, false),
+                physical,
+                display(4, 0x100, false),
+            ]),
+            1,
+        );
+        let gpu = matching_gpu(&report, "GRID RTX6000-8Q").expect("GPU");
+        let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
+        assert_eq!(keep, vec![1]);
+        assert!(
+            remove.is_empty(),
+            "the original active physical no-EDID output is baseline, not a temporary headless EDID"
+        );
     }
 
     #[test]
@@ -1904,6 +1944,35 @@ mod tests {
         let (keep, remove) = desired_display_ids(&report, gpu, 1, None).expect("plan");
         assert_eq!(keep, vec![1]);
         assert_eq!(remove, vec![3]);
+    }
+
+    #[test]
+    fn unchanged_active_keep_head_is_not_a_recovery_entry() {
+        let original_edid = vec![0x42; 128];
+        let display = display(1, 0x800, true);
+        assert!(
+            !keep_display_needs_edid_change(&display, Some(&original_edid), &original_edid),
+            "a real active output whose EDID already matches the contract must not be journalled as a temporary headless EDID"
+        );
+    }
+
+    #[test]
+    fn disconnected_or_different_keep_head_is_a_recovery_entry() {
+        let original_edid = vec![0x42; 128];
+        let desired_edid = vec![0x24; 128];
+        let active = display(1, 0x800, true);
+        assert!(keep_display_needs_edid_change(
+            &active,
+            Some(&original_edid),
+            &desired_edid
+        ));
+
+        let disconnected = display(2, 0x400, false);
+        assert!(keep_display_needs_edid_change(
+            &disconnected,
+            None,
+            &desired_edid
+        ));
     }
 
     fn recovery(

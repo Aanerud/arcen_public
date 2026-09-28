@@ -50,12 +50,13 @@ use arcen_protocol::messages::{CursorMode, MonitorQualityIntentMsg};
 use arcen_telemetry::CorrelationId;
 use thiserror::Error;
 
-use crate::display::topology::{LinuxTopologyPlan, VALID_HEAD_TOKENS};
+use crate::display::topology::LinuxTopologyPlan;
 use crate::logging::target;
 use crate::session::identity::UserExecution;
 
 use super::capenc::{
-    self, CapencConfig, CapencSession, CapencStartError, EncoderSelection, IdrRequester,
+    self, BitrateRequester, CapencConfig, CapencSession, CapencStartError, EncoderSelection,
+    IdrRequester,
 };
 use super::ResolvedMediaPlan;
 
@@ -79,12 +80,16 @@ pub struct MonitorPipelineTemplate {
     pub color_matrix: arcen_media::ColorMatrix,
     pub transfer: arcen_media::TransferCharacteristics,
     pub color_primaries: arcen_media::ColorPrimaries,
+    /// What the desktop's code values mean, the same for every monitor.
+    pub desktop_encoding: arcen_media::video::DesktopSignalEncoding,
     /// Encoder intent for the whole roster.
     ///
     /// Roster-wide rather than per monitor, for the same reason the codec is:
     /// a monitor encoding to a different budget than its peers would make one
     /// screen of a single desktop feel different from the next.
     pub intent: arcen_media::EncodeIntent,
+    /// Motion/detail preference for the whole roster, for the same reason.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// Damage-driven QP biasing for the whole roster.
     pub qp_map: arcen_media::video::QpMapPolicy,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
@@ -224,16 +229,14 @@ const fn dense_output_index(position: usize) -> u32 {
     position as u32
 }
 
-/// Validates that `head` is one of this tranche's recognized `DFP-N`
-/// NvFBC-capable output tokens
-/// ([`crate::display::topology::VALID_HEAD_TOKENS`]).
+/// Validates that `head` is an NVIDIA `DFP-N` NvFBC-capable output token.
 ///
 /// Defensive only: `display::topology::plan_topology` never assigns any
 /// other token, but every field crossing from a topology plan into a
 /// `capenc` launch spec is still explicitly validated here rather than
 /// trusted blindly.
 fn validate_head_token(head: &str) -> Result<(), MultiCapencConfigError> {
-    if VALID_HEAD_TOKENS.contains(&head) {
+    if arcen_outputs::is_nvidia_dfp_head_token(head) {
         Ok(())
     } else {
         Err(MultiCapencConfigError::InvalidHeadToken(head.to_owned()))
@@ -298,6 +301,7 @@ pub fn build_pipeline_specs(
                     color_matrix: template.color_matrix,
                     transfer: template.transfer,
                     color_primaries: template.color_primaries,
+                    desktop_encoding: template.desktop_encoding,
                     video_selection: template.video_selection,
                     codec_pinned: false,
                     variant_pinned: false,
@@ -306,6 +310,7 @@ pub fn build_pipeline_specs(
                     // session, so a monitor added to the roster must not
                     // silently encode to a different budget than its peers.
                     intent: template.intent,
+                    motion_priority: template.motion_priority,
                     qp_map: template.qp_map,
                     width: monitor.width,
                     height: monitor.height,
@@ -589,6 +594,7 @@ impl MultiCapencSupervisor {
                     frames,
                     plan: pipeline.handle.plan,
                     idr: pipeline.handle.session.idr(),
+                    bitrate: pipeline.handle.session.bitrate(),
                 })
             })
             .collect()
@@ -615,6 +621,7 @@ pub struct MonitorFrameSource {
     pub frames: tokio::sync::mpsc::Receiver<crate::media::annexb::AccessUnit>,
     pub plan: ResolvedMediaPlan,
     pub idr: IdrRequester,
+    pub bitrate: BitrateRequester,
 }
 
 /// Typed post-READY rejection: what every started pipeline's own resolved
@@ -735,10 +742,12 @@ mod tests {
             color_matrix: arcen_media::ColorMatrix::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Sdr,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             width: 1920,
             height: 1080,
@@ -809,7 +818,9 @@ mod tests {
             color_matrix: arcen_media::ColorMatrix::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Sdr,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
@@ -849,6 +860,7 @@ mod tests {
         plan: ResolvedMediaPlan,
     ) -> MonitorFrameSource {
         let (idr, _rx) = capenc::test_support::fake_idr();
+        let bitrate = capenc::test_support::fake_bitrate(&idr);
         let (_tx, frames) = tokio::sync::mpsc::channel(1);
         MonitorFrameSource {
             session_monitor_id: sid(session_monitor_id),
@@ -856,6 +868,7 @@ mod tests {
             frames,
             plan,
             idr,
+            bitrate,
         }
     }
 
@@ -863,6 +876,7 @@ mod tests {
     fn validate_head_token_accepts_known_tokens_and_rejects_unknown_ones() {
         assert_eq!(validate_head_token("DFP-0"), Ok(()));
         assert_eq!(validate_head_token("DFP-3"), Ok(()));
+        assert_eq!(validate_head_token("DFP-4"), Ok(()));
         assert_eq!(
             validate_head_token("HDMI-0"),
             Err(MultiCapencConfigError::InvalidHeadToken(

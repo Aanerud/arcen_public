@@ -47,6 +47,7 @@
 
 use std::sync::Arc;
 
+use arcen_media::video::VideoQueueWaitStats;
 use arcen_media::SessionMonitorId;
 use arcen_outputs::FairRoster;
 
@@ -160,6 +161,14 @@ impl MonitorMux {
         self.roster
             .close_and_clear_all(|queue| queue.close_and_clear());
     }
+
+    pub fn take_wait_stats(&self) -> VideoQueueWaitStats {
+        VideoQueueWaitStats::combine(
+            (0..self.roster.len())
+                .filter_map(|index| self.roster.entry(index))
+                .map(|(_, queue)| queue.take_wait_stats()),
+        )
+    }
 }
 
 /// The video delivery path `net::server::sender_loop` drains: either the
@@ -180,6 +189,13 @@ impl VideoSource {
         match self {
             Self::Single(queue) => queue.dequeue().await,
             Self::Muxed(mux) => mux.dequeue().await,
+        }
+    }
+
+    pub fn take_wait_stats(&self) -> VideoQueueWaitStats {
+        match self {
+            Self::Single(queue) => queue.take_wait_stats(),
+            Self::Muxed(mux) => mux.take_wait_stats(),
         }
     }
 }

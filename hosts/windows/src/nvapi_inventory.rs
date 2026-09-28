@@ -2259,6 +2259,8 @@ mod tests {
             scale: 1.0,
             product_id: 0x0000,
             serial: 1,
+            // Inventory summarization decodes existing EDID bytes; this test
+            // fixture is not a Deck-backed session display.
             color: None,
         })
         .expect("generate an Arcen EDID");
@@ -2310,6 +2312,8 @@ mod tests {
             scale: 1.0,
             product_id: 0x0001,
             serial: 0x0dad_beef,
+            // Inventory summarization decodes existing EDID bytes; this test
+            // fixture is not a Deck-backed session display.
             color: None,
         })
         .expect("generate an Arcen EDID");

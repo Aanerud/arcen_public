@@ -1,6 +1,6 @@
 [package]
 name = "arcen-capenc"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -34,6 +34,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",          # HMONITOR in DXGI_OUTPUT_DESC gates GetDesc
     # QueryDisplayConfig / DisplayConfigGetDeviceInfo: asks Windows whether an

@@ -135,6 +135,36 @@ pub enum CaptureBackend {
     PipeWire,
 }
 
+/// Where capture-to-encoder pixel conversion ran for this stream.
+///
+/// Separate from [`CaptureBackend`]: DDA and WGC can both deliver D3D11
+/// textures, but a session may either submit that texture directly to NVENC
+/// or map it back to the CPU for shared colour conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionBackend {
+    Gpu,
+    Cpu,
+}
+
+impl ConversionBackend {
+    #[must_use]
+    pub const fn ready_token(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        match value {
+            "gpu" => Some(Self::Gpu),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
+    }
+}
+
 impl CaptureBackend {
     /// Stable wire token. Kept separate from `Debug` so renaming a variant
     /// cannot silently change the protocol.
@@ -166,17 +196,17 @@ impl CaptureBackend {
 
     /// Whether frames reach the encoder without a host round trip.
     ///
-    /// `NvFBC` grabs straight into CUDA device memory and Desktop Duplication
-    /// yields a D3D11 texture the encoder can read in place. `XShm` copies
-    /// through shared host memory, and WGC is treated as a copy because the
-    /// production path stages its frames rather than encoding them in place.
+    /// `NvFBC` grabs straight into CUDA device memory; Desktop Duplication
+    /// and WGC yield D3D11 textures. Whether a later colour conversion maps
+    /// those textures back to the CPU is reported separately as
+    /// `conversion_backend`.
     #[must_use]
     pub const fn zero_copy(self) -> bool {
         match self {
-            Self::NvFbc | Self::DesktopDuplication => true,
+            Self::NvFbc | Self::DesktopDuplication | Self::WindowsGraphicsCapture => true,
             // The PipeWire path proven so far copies frames through host
             // memory; DMA-BUF import into CUDA is what would make it zero-copy.
-            Self::XShm | Self::WindowsGraphicsCapture | Self::PipeWire => false,
+            Self::XShm | Self::PipeWire => false,
         }
     }
 }
@@ -1186,6 +1216,7 @@ pub fn parse_ready_v1(
     // it with `parse_ready_capture`.
     let _ = fields.remove("capture");
     let _ = fields.remove("capture_zero_copy");
+    let _ = fields.remove("conversion_backend");
     if !fields.is_empty() {
         return Err(ReadyProtocolError::UnknownFields(
             fields.keys().copied().collect::<Vec<_>>().join(","),
@@ -1317,6 +1348,17 @@ pub fn format_ready_v1_with_capture(
     capture: Option<CaptureBackend>,
     session_log_id: Option<&str>,
 ) -> String {
+    format_ready_v1_with_capture_and_conversion(plan, capture, None, session_log_id)
+}
+
+/// Format the canonical READY line with optional capture and conversion paths.
+#[must_use]
+pub fn format_ready_v1_with_capture_and_conversion(
+    plan: ResolvedMediaPlan,
+    capture: Option<CaptureBackend>,
+    conversion: Option<ConversionBackend>,
+    session_log_id: Option<&str>,
+) -> String {
     let sid = session_log_id.map_or_else(String::new, |value| format!(" sid={value}"));
     let capture = capture.map_or_else(String::new, |backend| {
         format!(
@@ -1325,11 +1367,14 @@ pub fn format_ready_v1_with_capture(
             backend.zero_copy()
         )
     });
+    let conversion = conversion.map_or_else(String::new, |backend| {
+        format!(" conversion_backend={}", backend.ready_token())
+    });
     format!(
         "{READY_PREFIX}version={READY_VERSION} backend={} codec={} chroma={} bit_depth={} \
 range={} matrix={} primaries={} transfer={} width={} height={} fps={} \
 supports_h264={} supports_h265={} supports_yuv444={} supports_main10={} \
-supports_full_range={} cursor={}{}{}",
+supports_full_range={} cursor={}{}{}{}",
         plan.backend.ready_token(),
         plan.codec_token(),
         plan.chroma_token(),
@@ -1351,6 +1396,7 @@ supports_full_range={} cursor={}{}{}",
             CursorMode::Host => "host",
         },
         capture,
+        conversion,
         sid
     )
 }
@@ -1371,6 +1417,15 @@ pub fn parse_ready_capture(line: &str) -> Option<CaptureBackend> {
         .split_ascii_whitespace()
         .find_map(|token| token.strip_prefix("capture="))
         .and_then(CaptureBackend::from_token)
+}
+
+/// Read the conversion backend named by a READY line, when present.
+#[must_use]
+pub fn parse_ready_conversion(line: &str) -> Option<ConversionBackend> {
+    line.strip_prefix(READY_PREFIX)?
+        .split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("conversion_backend="))
+        .and_then(ConversionBackend::from_token)
 }
 
 /// Format a canonical typed pre-READY unavailability notice.
@@ -2178,6 +2233,26 @@ mod tests {
             "naming the capture path must not change the video contract"
         );
         assert_eq!(parse_ready_capture(&line), Some(CaptureBackend::XShm));
+
+        let line = format_ready_v1_with_capture_and_conversion(
+            plan,
+            Some(CaptureBackend::WindowsGraphicsCapture),
+            Some(ConversionBackend::Gpu),
+            Some(sid),
+        );
+        assert_eq!(
+            parse_ready_v1(
+                &line,
+                ReadyExpectation {
+                    request: REQUEST,
+                    allowed_backends: &[EncoderBackend::OpenH264],
+                    session_log_id: Some(sid),
+                }
+            )
+            .expect("a conversion-naming READY line must parse"),
+            plan
+        );
+        assert_eq!(parse_ready_conversion(&line), Some(ConversionBackend::Gpu));
     }
 
     /// The other direction: an older capenc names nothing, and that must read
@@ -2229,8 +2304,8 @@ mod tests {
         // The distinction the field exists to record.
         assert!(CaptureBackend::NvFbc.zero_copy());
         assert!(CaptureBackend::DesktopDuplication.zero_copy());
+        assert!(CaptureBackend::WindowsGraphicsCapture.zero_copy());
         assert!(!CaptureBackend::XShm.zero_copy());
-        assert!(!CaptureBackend::WindowsGraphicsCapture.zero_copy());
         assert!(!CaptureBackend::PipeWire.zero_copy());
     }
 }

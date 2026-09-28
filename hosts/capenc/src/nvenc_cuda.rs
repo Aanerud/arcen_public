@@ -49,7 +49,8 @@ use crate::linux::NativeStartupError;
 use arcen_keel::BgraFrame;
 use arcen_media::video::{
     convert_bgra_to_i444_p16, convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
-    BackendUnavailableReason, ColorTransform, I444P16FrameMut, PackedRgb10Layout,
+    BackendUnavailableReason, ColorTransform, I444P16FrameMut, MotionPriority, PackedRgb10Layout,
+    Rgb10Signal,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -118,6 +119,12 @@ pub struct Encoder {
     inflight: std::collections::VecDeque<(usize, NV_ENC_INPUT_PTR)>,
     write_idx: usize,
     drain_policy: crate::nvenc_policy::OutputDrainPolicy,
+    encode_guid: GUID,
+    preset_guid: GUID,
+    tuning: NV_ENC_TUNING_INFO,
+    reconfig_config: NV_ENC_CONFIG,
+    frame_rate: u32,
+    vbv_buffer_frames: f64,
     width: u32,
     height: u32,
     frame_bytes: usize,
@@ -136,6 +143,9 @@ pub struct Encoder {
     /// ST 2084. Keeping that choice in the encoder prevents READY/VUI colour
     /// metadata from drifting away from the pixels staged into NVENC.
     wide_transform: ColorTransform,
+    /// What the wide source's codes mean relative to the session contract:
+    /// direct, or Rec.2100 PQ converted to BT.709 SDR (the shared desktop rule).
+    wide_signal: Rgb10Signal,
     /// DtoH scratch: NvFBC's raw BGRA source, copied off the device once per
     /// `stage()` call so `arcen_media`'s conversion can run on the CPU (see
     /// the module doc's w2-10bit note). Resized lazily on first use to
@@ -782,50 +792,49 @@ impl WideSource {
     }
 }
 
+impl WideSource {
+    /// What this source's code values mean, for the shared desktop rule.
+    const fn signal_encoding(self) -> arcen_media::video::DesktopSignalEncoding {
+        match self {
+            Self::XorgDepth30 => arcen_media::video::DesktopSignalEncoding::Sdr,
+            Self::ColorManagedPq | Self::XorgDeclaredPq => {
+                arcen_media::video::DesktopSignalEncoding::Rec2100Pq
+            }
+        }
+    }
+}
+
+/// The matrix and the source conversion for a wide frame, from the shared
+/// desktop rule ([`arcen_media::video::conversion_for_output`]). A contract
+/// that rule never produces for this source is refused rather than encoded.
 fn wide_transform(
     color: crate::ColorSpec,
     source: WideSource,
-) -> Result<ColorTransform, NativeStartupError> {
-    let transform = || {
+) -> Result<(ColorTransform, Rgb10Signal), NativeStartupError> {
+    let signal = arcen_media::video::conversion_for_output(
+        source.signal_encoding(),
+        color.transfer,
+        color.primaries,
+        color.matrix,
+    )
+    .ok_or_else(|| NativeStartupError::Unavailable {
+        reason: BackendUnavailableReason::UnsupportedConfiguration,
+        detail: format!(
+            "a {source:?} source cannot be encoded as {:?} / {:?} / {:?}: a PQ source keeps \
+             PQ / BT.2020 / BT.2020 NCL or converts to BT.709 SDR, and an SDR Xorg desktop has \
+             no HDR composition space",
+            color.transfer, color.primaries, color.matrix
+        ),
+    })?;
+    Ok((
         ColorTransform::for_input_max(
             color.matrix,
             color.range,
             color.bit_depth,
             f64::from(arcen_media::video::WIDE_INPUT_MAX),
-        )
-    };
-    if matches!(
-        source,
-        WideSource::ColorManagedPq | WideSource::XorgDeclaredPq
-    ) {
-        return match (color.transfer, color.primaries, color.matrix) {
-            (TransferCharacteristics::Pq, ColorPrimaries::Bt2020, ColorMatrix::Bt2020Ncl) => {
-                Ok(transform())
-            }
-            _ => Err(NativeStartupError::Unavailable {
-                reason: BackendUnavailableReason::UnsupportedConfiguration,
-                detail: format!(
-                    "a PQ / BT.2020 compositor stream can only be encoded as PQ / BT.2020 / \
-                     BT.2020 NCL, not {:?} / {:?} / {:?}",
-                    color.transfer, color.primaries, color.matrix
-                ),
-            }),
-        };
-    }
-    match (color.transfer, color.primaries) {
-        (TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb, ColorPrimaries::Bt709) => {
-            Ok(transform())
-        }
-        _ => Err(NativeStartupError::Unavailable {
-            reason: BackendUnavailableReason::UnsupportedConfiguration,
-            detail: format!(
-                "Linux Xorg capture provides a 10-bit SDR/BT.709 desktop, not an HDR composition \
-                 space; {:?} primaries with {:?} transfer require the future color-managed \
-                 Wayland provider",
-                color.primaries, color.transfer
-            ),
-        }),
-    }
+        ),
+        signal,
+    ))
 }
 
 impl Encoder {
@@ -845,6 +854,7 @@ impl Encoder {
         codec: &str,
         color: crate::ColorSpec,
         intent: EncodeIntent,
+        priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
     ) -> Result<Self, NativeStartupError> {
         Self::new_for_source(
@@ -854,6 +864,7 @@ impl Encoder {
             codec,
             color,
             intent,
+            priority,
             qp_map_policy,
             WideSource::XorgDepth30,
         )
@@ -868,6 +879,7 @@ impl Encoder {
         codec: &str,
         color: crate::ColorSpec,
         intent: EncodeIntent,
+        priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
         wide_source: WideSource,
     ) -> Result<Self, NativeStartupError> {
@@ -883,11 +895,17 @@ impl Encoder {
                 detail: rejection.to_string(),
             }
         })?;
-        let wide_transform = if format.needs_own_conversion() {
+        let (wide_transform, wide_signal) = if format.needs_own_conversion() {
             wide_transform(color, wide_source)?
         } else {
-            color.transform()
+            (color.transform(), Rgb10Signal::Direct)
         };
+        if wide_signal != Rgb10Signal::Direct {
+            crate::log(&format!(
+                "wide source {wide_source:?} is converted with {wide_signal:?} for {:?} / {:?}",
+                color.transfer, color.primaries
+            ));
+        }
         let lib =
             dl::open("libnvidia-encode.so.1").map_err(|error| NativeStartupError::Unavailable {
                 reason: BackendUnavailableReason::RuntimeMissing,
@@ -1199,6 +1217,7 @@ impl Encoder {
             60,
             color.chroma,
             color.bit_depth,
+            priority,
             intent,
         );
         preset.presetCfg.rcParams.averageBitRate = sizing.average_bitrate_bps;
@@ -1354,6 +1373,12 @@ impl Encoder {
             inflight: std::collections::VecDeque::with_capacity(drain_policy.max_inflight()),
             write_idx: 0,
             drain_policy,
+            encode_guid: codec_guid,
+            preset_guid,
+            tuning,
+            reconfig_config: preset.presetCfg,
+            frame_rate: 60,
+            vbv_buffer_frames: crate::nvenc_policy::vbv_buffer_frames(priority, intent),
             width,
             height,
             frame_bytes,
@@ -1362,6 +1387,7 @@ impl Encoder {
             plane_count,
             transform: color.transform(),
             wide_transform,
+            wide_signal,
             host_src: Vec::new(),
             host_dst,
             conversion_workers,
@@ -1428,6 +1454,60 @@ impl Encoder {
             registered: reg.registeredResource,
             bitstream: bb.bitstreamBuffer,
         })
+    }
+
+    /// Reconfigures NVENC's nominal frame rate, preserving the current bitrate.
+    pub fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), String> {
+        self.frame_rate = fps.max(1);
+        let bitrate = self.reconfig_config.rcParams.averageBitRate;
+        self.reconfigure_bitrate(u64::from(bitrate))
+    }
+
+    /// Reconfigures NVENC's average/max bitrate and VBV without forcing an IDR.
+    pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
+        let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
+        let vbv = ((f64::from(bitrate) / f64::from(self.frame_rate.max(1)))
+            * self.vbv_buffer_frames)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let mut config = self.reconfig_config;
+        config.rcParams.averageBitRate = bitrate;
+        config.rcParams.maxBitRate = bitrate;
+        config.rcParams.vbvBufferSize = vbv;
+        config.rcParams.vbvInitialDelay = vbv;
+        let mut init: NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
+        init.version = NV_ENC_INITIALIZE_PARAMS_VER;
+        init.encodeGUID = self.encode_guid;
+        init.presetGUID = self.preset_guid;
+        init.encodeWidth = self.width;
+        init.encodeHeight = self.height;
+        init.darWidth = self.width;
+        init.darHeight = self.height;
+        init.frameRateNum = self.frame_rate;
+        init.frameRateDen = 1;
+        init.enablePTD = 1;
+        init.tuningInfo = self.tuning;
+        init.encodeConfig = &mut config;
+        let mut params: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+        params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        params.reInitEncodeParams = init;
+        params.set_resetEncoder(0);
+        params.set_forceIDR(0);
+        let reconfigure = self
+            .fl
+            .nvEncReconfigureEncoder
+            .ok_or_else(|| "missing nvEncReconfigureEncoder".to_owned())?;
+        let status = unsafe { reconfigure(self.enc, &mut params) };
+        if status != NV_ENC_SUCCESS {
+            return Err(format!(
+                "NvEncReconfigureEncoder bitrate={bitrate}: {status:?}"
+            ));
+        }
+        self.reconfig_config = config;
+        crate::log(&format!(
+            "NVENC CUDA live bitrate reconfigured: average={bitrate} max={bitrate} vbv_bits={vbv}"
+        ));
+        Ok(())
     }
 
     /// Copy the source frame (NvFBC's shared buffer, or a synthetic
@@ -1546,6 +1626,7 @@ impl Encoder {
                     self.height as usize,
                     layout,
                     self.wide_transform,
+                    self.wide_signal,
                     self.conversion_workers,
                 )?;
             }
@@ -1562,6 +1643,7 @@ impl Encoder {
                     self.height as usize,
                     layout,
                     self.wide_transform,
+                    self.wide_signal,
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -1888,6 +1970,7 @@ struct PackedRgb10ConversionJob<'source, 'destination> {
     height: usize,
     layout: PackedRgb10Layout,
     transform: ColorTransform,
+    signal: Rgb10Signal,
 }
 
 impl PackedRgb10ConversionJob<'_, '_> {
@@ -1901,6 +1984,7 @@ impl PackedRgb10ConversionJob<'_, '_> {
             self.height,
             self.layout,
             self.transform,
+            self.signal,
         )
         .map_err(|error| error.to_string())
     }
@@ -1916,6 +2000,7 @@ fn convert_packed_rgb10_to_i444_p16_parallel(
     height: usize,
     layout: PackedRgb10Layout,
     transform: ColorTransform,
+    signal: Rgb10Signal,
     workers: usize,
 ) -> Result<(), String> {
     let row_bytes = width
@@ -1965,6 +2050,7 @@ fn convert_packed_rgb10_to_i444_p16_parallel(
             height: rows,
             layout,
             transform,
+            signal,
         });
         first_row = last_row;
     }
@@ -2228,11 +2314,22 @@ mod pixel_format_tests {
         };
         assert!(wide_transform(hlg, WideSource::XorgDepth30).is_err());
 
-        // A colour-managed PQ stream may be encoded as exactly PQ / BT.2020,
-        // and never relabelled as SDR, nor Xorg's SDR as PQ.
-        assert!(wide_transform(hdr, WideSource::ColorManagedPq).is_ok());
+        // A colour-managed PQ stream is encoded as exactly PQ / BT.2020, or
+        // converted to BT.709 SDR; it is never relabelled, nor Xorg's SDR as PQ.
+        let signal = |color, source| wide_transform(color, source).map(|(_, signal)| signal);
+        assert_eq!(
+            signal(hdr, WideSource::ColorManagedPq).ok(),
+            Some(Rgb10Signal::Direct)
+        );
         assert!(wide_transform(hlg, WideSource::ColorManagedPq).is_err());
-        assert!(wide_transform(grading, WideSource::ColorManagedPq).is_err());
+        assert_eq!(
+            signal(grading, WideSource::ColorManagedPq).ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrBt709)
+        );
+        assert_eq!(
+            signal(grading, WideSource::XorgDepth30).ok(),
+            Some(Rgb10Signal::Direct)
+        );
         let wrong_matrix = crate::ColorSpec {
             matrix: ColorMatrix::Bt709,
             ..hdr
@@ -2241,8 +2338,15 @@ mod pixel_format_tests {
 
         // A declared PQ desktop obeys the same rule, and only a declaration
         // turns Xorg's codes into PQ.
-        assert!(wide_transform(hdr, WideSource::XorgDeclaredPq).is_ok());
-        assert!(wide_transform(grading, WideSource::XorgDeclaredPq).is_err());
+        assert_eq!(
+            signal(hdr, WideSource::XorgDeclaredPq).ok(),
+            Some(Rgb10Signal::Direct)
+        );
+        assert_eq!(
+            signal(grading, WideSource::XorgDeclaredPq).ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrBt709),
+            "an SDR session on a PQ desktop is converted, not shown as dim SDR"
+        );
         assert!(wide_transform(hlg, WideSource::XorgDeclaredPq).is_err());
         assert_eq!(
             WideSource::xorg(arcen_media::video::DesktopSignalEncoding::Sdr),
@@ -2887,6 +2991,7 @@ mod write_owned_from_bgra_tests {
             height,
             layout,
             transform,
+            Rgb10Signal::Direct,
         )
         .unwrap();
 
@@ -2901,6 +3006,7 @@ mod write_owned_from_bgra_tests {
             height,
             layout,
             transform,
+            Rgb10Signal::Direct,
             4,
         )
         .unwrap();

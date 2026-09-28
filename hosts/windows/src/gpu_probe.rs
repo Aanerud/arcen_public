@@ -225,6 +225,68 @@ pub fn probe() -> Result<HostCapabilityReport, String> {
     })
 }
 
+pub fn adapter_selection_inventory(
+    output_selector: &crate::display::OutputSelector,
+    nvapi: Option<&crate::nvapi_inventory::NvapiInventoryReport>,
+) -> Result<Vec<arcen_outputs::WindowsMultiMonitorAdapter>, String> {
+    let report = probe()?;
+    Ok(adapter_selection_inventory_from_report(
+        &report,
+        output_selector,
+        nvapi,
+    ))
+}
+
+pub fn adapter_selection_inventory_from_report(
+    report: &HostCapabilityReport,
+    output_selector: &crate::display::OutputSelector,
+    nvapi: Option<&crate::nvapi_inventory::NvapiInventoryReport>,
+) -> Vec<arcen_outputs::WindowsMultiMonitorAdapter> {
+    report
+        .adapters
+        .iter()
+        .map(|adapter| arcen_outputs::WindowsMultiMonitorAdapter {
+            description: adapter.description.clone(),
+            vendor_id: adapter.vendor_id,
+            nvenc_capable: adapter.direct_nvenc_candidate,
+            grid_or_quadro_class: nvapi
+                .is_some_and(|inventory| nvapi_headless_capable(adapter, inventory)),
+            desktop_owner: adapter_owns_selector(adapter, output_selector),
+            dxgi_index: adapter.dxgi_index,
+        })
+        .collect()
+}
+
+fn adapter_owns_selector(
+    adapter: &AdapterCapability,
+    output_selector: &crate::display::OutputSelector,
+) -> bool {
+    match output_selector {
+        crate::display::OutputSelector::GlobalIndex(index) => adapter
+            .outputs
+            .iter()
+            .any(|output| output.attached_global_index == Some(*index)),
+        crate::display::OutputSelector::Adapter { name, .. } => {
+            name.eq_ignore_ascii_case(&adapter.description)
+        }
+    }
+}
+
+fn nvapi_headless_capable(
+    adapter: &AdapterCapability,
+    inventory: &crate::nvapi_inventory::NvapiInventoryReport,
+) -> bool {
+    if adapter.vendor_id != 0x10de {
+        return false;
+    }
+    let Ok(luid) = parse_session_luid(&adapter.session_luid) else {
+        return false;
+    };
+    inventory.gpus.iter().any(|gpu| {
+        gpu.adapter_luid == Some(luid) && gpu.quadro.unwrap_or(false) && gpu.displays.len() >= 2
+    })
+}
+
 fn enumerate_adapters(
     ccd: &HashMap<String, CcdTarget>,
     nvenc_runtime_dll: bool,
@@ -606,9 +668,10 @@ pub fn physical_output_inventory(
     let mut outputs = Vec::new();
     for adapter in report.adapters {
         if adapter.d3d11_feature_level.is_none()
-            || !allowed_adapters
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&adapter.description))
+            || (!allowed_adapters.is_empty()
+                && !allowed_adapters
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&adapter.description)))
         {
             continue;
         }
@@ -687,7 +750,7 @@ pub fn physical_output_inventory(
     }
     if outputs.is_empty() {
         return Err(format!(
-            "no attached capture-capable outputs matched allowed adapters {allowed_adapters:?}"
+            "no attached capture-capable outputs matched adapter filter {allowed_adapters:?}"
         ));
     }
     outputs.sort_by_key(|output| (!output.primary, output.global_index));

@@ -103,7 +103,7 @@ impl MultiMonitorGate {
     /// config section.
     #[must_use]
     pub const fn from_config(config: &WindowsMultiMonitorConfig) -> Self {
-        let max_monitors = if config.nvidia_headless_enabled {
+        let max_monitors = if config.nvidia_headless_effective() {
             Some(match config.max_monitors {
                 Some(configured) => {
                     if configured < MAX_NVIDIA_HEADLESS_MONITORS {
@@ -517,6 +517,7 @@ pub fn build_applied_capability(
     carrier: MultiMonitorCarrierMsg,
     media: &[(SessionMonitorId, ResolvedMediaPlan)],
     negotiated: &RegionMediaRoster,
+    degradation_reason: Option<&'static str>,
 ) -> Result<ServerMultiMonitorMsg, AppliedCapabilityError> {
     // Unlike a dedicated server-side topology, Windows describes the physical
     // desktop as the interactive session already laid it out, so its origin
@@ -524,7 +525,7 @@ pub fn build_applied_capability(
     // shift that normalises it.
     let translation = OriginTranslation::to_origin(plan.desktop_x, plan.desktop_y);
     let descriptors = assemble_applied_regions(
-        &WindowsAppliedRegions,
+        &WindowsAppliedRegions { degradation_reason },
         &plan.monitors,
         media,
         negotiated,
@@ -572,7 +573,9 @@ fn monitor_translation_overflow() -> AppliedCapabilityError {
 /// Everything here is wire glue this crate owns: the protocol descriptor
 /// shape, the `client_display_id` re-validation, this host's real
 /// per-monitor `refresh_hz`, and its own coordinate-overflow evidence.
-struct WindowsAppliedRegions;
+struct WindowsAppliedRegions {
+    degradation_reason: Option<&'static str>,
+}
 
 impl AppliedRegionAssembler for WindowsAppliedRegions {
     type Region = WindowsMonitorPlan;
@@ -632,7 +635,8 @@ impl AppliedRegionAssembler for WindowsAppliedRegions {
                 // here, so plan and wire cannot diverge.
                 bitrate_kbps: region.bitrate_kbps(),
                 cursor_mode: resolved.cursor_mode,
-                degraded: false,
+                degraded: self.degradation_reason.is_some(),
+                degradation_reason: self.degradation_reason.unwrap_or_default().to_owned(),
             },
         })
     }
@@ -956,7 +960,7 @@ mod tests {
         let config = WindowsMultiMonitorConfig {
             advertise_enabled: true,
             max_monitors: None,
-            nvidia_headless_enabled: true,
+            nvidia_headless_enabled: Some(true),
             ..WindowsMultiMonitorConfig::default()
         };
         let gate = MultiMonitorGate::from_config(&config);
@@ -968,7 +972,7 @@ mod tests {
         let lower = MultiMonitorGate::from_config(&WindowsMultiMonitorConfig {
             advertise_enabled: true,
             max_monitors: Some(1),
-            nvidia_headless_enabled: true,
+            nvidia_headless_enabled: Some(true),
             ..WindowsMultiMonitorConfig::default()
         });
         assert_eq!(build_offer(&lower).unwrap().max_monitors(), 1);
@@ -976,7 +980,7 @@ mod tests {
         let excessive = MultiMonitorGate::from_config(&WindowsMultiMonitorConfig {
             advertise_enabled: true,
             max_monitors: Some(4),
-            nvidia_headless_enabled: true,
+            nvidia_headless_enabled: Some(true),
             ..WindowsMultiMonitorConfig::default()
         });
         assert_eq!(
@@ -1375,7 +1379,7 @@ mod tests {
         }
         let negotiated = negotiated_roster(&plan, budget);
 
-        let capability = build_applied_capability(&plan, carrier, &media, &negotiated)
+        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None)
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1417,7 +1421,7 @@ mod tests {
         let negotiated =
             negotiated_roster(&plan, arcen_media::BitrateBudgetKbps::NOMINAL_FLOOR_KBPS);
 
-        let capability = build_applied_capability(&plan, carrier, &media, &negotiated)
+        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None)
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1439,7 +1443,7 @@ mod tests {
         let negotiated =
             negotiated_roster(&plan, arcen_media::BitrateBudgetKbps::NOMINAL_FLOOR_KBPS);
 
-        let error = build_applied_capability(&plan, carrier, &media, &negotiated)
+        let error = build_applied_capability(&plan, carrier, &media, &negotiated, None)
             .expect_err("must fail when a monitor's media plan is missing");
         assert!(matches!(error, AppliedCapabilityError::MissingMediaPlan(_)));
     }
@@ -1599,6 +1603,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             encoder: Some(crate::capenc::EncoderSelection::SoftwareH264),

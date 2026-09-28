@@ -3,7 +3,8 @@
 use arcen_input::{
     PenTool, RegionInputDecodeError, RegionInputEvent, RegionInputWireError,
     RegionInputWireMessage, RegionInputWireRef, RegionLogicalPosition, RegionPenSample,
-    domain_generation, domain_pen_tool, domain_position, wire_pen_tool, wire_position,
+    ScrollPhase, ScrollUnit, domain_generation, domain_pen_tool, domain_position, wire_pen_tool,
+    wire_position,
 };
 use arcen_media::{LogicalPoint, RegionContractError, RegionGeneration, RegionId};
 use arcen_protocol::messages::{
@@ -11,6 +12,7 @@ use arcen_protocol::messages::{
     REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL, RegionInputMetadataMsg,
     RegionInputPositionMsg, RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg,
     RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
+    ScrollPhaseMsg, ScrollUnitMsg,
 };
 
 const CROSS_COMPONENT_BASELINE: &str = include_str!(concat!(
@@ -80,6 +82,8 @@ fn every_event() -> Vec<(RegionInputEvent, u64, bool)> {
                 position: position(60, 1_440),
                 delta_x: 120,
                 delta_y: -240,
+                unit: ScrollUnit::Point,
+                phase: ScrollPhase::Changed,
                 sequence: 43,
             },
             9_003,
@@ -356,6 +360,8 @@ fn every_message_kind_rejects_the_same_zero_region_identity() {
         position,
         delta_x: 0,
         delta_y: 0,
+        unit: ScrollUnitMsg::Line,
+        phase: ScrollPhaseMsg::None,
         metadata,
     };
     let pen = RegionPenEventMsg {

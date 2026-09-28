@@ -1326,7 +1326,7 @@ unsafe fn run_encode(
     let control = crate::spawn_control_thread("NVENC");
 
     let mut stdout = std::io::stdout();
-    let target_dt = crate::frame_interval_from_fps(fps);
+    let mut target_dt = crate::frame_interval_from_fps(fps);
     let mut next = Instant::now();
     let mut latest_frame = None;
     let mut announced_layout = false;
@@ -1393,6 +1393,17 @@ unsafe fn run_encode(
                 let force = mode == SubmissionMode::FirstFrame || requested_idr;
                 if requested_idr && mode != SubmissionMode::FirstFrame {
                     log("consuming IDR request");
+                }
+                if let Some(fps) = control.take_framerate_fps() {
+                    target_dt = crate::frame_interval_from_fps(fps);
+                    if let Err(error) = encoder.reconfigure_framerate(fps) {
+                        log_error(&format!("live framerate reconfigure failed: {error}"));
+                    }
+                }
+                if let Some(bps) = control.take_bitrate_bps() {
+                    if let Err(error) = encoder.reconfigure_bitrate(bps) {
+                        log_error(&format!("live bitrate reconfigure failed: {error}"));
+                    }
                 }
 
                 let t0 = Instant::now();
@@ -1508,7 +1519,7 @@ unsafe fn run_wide_encode(
     ));
     let control = crate::spawn_control_thread("NVENC-XShm");
     let mut stdout = std::io::stdout();
-    let target_dt = crate::frame_interval_from_fps(fps);
+    let mut target_dt = crate::frame_interval_from_fps(fps);
     let mut next = Instant::now();
     let mut submission_gate = SubmissionGate::new(IDLE_KEEPALIVE);
     submission_gate.note_frame();
@@ -1604,6 +1615,17 @@ unsafe fn run_wide_encode(
                 let force = mode == SubmissionMode::FirstFrame || requested_idr;
                 if requested_idr && mode != SubmissionMode::FirstFrame {
                     log("consuming IDR request");
+                }
+                if let Some(fps) = control.take_framerate_fps() {
+                    target_dt = crate::frame_interval_from_fps(fps);
+                    if let Err(error) = encoder.reconfigure_framerate(fps) {
+                        log_error(&format!("live framerate reconfigure failed: {error}"));
+                    }
+                }
+                if let Some(bps) = control.take_bitrate_bps() {
+                    if let Err(error) = encoder.reconfigure_bitrate(bps) {
+                        log_error(&format!("live bitrate reconfigure failed: {error}"));
+                    }
                 }
 
                 let encode_started = Instant::now();
@@ -1709,6 +1731,7 @@ unsafe fn run_selftest(
     h: u32,
     color: crate::ColorSpec,
     intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
     yuv444: bool,
     framed: bool,
@@ -1731,6 +1754,7 @@ unsafe fn run_selftest(
         codec,
         color,
         intent,
+        priority,
         qp_map_policy,
     ) {
         Ok(e) => e,
@@ -1748,7 +1772,7 @@ unsafe fn run_selftest(
     ));
 
     let mut stdout = std::io::stdout();
-    let target_dt = Duration::from_micros(16_666);
+    let mut target_dt = Duration::from_micros(16_666);
     let mut next = Instant::now();
     let mut frame = 0u32;
     let mut sec = Instant::now();
@@ -1816,15 +1840,25 @@ unsafe fn run_selftest(
 /// unknown token fails closed rather than guessing.
 fn desktop_encoding_from_args(
     args: &[String],
+    bit_depth: arcen_media::BitDepth,
 ) -> Result<arcen_media::video::DesktopSignalEncoding, String> {
-    match args
+    let encoding = match args
         .iter()
         .find_map(|arg| arg.strip_prefix("desktop-encoding="))
     {
-        None => Ok(arcen_media::video::DesktopSignalEncoding::Sdr),
+        None => arcen_media::video::DesktopSignalEncoding::Sdr,
         Some(token) => arcen_media::video::DesktopSignalEncoding::from_token(token)
-            .ok_or_else(|| format!("unknown desktop-encoding={token}")),
+            .ok_or_else(|| format!("unknown desktop-encoding={token}"))?,
+    };
+    // The eight-bit NvFBC path has no conversion stage, so it would show PQ
+    // code values as SDR. The Pier refuses these sessions; this is the
+    // helper's own guard in case one is ever launched anyway.
+    if encoding == arcen_media::video::DesktopSignalEncoding::Rec2100Pq
+        && bit_depth == arcen_media::BitDepth::Eight
+    {
+        return Err(arcen_media::video::DesktopPlanError::EightBitOnPqDesktop.to_string());
     }
+    Ok(encoding)
 }
 
 /// One frame of the experimental colour-managed capture pipe: the header a
@@ -1892,6 +1926,7 @@ unsafe fn run_rgb10_pipe(
     codec: &str,
     color: crate::ColorSpec,
     intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
     framed: bool,
     fps: u32,
@@ -1947,6 +1982,7 @@ unsafe fn run_rgb10_pipe(
         codec,
         color,
         intent,
+        priority,
         qp_map_policy,
         crate::nvenc_cuda::WideSource::ColorManagedPq,
     ) {
@@ -1988,6 +2024,16 @@ unsafe fn run_rgb10_pipe(
         let requested_idr = control.idr_pending() && control.take_idr();
         if requested_idr && frames != 0 {
             log("consuming IDR request");
+        }
+        if let Some(fps) = control.take_framerate_fps() {
+            if let Err(error) = encoder.reconfigure_framerate(fps) {
+                log_error(&format!("live framerate reconfigure failed: {error}"));
+            }
+        }
+        if let Some(bps) = control.take_bitrate_bps() {
+            if let Err(error) = encoder.reconfigure_bitrate(bps) {
+                log_error(&format!("live bitrate reconfigure failed: {error}"));
+            }
         }
         match encoder.encode(frames == 0 || requested_idr) {
             Ok(Some(au)) => {
@@ -2048,6 +2094,7 @@ unsafe fn run_admission_probe(
     codec: &str,
     color: crate::ColorSpec,
     intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
     yuv444: bool,
     options: &crate::admission_probe::AdmissionProbeOptions,
@@ -2084,6 +2131,7 @@ unsafe fn run_admission_probe(
         codec,
         color,
         intent,
+        priority,
         qp_map_policy,
     ) {
         Ok(encoder) => encoder,
@@ -2142,6 +2190,7 @@ unsafe fn run_wide_admission_probe(
     codec: &str,
     color: crate::ColorSpec,
     intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
     options: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
@@ -2162,6 +2211,7 @@ unsafe fn run_wide_admission_probe(
         codec,
         color,
         intent,
+        priority,
         qp_map_policy,
     ) {
         Ok(encoder) => encoder,
@@ -2240,7 +2290,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(2);
         }
     };
-    let desktop_encoding = match desktop_encoding_from_args(&args) {
+    let desktop_encoding = match desktop_encoding_from_args(&args, color.bit_depth) {
         Ok(encoding) => encoding,
         Err(error) => {
             log_error(&error);
@@ -2251,6 +2301,13 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
         Ok(intent) => intent,
         Err(error) => {
             log_error(&format!("invalid intent: {error}"));
+            std::process::exit(2);
+        }
+    };
+    let priority = match crate::requested_motion_priority(&args) {
+        Ok(priority) => priority,
+        Err(error) => {
+            log_error(&format!("invalid priority: {error}"));
             std::process::exit(2);
         }
     };
@@ -2345,6 +2402,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         &codec,
                         color,
                         intent,
+                        priority,
                         qp_map_policy,
                         yuv444,
                         options,
@@ -2365,6 +2423,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         &codec,
                         color,
                         intent,
+                        priority,
                         qp_map_policy,
                         options,
                     )
@@ -2380,6 +2439,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                 &codec,
                 color,
                 intent,
+                priority,
                 qp_map_policy,
                 framed,
                 fps,
@@ -2396,6 +2456,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                 st_h,
                 color,
                 intent,
+                priority,
                 qp_map_policy,
                 yuv444,
                 framed,
@@ -2427,6 +2488,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                     &codec,
                     color,
                     intent,
+                    priority,
                     qp_map_policy,
                 ) {
                     Ok(mut encoder) => {
@@ -2468,6 +2530,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                     &codec,
                     color,
                     intent,
+                    priority,
                     qp_map_policy,
                     crate::nvenc_cuda::WideSource::xorg(desktop_encoding),
                 ) {
@@ -2534,7 +2597,7 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
             std::process::exit(2);
         }
     };
-    let desktop_encoding = match desktop_encoding_from_args(&args) {
+    let desktop_encoding = match desktop_encoding_from_args(&args, color.bit_depth) {
         Ok(encoding) => encoding,
         Err(error) => {
             log_error(&error);
@@ -2545,6 +2608,13 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
         Ok(intent) => intent,
         Err(error) => {
             log_error(&format!("invalid intent: {error}"));
+            std::process::exit(2);
+        }
+    };
+    let priority = match crate::requested_motion_priority(&args) {
+        Ok(priority) => priority,
+        Err(error) => {
+            log_error(&format!("invalid priority: {error}"));
             std::process::exit(2);
         }
     };
@@ -2606,6 +2676,7 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                     codec,
                     color,
                     intent,
+                    priority,
                     qp_map_policy,
                 ) {
                     Ok(encoder) => encoder,
@@ -2637,6 +2708,7 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                     codec,
                     color,
                     intent,
+                    priority,
                     qp_map_policy,
                     if pipe_source {
                         crate::nvenc_cuda::WideSource::ColorManagedPq
@@ -2718,6 +2790,13 @@ fn fallback_or_exit(
                             std::process::exit(2);
                         }
                     };
+                    let priority = match crate::requested_motion_priority(&args) {
+                        Ok(priority) => priority,
+                        Err(error) => {
+                            log_error(&format!("invalid priority: {error}"));
+                            std::process::exit(2);
+                        }
+                    };
                     let qp_map_policy = match crate::requested_qp_map(&args) {
                         Ok(policy) => policy,
                         Err(error) => {
@@ -2725,6 +2804,9 @@ fn fallback_or_exit(
                             std::process::exit(2);
                         }
                     };
+                    if priority != arcen_media::video::MotionPriority::Detail {
+                        log("software-h264 ignores priority=motion; motion preference applies to NVENC rate control");
+                    }
                     if !crate::linux_software_policy_supported(intent, qp_map_policy) {
                         log_error(
                             "software-h264 supports only intent=interactive and qp-map=off; \
@@ -2874,6 +2956,7 @@ fn nvenc_attempt_for_row(
             codec_token,
             color,
             arcen_media::EncodeIntent::Interactive,
+            arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
         )
     } {

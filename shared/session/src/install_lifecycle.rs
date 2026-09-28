@@ -12,6 +12,10 @@ pub enum InstallPhase {
     Quiesced,
     Activated,
     SmokeValidated,
+    /// Files are in place and the operator asked for no service (a staging
+    /// prefix, `--no-service`, or a dry run): nothing was started, so
+    /// nothing is claimed to run.
+    InstalledWithoutService,
     RolledBack,
     Uninstalled,
     Failed,
@@ -25,6 +29,8 @@ pub enum InstallEvent {
     ServiceQuiesced,
     ActivationCommitted,
     SmokePassed,
+    /// The operator asked for the payload without a running service.
+    ServiceNotRequested,
     RollbackCompleted,
     UninstallCompleted,
     TransactionFailed,
@@ -89,6 +95,9 @@ impl InstallTransaction {
             (InstallPhase::Staged, InstallEvent::ServiceQuiesced) => InstallPhase::Quiesced,
             (InstallPhase::Quiesced, InstallEvent::ActivationCommitted) => InstallPhase::Activated,
             (InstallPhase::Activated, InstallEvent::SmokePassed) => InstallPhase::SmokeValidated,
+            (InstallPhase::Staged, InstallEvent::ServiceNotRequested) => {
+                InstallPhase::InstalledWithoutService
+            }
             (
                 InstallPhase::Staged
                 | InstallPhase::Quiesced
@@ -122,9 +131,92 @@ impl InstallTransaction {
     }
 }
 
+/// An install that ended without reaching a successful terminal phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteInstall {
+    pub phase: InstallPhase,
+}
+
+impl Display for IncompleteInstall {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the install did not complete: it stopped at {:?}, before the service was \
+             proven to run",
+            self.phase
+        )
+    }
+}
+
+impl Error for IncompleteInstall {}
+
+impl InstallTransaction {
+    /// Whether the install succeeded, which only a smoke-validated service
+    /// or an explicitly service-less install is.
+    ///
+    /// This is what an installer's exit status comes from, so a service that
+    /// was started but never proven to run cannot be reported as installed.
+    ///
+    /// # Errors
+    ///
+    /// [`IncompleteInstall`] for every other phase.
+    pub const fn finish(self) -> Result<InstallPhase, IncompleteInstall> {
+        match self.phase {
+            InstallPhase::SmokeValidated | InstallPhase::InstalledWithoutService => Ok(self.phase),
+            phase => Err(IncompleteInstall { phase }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_proven_service_or_an_explicit_no_service_install_finishes() {
+        let mut started_not_proven = InstallTransaction::new();
+        for event in [
+            InstallEvent::PreflightPassed,
+            InstallEvent::PayloadStaged,
+            InstallEvent::ServiceQuiesced,
+            InstallEvent::ActivationCommitted,
+        ] {
+            started_not_proven.apply(event).expect("valid");
+        }
+        assert_eq!(
+            started_not_proven.finish(),
+            Err(IncompleteInstall {
+                phase: InstallPhase::Activated
+            })
+        );
+        started_not_proven
+            .apply(InstallEvent::SmokePassed)
+            .expect("smoke");
+        assert_eq!(
+            started_not_proven.finish(),
+            Ok(InstallPhase::SmokeValidated)
+        );
+
+        let mut staging = InstallTransaction::new();
+        staging
+            .apply(InstallEvent::PreflightPassed)
+            .expect("preflight");
+        staging.apply(InstallEvent::PayloadStaged).expect("stage");
+        staging
+            .apply(InstallEvent::ServiceNotRequested)
+            .expect("no service");
+        assert_eq!(staging.finish(), Ok(InstallPhase::InstalledWithoutService));
+
+        let mut failed = InstallTransaction::new();
+        failed.apply(InstallEvent::TransactionFailed).expect("fail");
+        assert!(failed.finish().is_err());
+        assert!(
+            InstallTransaction::new()
+                .apply(InstallEvent::ServiceNotRequested)
+                .is_err(),
+            "nothing is installed before staging"
+        );
+    }
 
     #[test]
     fn install_requires_smoke_validation_before_completion() {

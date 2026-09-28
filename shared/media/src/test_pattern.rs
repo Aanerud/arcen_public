@@ -454,10 +454,7 @@ mod tests {
         let transform =
             ColorTransform::new(ColorMatrix::Bt709, ColorRange::Limited, BitDepth::Eight);
         let accuracy = measure_transform_roundtrip(TestPattern::GreyRamp, transform, WIDTH, HEIGHT);
-        assert!(
-            u16::try_from(accuracy.mean_error.round() as u64).unwrap_or(u16::MAX)
-                <= accuracy.max_error
-        );
+        assert!(accuracy.mean_error.round() <= f64::from(accuracy.max_error));
         assert_eq!(accuracy.pixels, WIDTH * HEIGHT);
     }
 

@@ -453,7 +453,10 @@ mod macos {
         let (backing_width, backing_height) = backing_pixels(&display, arrangement);
         let rotation = rotation_from_degrees(display.rotation());
         let appkit = appkit_screen_facts(id);
-        let insets = appkit.map(|facts| facts.insets).unwrap_or_default();
+        let insets = appkit
+            .as_ref()
+            .map(|facts| facts.insets)
+            .unwrap_or_default();
         let metrics = validated_metrics_or_unscaled(
             id,
             arrangement,
@@ -517,9 +520,11 @@ mod macos {
     }
 
     /// Everything one `NSScreen` pass can tell us about a display.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct AppKitScreenFacts {
         insets: SafeAreaInsets,
+        /// Localized display name, as AppKit exposes it for the screen.
+        name: Option<String>,
         /// Gamut and HDR headroom, as AppKit states them. `None` when no
         /// `NSScreen` backs the display.
         color: Option<arcen_protocol::messages::DisplayColorMsg>,
@@ -561,6 +566,7 @@ mod macos {
             // can never leave the stream taller than the viewport.
             let insets = screen.safeAreaInsets();
             let frame = screen.frame();
+            let localized_name = screen.localizedName().to_string();
             let color = arcen_protocol::messages::DisplayColorMsg {
                 gamut: if screen.canRepresentDisplayGamut(objc2_app_kit::NSDisplayGamut::P3) {
                     arcen_protocol::messages::DisplayGamutMsg::DisplayP3
@@ -583,6 +589,7 @@ mod macos {
                 ..Default::default()
             };
             return Some(AppKitScreenFacts {
+                name: (!localized_name.trim().is_empty()).then_some(localized_name),
                 color: Some(color),
                 insets: SafeAreaInsets {
                     top: insets.top.max(0.0).ceil() as u32,
@@ -603,8 +610,23 @@ mod macos {
         }
         Some(AppKitScreenFacts {
             insets: SafeAreaInsets::ZERO,
+            name: None,
             color: None,
             arrangement: None,
+        })
+    }
+
+    fn appkit_display_name(id: u32) -> Option<String> {
+        appkit_screen_facts(id).and_then(|facts| facts.name)
+    }
+
+    fn display_name(id: u32, display: &CGDisplay) -> String {
+        appkit_display_name(id).unwrap_or_else(|| {
+            if display.is_builtin() {
+                "Built-in Display".to_string()
+            } else {
+                format!("Display {id}")
+            }
         })
     }
 
@@ -732,11 +754,7 @@ mod macos {
         } else {
             60
         };
-        let name = if display.is_builtin() {
-            "Built-in Display".to_string()
-        } else {
-            format!("Display {id}")
-        };
+        let name = display_name(id, &display);
 
         // Physical size in millimetres (CGDisplayScreenSize) → the host derives
         // the correct DPI for the synthesized EDID. Some virtual/unknown

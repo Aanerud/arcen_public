@@ -25,7 +25,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 #[cfg(feature = "nvenc")]
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
@@ -875,6 +876,7 @@ unsafe fn create_nvenc_encoder(
     codec: &str,
     color: crate::ColorSpec,
     intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
 ) -> Result<crate::nvenc::Encoder, crate::nvenc::NvencInitError> {
     crate::nvenc::Encoder::new(
@@ -885,6 +887,7 @@ unsafe fn create_nvenc_encoder(
         codec,
         color,
         intent,
+        priority,
         qp_map_policy,
         // From the pool that was actually created, so staging and conversion
         // follow the concrete source format rather than the request.
@@ -1034,6 +1037,12 @@ unsafe fn run_encode(
     // Captured before the loop borrows `cap` mutably; the variant cannot
     // change once the source is built.
     let announced_capture = cap.capture_backend();
+    let announced_conversion = encoder.conversion_backend();
+    log(&format!(
+        "capture path selected: capture={} conversion_backend={}",
+        announced_capture.ready_token(),
+        announced_conversion.media().ready_token()
+    ));
     // The exact same `color` this run's `Encoder` was constructed with (see
     // `create_nvenc_encoder`'s caller) — never a separately re-derived
     // `ColorSpec::legacy(...)` — so the READY line this builds and the
@@ -1057,7 +1066,7 @@ unsafe fn run_encode(
     let control = crate::spawn_control_thread("NVENC");
 
     let mut stdout = std::io::stdout();
-    let target_dt = crate::frame_interval_from_fps(fps);
+    let mut target_dt = crate::frame_interval_from_fps(fps);
     let started = Instant::now();
     let mut next = Instant::now();
     let mut first = true; // first encoded picture is a forced IDR
@@ -1112,6 +1121,7 @@ unsafe fn run_encode(
     let mut encode_submitted = 0u64;
     let mut encode_skipped_no_new = 0u64;
     let mut ready_announced = false;
+    let mut stream_truth = crate::StreamTruthLog::new(codec);
 
     while !control.stop_requested() {
         // Drain toward the newest frame (short timeout keeps the pace tight and
@@ -1247,6 +1257,17 @@ unsafe fn run_encode(
             if force && !first {
                 log("consuming IDR request");
             }
+            if let Some(fps) = control.take_framerate_fps() {
+                target_dt = crate::frame_interval_from_fps(fps);
+                if let Err(error) = encoder.reconfigure_framerate(fps) {
+                    crate::log(&format!("live framerate reconfigure failed: {error}"));
+                }
+            }
+            if let Some(bps) = control.take_bitrate_bps() {
+                if let Err(error) = encoder.reconfigure_bitrate(bps) {
+                    crate::log(&format!("live bitrate reconfigure failed: {error}"));
+                }
+            }
             let t0 = Instant::now();
             encode_submitted += 1;
             let encoded = encoder.encode(force);
@@ -1282,11 +1303,16 @@ unsafe fn run_encode(
                 Ok(out) => {
                     first = false; // the forced IDR rode on the submitted frame
                     if let Some(au) = out {
+                        stream_truth.observe(&au);
                         if !ready_announced {
                             if au.is_empty()
                                 || au.len() > crate::MAX_ACCESS_UNIT_BYTES
-                                || crate::announce_ready_from(ready_plan, Some(announced_capture))
-                                    .is_err()
+                                || crate::announce_ready_from_with_conversion(
+                                    ready_plan,
+                                    Some(announced_capture),
+                                    Some(announced_conversion.media()),
+                                )
+                                .is_err()
                             {
                                 log("could not emit READY after first in-memory NVENC access unit");
                                 return 5;
@@ -1580,6 +1606,30 @@ unsafe fn run_selftest(
 ) -> i32 {
     use std::time::Duration;
 
+    let vector_device = device.clone();
+    let vector_context = context.clone();
+    let vector_result = std::thread::Builder::new()
+        .name("arcen-wide-shader-selftest".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || unsafe {
+            crate::nvenc::wide_shader_vector_selftest(&vector_device, &vector_context)
+        })
+        .map_err(|error| format!("spawn shader vector selftest: {error}"))
+        .and_then(|handle| {
+            handle
+                .join()
+                .map_err(|_| "shader vector selftest panicked".to_string())
+                .and_then(|result| result)
+        });
+    match vector_result {
+        Ok((sdr, hdr)) => log(&format!(
+            "FP16 shader vectors: sdr_max_code_error={sdr} hdr_max_code_error={hdr}"
+        )),
+        Err(error) => log(&format!("FP16 shader vectors unavailable: {error}")),
+    }
+
+    let wide_source = color.bit_depth == arcen_media::BitDepth::Ten
+        && color.chroma == arcen_media::ChromaSubsampling::Yuv444;
     let mut encoder = match crate::nvenc::Encoder::new(
         &device,
         &context,
@@ -1591,8 +1641,9 @@ unsafe fn run_selftest(
         // "how good does it look", so it uses the shipped default rather than
         // whatever a session happened to request.
         arcen_media::EncodeIntent::default(),
+        arcen_media::video::MotionPriority::Detail,
         qp_map_policy,
-        false,
+        wide_source,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -1613,7 +1664,11 @@ unsafe fn run_selftest(
         Height: h,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: if wide_source {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        } else {
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        },
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
@@ -1632,11 +1687,12 @@ unsafe fn run_selftest(
     let staging_res: ID3D11Resource = staging.cast().expect("staging as resource");
 
     let mut stdout = std::io::stdout();
-    let target_dt = Duration::from_micros(16_666); // cap at 60 fps
+    let mut target_dt = Duration::from_micros(16_666); // cap at 60 fps
     let mut next = Instant::now();
     let mut frame: u32 = 0;
     let mut sec = Instant::now();
     let (mut cnt, mut ms_sum, mut ms_max, mut bytes) = (0u64, 0.0f64, 0.0f64, 0u64);
+    let mut stream_truth = crate::StreamTruthLog::new(codec);
 
     loop {
         // Paint synthetic moving content into the staging texture.
@@ -1656,26 +1712,52 @@ unsafe fn run_selftest(
             let bx = ((frame * 7) as usize) % (w as usize - bw);
             let by = ((frame * 3) as usize) % (h as usize - bh);
             for y in 0..h as usize {
-                let row = base.add(y * pitch) as *mut u32;
-                let rs = std::slice::from_raw_parts_mut(row, w as usize);
-                let g = if full_churn {
-                    ((y as u32 + frame) & 0xFF) << 8
-                } else {
-                    ((y as u32) & 0xFF) << 8
-                };
                 let in_block_y = y >= by && y < by + bh;
-                for (x, pixel) in rs.iter_mut().enumerate() {
-                    if in_block_y && x >= bx && x < bx + bw {
-                        *pixel = 0xFFFF_FFFF; // bright moving block
-                        continue;
+                if wide_source {
+                    let row = base.add(y * pitch) as *mut u16;
+                    let rs = std::slice::from_raw_parts_mut(row, w as usize * 4);
+                    for x in 0..w as usize {
+                        let pixel = &mut rs[x * 4..x * 4 + 4];
+                        let (r, g, b) = if in_block_y && x >= bx && x < bx + bw {
+                            (1.0, 1.0, 1.0)
+                        } else {
+                            let r = ((x as f32 / w.max(1) as f32)
+                                + if full_churn {
+                                    frame as f32 / 255.0
+                                } else {
+                                    0.0
+                                })
+                            .fract();
+                            let g = y as f32 / h.max(1) as f32;
+                            let b = ((x ^ y) & 0xff) as f32 / 255.0;
+                            (r, g, b)
+                        };
+                        pixel[0] = crate::nvenc::f32_to_half_bits(r);
+                        pixel[1] = crate::nvenc::f32_to_half_bits(g);
+                        pixel[2] = crate::nvenc::f32_to_half_bits(b);
+                        pixel[3] = crate::nvenc::f32_to_half_bits(1.0);
                     }
-                    let b = if full_churn {
-                        (x as u32 + frame) & 0xFF
+                } else {
+                    let row = base.add(y * pitch) as *mut u32;
+                    let rs = std::slice::from_raw_parts_mut(row, w as usize);
+                    let g = if full_churn {
+                        ((y as u32 + frame) & 0xFF) << 8
                     } else {
-                        (x as u32) & 0xFF
+                        ((y as u32) & 0xFF) << 8
                     };
-                    let r = ((x as u32 ^ y as u32) & 0xFF) << 16;
-                    *pixel = 0xFF00_0000 | r | g | b;
+                    for (x, pixel) in rs.iter_mut().enumerate() {
+                        if in_block_y && x >= bx && x < bx + bw {
+                            *pixel = 0xFFFF_FFFF; // bright moving block
+                            continue;
+                        }
+                        let b = if full_churn {
+                            (x as u32 + frame) & 0xFF
+                        } else {
+                            (x as u32) & 0xFF
+                        };
+                        let r = ((x as u32 ^ y as u32) & 0xFF) << 16;
+                        *pixel = 0xFF00_0000 | r | g | b;
+                    }
                 }
             }
             context.Unmap(&staging_res, 0);
@@ -1691,6 +1773,7 @@ unsafe fn run_selftest(
             Ok(out) => {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if let Some(au) = out {
+                    stream_truth.observe(&au);
                     if crate::write_access_unit(&mut stdout, &au, framed).is_err() {
                         return 0;
                     }
@@ -1752,6 +1835,7 @@ unsafe fn run_admission_probe(
         color,
         // An admission probe asks whether the format initialises at all.
         arcen_media::EncodeIntent::default(),
+        arcen_media::video::MotionPriority::Detail,
         qp_map_policy,
         false,
     ) {
@@ -2131,6 +2215,7 @@ fn nvenc_attempt_for_row(
             color,
             // The matrix probes which colour formats encode, not how well.
             arcen_media::EncodeIntent::default(),
+            arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
             false,
         )
@@ -2338,6 +2423,7 @@ fn write_roundtrip_bitstream_for_row(
             color,
             // The matrix probes which colour formats encode, not how well.
             arcen_media::EncodeIntent::default(),
+            arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
             false,
         )
@@ -2668,6 +2754,13 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             std::process::exit(2);
         }
     };
+    let priority = match crate::requested_motion_priority(&args) {
+        Ok(priority) => priority,
+        Err(error) => {
+            log(&format!("invalid priority: {error}"));
+            std::process::exit(2);
+        }
+    };
     let qp_map_policy = match crate::requested_qp_map(&args) {
         Ok(policy) => policy,
         Err(error) => {
@@ -2876,8 +2969,9 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                         hdr_required,
                     )
                 };
-                match unsafe { create_nvenc_encoder(&source, &codec, color, intent, qp_map_policy) }
-                {
+                match unsafe {
+                    create_nvenc_encoder(&source, &codec, color, intent, priority, qp_map_policy)
+                } {
                     Ok(mut encoder) => unsafe {
                         // Construction truthfully records whether this selected
                         // policy received a DELTA-capability trial. Engagement

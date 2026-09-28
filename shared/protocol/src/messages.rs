@@ -37,6 +37,10 @@ pub const HEALTH_PING: &str = "health_ping";
 pub const HEALTH_PONG: &str = "health_pong";
 pub const HEALTH_STATS: &str = "health_stats";
 pub const MOUSE_SCROLL: &str = "mouse_scroll";
+pub const GESTURE_MAGNIFY: &str = "gesture_magnify";
+pub const GESTURE_ROTATE: &str = "gesture_rotate";
+pub const GESTURE_SMART_ZOOM: &str = "gesture_smart_zoom";
+pub const GESTURE_SWIPE: &str = "gesture_swipe";
 pub const MOUSE_MOVE_RELATIVE: &str = "mouse_move_relative";
 pub const CURSOR_MODE_RESULT: &str = "cursor_mode_result";
 pub const TABLET_MODE_RESULT: &str = "tablet_mode_result";
@@ -83,6 +87,8 @@ pub const RELATIVE_POINTER_INPUT_PROTOCOL_VERSION: u32 = 2;
 pub const PEN_INPUT_PROTOCOL_VERSION: u32 = 3;
 /// Minimum input version for region-scoped input-v1 commands.
 pub const REGION_INPUT_PROTOCOL_VERSION: u32 = 4;
+/// Minimum input version for native gesture commands.
+pub const GESTURE_INPUT_PROTOCOL_VERSION: u32 = 4;
 /// Maximum UTF-8 bytes allowed in a cursor negotiation reason.
 pub const MAX_CURSOR_MODE_REASON_BYTES: usize = 160;
 /// Maximum UTF-8 bytes allowed in a tablet-mode negotiation reason.
@@ -635,6 +641,12 @@ pub struct QualitySettings {
     /// review where the image is judged rather than driven.
     #[serde(default = "default_encode_intent")]
     pub encode_intent: String,
+    /// What to preserve when the link is tight (`detail`/`motion`).
+    ///
+    /// Absent means `detail`, which is the historical behaviour: keep
+    /// per-frame quality and let frame rate fall.
+    #[serde(default = "default_motion_priority")]
+    pub motion_priority: String,
     pub force_lossless: bool,
     pub intra_refresh: bool,
     pub enable_audio: bool,
@@ -657,6 +669,7 @@ impl Default for QualitySettings {
             transfer: default_transfer(),
             color_primaries: default_color_primaries(),
             encode_intent: default_encode_intent(),
+            motion_priority: default_motion_priority(),
             force_lossless: false,
             intra_refresh: false,
             enable_audio: true,
@@ -1136,6 +1149,11 @@ pub struct AuthResult {
     /// Stable machine-readable resume failure code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ResumeErrorCode>,
+    /// The credentials were accepted, but the host could not start the
+    /// session (display, encoder or session agent). A failure without it is
+    /// an authentication refusal.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_setup_failed: bool,
 }
 
 impl std::fmt::Debug for AuthResult {
@@ -1152,6 +1170,7 @@ impl std::fmt::Debug for AuthResult {
             .field("resume_window_secs", &self.resume_window_secs)
             .field("resumed", &self.resumed)
             .field("error_code", &self.error_code)
+            .field("session_setup_failed", &self.session_setup_failed)
             .finish()
     }
 }
@@ -1249,6 +1268,11 @@ pub struct InputCapabilitiesMsg {
     /// `region_pen_event`). Legal only with input protocol v4+.
     #[serde(default)]
     pub region_input: InputCapabilityAvailability,
+    /// Native gesture DTOs (`gesture_magnify`, `gesture_rotate`,
+    /// `gesture_smart_zoom`, `gesture_swipe`). Legal only with input protocol
+    /// v4+ and explicit host `gestures = available`.
+    #[serde(default)]
+    pub gestures: InputCapabilityAvailability,
     /// Pen digitizer availability.
     #[serde(default)]
     pub pen: InputCapabilityAvailability,
@@ -1278,6 +1302,19 @@ pub const fn supports_region_input_v1(
     input_protocol_version >= REGION_INPUT_PROTOCOL_VERSION
         && matches!(
             capabilities.region_input,
+            InputCapabilityAvailability::Available
+        )
+}
+
+/// Whether one peer has explicitly advertised gesture-v1 support.
+#[must_use]
+pub const fn supports_gestures_v1(
+    input_protocol_version: u32,
+    capabilities: InputCapabilitiesMsg,
+) -> bool {
+    input_protocol_version >= GESTURE_INPUT_PROTOCOL_VERSION
+        && matches!(
+            capabilities.gestures,
             InputCapabilityAvailability::Available
         )
 }
@@ -1734,6 +1771,11 @@ fn default_encode_intent() -> String {
     "interactive".to_string()
 }
 
+/// Detail-first, matching what Arcen has always done when bandwidth is tight.
+fn default_motion_priority() -> String {
+    "detail".to_string()
+}
+
 fn default_color_primaries() -> String {
     "bt709".to_string()
 }
@@ -1842,7 +1884,8 @@ pub struct ServerHelloMsg {
     /// Host injects point-unit, phased scrolling (`ScrollUnitMsg::Point`),
     /// which is what makes a trackpad feel local: pixel-precise travel,
     /// momentum and rubber-banding. Absent/false on hosts that only take
-    /// wheel notches; a client must send notches to them.
+    /// wheel notches; a client must send notches to them. Applies to both
+    /// legacy `mouse_scroll` and input-v4 `region_pointer_scroll`.
     #[serde(default)]
     pub precise_scroll_v1: bool,
     /// This session shows the operating system's sign-in screen rather than a
@@ -3108,6 +3151,230 @@ impl Default for MouseScrollMsg {
     }
 }
 
+fn default_gesture_magnify_type() -> String {
+    GESTURE_MAGNIFY.to_owned()
+}
+
+fn default_gesture_rotate_type() -> String {
+    GESTURE_ROTATE.to_owned()
+}
+
+fn default_gesture_smart_zoom_type() -> String {
+    GESTURE_SMART_ZOOM.to_owned()
+}
+
+fn default_gesture_swipe_type() -> String {
+    GESTURE_SWIPE.to_owned()
+}
+
+/// Direction of a native swipe gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwipeDirectionMsg {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Magnification gesture delta. `scale_delta` is additive: `0.10` means
+/// roughly 10% larger than the previous sample.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GestureMagnifyMsg {
+    #[serde(rename = "type", default = "default_gesture_magnify_type")]
+    pub msg_type: String,
+    pub scale_delta: f64,
+    #[serde(default)]
+    pub phase: ScrollPhaseMsg,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub timestamp_ns: u64,
+    #[serde(default)]
+    pub coalescable: bool,
+}
+
+/// Rotation gesture delta in degrees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GestureRotateMsg {
+    #[serde(rename = "type", default = "default_gesture_rotate_type")]
+    pub msg_type: String,
+    pub degrees_delta: f64,
+    #[serde(default)]
+    pub phase: ScrollPhaseMsg,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub timestamp_ns: u64,
+    #[serde(default)]
+    pub coalescable: bool,
+}
+
+/// Double-tap smart zoom at the current pointer focus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GestureSmartZoomMsg {
+    #[serde(rename = "type", default = "default_gesture_smart_zoom_type")]
+    pub msg_type: String,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub timestamp_ns: u64,
+}
+
+/// Multi-finger swipe gesture.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GestureSwipeMsg {
+    #[serde(rename = "type", default = "default_gesture_swipe_type")]
+    pub msg_type: String,
+    pub direction: SwipeDirectionMsg,
+    pub fingers: u8,
+    #[serde(default)]
+    pub phase: ScrollPhaseMsg,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub timestamp_ns: u64,
+    #[serde(default)]
+    pub coalescable: bool,
+}
+
+impl Default for GestureMagnifyMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_gesture_magnify_type(),
+            scale_delta: 0.0,
+            phase: ScrollPhaseMsg::None,
+            sequence: 0,
+            timestamp_ns: 0,
+            coalescable: false,
+        }
+    }
+}
+
+impl Default for GestureRotateMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_gesture_rotate_type(),
+            degrees_delta: 0.0,
+            phase: ScrollPhaseMsg::None,
+            sequence: 0,
+            timestamp_ns: 0,
+            coalescable: false,
+        }
+    }
+}
+
+impl Default for GestureSmartZoomMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_gesture_smart_zoom_type(),
+            sequence: 0,
+            timestamp_ns: 0,
+        }
+    }
+}
+
+impl Default for GestureSwipeMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_gesture_swipe_type(),
+            direction: SwipeDirectionMsg::Left,
+            fingers: 0,
+            phase: ScrollPhaseMsg::None,
+            sequence: 0,
+            timestamp_ns: 0,
+            coalescable: false,
+        }
+    }
+}
+
+impl GestureMagnifyMsg {
+    /// Validates finite scale and nonzero ordering identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GestureValidationError`] when a field cannot be trusted.
+    pub fn validate(&self) -> Result<(), GestureValidationError> {
+        validate_gesture_f64("scale_delta", self.scale_delta)?;
+        validate_gesture_sequence(self.sequence)
+    }
+}
+
+impl GestureRotateMsg {
+    /// Validates finite degrees and nonzero ordering identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GestureValidationError`] when a field cannot be trusted.
+    pub fn validate(&self) -> Result<(), GestureValidationError> {
+        validate_gesture_f64("degrees_delta", self.degrees_delta)?;
+        validate_gesture_sequence(self.sequence)
+    }
+}
+
+impl GestureSmartZoomMsg {
+    /// Validates nonzero ordering identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GestureValidationError::ZeroSequence`] for sequence zero.
+    pub fn validate(&self) -> Result<(), GestureValidationError> {
+        validate_gesture_sequence(self.sequence)
+    }
+}
+
+impl GestureSwipeMsg {
+    /// Validates finger count, phase, and nonzero ordering identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GestureValidationError`] when a field cannot be trusted.
+    pub fn validate(&self) -> Result<(), GestureValidationError> {
+        validate_gesture_sequence(self.sequence)?;
+        if self.fingers == 0 || self.fingers > 5 {
+            return Err(GestureValidationError::FingerCountOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+fn validate_gesture_sequence(sequence: u64) -> Result<(), GestureValidationError> {
+    if sequence == 0 {
+        Err(GestureValidationError::ZeroSequence)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_gesture_f64(field: &'static str, value: f64) -> Result<(), GestureValidationError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(GestureValidationError::FieldOutOfRange(field))
+    }
+}
+
+/// Invalid native gesture wire field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GestureValidationError {
+    ZeroSequence,
+    FieldOutOfRange(&'static str),
+    FingerCountOutOfRange,
+}
+
+impl std::fmt::Display for GestureValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSequence => formatter.write_str("gesture sequence must be nonzero"),
+            Self::FieldOutOfRange(field) => write!(formatter, "gesture {field} is not finite"),
+            Self::FingerCountOutOfRange => formatter.write_str("gesture finger count is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for GestureValidationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KeyEventMsg {
     #[serde(rename = "type")]
@@ -3523,6 +3790,26 @@ mod tests {
     }
 
     #[test]
+    fn motion_priority_round_trips_and_legacy_defaults_to_detail() {
+        let motion = QualitySettings {
+            motion_priority: "motion".to_string(),
+            ..QualitySettings::default()
+        };
+        let wire = serde_json::to_value(&motion).expect("serialize");
+        assert_eq!(
+            wire.get("motion_priority").and_then(|value| value.as_str()),
+            Some("motion")
+        );
+        let decoded: QualitySettings = serde_json::from_value(wire).expect("round trip");
+        assert_eq!(decoded, motion);
+
+        let mut legacy = serde_json::to_value(QualitySettings::default()).expect("serialize");
+        legacy.as_object_mut().unwrap().remove("motion_priority");
+        let decoded: QualitySettings = serde_json::from_value(legacy).expect("legacy decode");
+        assert_eq!(decoded.motion_priority, "detail");
+    }
+
+    #[test]
     fn auth_time_video_intent_is_additive_and_legacy_exact() {
         let legacy_quality = serde_json::to_value(QualitySettings::default()).unwrap();
         assert!(
@@ -3558,6 +3845,10 @@ mod tests {
         assert_eq!(
             json["initial_video"]["quality"]["video_selection"],
             "adaptive_performance"
+        );
+        assert_eq!(
+            json["initial_video"]["quality"]["motion_priority"],
+            "detail"
         );
         let round_trip: AuthResponse = serde_json::from_value(json).unwrap();
         assert_eq!(
@@ -3897,6 +4188,36 @@ mod tests {
     }
 
     #[test]
+    fn a_session_setup_failure_is_distinct_and_absent_by_default() {
+        let legacy: AuthResult = serde_json::from_str(
+            r#"{"type":"auth_result","success":false,"message":"Invalid credentials"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.session_setup_failed);
+        let setup = AuthResult {
+            msg_type: AUTH_RESULT.to_owned(),
+            success: false,
+            message: "capenc READY failed".to_owned(),
+            resume_grant: None,
+            resume_window_secs: None,
+            resumed: false,
+            error_code: None,
+            session_setup_failed: true,
+        };
+        let json = serde_json::to_value(&setup).unwrap();
+        assert_eq!(json["session_setup_failed"], true);
+        assert_eq!(serde_json::from_value::<AuthResult>(json).unwrap(), setup);
+        let refusal = AuthResult {
+            session_setup_failed: false,
+            ..setup
+        };
+        assert!(serde_json::to_value(&refusal)
+            .unwrap()
+            .get("session_setup_failed")
+            .is_none());
+    }
+
+    #[test]
     fn resume_result_round_trips_and_debug_redacts_grants() {
         let result = AuthResult {
             msg_type: AUTH_RESULT.to_owned(),
@@ -3906,6 +4227,7 @@ mod tests {
             resume_window_secs: Some(1_200),
             resumed: true,
             error_code: None,
+            session_setup_failed: false,
         };
         assert_eq!(
             serde_json::from_value::<AuthResult>(serde_json::to_value(&result).unwrap()).unwrap(),

@@ -59,6 +59,8 @@ pub struct MappedRegionScroll<P> {
     pub position: P,
     pub delta_x: i64,
     pub delta_y: i64,
+    pub unit: crate::ScrollUnit,
+    pub phase: crate::ScrollPhase,
 }
 
 /// Checked region-scoped pen sample ready for injection.
@@ -212,6 +214,8 @@ impl<M: RegionPointMapper> RegionInputPipeline<M> {
             position,
             delta_x: message.delta_x,
             delta_y: message.delta_y,
+            unit: message.unit.into(),
+            phase: message.phase.into(),
         })
     }
 
@@ -255,11 +259,17 @@ impl<M: RegionPointMapper> RegionInputPipeline<M> {
                 pressed,
             }),
             RegionInputEvent::PointerScroll {
-                delta_x, delta_y, ..
+                delta_x,
+                delta_y,
+                unit,
+                phase,
+                ..
             } => MappedRegionInput::PointerScroll(MappedRegionScroll {
                 position,
                 delta_x,
                 delta_y,
+                unit,
+                phase,
             }),
             RegionInputEvent::Pen { sample, .. } => {
                 MappedRegionInput::Pen(MappedRegionPen { position, sample })

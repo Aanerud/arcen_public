@@ -331,18 +331,17 @@ pub fn plan_encoder_sets(
     hardware_context_ceiling: Option<u8>,
     allow_software_fallback: bool,
 ) -> Result<WindowsEncoderAdmissionPlan, WindowsEncoderAdmissionError> {
-    if allowed_adapters.is_empty() {
-        return Err(WindowsEncoderAdmissionError::NoAllowedAdapters);
-    }
-    for monitor in &topology.monitors {
-        if !allowed_adapters
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(&monitor.adapter_name))
-        {
-            return Err(WindowsEncoderAdmissionError::UnapprovedAdapter {
-                monitor_id: monitor.session_monitor_id.get(),
-                adapter_name: monitor.adapter_name.clone(),
-            });
+    if !allowed_adapters.is_empty() {
+        for monitor in &topology.monitors {
+            if !allowed_adapters
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&monitor.adapter_name))
+            {
+                return Err(WindowsEncoderAdmissionError::UnapprovedAdapter {
+                    monitor_id: monitor.session_monitor_id.get(),
+                    adapter_name: monitor.adapter_name.clone(),
+                });
+            }
         }
     }
     let hardware_encode = match template.encoder {
@@ -541,9 +540,12 @@ pub fn emit_admission_telemetry(decision: &EncoderSetDecision) {
         decision = match decision {
             EncoderSetDecision::Accept { .. } => "accept",
             EncoderSetDecision::Reassign { .. } => "reassign",
+            EncoderSetDecision::StepDown { .. } => "step_down",
             EncoderSetDecision::Reject { .. } => "reject",
         },
         selected_candidate = ?decision.selected_candidate_index(),
+        admitted_fps = decision.fps_stepdown().map(|step| step.admitted_fps),
+        requested_fps = decision.fps_stepdown().map(|step| step.requested_fps),
         "aggregate encoder admission decision"
     );
 }
@@ -793,6 +795,7 @@ mod tests {
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
+            color: None,
         }
     }
 
@@ -821,6 +824,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             encoder: Some(EncoderSelection::Nvenc),
@@ -1024,6 +1028,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             encoder: Some(EncoderSelection::SoftwareH264),

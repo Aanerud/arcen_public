@@ -1007,10 +1007,17 @@ fn run_inner(args: Vec<String>) -> i32 {
         Ok(intent) => intent,
         Err(error) => return failure_code(&format!("invalid intent: {error}"), 2),
     };
+    let priority = match crate::requested_motion_priority(&args) {
+        Ok(priority) => priority,
+        Err(error) => return failure_code(&format!("invalid priority: {error}"), 2),
+    };
     let qp_map_policy = match crate::requested_qp_map(&args) {
         Ok(policy) => policy,
         Err(error) => return failure_code(&format!("invalid qp-map: {error}"), 2),
     };
+    if priority != arcen_media::video::MotionPriority::Detail {
+        crate::log("software-h264 ignores priority=motion; motion preference applies to NVENC rate control");
+    }
     if !crate::linux_software_policy_supported(intent, qp_map_policy) {
         return failure_code(
             "software-h264 supports only intent=interactive and qp-map=off; \

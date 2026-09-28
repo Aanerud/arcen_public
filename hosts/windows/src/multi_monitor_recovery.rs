@@ -641,6 +641,7 @@ mod tests {
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
+            color: None,
         }
     }
 

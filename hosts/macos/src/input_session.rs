@@ -10,13 +10,19 @@
 //! The shared tracker rejects anything that is not a strict advance, and
 //! everything held is released when the session ends.
 
+use std::collections::BTreeMap;
+
 use arcen_input::{
     InputSequenceTracker, KeyboardEvent, LowLatencyMetadata, ModifierMask, PointerButton,
-    PointerMotion, PointerScroll,
+    PointerMotion, PointerScroll, RegionInputPipeline, RegionInputPipelineError, RegionPointMapper,
 };
 use arcen_protocol::messages::{
-    KEY_RESET_MODIFIERS, KeyEventMsg, MOUSE_SCROLL, MouseButtonMsg, MouseMoveMsg, MouseScrollMsg,
-    PEN_EVENT, PenEventMsg,
+    GESTURE_MAGNIFY, GESTURE_ROTATE, GESTURE_SMART_ZOOM, GESTURE_SWIPE, GestureMagnifyMsg,
+    GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, KEY_RESET_MODIFIERS, KeyEventMsg,
+    MOUSE_SCROLL, MouseButtonMsg, MouseMoveMsg, MouseScrollMsg, PEN_EVENT, PenEventMsg,
+    REGION_PEN_EVENT, REGION_POINTER_BUTTON, REGION_POINTER_ENTER, REGION_POINTER_LEAVE,
+    REGION_POINTER_MOTION, REGION_POINTER_SCROLL, RegionPenEventMsg, RegionPointerButtonMsg,
+    RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
 };
 
 /// Wire names the shared crate does not expose as constants.
@@ -25,7 +31,144 @@ const MOUSE_BUTTON: &str = "mouse_button";
 const KEY_EVENT: &str = "key_event";
 use serde::Serialize;
 
-use crate::input::{DesktopBounds, InputController, InputError};
+use crate::input::{DesktopBounds, InputController, InputError, NativePoint};
+
+/// Which input coordinate contract this stream accepts.
+#[derive(Debug, Clone)]
+pub enum InputMode {
+    /// Legacy normalized full-desktop input.
+    Legacy(DesktopBounds),
+    /// Region-scoped input from multi-monitor-v1.
+    Region(RegionInputSession),
+}
+
+impl InputMode {
+    /// Starts the selected input session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] when the native injector cannot be created.
+    pub fn start(self) -> Result<InputSession, InputError> {
+        match self {
+            Self::Legacy(bounds) => InputSession::new(bounds),
+            Self::Region(region) => InputSession::new_region(region),
+        }
+    }
+}
+
+/// Region-scoped multi-monitor input contract for one stream.
+#[derive(Debug, Clone)]
+pub struct RegionInputSession {
+    applied_regions: arcen_media::AppliedRegionSet,
+    bounds_by_region: BTreeMap<u32, DesktopBounds>,
+}
+
+impl RegionInputSession {
+    #[must_use]
+    pub fn new(
+        applied_regions: arcen_media::AppliedRegionSet,
+        bounds: Vec<(arcen_media::SessionMonitorId, DesktopBounds)>,
+    ) -> Self {
+        let bounds_by_region = bounds
+            .into_iter()
+            .map(|(monitor_id, bounds)| (u32::from(monitor_id.get()), bounds))
+            .collect();
+        Self {
+            applied_regions,
+            bounds_by_region,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MacRegionPointMapper {
+    regions: [Option<MacRegionNativeMap>; arcen_media::MAX_MULTI_MONITOR_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MacRegionNativeMap {
+    left: i64,
+    top: i64,
+    width: u32,
+    height: u32,
+    bounds: DesktopBounds,
+}
+
+impl MacRegionPointMapper {
+    fn new(
+        applied_regions: &arcen_media::AppliedRegionSet,
+        bounds_by_region: &BTreeMap<u32, DesktopBounds>,
+    ) -> Self {
+        let mut regions = [None; arcen_media::MAX_MULTI_MONITOR_COUNT];
+        for (index, region) in applied_regions.regions().iter().enumerate() {
+            let rect = region.applied_rect();
+            let origin = rect.origin();
+            let size = rect.size();
+            regions[index] = bounds_by_region
+                .get(&region.id().get())
+                .copied()
+                .map(|bounds| MacRegionNativeMap {
+                    left: origin.x,
+                    top: origin.y,
+                    width: size.width(),
+                    height: size.height(),
+                    bounds,
+                });
+        }
+        Self { regions }
+    }
+}
+
+impl RegionPointMapper for MacRegionPointMapper {
+    type Point = NativePoint;
+    type Error = RegionMappingError;
+
+    fn map_applied(
+        &self,
+        point: arcen_media::AppliedPoint,
+    ) -> Result<NativePoint, RegionMappingError> {
+        for region in self.regions.into_iter().flatten() {
+            let right = region.left + i64::from(region.width);
+            let bottom = region.top + i64::from(region.height);
+            if point.x >= region.left
+                && point.y >= region.top
+                && point.x < right
+                && point.y < bottom
+            {
+                let local_x = (point.x - region.left) as f64;
+                let local_y = (point.y - region.top) as f64;
+                return Ok(NativePoint {
+                    x: region.bounds.origin_x
+                        + local_x * region.bounds.width / f64::from(region.width),
+                    y: region.bounds.origin_y
+                        + local_y * region.bounds.height / f64::from(region.height),
+                });
+            }
+        }
+        Err(RegionMappingError::PointOutsideDisplays(point))
+    }
+}
+
+/// macOS-specific mapping failure for one region input point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionMappingError {
+    PointOutsideDisplays(arcen_media::AppliedPoint),
+}
+
+impl std::fmt::Display for RegionMappingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PointOutsideDisplays(point) => {
+                write!(
+                    formatter,
+                    "mapped region point {point:?} is outside the virtual displays"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegionMappingError {}
 
 /// What a session did with the input it was sent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -68,6 +211,7 @@ pub struct InputStats {
 pub struct InputSession {
     controller: InputController,
     sequence: InputSequenceTracker,
+    region: Option<RegionInputPipeline<MacRegionPointMapper>>,
     stats: InputStats,
 }
 
@@ -90,6 +234,30 @@ impl InputSession {
         Ok(Self {
             controller: InputController::new(bounds)?,
             sequence: InputSequenceTracker::default(),
+            region: None,
+            stats: InputStats::default(),
+        })
+    }
+
+    /// Creates a session accepting region-scoped multi-monitor input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] when no event source is available.
+    pub fn new_region(region: RegionInputSession) -> Result<Self, InputError> {
+        let bounds = region
+            .bounds_by_region
+            .values()
+            .next()
+            .copied()
+            .ok_or(InputError::NoDesktopBounds)?;
+        Ok(Self {
+            controller: InputController::new(bounds)?,
+            sequence: InputSequenceTracker::default(),
+            region: Some(RegionInputPipeline::new(
+                region.applied_regions.clone(),
+                MacRegionPointMapper::new(&region.applied_regions, &region.bounds_by_region),
+            )),
             stats: InputStats::default(),
         })
     }
@@ -130,11 +298,21 @@ impl InputSession {
         };
 
         match kind {
+            REGION_POINTER_ENTER
+            | REGION_POINTER_LEAVE
+            | REGION_POINTER_MOTION
+            | REGION_POINTER_BUTTON
+            | REGION_POINTER_SCROLL
+            | REGION_PEN_EVENT => self.apply_region(kind, &value),
             MOUSE_MOVE => self.apply_move(&value),
             MOUSE_BUTTON => self.apply_button(&value),
             MOUSE_SCROLL => self.apply_scroll(&value),
             KEY_EVENT => self.apply_key(&value),
             PEN_EVENT => self.apply_pen(&value),
+            GESTURE_MAGNIFY => self.apply_gesture_magnify(&value),
+            GESTURE_ROTATE => self.apply_gesture_rotate(&value),
+            GESTURE_SMART_ZOOM => self.apply_gesture_smart_zoom(&value),
+            GESTURE_SWIPE => self.apply_gesture_swipe(&value),
             // A client that has lost track of what it is holding asks for
             // everything to be let go. Honouring it is what keeps a modifier
             // from sticking after an alt-tab away from the client window.
@@ -148,6 +326,58 @@ impl InputSession {
                 Ok(())
             }
         }
+    }
+
+    fn apply_gesture_magnify(&mut self, value: &serde_json::Value) -> Result<(), InputError> {
+        let Ok(message) = serde_json::from_value::<GestureMagnifyMsg>(value.clone()) else {
+            self.stats.malformed += 1;
+            return Ok(());
+        };
+        if !self.accepts(message.sequence) {
+            return Ok(());
+        }
+        self.controller.gesture_magnify(&message)?;
+        self.stats.applied += 1;
+        Ok(())
+    }
+
+    fn apply_gesture_rotate(&mut self, value: &serde_json::Value) -> Result<(), InputError> {
+        let Ok(message) = serde_json::from_value::<GestureRotateMsg>(value.clone()) else {
+            self.stats.malformed += 1;
+            return Ok(());
+        };
+        if !self.accepts(message.sequence) {
+            return Ok(());
+        }
+        self.controller.gesture_rotate(&message)?;
+        self.stats.applied += 1;
+        Ok(())
+    }
+
+    fn apply_gesture_smart_zoom(&mut self, value: &serde_json::Value) -> Result<(), InputError> {
+        let Ok(message) = serde_json::from_value::<GestureSmartZoomMsg>(value.clone()) else {
+            self.stats.malformed += 1;
+            return Ok(());
+        };
+        if !self.accepts(message.sequence) {
+            return Ok(());
+        }
+        self.controller.gesture_smart_zoom(&message)?;
+        self.stats.applied += 1;
+        Ok(())
+    }
+
+    fn apply_gesture_swipe(&mut self, value: &serde_json::Value) -> Result<(), InputError> {
+        let Ok(message) = serde_json::from_value::<GestureSwipeMsg>(value.clone()) else {
+            self.stats.malformed += 1;
+            return Ok(());
+        };
+        if !self.accepts(message.sequence) {
+            return Ok(());
+        }
+        self.controller.gesture_swipe(&message)?;
+        self.stats.applied += 1;
+        Ok(())
     }
 
     /// Returns whether `sequence` may be applied, counting it if not.
@@ -259,6 +489,131 @@ impl InputSession {
         Ok(())
     }
 
+    fn apply_region(&mut self, kind: &str, value: &serde_json::Value) -> Result<(), InputError> {
+        let Some(pipeline) = self.region.as_mut() else {
+            self.stats.unsupported += 1;
+            return Ok(());
+        };
+        let result = match kind {
+            REGION_POINTER_ENTER => {
+                let Ok(message) = serde_json::from_value::<RegionPointerEnterMsg>(value.clone())
+                else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline
+                    .pointer_enter(&message)
+                    .map(|point| RegionAction::Motion(point))
+            }
+            REGION_POINTER_LEAVE => {
+                let Ok(message) = serde_json::from_value::<RegionPointerLeaveMsg>(value.clone())
+                else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline
+                    .pointer_leave(&message)
+                    .map(|point| RegionAction::Motion(point))
+            }
+            REGION_POINTER_MOTION => {
+                let Ok(message) = serde_json::from_value::<RegionPointerMotionMsg>(value.clone())
+                else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline
+                    .pointer_motion(&message)
+                    .map(|point| RegionAction::Motion(point))
+            }
+            REGION_POINTER_BUTTON => {
+                let Ok(message) = serde_json::from_value::<RegionPointerButtonMsg>(value.clone())
+                else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline.pointer_button(&message).map(RegionAction::Button)
+            }
+            REGION_POINTER_SCROLL => {
+                let Ok(message) = serde_json::from_value::<RegionPointerScrollMsg>(value.clone())
+                else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline.pointer_scroll(&message).map(RegionAction::Scroll)
+            }
+            REGION_PEN_EVENT => {
+                let Ok(message) = serde_json::from_value::<RegionPenEventMsg>(value.clone()) else {
+                    self.stats.malformed += 1;
+                    return Ok(());
+                };
+                pipeline.pen(&message).map(RegionAction::Pen)
+            }
+            _ => unreachable!("region kind was prefiltered"),
+        };
+        match result {
+            Ok(action) => self.inject_region_action(action),
+            Err(RegionInputPipelineError::State(_)) => {
+                self.stats.out_of_order += 1;
+                Ok(())
+            }
+            Err(RegionInputPipelineError::Wire(_) | RegionInputPipelineError::Contract(_)) => {
+                self.stats.malformed += 1;
+                Ok(())
+            }
+            Err(RegionInputPipelineError::Transform(_) | RegionInputPipelineError::Mapping(_)) => {
+                self.stats.malformed += 1;
+                Ok(())
+            }
+        }
+    }
+
+    fn inject_region_action(&mut self, action: RegionAction) -> Result<(), InputError> {
+        match action {
+            RegionAction::Motion(point) => {
+                self.controller.post_native_motion(point)?;
+                self.stats.applied += 1;
+            }
+            RegionAction::Button(button) => {
+                self.controller.native_pointer_button(
+                    button.button,
+                    button.pressed,
+                    button.position,
+                )?;
+                self.stats.applied += 1;
+            }
+            RegionAction::Scroll(scroll) => {
+                let denom = arcen_media::LOGICAL_UNITS_PER_PIXEL as f64;
+                self.controller.native_pointer_scroll(
+                    scroll.position,
+                    scroll.delta_x as f64 / denom,
+                    scroll.delta_y as f64 / denom,
+                    scroll.unit,
+                    scroll.phase,
+                )?;
+                self.stats.applied += 1;
+            }
+            RegionAction::Pen(pen) => {
+                let message = PenEventMsg {
+                    x: 0.0,
+                    y: 0.0,
+                    pressure: pen.sample.pressure,
+                    tilt_x_degrees: pen.sample.tilt_x_degrees,
+                    tilt_y_degrees: pen.sample.tilt_y_degrees,
+                    rotation_degrees: pen.sample.rotation_degrees,
+                    tool: arcen_input::wire_pen_tool(pen.sample.tool),
+                    in_proximity: pen.sample.in_proximity,
+                    touching: pen.sample.touching,
+                    buttons: pen.sample.buttons,
+                    sequence: 0,
+                    ..PenEventMsg::default()
+                };
+                self.controller.native_pen_event(&message, pen.position)?;
+                self.stats.applied += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Releases everything this session is holding.
     ///
     /// Called when the session ends, so a dropped client never leaves a key or
@@ -271,6 +626,13 @@ impl InputSession {
     pub fn release_all(&mut self) -> Result<(), InputError> {
         self.controller.release_all()
     }
+}
+
+enum RegionAction {
+    Motion(NativePoint),
+    Button(arcen_input::MappedRegionButton<NativePoint>),
+    Scroll(arcen_input::MappedRegionScroll<NativePoint>),
+    Pen(arcen_input::MappedRegionPen<NativePoint>),
 }
 
 fn metadata(sequence: u64, timestamp_ns: u64) -> LowLatencyMetadata {
@@ -375,6 +737,76 @@ mod tests {
         // Without an event source there is nothing to test against; that is a
         // machine without Accessibility, not a failing assertion.
         InputSession::new(bounds()).ok()
+    }
+
+    fn applied_regions_for_mapping() -> arcen_media::AppliedRegionSet {
+        let generation = arcen_media::RegionGeneration::new(1).expect("generation");
+        let descriptor = |id: u32, primary: bool| {
+            arcen_media::RegionDescriptor::new(
+                arcen_media::RegionId::new(id).expect("region id"),
+                arcen_media::OutputIdentity::new(format!("display-{id}")).expect("identity"),
+                arcen_media::LogicalRect::new(
+                    arcen_media::LogicalPoint::from_pixels(0, 0).expect("origin"),
+                    arcen_media::LogicalSize::from_pixels(1920, 1080).expect("size"),
+                )
+                .expect("logical rect"),
+                arcen_media::PhysicalSize::new(1920, 1080).expect("physical"),
+                arcen_media::Scale120::new(120).expect("scale"),
+                arcen_media::OutputTransform::Normal,
+                primary,
+            )
+        };
+        let first = descriptor(1, true);
+        let second = descriptor(2, false);
+        arcen_media::AppliedRegionSet::new(
+            generation,
+            vec![
+                arcen_media::AppliedRegionDescriptor::new(
+                    first,
+                    arcen_media::AppliedRect::new(
+                        arcen_media::AppliedPoint::new(0, 0),
+                        arcen_media::AppliedSize::new(1920, 1080).expect("size"),
+                    )
+                    .expect("rect"),
+                )
+                .expect("first"),
+                arcen_media::AppliedRegionDescriptor::new(
+                    second,
+                    arcen_media::AppliedRect::new(
+                        arcen_media::AppliedPoint::new(1920, 0),
+                        arcen_media::AppliedSize::new(1920, 1080).expect("size"),
+                    )
+                    .expect("rect"),
+                )
+                .expect("second"),
+            ],
+        )
+        .expect("applied regions")
+    }
+
+    #[test]
+    fn region_coordinate_mapping_targets_the_matching_global_display() {
+        let regions = applied_regions_for_mapping();
+        let mut bounds = BTreeMap::new();
+        bounds.insert(1, DesktopBounds::new(-1920.0, 0.0, 1920.0, 1080.0));
+        bounds.insert(2, DesktopBounds::new(0.0, 0.0, 1920.0, 1080.0));
+        let mapper = MacRegionPointMapper::new(&regions, &bounds);
+
+        let left = mapper
+            .map_applied(arcen_media::AppliedPoint::new(100, 50))
+            .expect("left display");
+        let right = mapper
+            .map_applied(arcen_media::AppliedPoint::new(2020, 50))
+            .expect("right display");
+
+        assert_eq!(
+            left,
+            NativePoint {
+                x: -1820.0,
+                y: 50.0
+            }
+        );
+        assert_eq!(right, NativePoint { x: 100.0, y: 50.0 });
     }
 
     #[test]

@@ -49,16 +49,16 @@ Notarization is a separate step from signing, and the ticket has to be
 stapled or the package only validates on a machine that can reach Apple.
 
 ```sh
-xcrun notarytool submit dist/ArcenPier-0.12.0.pkg \
+xcrun notarytool submit dist/macos/ArcenPier-<version>.pkg \
   --keychain-profile "$NOTARY_PROFILE" --wait
 
-xcrun stapler staple dist/ArcenPier-0.12.0.pkg
+xcrun stapler staple dist/macos/ArcenPier-<version>.pkg
 ```
 
 Then confirm what a *clean* Mac will decide, rather than assuming:
 
 ```sh
-spctl -a -vvv -t install dist/ArcenPier-0.12.0.pkg
+spctl -a -vvv -t install dist/macos/ArcenPier-<version>.pkg
 ```
 
 The verdict you want:
@@ -195,6 +195,12 @@ from the kernel and its executable path, and relays the stream. The agent
 serves only its own account: a different account that authenticates is told
 the screen belongs to someone else before it is told it succeeded.
 
+Why this cannot be one process, why the service account exists, and what each
+installer prompt is for are written up for administrators and users in
+[`docs/security/macos-pier-process-model.md`](../../docs/security/macos-pier-process-model.md).
+The installer's welcome page (`packaging/macos/pier/welcome.html`) gives the
+same explanation in short. Keep the two in step when the design changes.
+
 ### The installer checks its own result
 
 Because two different causes produced one symptom, the `postinstall` now
@@ -283,7 +289,7 @@ Everything a full install leaves:
 
 ```text
 /Applications/Arcen Pier.app
-/Applications/Arcen Agent Helper.app
+/Library/PrivilegedHelperTools/Arcen Agent Helper.app
 /Library/LaunchDaemons/pier.arcen.tech.service.plist   (network service, runs as _arcen)
 /Library/LaunchAgents/pier.arcen.tech.agent.plist      (desktop agent, every Aqua session)
 /Library/Application Support/Arcen/   root:wheel 755   (pier.json root 644)

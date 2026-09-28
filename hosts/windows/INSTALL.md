@@ -363,6 +363,32 @@ and NVENC encoding remain on this same GPU for zero-copy. Use
 `desktop.output_index` only as a legacy global-index fallback, never together
 with `desktop.adapter`.
 
+`platform.multi_monitor.advertise_enabled` defaults to `true`. The Pier chooses
+the streaming adapter at startup from the live DXGI/NVAPI inventory: first the
+configured/current desktop adapter when it is NVIDIA/NVENC-capable, then a
+GRID/Quadro-class adapter for native NVIDIA headless provisioning, then the
+first eligible adapter by DXGI index. Leave `allowed_adapters` empty for any
+eligible adapter, or list exact case-insensitive DXGI descriptions to limit the
+choice. Use `excluded_adapters` to reserve a GPU for other work, for example:
+
+```json
+{
+  "platform": {
+    "multi_monitor": {
+      "advertise_enabled": true,
+      "allowed_adapters": [],
+      "excluded_adapters": ["NVIDIA RTX 6000 Ada Generation"],
+      "nvidia_headless_enabled": null
+    }
+  }
+}
+```
+
+That keeps the RTX available for applications such as DaVinci Resolve while the
+Pier can stream on an eligible V100D. Set `advertise_enabled` to `false` to turn
+multi-display off. Set `nvidia_headless_enabled` to `false` to forbid NVIDIA
+headless provisioning or `true` to force it; `null` is the automatic default.
+
 `clipboard` is strict and host-authoritative. `max_bytes` must be from
 1,048,576 through 20,971,520 bytes; startup and `validate-config` reject values
 outside that range. Equivalent CLI overrides are

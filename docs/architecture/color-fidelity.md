@@ -190,12 +190,25 @@ cannot report that, so the operator declares it: `video.desktop_encoding =
 rec2100-pq`. Then a ten-bit PQ request keeps PQ / BT.2020 / BT.2020 NCL, capenc
 encodes the XShm frames as `WideSource::XorgDeclaredPq` (matrix only, no
 transfer change), and the Deck enters EDR because the host returned PQ. The
-rule is shared (`arcen_media::video::constrain_to_desktop_encoding`): HLG and
-eight-bit PQ still resolve to Grading, SDR requests are never changed, and an
-SDR session on a declared PQ desktop logs a warning because it shows PQ codes
-as SDR, as an SDR monitor would. Measured on the Linux lab with a depth-30 PQ
-ramp: the Deck received `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`, 950 distinct
-luma codes, neutral chroma exactly 512.
+rule is shared (`arcen_media::video::resolve_desktop_plan`). The desktop's
+source encoding travels to capenc separately from the session's output, so
+PQ code values never reach an SDR session unconverted:
+
+- a ten-bit PQ request is passed through as PQ / BT.2020 / BT.2020 NCL;
+- any other ten-bit request (Grading, and HLG) is served as BT.709 SDR and
+  capenc converts the pixels with `Rgb10Signal::PqBt2020ToSdrBt709`: PQ
+  decoded to linear light with graphics white at 203 nits (BT.2408), BT.2020
+  primaries mapped to BT.709, clipped at SDR white, then the BT.709 OETF;
+- an eight-bit request (Auto, Speed) is refused with a message that names
+  Grading and HDR, because the eight-bit capture paths have no conversion
+  stage. The wire does not tell Auto from Speed, so both are refused.
+
+capenc derives its conversion from the same rule
+(`conversion_for_output`) rather than restating it. Measured on the Linux lab
+with a depth-30 PQ ramp: HDR received `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`,
+950 distinct luma codes, neutral chroma exactly 512; Grading received BT.709
+with the ramp converted (codes above the 203-nit white collapse to SDR white,
+about 605 distinct luma codes); Auto was refused with the message.
 
 General Linux desktop HDR, where the compositor rather than one application
 owns the transfer, is reserved for the colour-managed Wayland provider
@@ -516,8 +529,8 @@ incoherent, because no encoder Arcen has can produce it.
   genuine 10-bit SDR grading, and PQ only for a desktop the operator declares
   Rec.2100 PQ (`video.desktop_encoding`). Compositor-owned HDR still needs the
   provider to prove compositor HDR state plus a ten-bit capture format carrying
-  transfer/primaries metadata. A PQ-to-SDR conversion for SDR sessions on a
-  declared PQ desktop is not built.
+  transfer/primaries metadata. On a declared PQ desktop, eight-bit sessions
+  are refused rather than converted: there is no eight-bit conversion path.
 - **4:2:2 is not wired.** NV16/P210 bindings and BGRA conversion are absent,
   so the Blackwell capability question cannot yet be measured.
 - The `rav1e` software tier has a real wrapper

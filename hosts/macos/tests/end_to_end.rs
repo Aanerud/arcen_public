@@ -492,6 +492,9 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -649,6 +652,9 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
                 input_bounds: arcen_pier_macos::input::DesktopBounds::new(
                     0.0,
                     0.0,
@@ -797,6 +803,9 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1042,6 +1051,9 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1233,6 +1245,9 @@ async fn a_streamed_session_records_what_it_measured() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1368,6 +1383,9 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1512,6 +1530,9 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1714,6 +1735,9 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await
@@ -1905,6 +1929,9 @@ async fn a_still_desktop_sends_almost_nothing() {
                 cursor_mode: arcen_protocol::messages::CursorMode::Local,
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
             },
         )
         .await

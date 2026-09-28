@@ -1273,13 +1273,13 @@ mod tests {
             assert_eq!(wire.height_px, 1440);
             assert_eq!(wire.logical_width, 2048);
             assert_eq!(wire.logical_height, 1152);
-            assert_eq!(wire.scale, 1.25);
+            assert!((wire.scale - 1.25).abs() < f32::EPSILON);
             assert_eq!(wire.refresh_hz, 144);
             assert_eq!(wire.rotation, RotationMsg::from(rotation));
             assert!(wire.is_primary);
             assert_eq!(wire.name, "Studio Panel");
-            assert_eq!(wire.width_mm, 598.0);
-            assert_eq!(wire.height_mm, 336.0);
+            assert!((wire.width_mm - 598.0).abs() < f32::EPSILON);
+            assert!((wire.height_mm - 336.0).abs() < f32::EPSILON);
             assert_eq!(wire.vendor, 0x1234);
             assert_eq!(wire.model, 0x5678);
             assert_eq!(wire.serial, 0x9abc_def0);

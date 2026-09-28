@@ -43,6 +43,15 @@ if ! dscl . -read "/Users/$ARCEN_ACCOUNT" UniqueID >/dev/null 2>&1; then
   dscl . -create "/Users/$ARCEN_ACCOUNT" UserShell /usr/bin/false
   dscl . -create "/Users/$ARCEN_ACCOUNT" Password '*'
   dscl . -create "/Users/$ARCEN_ACCOUNT" IsHidden 1
+  # macOS gates writes to the local directory behind "Installer would like to
+  # administer your computer". Declining it leaves no account, and launchd
+  # would then refuse the service with nothing to say why.
+  if ! dscl . -read "/Users/$ARCEN_ACCOUNT" UniqueID >/dev/null 2>&1; then
+    arcen_log "could not create $ARCEN_ACCOUNT: macOS refused the change to" \
+      "local accounts. Run the installer again and allow Installer to" \
+      "administer this computer." >&2
+    exit 1
+  fi
 fi
 
 arcen_log "stopping any running version"

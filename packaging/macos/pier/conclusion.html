@@ -19,14 +19,26 @@ this Mac's screen and take keyboard input, macOS needs your approval. Only
 someone at this Mac can give it.</p>
 
 <h2>Approve, once, for each person who will be served</h2>
+<p>The approvals go to <b>Arcen Agent Helper</b>, not Arcen Pier: the helper
+is the only part that can see the screen or type, and it acts only as the
+person signed in. The network service never gets either.</p>
 <ol>
-  <li><b>System Settings &gt; Privacy &amp; Security &gt; Screen &amp; System
-      Audio Recording</b>: turn on <b>Arcen Agent Helper</b>.</li>
+  <li><b>System Audio Recording</b>: when macOS asks whether Arcen Agent
+      Helper may record this Mac's audio, choose <b>Allow</b>. It is listed
+      separately, under <b>System Audio Recording Only</b> in the Screen &amp;
+      System Audio Recording pane. Until it is allowed the host cannot silence
+      its own speakers during a session, so it refuses Decks.</li>
   <li><b>System Settings &gt; Privacy &amp; Security &gt; Accessibility</b>:
       turn on <b>Arcen Agent Helper</b>.</li>
+  <li><b>System Settings &gt; Privacy &amp; Security &gt; Screen &amp; System
+      Audio Recording</b>: turn on <b>Arcen Agent Helper</b>.</li>
 </ol>
-<p class="note">macOS may ask for these itself when the helper starts. Choose
-Allow, or open System Settings to allow it.</p>
+<p class="note">Arcen Agent Helper asks for these now, one at a time, in this
+order: system audio, then Accessibility, then Screen Recording. Each question
+waits for the one before it. Choose Allow, or open System Settings to allow
+it. If Arcen Agent Helper is already
+listed and switched on, it was approved before (macOS keeps approvals when an
+app is removed without <code>--purge</code>); there is nothing more to do.</p>
 
 <h2>The login window</h2>
 <p>The login window asks separately. The first time a Deck connects before

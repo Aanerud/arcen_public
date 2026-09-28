@@ -25,6 +25,8 @@ pub mod build_identity;
 pub mod clipboard;
 pub mod credentials;
 pub mod display;
+#[cfg(target_os = "macos")]
+pub mod gestures;
 #[cfg(feature = "experimental-raw-hid")]
 pub mod hid;
 pub mod logging;

@@ -66,6 +66,9 @@ fn main() -> ExitCode {
     if command == "install-service" || command == "uninstall-service" {
         return run_service(command, &support_args);
     }
+    if command == "activate" {
+        return run_activate(&support_args);
+    }
     if command == "serve" {
         return run_serve(&support_args, &config_path);
     }
@@ -76,6 +79,15 @@ fn main() -> ExitCode {
     // reads reports; nothing else.
     if command == "hid-injector" {
         return arcen_pier_macos::input::virtual_keyboard::run_injector();
+    }
+    if command == "virtual-display-child" {
+        return match arcen_pier_macos::virtual_display::run_child_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("virtual-display-child: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     // The installer's launchd definitions, printed from the same code the
     // tests check, so the package cannot ship a hand-edited copy that drifts.
@@ -500,6 +512,59 @@ fn main() -> ExitCode {
     }
 }
 
+/// Starts the installed service and agents and proves they run, for the
+/// package's `postinstall`. The exit status is the shared installer
+/// transaction's verdict.
+fn run_activate(arguments: &[String]) -> ExitCode {
+    let mut agent_uids = Vec::new();
+    let mut port = arcen_pier_macos::net::DEFAULT_PORT;
+    let mut index = 0;
+    while index < arguments.len() {
+        let value = arguments.get(index + 1);
+        match (arguments[index].as_str(), value) {
+            ("--agent-uid", Some(value)) => match value.parse::<u32>() {
+                Ok(uid) => agent_uids.push(uid),
+                Err(_) => {
+                    eprintln!("activate: --agent-uid needs a number, not {value:?}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            ("--port", Some(value)) => match value.parse::<u16>() {
+                Ok(parsed) => port = parsed,
+                Err(_) => {
+                    eprintln!("activate: --port needs a port number, not {value:?}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            (other, _) => {
+                eprintln!("activate: unknown or incomplete argument {other}");
+                return ExitCode::FAILURE;
+            }
+        }
+        index += 2;
+    }
+    if !arcen_pier_macos::service::is_root() {
+        eprintln!("activate: must run as root");
+        return ExitCode::FAILURE;
+    }
+    let plan = arcen_pier_macos::activation::ActivationPlan::installed(agent_uids, port);
+    match arcen_pier_macos::activation::activate(
+        &mut arcen_pier_macos::activation::SystemLaunchd,
+        &plan,
+    ) {
+        Ok(report) => {
+            for line in report {
+                println!("Arcen Pier: {line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Arcen Pier: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Runs `serve`: provisions material if needed, binds QUIC, and handshakes.
 ///
 /// This is the command that makes the Mac reachable by a Deck.
@@ -740,10 +805,12 @@ async fn serve_desktop(
         arcen_pier_macos::stream::StreamSession {
             capture,
             codec: handshake.codec,
+            motion_priority: handshake.motion_priority,
             // The login window has no pasteboard: AppKit returns none, and
             // asking for one panicked the clipboard thread.
             clipboard: handshake.clipboard.filter(|_| !handshake.login_window),
             cursor_mode: handshake.cursor_mode,
+            input_mode_results: handshake.input_mode_results.clone(),
             audio_channel,
             audio_encoding: arcen_pier_macos::stream::AudioEncoding::for_stream(handshake.audio),
             frame_budget: stream_frames,
@@ -771,6 +838,7 @@ async fn serve_desktop(
             telemetry,
             session_id,
             audio,
+            path_signal_connection: socket.get_ref().path_signal_connection(),
         },
     )
     .await?;
@@ -822,17 +890,33 @@ async fn serve_multi_desktop(
         arcen_pier_macos::stream::MultiStreamSession {
             monitors,
             codec: handshake.codec,
+            motion_priority: handshake.motion_priority,
             // The login window has no pasteboard: AppKit returns none, and
             // asking for one panicked the clipboard thread.
             clipboard: handshake.clipboard.filter(|_| !handshake.login_window),
             cursor_mode: handshake.cursor_mode,
+            input_mode_results: handshake.input_mode_results.clone(),
             audio_encoding: arcen_pier_macos::stream::AudioEncoding::for_stream(handshake.audio),
             frame_budget: stream_frames,
-            input_bounds: arcen_pier_macos::input::DesktopBounds::new(
-                f64::from(multi_monitor.desktop_x),
-                f64::from(multi_monitor.desktop_y),
-                f64::from(multi_monitor.desktop_width_px),
-                f64::from(multi_monitor.desktop_height_px),
+            input: arcen_pier_macos::input_session::InputMode::Region(
+                arcen_pier_macos::input_session::RegionInputSession::new(
+                    multi_monitor.applied_regions.clone(),
+                    multi_monitor
+                        .monitors
+                        .iter()
+                        .map(|monitor| {
+                            (
+                                monitor.session_monitor_id,
+                                arcen_pier_macos::input::DesktopBounds::new(
+                                    monitor.display.origin_x,
+                                    monitor.display.origin_y,
+                                    monitor.display.pixel_width as f64,
+                                    monitor.display.pixel_height as f64,
+                                ),
+                            )
+                        })
+                        .collect(),
+                ),
             ),
             telemetry,
             session_id,
@@ -1145,9 +1229,6 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
 /// is told so while the person is still looking at it.
 const AGENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How often a relayed connection's send window follows its congestion window.
-const SEND_WINDOW_RESIZE: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Runs the network service: the listener, the TLS key and admission, and no
 /// desktop.
 ///
@@ -1384,20 +1465,11 @@ async fn relay_one(
             // Keep the backlog out of QUIC. The agent decides what is worth
             // sending — audio before video, the newest picture rather than a
             // stale one — and it can only decide if its writes feel the path.
-            let connection = deck.connection_handle();
-            let sizing = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(SEND_WINDOW_RESIZE);
-                loop {
-                    tick.tick().await;
-                    if connection.close_reason().is_some() {
-                        break;
-                    }
-                    let cwnd = connection.stats().path.cwnd;
-                    connection
-                        .set_send_window(arcen_transport::quic::interactive_send_window(cwnd));
-                }
-            });
-            let relayed = arcen_pier_macos::relay::relay_media(deck, agent, audio_channel).await;
+            let sizing = tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
+                deck.connection_handle(),
+            ));
+            let relayed =
+                arcen_pier_macos::relay::relay_media(deck, agent, session, audio_channel).await;
             sizing.abort();
             registry.end_session(session);
             match relayed {
@@ -1520,9 +1592,12 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Only a host that will ever tap needs the System Audio Recording answer.
+    let ask_audio_consent = host_setup.file_config.audio.enabled || local_playback.requires_mute();
     runtime.block_on(agent_loop(
         kind,
         local_playback,
+        ask_audio_consent,
         session_policy,
         host_setup.telemetry,
     ))
@@ -1582,10 +1657,17 @@ const AGENT_SIGN_IN_SLOTS: usize = 3;
 async fn agent_loop(
     kind: arcen_session::agent_relay::DesktopSessionKind,
     local_playback: arcen_session::pier_config::LocalPlayback,
+    ask_audio_consent: bool,
     session_policy: arcen_pier_macos::session::SessionPolicy,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
 ) -> ExitCode {
-    announce_permissions();
+    // A signed-in person can answer the prompts, so ask them all now, one at a
+    // time. The login window has nobody to ask.
+    if kind == arcen_session::agent_relay::DesktopSessionKind::User {
+        tokio::spawn(ask_for_permissions_in_turn(ask_audio_consent));
+    } else {
+        announce_permissions();
+    }
     let service_uid =
         arcen_pier_macos::auth::resolve_account(arcen_pier_macos::service::SERVICE_ACCOUNT)
             .map(|account| account.uid);
@@ -1865,11 +1947,102 @@ async fn start_session_audio(
     }
 }
 
+/// How long each prompt is given before the next one is raised anyway.
+const PERMISSION_PROMPT_TURN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Asks for every permission the helper needs, one at a time, when it starts.
+///
+/// Each one used to be raised by whatever first needed it. System audio
+/// waited for the first Deck, so its prompt appeared on a Mac nobody was
+/// watching while the session was refused. And Screen Recording and
+/// Accessibility were asked in the same instant, so the second dialog opened
+/// underneath the first and was found later, as a surprise.
+///
+/// So they are asked in turn, right after install while the person who
+/// installed is still at the Mac, each waiting for the previous answer.
+/// The order follows what can be observed. The system audio prompt holds the
+/// tap until it is answered, and Accessibility reports a grant as soon as it is
+/// given. Screen Recording is last because a new grant may only take effect
+/// once the helper restarts, so waiting on it proves nothing.
+///
+/// A prompt nobody answers holds up the next one for at most
+/// [`PERMISSION_PROMPT_TURN`].
+async fn ask_for_permissions_in_turn(ask_audio: bool) {
+    use arcen_pier_macos::permissions;
+
+    if ask_audio {
+        // Shares the exclusive slot with a session's audio startup, so it
+        // never holds the output device alongside a session's tap. The tap it
+        // creates leaves playback audible and is dropped at once.
+        let consent = tokio::time::timeout(
+            PERMISSION_PROMPT_TURN,
+            arcen_pier_macos::blocking::run_exclusive(
+                "arcen-macos-audio-consent",
+                &AUDIO_STARTUP_SLOT,
+                audio_startup_failure,
+                arcen_pier_macos::audio::register_capture_consent,
+            ),
+        )
+        .await;
+        match consent {
+            Ok(Ok(arcen_pier_macos::audio::CaptureConsent::Registered)) => {}
+            Ok(Ok(arcen_pier_macos::audio::CaptureConsent::Unavailable)) => eprintln!(
+                "No audio tap could be created. Host audio and muting local playback are \
+                 unavailable; with audio.local_playback \"muted\" every session will be refused."
+            ),
+            Ok(Err(error)) => eprintln!("asking for system audio consent: {error}"),
+            Err(_) => eprintln!(
+                "The System Audio Recording prompt has not been answered; asking for the next \
+                 permission meanwhile."
+            ),
+        }
+    }
+
+    if !permissions::probe().accessibility {
+        // Returns at once: the dialog belongs to another process.
+        let _ = permissions::request_accessibility_access();
+        let deadline = tokio::time::Instant::now() + PERMISSION_PROMPT_TURN;
+        while !permissions::probe().accessibility && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if !permissions::probe().accessibility {
+            eprintln!(
+                "Accessibility is not granted. Approve \"Arcen Agent Helper\" under \
+                 System Settings > Privacy & Security > Accessibility; until then \
+                 keyboard injection will not reach applications."
+            );
+        }
+    }
+
+    // Returns at once; the system shows its own dialog.
+    if !permissions::probe().screen_recording && !permissions::request_screen_recording() {
+        eprintln!(
+            "Screen Recording is not granted. Approve \"Arcen Agent Helper\" under \
+             System Settings > Privacy & Security > Screen & System Audio Recording; \
+             until then this host serves a session with no picture."
+        );
+    }
+}
+
+/// What the Deck is told when audio refuses a session.
+///
+/// A close frame holds about 120 bytes, so the full explanation stays in the
+/// agent log and the Deck gets the part its user can act on.
+fn deck_reason_for_audio_refusal(reason: &str) -> &'static str {
+    if reason.contains("System Audio Recording") {
+        "At the host, allow System Audio Recording for Arcen Agent Helper, then reconnect."
+    } else {
+        "The host could not mute its own speakers, so it refused the session. See its agent log."
+    }
+}
+
 fn audio_startup_failure(failure: arcen_pier_macos::blocking::ExclusiveFailure) -> String {
     match failure {
         arcen_pier_macos::blocking::ExclusiveFailure::Busy => {
-            "a previous audio startup is still running; refusing to start another session while a \
-             timed-out tap may still be muting local playback"
+            "host audio is still starting, usually because the System Audio Recording prompt on \
+             the host has not been answered. Someone at the host must choose Allow for \"Arcen \
+             Agent Helper\" (System Settings > Privacy & Security > System Audio Recording). \
+             Until then the host cannot mute its own speakers, so it refuses the session."
                 .to_owned()
         }
         arcen_pier_macos::blocking::ExclusiveFailure::Spawn(error) => {
@@ -2159,6 +2332,47 @@ fn emit_session_event(
 /// decide-whether-to-continue, and so the telemetry around a session sits
 /// beside the session rather than between the accept and the next accept.
 #[allow(clippy::too_many_lines)]
+/// Every live session's shared Pier lifecycle in this agent. Steps are
+/// reported where the agent already emits its session lifecycle telemetry;
+/// ordering and the readiness-evidence rule are the shared crate's.
+static LIFECYCLES: arcen_session::host_lifecycle::SessionLifecycles =
+    arcen_session::host_lifecycle::SessionLifecycles::new();
+
+fn log_lifecycle(
+    key: &str,
+    step: &'static str,
+    report: arcen_session::host_lifecycle::LifecycleReport,
+) {
+    match report.to {
+        Ok(state) => tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            session = key,
+            step,
+            from = report.from.map(|state| state.token()),
+            state = state.token(),
+            "Pier lifecycle"
+        ),
+        Err(error) => tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            session = key,
+            step,
+            from = report.from.map(|state| state.token()),
+            %error,
+            "Pier lifecycle step refused"
+        ),
+    }
+}
+
+/// Ends a session's lifecycle however `serve_one` leaves: refused after
+/// authentication, failed, or served.
+struct LifecycleEnd(String);
+
+impl Drop for LifecycleEnd {
+    fn drop(&mut self) {
+        log_lifecycle(&self.0, "ended", LIFECYCLES.ended(&self.0));
+    }
+}
+
 async fn serve_one(
     socket: &mut arcen_pier_macos::net::PierSocket,
     peer: std::net::SocketAddr,
@@ -2195,11 +2409,18 @@ async fn serve_one(
                 arcen_telemetry::names::target::AUTH,
                 "session auth ok",
             );
+            let lifecycle = LifecycleEnd(session_id.to_string());
+            log_lifecycle(
+                &lifecycle.0,
+                "authenticated",
+                LIFECYCLES.authenticated(&lifecycle.0),
+            );
             // The login window is served to whoever authenticated, so that
             // they can sign in; only a user's desktop must belong to them.
             if !session_policy.login_window {
                 if let Err(reason) = admit_session(&handshake.user, first_login_timeout).await {
                     eprintln!("refusing the session: {reason}");
+                    let _ = arcen_pier_macos::net::refuse_with_reason(socket, &reason).await;
                     return SessionOutcome::Refused;
                 }
             }
@@ -2208,6 +2429,12 @@ async fn serve_one(
                 Ok(audio) => audio,
                 Err(reason) => {
                     eprintln!("refusing the session: {reason}");
+                    // Without this the Deck sees only a reset connection.
+                    let _ = arcen_pier_macos::net::refuse_with_reason(
+                        socket,
+                        deck_reason_for_audio_refusal(&reason),
+                    )
+                    .await;
                     return SessionOutcome::Refused;
                 }
             };
@@ -2271,6 +2498,24 @@ async fn serve_one(
                 )),
                 arcen_telemetry::names::target::MEDIA,
                 "session stream start",
+            );
+            log_lifecycle(
+                &lifecycle.0,
+                "stream_started",
+                LIFECYCLES.stream_started(
+                    &lifecycle.0,
+                    arcen_session::host_lifecycle::NativeReadinessEvidence {
+                        // PAM authenticated this user for this console.
+                        session_identity: !handshake.user.is_empty(),
+                        // The capture display resolved a real geometry.
+                        outputs_verified: handshake.capture_width > 0
+                            && handshake.capture_height > 0,
+                        // The handshake resolved an encoder contract.
+                        media_verified: handshake.fps > 0,
+                        // The input session was negotiated in the handshake.
+                        input_verified: true,
+                    },
+                ),
             );
 
             let outcome = serve_desktop(
@@ -2761,12 +3006,14 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
         if matches!(
             command,
             "support-bundle"
+                | "activate"
                 | "probe-media"
                 | "new-host-cert"
                 | "serve"
                 | "daemon"
                 | "agent"
                 | "launchd-plist"
+                | "virtual-display-child"
                 | "probe-audio"
                 | "register-audio-consent"
         ) {
@@ -2797,7 +3044,9 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             "agent" => command = "agent",
             "launchd-plist" => command = "launchd-plist",
             "hid-injector" => command = "hid-injector",
+            "virtual-display-child" => command = "virtual-display-child",
             "install-service" => command = "install-service",
+            "activate" => command = "activate",
             "uninstall-service" => command = "uninstall-service",
             "support-bundle" => command = "support-bundle",
             "--config" => {

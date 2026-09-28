@@ -51,7 +51,9 @@ pub mod applied;
 pub mod atomic_start;
 pub mod edid;
 pub mod fairness;
+pub mod nvidia_heads;
 pub mod provider;
+pub mod windows_multi_monitor;
 
 #[cfg(test)]
 mod block_on;
@@ -70,8 +72,17 @@ pub use edid::{
     validate,
 };
 pub use fairness::{FairRoster, RosterError, ServiceOrder};
+pub use nvidia_heads::{
+    NvidiaXorgOutput, choose_nvidia_xorg_heads, is_nvidia_dfp_head_token, nvidia_dfp_head_index,
+    parse_nvidia_xorg_outputs, rank_nvidia_xorg_heads,
+};
 pub use provider::{
     BindFailure, CapabilityMismatch, CapabilityRangeError, CommittedOutput, OutputCapabilities,
     OutputContext, OutputDemand, OutputProvider, OutputStage, OutputSurface, OutputTransaction,
     OutputTransactionError, OutputTransactionState, RollbackGuarantee, admits,
+};
+pub use windows_multi_monitor::{
+    AdminHeadlessMode, WindowsMultiMonitorAdapter, WindowsMultiMonitorPolicy,
+    WindowsMultiMonitorRefusal, WindowsMultiMonitorSelection, WindowsMultiMonitorSelectionReason,
+    resolve_windows_multi_monitor_adapter,
 };

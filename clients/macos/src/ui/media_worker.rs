@@ -34,7 +34,10 @@ use crate::transport::websocket::{
     FullFrameRequestGate, SessionAuthentication, SessionCommandSender, SessionEnd, SessionEvent,
 };
 use crate::ui::session_truth::ActiveContract;
-use arcen_media::{ColorPrimaries, TransferCharacteristics};
+use arcen_media::{
+    classify_presentation_window, ColorPrimaries, PresentationWindow, TransferCharacteristics,
+};
+use arcen_telemetry::rounded_percentiles_ms;
 
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(2);
 /// How often the worker emits an INFO "stream healthy" heartbeat while frames
@@ -67,6 +70,9 @@ pub struct MonitorMediaCounters {
     /// Fresh frames that replaced a still-unpresented frame for this
     /// monitor -- decode kept up but presentation did not.
     pub presentation_superseded: u64,
+    /// Fresh frames the Deck intentionally did not present because the
+    /// target display had not reached its next refresh opportunity.
+    pub frames_superseded_by_refresh: u64,
     /// Whether this monitor's own slot is currently waiting for a keyframe.
     pub waiting_for_keyframe: bool,
     /// Most recent route+decode duration for this monitor.
@@ -85,6 +91,77 @@ impl MonitorMediaCounters {
             return 0.0;
         }
         self.decode_ms_total / self.frames_decoded as f64
+    }
+}
+
+/// Local display identity a negotiated monitor is presented on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonitorPresentationTarget {
+    /// The local `CGDirectDisplayID` receiving this monitor.
+    pub deck_display_id: u32,
+    /// Human-readable Deck display name, or a stable fallback.
+    pub deck_display_name: String,
+    /// Nominal refresh of the local Deck display receiving this monitor.
+    pub display_refresh_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MonitorRateSnapshot {
+    frames_received: u64,
+    frames_presented: u64,
+    frames_rejected: u64,
+    frames_superseded_by_refresh: u64,
+}
+
+impl MonitorRateSnapshot {
+    fn from_counts(counters: &MonitorMediaCounters, frames_presented: u64) -> Self {
+        Self {
+            frames_received: counters.frames_received,
+            frames_presented,
+            frames_rejected: counters.frames_rejected,
+            frames_superseded_by_refresh: counters.frames_superseded_by_refresh,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MonitorWindowRates {
+    fps_received: f64,
+    fps_presented: f64,
+    frames_dropped: u64,
+    frames_superseded_by_refresh: u64,
+    frames_dropped_before_presentation: u64,
+}
+
+fn monitor_stream_window(
+    elapsed: Duration,
+    previous: Option<MonitorRateSnapshot>,
+    current: MonitorRateSnapshot,
+    display_refresh_hz: u32,
+) -> MonitorWindowRates {
+    let previous = previous.unwrap_or_default();
+    let report = classify_presentation_window(PresentationWindow {
+        frames_received: current
+            .frames_received
+            .saturating_sub(previous.frames_received),
+        frames_presented_by_client: current
+            .frames_presented
+            .saturating_sub(previous.frames_presented),
+        frames_rejected: current
+            .frames_rejected
+            .saturating_sub(previous.frames_rejected),
+        frames_superseded_by_refresh: current
+            .frames_superseded_by_refresh
+            .saturating_sub(previous.frames_superseded_by_refresh),
+        display_refresh_hz,
+        elapsed,
+    });
+    MonitorWindowRates {
+        fps_received: report.fps_received,
+        fps_presented: report.fps_presented,
+        frames_dropped: report.frames_dropped,
+        frames_superseded_by_refresh: report.frames_superseded_by_refresh,
+        frames_dropped_before_presentation: report.frames_dropped_before_presentation,
     }
 }
 
@@ -153,6 +230,8 @@ pub struct SharedMediaState {
     pub inbox: IncomingMediaTelemetry,
     pub ingress_idr_requests: u64,
     pub malformed_media_packets: u64,
+    /// Number of media-ready events that explicitly woke the UI.
+    pub ui_wake_media_ready: u64,
     pub generation: u64,
     pub end: Option<SessionEnd>,
     pub closed: bool,
@@ -185,9 +264,14 @@ pub struct SharedMediaState {
         arcen_media::TopologyGeneration,
         arcen_media::RegionMediaRoster,
     )>,
-    /// Latest decoded frame for every negotiated *secondary* monitor (i.e.
-    /// every committed monitor id other than the roster's primary, whose
-    /// frame continues to flow through `latest_frame` unchanged). Empty
+    /// Negotiated monitor presented by the Deck root viewport. Defaults to
+    /// the roster primary when absent; multi-window presentation may move
+    /// root to another local display to avoid pacing every viewport on a
+    /// slow primary display.
+    pub multi_monitor_root_monitor_id: Option<arcen_media::SessionMonitorId>,
+    /// Latest decoded frame for every negotiated non-root monitor (i.e.
+    /// every committed monitor id other than `multi_monitor_root_monitor_id`
+    /// or, when absent, the roster primary). Empty
     /// until `multi_monitor_decode_roster` is set and at least one
     /// secondary frame has decoded. Bounded to one latest frame per monitor,
     /// mirroring `latest_frame`'s single-slot bound -- and, like
@@ -206,6 +290,15 @@ pub struct SharedMediaState {
     /// (`arcen_media::MAX_MULTI_MONITOR_COUNT`), so this map can never grow
     /// beyond four entries.
     pub monitor_media: BTreeMap<arcen_media::SessionMonitorId, MonitorMediaCounters>,
+    /// Recent video wire-age samples by negotiated monitor, using the same
+    /// host timestamp clock as the session-wide `video_wire_age_samples`.
+    pub monitor_wire_age_samples: BTreeMap<arcen_media::SessionMonitorId, VecDeque<f64>>,
+    /// Cumulative UI presentations by monitor. Decode/receive counters are
+    /// worker-owned, but presentation happens on the UI thread.
+    pub monitor_presented_frames: BTreeMap<arcen_media::SessionMonitorId, u64>,
+    /// The local Deck display each negotiated monitor is presented on.
+    pub monitor_presentation_targets:
+        BTreeMap<arcen_media::SessionMonitorId, MonitorPresentationTarget>,
 }
 
 impl SharedMediaState {
@@ -236,6 +329,10 @@ pub fn spawn_media_worker(
             let mut full_frame_requests = FullFrameRequestGate::default();
             let mut pending_ingress_idr = false;
             let mut last_heartbeat = Instant::now();
+            let mut monitor_rate_snapshots: BTreeMap<
+                arcen_media::SessionMonitorId,
+                MonitorRateSnapshot,
+            > = BTreeMap::new();
             // Additive per-monitor router for wire `monitor_id != 0` traffic.
             // Stays `None` (and `decoder` above remains the entire decode
             // path, byte for byte unchanged) for every legacy and
@@ -430,6 +527,10 @@ pub fn spawn_media_worker(
                         repaint.request_repaint();
                     }
                     SessionEvent::MediaReady => {
+                        {
+                            let mut state = shared.lock().expect("media state poisoned");
+                            state.ui_wake_media_ready = state.ui_wake_media_ready.saturating_add(1);
+                        }
                         maybe_commit_secondary_router(
                             &shared,
                             &mut secondary_router,
@@ -447,7 +548,7 @@ pub fn spawn_media_worker(
                             &telemetry,
                             &repaint,
                         );
-                        maybe_heartbeat(&shared, &mut last_heartbeat);
+                        maybe_heartbeat(&shared, &mut last_heartbeat, &mut monitor_rate_snapshots);
                         repaint.request_repaint();
                     }
                     SessionEvent::Ended(end) => {
@@ -487,11 +588,17 @@ fn finish(shared: &Arc<Mutex<SharedMediaState>>, repaint: &egui::Context, error:
 /// Emit an INFO "stream healthy" heartbeat at most every HEARTBEAT_INTERVAL.
 /// This is the light-level "OK working" signal a sysadmin greps for; DEBUG
 /// carries the per-event drop/keyframe/decode detail between heartbeats.
-fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
-    if last.elapsed() < HEARTBEAT_INTERVAL {
+fn maybe_heartbeat(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    last: &mut Instant,
+    monitor_rate_snapshots: &mut BTreeMap<arcen_media::SessionMonitorId, MonitorRateSnapshot>,
+) {
+    let now = Instant::now();
+    let elapsed = now.duration_since(*last);
+    if elapsed < HEARTBEAT_INTERVAL {
         return;
     }
-    *last = Instant::now();
+    *last = now;
     let state = shared.lock().expect("media state poisoned");
     tracing::info!(
         target: crate::logging::target::VIDEO,
@@ -530,16 +637,16 @@ fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
     );
     // Its own record: the heartbeat above is at the per-record field cap.
     // Audio heard = its wire age + what waits in the playout queue.
-    let video_age = percentiles(&state.video_wire_age_samples);
-    let audio_age = percentiles(&state.audio_wire_age_samples);
+    let video_age = rounded_percentiles_ms(state.video_wire_age_samples.iter().copied());
+    let audio_age = rounded_percentiles_ms(state.audio_wire_age_samples.iter().copied());
     tracing::info!(
         target: crate::logging::target::VIDEO,
-        video_age_p50_ms = ?video_age.map(|(p50, _)| p50),
-        video_age_p95_ms = ?video_age.map(|(_, p95)| p95),
-        audio_age_p50_ms = ?audio_age.map(|(p50, _)| p50),
-        audio_age_p95_ms = ?audio_age.map(|(_, p95)| p95),
+        video_age_p50_ms = ?video_age.map(|age| age.p50_ms),
+        video_age_p95_ms = ?video_age.map(|age| age.p95_ms),
+        audio_age_p50_ms = ?audio_age.map(|age| age.p50_ms),
+        audio_age_p95_ms = ?audio_age.map(|age| age.p95_ms),
         audio_queued_ms = state.last_audio_queued_ms,
-        audio_heard_ms = ?audio_age.map(|(p50, _)| p50 + state.last_audio_queued_ms as i64),
+        audio_heard_ms = ?audio_age.map(|age| age.p50_ms + state.last_audio_queued_ms as i64),
         "stream delay",
     );
     // One bounded record per negotiated monitor (never more than
@@ -548,6 +655,39 @@ fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
     // starved -- the exact gap that left the pier-windows.example.internal stutter
     // undiagnosable from client telemetry alone.
     for (monitor_id, counters) in &state.monitor_media {
+        let presented = state
+            .monitor_presented_frames
+            .get(monitor_id)
+            .copied()
+            .unwrap_or_default();
+        let current = MonitorRateSnapshot::from_counts(counters, presented);
+        let target = state.monitor_presentation_targets.get(monitor_id);
+        let rates = monitor_stream_window(
+            elapsed,
+            monitor_rate_snapshots.get(monitor_id).copied(),
+            current,
+            target.map_or(0, |target| target.display_refresh_hz),
+        );
+        monitor_rate_snapshots.insert(*monitor_id, current);
+        let video_age = state
+            .monitor_wire_age_samples
+            .get(monitor_id)
+            .and_then(|samples| rounded_percentiles_ms(samples.iter().copied()));
+        tracing::info!(
+            target: crate::logging::target::VIDEO,
+            monitor_id = monitor_id.get(),
+            video_age_p50_ms = ?video_age.map(|age| age.p50_ms),
+            video_age_p95_ms = ?video_age.map(|age| age.p95_ms),
+            fps_received = rates.fps_received,
+            fps_presented = rates.fps_presented,
+            frames_dropped = rates.frames_dropped,
+            display_refresh_hz = target.map_or(0, |target| target.display_refresh_hz),
+            frames_superseded_by_refresh = rates.frames_superseded_by_refresh,
+            frames_dropped_before_presentation = rates.frames_dropped_before_presentation,
+            deck_display_id = target.map_or(0, |target| target.deck_display_id),
+            deck_display_name = target.map_or("", |target| target.deck_display_name.as_str()),
+            "per-monitor stream delay",
+        );
         tracing::info!(
             target: crate::logging::target::VIDEO,
             monitor_id = monitor_id.get(),
@@ -555,12 +695,14 @@ fn maybe_heartbeat(shared: &Arc<Mutex<SharedMediaState>>, last: &mut Instant) {
             frames_decoded = counters.frames_decoded,
             frames_rejected = counters.frames_rejected,
             presentation_superseded = counters.presentation_superseded,
+            frames_superseded_by_refresh = counters.frames_superseded_by_refresh,
             waiting_for_keyframe = counters.waiting_for_keyframe,
             decode_ms = counters.last_decode_ms,
             average_decode_ms = counters.average_decode_ms(),
             "per-monitor stream health",
         );
     }
+    monitor_rate_snapshots.retain(|monitor_id, _| state.monitor_media.contains_key(monitor_id));
 }
 
 /// One-way arm: builds the additive per-monitor `secondary_router` the
@@ -650,6 +792,18 @@ fn handle_media_batch(
         }
         for _ in &batch.video {
             push_instant_sample(&mut state.video_packet_times, now);
+        }
+        for (header, _) in &batch.video {
+            if let Ok(monitor_id) = arcen_media::SessionMonitorId::new(header.monitor_id) {
+                let age = wire_frame_age_ms(header.timestamp_ms);
+                push_ms_sample(
+                    state
+                        .monitor_wire_age_samples
+                        .entry(monitor_id)
+                        .or_default(),
+                    f64::from(age),
+                );
+            }
         }
         if let Some((header, payload)) = batch.video.last() {
             let age = wire_frame_age_ms(header.timestamp_ms);
@@ -1010,12 +1164,15 @@ fn decode_secondary_packets(
     telemetry: &ClientTelemetry,
     repaint: &egui::Context,
 ) -> SecondaryDecodeOutcome {
-    // The router's own explicit negotiated primary -- never
-    // `router.monitor_ids().next()`, which iterates in ascending numeric
-    // order and would silently treat the *smallest* admitted id as "the
-    // primary" whenever the real negotiated primary is not the smallest
-    // (e.g. primary `7` alongside secondary `1`).
-    let primary_monitor_id = router.primary_monitor_id();
+    // The monitor the Deck root viewport presents. Defaults to the router's
+    // explicit negotiated primary, but multi-window presentation can choose
+    // a faster local display for root so a slow primary display cannot pace
+    // every immediate secondary viewport.
+    let root_monitor_id = shared
+        .lock()
+        .expect("media state poisoned")
+        .multi_monitor_root_monitor_id
+        .or_else(|| router.primary_monitor_id());
     let mut decoded_any = false;
     for (header, payload) in packets {
         let monitor_id = arcen_media::SessionMonitorId::new(header.monitor_id).ok();
@@ -1041,7 +1198,7 @@ fn decode_secondary_packets(
                 };
                 decoded_any = true;
                 let mut state = shared.lock().expect("media state poisoned");
-                let superseded = if is_primary_route(route, primary_monitor_id) {
+                let superseded = if is_primary_route(route, root_monitor_id) {
                     state.latest_frame.replace(frame).is_some()
                 } else {
                     match route {
@@ -1067,12 +1224,12 @@ fn decode_secondary_packets(
                 // its entire 126-second lifetime while it was in fact
                 // decoding and presenting ~29 fps.
                 record_monitor_decode(&mut state, monitor_id, elapsed_ms, superseded);
-                if is_primary_route(route, primary_monitor_id) {
-                    if let Some(primary_id) = primary_monitor_id {
+                if is_primary_route(route, root_monitor_id) {
+                    if let Some(root_id) = root_monitor_id {
                         state.decoder_backend_name =
-                            router.decoder_backend_name(primary_id).unwrap_or("");
+                            router.decoder_backend_name(root_id).unwrap_or("");
                         state.decoder_hardware_accelerated =
-                            router.decoder_hardware_accelerated(primary_id).flatten();
+                            router.decoder_hardware_accelerated(root_id).flatten();
                     }
                 }
                 let (seen, decoded, dropped) = (
@@ -1254,20 +1411,6 @@ fn push_ms_sample(samples: &mut VecDeque<f64>, value: f64) {
     }
 }
 
-/// The median and 95th percentile of `samples`, rounded to milliseconds.
-fn percentiles(samples: &VecDeque<f64>) -> Option<(i64, i64)> {
-    if samples.is_empty() {
-        return None;
-    }
-    let mut sorted: Vec<f64> = samples.iter().copied().collect();
-    sorted.sort_by(f64::total_cmp);
-    let at = |fraction: f64| {
-        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
-        sorted[index].round() as i64
-    };
-    Some((at(0.5), at(0.95)))
-}
-
 fn wire_frame_age_ms(timestamp_ms: u32) -> i32 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1282,10 +1425,63 @@ mod tests {
     use crate::protocol::{ChromaSubsampling, FrameType, VideoCodec, VIDEO_KEYFRAME_FLAG};
 
     #[test]
-    fn delay_percentiles_are_the_median_and_the_tail() {
-        let samples: VecDeque<f64> = (1..=100).map(f64::from).collect();
-        assert_eq!(percentiles(&samples), Some((51, 95)));
-        assert_eq!(percentiles(&VecDeque::new()), None);
+    fn per_monitor_window_rates_use_counter_deltas() {
+        let previous = MonitorRateSnapshot {
+            frames_received: 100,
+            frames_presented: 90,
+            frames_rejected: 7,
+            frames_superseded_by_refresh: 0,
+        };
+        let current = MonitorRateSnapshot {
+            frames_received: 250,
+            frames_presented: 140,
+            frames_rejected: 12,
+            frames_superseded_by_refresh: 0,
+        };
+
+        let rates = monitor_stream_window(Duration::from_secs(5), Some(previous), current, 0);
+
+        assert!((rates.fps_received - 30.0).abs() < f64::EPSILON);
+        assert!((rates.fps_presented - 10.0).abs() < f64::EPSILON);
+        assert_eq!(rates.frames_dropped, 100);
+        assert_eq!(rates.frames_superseded_by_refresh, 0);
+        assert_eq!(rates.frames_dropped_before_presentation, 100);
+    }
+
+    #[test]
+    fn per_monitor_window_rates_guard_missing_previous_and_zero_elapsed() {
+        let current = MonitorRateSnapshot {
+            frames_received: 50,
+            frames_presented: 25,
+            frames_rejected: 3,
+            frames_superseded_by_refresh: 0,
+        };
+
+        let rates = monitor_stream_window(Duration::ZERO, None, current, 60);
+
+        assert!(rates.fps_received.abs() < f64::EPSILON);
+        assert!(rates.fps_presented.abs() < f64::EPSILON);
+        assert_eq!(rates.frames_dropped, 50);
+        assert_eq!(rates.frames_superseded_by_refresh, 0);
+        assert_eq!(rates.frames_dropped_before_presentation, 50);
+    }
+
+    #[test]
+    fn per_monitor_window_rates_attribute_slow_display_supersession_to_refresh() {
+        let current = MonitorRateSnapshot {
+            frames_received: 300,
+            frames_presented: 300,
+            frames_rejected: 0,
+            frames_superseded_by_refresh: 0,
+        };
+
+        let rates = monitor_stream_window(Duration::from_secs(5), None, current, 30);
+
+        assert_eq!(rates.fps_received, 60.0);
+        assert_eq!(rates.fps_presented, 30.0);
+        assert_eq!(rates.frames_dropped, 150);
+        assert_eq!(rates.frames_superseded_by_refresh, 150);
+        assert_eq!(rates.frames_dropped_before_presentation, 0);
     }
 
     #[test]

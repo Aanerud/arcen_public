@@ -619,20 +619,33 @@ const REFERENCE_HDR10_LUMINANCE_CODES: [u8; 3] = [138, 96, 6];
 /// known frame average carries the peak as the average, the conservative
 /// claim, because the format has no "unknown" code for a middle value.
 fn hdr_luminance_codes(color: Option<arcen_media::display_color::DisplayColor>) -> Vec<u8> {
+    use arcen_media::display_color::Luminance;
+
     let Some(color) = color else {
         return REFERENCE_HDR10_LUMINANCE_CODES.to_vec();
     };
     let Some(luminance) = color.hdr_luminance() else {
         return REFERENCE_HDR10_LUMINANCE_CODES.to_vec();
     };
-    let peak = cta_max_luminance_code(luminance.peak_nits);
+    let Some(peak_nits) = luminance.peak.nits() else {
+        return REFERENCE_HDR10_LUMINANCE_CODES.to_vec();
+    };
+    let peak = cta_max_luminance_code(peak_nits);
     let mut codes = vec![peak];
-    match (luminance.frame_average_nits, luminance.min_nits) {
-        (None, None) => {}
-        (Some(average), None) => codes.push(cta_max_luminance_code(average)),
-        (average, Some(min)) => {
-            codes.push(average.map_or(peak, cta_max_luminance_code));
-            codes.push(cta_min_luminance_code(min, peak));
+    match (luminance.frame_average, luminance.min) {
+        (Luminance::Unknown, Luminance::Unknown) => {}
+        (average, Luminance::Unknown) => {
+            let Some(average) = average.nits() else {
+                return REFERENCE_HDR10_LUMINANCE_CODES.to_vec();
+            };
+            codes.push(cta_max_luminance_code(average));
+        }
+        (average, minimum) => {
+            let Some(minimum) = minimum.nits() else {
+                return REFERENCE_HDR10_LUMINANCE_CODES.to_vec();
+            };
+            codes.push(average.nits().map_or(peak, cta_max_luminance_code));
+            codes.push(cta_min_luminance_code(minimum, peak));
         }
     }
     codes
@@ -814,6 +827,7 @@ mod hdr10_tests {
             generate_hdr10(with_color(arcen_media::display_color::DisplayColorMsg {
                 peak_nits: Some(1000.0),
                 min_nits: Some(0.005),
+                hdr_headroom: 10.0,
                 ..Default::default()
             }))
             .expect("hdr10 edid");

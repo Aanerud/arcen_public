@@ -19,6 +19,8 @@ use arcen_telemetry::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
+pub mod activation;
+#[cfg(target_os = "macos")]
 pub mod audio;
 #[cfg(target_os = "macos")]
 pub mod auth;
@@ -89,6 +91,8 @@ pub struct MacOsPlatformConfig {
     pub service_user: Option<String>,
     #[serde(default)]
     pub agent_bundle_id: Option<String>,
+    /// Retired: nothing reads these any more. Still accepted so an existing
+    /// `pier.json` that carries them keeps loading.
     #[serde(default)]
     pub privileged_broker_enabled: bool,
     #[serde(default)]
@@ -144,20 +148,23 @@ pub struct MacOsMultiMonitorConfig {
 
 /// Whether this host may advertise `multi_monitor_v1` for a given inventory.
 ///
-/// Four conditions, all required. The operator has to have asked for it, and
-/// the host has to be able to serve it end-to-end. Saying so in one function beats
-/// scattering the reason across call sites.
-///
-/// `attached_displays` is what the window server actually reported, not what
-/// anyone configured: a ceiling in a file cannot conjure a second screen.
+/// The operator has to have asked for it, and the host has to be able to serve
+/// it end-to-end. On macOS the served monitors are session-owned virtual
+/// displays, so the attached-display count is evidence that WindowServer is
+/// alive, not a ceiling on what Match My Layout can request.
 #[must_use]
 pub const fn may_advertise_multi_monitor(
     config: &MacOsMultiMonitorConfig,
     attached_displays: usize,
     can_capture_many: bool,
     can_route_region_input: bool,
+    can_create_virtual_displays: bool,
 ) -> bool {
-    config.advertise_enabled && can_capture_many && attached_displays > 1 && can_route_region_input
+    config.advertise_enabled
+        && attached_displays > 0
+        && can_capture_many
+        && can_route_region_input
+        && can_create_virtual_displays
 }
 
 /// Whether this build can capture more than one display at once.
@@ -565,18 +572,6 @@ pub fn run(config: &PierFileConfig, startup: &StartupConfig) -> Result<(), Strin
         primary_only_capable = capacity.can_serve_primary_only(1),
         "macOS Pier control plane is ready; native session adapters are not armed"
     );
-    if !config.platform.virtual_display_enabled
-        || !config.platform.native_login_enabled
-        || !config.platform.privileged_broker_enabled
-    {
-        tracing::warn!(
-            target: "arcen.pier.macos",
-            virtual_display = config.platform.virtual_display_enabled,
-            native_login = config.platform.native_login_enabled,
-            privileged_broker = config.platform.privileged_broker_enabled,
-            "macOS native adapters are not fully enabled; refusing session admission"
-        );
-    }
     if !permissions.usable_for_input_and_capture() {
         return Err(format!(
             "required macOS permissions are unavailable (screen_recording={}, accessibility={})",
@@ -847,18 +842,18 @@ mod multi_monitor_tests {
             advertise_enabled: true,
             max_monitors: Some(4),
         };
-        assert!(!may_advertise_multi_monitor(&enabled, 2, false, true));
+        assert!(!may_advertise_multi_monitor(&enabled, 2, false, true, true));
     }
 
     #[test]
-    fn a_configured_ceiling_cannot_conjure_a_second_screen() {
+    fn one_attached_display_can_advertise_when_virtual_outputs_are_available() {
         let enabled = MacOsMultiMonitorConfig {
             advertise_enabled: true,
             max_monitors: Some(4),
         };
         assert!(
-            !may_advertise_multi_monitor(&enabled, 1, true, true),
-            "one attached display is one display, whatever the file says",
+            may_advertise_multi_monitor(&enabled, 1, true, true, true),
+            "macOS creates one session-owned virtual display per Deck monitor",
         );
     }
 
@@ -868,16 +863,25 @@ mod multi_monitor_tests {
             advertise_enabled: true,
             max_monitors: None,
         };
-        assert!(!may_advertise_multi_monitor(&enabled, 2, true, false));
+        assert!(!may_advertise_multi_monitor(&enabled, 2, true, false, true));
     }
 
     #[test]
-    fn all_four_conditions_together_would_open_the_gate() {
+    fn virtual_display_creation_is_part_of_the_advertisement_gate() {
         let enabled = MacOsMultiMonitorConfig {
             advertise_enabled: true,
             max_monitors: None,
         };
-        assert!(may_advertise_multi_monitor(&enabled, 2, true, true));
+        assert!(!may_advertise_multi_monitor(&enabled, 2, true, true, false));
+    }
+
+    #[test]
+    fn all_end_to_end_conditions_together_open_the_gate() {
+        let enabled = MacOsMultiMonitorConfig {
+            advertise_enabled: true,
+            max_monitors: None,
+        };
+        assert!(may_advertise_multi_monitor(&enabled, 2, true, true, true));
     }
 }
 

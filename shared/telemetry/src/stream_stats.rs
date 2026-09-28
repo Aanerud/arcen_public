@@ -18,6 +18,75 @@ use serde::{Deserialize, Serialize};
 /// How often a streaming session reports its health by default.
 pub const DEFAULT_SNAPSHOT_INTERVAL_SECS: u64 = 5;
 
+/// Rounded latency percentiles in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundedPercentiles {
+    /// Median sample, rounded to the nearest millisecond.
+    pub p50_ms: i64,
+    /// 95th-percentile sample, rounded to the nearest millisecond.
+    pub p95_ms: i64,
+}
+
+/// Returns the median and 95th percentile of millisecond samples.
+///
+/// The rank selection matches the stream delay logs' original behaviour:
+/// choose a rounded fractional index inside the sorted sample set, then round
+/// the selected sample to a whole millisecond for stable structured logs.
+#[must_use]
+pub fn rounded_percentiles_ms(
+    samples: impl IntoIterator<Item = f64>,
+) -> Option<RoundedPercentiles> {
+    let mut sorted: Vec<f64> = samples.into_iter().collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let at = |numerator: u128, denominator: u128| {
+        let last = u128::try_from(sorted.len().saturating_sub(1)).unwrap_or(u128::MAX);
+        let rounded_rank = (last.saturating_mul(numerator) + (denominator / 2)) / denominator;
+        let index = usize::try_from(rounded_rank).unwrap_or(usize::MAX);
+        round_f64_to_i64(sorted[index.min(sorted.len() - 1)])
+    };
+    Some(RoundedPercentiles {
+        p50_ms: at(50, 100),
+        p95_ms: at(95, 100),
+    })
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "stream delay logs intentionally round finite f64 samples to whole milliseconds"
+)]
+fn round_f64_to_i64(value: f64) -> i64 {
+    let rounded = value.round();
+    if rounded.is_nan() {
+        return 0;
+    }
+    if rounded <= i64::MIN as f64 {
+        i64::MIN
+    } else if rounded >= i64::MAX as f64 {
+        i64::MAX
+    } else {
+        rounded as i64
+    }
+}
+
+/// Computes a count-per-second rate over an observed elapsed window.
+///
+/// Returns zero rather than `NaN`/`inf` for a zero-length or backwards window,
+/// which keeps logs unambiguous when a caller has too little timing evidence.
+#[must_use]
+pub fn rate_per_second(count: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        0.0
+    } else {
+        let bounded_count = u32::try_from(count).map_or(f64::from(u32::MAX), f64::from);
+        bounded_count / seconds
+    }
+}
+
 /// Tracks when the next health snapshot is due and what the rate was.
 ///
 /// Generic over the caller's clock reading so a test can drive it without
@@ -154,6 +223,25 @@ mod tests {
     fn a_snapshot_is_not_due_before_the_interval() {
         let mut cadence = SnapshotCadence::new();
         assert_eq!(cadence.due(Duration::from_secs(1), 30), None);
+    }
+
+    #[test]
+    fn delay_percentiles_are_the_median_and_the_tail() {
+        let samples = (1..=100).map(f64::from);
+        assert_eq!(
+            rounded_percentiles_ms(samples),
+            Some(RoundedPercentiles {
+                p50_ms: 51,
+                p95_ms: 95
+            })
+        );
+        assert_eq!(rounded_percentiles_ms([]), None);
+    }
+
+    #[test]
+    fn rates_use_the_observed_window_and_guard_zero() {
+        assert!((rate_per_second(150, Duration::from_secs(5)) - 30.0).abs() < f64::EPSILON);
+        assert!(rate_per_second(1, Duration::ZERO).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -102,7 +102,7 @@ use std::io::Write;
     windows,
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
 ))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Whether the Linux capture backend selected for `bit_depth` can composite
 /// the host cursor into captured frames.
@@ -130,13 +130,10 @@ use std::sync::OnceLock;
 ))]
 use std::time::Duration;
 
-#[cfg(any(
-    windows,
-    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
-))]
-use arcen_media::video::format_ready_v1;
 #[cfg(any(test, windows, target_os = "linux"))]
 use arcen_media::video::EncoderBackend;
+#[cfg(any(test, windows, target_os = "linux"))]
+use arcen_media::video::MotionPriority;
 #[cfg(any(windows, target_os = "linux"))]
 use arcen_media::video::{
     format_unavailable_v1, BackendUnavailableNotice, BackendUnavailableReason,
@@ -194,6 +191,8 @@ pub(crate) const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct ControlState {
     want_idr: AtomicBool,
     input_activity: AtomicBool,
+    bitrate_bps: AtomicU64,
+    framerate_fps: AtomicU32,
     stop: AtomicBool,
 }
 
@@ -207,6 +206,8 @@ impl ControlState {
         Self {
             want_idr: AtomicBool::new(false),
             input_activity: AtomicBool::new(false),
+            bitrate_bps: AtomicU64::new(0),
+            framerate_fps: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         }
     }
@@ -238,6 +239,20 @@ impl ControlState {
         self.input_activity.swap(false, Ordering::AcqRel)
     }
 
+    pub(crate) fn take_bitrate_bps(&self) -> Option<u64> {
+        match self.bitrate_bps.swap(0, Ordering::AcqRel) {
+            0 => None,
+            bps => Some(bps),
+        }
+    }
+
+    pub(crate) fn take_framerate_fps(&self) -> Option<u32> {
+        match self.framerate_fps.swap(0, Ordering::AcqRel) {
+            0 => None,
+            fps => Some(fps),
+        }
+    }
+
     pub(crate) fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
@@ -251,17 +266,26 @@ impl ControlState {
 fn read_control<R: BufRead>(reader: R, state: &ControlState, label: &str) {
     for line in reader.lines() {
         match line {
-            Ok(command) if command.trim().eq_ignore_ascii_case("idr") => {
-                state.want_idr.store(true, Ordering::Release);
+            Ok(command) => {
+                match command.parse::<arcen_media::capenc_control::CapencControlCommand>() {
+                    Ok(arcen_media::capenc_control::CapencControlCommand::Idr) => {
+                        state.want_idr.store(true, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::Wake) => {
+                        state.input_activity.store(true, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::Bitrate { bps }) => {
+                        state.bitrate_bps.store(bps, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::Framerate { fps }) => {
+                        state.framerate_fps.store(fps, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::Stop) => break,
+                    Err(error) => log(&format!(
+                        "{label}: unknown stdin command: {command:?}: {error}"
+                    )),
+                }
             }
-            // Input/focus activity for this region. Advisory: it wakes a
-            // suppressed static region early and never suppresses, delays, or
-            // downgrades a keyframe, refresh deadline, or admitted frame.
-            Ok(command) if command.trim().eq_ignore_ascii_case("wake") => {
-                state.input_activity.store(true, Ordering::Release);
-            }
-            Ok(command) if command.trim().eq_ignore_ascii_case("stop") => break,
-            Ok(command) => log(&format!("{label}: unknown stdin command: {command:?}")),
             Err(error) => {
                 log(&format!("{label}: stdin read error: {error}"));
                 break;
@@ -638,6 +662,31 @@ pub(crate) fn requested_intent(args: &[String]) -> Result<EncodeIntent, String> 
     Ok(selected.unwrap_or_default())
 }
 
+/// Resolve what to preserve when the link is tight.
+#[cfg(any(test, windows, target_os = "linux"))]
+pub(crate) fn requested_motion_priority(args: &[String]) -> Result<MotionPriority, String> {
+    let mut selected = None;
+    for value in args
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("priority="))
+    {
+        if selected.is_some() {
+            return Err("priority may be specified only once".to_string());
+        }
+        selected = Some(
+            MotionPriority::from_token(&value.to_ascii_lowercase()).ok_or_else(|| {
+                let known = MotionPriority::ALL
+                    .iter()
+                    .map(|priority| priority.token())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("unsupported priority {value:?}: expected one of {known}")
+            })?,
+        );
+    }
+    Ok(selected.unwrap_or_default())
+}
+
 /// Linux's portable OpenH264 path has neither the quality NVENC preset nor
 /// NVENC's per-block QP-map API. Keep this check pure so every dispatch path
 /// (initial selection and native-to-software fallback) rejects the same
@@ -755,6 +804,18 @@ pub(crate) fn announce_ready_from(
     plan: ResolvedMediaPlan,
     capture: Option<arcen_media::video::CaptureBackend>,
 ) -> std::io::Result<()> {
+    announce_ready_from_with_conversion(plan, capture, None)
+}
+
+#[cfg(any(
+    windows,
+    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
+))]
+pub(crate) fn announce_ready_from_with_conversion(
+    plan: ResolvedMediaPlan,
+    capture: Option<arcen_media::video::CaptureBackend>,
+    conversion: Option<arcen_media::video::ConversionBackend>,
+) -> std::io::Result<()> {
     let session_log_id = SESSION_LOG_ID
         .get()
         .and_then(Option::as_ref)
@@ -762,7 +823,12 @@ pub(crate) fn announce_ready_from(
     writeln!(
         std::io::stderr(),
         "{}",
-        arcen_media::video::format_ready_v1_with_capture(plan, capture, session_log_id)
+        arcen_media::video::format_ready_v1_with_capture_and_conversion(
+            plan,
+            capture,
+            conversion,
+            session_log_id
+        )
     )
 }
 
@@ -1167,6 +1233,28 @@ mod tests {
         );
         assert!(requested_intent(&args_vec(&["intent=nonsense"])).is_err());
         assert!(requested_intent(&args_vec(&["intent=quality", "intent=interactive"])).is_err());
+    }
+
+    #[test]
+    fn motion_priority_parses_defaults_to_detail_and_refuses_to_guess() {
+        use arcen_media::video::MotionPriority;
+        assert_eq!(
+            requested_motion_priority(&args_vec(&["0", "h265", "60"])).unwrap(),
+            MotionPriority::Detail,
+            "absent priority must keep the shipped behaviour",
+        );
+        assert_eq!(
+            requested_motion_priority(&args_vec(&["0", "h265", "60", "priority=motion"])).unwrap(),
+            MotionPriority::Motion,
+        );
+        assert_eq!(
+            requested_motion_priority(&args_vec(&["priority=MOTION"])).unwrap(),
+            MotionPriority::Motion,
+        );
+        assert!(requested_motion_priority(&args_vec(&["priority=nonsense"])).is_err());
+        assert!(
+            requested_motion_priority(&args_vec(&["priority=detail", "priority=motion"])).is_err()
+        );
     }
 
     /// The QP-map policy must default to off and refuse to guess, so a

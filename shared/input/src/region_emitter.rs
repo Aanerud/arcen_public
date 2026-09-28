@@ -22,6 +22,7 @@ use crate::region_state::{
     RegionPenSample, ReleasedRegionInput,
 };
 use crate::region_wire::RegionInputWireMessage;
+use crate::{ScrollPhase, ScrollUnit};
 
 /// Ordered region input encoder for one client input stream.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -188,6 +189,52 @@ impl RegionInputEmitter {
                     position,
                     delta_x,
                     delta_y,
+                    unit: ScrollUnit::Line,
+                    phase: ScrollPhase::None,
+                    sequence,
+                },
+                timestamp_ns,
+                false,
+            )?);
+        }
+        Ok(messages)
+    }
+
+    /// Emits a scroll sample with explicit units and phase.
+    ///
+    /// This is the trackpad/precise-wheel form of [`Self::pointer_scroll`]:
+    /// it keeps the same ordered pointer-position dependency but does not
+    /// force the legacy line/no-phase defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ordered-state or wire validation error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pointer_scroll_with_details(
+        &mut self,
+        regions: &AppliedRegionSet,
+        position: RegionLogicalPosition,
+        delta_x: i64,
+        delta_y: i64,
+        unit: ScrollUnit,
+        phase: ScrollPhase,
+        timestamp_ns: u64,
+    ) -> Result<Vec<RegionInputWireMessage>, RegionInputEmitError> {
+        let mut messages = self.ensure_pointer_position(regions, position, timestamp_ns)?;
+        if delta_x != 0
+            || delta_y != 0
+            || !matches!(phase, ScrollPhase::None | ScrollPhase::Changed)
+        {
+            let sequence = self.next_sequence();
+            messages.push(self.emit(
+                regions,
+                RegionInputEvent::PointerScroll {
+                    generation: regions.generation(),
+                    position,
+                    delta_x,
+                    delta_y,
+                    unit,
+                    phase,
                     sequence,
                 },
                 timestamp_ns,

@@ -60,9 +60,9 @@ pub const MAX_HEAD_DIMENSION_PX: u32 = 7680;
 /// release targets (4x1920x1080 and 2x3840x2160) fit well inside this bound.
 pub const MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX: u32 = 8192;
 
-/// Recognized NVIDIA RandR output tokens for this Linux tranche's dedicated
-/// Xorg session, matching `session::launcher::validate_gpu_head`'s existing
-/// single-head allow-list.
+/// Representative NVIDIA RandR output tokens for tests and examples. Runtime
+/// validation accepts any syntactically valid `DFP-N` token reported by the
+/// NVIDIA driver; this list is not a product ceiling.
 pub const VALID_HEAD_TOKENS: [&str; 4] = ["DFP-0", "DFP-1", "DFP-2", "DFP-3"];
 
 /// One NVIDIA output head available to a dedicated Xorg session and this
@@ -120,7 +120,7 @@ impl HeadInventory {
         }
         let mut seen = std::collections::BTreeSet::new();
         for head in &heads {
-            if !VALID_HEAD_TOKENS.contains(&head.head.as_str()) {
+            if !arcen_outputs::is_nvidia_dfp_head_token(&head.head) {
                 return Err(LinuxTopologyError::InvalidHeadToken(head.head.clone()));
             }
             if !seen.insert(head.head.as_str()) {
@@ -927,10 +927,8 @@ mod tests {
             HeadInventory::uniform(Vec::<&str>::new()),
             Err(LinuxTopologyError::NoHeadsConfigured)
         );
-        assert_eq!(
-            HeadInventory::uniform(["DFP-9"]),
-            Err(LinuxTopologyError::InvalidHeadToken("DFP-9".to_owned()))
-        );
+        assert!(HeadInventory::uniform(["HDMI-0"]).is_err());
+        assert!(HeadInventory::uniform(["DFP-9"]).is_ok());
         assert_eq!(
             HeadInventory::uniform(["DFP-0", "DFP-0"]),
             Err(LinuxTopologyError::DuplicateHead("DFP-0".to_owned()))

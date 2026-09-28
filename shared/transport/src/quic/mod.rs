@@ -52,7 +52,8 @@ pub use carrier_bench::{
 };
 pub use config::{
     ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW, ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
-    apply_direct_server_limits, apply_migration_stub_server_limits, interactive_send_window,
+    CongestionControl, SEND_WINDOW_RESIZE_INTERVAL, apply_direct_server_limits,
+    apply_migration_stub_server_limits, interactive_send_window, keep_send_window_interactive,
     monitor_carrier_transport_config, monitor_carrier_transport_config_arc,
     recommended_transport_config, recommended_transport_config_arc,
 };

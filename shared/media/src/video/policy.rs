@@ -506,6 +506,7 @@ mod tests {
                 ..video(VideoCodec::H265)
             },
             encode_intent: EncodeIntent::Quality,
+            motion_priority: crate::video::MotionPriority::Detail,
             max_fps: 60,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,
@@ -542,6 +543,7 @@ mod tests {
                 ..video(VideoCodec::H265)
             },
             encode_intent: EncodeIntent::Quality,
+            motion_priority: crate::video::MotionPriority::Detail,
             max_fps: 30,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,
@@ -589,6 +591,7 @@ mod tests {
             selection: VideoSelectionIntent::AdaptivePerformance,
             video: video(VideoCodec::H265),
             encode_intent: EncodeIntent::Interactive,
+            motion_priority: crate::video::MotionPriority::Detail,
             max_fps: 60,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,

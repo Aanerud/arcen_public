@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-audiocap"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-telemetry",
  "libpulse-binding",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-capenc"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-cp-ipc"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "ring",
  "serde",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-credential-provider"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-cp-ipc",
  "windows 0.58.0",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-macos"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -273,11 +273,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-iddcx-provider"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "arcen-identity"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-input"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-media",
  "arcen-protocol",
@@ -298,11 +298,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-input-helper"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "arcen-keel"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-media"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-keel",
  "arcen-protocol",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-observability"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-telemetry",
  "serde_json",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-outputs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-media",
  "arcen-telemetry",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-audiocap",
  "arcen-capenc",
@@ -389,14 +389,15 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux-installer"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
+ "arcen-session",
  "serde_json",
 ]
 
 [[package]]
 name = "arcen-pier-macos"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -443,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-capenc",
  "arcen-cp-ipc",
@@ -480,8 +481,9 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows-installer"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
+ "arcen-session",
  "arcen-transport",
  "rcgen",
  "serde_json",
@@ -490,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-protocol"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-usb-bridge",
  "getrandom 0.2.17",
@@ -502,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-region-patch-benchmark"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -511,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-session"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-telemetry",
  "serde",
@@ -522,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-telemetry"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -531,10 +533,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-transport"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-identity",
  "arcen-protocol",
+ "arcen-telemetry",
  "bytes",
  "quinn",
  "rcgen",
@@ -548,14 +551,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-bridge"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "arcen-usb-helper"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arcen-protocol",
  "arcen-usb-bridge",

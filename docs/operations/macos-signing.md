@@ -150,7 +150,9 @@ Nothing secret belongs in this repository. It is public, and
 | `.provisionprofile` files | outside the repository (for example an `AppleCerts/` directory alongside it) |
 | Test-host inventory, lab addresses | `.claude/`, which is gitignored |
 
-`clients/macos/*.provisionprofile` and `.claude/` are both in `.gitignore`.
+`*.provisionprofile` (anywhere in the tree) and `.claude/` are both in
+`.gitignore`, but ignored is not the same as absent: keep profiles out of the
+repository entirely.
 Do not `git add -f` either.
 
 Because those locations are deliberately outside version control, they are

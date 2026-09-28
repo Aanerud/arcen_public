@@ -608,7 +608,11 @@ hostname.
 
 - **Implement the dedicated-Xorg-per-session launcher** (lesson above) to replace the
   shared-`:0` path and the `--unsafe-allow-shared-display` flags.
-- Multi-monitor (up to 4 heads) wiring end-to-end.
+- Multi-monitor (up to 4 NVIDIA heads) is wired end-to-end. By default the
+  Pier discovers the driver's `DFP-N` roster from a short startup Xorg probe,
+  ranks heads by maximum pixel clock, and advertises only when discovery
+  succeeds. `platform.multi_monitor.heads` remains an ordered override;
+  `platform.multi_monitor.advertise_enabled: false` is the off switch.
 - Fine-grained NvFBC damage. Shared-CUDA ToCuda exposes only frame-level
   `bIsNewFrame`; public NvFBC 1.7/1.9 diff maps are ToSys/ToGL-only. A future
   producer must preserve zero-copy through an approved design or use an original

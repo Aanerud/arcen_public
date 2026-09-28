@@ -17,9 +17,14 @@ pub mod cert_provisioning;
 pub mod cert_transaction;
 #[cfg(feature = "wss-compat")]
 pub mod fallback;
+pub mod path_signal;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod tls;
+
+#[cfg(feature = "quic")]
+pub use path_signal::observe_quinn_path_signal;
+pub use path_signal::{PathSignal, PathSignalCounters, PathSignalState};
 
 use arcen_identity::{
     ActiveHostSessionId, ConsumedSessionGrant, HostIdentity, ValidatedDirectResumeGrant,
@@ -1701,6 +1706,7 @@ impl Error for TransportContractError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use arcen_identity::{
         ClientIdentity, ConsumedSessionGrant, GrantNonce, GrantReplayConsumer,
         GrantReplayConsumption, GrantReplayKey, GrantSignatureVerifier, GrantValidationContext,

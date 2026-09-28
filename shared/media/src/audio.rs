@@ -52,6 +52,15 @@ pub const JITTER_MAX_MS: u16 = 200;
 /// writer without buying the listener anything.
 pub const AUDIO_SEND_BACKLOG_PACKETS: usize = 8;
 
+/// Audio packets a host may buffer when audio has its own priority transport.
+///
+/// This is a memory and burst bound, not a staleness policy: unlike audio sent
+/// on the video/session stream, priority audio does not make pictures wait
+/// behind it. A calm path can still produce short scheduling bursts from the
+/// OS audio callback, so the bound must be large enough not to turn those into
+/// audible dropouts.
+pub const AUDIO_PRIORITY_SEND_BACKLOG_PACKETS: usize = 64;
+
 /// Drops the oldest packets from a backlog that has outgrown what is still
 /// live, and reports how many were dropped.
 ///
@@ -894,7 +903,9 @@ mod tests {
 
 #[cfg(test)]
 mod backlog_tests {
-    use super::{AUDIO_SEND_BACKLOG_PACKETS, trim_audio_backlog};
+    use super::{
+        AUDIO_PRIORITY_SEND_BACKLOG_PACKETS, AUDIO_SEND_BACKLOG_PACKETS, trim_audio_backlog,
+    };
 
     #[test]
     fn a_backlog_within_the_bound_is_left_alone() {
@@ -936,12 +947,18 @@ mod backlog_tests {
     fn the_bound_stays_under_what_a_deck_will_hold() {
         // Eight 20 ms packets is 160 ms, which must stay under JITTER_MAX_MS or
         // the host would be sending audio the Deck has already given up on.
-        let held_ms =
-            AUDIO_SEND_BACKLOG_PACKETS as u32 * u32::from(super::AUDIO_V1_FRAME_DURATION_MS);
+        let held_ms = u32::try_from(AUDIO_SEND_BACKLOG_PACKETS)
+            .expect("audio backlog packet bound fits u32")
+            * u32::from(super::AUDIO_V1_FRAME_DURATION_MS);
         assert!(
             held_ms < u32::from(super::JITTER_MAX_MS),
             "a {held_ms} ms backlog is not worth sending to a Deck holding {} ms",
             super::JITTER_MAX_MS
         );
+    }
+
+    #[test]
+    fn priority_audio_backlog_covers_callback_bursts() {
+        assert!(AUDIO_PRIORITY_SEND_BACKLOG_PACKETS > AUDIO_SEND_BACKLOG_PACKETS);
     }
 }

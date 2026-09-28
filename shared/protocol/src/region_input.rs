@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::messages::PenToolMsg;
+use crate::messages::{PenToolMsg, ScrollPhaseMsg, ScrollUnitMsg};
 
 pub const REGION_POINTER_MOTION: &str = "region_pointer_motion";
 pub const REGION_POINTER_BUTTON: &str = "region_pointer_button";
@@ -31,6 +31,14 @@ fn default_region_pointer_leave_type() -> String {
 
 fn default_region_pen_event_type() -> String {
     REGION_PEN_EVENT.to_owned()
+}
+
+const fn is_line_scroll_unit(unit: &ScrollUnitMsg) -> bool {
+    matches!(unit, ScrollUnitMsg::Line)
+}
+
+const fn is_no_scroll_phase(phase: &ScrollPhaseMsg) -> bool {
+    matches!(phase, ScrollPhaseMsg::None)
 }
 
 /// Region generation, identity, and region-local logical position.
@@ -138,6 +146,13 @@ pub struct RegionPointerScrollMsg {
     pub position: RegionInputPositionMsg,
     pub delta_x: i64,
     pub delta_y: i64,
+    /// What `delta_x`/`delta_y` measure. Absent means the legacy detent fixed
+    /// point: 120 units per wheel notch.
+    #[serde(default, skip_serializing_if = "is_line_scroll_unit")]
+    pub unit: ScrollUnitMsg,
+    /// Where a continuous scroll is in its gesture. Absent for a plain wheel.
+    #[serde(default, skip_serializing_if = "is_no_scroll_phase")]
+    pub phase: ScrollPhaseMsg,
     #[serde(flatten)]
     pub metadata: RegionInputMetadataMsg,
 }

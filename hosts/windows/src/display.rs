@@ -1470,6 +1470,11 @@ fn ensure_recovery_journal_clear(pending: bool, path: &std::path::Path) -> Resul
 /// so a genuinely stuck host still stops rather than looping over a broken
 /// display.
 #[cfg(windows)]
+pub(crate) fn recover_pending_display_journal() -> Result<(), String> {
+    recover_pending_journal(&crate::recovery::default_path())
+}
+
+#[cfg(windows)]
 fn recover_pending_journal(path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -1561,6 +1566,11 @@ fn quarantine_unrestorable_journal(
         reason,
         "display journal could not be applied and was set aside; continuing without it"
     );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn recover_pending_display_journal() -> Result<(), String> {
     Ok(())
 }
 
@@ -2014,6 +2024,26 @@ pub(crate) fn edid_scale_ratio(scale: arcen_media::Scale120) -> Option<f32> {
         return None;
     }
     Some(ratio as f32)
+}
+
+pub(crate) fn exact_mode_edid_request(
+    monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+) -> crate::edid::EdidRequest {
+    crate::edid::EdidRequest {
+        width: monitor.mode_width,
+        height: monitor.mode_height,
+        refresh_hz: monitor.refresh_hz,
+        width_mm: 0.0,
+        height_mm: 0.0,
+        // Carry the client's requested per-monitor scale. Passing `1.0` here
+        // declared every synthesized display to be exactly 96 DPI, so Windows
+        // recommended 100% no matter what the client asked for -- measured on
+        // pier-windows.example.internal as 200% requested and 100% applied.
+        scale: edid_scale_ratio(monitor.scale).unwrap_or(1.0),
+        product_id: u16::try_from(monitor.target_id).unwrap_or(0),
+        serial: monitor.target_id,
+        color: monitor.color,
+    }
 }
 
 fn effective_scale_percent_from_dpi(dpi_x: u32, dpi_y: u32) -> Option<u16> {
@@ -2895,25 +2925,9 @@ mod windows_backend {
                     output_id = format_args!("{:#010x}", snapshot.mapping.output_id),
                     "bound planned Windows output to stable NVAPI head before mutation"
                 );
-                let edid = crate::edid::generate(crate::edid::EdidRequest {
-                    width: monitor.mode_width,
-                    height: monitor.mode_height,
-                    refresh_hz: monitor.refresh_hz,
-                    width_mm: 0.0,
-                    height_mm: 0.0,
-                    // Carry the client's requested per-monitor scale. Passing
-                    // `1.0` here declared every synthesized display to be
-                    // exactly 96 DPI, so Windows recommended 100% no matter
-                    // what the client asked for -- measured on pier-windows.example.internal as
-                    // 200% requested and 100% applied.
-                    scale: super::edid_scale_ratio(monitor.scale).unwrap_or(1.0),
-                    product_id: u16::try_from(monitor.target_id).unwrap_or(0),
-                    serial: monitor.target_id,
-                    color: None,
-                })
-                .map_err(|error| {
-                    format!("generate exact EDID for {}: {error}", monitor.device_name)
-                })?;
+                let edid = crate::edid::generate(super::exact_mode_edid_request(monitor)).map_err(
+                    |error| format!("generate exact EDID for {}: {error}", monitor.device_name),
+                )?;
                 match nvapi::apply_exact(
                     &mut driver,
                     &snapshot,
@@ -3113,15 +3127,10 @@ mod windows_backend {
             if !self.recovery_armed {
                 return Ok(());
             }
-            crate::recovery::remove(&self.journal_path)?;
-            self.recovery_armed = false;
-            self.nvapi_modes.clear();
-            self.nvapi_driver = None;
-            self.headless_entries.clear();
-            self.applied_dpi_scales.clear();
             tracing::info!(
                 target: DISPLAY,
-                "verified physical output-provider topology committed for the persistent dedicated Windows desktop"
+                headless_entries = self.headless_entries.len(),
+                "verified physical output-provider topology committed for the active Windows session; rollback remains armed"
             );
             Ok(())
         }
@@ -3353,6 +3362,101 @@ mod windows_backend {
         let mut report = empty_multi_display_report(plan)?;
         report.effective_scale_reports = effective_scale_reports;
         Ok(report)
+    }
+
+    #[cfg(test)]
+    mod physical_output_binding_tests {
+        use super::*;
+
+        fn test_plan() -> crate::multi_monitor_topology::WindowsTopologyPlan {
+            crate::multi_monitor_topology::WindowsTopologyPlan {
+                generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
+                desktop_x: 0,
+                desktop_y: 0,
+                desktop_width: 1280,
+                desktop_height: 720,
+                monitors: vec![crate::multi_monitor_topology::WindowsMonitorPlan {
+                    session_monitor_id: arcen_media::SessionMonitorId::new(1).expect("monitor id"),
+                    client_display_id: "test-display".to_string(),
+                    adapter_luid: crate::nvapi::AdapterLuid::default(),
+                    target_id: 1,
+                    adapter_output_index: 0,
+                    adapter_name: "NVIDIA GRID V100D-16Q".to_string(),
+                    global_index: 0,
+                    device_name: r"\\.\DISPLAY1".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 720,
+                    mode_width: 1280,
+                    mode_height: 720,
+                    logical_rect: arcen_media::LogicalRect::new(
+                        arcen_media::LogicalPoint::new(0, 0),
+                        arcen_media::LogicalSize::from_pixels(1280, 720).expect("logical size"),
+                    )
+                    .expect("logical rect"),
+                    scale: arcen_media::Scale120::new(120).expect("scale"),
+                    refresh_hz: 60,
+                    rotation: arcen_media::Rotation::Degrees0,
+                    primary: true,
+                    color: None,
+                }],
+                requires_custom_timing: false,
+            }
+        }
+
+        #[test]
+        fn commit_keeps_physical_rollback_armed_for_session_end() {
+            let plan = test_plan();
+            let report = empty_multi_display_report(&plan).expect("report");
+            let journal_path = std::env::temp_dir().join(format!(
+                "arcen-physical-binding-commit-test-{}.json",
+                std::process::id()
+            ));
+            let headless_entry = crate::nvapi_headless::HeadlessEdidRecovery {
+                display_id: 0x8001_0001,
+                output_id: 1,
+                adapter_luid: crate::nvapi::AdapterLuid::default(),
+                original_edid: None,
+                intended_edid_sha256: "0".repeat(64),
+            };
+            let mut binding = PhysicalOutputBinding {
+                evidence: crate::output_provider::WindowsOutputEvidence::new(report, plan),
+                original: TopologySnapshot {
+                    paths: Vec::new(),
+                    modes: Vec::new(),
+                },
+                working: TopologySnapshot {
+                    paths: Vec::new(),
+                    modes: Vec::new(),
+                },
+                original_stable: crate::recovery::StableTopologySnapshot { paths: Vec::new() },
+                journal_path,
+                recovery_armed: true,
+                nvapi_driver: None,
+                nvapi_modes: Vec::new(),
+                headless_entries: vec![headless_entry],
+                applied_dpi_scales: Vec::new(),
+            };
+
+            binding
+                .commit()
+                .expect("commit should only mark session-ready");
+
+            assert!(
+                binding.recovery_armed,
+                "session-end rollback must remain armed after commit"
+            );
+            assert_eq!(
+                binding.headless_entries.len(),
+                1,
+                "headless EDID rollback entries must survive until restore"
+            );
+            assert!(
+                binding.nvapi_driver.is_none(),
+                "commit must not synthesize driver cleanup side effects"
+            );
+        }
     }
 
     fn monitor_center_point(
@@ -7706,6 +7810,69 @@ mod tests {
         assert!((ratio(240) - 2.0).abs() < f32::EPSILON, "240/120 is 200%");
         assert!((ratio(180) - 1.5).abs() < f32::EPSILON, "180/120 is 150%");
         assert!((ratio(300) - 2.5).abs() < f32::EPSILON, "300/120 is 250%");
+    }
+
+    #[test]
+    fn exact_mode_edid_request_carries_the_monitor_color_contract() {
+        let color_msg = arcen_protocol::messages::DisplayColorMsg {
+            gamut: arcen_protocol::messages::DisplayGamutMsg::DisplayP3,
+            hdr_headroom: 16.0,
+            ..Default::default()
+        };
+        let color = arcen_media::display_color::DisplayColor::from_msg(&color_msg);
+        let monitor = crate::multi_monitor_topology::WindowsMonitorPlan {
+            session_monitor_id: arcen_media::SessionMonitorId::new(1).expect("monitor"),
+            client_display_id: "display".to_owned(),
+            adapter_luid: crate::nvapi::AdapterLuid {
+                low_part: 1,
+                high_part: 0,
+            },
+            target_id: 7,
+            adapter_output_index: 0,
+            adapter_name: "GPU".to_owned(),
+            global_index: 0,
+            device_name: r"\\.\DISPLAY1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 3_600,
+            height: 2_260,
+            mode_width: 3_600,
+            mode_height: 2_260,
+            logical_rect: arcen_media::LogicalRect::new(
+                arcen_media::LogicalPoint::new(0, 0),
+                arcen_media::LogicalSize::from_pixels(3_600, 2_260).expect("size"),
+            )
+            .expect("rect"),
+            scale: arcen_media::Scale120::new(240).expect("scale"),
+            refresh_hz: 60,
+            rotation: arcen_media::Rotation::Degrees0,
+            primary: true,
+            color: Some(color),
+        };
+
+        let request = exact_mode_edid_request(&monitor);
+        assert_eq!(request.color, Some(color));
+        let edid = crate::edid::generate_hdr10(request).expect("EDID");
+        let extension = &edid[128..];
+        let mut offset = 4usize;
+        let mut hdr_payload = None;
+        while offset < usize::from(extension[2]) {
+            let len = 1 + usize::from(extension[offset] & 0x1f);
+            let block = &extension[offset..offset + len];
+            if block[0] >> 5 == 7 && block[1] == 0x06 {
+                hdr_payload = Some(&block[2..]);
+                break;
+            }
+            offset += len;
+        }
+        let hdr_payload = hdr_payload.expect("HDR block");
+        assert_eq!(
+            hdr_payload.len(),
+            3,
+            "XDR headroom contributes peak luminance only"
+        );
+        let peak = 50.0 * 2f64.powf(f64::from(hdr_payload[2]) / 32.0);
+        assert!((peak - 1600.0).abs() < 30.0, "decodes to {peak:.0} nits");
     }
 
     #[test]

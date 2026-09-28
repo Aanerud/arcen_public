@@ -127,9 +127,83 @@ pub(super) const ARCEN_QUIC_DIRECT_INCOMING_BUFFER_TOTAL_BYTES: u64 = 512 * 1024
 /// stream classes (RFC 9308 §4.1). If control/input traffic and media frames
 /// need different DSCP or network treatment, place them on **separate QUIC
 /// connections** — each with its own `TransportConfig` and `QoS` marking.
+/// Which QUIC congestion controller paces a connection's sender.
+///
+/// Cubic, Quinn's default, reads every loss as congestion. On Wi-Fi, cellular
+/// and VPN paths that carry a random loss floor of a few tenths of a percent
+/// that caps the window far below the path: at 0.3% loss and 32 ms RTT with
+/// 1200-byte packets, about 7 Mbps for the whole session. BBR models the
+/// bottleneck from delivery rate and RTT instead, so random loss does not
+/// collapse the window.
+///
+/// BBR is the default. Measured on a VPN path with a few tenths of a percent
+/// of random loss it gave two displays 2.5-3x the bitrate at half the video
+/// age of Cubic, matched or beat Cubic on a calm path in every preset, and
+/// held a 20-minute session without a stall or reconnect. Quinn labels its
+/// BBR experimental, so `ARCEN_QUIC_CONGESTION=cubic` restores Cubic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CongestionControl {
+    /// Loss-based (Quinn's own default).
+    Cubic,
+    /// Model-based: bottleneck bandwidth and round-trip propagation time.
+    #[default]
+    Bbr,
+}
+
+impl CongestionControl {
+    /// Environment override read by [`Self::from_env`].
+    pub const ENV: &'static str = "ARCEN_QUIC_CONGESTION";
+
+    /// Parses `cubic` or `bbr`, case-insensitively.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "cubic" => Some(Self::Cubic),
+            "bbr" => Some(Self::Bbr),
+            _ => None,
+        }
+    }
+
+    /// The operator's choice from [`Self::ENV`]; an unknown value keeps the
+    /// default rather than guessing.
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var(Self::ENV)
+            .ok()
+            .and_then(|value| Self::from_token(&value))
+            .unwrap_or_default()
+    }
+
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr => "bbr",
+        }
+    }
+
+    /// Installs this controller on a transport config.
+    pub fn apply(self, config: &mut quinn::TransportConfig) {
+        match self {
+            Self::Cubic => {
+                config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::CubicConfig::default(),
+                ));
+            }
+            Self::Bbr => {
+                config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::BbrConfig::default(),
+                ));
+            }
+        }
+    }
+}
+
 #[must_use]
 pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
+    CongestionControl::from_env().apply(&mut config);
 
     // Stream concurrency: one bidi for either the direct product carrier or
     // the advanced binding handshake, plus the advanced `QuicPeer` adapter's
@@ -194,11 +268,13 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
 
 /// Smallest send window [`interactive_send_window`] returns.
 ///
-/// Measured, in both directions, on a 34 ms WAN path under full-screen motion:
-/// 256 KiB kept 26 fps with frame age p95 under a second; 64 KiB left the
-/// sender application-limited, the congestion window never grew, and the
-/// stream fell to 2 fps with frames 10–24 s old.
-pub const ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW: u64 = 256 * 1024;
+/// This is only the bootstrap floor. Once a path has a congestion window, the
+/// returned window is always at least that cwnd plus one burst, so growth is
+/// not app-limited; on slow links it avoids the fixed 256 KiB latency floor.
+pub const ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW: u64 = 96 * 1024;
+/// Extra burst above cwnd so the sender can keep probing without accepting
+/// seconds of video into QUIC.
+const ARCEN_QUIC_INTERACTIVE_BURST_BYTES: u64 = 32 * 1024;
 /// Largest send window [`interactive_send_window`] returns.
 pub const ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW: u64 = 4 * 1024 * 1024;
 
@@ -212,18 +288,43 @@ pub const ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW: u64 = 4 * 1024 * 1024;
 /// prioritise audio nor drop a stale picture: measured on a WAN session,
 /// frames arrived 2.2 s late with a 36 ms RTT, and 13 s late under motion.
 ///
-/// Sized from the live congestion window instead: what the path can hold in
-/// flight, plus half again as headroom so the pipe never idles between
-/// writes. Anything beyond that waits in the application, where the host
-/// decides what is worth sending. Pure, so every host applies the same rule.
+/// Sized from the live congestion window instead: at least cwnd plus a small
+/// burst, and otherwise 1.5x cwnd, capped. Anything beyond that waits in the
+/// application, where the host decides what is worth sending. Pure, so every
+/// host applies the same rule.
 #[must_use]
 pub fn interactive_send_window(congestion_window: u64) -> u64 {
-    congestion_window
-        .saturating_add(congestion_window / 2)
-        .clamp(
-            ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
-            ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW,
-        )
+    let cwnd_plus_burst = congestion_window.saturating_add(ARCEN_QUIC_INTERACTIVE_BURST_BYTES);
+    let one_and_half = congestion_window.saturating_add(congestion_window / 2);
+    cwnd_plus_burst.max(one_and_half).clamp(
+        ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
+        ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW,
+    )
+}
+
+/// How often [`keep_send_window_interactive`] follows the congestion window.
+pub const SEND_WINDOW_RESIZE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Keeps `connection`'s send window at [`interactive_send_window`] of its live
+/// congestion window until the connection closes.
+///
+/// Without it a connection keeps quinn's 16 MiB default, and on a link slower
+/// than the video, seconds of pictures wait inside QUIC where nothing can
+/// overtake them: measured on the Linux lab under a 3 Mbit/s bottleneck,
+/// frames 3.7 s old with the path's RTT still 44 ms, and audio and input
+/// feeling it too, because a priority stream only wins over bytes QUIC has not
+/// yet accepted. Every Pier runs this for every Deck connection.
+pub async fn keep_send_window_interactive(connection: quinn::Connection) {
+    let mut tick = tokio::time::interval(SEND_WINDOW_RESIZE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if connection.close_reason().is_some() {
+            return;
+        }
+        let cwnd = connection.stats().path.cwnd;
+        connection.set_send_window(interactive_send_window(cwnd));
+    }
 }
 
 /// Wraps a `quinn::TransportConfig` for callers that want the recommended
@@ -300,10 +401,60 @@ mod interactive_window_tests {
             interactive_send_window(12_000),
             ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW
         );
+        assert!(
+            interactive_send_window(80_000) >= 80_000 + super::ARCEN_QUIC_INTERACTIVE_BURST_BYTES
+        );
         assert_eq!(interactive_send_window(1_000_000), 1_500_000);
         assert_eq!(
             interactive_send_window(u64::MAX),
             ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW
         );
+    }
+
+    #[test]
+    fn open_vpn_target_is_not_app_limited_by_the_floor() {
+        const OPEN_TARGET_BPS: u64 = 9_150_000;
+        const RTT_MS: u64 = 42;
+        let bdp_bytes = OPEN_TARGET_BPS * RTT_MS / 1_000 / 8;
+        let needed_window = bdp_bytes + bdp_bytes / 2;
+        assert!(
+            interactive_send_window(0) >= needed_window,
+            "window {} is below 1.5x BDP {needed_window}",
+            interactive_send_window(0)
+        );
+        assert!(
+            interactive_send_window(bdp_bytes) >= needed_window,
+            "cwnd-following window app-limits the open path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod congestion_control_tests {
+    use super::CongestionControl;
+
+    #[test]
+    fn congestion_control_tokens_are_exact_and_default_is_bbr() {
+        assert_eq!(
+            CongestionControl::from_token("bbr"),
+            Some(CongestionControl::Bbr)
+        );
+        assert_eq!(
+            CongestionControl::from_token(" BBR "),
+            Some(CongestionControl::Bbr)
+        );
+        assert_eq!(
+            CongestionControl::from_token("cubic"),
+            Some(CongestionControl::Cubic)
+        );
+        assert_eq!(CongestionControl::from_token("reno"), None);
+        assert_eq!(CongestionControl::default(), CongestionControl::Bbr);
+        for control in [CongestionControl::Cubic, CongestionControl::Bbr] {
+            assert_eq!(
+                CongestionControl::from_token(control.token()),
+                Some(control)
+            );
+            control.apply(&mut quinn::TransportConfig::default());
+        }
     }
 }

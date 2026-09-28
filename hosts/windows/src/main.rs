@@ -416,6 +416,15 @@ impl HostConfig {
             .unwrap_or_default()
     }
 
+    pub(crate) fn requested_motion_priority(&self) -> arcen_media::video::MotionPriority {
+        self.auth_video_request
+            .as_ref()
+            .and_then(|request| {
+                arcen_media::video::MotionPriority::from_token(&request.quality.motion_priority)
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn apply_software_h264_backend(
         &mut self,
         active: crate::capenc::EncoderSelection,
@@ -1558,33 +1567,23 @@ where
         iddcx = file.platform.iddcx.clone();
         iddcx.validate(&multi_monitor)?;
         let desktop = file.platform.desktop;
-        if multi_monitor.allowed_adapters.is_empty() {
-            if let Some(adapter) = desktop.adapter.as_ref() {
-                multi_monitor.allowed_adapters.push(adapter.clone());
-            }
-        } else if let Some(desktop_adapter) = desktop.adapter.as_ref() {
-            // `allowed_adapters` documents that a host pinned to one GPU never
-            // silently borrows another GPU reserved for compute -- but that
-            // only held for the empty case above, which inherits the desktop
-            // adapter. A non-empty list naming some *other* GPU was accepted
-            // in silence, which is how a card documented as reserved ended up
-            // encoding a remote session with nothing anywhere saying so.
-            //
-            // Warn rather than reject: a genuine multi-GPU streaming host is a
-            // legitimate configuration, and failing closed here would take
-            // working hosts down on upgrade. The point is that the decision
-            // becomes visible and attributable, not that it becomes impossible.
-            let borrowed =
-                adapters_beyond_desktop(&multi_monitor.allowed_adapters, desktop_adapter);
-            if !borrowed.is_empty() {
-                tracing::warn!(
-                    target: crate::logging::DISPLAY,
-                    desktop_adapter = %desktop_adapter,
-                    borrowed_adapters = ?borrowed,
-                    "platform.multi_monitor.allowed_adapters permits GPUs other than the \
-                     configured desktop adapter; multi-monitor sessions may capture and encode \
-                     on a GPU that is reserved for other work"
-                );
+        if !multi_monitor.allowed_adapters.is_empty() {
+            if let Some(desktop_adapter) = desktop.adapter.as_ref() {
+                // `allowed_adapters` documents that a host pinned to one GPU
+                // may intentionally stream elsewhere. Warn so that decision
+                // is attributable, not silent.
+                let borrowed =
+                    adapters_beyond_desktop(&multi_monitor.allowed_adapters, desktop_adapter);
+                if !borrowed.is_empty() {
+                    tracing::warn!(
+                        target: crate::logging::DISPLAY,
+                        desktop_adapter = %desktop_adapter,
+                        borrowed_adapters = ?borrowed,
+                        "platform.multi_monitor.allowed_adapters permits GPUs other than the \
+                         configured desktop adapter; multi-monitor sessions may capture and \
+                         encode on a GPU that is reserved for other work"
+                    );
+                }
             }
         }
         desktop.deskside.validate()?;
@@ -1781,12 +1780,6 @@ where
         return Err("OpenH264 software encoding requires h264 + yuv420".to_string());
     }
     if multi_monitor.advertise_enabled {
-        if multi_monitor.allowed_adapters.is_empty() {
-            return Err(
-                "platform.multi_monitor.advertise_enabled requires at least one allowed adapter"
-                    .to_string(),
-            );
-        }
         if multi_monitor
             .allowed_adapters
             .iter()
@@ -1797,6 +1790,35 @@ where
             );
         }
         let mut unique = std::collections::BTreeSet::new();
+        if multi_monitor
+            .excluded_adapters
+            .iter()
+            .any(|adapter| adapter.trim().is_empty())
+        {
+            return Err(
+                "platform.multi_monitor.excluded_adapters must not contain empty names".to_string(),
+            );
+        }
+        let mut unique_excluded = std::collections::BTreeSet::new();
+        if multi_monitor
+            .excluded_adapters
+            .iter()
+            .any(|adapter| !unique_excluded.insert(adapter.to_ascii_lowercase()))
+        {
+            return Err(
+                "platform.multi_monitor.excluded_adapters contains a duplicate adapter".to_string(),
+            );
+        }
+        if multi_monitor.allowed_adapters.iter().any(|allowed| {
+            multi_monitor
+                .excluded_adapters
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(allowed))
+        }) {
+            return Err(
+                "platform.multi_monitor.allowed_adapters and excluded_adapters overlap".to_string(),
+            );
+        }
         if multi_monitor
             .allowed_adapters
             .iter()
@@ -1819,14 +1841,17 @@ where
                 ));
             }
         }
-        if multi_monitor.nvidia_headless_enabled && multi_monitor.allowed_adapters.len() != 1 {
+        if multi_monitor.nvidia_headless_enabled == Some(true)
+            && !multi_monitor.allowed_adapters.is_empty()
+            && multi_monitor.allowed_adapters.len() != 1
+        {
             return Err(
                 "platform.multi_monitor.nvidia_headless_enabled requires exactly one allowed \
                  display/stream adapter"
                     .to_string(),
             );
         }
-        if multi_monitor.nvidia_headless_enabled && iddcx.enabled {
+        if multi_monitor.nvidia_headless_enabled == Some(true) && iddcx.enabled {
             return Err(
                 "NVIDIA headless provisioning and platform.iddcx.enabled are mutually exclusive"
                     .to_string(),
@@ -1877,6 +1902,8 @@ where
         iddcx,
         multi_monitor,
     };
+    #[cfg(not(test))]
+    resolve_multi_monitor_adapter_at_startup(&mut config)?;
     if config.encoder == crate::capenc::EncoderSelection::SoftwareH264 {
         config.apply_software_h264_backend(config.encoder)?;
     }
@@ -1908,6 +1935,79 @@ where
         #[cfg(feature = "wss-compat")]
         wss_port,
     })
+}
+
+#[cfg(not(test))]
+fn resolve_multi_monitor_adapter_at_startup(config: &mut HostConfig) -> Result<(), String> {
+    if !config.multi_monitor.advertise_enabled || config.iddcx.enabled {
+        return Ok(());
+    }
+    let nvapi_inventory = match crate::nvapi_inventory::inventory() {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(
+                target: crate::logging::DISPLAY,
+                %error,
+                "NVAPI inventory unavailable; Windows multi-monitor startup selection will not \
+                 enable NVIDIA headless provisioning"
+            );
+            None
+        }
+    };
+    let adapters = match crate::gpu_probe::adapter_selection_inventory(
+        &config.output_selector,
+        nvapi_inventory.as_ref(),
+    ) {
+        Ok(adapters) => adapters,
+        Err(error) => {
+            config.multi_monitor.advertise_enabled = false;
+            config.multi_monitor.nvidia_headless_enabled = Some(false);
+            tracing::warn!(
+                target: crate::logging::DISPLAY,
+                %error,
+                "Windows multi-monitor advertisement withheld because adapter inventory failed; \
+                 single-display sessions remain available"
+            );
+            return Ok(());
+        }
+    };
+    let headless_mode = match config.multi_monitor.nvidia_headless_enabled {
+        None => arcen_outputs::AdminHeadlessMode::Auto,
+        Some(false) => arcen_outputs::AdminHeadlessMode::Off,
+        Some(true) => arcen_outputs::AdminHeadlessMode::Force,
+    };
+    let policy = arcen_outputs::WindowsMultiMonitorPolicy {
+        advertise_enabled: config.multi_monitor.advertise_enabled,
+        allowed_adapters: &config.multi_monitor.allowed_adapters,
+        excluded_adapters: &config.multi_monitor.excluded_adapters,
+        headless_mode,
+    };
+    match arcen_outputs::resolve_windows_multi_monitor_adapter(&adapters, &policy) {
+        Ok(selection) => {
+            config.multi_monitor.allowed_adapters = vec![selection.adapter_description.clone()];
+            config.multi_monitor.nvidia_headless_enabled = Some(selection.nvidia_headless_enabled);
+            tracing::info!(
+                target: crate::logging::DISPLAY,
+                adapter = %selection.adapter_description,
+                nvidia_headless_enabled = selection.nvidia_headless_enabled,
+                reason = selection.selection_reason.reason(),
+                excluded_adapters = ?config.multi_monitor.excluded_adapters,
+                "Windows multi-monitor startup selected streaming adapter"
+            );
+        }
+        Err(reason) => {
+            config.multi_monitor.advertise_enabled = false;
+            config.multi_monitor.nvidia_headless_enabled = Some(false);
+            tracing::warn!(
+                target: crate::logging::DISPLAY,
+                reason = reason.reason(),
+                allowed_adapters = ?config.multi_monitor.allowed_adapters,
+                excluded_adapters = ?config.multi_monitor.excluded_adapters,
+                "Windows multi-monitor advertisement withheld; single-display sessions remain available"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn prepare_disclaimer(
@@ -2804,6 +2904,12 @@ where
             .as_ref()
             .map_or_else(|| "<cli/defaults>".to_string(), |path| path.display().to_string()),
         output_selector = ?args.config.output_selector,
+        // The startup adapter choice runs while the configuration is parsed,
+        // before logging exists, so its outcome is reported here.
+        multi_monitor_advertised = args.config.multi_monitor.advertise_enabled,
+        multi_monitor_streaming_adapter = ?args.config.multi_monitor.allowed_adapters,
+        multi_monitor_excluded_adapters = ?args.config.multi_monitor.excluded_adapters,
+        nvidia_headless = ?args.config.multi_monitor.nvidia_headless_enabled,
         "resolved Windows Pier settings"
     );
     if args.retention_was_clamped {
@@ -3069,6 +3175,11 @@ where
                                 return;
                             }
                         };
+                        // Keep the video backlog out of QUIC for this Deck's
+                        // whole connection; the task ends when it closes.
+                        tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
+                            connection.clone(),
+                        ));
                         let stream = match tokio::time::timeout(
                             WEBSOCKET_UPGRADE_TIMEOUT,
                             arcen_transport::quic::accept_direct(connection),
@@ -3667,7 +3778,10 @@ mod tests {
             )
         };
         let args = write(r#"["NVIDIA GRID V100D-16Q"]"#, false).expect("one streaming adapter");
-        assert!(args.config.multi_monitor.nvidia_headless_enabled);
+        assert_eq!(
+            args.config.multi_monitor.nvidia_headless_enabled,
+            Some(true)
+        );
         assert_eq!(
             args.config.multi_monitor.allowed_adapters,
             ["NVIDIA GRID V100D-16Q"]

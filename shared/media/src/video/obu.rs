@@ -59,7 +59,10 @@ mod tests {
     use super::*;
 
     fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
-        let mut output = vec![(obu_type << 3) | 0x02, payload.len() as u8];
+        let mut output = vec![
+            (obu_type << 3) | 0x02,
+            u8::try_from(payload.len()).expect("test payload length fits u8"),
+        ];
         output.extend_from_slice(payload);
         output
     }

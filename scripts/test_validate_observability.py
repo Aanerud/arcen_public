@@ -177,12 +177,12 @@ class ObservabilityValidationTests(unittest.TestCase):
                     cross_file=True,
                 )
 
-    def test_static_table_matches_all_50_rust_event_definitions(self):
+    def test_static_table_matches_all_51_rust_event_definitions(self):
         static = {
             event_id: tuple(definition)
             for event_id, definition in VALIDATOR.EVENT_DEFINITIONS.items()
         }
-        self.assertEqual(len(static), 50)
+        self.assertEqual(len(static), 51)
         self.assertEqual(static, rust_event_definitions())
 
     def test_frozen_canonical_record_fixture_conforms(self):
@@ -191,8 +191,8 @@ class ObservabilityValidationTests(unittest.TestCase):
         self.assertEqual(records[0].get("event_id"), 1100)
         VALIDATOR.validate_paths([FROZEN_CANONICAL_FIXTURE])
 
-    def test_all_50_event_definitions_accept_required_and_optional_fields(self):
-        self.assertEqual(len(VALIDATOR.EVENT_DEFINITIONS), 50)
+    def test_all_51_event_definitions_accept_required_and_optional_fields(self):
+        self.assertEqual(len(VALIDATOR.EVENT_DEFINITIONS), 51)
         for event_id in VALIDATOR.EVENT_DEFINITIONS:
             with self.subTest(event_id=event_id):
                 validate_documents(encoded([event_record(event_id)]))

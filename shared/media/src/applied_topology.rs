@@ -585,6 +585,7 @@ mod tests {
             bitrate_kbps: 8_000,
             cursor_mode: CursorMode::Local,
             degraded: false,
+            degradation_reason: String::new(),
         }
     }
 

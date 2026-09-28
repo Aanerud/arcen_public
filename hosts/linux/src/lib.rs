@@ -58,53 +58,41 @@ pub const SOURCE_OFFER: &str =
      that others connect to over a network, you must offer them its corresponding source.";
 
 pub(crate) fn build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    use std::sync::OnceLock;
-
-    static ARTIFACT_HASH: OnceLock<Option<String>> = OnceLock::new();
-    let artifact_sha256 = ARTIFACT_HASH
-        .get_or_init(|| {
-            let mut file = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
-            let mut hasher = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buffer).ok()?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            Some(format!("{:x}", hasher.finalize()))
-        })
-        .clone();
-    arcen_protocol::messages::BuildIdentityMsg {
-        product: "arcen-pier-linux".to_string(),
-        version: VERSION.to_string(),
-        build_id: option_env!("ARCEN_BUILD_ID")
-            .unwrap_or("development")
-            .to_string(),
-        source_revision: option_env!("ARCEN_SOURCE_REVISION")
-            .unwrap_or("unknown")
-            .to_string(),
-        build_profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
-        .to_string(),
-        feature_profile: option_env!("ARCEN_FEATURE_PROFILE")
-            .unwrap_or("quic-default")
-            .to_string(),
-        artifact_sha256,
-        signing_state: option_env!("ARCEN_SIGNING_STATE").map(str::to_string),
-    }
+    arcen_protocol::build_identity::this_build("arcen-pier-linux", VERSION)
 }
 
 pub(crate) use eventlog::LifecycleEmitter;
 
+/// The kernel's handle on this process's own executable. It stays valid after
+/// an in-place upgrade unlinks the file the process started from, and exec'ing
+/// it runs exactly that build.
+const PROC_SELF_EXE: &str = "/proc/self/exe";
+
+/// The binary helpers are spawned from: this process's own build.
+///
+/// After an in-place upgrade without a restart, the running service's
+/// original file is gone (`current_exe` reads `... (deleted)`). Returning
+/// `None` then made every new login fail as "session-launcher binary is
+/// unavailable" until someone restarted the service, while the installer
+/// said the previous build was still serving. `/proc/self/exe` keeps the
+/// service and every helper it starts on one consistent build until the
+/// restart that picks up the new one.
 pub(crate) fn current_pier_exe() -> Option<std::path::PathBuf> {
-    std::env::current_exe().ok().filter(|path| path.is_file())
+    running_pier_exe(
+        std::env::current_exe().ok(),
+        std::path::Path::new(PROC_SELF_EXE).is_file(),
+    )
+}
+
+fn running_pier_exe(
+    current: Option<std::path::PathBuf>,
+    proc_self_exe_is_file: bool,
+) -> Option<std::path::PathBuf> {
+    match current {
+        Some(path) if path.is_file() => Some(path),
+        _ if proc_self_exe_is_file => Some(std::path::PathBuf::from(PROC_SELF_EXE)),
+        _ => None,
+    }
 }
 
 pub(crate) fn command_for_helper(
@@ -119,9 +107,10 @@ pub(crate) fn command_for_helper(
 }
 
 fn is_current_pier_exe(binary: &std::path::Path) -> bool {
-    std::env::current_exe()
-        .ok()
-        .is_some_and(|current| paths_same_file(&current, binary))
+    binary == std::path::Path::new(PROC_SELF_EXE)
+        || std::env::current_exe()
+            .ok()
+            .is_some_and(|current| paths_same_file(&current, binary))
 }
 
 fn paths_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -179,5 +168,30 @@ pub(crate) fn emit_lifecycle_event_with_context(
             event_id = kind.id(),
             "lifecycle event schema validation failed; native delivery skipped"
         ),
+    }
+}
+
+#[cfg(test)]
+mod running_exe_tests {
+    use super::{is_current_pier_exe, running_pier_exe, PROC_SELF_EXE};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn an_upgraded_service_keeps_spawning_its_own_build() {
+        let replaced = PathBuf::from("/opt/arcen/bin/arcen-pier (deleted)");
+        assert_eq!(
+            running_pier_exe(Some(replaced.clone()), true),
+            Some(PathBuf::from(PROC_SELF_EXE))
+        );
+        assert_eq!(running_pier_exe(Some(replaced), false), None);
+        assert_eq!(running_pier_exe(None, false), None);
+        let present = std::env::current_exe().expect("test binary");
+        assert_eq!(running_pier_exe(Some(present.clone()), true), Some(present));
+    }
+
+    #[test]
+    fn the_kernel_handle_is_the_pier_itself() {
+        assert!(is_current_pier_exe(Path::new(PROC_SELF_EXE)));
+        assert!(!is_current_pier_exe(Path::new("/usr/bin/true")));
     }
 }

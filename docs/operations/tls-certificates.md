@@ -49,10 +49,13 @@ sc.exe control ArcenPier 202
 sudo systemctl reload arcen-pier
 ```
 
-Previous-helper pairs without an ownership marker require one explicit
-same-key adoption. Use `-Renew -AdoptLegacyHelperPair` on Windows or
-`--renew --adopt-legacy` on Linux. These switches are only for known Arcen
-helper output; never adopt enterprise/custom PEM.
+An ordinary install or upgrade takes over a self-signed pair without an
+ownership marker (what every Arcen install before markers left) by itself: the
+key is kept, so paired Decks keep trusting the host, and the certificate is
+reissued with the marker. A CA-issued pair is served as it is and never
+reissued. Only the renewal helpers still need to be told:
+`-Renew -AdoptLegacyHelperPair` on Windows or `--renew --adopt-legacy` on
+Linux, and never for enterprise/custom PEM.
 
 Confirm the TLS activation event before removing the staged backup. A failed
 reload retains the last good certificate while valid. At expiry, Pier refuses

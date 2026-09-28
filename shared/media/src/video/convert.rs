@@ -959,6 +959,42 @@ const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const PQ_PEAK_NITS: f32 = 10_000.0;
 const PQ_CODE_COUNT: usize = WIDE_INPUT_MAX as usize + 1;
 
+/// One FP16 scRGB sample used to prove that GPU conversion code and the CPU
+/// reference are evaluating the same shared colour contract.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrgbConversionTestVector {
+    pub name: &'static str,
+    pub rgb_linear: [f32; 3],
+}
+
+/// Shared input table for FP16 scRGB conversion tests.
+///
+/// The expected YUV values are deliberately produced by the shared CPU
+/// conversion in each test, not duplicated here, so adding a new matrix or
+/// transfer cannot create two hand-maintained truth tables that drift apart.
+pub const SCRGB_CONVERSION_TEST_VECTORS: &[ScrgbConversionTestVector] = &[
+    ScrgbConversionTestVector {
+        name: "black",
+        rgb_linear: [0.0, 0.0, 0.0],
+    },
+    ScrgbConversionTestVector {
+        name: "mid-grey",
+        rgb_linear: [0.5, 0.5, 0.5],
+    },
+    ScrgbConversionTestVector {
+        name: "sdr-white",
+        rgb_linear: [1.0, 1.0, 1.0],
+    },
+    ScrgbConversionTestVector {
+        name: "saturated-red",
+        rgb_linear: [1.0, 0.0, 0.0],
+    },
+    ScrgbConversionTestVector {
+        name: "hdr-highlight",
+        rgb_linear: [4.0, 2.0, 1.0],
+    },
+];
+
 /// Convert linear-light sRGB/scRGB primaries into the negotiated linear RGB
 /// primaries before applying a nonlinear transfer function.
 fn scrgb_primary_matrix(output: ColorPrimaries) -> [[f32; 3]; 3] {
@@ -1316,6 +1352,101 @@ pub fn convert_scrgb_to_sdr_i444_p16(
     Ok(())
 }
 
+/// What the codes of a packed RGB10 frame mean, and therefore what must
+/// happen to them before the colour matrix.
+///
+/// A depth-30 framebuffer says nothing about its own encoding. When the
+/// source is ordinary BT.709 SDR the codes go to the matrix untouched. When
+/// the source carries Rec.2100 PQ in BT.2020 primaries (a colour-managed
+/// application writing HDR into the desktop) and the session is SDR, the
+/// codes are absolute luminance in the wrong primaries: sending them to a
+/// BT.709 matrix as they are shows a dim, desaturated picture, which is the
+/// failure this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rgb10Signal {
+    /// The codes are already in the session's transfer and primaries.
+    #[default]
+    Direct,
+    /// Rec.2100 PQ / BT.2020 source converted to BT.709 SDR: PQ decoded to
+    /// linear light with graphics white at 203 nits (BT.2408), BT.2020
+    /// primaries mapped to BT.709, clipped to SDR white, then BT.709 OETF.
+    PqBt2020ToSdrBt709,
+}
+
+/// Linear-light samples of the BT.709 OETF lookup, over `0.0..=1.0`.
+const SDR_OETF_STEPS: usize = 1 << 14;
+
+/// ITU-R BT.2087 linear BT.2020 to linear BT.709 (D65).
+const BT2020_TO_BT709: [[f32; 3]; 3] = [
+    [1.660_491, -0.587_641, -0.072_850],
+    [-0.124_551, 1.132_9, -0.008_349],
+    [-0.018_151, -0.100_579, 1.118_73],
+];
+
+/// Ten-bit PQ code to linear light relative to 203-nit graphics white.
+fn pq_code_to_graphics_white_linear() -> &'static [f32; PQ_CODE_COUNT] {
+    static TABLE: OnceLock<[f32; PQ_CODE_COUNT]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|code| {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            {
+                (pq_signal_to_linear_nits(code as f64 / f64::from(WIDE_INPUT_MAX))
+                    / super::pq_white::GRAPHICS_WHITE_NITS) as f32
+            }
+        })
+    })
+}
+
+/// Linear light in `0.0..=1.0` to a ten-bit BT.709 code.
+fn sdr_bt709_oetf_codes() -> &'static [u16] {
+    static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=SDR_OETF_STEPS)
+            .map(|step| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                {
+                    let linear = step as f32 / SDR_OETF_STEPS as f32;
+                    (linear_to_bt709(linear) * f32::from(WIDE_INPUT_MAX))
+                        .round()
+                        .clamp(0.0, f32::from(WIDE_INPUT_MAX)) as u16
+                }
+            })
+            .collect()
+    })
+}
+
+impl Rgb10Signal {
+    /// Maps one pixel's `[r, g, b]` ten-bit codes into the codes the matrix
+    /// expects.
+    #[must_use]
+    #[inline]
+    pub fn map(self, rgb: [u16; 3]) -> [u16; 3] {
+        match self {
+            Self::Direct => rgb,
+            Self::PqBt2020ToSdrBt709 => {
+                let decode = pq_code_to_graphics_white_linear();
+                let linear = rgb.map(|code| decode[usize::from(code.min(WIDE_INPUT_MAX))]);
+                let oetf = sdr_bt709_oetf_codes();
+                BT2020_TO_BT709.map(|row| {
+                    let value = (row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2])
+                        .clamp(0.0, 1.0);
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss
+                    )]
+                    let index = (value * SDR_OETF_STEPS as f32).round() as usize;
+                    oetf[index.min(SDR_OETF_STEPS)]
+                })
+            }
+        }
+    }
+}
+
 /// Convert a packed RGB10 frame to planar 4:4:4 sixteen-bit.
 ///
 /// This is the portable conversion used by the X11 depth-30 capture path.
@@ -1348,6 +1479,7 @@ pub fn convert_packed_rgb10_to_i444_p16(
     height: usize,
     layout: PackedRgb10Layout,
     transform: ColorTransform,
+    signal: Rgb10Signal,
 ) -> Result<(), ConversionError> {
     // One 32-bit word per pixel.
     let row_bytes = width
@@ -1380,7 +1512,7 @@ pub fn convert_packed_rgb10_to_i444_p16(
                 src_row[base + 2],
                 src_row[base + 3],
             ]);
-            let [r, g, b] = layout.components(word);
+            let [r, g, b] = signal.map(layout.components(word));
             y_row[column] = transform.pack_p16(transform.luma_wide(b, g, r));
             u_row[column] = transform.pack_p16(transform.cb_wide(b, g, r));
             v_row[column] = transform.pack_p16(transform.cr_wide(b, g, r));
@@ -1416,6 +1548,7 @@ pub fn convert_packed_rgb10_to_p010(
     height: usize,
     layout: PackedRgb10Layout,
     transform: ColorTransform,
+    signal: Rgb10Signal,
 ) -> Result<(), ConversionError> {
     let row_bytes = width
         .checked_mul(4)
@@ -1436,12 +1569,12 @@ pub fn convert_packed_rgb10_to_p010(
 
     let pixel = |row: &[u8], column: usize| {
         let base = column * 4;
-        layout.components(u32::from_le_bytes([
+        signal.map(layout.components(u32::from_le_bytes([
             row[base],
             row[base + 1],
             row[base + 2],
             row[base + 3],
-        ]))
+        ])))
     };
     for row_pair in 0..height / 2 {
         let top = row_pair * 2;
@@ -1537,6 +1670,11 @@ mod tests {
     use super::*;
     use crate::video::{I420FrameMut, I444FrameMut, I444P16FrameMut, Nv12FrameMut};
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     fn half_bits(value: f32) -> [u8; 2] {
         // Minimal f32 -> binary16 for test fixtures; only needs to be exact
         // for the handful of values used here.
@@ -2415,23 +2553,24 @@ mod wide_source_tests {
         )
     }
 
-    fn convert_one_a2r10g10b10(r: u16, g: u16, b: u16) -> (u16, u16, u16) {
-        let src = a2r10g10b10(r, g, b);
-        let mut y = [0u16; 1];
-        let mut u = [0u16; 1];
-        let mut v = [0u16; 1];
+    fn convert_one_a2r10g10b10(red: u16, green: u16, blue: u16) -> (u16, u16, u16) {
+        let src = a2r10g10b10(red, green, blue);
+        let mut luma = [0u16; 1];
+        let mut chroma_blue = [0u16; 1];
+        let mut chroma_red = [0u16; 1];
         convert_packed_rgb10_to_i444_p16(
             &src,
             4,
-            [&mut y, &mut u, &mut v],
+            [&mut luma, &mut chroma_blue, &mut chroma_red],
             [1, 1, 1],
             1,
             1,
             PackedRgb10Layout::XRGB2101010,
             wide_full_bt709(),
+            Rgb10Signal::Direct,
         )
         .expect("single pixel converts");
-        (y[0], u[0], v[0])
+        (luma[0], chroma_blue[0], chroma_red[0])
     }
 
     /// Black, white and neutral mid-grey land exactly where full-range
@@ -2518,6 +2657,7 @@ mod wide_source_tests {
                 1,
                 PackedRgb10Layout::XBGR2101010,
                 wide_full_bt709(),
+                Rgb10Signal::Direct,
             )
             .expect("ramp converts");
             (y, u, v)
@@ -2562,6 +2702,7 @@ mod wide_source_tests {
                 1,
                 PackedRgb10Layout::XRGB2101010,
                 wide_full_bt709(),
+                Rgb10Signal::Direct,
             )
             .is_err()
         );
@@ -2576,8 +2717,8 @@ mod wide_source_tests {
             PackedRgb10Layout::from_masks(0x3ff0_0000, 0x000f_fc00, 0x0000_03ff),
             Some(PackedRgb10Layout::XRGB2101010)
         );
-        assert!(PackedRgb10Layout::from_masks(0xff, 0xff00, 0xff0000).is_none());
-        assert!(PackedRgb10Layout::from_masks(0x3ff, 0x3ff, 0x3ff00000).is_none());
+        assert!(PackedRgb10Layout::from_masks(0xff, 0xff00, 0x00ff_0000).is_none());
+        assert!(PackedRgb10Layout::from_masks(0x3ff, 0x3ff, 0x3ff0_0000).is_none());
 
         let word = (0x3ff_u32 << 30) | (1023_u32 << 20);
         let src = word.to_le_bytes();
@@ -2593,6 +2734,7 @@ mod wide_source_tests {
             1,
             nvidia_xorg,
             wide_full_bt709(),
+            Rgb10Signal::Direct,
         )
         .expect("NVIDIA depth-30 pixel converts");
         assert!(u[0] > 0x8000, "blue in bits 20..29 must raise Cb");
@@ -2611,7 +2753,8 @@ mod wide_source_tests {
             let mut bgra = [0u8; 4];
             convert_packed_rgb10_to_bgra8(&word.to_le_bytes(), 4, &mut bgra, 4, 1, 1, layout)
                 .expect("ten-bit pixel reduces");
-            assert_eq!(bgra, [code as u8, code as u8, code as u8, u8::MAX]);
+            let narrow = u8::try_from(code).expect("test loop stays in u8 range");
+            assert_eq!(bgra, [narrow, narrow, narrow, u8::MAX]);
         }
     }
 
@@ -2632,6 +2775,7 @@ mod wide_source_tests {
             2,
             PackedRgb10Layout::XBGR2101010,
             wide_full_bt709(),
+            Rgb10Signal::Direct,
         )
         .expect("P010 conversion");
         assert_eq!(y, [0xffc0; 4]);
@@ -2728,5 +2872,98 @@ mod wide_source_tests {
         assert!((half_to_f32(0x3C00) - 1.0).abs() < 1e-6);
         assert!((half_to_f32(0x3800) - 0.5).abs() < 1e-6);
         assert!(half_to_f32(0x0000).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod pq_to_sdr_tests {
+    use super::{
+        ColorTransform, PackedRgb10Layout, Rgb10Signal, WIDE_INPUT_MAX,
+        convert_packed_rgb10_to_i444_p16, linear_nits_to_pq_signal,
+    };
+    use crate::{BitDepth, ColorMatrix, ColorRange};
+
+    const PQ: Rgb10Signal = Rgb10Signal::PqBt2020ToSdrBt709;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn pq_code(nits: f32) -> u16 {
+        (linear_nits_to_pq_signal(nits) * f32::from(WIDE_INPUT_MAX)).round() as u16
+    }
+
+    fn grey(nits: f32) -> [u16; 3] {
+        let code = pq_code(nits);
+        [code, code, code]
+    }
+
+    #[test]
+    fn direct_leaves_codes_alone() {
+        assert_eq!(Rgb10Signal::Direct.map([1, 512, 1023]), [1, 512, 1023]);
+    }
+
+    #[test]
+    fn graphics_white_becomes_sdr_white_and_black_stays_black() {
+        let white = PQ.map(grey(203.0));
+        assert!(white.iter().all(|code| *code >= 1020), "{white:?}");
+        assert_eq!(PQ.map([0, 0, 0]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_fifth_of_white_lands_on_the_bt709_curve() {
+        // 20% of 203 nits is linear 0.2; BT.709 OETF gives 0.4336, code 443.6.
+        let mid = PQ.map(grey(0.2 * 203.0));
+        for code in mid {
+            assert!((i32::from(code) - 444).abs() <= 3, "{mid:?}");
+        }
+        assert!(
+            mid[0] == mid[1] && mid[1] == mid[2],
+            "neutral stays neutral"
+        );
+    }
+
+    #[test]
+    fn highlights_above_sdr_white_clip_instead_of_wrapping() {
+        assert_eq!(PQ.map(grey(1000.0)), [1023, 1023, 1023]);
+        assert_eq!(PQ.map([1023, 1023, 1023]), [1023, 1023, 1023]);
+    }
+
+    #[test]
+    fn bt2020_primaries_outside_bt709_are_clipped_to_the_gamut() {
+        // Pure BT.2020 red at white level: linear BT.709 red is 1.66, green and
+        // blue are negative. They clip to [1, 0, 0].
+        let red = PQ.map([pq_code(203.0), 0, 0]);
+        assert_eq!(red[0], 1023);
+        assert_eq!((red[1], red[2]), (0, 0));
+    }
+
+    #[test]
+    fn the_frame_conversion_applies_the_signal_before_the_matrix() {
+        let layout =
+            PackedRgb10Layout::from_masks(0x3ff, 0x3ff << 10, 0x3ff << 20).expect("layout");
+        let transform = ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            1023.0,
+        );
+        let code = u32::from(pq_code(203.0));
+        let word = code | (code << 10) | (code << 20);
+        let source: Vec<u8> = [word, word].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (mut y, mut u, mut v) = (vec![0u16; 2], vec![0u16; 2], vec![0u16; 2]);
+        convert_packed_rgb10_to_i444_p16(
+            &source,
+            8,
+            [&mut y, &mut u, &mut v],
+            [2, 2, 2],
+            2,
+            1,
+            layout,
+            transform,
+            PQ,
+        )
+        .expect("convert");
+        // Full-range ten-bit white is luma 1023, MSB-aligned; chroma neutral 512.
+        assert!(y[0] >> 6 >= 1020, "luma {}", y[0] >> 6);
+        assert_eq!(u[0] >> 6, 512);
+        assert_eq!(v[0] >> 6, 512);
     }
 }

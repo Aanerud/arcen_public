@@ -14,12 +14,15 @@
 <installer-gui-script minSpecVersion="2">
   <title>Arcen Pier</title>
   <organization>tech.arcen</organization>
-  <options customize="never" require-scripts="true"
+  <!-- The Pier installs system-wide only. rootVolumeOnly skips the
+       destination and install-location questions, which offered choices the
+       package cannot honour. -->
+  <options customize="never" require-scripts="true" rootVolumeOnly="true"
            hostArchitectures="@HOST_ARCHITECTURES@"/>
-  <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
   <allowed-os-versions>
     <os-version min="@MINIMUM_SYSTEM_VERSION@"/>
   </allowed-os-versions>
+  <welcome file="welcome.html" mime-type="text/html"/>
   <conclusion file="conclusion.html" mime-type="text/html"/>
   <installation-check script="arcen_installation_check()"/>
   <script><![CDATA[

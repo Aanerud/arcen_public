@@ -36,7 +36,7 @@ use crate::multi_monitor_input::{
 };
 use arcen_protocol::messages::{
     KeyEventMsg, MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg,
-    PenToolMsg, PointerMotionMode, TextCommitMsg,
+    PenToolMsg, PointerMotionMode, ScrollUnitMsg, TextCommitMsg,
 };
 
 const MOD_SHIFT: u32 = 0x01;
@@ -44,6 +44,26 @@ const MOD_CTRL: u32 = 0x02;
 const MOD_ALT: u32 = 0x04;
 const MOD_META: u32 = 0x08;
 const MOD_KEYPAD: u32 = 0x10;
+
+fn wheel_delta_from_scroll(value: f64, unit: ScrollUnitMsg) -> i32 {
+    if value == 0.0 || !value.is_finite() {
+        return 0;
+    }
+    let scaled = match unit {
+        ScrollUnitMsg::Line => value * 120.0,
+        ScrollUnitMsg::Point => value,
+    };
+    let rounded = scaled.round();
+    if rounded == 0.0 {
+        value.signum() as i32
+    } else if rounded > f64::from(i32::MAX) {
+        i32::MAX
+    } else if rounded < f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        rounded as i32
+    }
+}
 
 const VK_LSHIFT: u16 = 0xA0;
 const VK_LCONTROL: u16 = 0xA2;
@@ -364,10 +384,10 @@ mod windows_impl {
     use super::{
         is_identity_dxgi_rotation, modifier_targets, pen_pixel_location, pen_pressure_to_windows,
         pen_rotation_to_windows, pen_tilt_to_windows, pen_tool_flags, qt_key_to_windows,
-        selected_output_to_virtual_abs, DesktopRect, KeyEventMsg, MappedRegionButton,
-        MappedRegionPen, MappedRegionPoint, MappedRegionScroll, MouseButtonMsg, MouseMoveMsg,
-        MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenPointerEdge, PenPointerState,
-        PenToolMsg, TextCommitMsg, INPUT,
+        selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect, KeyEventMsg,
+        MappedRegionButton, MappedRegionPen, MappedRegionPoint, MappedRegionScroll, MouseButtonMsg,
+        MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenPointerEdge,
+        PenPointerState, PenToolMsg, TextCommitMsg, INPUT,
     };
     use std::collections::HashSet;
     use windows::Win32::Foundation::POINT;
@@ -822,7 +842,7 @@ mod windows_impl {
                 inputs.push(Self::mouse_input(
                     0,
                     0,
-                    (msg.dy.round() as i32).saturating_mul(WHEEL_DELTA),
+                    wheel_delta_from_scroll(msg.dy, msg.unit),
                     MOUSEEVENTF_WHEEL,
                 ));
             }
@@ -830,7 +850,7 @@ mod windows_impl {
                 inputs.push(Self::mouse_input(
                     0,
                     0,
-                    (msg.dx.round() as i32).saturating_mul(WHEEL_DELTA),
+                    wheel_delta_from_scroll(msg.dx, msg.unit),
                     MOUSEEVENTF_HWHEEL,
                 ));
             }
@@ -1433,10 +1453,13 @@ mod tests {
         is_identity_dxgi_rotation, modifier_targets, norm_to_abs, pen_pixel_location,
         pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows, pen_tool_flags,
         prepends_absolute_position, qt_key_to_vk, qt_key_to_windows, relative_move_plan,
-        selected_output_to_virtual_abs, DesktopRect, PenPointerEdge, PenPointerState, MOD_CTRL,
-        MOD_KEYPAD, MOD_META, MOD_SHIFT, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
+        selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect, PenPointerEdge,
+        PenPointerState, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT, VK_LCONTROL, VK_LMENU,
+        VK_LSHIFT, VK_LWIN,
     };
-    use arcen_protocol::messages::{MouseMoveRelativeMsg, PenToolMsg, PointerMotionMode};
+    use arcen_protocol::messages::{
+        MouseMoveRelativeMsg, PenToolMsg, PointerMotionMode, ScrollUnitMsg,
+    };
 
     #[test]
     fn norm_maps_full_range() {
@@ -1468,6 +1491,15 @@ mod tests {
     fn relative_edges_and_wheels_do_not_prepend_absolute_warp() {
         assert!(prepends_absolute_position(PointerMotionMode::Absolute));
         assert!(!prepends_absolute_position(PointerMotionMode::Relative));
+    }
+
+    #[test]
+    fn wheel_delta_preserves_horizontal_fractions_for_point_scroll() {
+        assert_eq!(wheel_delta_from_scroll(0.5, ScrollUnitMsg::Line), 60);
+        assert_eq!(wheel_delta_from_scroll(-0.5, ScrollUnitMsg::Line), -60);
+        assert_eq!(wheel_delta_from_scroll(30.4, ScrollUnitMsg::Point), 30);
+        assert_eq!(wheel_delta_from_scroll(-0.25, ScrollUnitMsg::Point), -1);
+        assert_eq!(wheel_delta_from_scroll(f64::NAN, ScrollUnitMsg::Point), 0);
     }
 
     #[test]

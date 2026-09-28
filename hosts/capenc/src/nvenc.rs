@@ -1,22 +1,14 @@
-// NVENC encoder — D3D11 host-converted path. Loads nvEncodeAPI64.dll
+// NVENC encoder — D3D11/NVENC path. Loads nvEncodeAPI64.dll
 // dynamically (no link dep, no CUDA) and drives NVENC via the vendored
 // bindgen bindings (crate::nvenc_sys), generated from the MIT-licensed
 // nv-codec-headers copy vendored under third_party/.
 //
-// w2-drop-argb: this used to hand NVENC the packed-BGRA `ARGB` buffer format
-// and let the driver perform RGB->YCbCr with an undocumented, uncontrollable
-// matrix and range — the single largest uncontrolled variable in the colour
-// pipeline (see `ColorSpec`/`ColorTransform` in `arcen_media`). NVENC now
-// only ever receives samples *we* converted: `NV_ENC_BUFFER_FORMAT_NV12`
-// (4:2:0 8-bit), `_YUV420_10BIT` (4:2:0 10-bit / Main10), `_YUV444` (4:4:4
-// 8-bit) or `_YUV444_10BIT` (4:4:4 10-bit), chosen by `resolve_pixel_format`.
-// That trades the previous zero-copy GPU-only path for a CPU round trip: the
-// captured D3D11 texture is copied into a CPU-readable staging texture,
-// Mapped, converted with `arcen_media::video::convert_bgra_to_*`, and written
-// straight into an NVENC-allocated system-memory input buffer
-// (`nvEncCreateInputBuffer`/`nvEncLockInputBuffer`) instead of a registered,
-// GPU-only D3D11 texture (`nvEncRegisterResource`). See `Encoder::stage` and
-// `write_locked_from_bgra` for the concrete choice and why.
+// The 8-bit Auto/Speed contract keeps the captured BGRA texture on the GPU:
+// capenc copies it into a registered D3D11 texture and submits
+// `NV_ENC_BUFFER_FORMAT_ARGB`, letting NVENC's RGB input path do the hardware
+// RGB->YCbCr conversion. Wide FP16 contracts still use Arcen's shared
+// transfer/matrix maths and therefore remain an explicit CPU fallback until a
+// matching D3D11 shader backend is selected.
 //
 // PIPELINED (double-buffered): each slot owns its own input buffer and output
 // bitstream. We SUBMIT frame N's EncodePicture, then LOCK frame N-1's
@@ -63,12 +55,18 @@ unsafe fn zeroed<T>() -> T {
 
 use windows::core::{Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE};
+use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+    ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R16_UINT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -80,8 +78,10 @@ use crate::nvenc_sys::*; // GUIDs (guid.rs) + _VER version consts (version.rs), 
                          // can write NV_ENC_SUCCESS instead of _NVENCSTATUS::NV_ENC_SUCCESS everywhere.
 use crate::nvenc_sys::nvEncodeAPI::_NVENCSTATUS::*;
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_BUFFER_FORMAT::*;
+use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_BUFFER_USAGE::*;
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_CAPS::*; // NV_ENC_CAPS_SUPPORT_YUV444_ENCODE
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_DEVICE_TYPE::*;
+use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_INPUT_RESOURCE_TYPE::*;
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_MEMORY_HEAP::*;
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_QP_MAP_MODE::*;
 use crate::nvenc_sys::nvEncodeAPI::NV_ENC_TUNING_INFO::*;
@@ -91,6 +91,7 @@ use arcen_media::video::{
     convert_bgra_to_i444, convert_bgra_to_i444_p16_rows, convert_bgra_to_nv12,
     convert_scrgb_to_pq_i444_p16, convert_scrgb_to_sdr_i444_p16, ColorTransform, I444FrameMut,
     I444P16FrameMut, Nv12FrameMut, QpMapGeometry, ScrgbPqTransform, ScrgbSdrTransform,
+    SCRGB_CONVERSION_TEST_VECTORS,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -198,11 +199,25 @@ fn apply_av1_color(config: &mut NV_ENC_CONFIG_AV1, color: crate::ColorSpec) {
     config.colorRange = u32::from(matches!(color.range, ColorRange::Full));
 }
 
-/// One pipeline slot: its own NVENC-allocated system-memory input buffer and
-/// its own output bitstream buffer, so frame N and N-1 never collide.
+/// One pipeline slot: its own input resource and its own output bitstream
+/// buffer, so frame N and N-1 never collide.
 struct Slot {
-    input_buffer: NV_ENC_INPUT_PTR,
+    input: SlotInput,
     bitstream: NV_ENC_OUTPUT_PTR,
+}
+
+enum SlotInput {
+    CpuBuffer(NV_ENC_INPUT_PTR),
+    D3D11Texture {
+        texture: ID3D11Texture2D,
+        registered: NV_ENC_REGISTERED_PTR,
+        buffer_format: NV_ENC_BUFFER_FORMAT,
+    },
+}
+
+struct InflightSlot {
+    slot: usize,
+    mapped_input: Option<NV_ENC_INPUT_PTR>,
 }
 
 /// Which published frame each input slot currently holds.
@@ -345,12 +360,13 @@ pub struct Encoder {
     enc: *mut c_void,
     context: ID3D11DeviceContext,
     slots: Vec<Slot>,
-    // CPU-readable copy of the newest desktop image. Feeding NVENC our own
-    // conversion instead of ARGB (w2-drop-argb) means the pixel round trip is
-    // no longer purely GPU-side: the captured texture is copied into this
-    // staging texture and Mapped for CPU read, exactly mirroring win_mf.rs's
-    // software-encode path (`with_mapped_staging` there).
-    staging_tex: ID3D11Texture2D,
+    /// CPU-readable copy of the newest desktop image, present only for the
+    /// explicit CPU conversion fallback.
+    staging_tex: Option<ID3D11Texture2D>,
+    /// GPU-resident latest frame used by the 8-bit registered-texture path to
+    /// refresh idle ring slots without a host copy.
+    latest_tex: Option<ID3D11Texture2D>,
+    wide_gpu: Option<WideGpuConverter>,
     format: PixelFormat,
     transform: ColorTransform,
     /// Linear scRGB primaries, absolute PQ transfer, YCbCr matrix/range and
@@ -381,7 +397,7 @@ pub struct Encoder {
     // pitch would misplace whole chroma planes.
     locked_pitch: u32,
     frame_bytes: usize,
-    // Densely-mirrored bytes of the last frame NVENC's own buffer held,
+    // Densely-mirrored bytes of the last CPU-converted frame NVENC's own buffer held,
     // captured straight from a locked input buffer (see `publish_bgra`).
     // The encode ring advances at the target FPS even when capture is idle;
     // every submitted slot must therefore be refreshed from here or it would
@@ -394,9 +410,15 @@ pub struct Encoder {
     /// [`SlotGenerations`].
     generations: SlotGenerations,
     // Slots awaiting LockBitstream.
-    inflight: VecDeque<usize>,
+    inflight: VecDeque<InflightSlot>,
     write_idx: usize, // slot the next stage()/encode() targets
     drain_policy: crate::nvenc_policy::OutputDrainPolicy,
+    encode_guid: GUID,
+    preset_guid: GUID,
+    tuning: NV_ENC_TUNING_INFO,
+    reconfig_config: NV_ENC_CONFIG,
+    frame_rate: u32,
+    vbv_buffer_frames: f64,
     width: u32,
     height: u32,
     i444_conversion_workers: usize,
@@ -413,6 +435,553 @@ pub struct Encoder {
 enum WideScrgbTransform {
     Pq(ScrgbPqTransform),
     Sdr(ScrgbSdrTransform),
+}
+
+impl WideScrgbTransform {
+    const fn shader_mode(self) -> WideShaderMode {
+        match self {
+            Self::Sdr(_) => WideShaderMode::SdrBt709,
+            Self::Pq(_) => WideShaderMode::PqBt2020,
+        }
+    }
+
+    const fn white_gain(self) -> f32 {
+        match self {
+            Self::Pq(transform) => transform.white_gain(),
+            Self::Sdr(_) => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConversionBackend {
+    Gpu,
+    Cpu,
+}
+
+impl ConversionBackend {
+    pub(crate) const fn media(self) -> arcen_media::video::ConversionBackend {
+        match self {
+            Self::Gpu => arcen_media::video::ConversionBackend::Gpu,
+            Self::Cpu => arcen_media::video::ConversionBackend::Cpu,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuSlotFormat {
+    Bgra8,
+    Yuv444P16,
+    Abgr10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WideShaderMode {
+    SdrBt709,
+    PqBt2020,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WideShaderParams {
+    width: u32,
+    height: u32,
+    mode: u32,
+    range_full: u32,
+    output_kind: u32,
+    white_gain: f32,
+    _pad: [f32; 2],
+}
+
+struct WideGpuConverter {
+    shader: ID3D11ComputeShader,
+    constants: ID3D11Buffer,
+    source_tex: ID3D11Texture2D,
+    source_srv: ID3D11ShaderResourceView,
+    params: WideShaderParams,
+}
+
+const WIDE_SHADER_HLSL: &str = r#"
+    Texture2D<float4> source_tex : register(t0);
+    RWTexture2D<uint> output_yuv : register(u0);
+    RWTexture2D<float4> output_rgb : register(u1);
+
+    cbuffer Params : register(b0) {
+        uint width;
+        uint height;
+        uint mode;
+        uint range_full;
+        uint output_kind;
+        float white_gain;
+        float2 _pad;
+    };
+
+    float linear_to_bt709(float value) {
+        return value < 0.018 ? 4.5 * value : 1.099 * pow(value, 0.45) - 0.099;
+    }
+
+    float linear_nits_to_pq_signal(float nits) {
+        if (!isfinite(nits) || nits <= 0.0) {
+            return 0.0;
+        }
+        float normalized = min(nits / 10000.0, 1.0);
+        float m1 = 2610.0 / 16384.0;
+        float m2 = 2523.0 / 32.0;
+        float c1 = 3424.0 / 4096.0;
+        float c2 = 2413.0 / 128.0;
+        float c3 = 2392.0 / 128.0;
+        float powered = pow(normalized, m1);
+        return pow((c1 + c2 * powered) / (1.0 + c3 * powered), m2);
+    }
+
+    uint code10(float signal) {
+        return (uint)round(saturate(signal) * 1023.0);
+    }
+
+    float3 scrgb_to_bt2020(float3 rgb) {
+        return float3(
+            0.6274039 * rgb.r + 0.32928303 * rgb.g + 0.04331307 * rgb.b,
+            0.06909729 * rgb.r + 0.9195404 * rgb.g + 0.01136232 * rgb.b,
+            0.01639144 * rgb.r + 0.08801331 * rgb.g + 0.89559525 * rgb.b
+        );
+    }
+
+    uint pack_p16(float code) {
+        return ((uint)round(clamp(code, 0.0, 1023.0))) << 6;
+    }
+
+    float3 ycbcr_from_codes(float3 rgb, float kr, float kb) {
+        float kg = 1.0 - kr - kb;
+        float y_signal = kr * rgb.r + kg * rgb.g + kb * rgb.b;
+        float cb_signal = (rgb.b - y_signal) * (0.5 / (1.0 - kb));
+        float cr_signal = (rgb.r - y_signal) * (0.5 / (1.0 - kr));
+        float y_span = range_full != 0 ? 1023.0 : 876.0;
+        float c_span = range_full != 0 ? 1023.0 : 896.0;
+        float y_offset = range_full != 0 ? 0.0 : 64.0;
+        return float3(
+            y_offset + y_signal * y_span / 1023.0,
+            512.0 + cb_signal * c_span / 1023.0,
+            512.0 + cr_signal * c_span / 1023.0
+        );
+    }
+
+    [numthreads(8, 8, 1)]
+    void main(uint3 tid : SV_DispatchThreadID) {
+        if (tid.x >= width || tid.y >= height) {
+            return;
+        }
+        float3 rgb = source_tex.Load(int3(tid.xy, 0)).rgb;
+        float3 codes;
+        float kr;
+        float kb;
+        if (mode == 0) {
+            rgb = saturate(rgb);
+            rgb = float3(linear_to_bt709(rgb.r), linear_to_bt709(rgb.g), linear_to_bt709(rgb.b));
+            codes = float3(code10(rgb.r), code10(rgb.g), code10(rgb.b));
+            kr = 0.2126;
+            kb = 0.0722;
+        } else {
+            float3 bt2020 = scrgb_to_bt2020(rgb * white_gain);
+            rgb = float3(
+                linear_nits_to_pq_signal(bt2020.r * 80.0),
+                linear_nits_to_pq_signal(bt2020.g * 80.0),
+                linear_nits_to_pq_signal(bt2020.b * 80.0)
+            );
+            codes = float3(code10(rgb.r), code10(rgb.g), code10(rgb.b));
+            kr = 0.2627;
+            kb = 0.0593;
+        }
+        if (output_kind == 1) {
+            output_rgb[tid.xy] = float4(saturate(rgb), 1.0);
+            return;
+        }
+        float3 yuv = ycbcr_from_codes(codes, kr, kb);
+        output_yuv[uint2(tid.x, tid.y)] = pack_p16(yuv.x);
+        output_yuv[uint2(tid.x, tid.y + height)] = pack_p16(yuv.y);
+        output_yuv[uint2(tid.x, tid.y + height * 2)] = pack_p16(yuv.z);
+    }
+    "#;
+
+impl WideGpuConverter {
+    unsafe fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        transform: WideScrgbTransform,
+        range: ColorRange,
+        output_format: GpuSlotFormat,
+    ) -> Result<Self, String> {
+        let shader = compile_wide_shader(device)?;
+        let source_tex = make_wide_shader_source_texture(device, width, height)?;
+        let source_res: ID3D11Resource = source_tex
+            .cast()
+            .map_err(|error| format!("cast wide shader source: {error:?}"))?;
+        let mut source_srv = None;
+        device
+            .CreateShaderResourceView(&source_res, None, Some(&mut source_srv))
+            .map_err(|error| format!("CreateShaderResourceView(wide source): {error:?}"))?;
+        let source_srv = source_srv.ok_or_else(|| "wide source SRV null".to_string())?;
+        let params = WideShaderParams {
+            width,
+            height,
+            mode: match transform.shader_mode() {
+                WideShaderMode::SdrBt709 => 0,
+                WideShaderMode::PqBt2020 => 1,
+            },
+            range_full: u32::from(matches!(range, ColorRange::Full)),
+            output_kind: u32::from(output_format == GpuSlotFormat::Abgr10),
+            white_gain: transform.white_gain(),
+            _pad: [0.0; 2],
+        };
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: std::mem::size_of::<WideShaderParams>() as u32,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: (&params as *const WideShaderParams).cast(),
+            SysMemPitch: 0,
+            SysMemSlicePitch: 0,
+        };
+        let mut constants = None;
+        device
+            .CreateBuffer(&desc, Some(&data), Some(&mut constants))
+            .map_err(|error| format!("CreateBuffer(wide constants): {error:?}"))?;
+        let constants = constants.ok_or_else(|| "wide constants buffer null".to_string())?;
+        Ok(Self {
+            shader,
+            constants,
+            source_tex,
+            source_srv,
+            params,
+        })
+    }
+
+    unsafe fn convert(
+        &self,
+        context: &ID3D11DeviceContext,
+        acquired: &ID3D11Texture2D,
+        output: &ID3D11Texture2D,
+    ) -> Result<(), String> {
+        let src: ID3D11Resource = acquired
+            .cast()
+            .map_err(|error| format!("cast wide acquired: {error:?}"))?;
+        let shader_src: ID3D11Resource = self
+            .source_tex
+            .cast()
+            .map_err(|error| format!("cast wide shader source: {error:?}"))?;
+        context.CopyResource(&shader_src, &src);
+
+        let output_res: ID3D11Resource = output
+            .cast()
+            .map_err(|error| format!("cast wide shader output: {error:?}"))?;
+        let mut output_uav = None;
+        output
+            .GetDevice()
+            .map_err(|error| format!("wide output texture GetDevice: {error:?}"))?
+            .CreateUnorderedAccessView(&output_res, None, Some(&mut output_uav))
+            .map_err(|error| format!("CreateUnorderedAccessView(wide output): {error:?}"))?;
+        let output_uav = output_uav.ok_or_else(|| "wide output UAV null".to_string())?;
+
+        context.CSSetShader(&self.shader, None);
+        context.CSSetShaderResources(0, Some(&[Some(self.source_srv.clone())]));
+        let uavs = if self.params.output_kind == 0 {
+            [Some(output_uav), None]
+        } else {
+            [None, Some(output_uav)]
+        };
+        context.CSSetUnorderedAccessViews(0, 2, Some(uavs.as_ptr()), None);
+        context.CSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+        context.Dispatch(
+            self.params.width.div_ceil(8),
+            self.params.height.div_ceil(8),
+            1,
+        );
+        context.CSSetShaderResources(0, Some(&[None]));
+        let none_uav: [Option<ID3D11UnorderedAccessView>; 2] = [None, None];
+        context.CSSetUnorderedAccessViews(0, 2, Some(none_uav.as_ptr()), None);
+        context.CSSetConstantBuffers(0, Some(&[None]));
+        context.CSSetShader(None::<&ID3D11ComputeShader>, None);
+        Ok(())
+    }
+}
+
+unsafe fn compile_wide_shader(device: &ID3D11Device) -> Result<ID3D11ComputeShader, String> {
+    let bytes = compile_wide_shader_bytecode()?;
+    let mut shader = None;
+    device
+        .CreateComputeShader(&bytes, None, Some(&mut shader))
+        .map_err(|error| format!("CreateComputeShader(wide convert): {error:?}"))?;
+    shader.ok_or_else(|| "wide compute shader null".to_string())
+}
+
+fn compile_wide_shader_bytecode() -> Result<Vec<u8>, String> {
+    std::thread::Builder::new()
+        .name("arcen-d3dcompile".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| unsafe {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            D3DCompile(
+                WIDE_SHADER_HLSL.as_ptr().cast(),
+                WIDE_SHADER_HLSL.len(),
+                PCSTR(c"arcen-wide-convert.hlsl".as_ptr().cast()),
+                None,
+                None,
+                PCSTR(c"main".as_ptr().cast()),
+                PCSTR(c"cs_5_0".as_ptr().cast()),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .map_err(|error| {
+                let detail = errors.as_ref().map_or_else(String::new, |blob| {
+                    let bytes = std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    );
+                    String::from_utf8_lossy(bytes).to_string()
+                });
+                format!("D3DCompile(wide convert): {error:?} {detail}")
+            })?;
+            let code = code.ok_or_else(|| "D3DCompile returned no shader bytecode".to_string())?;
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            Ok(bytes.to_vec())
+        })
+        .map_err(|error| format!("spawn D3DCompile worker: {error}"))?
+        .join()
+        .map_err(|_| "D3DCompile worker panicked".to_string())?
+}
+
+unsafe fn make_wide_shader_source_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    device
+        .CreateTexture2D(&desc, None, Some(&mut texture))
+        .map_err(|error| format!("CreateTexture2D(wide shader source): {error:?}"))?;
+    texture.ok_or_else(|| "wide shader source texture null".to_string())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn f32_to_half_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent <= 0 {
+        return sign;
+    }
+    if exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exponent as u16) << 10) | ((mantissa >> 13) as u16)
+}
+
+fn scrgb_vector_source_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SCRGB_CONVERSION_TEST_VECTORS.len() * 8);
+    for vector in SCRGB_CONVERSION_TEST_VECTORS {
+        for component in vector.rgb_linear {
+            bytes.extend_from_slice(&f32_to_half_bits(component).to_le_bytes());
+        }
+        bytes.extend_from_slice(&f32_to_half_bits(1.0).to_le_bytes());
+    }
+    bytes
+}
+
+fn max_code_error(actual: &[u16], expected: &[u16]) -> u16 {
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| {
+            let actual = i32::from(*actual >> 6);
+            let expected = i32::from(*expected >> 6);
+            actual.abs_diff(expected) as u16
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) unsafe fn wide_shader_vector_selftest(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+) -> Result<(u16, u16), String> {
+    let width = u32::try_from(SCRGB_CONVERSION_TEST_VECTORS.len()).unwrap_or(0);
+    let height = 1u32;
+    let source = scrgb_vector_source_bytes();
+    let source_desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: 0,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let source_data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: source.as_ptr().cast(),
+        SysMemPitch: width * 8,
+        SysMemSlicePitch: 0,
+    };
+    let mut source_tex = None;
+    device
+        .CreateTexture2D(&source_desc, Some(&source_data), Some(&mut source_tex))
+        .map_err(|error| format!("CreateTexture2D(shader vector source): {error:?}"))?;
+    let source_tex = source_tex.ok_or_else(|| "shader vector source null".to_string())?;
+
+    unsafe fn run_one(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source_tex: &ID3D11Texture2D,
+        source: &[u8],
+        width: u32,
+        transform: WideScrgbTransform,
+    ) -> Result<u16, String> {
+        let converter = WideGpuConverter::new(
+            device,
+            width,
+            1,
+            transform,
+            ColorRange::Full,
+            GpuSlotFormat::Yuv444P16,
+        )?;
+        let output = Encoder::make_gpu_input_texture(device, width, 1, GpuSlotFormat::Yuv444P16)?;
+        converter.convert(context, source_tex, &output)?;
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: 3,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging = None;
+        device
+            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+            .map_err(|error| format!("CreateTexture2D(shader vector readback): {error:?}"))?;
+        let staging = staging.ok_or_else(|| "shader vector readback null".to_string())?;
+        let output_res: ID3D11Resource = output
+            .cast()
+            .map_err(|error| format!("cast shader vector output: {error:?}"))?;
+        let staging_res: ID3D11Resource = staging
+            .cast()
+            .map_err(|error| format!("cast shader vector staging: {error:?}"))?;
+        context.CopyResource(&staging_res, &output_res);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context
+            .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|error| format!("Map(shader vector readback): {error:?}"))?;
+        let samples = width as usize;
+        let mut actual = vec![0u16; samples * 3];
+        for plane in 0..3 {
+            let row = std::slice::from_raw_parts(
+                (mapped.pData.cast::<u8>())
+                    .add(mapped.RowPitch as usize * plane)
+                    .cast::<u16>(),
+                samples,
+            );
+            actual[plane * samples..(plane + 1) * samples].copy_from_slice(row);
+        }
+        context.Unmap(&staging_res, 0);
+
+        let mut y = vec![0u16; samples];
+        let mut u = vec![0u16; samples];
+        let mut v = vec![0u16; samples];
+        match transform {
+            WideScrgbTransform::Sdr(transform) => convert_scrgb_to_sdr_i444_p16(
+                source,
+                samples * 8,
+                [&mut y, &mut u, &mut v],
+                [samples, samples, samples],
+                samples,
+                1,
+                transform,
+            ),
+            WideScrgbTransform::Pq(transform) => convert_scrgb_to_pq_i444_p16(
+                source,
+                samples * 8,
+                [&mut y, &mut u, &mut v],
+                [samples, samples, samples],
+                samples,
+                1,
+                transform,
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        let mut expected = Vec::with_capacity(samples * 3);
+        expected.extend_from_slice(&y);
+        expected.extend_from_slice(&u);
+        expected.extend_from_slice(&v);
+        Ok(max_code_error(&actual, &expected))
+    }
+
+    let sdr = ScrgbSdrTransform::new(
+        ColorMatrix::Bt709,
+        ColorRange::Full,
+        BitDepth::Ten,
+        TransferCharacteristics::Bt709,
+    )
+    .expect("BT.709 SDR transform");
+    let hdr = ScrgbPqTransform::new(
+        ColorMatrix::Bt2020Ncl,
+        ColorPrimaries::Bt2020,
+        ColorRange::Full,
+        BitDepth::Ten,
+    );
+    let sdr_error = run_one(
+        device,
+        context,
+        &source_tex,
+        &source,
+        width,
+        WideScrgbTransform::Sdr(sdr),
+    )?;
+    let hdr_error = run_one(
+        device,
+        context,
+        &source_tex,
+        &source,
+        width,
+        WideScrgbTransform::Pq(hdr),
+    )?;
+    Ok((sdr_error, hdr_error))
 }
 
 /// Two-phase staging state: whether the CPU-readable staging texture currently
@@ -493,7 +1062,7 @@ impl Drop for EncoderInitGuard<'_> {
 
 unsafe fn cleanup_slots(fl: &NV_ENCODE_API_FUNCTION_LIST, enc: *mut c_void, slots: &mut Vec<Slot>) {
     for slot in slots.drain(..) {
-        cleanup_native_slot(fl, enc, slot.bitstream, slot.input_buffer);
+        cleanup_native_slot(fl, enc, slot.bitstream, slot.input);
     }
 }
 
@@ -501,17 +1070,25 @@ unsafe fn cleanup_native_slot(
     fl: &NV_ENCODE_API_FUNCTION_LIST,
     enc: *mut c_void,
     bitstream: NV_ENC_OUTPUT_PTR,
-    input_buffer: NV_ENC_INPUT_PTR,
+    input: SlotInput,
 ) {
     if !bitstream.is_null() {
         if let Some(destroy) = fl.nvEncDestroyBitstreamBuffer {
             let _ = destroy(enc, bitstream);
         }
     }
-    if !input_buffer.is_null() {
-        if let Some(destroy) = fl.nvEncDestroyInputBuffer {
-            let _ = destroy(enc, input_buffer);
+    match input {
+        SlotInput::CpuBuffer(input_buffer) if !input_buffer.is_null() => {
+            if let Some(destroy) = fl.nvEncDestroyInputBuffer {
+                let _ = destroy(enc, input_buffer);
+            }
         }
+        SlotInput::D3D11Texture { registered, .. } if !registered.is_null() => {
+            if let Some(unregister) = fl.nvEncUnregisterResource {
+                let _ = unregister(enc, registered);
+            }
+        }
+        SlotInput::CpuBuffer(_) | SlotInput::D3D11Texture { .. } => {}
     }
 }
 
@@ -674,6 +1251,59 @@ unsafe fn log_color_capabilities(
         "NVENC caps (codec={codec}): yuv444={yuv444} ten_bit={ten_bit} lossless={lossless} \
          (independent booleans; the combination is only proven by InitializeEncoder)"
     ));
+    log_input_formats(fl, enc, codec_guid, codec);
+}
+
+unsafe fn log_input_formats(
+    fl: &NV_ENCODE_API_FUNCTION_LIST,
+    enc: *mut c_void,
+    codec_guid: GUID,
+    codec: &str,
+) {
+    let Some(count_fn) = fl.nvEncGetInputFormatCount else {
+        crate::log("NVENC input formats: nvEncGetInputFormatCount missing");
+        return;
+    };
+    let Some(formats_fn) = fl.nvEncGetInputFormats else {
+        crate::log("NVENC input formats: nvEncGetInputFormats missing");
+        return;
+    };
+    let mut count = 0u32;
+    if count_fn(enc, codec_guid, &mut count) != NV_ENC_SUCCESS || count == 0 {
+        crate::log(&format!(
+            "NVENC input formats (codec={codec}): unavailable count={count}"
+        ));
+        return;
+    }
+    let mut formats = vec![NV_ENC_BUFFER_FORMAT_UNDEFINED; count as usize];
+    let mut returned = 0u32;
+    if formats_fn(enc, codec_guid, formats.as_mut_ptr(), count, &mut returned) != NV_ENC_SUCCESS {
+        crate::log(&format!(
+            "NVENC input formats (codec={codec}): query failed count={count}"
+        ));
+        return;
+    }
+    formats.truncate(returned as usize);
+    let names = formats
+        .iter()
+        .map(|format| nvenc_buffer_format_name(*format))
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::log(&format!("NVENC input formats (codec={codec}): {names}"));
+}
+
+fn nvenc_buffer_format_name(format: NV_ENC_BUFFER_FORMAT) -> &'static str {
+    match format {
+        NV_ENC_BUFFER_FORMAT_NV12 => "NV12",
+        NV_ENC_BUFFER_FORMAT_YUV444 => "YUV444",
+        NV_ENC_BUFFER_FORMAT_YUV420_10BIT => "YUV420_10BIT",
+        NV_ENC_BUFFER_FORMAT_YUV444_10BIT => "YUV444_10BIT",
+        NV_ENC_BUFFER_FORMAT_ARGB => "ARGB",
+        NV_ENC_BUFFER_FORMAT_ARGB10 => "ARGB10",
+        NV_ENC_BUFFER_FORMAT_ABGR => "ABGR",
+        NV_ENC_BUFFER_FORMAT_ABGR10 => "ABGR10",
+        _ => "OTHER",
+    }
 }
 
 /// Whether this GPU/driver's NVENC enumerates `codec_guid` among the codecs
@@ -788,6 +1418,11 @@ impl NvencCodec {
 /// than an item that exposes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PixelFormat {
+    /// `NV_ENC_BUFFER_FORMAT_ARGB`: packed BGRA handed to NVENC as a
+    /// registered D3D11 texture. This is the Auto/Speed 8-bit fast path:
+    /// capture and conversion remain on GPU and the coded stream is still
+    /// configured as 4:2:0 8-bit.
+    Bgra8,
     /// `NV_ENC_BUFFER_FORMAT_NV12`: semi-planar 4:2:0, 1 byte/sample (Y plane
     /// then one interleaved UV plane).
     Nv12,
@@ -810,6 +1445,7 @@ pub(crate) enum PixelFormat {
 impl PixelFormat {
     const fn buffer_format(self) -> NV_ENC_BUFFER_FORMAT {
         match self {
+            Self::Bgra8 => NV_ENC_BUFFER_FORMAT_ARGB,
             Self::Nv12 => NV_ENC_BUFFER_FORMAT_NV12,
             Self::P010 => NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
             Self::Yuv444_8 => NV_ENC_BUFFER_FORMAT_YUV444,
@@ -819,6 +1455,7 @@ impl PixelFormat {
 
     const fn bytes_per_sample(self) -> usize {
         match self {
+            Self::Bgra8 => 4,
             Self::Nv12 | Self::Yuv444_8 => 1,
             Self::P010 | Self::Yuv444_10 => 2,
         }
@@ -838,7 +1475,8 @@ impl PixelFormat {
     /// bits.
     const fn bit_depth_minus8(self) -> u32 {
         match self {
-            Self::Nv12 | Self::Yuv444_8 => 0,
+            Self::Bgra8 | Self::Nv12 => 0,
+            Self::Yuv444_8 => 0,
             Self::P010 | Self::Yuv444_10 => 2,
         }
     }
@@ -848,7 +1486,7 @@ impl PixelFormat {
     /// 4:2:2 `PixelFormat` — see `PixelFormatRejection::Yuv422Unsupported`.
     const fn chroma_format_idc(self) -> u32 {
         match self {
-            Self::Nv12 | Self::P010 => 1,
+            Self::Bgra8 | Self::Nv12 | Self::P010 => 1,
             Self::Yuv444_8 | Self::Yuv444_10 => 3,
         }
     }
@@ -861,7 +1499,7 @@ impl PixelFormat {
     /// the resolved chroma+depth pair, so this is a lookup, not a guess.
     const fn chroma_and_depth(self) -> (ChromaSubsampling, BitDepth) {
         match self {
-            Self::Nv12 => (ChromaSubsampling::Yuv420, BitDepth::Eight),
+            Self::Bgra8 | Self::Nv12 => (ChromaSubsampling::Yuv420, BitDepth::Eight),
             Self::P010 => (ChromaSubsampling::Yuv420, BitDepth::Ten),
             Self::Yuv444_8 => (ChromaSubsampling::Yuv444, BitDepth::Eight),
             Self::Yuv444_10 => (ChromaSubsampling::Yuv444, BitDepth::Ten),
@@ -963,7 +1601,7 @@ fn resolve_pixel_format(
         return Err(PixelFormatRejection::Av1RequiresYuv420(color.chroma));
     }
     Ok(match (color.chroma, color.bit_depth) {
-        (ChromaSubsampling::Yuv420, BitDepth::Eight) => PixelFormat::Nv12,
+        (ChromaSubsampling::Yuv420, BitDepth::Eight) => PixelFormat::Bgra8,
         (ChromaSubsampling::Yuv420, BitDepth::Ten) => PixelFormat::P010,
         (ChromaSubsampling::Yuv444, BitDepth::Eight) => PixelFormat::Yuv444_8,
         (ChromaSubsampling::Yuv444, BitDepth::Ten) => PixelFormat::Yuv444_10,
@@ -995,7 +1633,7 @@ fn profile_guid_override(codec: NvencCodec, format: PixelFormat) -> Option<GUID>
         return Some(NV_ENC_AV1_PROFILE_MAIN_GUID);
     }
     match format {
-        PixelFormat::Nv12 => None,
+        PixelFormat::Bgra8 | PixelFormat::Nv12 => None,
         PixelFormat::P010 => Some(NV_ENC_HEVC_PROFILE_MAIN10_GUID), // H.264 P010 already rejected upstream; AV1 handled above
         PixelFormat::Yuv444_8 => Some(if codec == NvencCodec::Hevc {
             NV_ENC_HEVC_PROFILE_FREXT_GUID
@@ -1027,6 +1665,9 @@ const fn chroma_rows(format: PixelFormat, luma_height: u32) -> usize {
 fn frame_bytes(format: PixelFormat, pitch: u32, height: u32) -> usize {
     let pitch = pitch as usize;
     let luma = pitch * height as usize;
+    if matches!(format, PixelFormat::Bgra8) {
+        return luma;
+    }
     if format.semi_planar() {
         luma + pitch * chroma_rows(format, height)
     } else {
@@ -1041,9 +1682,10 @@ fn frame_bytes(format: PixelFormat, pitch: u32, height: u32) -> usize {
 /// is called with this exact constant to keep the two in agreement; see
 /// `Encoder::new`'s `init.frameRateNum` assignment, the only other reader.
 const NVENC_FRAME_RATE_HINT: u32 = 60;
-use crate::nvenc_policy::{output_drain_policy, rate_control_sizing};
 #[cfg(test)]
-use crate::nvenc_policy::{vbv_buffer_frames, RateControlSizing};
+use crate::nvenc_policy::RateControlSizing;
+use crate::nvenc_policy::{output_drain_policy, rate_control_sizing, vbv_buffer_frames};
+use arcen_media::video::MotionPriority;
 
 /// `NvEncReconfigureEncoder` cannot change bit depth or chroma format — the
 /// NVIDIA Video Codec SDK Programming Guide is explicit that both are fixed
@@ -1131,6 +1773,7 @@ impl Encoder {
         codec: &str,
         color: crate::ColorSpec,
         intent: EncodeIntent,
+        priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
         // `wide_source` is true when the capture delivers FP16 scRGB rather
         // than 8-bit BGRA. It drives the staging texture format, which
@@ -1507,6 +2150,7 @@ impl Encoder {
                 NVENC_FRAME_RATE_HINT,
                 rc_chroma,
                 rc_depth,
+                priority,
                 intent,
             );
             preset.presetCfg.rcParams.averageBitRate = sizing.average_bitrate_bps;
@@ -1594,9 +2238,9 @@ impl Encoder {
             QpMapGeometry::for_codec(nvenc_codec.media_codec()),
         ));
 
-        // 6. Build the preset/cap-sized pipeline slots (NVENC-allocated input buffer +
-        // output bitstream — see the module doc for why this replaced the
-        // registered-D3D11-texture path).
+        // 6. Build the preset/cap-sized pipeline slots. The 8-bit contract
+        // uses registered D3D11 textures; fidelity contracts currently use
+        // NVENC-owned host buffers as an explicit CPU fallback.
         let drain_policy = output_drain_policy(
             intent,
             preset.presetCfg.frameIntervalP,
@@ -1617,37 +2261,184 @@ impl Encoder {
             drain_policy.max_inflight(),
             drain_policy.slot_count(),
         ));
-        for i in 0..drain_policy.slot_count() {
-            resources.slots.push(
-                Self::make_slot(resources.fl, resources.enc, width, height, format)
-                    .map_err(|error| NvencInitError::fatal(format!("slot {i}: {error}")))?,
-            );
-        }
-        // Learn the pitch NVENC actually gives this format/width/height (it
-        // may pad rows for alignment) and zero-fill every slot so a
-        // `frame_policy::FrameAction::SubmitBlank` before the first real
-        // `stage()` call encodes deterministic black instead of whatever the
-        // driver happened to allocate. All slots share identical creation
-        // parameters, so every one is expected to report the same pitch;
-        // `zero_slot` returns it and this loop asserts they agree rather than
-        // silently trusting it.
-        let mut locked_pitch: Option<u32> = None;
-        for slot in &resources.slots {
-            let pitch = Self::zero_slot(resources.fl, resources.enc, slot, format, height)
-                .map_err(NvencInitError::fatal)?;
-            match locked_pitch {
-                None => locked_pitch = Some(pitch),
-                Some(expected) if expected != pitch => {
-                    return Err(NvencInitError::fatal(format!(
-                        "NVENC reported different pitch ({pitch}) for identically-created \
-                         input buffers (expected {expected})"
-                    )));
+        let mut wide_gpu = if format == PixelFormat::Yuv444_10 {
+            match wide_transform {
+                Some(transform)
+                    if std::env::var_os("ARCEN_CONVERSION_BACKEND").as_deref()
+                        != Some(std::ffi::OsStr::new("cpu")) =>
+                {
+                    match WideGpuConverter::new(
+                        device,
+                        width,
+                        height,
+                        transform,
+                        color.range,
+                        GpuSlotFormat::Yuv444P16,
+                    ) {
+                        Ok(converter) => {
+                            crate::log("wide FP16 conversion backend: gpu shader");
+                            Some(converter)
+                        }
+                        Err(error) => {
+                            crate::log(&format!(
+                                "wide FP16 conversion backend: cpu fallback ({error})"
+                            ));
+                            None
+                        }
+                    }
                 }
-                Some(_) => {}
+                Some(_) => {
+                    crate::log("wide FP16 conversion backend: cpu fallback (forced)");
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut gpu_slot = match format {
+            PixelFormat::Bgra8 => Some(GpuSlotFormat::Bgra8),
+            PixelFormat::Yuv444_10 if wide_gpu.is_some() => Some(GpuSlotFormat::Yuv444P16),
+            PixelFormat::Nv12
+            | PixelFormat::P010
+            | PixelFormat::Yuv444_8
+            | PixelFormat::Yuv444_10 => None,
+        };
+        let mut gpu_slot_error = None;
+        for i in 0..drain_policy.slot_count() {
+            match Self::make_slot(
+                resources.fl,
+                resources.enc,
+                device,
+                width,
+                height,
+                format,
+                gpu_slot,
+            ) {
+                Ok(slot) => resources.slots.push(slot),
+                Err(error) if gpu_slot == Some(GpuSlotFormat::Yuv444P16) => {
+                    gpu_slot_error = Some(format!("slot {i}: {error}"));
+                    break;
+                }
+                Err(error) => return Err(NvencInitError::fatal(format!("slot {i}: {error}"))),
             }
         }
-        let locked_pitch = locked_pitch.expect("output drain policy always allocates a slot");
-        let frame_bytes = frame_bytes(format, locked_pitch, height);
+        if let Some(error) = gpu_slot_error {
+            crate::log(&format!(
+                "wide FP16 D3D11 YUV444_10BIT registration failed: {error}; trying ABGR10"
+            ));
+            cleanup_slots(resources.fl, resources.enc, &mut resources.slots);
+            match wide_transform
+                .map(|transform| {
+                    WideGpuConverter::new(
+                        device,
+                        width,
+                        height,
+                        transform,
+                        color.range,
+                        GpuSlotFormat::Abgr10,
+                    )
+                })
+                .transpose()
+            {
+                Ok(Some(converter)) => {
+                    wide_gpu = Some(converter);
+                    gpu_slot = Some(GpuSlotFormat::Abgr10);
+                    for i in 0..drain_policy.slot_count() {
+                        resources.slots.push(
+                            Self::make_slot(
+                                resources.fl,
+                                resources.enc,
+                                device,
+                                width,
+                                height,
+                                format,
+                                gpu_slot,
+                            )
+                            .map_err(|error| {
+                                NvencInitError::fatal(format!("ABGR10 slot {i}: {error}"))
+                            })?,
+                        );
+                    }
+                    crate::log("wide FP16 conversion backend: gpu shader -> ABGR10");
+                }
+                Ok(None) | Err(_) => {
+                    wide_gpu = None;
+                    gpu_slot = None;
+                    crate::log("wide FP16 conversion backend: cpu fallback");
+                    for i in 0..drain_policy.slot_count() {
+                        resources.slots.push(
+                            Self::make_slot(
+                                resources.fl,
+                                resources.enc,
+                                device,
+                                width,
+                                height,
+                                format,
+                                None,
+                            )
+                            .map_err(|error| NvencInitError::fatal(format!("slot {i}: {error}")))?,
+                        );
+                    }
+                }
+            }
+        }
+        let (locked_pitch, frame_bytes, latest_tex, staging_tex) = if let Some(gpu_slot) = gpu_slot
+        {
+            for slot in &resources.slots {
+                if let SlotInput::D3D11Texture { texture, .. } = &slot.input {
+                    Self::clear_gpu_texture(device, context, texture, gpu_slot, width, height)
+                        .map_err(NvencInitError::fatal)?;
+                }
+            }
+            let latest = Self::make_gpu_input_texture(device, width, height, gpu_slot)
+                .map_err(NvencInitError::fatal)?;
+            Self::clear_gpu_texture(device, context, &latest, gpu_slot, width, height)
+                .map_err(NvencInitError::fatal)?;
+            let pitch = width
+                .checked_mul(match gpu_slot {
+                    GpuSlotFormat::Bgra8 => 4,
+                    GpuSlotFormat::Yuv444P16 => 2,
+                    GpuSlotFormat::Abgr10 => 4,
+                })
+                .ok_or_else(|| NvencInitError::fatal("BGRA pitch overflow"))?;
+            (
+                pitch,
+                frame_bytes(format, pitch, height),
+                Some(latest),
+                None,
+            )
+        } else {
+            // Learn the pitch NVENC actually gives this format/width/height (it
+            // may pad rows for alignment) and zero-fill every slot so a
+            // `frame_policy::FrameAction::SubmitBlank` before the first real
+            // `stage()` call encodes deterministic black instead of whatever the
+            // driver happened to allocate.
+            let mut locked_pitch: Option<u32> = None;
+            for slot in &resources.slots {
+                let pitch = Self::zero_slot(resources.fl, resources.enc, slot, format, height)
+                    .map_err(NvencInitError::fatal)?;
+                match locked_pitch {
+                    None => locked_pitch = Some(pitch),
+                    Some(expected) if expected != pitch => {
+                        return Err(NvencInitError::fatal(format!(
+                            "NVENC reported different pitch ({pitch}) for identically-created \
+                             input buffers (expected {expected})"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            let locked_pitch = locked_pitch.expect("output drain policy always allocates a slot");
+            let staging = Self::make_staging_texture(device, width, height, wide_source)
+                .map_err(NvencInitError::fatal)?;
+            (
+                locked_pitch,
+                frame_bytes(format, locked_pitch, height),
+                None,
+                Some(staging),
+            )
+        };
         // Up to 16 threads: measured on the Windows lab's 32-vCPU EPYC at
         // 1800x1130, scRGB->PQ takes 27.0 ms with 8 (a 37 fps ceiling, and HDR
         // sessions ran at 22.7 fps), 14.6 ms with 16, and 9.7 ms with 32.
@@ -1667,9 +2458,20 @@ impl Encoder {
             ));
         }
 
-        // CPU-readable copy of the newest desktop image (see module doc).
-        let staging_tex = Self::make_staging_texture(device, width, height, wide_source)
-            .map_err(NvencInitError::fatal)?;
+        crate::log(&format!(
+            "conversion backend: {}",
+            if gpu_slot.is_some() {
+                "gpu"
+            } else {
+                match format {
+                    PixelFormat::Bgra8 => "gpu",
+                    PixelFormat::Nv12
+                    | PixelFormat::P010
+                    | PixelFormat::Yuv444_8
+                    | PixelFormat::Yuv444_10 => "cpu",
+                }
+            }
+        ));
 
         let slots = std::mem::take(&mut resources.slots);
         let slot_count = slots.len();
@@ -1683,6 +2485,8 @@ impl Encoder {
             context: context.clone(),
             slots,
             staging_tex,
+            latest_tex,
+            wide_gpu,
             format,
             transform: color.transform(),
             wide_transform,
@@ -1695,6 +2499,12 @@ impl Encoder {
             inflight: VecDeque::with_capacity(drain_policy.max_inflight()),
             write_idx: 0,
             drain_policy,
+            encode_guid: codec_guid,
+            preset_guid,
+            tuning,
+            reconfig_config: preset.presetCfg,
+            frame_rate: NVENC_FRAME_RATE_HINT,
+            vbv_buffer_frames: vbv_buffer_frames(priority, intent),
             width,
             height,
             i444_conversion_workers,
@@ -1716,6 +2526,19 @@ impl Encoder {
     #[allow(dead_code)]
     pub(crate) const fn pixel_format(&self) -> PixelFormat {
         self.format
+    }
+
+    pub(crate) fn conversion_backend(&self) -> ConversionBackend {
+        if self.wide_gpu.is_some() {
+            return ConversionBackend::Gpu;
+        }
+        match self.format {
+            PixelFormat::Bgra8 => ConversionBackend::Gpu,
+            PixelFormat::Nv12
+            | PixelFormat::P010
+            | PixelFormat::Yuv444_8
+            | PixelFormat::Yuv444_10 => ConversionBackend::Cpu,
+        }
     }
 
     /// Whether `requested` could be applied to this already-running session
@@ -1741,16 +2564,78 @@ impl Encoder {
         ensure_reconfigure_preserves_pixel_format(self.pixel_format(), requested)
     }
 
-    /// Create one slot: an NVENC-allocated system-memory input buffer (see
-    /// the module doc for why this replaced a registered D3D11 texture),
-    /// plus an output bitstream buffer.
+    /// Reconfigures NVENC's nominal frame rate, preserving the current bitrate.
+    pub fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), String> {
+        self.frame_rate = fps.max(1);
+        let bitrate = self.reconfig_config.rcParams.averageBitRate;
+        self.reconfigure_bitrate(u64::from(bitrate))
+    }
+
+    /// Reconfigures NVENC's average/max bitrate and VBV without forcing an IDR.
+    pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
+        let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
+        let vbv = ((f64::from(bitrate) / f64::from(self.frame_rate.max(1)))
+            * self.vbv_buffer_frames)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let mut config = self.reconfig_config;
+        config.rcParams.averageBitRate = bitrate;
+        config.rcParams.maxBitRate = bitrate;
+        config.rcParams.vbvBufferSize = vbv;
+        config.rcParams.vbvInitialDelay = vbv;
+        let mut init: NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
+        init.version = NV_ENC_INITIALIZE_PARAMS_VER;
+        init.encodeGUID = self.encode_guid;
+        init.presetGUID = self.preset_guid;
+        init.encodeWidth = self.width;
+        init.encodeHeight = self.height;
+        init.darWidth = self.width;
+        init.darHeight = self.height;
+        init.frameRateNum = self.frame_rate;
+        init.frameRateDen = 1;
+        init.enablePTD = 1;
+        init.tuningInfo = self.tuning;
+        init.encodeConfig = &mut config;
+        let mut params: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+        params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        params.reInitEncodeParams = init;
+        params.set_resetEncoder(0);
+        params.set_forceIDR(0);
+        let reconfigure = self
+            .fl
+            .nvEncReconfigureEncoder
+            .ok_or_else(|| "missing nvEncReconfigureEncoder".to_owned())?;
+        let status = unsafe { reconfigure(self.enc, &mut params) };
+        if status != NV_ENC_SUCCESS {
+            return Err(format!(
+                "NvEncReconfigureEncoder bitrate={bitrate}: {status:?}"
+            ));
+        }
+        self.reconfig_config = config;
+        crate::log(&format!(
+            "NVENC live bitrate reconfigured: average={bitrate} max={bitrate} vbv_bits={vbv}"
+        ));
+        Ok(())
+    }
+
+    /// Create one slot: either a registered D3D11 texture (8-bit GPU path) or
+    /// an NVENC-allocated system-memory input buffer (CPU fallback), plus an
+    /// output bitstream buffer.
     unsafe fn make_slot(
         fl: &NV_ENCODE_API_FUNCTION_LIST,
         enc: *mut c_void,
+        device: &ID3D11Device,
         width: u32,
         height: u32,
         format: PixelFormat,
+        gpu_slot: Option<GpuSlotFormat>,
     ) -> Result<Slot, String> {
+        if let Some(gpu_slot) = gpu_slot {
+            let input =
+                Self::make_registered_texture_slot(fl, enc, device, width, height, gpu_slot)?;
+            let bitstream = Self::make_bitstream(fl, enc, &input)?;
+            return Ok(Slot { input, bitstream });
+        }
         let mut cb: NV_ENC_CREATE_INPUT_BUFFER = zeroed();
         cb.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
         cb.width = width;
@@ -1762,30 +2647,182 @@ impl Encoder {
             .ok_or_else(|| "missing nvEncCreateInputBuffer".to_string())?;
         nvchk!(create_input(enc, &mut cb), "CreateInputBuffer");
         let input_buffer = cb.inputBuffer;
+        let input = SlotInput::CpuBuffer(input_buffer);
+        let bitstream = Self::make_bitstream(fl, enc, &input)?;
+
+        Ok(Slot { input, bitstream })
+    }
+
+    unsafe fn make_bitstream(
+        fl: &NV_ENCODE_API_FUNCTION_LIST,
+        enc: *mut c_void,
+        input: &SlotInput,
+    ) -> Result<NV_ENC_OUTPUT_PTR, String> {
+        let cleanup_input = |fl: &NV_ENCODE_API_FUNCTION_LIST| match input {
+            SlotInput::CpuBuffer(input_buffer) => {
+                if let Some(destroy) = fl.nvEncDestroyInputBuffer {
+                    let _ = destroy(enc, *input_buffer);
+                }
+            }
+            SlotInput::D3D11Texture { registered, .. } => {
+                if let Some(unregister) = fl.nvEncUnregisterResource {
+                    let _ = unregister(enc, *registered);
+                }
+            }
+        };
 
         let mut bb: NV_ENC_CREATE_BITSTREAM_BUFFER = zeroed();
         bb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         let create_bitstream = match fl.nvEncCreateBitstreamBuffer {
             Some(create_bitstream) => create_bitstream,
             None => {
-                if let Some(destroy) = fl.nvEncDestroyInputBuffer {
-                    let _ = destroy(enc, input_buffer);
-                }
+                cleanup_input(fl);
                 return Err("missing nvEncCreateBitstreamBuffer".to_string());
             }
         };
         let status = create_bitstream(enc, &mut bb);
         if status != NV_ENC_SUCCESS {
-            if let Some(destroy) = fl.nvEncDestroyInputBuffer {
-                let _ = destroy(enc, input_buffer);
-            }
+            cleanup_input(fl);
             return Err(format!("CreateBitstreamBuffer -> NVENC status {status:?}"));
         }
 
-        Ok(Slot {
-            input_buffer,
-            bitstream: bb.bitstreamBuffer,
+        Ok(bb.bitstreamBuffer)
+    }
+
+    unsafe fn make_registered_texture_slot(
+        fl: &NV_ENCODE_API_FUNCTION_LIST,
+        enc: *mut c_void,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        gpu_slot: GpuSlotFormat,
+    ) -> Result<SlotInput, String> {
+        let texture = Self::make_gpu_input_texture(device, width, height, gpu_slot)?;
+        let mut reg: NV_ENC_REGISTER_RESOURCE = zeroed();
+        reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+        reg.width = width;
+        reg.height = match gpu_slot {
+            GpuSlotFormat::Bgra8 => height,
+            GpuSlotFormat::Yuv444P16 => height
+                .checked_mul(3)
+                .ok_or_else(|| "YUV444P16 registered height overflow".to_string())?,
+            GpuSlotFormat::Abgr10 => height,
+        };
+        reg.resourceToRegister = texture.as_raw();
+        let buffer_format = match gpu_slot {
+            GpuSlotFormat::Bgra8 => NV_ENC_BUFFER_FORMAT_ARGB,
+            GpuSlotFormat::Yuv444P16 => NV_ENC_BUFFER_FORMAT_YUV444_10BIT,
+            GpuSlotFormat::Abgr10 => NV_ENC_BUFFER_FORMAT_ABGR10,
+        };
+        reg.bufferFormat = buffer_format;
+        reg.bufferUsage = NV_ENC_INPUT_IMAGE;
+        let register = fl
+            .nvEncRegisterResource
+            .ok_or_else(|| "missing nvEncRegisterResource".to_string())?;
+        nvchk!(register(enc, &mut reg), "RegisterResource");
+        Ok(SlotInput::D3D11Texture {
+            texture,
+            registered: reg.registeredResource,
+            buffer_format,
         })
+    }
+
+    unsafe fn make_gpu_input_texture(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        gpu_slot: GpuSlotFormat,
+    ) -> Result<ID3D11Texture2D, String> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: match gpu_slot {
+                GpuSlotFormat::Bgra8 => height,
+                GpuSlotFormat::Yuv444P16 => height
+                    .checked_mul(3)
+                    .ok_or_else(|| "YUV444P16 texture height overflow".to_string())?,
+                GpuSlotFormat::Abgr10 => height,
+            },
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: match gpu_slot {
+                GpuSlotFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+                GpuSlotFormat::Yuv444P16 => DXGI_FORMAT_R16_UINT,
+                GpuSlotFormat::Abgr10 => DXGI_FORMAT_R10G10B10A2_UNORM,
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: match gpu_slot {
+                GpuSlotFormat::Bgra8 => D3D11_BIND_RENDER_TARGET.0 as u32,
+                GpuSlotFormat::Yuv444P16 => {
+                    (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32
+                }
+                GpuSlotFormat::Abgr10 => D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+            },
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut input_tex: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut input_tex))
+            .map_err(|e| format!("CreateTexture2D(gpu input): {e:?}"))?;
+        input_tex.ok_or_else(|| "input texture null".to_string())
+    }
+
+    unsafe fn clear_gpu_texture(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+        gpu_slot: GpuSlotFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if gpu_slot == GpuSlotFormat::Abgr10 {
+            let mut view: Option<ID3D11UnorderedAccessView> = None;
+            let resource: ID3D11Resource = texture
+                .cast()
+                .map_err(|error| format!("cast ABGR10 clear texture: {error:?}"))?;
+            device
+                .CreateUnorderedAccessView(&resource, None, Some(&mut view))
+                .map_err(|error| format!("CreateUnorderedAccessView(ABGR10 clear): {error:?}"))?;
+            let view = view.ok_or_else(|| "ABGR10 clear UAV null".to_string())?;
+            context.ClearUnorderedAccessViewUint(&view, &[0, 0, 0, 3]);
+            return Ok(());
+        }
+        if gpu_slot == GpuSlotFormat::Yuv444P16 {
+            let samples = usize::try_from(width)
+                .ok()
+                .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+                .ok_or_else(|| "YUV444P16 clear size overflow".to_string())?;
+            let mut frame = vec![0u16; samples * 3];
+            for sample in &mut frame[samples..] {
+                *sample = 0x8000;
+            }
+            let resource: ID3D11Resource = texture
+                .cast()
+                .map_err(|error| format!("cast YUV444P16 clear texture: {error:?}"))?;
+            context.UpdateSubresource(
+                &resource,
+                0,
+                None,
+                frame.as_ptr().cast(),
+                width
+                    .checked_mul(2)
+                    .ok_or_else(|| "YUV444P16 clear pitch overflow".to_string())?,
+                0,
+            );
+            return Ok(());
+        }
+        let mut view: Option<ID3D11RenderTargetView> = None;
+        device
+            .CreateRenderTargetView(texture, None, Some(&mut view))
+            .map_err(|e| format!("CreateRenderTargetView(input): {e:?}"))?;
+        let view = view.ok_or_else(|| "render target view null".to_string())?;
+        context.ClearRenderTargetView(&view, &[0.0, 0.0, 0.0, 1.0]);
+        Ok(())
     }
 
     /// Lock `slot`'s input buffer, zero-fill every plane it holds for
@@ -1801,7 +2838,10 @@ impl Encoder {
     ) -> Result<u32, String> {
         let mut lock: NV_ENC_LOCK_INPUT_BUFFER = zeroed();
         lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-        lock.inputBuffer = slot.input_buffer;
+        let SlotInput::CpuBuffer(input_buffer) = &slot.input else {
+            return Err("zero_slot called for a registered D3D11 texture".to_string());
+        };
+        lock.inputBuffer = *input_buffer;
         let lock_fn = fl
             .nvEncLockInputBuffer
             .ok_or_else(|| "missing nvEncLockInputBuffer".to_string())?;
@@ -1812,7 +2852,7 @@ impl Encoder {
             .nvEncUnlockInputBuffer
             .ok_or_else(|| "missing nvEncUnlockInputBuffer".to_string())?;
         nvchk!(
-            unlock_fn(enc, slot.input_buffer),
+            unlock_fn(enc, *input_buffer),
             "UnlockInputBuffer(zero-init)"
         );
         Ok(lock.pitch)
@@ -1855,35 +2895,77 @@ impl Encoder {
         staging.ok_or_else(|| "staging texture null".to_string())
     }
 
-    /// GPU->GPU copy of the DXGI-acquired desktop frame into our CPU-readable
-    /// staging texture. This is the **only** step that needs the acquired
-    /// surface, so it is the only step that must run before `ReleaseFrame`:
-    /// DXGI recycles the acquired surface on the next `AcquireNextFrame`, but
-    /// the staging texture is ours.
+    /// GPU copy of the acquired desktop frame into the current input slot.
     ///
-    /// Pair every call with [`Self::convert_and_publish_staging`]. Splitting
-    /// them is the point: the CPU `Map`, colour conversion, NVENC write and
-    /// mirror copy that follow used to run inside the `AcquireNextFrame`
-    /// callback, holding Desktop Duplication for the whole ~13 ms rather than
-    /// the ~1 ms the copy needs, which stopped DXGI accumulating the next
-    /// frame while we were still working on this one.
-    ///
-    /// Newest-frame semantics are preserved: a second copy before a publish
-    /// deliberately replaces the pending frame rather than queueing it.
-    ///
-    /// Unlike the old ARGB path this round trip is no longer purely GPU-side
-    /// (see module doc): NVENC must see samples in a format and colour space
-    /// *we* chose, and no in-hardware path other than a CPU round trip is
-    /// available without a custom compute shader — a materially bigger change
-    /// this task deliberately did not make.
+    /// For 8-bit sessions the destination is a registered D3D11 texture that
+    /// NVENC reads directly. For fidelity sessions it is the explicit
+    /// CPU-readable fallback staging texture consumed by
+    /// [`Self::convert_and_publish_staging`].
     pub unsafe fn copy_acquired_texture(
         &mut self,
         acquired: &ID3D11Texture2D,
     ) -> Result<(), String> {
-        // A failed copy leaves the staging texture holding an indeterminate
-        // mixture of the old and new frames, so drop the claim first and only
-        // re-establish it once the copy has actually been issued.
         self.staged_capture.copy_failed();
+        if self.format == PixelFormat::Bgra8 {
+            let latest = self
+                .latest_tex
+                .as_ref()
+                .ok_or_else(|| "BGRA GPU path has no latest texture".to_string())?;
+            let SlotInput::D3D11Texture { texture, .. } = &self.slots[self.write_idx].input else {
+                return Err("BGRA GPU path has no registered D3D11 slot".to_string());
+            };
+            let copy_started = Instant::now();
+            let src: ID3D11Resource = acquired.cast().map_err(|e| format!("cast src: {e:?}"))?;
+            let latest_dst: ID3D11Resource =
+                latest.cast().map_err(|e| format!("cast latest: {e:?}"))?;
+            let dst: ID3D11Resource = texture.cast().map_err(|e| format!("cast dst: {e:?}"))?;
+            self.context.CopyResource(&latest_dst, &src);
+            self.context.CopyResource(&dst, &latest_dst);
+            self.last_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
+            self.last_conversion_ms = 0.0;
+            self.last_mirror_ms = 0.0;
+            self.last_stage_timing = StageTiming {
+                copy_ms: self.last_copy_ms,
+                readback_ms: 0.0,
+                conversion_ms: 0.0,
+                mirror_ms: 0.0,
+            };
+            self.generations.published(self.write_idx);
+            return Ok(());
+        }
+        if let Some(converter) = self.wide_gpu.as_ref() {
+            let latest = self
+                .latest_tex
+                .as_ref()
+                .ok_or_else(|| "wide GPU path has no latest texture".to_string())?;
+            let SlotInput::D3D11Texture { texture, .. } = &self.slots[self.write_idx].input else {
+                return Err("wide GPU path has no registered D3D11 slot".to_string());
+            };
+            let convert_started = Instant::now();
+            converter.convert(&self.context, acquired, texture)?;
+            let latest_dst: ID3D11Resource = latest
+                .cast()
+                .map_err(|e| format!("cast wide latest: {e:?}"))?;
+            let slot_src: ID3D11Resource = texture
+                .cast()
+                .map_err(|e| format!("cast wide slot: {e:?}"))?;
+            self.context.CopyResource(&latest_dst, &slot_src);
+            self.last_copy_ms = 0.0;
+            self.last_conversion_ms = convert_started.elapsed().as_secs_f64() * 1000.0;
+            self.last_mirror_ms = 0.0;
+            self.last_stage_timing = StageTiming {
+                copy_ms: 0.0,
+                readback_ms: 0.0,
+                conversion_ms: self.last_conversion_ms,
+                mirror_ms: 0.0,
+            };
+            self.generations.published(self.write_idx);
+            return Ok(());
+        }
+        let staging_tex = self
+            .staging_tex
+            .as_ref()
+            .ok_or_else(|| "CPU conversion path has no staging texture".to_string())?;
         // `CopyResource` requires identical formats. A wide capture pool
         // copied into an 8-bit staging texture is not a slow path or a lossy
         // one -- it is undefined, and the failure would surface as a corrupt
@@ -1892,7 +2974,7 @@ impl Encoder {
             let mut source_desc = D3D11_TEXTURE2D_DESC::default();
             acquired.GetDesc(&mut source_desc);
             let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
-            self.staging_tex.GetDesc(&mut staging_desc);
+            staging_tex.GetDesc(&mut staging_desc);
             if source_desc.Format != staging_desc.Format {
                 return Err(format!(
                     "capture format {:?} does not match staging format {:?}; \
@@ -1903,8 +2985,7 @@ impl Encoder {
         }
         let copy_started = Instant::now();
         let src: ID3D11Resource = acquired.cast().map_err(|e| format!("cast src: {e:?}"))?;
-        let dst: ID3D11Resource = self
-            .staging_tex
+        let dst: ID3D11Resource = staging_tex
             .cast()
             .map_err(|e| format!("cast staging: {e:?}"))?;
         self.context.CopyResource(&dst, &src);
@@ -1937,9 +3018,16 @@ impl Encoder {
     /// stale desktop presented as a fresh capture. That is refused explicitly
     /// rather than tolerated.
     pub unsafe fn convert_and_publish_staging(&mut self) -> Result<(), String> {
+        if self.format == PixelFormat::Bgra8 || self.wide_gpu.is_some() {
+            return Ok(());
+        }
         if !self.staged_capture.take() {
             return Err("publish requested with no copied frame staged".to_string());
         }
+        let staging_tex = self
+            .staging_tex
+            .as_ref()
+            .ok_or_else(|| "CPU conversion path has no staging texture".to_string())?;
         // Every conversion below reads the staging texture as 8-bit BGRA. A
         // wide staging texture holds half-floats, and reading those as bytes
         // produces a corrupt desktop rather than a wrong-but-plausible one.
@@ -1948,7 +3036,7 @@ impl Encoder {
         // rather than interpreting half-floats as bytes.
         let wide_staging = {
             let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
-            self.staging_tex.GetDesc(&mut staging_desc);
+            staging_tex.GetDesc(&mut staging_desc);
             staging_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
         };
         if wide_staging && self.format != PixelFormat::Yuv444_10 {
@@ -1962,8 +3050,7 @@ impl Encoder {
             ));
         }
         let map_started = Instant::now();
-        let dst: ID3D11Resource = self
-            .staging_tex
+        let dst: ID3D11Resource = staging_tex
             .cast()
             .map_err(|e| format!("cast staging: {e:?}"))?;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -2056,9 +3143,10 @@ impl Encoder {
             .ok_or_else(|| "FP16 capture has no negotiated scRGB transform".to_string())?;
         let slot = self.write_idx;
         self.generations.invalidated(slot);
+        let input_buffer = self.cpu_input_buffer(slot)?;
         let mut lock: NV_ENC_LOCK_INPUT_BUFFER = zeroed();
         lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-        lock.inputBuffer = self.slots[slot].input_buffer;
+        lock.inputBuffer = input_buffer;
         let lock_fn = self
             .fl
             .nvEncLockInputBuffer
@@ -2101,7 +3189,7 @@ impl Encoder {
             .fl
             .nvEncUnlockInputBuffer
             .ok_or_else(|| "missing nvEncUnlockInputBuffer".to_string())?;
-        let unlock_status = unlock_fn(self.enc, self.slots[slot].input_buffer);
+        let unlock_status = unlock_fn(self.enc, input_buffer);
         write_result?;
         if unlock_status != NV_ENC_SUCCESS {
             return Err(format!(
@@ -2115,9 +3203,10 @@ impl Encoder {
     unsafe fn publish_bgra(&mut self, bgra: BgraFrame<'_>) -> Result<(), String> {
         let slot = self.write_idx;
         self.generations.invalidated(slot);
+        let input_buffer = self.cpu_input_buffer(slot)?;
         let mut lock: NV_ENC_LOCK_INPUT_BUFFER = zeroed();
         lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-        lock.inputBuffer = self.slots[slot].input_buffer;
+        lock.inputBuffer = input_buffer;
         let lock_fn = self
             .fl
             .nvEncLockInputBuffer
@@ -2152,7 +3241,7 @@ impl Encoder {
             .fl
             .nvEncUnlockInputBuffer
             .ok_or_else(|| "missing nvEncUnlockInputBuffer".to_string())?;
-        let unlock_status = unlock_fn(self.enc, self.slots[slot].input_buffer);
+        let unlock_status = unlock_fn(self.enc, input_buffer);
         write_result?;
         if unlock_status != NV_ENC_SUCCESS {
             return Err(format!(
@@ -2178,6 +3267,16 @@ impl Encoder {
         }
     }
 
+    fn cpu_input_buffer(&self, slot: usize) -> Result<NV_ENC_INPUT_PTR, String> {
+        match self.slots.get(slot).map(|slot| &slot.input) {
+            Some(SlotInput::CpuBuffer(input_buffer)) => Ok(*input_buffer),
+            Some(SlotInput::D3D11Texture { .. }) => {
+                Err("CPU buffer operation requested for registered D3D11 slot".to_string())
+            }
+            None => Err(format!("slot {slot} is out of range")),
+        }
+    }
+
     /// Republish the last frame `stage()` successfully converted into the
     /// current ring slot, for an idle-frame submission when no new capture
     /// arrived. Without this, the ring cycles through stale slot contents and
@@ -2199,16 +3298,31 @@ impl Encoder {
         }
         let slot = self.write_idx;
         debug_assert!(
-            !self.inflight.contains(&slot),
+            !self.inflight.iter().any(|inflight| inflight.slot == slot),
             "restage targeted an in-flight slot"
         );
         if !self.generations.needs_copy(slot) {
             return Ok(RestageOutcome::AlreadyCurrent);
         }
         self.generations.invalidated(slot);
+        if self.latest_tex.is_some() {
+            let latest = self
+                .latest_tex
+                .as_ref()
+                .ok_or_else(|| "GPU path has no latest texture".to_string())?;
+            let SlotInput::D3D11Texture { texture, .. } = &self.slots[slot].input else {
+                return Err("GPU path has no registered D3D11 slot".to_string());
+            };
+            let src: ID3D11Resource = latest.cast().map_err(|e| format!("cast latest: {e:?}"))?;
+            let dst: ID3D11Resource = texture.cast().map_err(|e| format!("cast dst: {e:?}"))?;
+            self.context.CopyResource(&dst, &src);
+            self.generations.copied(slot);
+            return Ok(RestageOutcome::Copied);
+        }
+        let input_buffer = self.cpu_input_buffer(slot)?;
         let mut lock: NV_ENC_LOCK_INPUT_BUFFER = zeroed();
         lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-        lock.inputBuffer = self.slots[slot].input_buffer;
+        lock.inputBuffer = input_buffer;
         let lock_fn = self
             .fl
             .nvEncLockInputBuffer
@@ -2227,7 +3341,7 @@ impl Encoder {
             .fl
             .nvEncUnlockInputBuffer
             .ok_or_else(|| "missing nvEncUnlockInputBuffer".to_string())?;
-        let unlock_status = unlock_fn(self.enc, self.slots[slot].input_buffer);
+        let unlock_status = unlock_fn(self.enc, input_buffer);
         copy_result?;
         if unlock_status != NV_ENC_SUCCESS {
             return Err(format!(
@@ -2308,7 +3422,7 @@ impl Encoder {
             .iter()
             .enumerate()
             .find_map(|(slot, _)| {
-                (!self.inflight.iter().any(|inflight| *inflight == slot)).then_some(slot)
+                (!self.inflight.iter().any(|inflight| inflight.slot == slot)).then_some(slot)
             })
             .expect("output drain policy always reserves one writable slot")
     }
@@ -2317,15 +3431,19 @@ impl Encoder {
     /// The synchronous path deliberately never sets
     /// `doNotWait`; older Linux drivers can crash on that mode.
     unsafe fn drain_oldest(&mut self) -> Result<Option<Vec<u8>>, String> {
-        let done_slot = *self
+        let done = self
             .inflight
             .front()
             .ok_or_else(|| "NVENC drain requested with no in-flight slot".to_string())?;
+        let done_slot = done.slot;
         let mut lock: NV_ENC_LOCK_BITSTREAM = zeroed();
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
         lock.outputBitstream = self.slots[done_slot].bitstream;
         let lock_status = (self.fl.nvEncLockBitstream.unwrap())(self.enc, &mut lock);
         if lock_status != NV_ENC_SUCCESS {
+            if let Some(mapped) = done.mapped_input {
+                let _ = (self.fl.nvEncUnmapInputResource.unwrap())(self.enc, mapped);
+            }
             return Err(format!("LockBitstream -> NVENC status {lock_status:?}"));
         }
 
@@ -2334,11 +3452,19 @@ impl Encoder {
         let data = std::slice::from_raw_parts(ptr, len).to_vec();
         let unlock_status =
             (self.fl.nvEncUnlockBitstream.unwrap())(self.enc, self.slots[done_slot].bitstream);
+        let unmap_status = done
+            .mapped_input
+            .map(|mapped| (self.fl.nvEncUnmapInputResource.unwrap())(self.enc, mapped));
         if unlock_status != NV_ENC_SUCCESS {
             return Err(format!("UnlockBitstream -> NVENC status {unlock_status:?}"));
         }
+        if let Some(status) = unmap_status {
+            if status != NV_ENC_SUCCESS {
+                return Err(format!("UnmapInputResource -> NVENC status {status:?}"));
+            }
+        }
         let completed = self.inflight.pop_front();
-        debug_assert_eq!(completed, Some(done_slot));
+        debug_assert_eq!(completed.map(|inflight| inflight.slot), Some(done_slot));
         Ok(Some(data))
     }
 
@@ -2364,9 +3490,26 @@ impl Encoder {
         pic.version = NV_ENC_PIC_PARAMS_VER;
         pic.inputWidth = self.width;
         pic.inputHeight = self.height;
-        pic.inputBuffer = self.slots[slot].input_buffer;
+        let mut mapped_input = None;
+        pic.inputBuffer = match &self.slots[slot].input {
+            SlotInput::CpuBuffer(input_buffer) => *input_buffer,
+            SlotInput::D3D11Texture { registered, .. } => {
+                let mut map: NV_ENC_MAP_INPUT_RESOURCE = zeroed();
+                map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+                map.registeredResource = *registered;
+                nvchk!(
+                    (self.fl.nvEncMapInputResource.unwrap())(self.enc, &mut map),
+                    "MapInputResource"
+                );
+                mapped_input = Some(map.mappedResource);
+                map.mappedResource
+            }
+        };
         pic.outputBitstream = self.slots[slot].bitstream;
-        pic.bufferFmt = self.format.buffer_format();
+        pic.bufferFmt = match &self.slots[slot].input {
+            SlotInput::CpuBuffer(_) => self.format.buffer_format(),
+            SlotInput::D3D11Texture { buffer_format, .. } => *buffer_format,
+        };
         pic.pictureStruct = NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
         let expected_entries = self.qp_map_entries;
         if let Some(state) = self.qp_state.as_mut() {
@@ -2413,10 +3556,13 @@ impl Encoder {
         }
         let enc_status = (self.fl.nvEncEncodePicture.unwrap())(self.enc, &mut pic);
         if enc_status != NV_ENC_SUCCESS && enc_status != NV_ENC_ERR_NEED_MORE_INPUT {
+            if let Some(mapped) = mapped_input {
+                let _ = (self.fl.nvEncUnmapInputResource.unwrap())(self.enc, mapped);
+            }
             return Err(format!("EncodePicture -> {enc_status:?}"));
         }
 
-        self.inflight.push_back(slot);
+        self.inflight.push_back(InflightSlot { slot, mapped_input });
         // Drain the moment the encoder says a frame is ready, instead of
         // always filling the window first.
         //
@@ -2491,6 +3637,9 @@ unsafe fn write_locked_from_bgra(
     let (width, height) = dimensions;
     let pitch = pitch as usize;
     match format {
+        PixelFormat::Bgra8 => {
+            Err("BGRA8 uses the registered GPU path, not CPU conversion".to_string())
+        }
         PixelFormat::Nv12 => {
             let luma_len = pitch * height as usize;
             let uv_len = pitch * chroma_rows(format, height);
@@ -2962,7 +4111,7 @@ mod init_error_tests {
                 &functions,
                 encoder,
                 2usize as NV_ENC_OUTPUT_PTR,
-                3usize as NV_ENC_INPUT_PTR,
+                SlotInput::CpuBuffer(3usize as NV_ENC_INPUT_PTR),
             );
             destroy_encoder(&functions, &mut encoder);
             destroy_encoder(&functions, &mut encoder);
@@ -3202,7 +4351,7 @@ mod pixel_format_tests {
         for codec in [NvencCodec::H264, NvencCodec::Hevc] {
             assert_eq!(
                 resolve_pixel_format(codec, color(ChromaSubsampling::Yuv420, BitDepth::Eight)),
-                Ok(PixelFormat::Nv12),
+                Ok(PixelFormat::Bgra8),
                 "{codec:?} 4:2:0 8-bit"
             );
         }
@@ -3236,8 +4385,8 @@ mod pixel_format_tests {
                 NvencCodec::Av1,
                 color(ChromaSubsampling::Yuv420, BitDepth::Eight)
             ),
-            Ok(PixelFormat::Nv12),
-            "AV1 Main 4:2:0 8-bit reuses the same Nv12 surface as H.264/HEVC"
+            Ok(PixelFormat::Bgra8),
+            "AV1 Main 4:2:0 8-bit uses the registered BGRA GPU path"
         );
         assert_eq!(
             resolve_pixel_format(
@@ -4135,7 +5284,15 @@ mod rate_control_tests {
         chroma: ChromaSubsampling,
         depth: BitDepth,
     ) -> RateControlSizing {
-        rate_control_sizing(width, height, fps, chroma, depth, EncodeIntent::Interactive)
+        rate_control_sizing(
+            width,
+            height,
+            fps,
+            chroma,
+            depth,
+            MotionPriority::Detail,
+            EncodeIntent::Interactive,
+        )
     }
 
     /// The grading intent must buy a bigger VBV buffer, and nothing else.
@@ -4153,6 +5310,7 @@ mod rate_control_tests {
             args.2,
             args.3,
             args.4,
+            MotionPriority::Detail,
             EncodeIntent::Interactive,
         );
         let quality = rate_control_sizing(
@@ -4161,6 +5319,7 @@ mod rate_control_tests {
             args.2,
             args.3,
             args.4,
+            MotionPriority::Detail,
             EncodeIntent::Quality,
         );
 
@@ -4177,6 +5336,19 @@ mod rate_control_tests {
             "grading must get a larger smoothing buffer: {} vs {}",
             quality.vbv_buffer_size_bits,
             interactive.vbv_buffer_size_bits,
+        );
+        let motion = rate_control_sizing(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            MotionPriority::Motion,
+            EncodeIntent::Interactive,
+        );
+        assert!(
+            motion.vbv_buffer_size_bits < interactive.vbv_buffer_size_bits,
+            "motion priority must tighten the buffer below detail priority"
         );
     }
 
@@ -4228,7 +5400,7 @@ mod rate_control_tests {
     fn vbv_buffer_is_a_couple_of_frames_of_the_average_bitrate() {
         let sizing = sizing(1920, 1080, 60, ChromaSubsampling::Yuv420, BitDepth::Eight);
         let expected_bits = (f64::from(sizing.average_bitrate_bps) / 60.0
-            * vbv_buffer_frames(EncodeIntent::Interactive))
+            * vbv_buffer_frames(MotionPriority::Detail, EncodeIntent::Interactive))
         .round() as u32;
         assert_eq!(sizing.vbv_buffer_size_bits, expected_bits);
         // Small relative to a whole second of bitrate — this is a low-latency

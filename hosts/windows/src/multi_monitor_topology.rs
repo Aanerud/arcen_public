@@ -639,6 +639,9 @@ pub struct WindowsMonitorPlan {
     pub refresh_hz: u32,
     pub rotation: Rotation,
     pub primary: bool,
+    /// Deck display colour contract for the physical output this monitor is
+    /// mapped onto, when the Deck reported one.
+    pub color: Option<arcen_media::display_color::DisplayColor>,
 }
 
 /// Complete Windows physical topology plan for one committed
@@ -855,6 +858,10 @@ pub fn plan_current_topology(
             refresh_hz: output.current_refresh_hz.max(1),
             rotation: monitor.rotation,
             primary: monitor.primary,
+            color: monitor
+                .color
+                .as_ref()
+                .map(arcen_media::display_color::DisplayColor::from_msg),
         });
     }
     let bounds = signed_desktop_bounds(rects)?;
@@ -1045,6 +1052,11 @@ pub fn plan_topology(
             refresh_hz,
             rotation,
             primary: applied_monitor.monitor().primary,
+            color: applied_monitor
+                .monitor()
+                .color
+                .as_ref()
+                .map(arcen_media::display_color::DisplayColor::from_msg),
         });
     }
 
@@ -1207,6 +1219,25 @@ mod tests {
             color: None,
         };
         RequestedMonitor::new(monitor, logical_width, logical_height).expect("requested monitor")
+    }
+
+    fn monitor_scaled_with_color(
+        id: &str,
+        position: (i32, i32),
+        size_px: (u32, u32),
+        color: arcen_protocol::messages::DisplayColorMsg,
+    ) -> RequestedMonitor {
+        let mut monitor = monitor_scaled(
+            id,
+            position,
+            size_px,
+            size_px,
+            1.0,
+            true,
+            Rotation::Degrees0,
+        );
+        monitor.monitor.color = Some(color);
+        monitor
     }
 
     fn horizontal_separation_px(left: &WindowsMonitorPlan, right: &WindowsMonitorPlan) -> i64 {
@@ -1804,6 +1835,32 @@ mod tests {
         let primary = plan.primary();
         assert_eq!(primary.client_display_id, "b");
         assert_eq!(primary.target_id, 0);
+    }
+
+    #[test]
+    fn plan_carries_client_display_color_to_each_physical_monitor() {
+        let inventory = PhysicalOutputInventory::new(vec![output(luid(1), 0, 3_600, 2_260)])
+            .expect("inventory");
+        let color = arcen_protocol::messages::DisplayColorMsg {
+            gamut: arcen_protocol::messages::DisplayGamutMsg::DisplayP3,
+            hdr_headroom: 16.0,
+            ..Default::default()
+        };
+        let requested = RequestedMonitorTopology::new(vec![monitor_scaled_with_color(
+            "xdr",
+            (0, 0),
+            (3_600, 2_260),
+            color,
+        )])
+        .expect("requested topology");
+        let plan = plan_topology(&requested, generation(), &inventory).expect("plan");
+        let planned_color = plan.monitors[0].color.expect("display color");
+        assert_eq!(
+            planned_color.gamut(),
+            arcen_media::ColorPrimaries::DisplayP3
+        );
+        assert!(planned_color.is_hdr());
+        assert_eq!(planned_color.hdr_headroom(), Some(16.0));
     }
 
     #[test]

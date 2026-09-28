@@ -22,7 +22,7 @@ Two bundles are signed, with separate identifiers:
 | Bundle | Identifier | Installed at |
 | --- | --- | --- |
 | Arcen Pier | `pier.arcen.tech` | `/Applications/Arcen Pier.app` |
-| Arcen Agent Helper | `pier.arcen.tech.agent` | `/Applications/Arcen Agent Helper.app` |
+| Arcen Agent Helper | `pier.arcen.tech.agent` | `/Library/PrivilegedHelperTools/Arcen Agent Helper.app` |
 
 The helper is a **sibling**, not nested inside the Pier bundle. This is not
 tidiness. TCC attributes a permission request to the bundle it can find by

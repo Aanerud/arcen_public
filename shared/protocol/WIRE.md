@@ -683,6 +683,7 @@ remains 3. The current product carries these messages over direct QUIC.
 | `AuthResult` | `resume_window_secs: Option<u32>` | Accompanies an issued grant and reports the host-selected post-loss reconnect window `W` (`1..=7200`). The signed claim lifetime is bounded to `2W`; Deck does not start its `W` deadline until transport loss. |
 | `AuthResult` | `resumed: bool = false` | True only when the connection attached to the existing native session. |
 | `AuthResult` | `error_code: Option<ResumeErrorCode>` | Machine-readable resume failure. Successful results omit it. |
+| `AuthResult` | `session_setup_failed: bool = false` | On a failure, true when the credentials were accepted but the host could not start the session (display, encoder or session agent). The Deck reports it as a host problem, not as a refused sign-in. Omitted when false. |
 
 An in-band refresh has the exact shape `type="auth_result"`, `success=true`, a
 bounded `message`, nonempty `resume_grant`, `resume_window_secs` in
@@ -749,6 +750,11 @@ legacy `common/session_fsm.py` contract.
 
 ## Changelog
 
+- **2026-09-28 — `AuthResult.session_setup_failed`** — Additive, defaulted
+  `bool`, omitted when false; `wire::PROTOCOL_VERSION` unchanged. A Windows
+  Pier sets it on every refusal after the credentials were verified, so a
+  failed display, encoder or session agent no longer reaches the Deck as
+  "authentication failed". Older peers ignore it and see the same message.
 - **2026-08-09 — input-v4 region-input-v1 cutover** — Bump
   `input_protocol_version` 3 -> 4 (`wire::PROTOCOL_VERSION` remains 3) and add
   additive `InputCapabilitiesMsg.region_input`. Match My Layout requires both
