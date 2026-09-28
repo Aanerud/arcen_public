@@ -107,6 +107,7 @@ whole machine. The alternatives are worse:
 | Administrator password | Installing into `/Library` and `/Applications` | Every install |
 | "Installer would like to administer your computer" | Creating the `_arcen` account. macOS guards changes to local accounts behind this approval (the TCC service `SystemPolicySysAdminFiles`). | First install on a Mac only; an upgrade finds the account and creates nothing |
 | Screen & System Audio Recording, Accessibility for **Arcen Agent Helper** | The agent's capture and input | Once per person who will be served |
+| System Audio Recording for **Arcen Agent Helper** | Core Audio process taps, which carry host audio and silence the host's speakers during a session. A separate approval from screen recording. The helper asks when it starts, so the prompt appears while the installer is still at the Mac. | Once per person who will be served. Until it is allowed, a host whose `audio.local_playback` is `muted` (the default) refuses sessions, and the Deck is told why |
 | Screen capture at the login window | Serving the login window before anyone signs in | The first time a Deck connects there |
 | "Background Items Added" notification | macOS reports new launchd jobs. Both definitions carry `AssociatedBundleIdentifiers = pier.arcen.tech`, so System Settings attributes them to Arcen Pier (`hosts/macos/src/service.rs`) | Once, after install |
 
