@@ -231,6 +231,9 @@ pub fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> Result<MaterialSta
         certificate_valid,
         expiring_or_expired,
         stale_staging_present: paths.has_stale_staging(),
+        self_signed: certificate_bytes
+            .as_ref()
+            .is_some_and(|bytes| arcen_transport::cert_marker::is_self_signed_pem(bytes)),
     })
 }
 
@@ -819,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn material_we_did_not_issue_is_refused_until_adopted() {
+    fn an_unmarked_self_signed_pair_is_taken_over_without_asking() {
         let dir = temp_dir("foreign");
         provision(
             &dir,
@@ -836,21 +839,13 @@ mod tests {
         let state = inspect(&paths, NOW).expect("inspect");
         assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));
 
-        let refused = provision(
-            &dir,
-            ProvisioningRequest::Ensure,
-            &["pier.example".to_owned()],
-            NOW,
-        );
-        assert!(matches!(
-            refused,
-            Err(CertError::Refused(ProvisioningRefusal::ForeignMaterial))
-        ));
+        assert!(state.self_signed);
 
+        // An ordinary install takes it over; no adoption flag is needed.
         let key_before = fs::read(&paths.key).expect("key");
         let adopted = provision(
             &dir,
-            ProvisioningRequest::AdoptLegacy,
+            ProvisioningRequest::Ensure,
             &["pier.example".to_owned()],
             NOW,
         )

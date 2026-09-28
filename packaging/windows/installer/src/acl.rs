@@ -227,9 +227,41 @@ pub(crate) fn assert_acl_sddl(path: &str, sddl: &str, acl_class: AclClass) -> Re
     }
 }
 
+/// Trustees present in `sddl` that `acl_class` does not allow.
+///
+/// # Errors
+///
+/// Returns a message when the DACL cannot be parsed.
+pub(crate) fn unexpected_trustees(sddl: &str, acl_class: AclClass) -> Result<Vec<String>, String> {
+    let dacl = parse_dacl(sddl)?;
+    let expected = acl_class.expected_sids();
+    Ok(dacl
+        .sids
+        .into_iter()
+        .filter(|sid| !expected.contains(sid))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_user_explorer_added_is_found_and_nothing_else() {
+        // Exactly what an operator's machine reported after they opened the
+        // folder in Explorer and accepted its permission prompt.
+        let sddl = "O:BAG:S-1-5-21-2635842226-2484704124-390085508-513D:PAI(A;OICI;FA;;;SY)\
+                    (A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-21-2635842226-2484704124-390085508-1001)";
+        assert_eq!(
+            unexpected_trustees(sddl, AclClass::SecretDirectory).unwrap(),
+            vec!["S-1-5-21-2635842226-2484704124-390085508-1001".to_string()]
+        );
+        assert!(
+            unexpected_trustees(&secret_ok(), AclClass::SecretDirectory)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     const PATH: &str = r"C:\ProgramData\Arcen\tls\host.key";
     const RUNTIME_PATH: &str = r"C:\ProgramData\Arcen\runtime";

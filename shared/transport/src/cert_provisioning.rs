@@ -63,6 +63,9 @@ pub struct MaterialState {
     pub expiring_or_expired: bool,
     /// Whether an interrupted publication left staged files behind.
     pub stale_staging_present: bool,
+    /// Whether the certificate is self-signed, as everything Arcen generates
+    /// is. An operator's CA-issued certificate is not.
+    pub self_signed: bool,
 }
 
 impl MaterialState {
@@ -76,6 +79,7 @@ impl MaterialState {
             certificate_valid: false,
             expiring_or_expired: false,
             stale_staging_present: false,
+            self_signed: false,
         }
     }
 
@@ -89,6 +93,7 @@ impl MaterialState {
             certificate_valid: true,
             expiring_or_expired: false,
             stale_staging_present: false,
+            self_signed: true,
         }
     }
 
@@ -265,10 +270,20 @@ pub fn plan(
         ProvisioningRequest::Ensure => {
             if !state.is_complete() {
                 ProvisioningAction::CreateNew
+            } else if foreign && state.self_signed {
+                // A self-signed pair without our marker is what every Arcen
+                // install before ownership markers left behind. Taking it over
+                // keeps the key, so every Deck that trusts this host still
+                // does; demanding a flag for it only stopped upgrades.
+                ProvisioningAction::AdoptAndRenew
             } else if foreign {
-                // Silently replacing someone else's material would break every
-                // client already trusting it.
-                return Err(ProvisioningRefusal::ForeignMaterial);
+                // An operator's CA-issued certificate: serve it as it is and
+                // never reissue it, which would replace their chain with a
+                // self-signed one.
+                if !state.certificate_valid {
+                    return Err(ProvisioningRefusal::InvalidCertificate);
+                }
+                ProvisioningAction::KeepExisting
             } else if !state.certificate_valid {
                 return Err(ProvisioningRefusal::InvalidCertificate);
             } else if state.expiring_or_expired {
@@ -363,15 +378,57 @@ mod tests {
     }
 
     #[test]
+    fn an_earlier_installs_unmarked_pair_is_taken_over_without_asking() {
+        let legacy = MaterialState {
+            ownership: Some(MaterialOwnership::Foreign),
+            ..MaterialState::owned_valid()
+        };
+        let adopted = plan(ProvisioningRequest::Ensure, legacy).expect("adoptable");
+        assert_eq!(adopted.action, ProvisioningAction::AdoptAndRenew);
+        assert!(
+            !adopted.invalidates_pins,
+            "the key, and so every pin, survives"
+        );
+        let expired = MaterialState {
+            certificate_valid: false,
+            expiring_or_expired: true,
+            ..legacy
+        };
+        assert_eq!(
+            plan(ProvisioningRequest::Ensure, expired).map(|plan| plan.action),
+            Ok(ProvisioningAction::AdoptAndRenew)
+        );
+    }
+
+    #[test]
+    fn an_operators_ca_issued_certificate_is_served_and_never_reissued() {
+        let enterprise = MaterialState {
+            ownership: Some(MaterialOwnership::Foreign),
+            self_signed: false,
+            ..MaterialState::owned_valid()
+        };
+        assert_eq!(
+            plan(ProvisioningRequest::Ensure, enterprise).map(|plan| plan.action),
+            Ok(ProvisioningAction::KeepExisting)
+        );
+        assert_eq!(
+            plan(
+                ProvisioningRequest::Ensure,
+                MaterialState {
+                    certificate_valid: false,
+                    ..enterprise
+                }
+            ),
+            Err(ProvisioningRefusal::InvalidCertificate)
+        );
+    }
+
+    #[test]
     fn foreign_material_is_never_replaced_without_being_asked() {
         let foreign = MaterialState {
             ownership: Some(MaterialOwnership::Foreign),
             ..MaterialState::owned_valid()
         };
-        assert_eq!(
-            plan(ProvisioningRequest::Ensure, foreign),
-            Err(ProvisioningRefusal::ForeignMaterial)
-        );
         assert_eq!(
             plan(ProvisioningRequest::Renew, foreign),
             Err(ProvisioningRefusal::ForeignMaterial)

@@ -254,6 +254,22 @@ impl ValidityWindow {
     }
 }
 
+/// Returns whether the certificate names itself as its issuer.
+///
+/// Every certificate an Arcen installer or helper generates is self-signed.
+/// An enterprise CA-issued certificate is not, which is what lets a host tell
+/// material an earlier Arcen install left behind from material an operator
+/// provisioned on purpose. `false` when the PEM does not parse.
+#[must_use]
+pub fn is_self_signed_pem(pem_bytes: &[u8]) -> bool {
+    let Some(der) = std::str::from_utf8(pem_bytes).ok().and_then(pem_to_der) else {
+        return false;
+    };
+    x509_parser::parse_x509_certificate(&der).is_ok_and(|(_, certificate)| {
+        certificate.issuer().as_raw() == certificate.subject().as_raw()
+    })
+}
+
 /// Reads a PEM certificate's validity window.
 ///
 /// Returns `None` when the certificate cannot be parsed. Callers treat that as
@@ -373,6 +389,31 @@ impl OwnershipMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_generated_certificate_is_self_signed_and_a_ca_issued_one_is_not() {
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Example Enterprise CA");
+        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        assert!(is_self_signed_pem(ca.pem().as_bytes()));
+
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["pier.example".to_owned()]).expect("leaf");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "pier.example");
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf cert");
+        assert!(!is_self_signed_pem(leaf.pem().as_bytes()));
+        assert!(!is_self_signed_pem(b"not a certificate"));
+    }
 
     const HEX: &str = "2bfdf2fb2c67e38c2569c09b243fed94be54eefe2aba3c1815b24cd6e6cf86d4";
     const COLONS: &str = "2B:FD:F2:FB:2C:67:E3:8C:25:69:C0:9B:24:3F:ED:94:BE:54:EE:FE:2A:BA:3C:18:15:B2:4C:D6:E6:CF:86:D4";
