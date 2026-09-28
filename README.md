@@ -21,7 +21,7 @@ Read this before you invest time.
 | **Windows Pier** (host) | Works. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
 | **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. AV1 decode needs Apple silicon M3 or later. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
-| **macOS Pier** | In development. A logged-in Aqua user can serve a real Deck today: PAM authentication, QUIC, ScreenCaptureKit → VideoToolbox video, pointer/keyboard/pen input, clipboard both directions, and host audio when the separate System Audio Recording grant exists. Cold-boot login from the macOS login screen is not supported: it needs a virtual-HID entitlement Apple has not granted, and no Apple contract covers third-party capture of the login window. FileVault's pre-boot disk-unlock screen is not supported. No usable host release exists yet. |
+| **macOS Pier** | In development. A logged-in Aqua user can serve a real Deck today: PAM authentication, QUIC, ScreenCaptureKit → VideoToolbox video, pointer/keyboard/pen input, clipboard both directions, and host audio when the separate System Audio Recording grant exists. Installed as a network service under a hidden `_arcen` account plus a helper in each signed-in session ([why two parts](docs/security/macos-pier-process-model.md)). Serving the login screen is built: Apple has granted the virtual-HID entitlement, and a login-window agent types through a virtual keyboard. Cold-boot operation is not yet qualified, and no Apple contract covers third-party capture of the login window. FileVault's pre-boot disk-unlock screen is not supported. No usable host release exists yet. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
 
 Every claim above was tested on real hardware, running real work, not merely
@@ -66,7 +66,7 @@ account.
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. On macOS Pier this now negotiates honestly: the host publishes `audio_output`, sends `audio_stream_result`, and starts capture on a separate thread under a 1500 ms budget so Apple's consent prompt cannot hold the desktop hostage. Note that macOS gates Core Audio process taps behind **System Audio Recording**, a different permission from the **Screen & System Audio Recording** one that gates video — a host can hold the second and none of the first, and then stream a picture in silence. |
 | **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Opt-in every launch — consent is deliberately never restored from settings — and the operator must enable it on the host too. Windows needs a signed driver Arcen does not yet ship; see [Where help is wanted](#where-help-is-wanted). |
 | **Keyboard and pointer** | Absolute and relative motion, scroll, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. |
-| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike — and that entitlement has been requested and not granted. |
+| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
 | **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
@@ -150,12 +150,33 @@ the folder you downloaded it to:
 .\install-arcen-pier.exe
 ```
 
-**macOS** — no Pier installer is published yet. The repository contains
-development `build-pier-app.sh` and `build-pier-pkg.sh` scripts, and the app
-script now builds `arcen-pier-macos` before assembling the bundle instead of
-packaging whatever binary happened to be in `target/release`. That is build
-hygiene, not a release claim: the macOS Pier package still has not completed
-Release/Security review or the cold-boot LoginWindow qualification.
+**macOS** — a development package, `ArcenPier-<version>.pkg`, is signed and
+notarised. Open it in Installer.app on the Mac it installs; the command-line
+`installer` is refused, because the privacy approvals that follow need a
+person at that Mac. It is not yet a supported host: the cold-boot login window
+and multi-monitor hardware are unqualified, and it has not completed
+Release/Security review.
+
+The macOS Pier is deliberately **more than one app**. Packages after 0.13.0
+say so on the installer's first page, before anything changes:
+
+- **Arcen Pier**, the network service. It starts at boot, listens on UDP 18444,
+  holds the host key and checks passwords. It cannot see or control any screen,
+  and it runs as `_arcen`, a hidden account with no password and no shell. It
+  refuses to run as root.
+- **Arcen Agent Helper**, in `/Library/PrivilegedHelperTools`. macOS starts one
+  in each signed-in session, as that person, to capture and to type. It has no
+  port and cannot read the key.
+
+They cannot be one program. macOS allows capture and input only inside a
+signed-in session, while a host must answer when nobody is signed in and must
+not fight over its port when two people are. Creating `_arcen` is why macOS asks
+once, on first install, *"Installer would like to administer your computer"*.
+Nothing else about any account changes. Each person who will be served then
+approves Screen & System Audio Recording and Accessibility for Arcen Agent
+Helper. The full reasoning, what each part can and cannot do, and the one open
+gap (the login-window agent runs as root) are in
+[`docs/security/macos-pier-process-model.md`](docs/security/macos-pier-process-model.md).
 
 The installer creates the directories, generates a TLS certificate, registers
 and starts the service, and opens **UDP 18444** on a firewall it recognises.
@@ -358,7 +379,10 @@ same address is protected too.
 This is the point of the whole ceremony. Once a fingerprint is recorded, a
 different one is a hard error with no "trust anyway" button, because an
 impostor's certificate would otherwise raise exactly the same friendly dialog
-the real host raised the first time.
+the real host raised the first time. If the host really was reinstalled, you
+can confirm that you checked with its administrator and choose *Forget and
+Verify*. The Deck drops the old fingerprint, reconnects at once and shows you
+the new one to compare before anything is trusted.
 
 **Pins are compared in constant time**, so an attacker cannot learn a pin by
 measuring how long a rejection takes. A pin changes only when you change it.
@@ -548,17 +572,18 @@ login/session activation, capture, input, clipboard, tablet, audio, and
 packaging adapters kept separate from shared policy. The logged-in Aqua path is
 real enough to drive by hand from the Deck, including two-way clipboard and
 host audio when consent exists. Multi-monitor has a wire implementation but has
-not been qualified on hardware with more than one attached display. Cold-boot
-remote login from the macOS login screen is **not supported**, and research has
-now established why rather than leaving it as unfinished work: the login window
-needs a `LoginWindow` launch agent, an authorization plug-in registered against
-`system.login.console`, and virtual-HID input because `CGEvent` posting does not
-reach that screen. Every piece is documented by Apple individually, but Apple
-publishes no contract that third-party code may capture the login window, and
-the virtual-HID entitlement it requires has been requested and not granted.
-FileVault's pre-boot disk-unlock screen is not supported either, for a different
-and simpler reason: macOS is not running yet. No usable macOS host release
-exists yet.
+not been qualified on hardware with more than one attached display. Serving
+the macOS login screen needs a `LoginWindow` launch agent and virtual-HID input,
+because `CGEvent` posting does not reach that screen. Apple has now granted the
+virtual-HID entitlement, and both pieces are built. Apple still publishes no
+contract that third-party code may capture the login window, and cold-boot
+operation has not been qualified. That agent also runs as root, the one place the
+Pier holds more privilege than it needs; narrowing it to the virtual keyboard
+alone is open work, described in
+[`docs/security/macos-pier-process-model.md`](docs/security/macos-pier-process-model.md).
+FileVault's pre-boot disk-unlock screen is not supported, for a different and
+simpler reason: macOS is not running yet. The macOS host is not yet a supported
+release.
 
 **The gateway.** Today a Deck must reach a Pier directly, which in practice
 means the same network or a VPN. The gateway would carry traffic between them
@@ -697,7 +722,7 @@ builds are the contributor's responsibility.
 | [`docs/architecture/`](docs/architecture) | How each part works and why |
 | [`docs/adr/`](docs/adr) | Decisions, including withdrawn ones, with reasons |
 | [`docs/operations/`](docs/operations) | Running and releasing |
-| [`docs/security/`](docs/security) | Trust boundaries |
+| [`docs/security/`](docs/security) | Trust boundaries, and [why the macOS Pier runs as separate processes](docs/security/macos-pier-process-model.md) |
 | `*/ARCHITECTURE.md` | Component detail, beside the code |
 | `*/AGENTS.md` | Who owns a directory and how to validate it |
 

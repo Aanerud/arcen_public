@@ -16,6 +16,16 @@ software; see [ADR 0006](../adr/0006-offline-pier-licensing.md). The remaining
 capacity-one session gate is a physical host-resource boundary, not an
 entitlement boundary.
 
+## macOS Pier process boundary
+
+The macOS Pier splits into a network service running as the unprivileged
+`_arcen` account and a desktop agent running in each signed-in session as that
+person. The two verify each other over a local socket. Only the service holds
+the host key and the port; only the agent can capture or inject input. At the
+login window the agent runs as root, which is the one open gap. The reasons,
+the enforcing code and the installer prompts are in
+[`macos-pier-process-model.md`](macos-pier-process-model.md).
+
 ## Direct-QUIC certificate boundary
 
 Direct QUIC is the only live transport and listens on UDP 18444. The
