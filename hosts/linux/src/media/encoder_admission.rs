@@ -401,9 +401,12 @@ pub fn emit_admission_telemetry(decision: &EncoderSetDecision) {
         decision = match decision {
             EncoderSetDecision::Accept { .. } => "accept",
             EncoderSetDecision::Reassign { .. } => "reassign",
+            EncoderSetDecision::StepDown { .. } => "step_down",
             EncoderSetDecision::Reject { .. } => "reject",
         },
         selected_candidate = ?decision.selected_candidate_index(),
+        admitted_fps = decision.fps_stepdown().map(|step| step.admitted_fps),
+        requested_fps = decision.fps_stepdown().map(|step| step.requested_fps),
         "aggregate encoder admission decision"
     );
 }
@@ -616,7 +619,9 @@ mod tests {
             color_matrix: arcen_media::ColorMatrix::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Sdr,
             intent: arcen_media::EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,

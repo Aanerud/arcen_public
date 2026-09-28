@@ -614,4 +614,17 @@ EVENT_DEFINITIONS = {
         "started",
         (("permission", STRING), ("platform", STRING)),
     ),
+    1904: _event(
+        "ENCODER_ADMISSION_FPS_REDUCED",
+        2,
+        "info",
+        "streaming",
+        "succeeded",
+        (
+            ("requested_fps", INTEGER),
+            ("admitted_fps", INTEGER),
+            ("reason", STRING),
+        ),
+        (("candidate", INTEGER), ("monitor_count", INTEGER)),
+    ),
 }

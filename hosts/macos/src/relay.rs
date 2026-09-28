@@ -21,6 +21,7 @@ use arcen_session::agent_relay::{
     AgentMessage, AgentRegistration, ConsoleHolder, DesktopSessionKind, MAX_RELAY_LINE_BYTES,
     ParkedAgent, RouteRefusal, ServiceMessage, select_agent, validate_registration,
 };
+use arcen_transport::quic::{PriorityAudio, PriorityAudioSend};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -537,14 +538,16 @@ pub struct MediaRelayStats {
 pub async fn relay_media(
     deck: arcen_transport::quic::DirectQuicStream,
     agent: UnixStream,
+    session: u64,
     audio_channel: tokio::sync::oneshot::Receiver<UnixStream>,
 ) -> Result<MediaRelayStats, String> {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 
+    let connection = deck.connection_handle();
     let priority = std::sync::Arc::new(tokio::sync::Mutex::new(PriorityAudio::new(
-        deck.connection_handle(),
+        connection.clone(),
     )));
     let deck_config = WebSocketConfig {
         max_message_size: Some(crate::net::MAX_INBOUND_MESSAGE),
@@ -574,21 +577,64 @@ pub async fn relay_media(
     let inbound_flag = std::sync::Arc::clone(&wants_priority);
     let inbound = async {
         let mut forwarded = 0_u64;
-        while let Some(message) = deck_rx.next().await {
-            let message = message.map_err(|error| format!("from Deck: {error}"))?;
-            if let Message::Text(text) = &message {
-                if deck_accepts_priority_audio(text) {
-                    inbound_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut path_state = arcen_telemetry::PathSignalState::default();
+        let path_started = tokio::time::Instant::now();
+        let mut path_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        path_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The agent authenticates the Deck over this very stream and takes
+        // nothing but the Deck's own `auth_response` until that is done, so
+        // path truth waits for the Deck's `client_hello`, which only follows
+        // a successful authentication.
+        let mut session_started = false;
+        loop {
+            tokio::select! {
+                message = deck_rx.next() => {
+                    let Some(message) = message else { break; };
+                    let message = message.map_err(|error| format!("from Deck: {error}"))?;
+                    if let Message::Text(text) = &message {
+                        if serde_json::from_str::<serde_json::Value>(text)
+                            .ok()
+                            .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+                            .is_some_and(|kind| {
+                                arcen_session::agent_relay::ServiceMessage::is_service_type(&kind)
+                            }) {
+                            return Err("Deck sent a service-only message".to_string());
+                        }
+                        if deck_accepts_priority_audio(text) {
+                            inbound_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        session_started |= is_client_hello(text);
+                    }
+                    let closing = matches!(message, Message::Close(_));
+                    agent_tx
+                        .send(message)
+                        .await
+                        .map_err(|error| format!("to agent: {error}"))?;
+                    forwarded += 1;
+                    if closing {
+                        break;
+                    }
                 }
-            }
-            let closing = matches!(message, Message::Close(_));
-            agent_tx
-                .send(message)
-                .await
-                .map_err(|error| format!("to agent: {error}"))?;
-            forwarded += 1;
-            if closing {
-                break;
+                _ = path_tick.tick() => {
+                    if connection.close_reason().is_some() {
+                        break;
+                    }
+                    if !session_started {
+                        continue;
+                    }
+                    let signal = arcen_transport::observe_quinn_path_signal(
+                            &mut path_state,
+                            path_started.elapsed(),
+                            &connection,
+                        );
+                    let message = ServiceMessage::PathSignal { session, signal };
+                    let text = serde_json::to_string(&message)
+                        .map_err(|error| format!("path signal encode: {error}"))?;
+                    agent_tx
+                        .send(Message::Text(text.into()))
+                        .await
+                        .map_err(|error| format!("to agent path signal: {error}"))?;
+                }
             }
         }
         let _ = agent_tx.close().await;
@@ -606,9 +652,36 @@ pub async fn relay_media(
                     bytes.first().copied() == Some(arcen_protocol::wire::FrameType::Audio as u8);
                 if is_audio && wants_priority.load(std::sync::atomic::Ordering::Relaxed) {
                     let mut priority = outbound_priority.lock().await;
-                    if priority.usable() && priority.send(bytes).await {
-                        priority_audio += 1;
-                        continue;
+                    if priority.usable() {
+                        match priority.send(bytes).await {
+                            PriorityAudioSend::Opened => {
+                                tracing::info!(
+                                    target: "arcen::relay",
+                                    "audio moved to its own priority stream"
+                                );
+                                priority_audio += 1;
+                                continue;
+                            }
+                            PriorityAudioSend::Sent => {
+                                priority_audio += 1;
+                                continue;
+                            }
+                            PriorityAudioSend::Unusable => {}
+                            PriorityAudioSend::OpenFailed(error) => {
+                                tracing::warn!(
+                                    target: "arcen::relay",
+                                    %error,
+                                    "no audio priority stream"
+                                );
+                            }
+                            PriorityAudioSend::WriteFailed(error) => {
+                                tracing::warn!(
+                                    target: "arcen::relay",
+                                    %error,
+                                    "audio priority stream failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -644,6 +717,14 @@ pub async fn relay_media(
 
 /// Whether a Deck text message is a `client_hello` opting in to the audio
 /// priority stream.
+fn is_client_hello(text: &str) -> bool {
+    text.contains(arcen_protocol::messages::CLIENT_HELLO)
+        && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+            value.get("type").and_then(serde_json::Value::as_str)
+                == Some(arcen_protocol::messages::CLIENT_HELLO)
+        })
+}
+
 fn deck_accepts_priority_audio(text: &str) -> bool {
     if !text.contains(arcen_protocol::messages::CLIENT_HELLO) {
         return false;
@@ -652,14 +733,17 @@ fn deck_accepts_priority_audio(text: &str) -> bool {
         .is_ok_and(|hello| hello.audio_priority_stream_v1)
 }
 
-/// Where the agent executable sits beside the service's own bundle.
+/// Which agent executable the service accepts.
 ///
-/// `/Applications/Arcen Pier.app/Contents/MacOS/arcen-pier-macos` pairs with
-/// `/Applications/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper`.
-/// Returns `None` when the service is not running from a bundle, which is a
-/// build tree.
+/// The installed service pairs with the installed helper under
+/// `/Library/PrivilegedHelperTools`. A bundle anywhere else (a build output
+/// such as `dist/macos/`) pairs with the helper beside it. Returns `None` when
+/// the service is not running from a bundle, which is a build tree.
 #[must_use]
 pub fn expected_agent_program(service_executable: &Path) -> Option<PathBuf> {
+    if service_executable == Path::new(crate::service::PIER_PROGRAM) {
+        return Some(PathBuf::from(crate::service::AGENT_PROGRAM));
+    }
     let macos = service_executable.parent()?;
     let contents = macos.parent()?;
     let bundle = contents.parent()?;
@@ -733,6 +817,7 @@ pub async fn park(
     write_line(&mut stream, &AgentRegistration::new(kind, crate::VERSION)).await?;
     match read_service_message(&mut stream).await? {
         ServiceMessage::Registered { .. } => {}
+        ServiceMessage::PathSignal { .. } => {}
         ServiceMessage::Refused { reason } => return Err(RelayError::Refused(reason)),
         ServiceMessage::Attach { .. } => {
             return Err(RelayError::Protocol(
@@ -750,6 +835,9 @@ pub async fn park(
             })
         }
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
+        ServiceMessage::PathSignal { .. } => Err(RelayError::Protocol(
+            "received path signal before Deck attachment".to_owned(),
+        )),
         ServiceMessage::Registered { .. } => {
             Err(RelayError::Protocol("registered twice".to_owned()))
         }
@@ -796,6 +884,7 @@ pub async fn open_audio_channel(
     .await?;
     match read_service_message(&mut stream).await? {
         ServiceMessage::Registered { .. } => Ok(stream),
+        ServiceMessage::PathSignal { .. } => Ok(stream),
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
         ServiceMessage::Attach { .. } => Err(RelayError::Protocol(
             "offered a Deck on an audio channel".to_owned(),
@@ -825,74 +914,24 @@ pub async fn forward_audio_channel(
         if channel.read_exact(&mut frame).await.is_err() {
             return forwarded;
         }
-        if priority.lock().await.send(&frame).await {
-            forwarded += 1;
-        }
-    }
-}
-
-/// The Deck's audio priority stream, opened on first use and shared by
-/// whichever path carries audio to it.
-pub struct PriorityAudio {
-    connection: quinn::Connection,
-    stream: Option<quinn::SendStream>,
-    failed: bool,
-}
-
-impl PriorityAudio {
-    /// A priority stream not yet opened.
-    #[must_use]
-    pub const fn new(connection: quinn::Connection) -> Self {
-        Self {
-            connection,
-            stream: None,
-            failed: false,
-        }
-    }
-
-    /// Whether the stream can still be used.
-    #[must_use]
-    pub const fn usable(&self) -> bool {
-        !self.failed
-    }
-
-    /// Sends one frame, opening the stream on first use. Returns whether it
-    /// was sent; once it fails it stays failed and the caller falls back.
-    pub async fn send(&mut self, frame: &[u8]) -> bool {
-        if self.failed {
-            return false;
-        }
-        if self.stream.is_none() {
-            match arcen_transport::quic::open_audio_priority_stream(&self.connection).await {
-                Ok(stream) => {
-                    tracing::info!(target: "arcen::relay", "audio moved to its own priority stream");
-                    self.stream = Some(stream);
-                }
-                Err(error) => {
-                    tracing::warn!(target: "arcen::relay", %error, "no audio priority stream");
-                    self.failed = true;
-                    return false;
-                }
+        match priority.lock().await.send(&frame).await {
+            PriorityAudioSend::Opened => {
+                tracing::info!(
+                    target: "arcen::relay",
+                    "audio moved to its own priority stream"
+                );
+                forwarded += 1;
             }
-        }
-        let Some(stream) = self.stream.as_mut() else {
-            return false;
-        };
-        match arcen_transport::quic::write_priority_frame(stream, frame).await {
-            Ok(()) => true,
-            Err(error) => {
+            PriorityAudioSend::Sent => {
+                forwarded += 1;
+            }
+            PriorityAudioSend::Unusable => {}
+            PriorityAudioSend::OpenFailed(error) => {
+                tracing::warn!(target: "arcen::relay", %error, "no audio priority stream");
+            }
+            PriorityAudioSend::WriteFailed(error) => {
                 tracing::warn!(target: "arcen::relay", %error, "audio priority stream failed");
-                self.stream = None;
-                self.failed = true;
-                false
             }
-        }
-    }
-
-    /// Finishes the stream.
-    pub fn finish(&mut self) {
-        if let Some(mut stream) = self.stream.take() {
-            let _ = stream.finish();
         }
     }
 }
@@ -932,13 +971,33 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_is_the_sibling_bundle() {
+    fn path_truth_waits_for_an_authenticated_session() {
+        let hello = serde_json::to_string(&arcen_protocol::messages::ClientHelloMsg::default())
+            .expect("hello");
+        assert!(is_client_hello(&hello));
+        // The Deck's credentials must reach the agent before anything else.
+        assert!(!is_client_hello(
+            r#"{"type":"auth_response","username":"client_hello"}"#
+        ));
+        assert!(!is_client_hello("not json client_hello"));
+    }
+
+    #[test]
+    fn the_agent_is_the_installed_helper_or_the_sibling_bundle() {
         assert_eq!(
             expected_agent_program(Path::new(
                 "/Applications/Arcen Pier.app/Contents/MacOS/arcen-pier-macos"
             )),
             Some(PathBuf::from(
-                "/Applications/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper"
+                "/Library/PrivilegedHelperTools/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper"
+            ))
+        );
+        assert_eq!(
+            expected_agent_program(Path::new(
+                "/Users/dev/arcen/dist/macos/Arcen Pier.app/Contents/MacOS/arcen-pier-macos"
+            )),
+            Some(PathBuf::from(
+                "/Users/dev/arcen/dist/macos/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper"
             ))
         );
         assert_eq!(

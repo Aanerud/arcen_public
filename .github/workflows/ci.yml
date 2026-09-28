@@ -71,6 +71,11 @@ jobs:
         run: |
           python3 -m unittest scripts/test_validate_observability.py
           python3 -m unittest scripts/test_verify_quic_product_binary.py
+      - name: Shared contracts and dependency direction
+        run: |
+          python3 -m unittest scripts/test_check_shared_contracts.py
+          python3 scripts/check_shared_contracts.py --verbose
+          bash scripts/ci/check-workspace-boundaries.sh
       - name: Verify governed Opus source
         run: bash scripts/verify-opusic-source.sh
       - name: Native source-build tools

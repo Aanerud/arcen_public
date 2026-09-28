@@ -66,6 +66,8 @@
       "logical_y": 1440,
       "delta_x": 120,
       "delta_y": -240,
+      "unit": "point",
+      "phase": "changed",
       "sequence": 43,
       "timestamp_ns": 9003,
       "coalescable": false

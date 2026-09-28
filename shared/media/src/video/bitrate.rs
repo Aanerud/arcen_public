@@ -68,15 +68,14 @@ pub fn average_bitrate_bps(
     }
 }
 
-/// The average bitrate a Pier encodes a session at: [`average_bitrate_bps`],
-/// held to what 1080p of the same cadence costs on the fast path.
+/// The conservative starting bitrate for a live adaptive session.
 ///
-/// The cap exists because hardware encoders spend their average rather than
-/// treating it as a ceiling: measured against a real Deck, bytes per frame
-/// matched the configured average to within one percent whether the desktop
-/// moved or not. A target above what the link carries is therefore a
-/// permanent backlog: frames wait, input feels late, and audio sharing the
-/// path starves.
+/// This remains the safe cap Arcen used before adaptive rate control: the
+/// controller in [`crate::rate_control`] starts here, then climbs toward
+/// [`average_bitrate_bps`] when the transport path is clear. Hardware encoders
+/// spend their configured average rather than treating it as a ceiling, so this
+/// starting point protects the known WAN/VPN knee while live path feedback lets
+/// LAN sessions escape it.
 ///
 /// - 1080p at up to 30 fps is the reference, so anything at or below it is
 ///   untouched.

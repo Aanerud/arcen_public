@@ -93,20 +93,23 @@ fn bounded_selector<'a>(value: Option<&'a str>, name: &str) -> Result<Option<&'a
     Ok(value)
 }
 
-/// Explicit operator opt-in for advertising `multi_monitor_v1` pre-auth.
-/// Defaults to fully disabled. See `multi_monitor_gate::MultiMonitorGate`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Windows multi-monitor advertisement policy.
+///
+/// Multi-monitor is on by default. Empty `allowed_adapters` means any eligible
+/// NVIDIA/NVENC adapter; non-empty lists and `excluded_adapters` constrain the
+/// live startup selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowsMultiMonitorConfig {
-    /// Explicit operator opt-in. `false` unless set. Even when `true`, this
-    /// host also requires a non-empty probed physical output inventory and
-    /// the hardcoded carrier-ready gate before it ever advertises support
-    /// (see `multi_monitor_gate`).
+    /// Administrator off switch. Even when `true`, this host advertises only
+    /// after startup chooses an eligible live NVIDIA/NVENC streaming adapter.
     pub advertise_enabled: bool,
-    /// Exact case-insensitive DXGI adapter descriptions multi-monitor may
-    /// consume. Empty inherits `platform.desktop.adapter`, so a host pinned
-    /// to one GPU never silently borrows another GPU reserved for compute.
+    /// Exact case-insensitive DXGI adapter descriptions multi-monitor may use.
+    /// Empty means any eligible adapter.
     pub allowed_adapters: Vec<String>,
+    /// Exact case-insensitive DXGI adapter descriptions multi-monitor must not
+    /// use. Prefer this to reserve a GPU for other work.
+    pub excluded_adapters: Vec<String>,
     /// Optional operator ceiling on the advertised `max_monitors`, clamped to
     /// [`arcen_media::MAX_MULTI_MONITOR_COUNT`]. Native NVIDIA headless mode
     /// additionally clamps this to its hardware-validated safe provider limit.
@@ -122,10 +125,32 @@ pub struct WindowsMultiMonitorConfig {
     /// Whether admission may replace non-full-color monitors with a supported
     /// software 4:2:0 plan when hardware sessions are exhausted.
     pub allow_software_fallback: bool,
-    /// Provision missing monitors through spare NVIDIA display IDs on the one
-    /// allowed streaming adapter. Default-off and mutually exclusive with the
-    /// externally supplied IddCx backend.
-    pub nvidia_headless_enabled: bool,
+    /// Provision missing monitors through spare NVIDIA display IDs on the
+    /// chosen streaming adapter. `None` lets startup enable it for a
+    /// GRID/Quadro-class adapter; `Some(false)` is an administrator off switch;
+    /// `Some(true)` forces the NVIDIA headless provider.
+    pub nvidia_headless_enabled: Option<bool>,
+}
+
+impl Default for WindowsMultiMonitorConfig {
+    fn default() -> Self {
+        Self {
+            advertise_enabled: true,
+            allowed_adapters: Vec::new(),
+            excluded_adapters: Vec::new(),
+            max_monitors: None,
+            nvenc_session_limit: None,
+            allow_software_fallback: true,
+            nvidia_headless_enabled: None,
+        }
+    }
+}
+
+impl WindowsMultiMonitorConfig {
+    #[must_use]
+    pub const fn nvidia_headless_effective(&self) -> bool {
+        matches!(self.nvidia_headless_enabled, Some(true))
+    }
 }
 
 pub struct LoadedConfig {
@@ -287,10 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn iddcx_is_default_off_and_requires_both_gates_and_affinity() {
+    fn iddcx_is_default_off_and_requires_advertisement_and_affinity() {
         let defaulted =
             serde_json::from_str::<WindowsPlatformConfig>(r#"{}"#).expect("default platform");
         assert!(!defaulted.iddcx.enabled);
+        assert!(defaulted.multi_monitor.advertise_enabled);
 
         let enabled = WindowsIddCxConfig {
             enabled: true,
@@ -300,13 +326,13 @@ mod tests {
             },
         };
         assert!(enabled
-            .validate(&WindowsMultiMonitorConfig::default())
-            .is_err());
-        assert!(enabled
             .validate(&WindowsMultiMonitorConfig {
-                advertise_enabled: true,
+                advertise_enabled: false,
                 ..WindowsMultiMonitorConfig::default()
             })
+            .is_err());
+        assert!(enabled
+            .validate(&WindowsMultiMonitorConfig::default())
             .is_ok());
     }
 
@@ -469,8 +495,10 @@ mod tests {
         let parsed: PierFileConfig =
             serde_json::from_str(include_str!("../../../packaging/windows/pier.json"))
                 .expect("packaged config");
+        // Everything is on by default; the file is for turning things off.
         assert!(parsed.audio.enabled);
-        assert!(!parsed.audio.compressed);
-        assert!(!parsed.microphone_input.enabled);
+        assert!(parsed.audio.compressed);
+        assert!(parsed.microphone_input.enabled);
+        assert_eq!(parsed.redirection.timezone, Some(true));
     }
 }

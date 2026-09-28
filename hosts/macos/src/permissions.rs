@@ -201,6 +201,33 @@ pub fn request() -> PermissionSnapshot {
     }
 }
 
+/// Asks for Screen Recording alone. See [`request`].
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn request_screen_recording() -> bool {
+    // SAFETY: nullary; may show the system's dialog and returns at once.
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+/// Asks for Accessibility alone. See [`request`].
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn request_accessibility_access() -> bool {
+    request_accessibility()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn request_screen_recording() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn request_accessibility_access() -> bool {
+    false
+}
+
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn request() -> PermissionSnapshot {

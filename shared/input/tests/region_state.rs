@@ -1,6 +1,6 @@
 use arcen_input::{
     PenTool, RegionCoordinateTransformer, RegionInputEvent, RegionInputState,
-    RegionInputStateError, RegionLogicalPosition, RegionPenSample,
+    RegionInputStateError, RegionLogicalPosition, RegionPenSample, ScrollPhase, ScrollUnit,
 };
 use arcen_media::{
     AppliedPoint, AppliedRect, AppliedRegionDescriptor, AppliedRegionSet, LogicalPoint,
@@ -123,6 +123,17 @@ fn cross_component_fixture_freezes_state_and_physical_endpoints() {
                 position,
                 delta_x: event["delta_x"].as_i64().unwrap(),
                 delta_y: event["delta_y"].as_i64().unwrap(),
+                unit: match event["unit"].as_str() {
+                    Some("point") => ScrollUnit::Point,
+                    _ => ScrollUnit::Line,
+                },
+                phase: match event["phase"].as_str() {
+                    Some("began") => ScrollPhase::Began,
+                    Some("changed") => ScrollPhase::Changed,
+                    Some("ended") => ScrollPhase::Ended,
+                    Some("cancelled") => ScrollPhase::Cancelled,
+                    _ => ScrollPhase::None,
+                },
                 sequence,
             },
             "region_pen_event" => RegionInputEvent::Pen {

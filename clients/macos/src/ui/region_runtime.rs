@@ -17,7 +17,7 @@ use std::fmt::{Display, Formatter};
 use arcen_input::{
     PenEvent, RegionCoordinateTransformer, RegionInputEmitError, RegionInputEmitter,
     RegionInputState, RegionInputStateError, RegionInputWireMessage, RegionLogicalPosition,
-    RegionPenSample,
+    RegionPenSample, ScrollPhase, ScrollUnit,
 };
 use arcen_media::{
     AppliedPoint, AppliedRect, AppliedRegionSet, AppliedSize, LogicalPoint, LogicalRect,
@@ -192,6 +192,8 @@ impl TemporaryLegacyRegionInputAdapter {
                     y,
                     dx: message.delta_x as f64 / arcen_media::LOGICAL_UNITS_PER_PIXEL as f64,
                     dy: message.delta_y as f64 / arcen_media::LOGICAL_UNITS_PER_PIXEL as f64,
+                    unit: message.unit,
+                    phase: message.phase,
                     server_x,
                     server_y,
                     sequence: message.metadata.sequence,
@@ -597,6 +599,30 @@ impl DeckRegionRuntime {
         sequence: &mut u64,
         timestamp_ns: u64,
     ) -> Result<Vec<RegionInputWireMessage>, DeckRegionRuntimeError> {
+        self.pointer_scroll_units_with_details(
+            viewport,
+            local_fraction,
+            delta_x_units,
+            delta_y_units,
+            ScrollUnit::Line,
+            ScrollPhase::None,
+            sequence,
+            timestamp_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn pointer_scroll_units_with_details(
+        &mut self,
+        viewport: RegionViewport,
+        local_fraction: (f64, f64),
+        delta_x_units: i64,
+        delta_y_units: i64,
+        unit: ScrollUnit,
+        phase: ScrollPhase,
+        sequence: &mut u64,
+        timestamp_ns: u64,
+    ) -> Result<Vec<RegionInputWireMessage>, DeckRegionRuntimeError> {
         let bound = |delta: i64| {
             i32::try_from(delta)
                 .map(i64::from)
@@ -606,7 +632,15 @@ impl DeckRegionRuntime {
         let delta_y = bound(delta_y_units)?;
         let position = self.logical_position(viewport, local_fraction)?;
         self.emit(sequence, |emitter, regions| {
-            emitter.pointer_scroll(regions, position, delta_x, delta_y, timestamp_ns)
+            emitter.pointer_scroll_with_details(
+                regions,
+                position,
+                delta_x,
+                delta_y,
+                unit,
+                phase,
+                timestamp_ns,
+            )
         })
     }
 
@@ -1073,6 +1107,8 @@ mod tests {
                     position: pointer,
                     delta_x: 120,
                     delta_y: -240,
+                    unit: ScrollUnit::Point,
+                    phase: ScrollPhase::Changed,
                     sequence: 43,
                 },
                 9_003,

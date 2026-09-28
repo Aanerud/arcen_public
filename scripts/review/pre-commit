@@ -37,6 +37,26 @@ if [ -x "$REPO/scripts/ci/check-publication-hygiene.sh" ]; then
   fi
 fi
 
+# ---- guard 1b: the shared rule ----------------------------------------------
+# Hosts must use shared policy, not copy or bypass it; the dependency
+# direction must hold. See scripts/ci/shared-contracts.toml.
+if [ -f "$REPO/scripts/check_shared_contracts.py" ]; then
+  if ! python3 "$REPO/scripts/check_shared_contracts.py" >/tmp/arcen-contracts.$$ 2>&1; then
+    grep -E 'FAIL' /tmp/arcen-contracts.$$ | head -20
+    echo "pre-commit: BLOCKED by shared contracts." >&2
+    FAILED=1
+  else
+    tail -1 /tmp/arcen-contracts.$$
+  fi
+  rm -f /tmp/arcen-contracts.$$
+fi
+if [ -x "$REPO/scripts/ci/check-workspace-boundaries.sh" ] && command -v jq >/dev/null; then
+  if ! "$REPO/scripts/ci/check-workspace-boundaries.sh"; then
+    echo "pre-commit: BLOCKED by workspace boundaries." >&2
+    FAILED=1
+  fi
+fi
+
 # ---- guard 2: secrets (opt-in) ---------------------------------------------
 if [ -n "${ARCEN_SECRET_VALUES:-}" ]; then
   if ! "$REPO/scripts/review/secret-scan.sh" >/tmp/arcen-secret-scan.$$ 2>&1; then

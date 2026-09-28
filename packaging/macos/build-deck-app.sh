@@ -2,7 +2,8 @@
 # Build "Arcen Deck.app" — the macOS client bundle.
 #
 # Compiles arcen-deck-macos in release and assembles a minimal .app around it.
-# Output: <repo>/Arcen Deck.app (git-ignored; regenerate any time with this script).
+# Output: <repo>/dist/macos/Arcen Deck.app (git-ignored; regenerate any time with
+# this script). --release also writes dist/macos/Arcen-Deck-<version>-macOS.zip.
 #
 # Usage: packaging/macos/build-deck-app.sh [--no-build] [--release | --dev-sign]
 #
@@ -18,7 +19,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-APP="$REPO/Arcen Deck.app"
+OUT="$REPO/dist/macos"
+APP="$OUT/Arcen Deck.app"
+mkdir -p "$OUT"
 BIN="$REPO/target/release/arcen-deck"
 PLIST="$HERE/Deck-Info.plist"
 # Hard USB is a product feature, so the helper is embedded unless someone
@@ -259,6 +262,11 @@ run_signed_assembly() {
         xcrun stapler validate "$APP"
         spctl --assess --type execute --verbose=2 "$APP"
         echo "==> stapled — app is notarized and Gatekeeper-clean"
+        DECK_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
+        RELEASE_ZIP="$OUT/Arcen-Deck-$DECK_VERSION-macOS.zip"
+        rm -f "$RELEASE_ZIP"
+        ditto -c -k --keepParent "$APP" "$RELEASE_ZIP"
+        echo "==> wrote $RELEASE_ZIP"
     else
         echo "==> signed with a local Apple Development identity — development mode only, not notarized"
     fi

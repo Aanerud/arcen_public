@@ -1,4 +1,7 @@
 /target/
+# Scratch directories some crate tests create beside their manifest.
+/hosts/*/target/
+/clients/*/target/
 /.idea/
 /.vscode/
 .DS_Store
@@ -6,17 +9,21 @@
 *.tmp
 __pycache__/
 *.py[cod]
-# Runtime log of the five-minute disk guardian (scripts/disk-guardian.sh)
+# Runtime log of the disk guardian (.claude/disk-guardian.sh)
 .disk-guardian.log
 # Local reference corpus is never source input and must never be committed.
 refference/
-# Built macOS client bundle (regenerate: packaging/macos/build-deck-app.sh)
+# macOS bundles now build into dist/macos/; these cover older checkouts and
+# worktrees whose scripts still write them to the repository root.
 Arcen Deck.app/
 Arcen Pier.app/
 Arcen Agent Helper.app/
 .gstack/
 # Local key material. Never commit.
 /keys/
+# Support bundles copied from hosts hold logs, configuration and host
+# identity. Never commit.
+/support/
 # Provisioning profiles contain sensitive team credentials — store outside git or in AppleCerts/
 # The rule is deliberately unanchored: the Pier has its own profile now, and a
 # path-specific pattern only protects the one directory someone thought of.
@@ -26,7 +33,7 @@ Arcen Agent Helper.app/
 dist/*
 !dist/README.md
 
-# Lab installer output (built binaries, never committed)
+# Retired lab installer output directory; installers now go to dist/<platform>/.
 /dist-installers/
 
 # ---------------------------------------------------------------------------

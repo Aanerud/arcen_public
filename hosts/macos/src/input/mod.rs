@@ -24,7 +24,10 @@ use arcen_input::{
     KeyboardEvent, PenEdge, PenTool, PenToolState, PointerButton, PointerMotion, PointerMotionMode,
     PointerScroll,
 };
-use arcen_protocol::messages::PenEventMsg;
+use arcen_protocol::messages::{
+    GestureMagnifyMsg, GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, PenEventMsg,
+    SwipeDirectionMsg,
+};
 use serde::Serialize;
 
 /// Opaque `CoreGraphics` event source.
@@ -33,11 +36,13 @@ type CGEventSourceRef = *mut c_void;
 type CGEventRef = *mut c_void;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct CGPoint {
-    x: f64,
-    y: f64,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativePoint {
+    pub x: f64,
+    pub y: f64,
 }
+
+type CGPoint = NativePoint;
 
 // Event source states. `HIDSystemState` makes injected events observe the same
 // modifier and lock state the physical keyboard does.
@@ -182,6 +187,10 @@ pub enum InputError {
     /// Input may only go through the virtual HID devices here, and they are
     /// not available.
     VirtualHidUnavailable,
+    /// A gesture message was malformed or outside the host's supported set.
+    InvalidGesture(&'static str),
+    /// This gesture cannot be injected by the current adapter.
+    Unsupported,
 }
 
 impl std::fmt::Display for InputError {
@@ -196,6 +205,8 @@ impl std::fmt::Display for InputError {
             Self::NoDesktopBounds => formatter.write_str("desktop bounds are empty"),
             Self::VirtualHidUnavailable => formatter
                 .write_str("input here goes only through virtual HID, which is unavailable"),
+            Self::InvalidGesture(what) => write!(formatter, "invalid {what} gesture"),
+            Self::Unsupported => formatter.write_str("input gesture is unsupported"),
         }
     }
 }
@@ -260,7 +271,7 @@ impl DesktopBounds {
     /// the shared region should stop at the edge, not jump somewhere else or
     /// drop the event.
     #[must_use]
-    fn to_global(self, x: f64, y: f64) -> CGPoint {
+    pub fn to_global(self, x: f64, y: f64) -> NativePoint {
         let clamped_x = x.clamp(0.0, 1.0);
         let clamped_y = y.clamp(0.0, 1.0);
         // The far edge is the last point *on* the display. `origin + width`
@@ -269,7 +280,7 @@ impl DesktopBounds {
         // right edge put the host cursor on the monitor to the right.
         let last_x = self.origin_x + (self.width - 1.0).max(0.0);
         let last_y = self.origin_y + (self.height - 1.0).max(0.0);
-        CGPoint {
+        NativePoint {
             x: (self.origin_x + clamped_x * self.width).min(last_x),
             y: (self.origin_y + clamped_y * self.height).min(last_y),
         }
@@ -556,7 +567,7 @@ impl InputController {
             held_keys: BTreeSet::new(),
             held_buttons: 0,
             scroll_remainder: (0.0, 0.0),
-            last_position: CGPoint {
+            last_position: NativePoint {
                 x: bounds.origin_x + bounds.width / 2.0,
                 y: bounds.origin_y + bounds.height / 2.0,
             },
@@ -734,12 +745,12 @@ impl InputController {
             return Ok(());
         }
         let point = self.bounds.to_global(motion.x, motion.y);
-        self.post_motion(point)?;
+        self.post_native_motion(point)?;
         self.stats.pointer_moves += 1;
         Ok(())
     }
 
-    fn post_motion(&mut self, point: CGPoint) -> Result<(), InputError> {
+    pub fn post_native_motion(&mut self, point: NativePoint) -> Result<(), InputError> {
         let (event_type, button) = motion_event_type(self.held_buttons);
         // Absolute placement has to be exact. Posting a mouse event alone goes
         // through the HID system's pointer acceleration, which lands the
@@ -825,6 +836,88 @@ impl InputController {
         Ok(())
     }
 
+    /// Injects a pointer button transition at an already mapped native point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::EventCreationFailed`] when `CoreGraphics` refuses
+    /// the event.
+    pub fn native_pointer_button(
+        &mut self,
+        button: u8,
+        pressed: bool,
+        point: NativePoint,
+    ) -> Result<(), InputError> {
+        self.post_button(button, pressed, point)
+    }
+
+    /// Injects a scroll sample at an already mapped native point.
+    ///
+    /// Region input deltas are fixed-point logical pixels; macOS point-unit
+    /// scrolling consumes ordinary points, so the adapter converts by the
+    /// shared logical-units denominator before reaching here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::EventCreationFailed`] when `CoreGraphics` refuses
+    /// the event.
+    pub fn native_pointer_scroll(
+        &mut self,
+        point: NativePoint,
+        delta_x: f64,
+        delta_y: f64,
+        unit: arcen_input::ScrollUnit,
+        phase: arcen_input::ScrollPhase,
+    ) -> Result<(), InputError> {
+        self.post_native_motion(point)?;
+        let (cg_unit, vertical, horizontal) = match unit {
+            arcen_input::ScrollUnit::Line => (
+                K_CG_SCROLL_EVENT_UNIT_LINE,
+                finite_delta(delta_y),
+                finite_delta(delta_x),
+            ),
+            arcen_input::ScrollUnit::Point => {
+                let (x, y) = self.scroll_remainder;
+                let x = x + if delta_x.is_finite() { delta_x } else { 0.0 };
+                let y = y + if delta_y.is_finite() { delta_y } else { 0.0 };
+                let (vertical, horizontal) = (finite_delta(y), finite_delta(x));
+                self.scroll_remainder = (x - f64::from(horizontal), y - f64::from(vertical));
+                if matches!(
+                    phase,
+                    arcen_input::ScrollPhase::Ended | arcen_input::ScrollPhase::Cancelled
+                ) {
+                    self.scroll_remainder = (0.0, 0.0);
+                }
+                (K_CG_SCROLL_EVENT_UNIT_PIXEL, vertical, horizontal)
+            }
+        };
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent2(self.source, cg_unit, 2, vertical, horizontal, 0)
+        };
+        if event.is_null() {
+            return Err(InputError::EventCreationFailed("scroll"));
+        }
+        unsafe {
+            if cg_unit == K_CG_SCROLL_EVENT_UNIT_PIXEL {
+                let phase = match phase {
+                    arcen_input::ScrollPhase::None => 0,
+                    arcen_input::ScrollPhase::Began => K_CG_SCROLL_PHASE_BEGAN,
+                    arcen_input::ScrollPhase::Changed => K_CG_SCROLL_PHASE_CHANGED,
+                    arcen_input::ScrollPhase::Ended => K_CG_SCROLL_PHASE_ENDED,
+                    arcen_input::ScrollPhase::Cancelled => K_CG_SCROLL_PHASE_CANCELLED,
+                };
+                CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+                if phase != 0 {
+                    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE, phase);
+                }
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        self.stats.scroll_events += 1;
+        Ok(())
+    }
+
     /// Injects a pen sample with its tablet surface intact.
     ///
     /// This is Basic Tablet termination: the Deck's Wacom driver has already
@@ -850,6 +943,31 @@ impl InputController {
 
         // A sample away from the tablet has nowhere to land: posting motion
         // for it would move the pointer to wherever the pen last hovered.
+        if next.in_proximity {
+            self.post_pen_motion(point, annotations)?;
+        }
+        self.pen = next;
+        self.stats.pen_samples += 1;
+        Ok(())
+    }
+
+    /// Injects a pen sample at an already mapped native point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::EventCreationFailed`] when `CoreGraphics` refuses
+    /// an event.
+    pub fn native_pen_event(
+        &mut self,
+        event: &PenEventMsg,
+        point: NativePoint,
+    ) -> Result<(), InputError> {
+        if self.hid_only {
+            return self.hid_pen_event(event);
+        }
+        let (edges, next) = pen::plan(self.pen, event);
+        let annotations = pen::tablet_point(event);
+        self.post_pen_edges(&edges, point, annotations)?;
         if next.in_proximity {
             self.post_pen_motion(point, annotations)?;
         }
@@ -1115,7 +1233,7 @@ impl InputController {
             return self.hid_scroll(scroll);
         }
         if let Some(point) = scroll_position(scroll.motion_mode, self.bounds, scroll.position) {
-            self.post_motion(point)?;
+            self.post_native_motion(point)?;
         }
         let (unit, vertical, horizontal) = match scroll.unit {
             // Non-finite deltas would become an unpredictable jump after the
@@ -1180,6 +1298,95 @@ impl InputController {
             CFRelease(event.cast_const());
         }
         self.stats.scroll_events += 1;
+        Ok(())
+    }
+
+    /// Best-available gesture injection for macOS today.
+    ///
+    /// The reference stack uses CGEvent for pointer/scroll and reserves
+    /// IOHIDUserDevice for HID devices. AppKit exposes no public CGEvent
+    /// constructor for pinch/rotate/swipe, so magnify/smart-zoom degrade to
+    /// the conventional Control-scroll zoom gesture and swipe degrades to the
+    /// platform shortcut most apps/Spaces already consume.
+    pub fn gesture_magnify(&mut self, message: &GestureMagnifyMsg) -> Result<(), InputError> {
+        message
+            .validate()
+            .map_err(|_| InputError::InvalidGesture("magnify"))?;
+        self.post_control_scroll((message.scale_delta * 240.0).round() as i32)
+    }
+
+    /// Rotation has no public CGEvent equivalent, and a remote session must
+    /// not end because a Deck sent a gesture this host can only decline.
+    pub fn gesture_rotate(&mut self, message: &GestureRotateMsg) -> Result<(), InputError> {
+        message
+            .validate()
+            .map_err(|_| InputError::InvalidGesture("rotate"))?;
+        tracing::debug!(
+            target: arcen_telemetry::names::target::HID,
+            degrees = message.degrees_delta,
+            "rotate gesture declined: no public macOS injection"
+        );
+        Ok(())
+    }
+
+    pub fn gesture_smart_zoom(&mut self, message: &GestureSmartZoomMsg) -> Result<(), InputError> {
+        message
+            .validate()
+            .map_err(|_| InputError::InvalidGesture("smart_zoom"))?;
+        self.post_control_scroll(120)
+    }
+
+    pub fn gesture_swipe(&mut self, message: &GestureSwipeMsg) -> Result<(), InputError> {
+        message
+            .validate()
+            .map_err(|_| InputError::InvalidGesture("swipe"))?;
+        let key = match message.direction {
+            SwipeDirectionMsg::Left => 0x7B,
+            SwipeDirectionMsg::Right => 0x7C,
+            SwipeDirectionMsg::Up => 0x7E,
+            SwipeDirectionMsg::Down => 0x7D,
+        };
+        self.post_shortcut(key, K_CG_EVENT_FLAG_MASK_CONTROL)
+    }
+
+    fn post_control_scroll(&mut self, vertical: i32) -> Result<(), InputError> {
+        if vertical == 0 {
+            return Ok(());
+        }
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent2(
+                self.source,
+                K_CG_SCROLL_EVENT_UNIT_LINE,
+                1,
+                vertical,
+                0,
+                0,
+            )
+        };
+        if event.is_null() {
+            return Err(InputError::EventCreationFailed("gesture_zoom_scroll"));
+        }
+        unsafe {
+            CGEventSetFlags(event, K_CG_EVENT_FLAG_MASK_CONTROL);
+            CGEventPost(K_CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        self.stats.scroll_events += 1;
+        Ok(())
+    }
+
+    fn post_shortcut(&mut self, key: u16, flags: u64) -> Result<(), InputError> {
+        for pressed in [true, false] {
+            let event = unsafe { CGEventCreateKeyboardEvent(self.source, key, pressed) };
+            if event.is_null() {
+                return Err(InputError::EventCreationFailed("gesture_shortcut"));
+            }
+            unsafe {
+                CGEventSetFlags(event, flags);
+                CGEventPost(K_CG_HID_EVENT_TAP, event);
+                CFRelease(event.cast_const());
+            }
+        }
         Ok(())
     }
 
@@ -1329,7 +1536,7 @@ pub struct InputProbeReport {
 /// warping alone concludes the shape cannot be read, and would be measuring
 /// its own omission.
 pub fn move_pointer_for_probe(position: (f64, f64)) {
-    let point = CGPoint {
+    let point = NativePoint {
         x: position.0,
         y: position.1,
     };
@@ -1797,7 +2004,7 @@ mod tests {
     #[test]
     fn relative_button_edges_do_not_reinterpret_deltas_as_absolute_points() {
         let bounds = DesktopBounds::new(100.0, 50.0, 800.0, 600.0);
-        let last_position = CGPoint { x: 640.0, y: 360.0 };
+        let last_position = NativePoint { x: 640.0, y: 360.0 };
         let relative_delta = PointerMotion {
             x: -12.0,
             y: 7.0,

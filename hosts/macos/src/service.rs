@@ -25,9 +25,13 @@ pub const AGENT_PLIST: &str = "/Library/LaunchAgents/pier.arcen.tech.agent.plist
 pub const LEGACY_LABELS: [&str; 2] = ["pier.arcen.tech", "com.arcen.pier"];
 /// The installed network service executable.
 pub const PIER_PROGRAM: &str = "/Applications/Arcen Pier.app/Contents/MacOS/arcen-pier-macos";
-/// The installed desktop agent executable.
+/// The installed desktop agent executable. A background helper, so it is not
+/// shown in /Applications as a second app.
 pub const AGENT_PROGRAM: &str =
-    "/Applications/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper";
+    "/Library/PrivilegedHelperTools/Arcen Agent Helper.app/Contents/MacOS/arcen-agent-helper";
+/// The Pier app's bundle identifier. Both launchd jobs name it, so System
+/// Settings lists them under "Arcen Pier" instead of the signing team.
+pub const APP_BUNDLE_ID: &str = "pier.arcen.tech";
 /// Where the installer keeps the host's TLS identity.
 pub const TLS_DIRECTORY: &str = "/Library/Application Support/Arcen/tls";
 /// Unprivileged account the network service runs as.
@@ -46,6 +50,8 @@ pub enum ServiceError {
     Launchctl(String),
     /// The installed binary could not be located.
     MissingProgram(PathBuf),
+    /// The shared installer transaction refused the step or never finished.
+    Transaction(String),
 }
 
 impl std::fmt::Display for ServiceError {
@@ -59,6 +65,7 @@ impl std::fmt::Display for ServiceError {
             Self::MissingProgram(path) => {
                 write!(formatter, "no Pier binary at {}", path.display())
             }
+            Self::Transaction(detail) => formatter.write_str(detail),
         }
     }
 }
@@ -80,6 +87,10 @@ pub fn daemon_plist(program: &Path, tls_directory: &Path) -> String {
 <dict>
     <key>Label</key>
     <string>{DAEMON_LABEL}</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>{APP_BUNDLE_ID}</string>
+    </array>
     <key>ProgramArguments</key>
     <array>
         <string>{program}</string>
@@ -141,6 +152,10 @@ pub fn agent_plist(program: &Path) -> String {
 <dict>
     <key>Label</key>
     <string>{AGENT_LABEL}</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>{APP_BUNDLE_ID}</string>
+    </array>
     <key>ProgramArguments</key>
     <array>
         <string>{program}</string>
@@ -253,8 +268,15 @@ pub fn install(program: &Path, tls_directory: &Path) -> Result<(), ServiceError>
     // the other two hosts do not follow. It also refuses to let activation be
     // reported before staging, which is the mistake that leaves a machine
     // claiming to run a service whose definition was never written.
-    let mut transaction = arcen_session::install_lifecycle::InstallTransaction::new();
-    let _ = transaction.apply(arcen_session::install_lifecycle::InstallEvent::PreflightPassed);
+    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
+    fn step(transaction: &mut InstallTransaction, event: InstallEvent) -> Result<(), ServiceError> {
+        transaction
+            .apply(event)
+            .map(|_| ())
+            .map_err(|error| ServiceError::Transaction(error.to_string()))
+    }
+    let mut transaction = InstallTransaction::new();
+    step(&mut transaction, InstallEvent::PreflightPassed)?;
 
     std::fs::create_dir_all(LOG_DIRECTORY)
         .map_err(|error| ServiceError::Io(format!("create {LOG_DIRECTORY}: {error}")))?;
@@ -267,29 +289,43 @@ pub fn install(program: &Path, tls_directory: &Path) -> Result<(), ServiceError>
     let plist = daemon_plist(program, tls_directory);
     std::fs::write(DAEMON_PLIST, plist)
         .map_err(|error| ServiceError::Io(format!("write {DAEMON_PLIST}: {error}")))?;
-    let _ = transaction.apply(arcen_session::install_lifecycle::InstallEvent::PayloadStaged);
+    step(&mut transaction, InstallEvent::PayloadStaged)?;
 
     // Replace any previous definition rather than layering on top of it.
     let _ = bootout();
-    let _ = transaction.apply(arcen_session::install_lifecycle::InstallEvent::ServiceQuiesced);
+    step(&mut transaction, InstallEvent::ServiceQuiesced)?;
 
-    match bootstrap() {
-        Ok(()) => {
-            let _ = transaction
-                .apply(arcen_session::install_lifecycle::InstallEvent::ActivationCommitted);
-            Ok(())
-        }
-        Err(error) => {
-            // Previously the plist stayed on disk when launchd refused it, so
-            // the machine was left with a definition nothing had loaded: the
-            // next boot would start a service the operator had been told
-            // failed to install, and `uninstall` was the only way back.
-            rollback_definition(previous.as_deref());
-            let _ = transaction
-                .apply(arcen_session::install_lifecycle::InstallEvent::TransactionFailed);
-            Err(error)
-        }
+    if let Err(error) = bootstrap() {
+        // Previously the plist stayed on disk when launchd refused it, so
+        // the machine was left with a definition nothing had loaded: the
+        // next boot would start a service the operator had been told
+        // failed to install, and `uninstall` was the only way back.
+        rollback_definition(previous.as_deref());
+        step(&mut transaction, InstallEvent::TransactionFailed)?;
+        return Err(error);
     }
+    step(&mut transaction, InstallEvent::ActivationCommitted)?;
+    // Loaded is not running: prove it before reporting an install.
+    let mut launchd = crate::activation::SystemLaunchd;
+    let target = format!("system/{DAEMON_LABEL}");
+    let running = (0..10).any(|attempt| {
+        if attempt > 0 {
+            crate::activation::Launchd::pause(&mut launchd, std::time::Duration::from_secs(1));
+        }
+        crate::activation::Launchd::running(&mut launchd, &target)
+    });
+    step(
+        &mut transaction,
+        if running {
+            InstallEvent::SmokePassed
+        } else {
+            InstallEvent::TransactionFailed
+        },
+    )?;
+    transaction
+        .finish()
+        .map(|_| ())
+        .map_err(|error| ServiceError::Transaction(format!("{error}; see {LOG_DIRECTORY}")))
 }
 
 /// Puts the launchd definition back the way it was found.
@@ -457,6 +493,19 @@ mod tests {
             "one path for every user's agent is owned by whoever wrote it first"
         );
         assert!(!plist.contains("<key>UserName</key>"));
+    }
+
+    #[test]
+    fn both_jobs_are_attributed_to_the_pier_app() {
+        // Without this, Login Items lists the jobs under the signing team's
+        // name, which reads as an unrelated second app.
+        let expected = format!(
+            "<key>AssociatedBundleIdentifiers</key>\n    <array>\n        \
+             <string>{APP_BUNDLE_ID}</string>"
+        );
+        for plist in [rendered(), agent_plist(Path::new(AGENT_PROGRAM))] {
+            assert!(plist.contains(&expected), "{plist}");
+        }
     }
 
     #[test]

@@ -23,6 +23,13 @@ use crate::capture::{
 use crate::encode::{EncodedAccessUnit, Encoder, EncoderCodec, EncoderConfig};
 use crate::net::PierSocket;
 
+/// Authoritative input-mode result messages sent once, before media/input flow starts.
+#[derive(Debug, Clone, Default)]
+pub struct InputModeResults {
+    pub cursor: arcen_protocol::messages::CursorModeResultMsg,
+    pub tablet: arcen_protocol::messages::TabletModeResultMsg,
+}
+
 /// How long to wait for a frame before deciding the display is idle.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const FRAME_TIMEOUT_ENV: &str = "ARCEN_FRAME_TIMEOUT_MS";
@@ -142,6 +149,8 @@ pub enum StreamError {
     Input(String),
     /// The clipboard service could not be established or framed.
     Clipboard(String),
+    /// A control message could not be encoded or decoded.
+    Protocol(String),
 }
 
 impl std::fmt::Display for StreamError {
@@ -153,6 +162,7 @@ impl std::fmt::Display for StreamError {
             Self::WriteTimeout => formatter.write_str("client write timed out"),
             Self::Input(detail) => write!(formatter, "input: {detail}"),
             Self::Clipboard(detail) => write!(formatter, "clipboard: {detail}"),
+            Self::Protocol(detail) => write!(formatter, "protocol: {detail}"),
         }
     }
 }
@@ -376,24 +386,26 @@ async fn send_audio(
         return Ok(());
     };
     let mut packets = session.drain_packets();
-    // Bounded before writing, not after. This drain used to write every packet
-    // the capture side had accumulated, and that buffer holds two seconds of
-    // stereo — up to a hundred packets, each one an await on the same
-    // connection the video uses, ahead of video in the loop that picks what to
-    // do next. A backlog therefore did not merely delay sound, it held the
-    // writer while frames queued behind it. The Linux Pier has never had this
-    // shape: it bounds the queue at eight and takes one packet at a time.
-    let dropped = arcen_media::audio::trim_audio_backlog(
-        &mut packets,
-        arcen_media::audio::AUDIO_SEND_BACKLOG_PACKETS,
-    );
-    if dropped > 0 {
-        *stats_dropped += dropped as u64;
-        tracing::debug!(
-            target: arcen_telemetry::names::target::MEDIA,
-            dropped,
-            "dropped audio too old to play in time rather than delay the picture behind it"
+    if side_channel.is_none() {
+        // Bounded before writing, not after. This drain used to write every packet
+        // the capture side had accumulated, and that buffer holds two seconds of
+        // stereo — up to a hundred packets, each one an await on the same
+        // connection the video uses, ahead of video in the loop that picks what to
+        // do next. A backlog therefore did not merely delay sound, it held the
+        // writer while frames queued behind it. The Linux Pier has never had this
+        // shape: it bounds the queue at eight and takes one packet at a time.
+        let dropped = arcen_media::audio::trim_audio_backlog(
+            &mut packets,
+            arcen_media::audio::AUDIO_SEND_BACKLOG_PACKETS,
         );
+        if dropped > 0 {
+            *stats_dropped += dropped as u64;
+            tracing::debug!(
+                target: arcen_telemetry::names::target::MEDIA,
+                dropped,
+                "dropped audio too old to play in time rather than delay the picture behind it"
+            );
+        }
     }
     for packet in packets {
         let Some(payload) = encoder.encode(&packet, clock.next()) else {
@@ -404,16 +416,12 @@ async fn send_audio(
         // audio than is worth playing; this packet is dropped and counted,
         // and the loop goes on reading input and taking frames.
         if let Some(channel) = side_channel {
+            // The lane is sized for a burst (AUDIO_PRIORITY_SEND_BACKLOG_PACKETS),
+            // so a full lane is a stalled writer, not jitter: drop and count
+            // rather than let audio block video and input.
             match channel.try_send(payload) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    *stats_dropped += 1;
-                    continue;
-                }
-                // The side channel went away; nothing else of the session
-                // depends on it, so the rest of this session is silent rather
-                // than ended.
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(_) => {
                     *stats_dropped += 1;
                     continue;
                 }
@@ -453,8 +461,9 @@ fn spawn_audio_channel(
     let Some(mut channel) = channel else {
         return (None, None);
     };
-    let (sender, mut frames) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(arcen_media::audio::AUDIO_SEND_BACKLOG_PACKETS);
+    let (sender, mut frames) = tokio::sync::mpsc::channel::<Vec<u8>>(
+        arcen_media::audio::AUDIO_PRIORITY_SEND_BACKLOG_PACKETS,
+    );
     let task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt as _;
         while let Some(frame) = frames.recv().await {
@@ -676,6 +685,18 @@ async fn enqueue(
         .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))
 }
 
+async fn send_input_mode_results(
+    writer: &tokio::sync::mpsc::Sender<Message>,
+    results: &InputModeResults,
+) -> Result<(), StreamError> {
+    let cursor = serde_json::to_string(&results.cursor)
+        .map_err(|error| StreamError::Protocol(format!("serialize cursor mode result: {error}")))?;
+    enqueue(writer, Message::Text(cursor)).await?;
+    let tablet = serde_json::to_string(&results.tablet)
+        .map_err(|error| StreamError::Protocol(format!("serialize tablet mode result: {error}")))?;
+    enqueue(writer, Message::Text(tablet)).await
+}
+
 /// Sends one message with an explicit write deadline.
 ///
 /// # Errors
@@ -715,6 +736,8 @@ where
 enum Incoming {
     /// Handled; keep streaming.
     Continue,
+    /// Transport path signal injected by a split service relay.
+    PathSignal(arcen_telemetry::PathSignal),
     /// Handled, and the client is owed this answer.
     Reply(String),
     /// The client is gone.
@@ -748,6 +771,16 @@ fn handle_control(
             serde_json::to_string(&health_reply)
                 .ok()
                 .map(Incoming::Reply)
+        }
+        "path_signal" => {
+            serde_json::from_value::<arcen_session::agent_relay::ServiceMessage>(value)
+                .ok()
+                .and_then(|message| match message {
+                    arcen_session::agent_relay::ServiceMessage::PathSignal { signal, .. } => {
+                        Some(Incoming::PathSignal(signal))
+                    }
+                    _ => None,
+                })
         }
         arcen_protocol::messages::REQUEST_FULL_FRAME => {
             stats.full_frame_requests += 1;
@@ -941,6 +974,7 @@ struct ProducerSignals<'a> {
 fn spawn_producer(
     capture: CaptureConfig,
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
     frame_budget: Option<u64>,
 ) -> Producer {
     // Two, not eight. Encoded frames cannot be dropped to catch up — a P-frame
@@ -965,6 +999,7 @@ fn spawn_producer(
         produce(
             capture,
             codec,
+            motion_priority,
             frame_budget,
             &frames_tx,
             ProducerSignals {
@@ -991,6 +1026,7 @@ fn spawn_producer(
 fn spawn_multi_producer(
     monitors: Vec<RegionStreamPlan>,
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
     frame_budget: Option<u64>,
 ) -> Producer {
     // Two per monitor, for the reason given in `spawn_producer`.
@@ -1011,6 +1047,7 @@ fn spawn_multi_producer(
         produce_multi(
             &monitors,
             codec,
+            motion_priority,
             frame_budget,
             &frames_tx,
             ProducerSignals {
@@ -1276,6 +1313,8 @@ pub struct StreamSession<'a> {
     pub capture: CaptureConfig,
     /// Which encoder.
     pub codec: EncoderCodec,
+    /// Shared detail/motion trade-off hook for this session.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// Stop after this many frames, for probes and tests.
     pub frame_budget: Option<u64>,
     /// Where normalized input coordinates land.
@@ -1295,12 +1334,17 @@ pub struct StreamSession<'a> {
     /// Who draws the pointer: the Deck locally, or the compositor into the
     /// picture. Only the local case wants a shape reported.
     pub cursor_mode: arcen_protocol::messages::CursorMode,
+    /// Authoritative cursor/tablet negotiation results for this session.
+    pub input_mode_results: InputModeResults,
     /// The service's audio side channel for this session, when the Deck
     /// accepts audio on its own priority stream. Audio sent here never waits
     /// behind a video frame on the session socket.
     pub audio_channel: Option<tokio::net::UnixStream>,
     /// How audio is encoded for the wire.
     pub audio_encoding: AudioEncoding,
+    /// Direct QUIC connection for path sampling. Relayed agents receive the
+    /// same signal as local control messages injected by the service relay.
+    pub path_signal_connection: Option<quinn::Connection>,
 }
 
 /// How a session's audio is encoded for the wire.
@@ -1385,8 +1429,9 @@ pub struct RegionStreamPlan {
 pub struct MultiStreamSession<'a> {
     pub monitors: Vec<RegionStreamPlan>,
     pub codec: EncoderCodec,
+    pub motion_priority: arcen_media::video::MotionPriority,
     pub frame_budget: Option<u64>,
-    pub input_bounds: crate::input::DesktopBounds,
+    pub input: crate::input_session::InputMode,
     pub telemetry: crate::observability::HostTelemetry,
     pub session_id: arcen_telemetry::CorrelationId,
     pub audio: Option<&'a mut crate::audio::AudioCaptureSession>,
@@ -1395,6 +1440,8 @@ pub struct MultiStreamSession<'a> {
     /// Who draws the pointer: the Deck locally, or the compositor into the
     /// picture. Only the local case wants a shape reported.
     pub cursor_mode: arcen_protocol::messages::CursorMode,
+    /// Authoritative cursor/tablet negotiation results for this session.
+    pub input_mode_results: InputModeResults,
     /// How audio is encoded for the wire.
     pub audio_encoding: AudioEncoding,
 }
@@ -1443,8 +1490,11 @@ pub async fn stream(
         mut audio,
         clipboard: clipboard_negotiation,
         cursor_mode: session_cursor_mode,
+        input_mode_results,
         audio_channel,
         audio_encoding,
+        path_signal_connection,
+        motion_priority,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     let (side_audio, side_audio_writer) = spawn_audio_channel(audio_channel);
@@ -1456,34 +1506,32 @@ pub async fn stream(
         keyframe_requests,
         suppressed: capture_suppressed,
         rate: encode_rate,
-    } = spawn_producer(capture, codec, frame_budget);
+    } = spawn_producer(capture, codec, motion_priority, frame_budget);
     // What the path carries decides how fast to encode; see
     // `arcen_media::rate_control`. The ceiling is what this session was sized
     // for, the rate the encoder starts at.
-    let ceiling_bps = u64::try_from(
-        crate::encode::EncoderConfig::realtime_for(
-            i32::try_from(capture.width).unwrap_or(1920),
-            i32::try_from(capture.height).unwrap_or(1080),
-            codec,
-            capture.fps,
-            capture.pixel_format.chroma(),
-            capture.pixel_format.bit_depth(),
-        )
-        .bitrate_bps,
-    )
-    .unwrap_or(8_000_000);
+    let width = u32::try_from(capture.width).unwrap_or(u32::MAX);
+    let height = u32::try_from(capture.height).unwrap_or(u32::MAX);
+    let fps = capture.fps;
+    let chroma = capture.pixel_format.chroma();
+    let depth = capture.pixel_format.bit_depth();
+    let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+        width, height, fps, chroma, depth,
+    ));
+    let ceiling_bps = u64::from(arcen_media::video::average_bitrate_bps(
+        width, height, fps, chroma, depth,
+    ));
     let mut rate_controller = arcen_media::rate_control::RateController::new(
-        arcen_media::rate_control::RateControlPolicy::for_ceiling(ceiling_bps),
+        arcen_media::rate_control::RateControlPolicy::for_bounds_and_priority(
+            start_bps,
+            ceiling_bps,
+            motion_priority,
+        ),
     );
+    let mut path_state = arcen_telemetry::PathSignalState::default();
+    let mut latest_path_signal: Option<arcen_media::rate_control::PathSignal> = None;
     let mut rate_tick = tokio::time::interval(RATE_TICK);
-    // Opt-in until it has a signal it can trust. Measured: frames almost never
-    // wait in the agent (mean 0.03 ms) because congestion first queues inside
-    // QUIC's 256 KiB floor, where this loop cannot see it; and a keyframe's
-    // wait in a session's first second read as congestion and cut the rate
-    // towards the little that had been delivered yet. On one path, enabled
-    // measured p95 frame age 624 ms against 9 ms disabled. It needs the
-    // service's transport delay (cwnd, RTT, bytes waiting) before it decides.
-    let rate_control = std::env::var("ARCEN_RATE_CONTROL").as_deref() == Ok("1");
+    let rate_control = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
     let mut rate_mark = (0_u64, 0_u64, Duration::ZERO);
 
     // The rate this session promised, so a snapshot can say whether it is being
@@ -1544,6 +1592,7 @@ pub async fn stream(
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
         tokio::pin!(pump);
+        send_input_mode_results(&priority, &input_mode_results).await?;
         // A session without an event source still streams; it just carries no
         // input, which is better than refusing the desktop.
         // Only worth running when the Deck draws the pointer itself. In host
@@ -1604,6 +1653,10 @@ pub async fn stream(
                         Some(&mut last_keyframe_request),
                     )? {
                         Incoming::Continue => continue,
+                        Incoming::PathSignal(signal) => {
+                            latest_path_signal = Some(signal);
+                            continue;
+                        }
                         Incoming::Reply(text) => {
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
@@ -1685,6 +1738,16 @@ pub async fn stream(
                 _ = rate_tick.tick() => {
                     let (bytes, frames, queued) = rate_mark;
                     let frames_now = stats.frames_sent.saturating_sub(frames);
+                    let path = path_signal_connection
+                        .as_ref()
+                        .map(|connection| {
+                            arcen_transport::observe_quinn_path_signal(
+                                &mut path_state,
+                                started.elapsed(),
+                                connection,
+                            )
+                        })
+                        .or(latest_path_signal);
                     let sample = arcen_media::rate_control::RateSample {
                         delivered_bytes: stats.bytes_sent.saturating_sub(bytes),
                         elapsed: RATE_TICK,
@@ -1693,14 +1756,23 @@ pub async fn stream(
                             .checked_div(u32::try_from(frames_now).unwrap_or(u32::MAX))
                             .unwrap_or_default(),
                         frames: frames_now,
+                        pipeline_count: 1,
+                        path,
                     };
                     rate_mark = (stats.bytes_sent, stats.frames_sent, total_queue);
-                    if let Some(target) = rate_controller.observe(sample).filter(|_| rate_control) {
-                        encode_rate.store(target, std::sync::atomic::Ordering::Relaxed);
+                    if rate_control && let Some(change) = rate_controller.observe(sample) {
+                        encode_rate.store(change.target_bps, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(
                             target: arcen_telemetry::names::target::MEDIA,
-                            target_bps = target,
+                            previous_bps = change.previous_bps,
+                            target_bps = change.target_bps,
+                            reason = change.reason.token(),
                             delivered_bps = sample.delivered_bytes * 8,
+                            rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
+                            queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                loss_rate_permille = sample
+                                    .path
+                                    .map(|path| (path.loss_rate() * 1000.0).round() as u64),
                             mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
                             "encoder rate follows the path"
                         );
@@ -1812,13 +1884,15 @@ pub async fn stream_multi(
     let MultiStreamSession {
         monitors,
         codec,
+        motion_priority,
         frame_budget,
-        input_bounds,
+        input,
         telemetry,
         session_id,
         mut audio,
         clipboard: clipboard_negotiation,
         cursor_mode: session_cursor_mode,
+        input_mode_results,
         audio_encoding,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
@@ -1836,7 +1910,7 @@ pub async fn stream_multi(
         keyframe_requests,
         suppressed: capture_suppressed,
         rate: _,
-    } = spawn_multi_producer(monitors, codec, frame_budget);
+    } = spawn_multi_producer(monitors, codec, motion_priority, frame_budget);
 
     // Every monitor in a multi-display session is captured at the same rate,
     // and the aggregate `frames_sent` counts all of them, so the target a
@@ -1870,7 +1944,7 @@ pub async fn stream_multi(
     // Ownership, not a shared borrow: `ClipboardWorker` holds an
     // `mpsc::Receiver`, which is `Send` but not `Sync`, so a `&` spanning an
     // await would make this future non-`Send` and unspawnable.
-    let mut input = crate::input_session::InputSession::new(input_bounds).ok();
+    let mut input = input.start().ok();
     // A failed start is carried in rather than raised here, so it still ends the
     // session through `finish` and is reported like every other stream failure.
     let (mut clipboard, clipboard_start) = match start_clipboard(clipboard_negotiation) {
@@ -1890,6 +1964,7 @@ pub async fn stream_multi(
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
         tokio::pin!(pump);
+        send_input_mode_results(&priority, &input_mode_results).await?;
         // Only worth running when the Deck draws the pointer itself. In host
         // cursor mode the compositor already draws the real one into the
         // picture, and naming it as well would have the Deck draw a second.
@@ -1939,6 +2014,7 @@ pub async fn stream_multi(
                         Some(&mut last_keyframe_request),
                     )? {
                         Incoming::Continue => continue,
+                        Incoming::PathSignal(_) => continue,
                         Incoming::Reply(text) => {
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
@@ -2400,6 +2476,7 @@ impl LatestFrame {
 fn produce(
     capture: CaptureConfig,
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
     frame_budget: Option<u64>,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
     signals: ProducerSignals<'_>,
@@ -2421,6 +2498,7 @@ fn produce(
                 EncodeLoopContext {
                     capture,
                     codec,
+                    motion_priority,
                     frame_budget,
                     frames,
                     cancelled,
@@ -2594,6 +2672,7 @@ fn capture_loop(
 struct EncodeLoopContext<'a> {
     capture: CaptureConfig,
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
     frame_budget: Option<u64>,
     frames: &'a tokio::sync::mpsc::Sender<Result<Produced, String>>,
     cancelled: &'a std::sync::atomic::AtomicBool,
@@ -2743,6 +2822,14 @@ fn observe_damage(
     }
 }
 
+fn detail_frame_interval(max_fps: u32, start_bps: u64, target_bps: u64) -> Duration {
+    Duration::from_secs_f64(
+        1.0 / f64::from(
+            arcen_media::rate_control::detail_framerate(max_fps, start_bps, target_bps).max(1),
+        ),
+    )
+}
+
 /// Encodes the newest captured frame and hands it to the writer.
 ///
 /// Blocking here is now safe in a way it was not before: this thread blocking
@@ -2771,8 +2858,17 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         keyframe_requests,
         suppressed,
         rate,
+        motion_priority,
     } = context;
     let mut applied_rate = 0_u64;
+    let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+        u32::try_from(capture.width).unwrap_or(u32::MAX),
+        u32::try_from(capture.height).unwrap_or(u32::MAX),
+        capture.fps,
+        capture.pixel_format.chroma(),
+        capture.pixel_format.bit_depth(),
+    ));
+    let mut detail_interval = Duration::from_secs_f64(1.0 / f64::from(capture.fps.max(1)));
     let mut encoder = Encoder::new(
         EncoderConfig::realtime_for(
             i32::try_from(capture.width).unwrap_or(1920),
@@ -2782,6 +2878,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
             capture.pixel_format.chroma(),
             capture.pixel_format.bit_depth(),
         )
+        .with_motion_priority(motion_priority)
         .with_colour(crate::encode::colour_for_capture(&capture))
         .with_diagnostic_bitrate_override(),
     )
@@ -2818,6 +2915,9 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         // rate for the frames that follow.
         let wanted = rate.load(std::sync::atomic::Ordering::Relaxed);
         if wanted != 0 && wanted != applied_rate {
+            if motion_priority == arcen_media::video::MotionPriority::Detail {
+                detail_interval = detail_frame_interval(capture.fps, start_bps, wanted);
+            }
             match encoder.set_average_bitrate(wanted) {
                 Ok(()) => applied_rate = wanted,
                 Err(error) => {
@@ -2907,6 +3007,14 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         }
         let idr_pending = keyframe_requests.load(std::sync::atomic::Ordering::Relaxed)
             != encoded_keyframe_request;
+        if motion_priority == arcen_media::video::MotionPriority::Detail
+            && !idr_pending
+            && last_emit.elapsed() < detail_interval
+        {
+            suppressed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            suppressed_here += 1;
+            continue;
+        }
         let decision = cadence.decision(idr_pending, last_emit.elapsed());
         // Kept whatever the decision, because the damage it carries has already
         // been accumulated and a later frame will need this picture to serve a
@@ -3095,6 +3203,7 @@ impl HdrWhiteStats {
 fn make_region_encoders(
     monitors: &[RegionStreamPlan],
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
 ) -> Result<Vec<RegionEncoder>, StreamError> {
     monitors
         .iter()
@@ -3109,6 +3218,7 @@ fn make_region_encoders(
                     plan.capture.pixel_format.chroma(),
                     plan.capture.pixel_format.bit_depth(),
                 )
+                .with_motion_priority(motion_priority)
                 .with_colour(crate::encode::colour_for_capture(&plan.capture)),
             )
             .map_err(|error| StreamError::Encode(error.to_string()))?;
@@ -3131,6 +3241,7 @@ fn make_region_encoders(
 fn produce_multi(
     monitors: &[RegionStreamPlan],
     codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
     frame_budget: Option<u64>,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
     signals: ProducerSignals<'_>,
@@ -3146,7 +3257,7 @@ fn produce_multi(
         monitors.iter().map(|monitor| monitor.capture).collect(),
     )
     .map_err(|error| StreamError::Capture(CaptureError::StartFailed(error.to_string())))?;
-    let mut encoders = make_region_encoders(monitors, codec)?;
+    let mut encoders = make_region_encoders(monitors, codec, motion_priority)?;
     let mut sent = 0_u64;
     let mut total_captured = 0_u64;
     let mut total_encoded = 0_u64;

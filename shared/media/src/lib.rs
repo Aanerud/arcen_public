@@ -15,11 +15,13 @@ pub use arcen_keel::{
 pub mod annexb;
 mod applied_topology;
 pub mod audio;
+pub mod capenc_control;
 pub mod clipboard;
 pub mod display_color;
 mod encoder_admission;
 pub mod hevc_sps;
 mod multi_monitor;
+pub mod presentation;
 pub mod rate_control;
 mod region;
 mod region_activity;
@@ -38,21 +40,26 @@ pub use applied_topology::{
 };
 pub use arcen_protocol::messages::ClientDisplayId;
 pub use encoder_admission::{
-    EncoderAdmissionError, EncoderAdmissionThresholds, EncoderBindingId, EncoderMeasurementAdapter,
-    EncoderProbeFailure, EncoderProbeFailureKind, EncoderProbeRequest, EncoderProbeSample,
-    EncoderProbeTrace, EncoderSetAttempt, EncoderSetAttemptOutcome, EncoderSetCandidate,
-    EncoderSetDecision, EncoderSetMeasurements, EncoderThresholdViolation,
-    MAX_ENCODER_BINDING_ID_BYTES, MAX_ENCODER_PROBE_DURATION, MAX_ENCODER_PROBE_FRAMES_PER_REGION,
+    ENCODER_CAPACITY_FPS_DEGRADATION_REASON, EncoderAdmissionError, EncoderAdmissionThresholds,
+    EncoderBindingId, EncoderFpsStepdown, EncoderMeasurementAdapter, EncoderProbeFailure,
+    EncoderProbeFailureKind, EncoderProbeRequest, EncoderProbeSample, EncoderProbeTrace,
+    EncoderSetAttempt, EncoderSetAttemptOutcome, EncoderSetCandidate, EncoderSetDecision,
+    EncoderSetMeasurements, EncoderThresholdViolation, MAX_ENCODER_BINDING_ID_BYTES,
+    MAX_ENCODER_PROBE_DURATION, MAX_ENCODER_PROBE_FRAMES_PER_REGION,
     MAX_ENCODER_PROBE_WARMUP_FRAMES, MAX_ENCODER_PROBE_WINDOW, MAX_ENCODER_SET_CANDIDATES,
     RegionActivityProfile, RegionActivityProfiles, RegionAdmissionPriority, RegionEncoderBinding,
     RegionEncoderMeasurements, RegionProbeFailure, RepresentativeFrame, RepresentativeFrameKind,
-    admit_encoder_sets,
+    admit_encoder_sets, retarget_encoder_roster_fps,
 };
 pub use multi_monitor::{
     AggregateMediaBudget, AggregateMediaPlan, AppliedMonitor, AppliedMonitorTopology,
     BitrateBudgetKbps, LayoutBounds, LayoutRect, LayoutTranslation, MAX_MULTI_MONITOR_COUNT,
     MediaStreamEpoch, PerMonitorMediaPlan, RegionMediaPlan, RegionMediaRoster, RequestedMonitor,
     RequestedMonitorTopology, SessionMonitorId, TopologyGeneration,
+};
+pub use presentation::{
+    PresentationWindow, PresentationWindowReport, classify_presentation_window,
+    expected_presentable_fps, refresh_present_due,
 };
 pub use region::{
     AppliedPoint, AppliedRect, AppliedRegionDescriptor, AppliedRegionSet, AppliedSize,
@@ -1348,7 +1355,7 @@ mod tests {
     /// A live session must never emit reordered output, whatever the intent.
     ///
     /// This is the invariant behind the grading-playback defect: `Quality`
-    /// selects P6 + HIGH_QUALITY, whose driver defaults enable B-frames, and
+    /// selects P6 + `HIGH_QUALITY`, whose driver defaults enable B-frames, and
     /// Arcen has no capture timestamp on the wire to reorder them with. The
     /// constant exists so both encoder backends read the same rule and a
     /// future "let Quality use B-frames" change has to come here and read why

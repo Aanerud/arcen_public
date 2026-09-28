@@ -6,6 +6,174 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-28
+
+### Configuration
+
+- One set of defaults on every host, with everything on: the Linux, Windows
+  and macOS installers write identical common sections (10-bit video, Opus
+  audio, microphone input, clipboard both ways, time-zone redirection), and
+  `check_shared_contracts.py` fails if they drift. The file is for turning
+  things off. Multi-display is on where the host can prove it (macOS always,
+  Windows by startup selection from live DXGI/NVAPI inventory, Linux by
+  service-start NVIDIA head discovery). Existing configurations are kept on
+  upgrade.
+- Windows: multi-display no longer depends on an installer-time allow-list
+  probe. Empty `platform.multi_monitor.allowed_adapters` means any eligible
+  NVIDIA/NVENC adapter, `excluded_adapters` reserves GPUs such as an RTX card
+  for other work, and NVIDIA headless provisioning is automatic unless an
+  administrator forces it on or off.
+- Linux multi-monitor now discovers NVIDIA `DFP-N` heads automatically from a
+  short Xorg probe and ranks them by maximum pixel clock. Empty
+  `platform.multi_monitor.heads` means automatic discovery; a non-empty list is
+  an administrator override, and `advertise_enabled: false` remains the off
+  switch.
+- Windows: time-zone redirection works; the installer now creates the
+  recovery directory its crash journal needs.
+- macOS: the unused `virtual_display_enabled`, `native_login_enabled` and
+  `privileged_broker_enabled` settings are no longer written, and no longer
+  log a misleading "refusing session admission" warning.
+
+### Shared rule, enforced
+
+- `scripts/check_shared_contracts.py` (CI and pre-commit) fails when a Pier
+  stops using a shared policy it must use, when a known host-local copy of a
+  shared policy reappears, or when new portable code (no OS API) lands under
+  `hosts/`. `check-workspace-boundaries.sh` works again and proves the
+  dependency direction with a reviewed allowlist of product helper crates.
+- Every Pier drives the shared session lifecycle, and every installer the
+  shared install transaction.
+- The Linux and Windows video queues share one drop / keyframe-recovery
+  policy; macOS uses the shared audio priority stream.
+- Every host takes the Deck display's colour from the shared rule; a bright
+  display without HDR headroom is no longer counted as HDR.
+
+### Installers
+
+- An install succeeds only when the Pier is proven running: the Linux and
+  Windows installers exit non-zero when the service does not settle running,
+  and the macOS package fails when the service does not listen or a signed-in
+  user's agent does not start. A missing privacy approval is onboarding, not
+  a failure.
+- Linux: after an upgrade without `--restart`, the running Pier keeps
+  accepting new sessions on its own build until it is restarted, instead of
+  refusing every login.
+
+### Streaming
+
+- The encoder bitrate follows the QUIC path on every Pier through one shared
+  controller (`arcen_media::rate_control`). A random loss floor on Wi-Fi,
+  cellular and VPN paths is not counted as congestion, a congestion epoch
+  cuts once rather than every second, and a multi-display session is
+  measured across all of its monitors and reaches every encoder pipeline.
+  `ARCEN_RATE_CONTROL=0` restores the fixed rate.
+- Presets are stated trade-offs, not promised frame rates: when an encoder
+  cannot sustain a preset's ceiling (for example Speed at 60 fps on two
+  displays of a vGPU), the session is admitted at the best proven rate and
+  says so (`degradation_reason: fps_reduced_by_encoder_capacity`) instead of
+  being refused.
+- Every Pier now uses QUIC's BBR congestion controller, which does not read
+  random loss as congestion. On a VPN path with a few tenths of a percent of
+  random loss it gave each of two displays 2.5–3× the bitrate at half the
+  latency of Cubic, and it matched Cubic on a calm path.
+  `ARCEN_QUIC_CONGESTION=cubic` restores Cubic (Quinn marks its BBR
+  experimental).
+
+### Match my displays
+
+- Deck: with several displays the remote pointer could bounce between
+  displays about a thousand times a second (the Windows Pier lost the mouse,
+  the Linux Pier lagged); a display now moves the pointer only when its own
+  input carries a pointer event. A button released outside the display it
+  was pressed on is still delivered.
+- Windows Pier: the same user reconnecting takes over the session at once
+  instead of waiting out the resume window; a different user is still
+  refused. A new session waits for the previous one's display restore to
+  settle, and every session end rolls back the NVIDIA headless outputs it
+  provisioned.
+- macOS Pier: each session owns its virtual displays through a short-lived
+  helper process, so repeated multi-display sessions keep working.
+
+### Input
+
+- Trackpad scrolling is precise end to end: phased point deltas on macOS,
+  high-resolution wheel on Linux, fractional and horizontal wheel on Windows.
+- Negotiated gestures (`gestures_v1`): the Deck captures magnify, rotate,
+  smart zoom and swipe; the macOS Pier injects what macOS allows publicly and
+  declines rotate without ending the session.
+- macOS Pier: reports the cursor and tablet modes it applied.
+
+### Performance
+
+- Windows Pier: colour conversion runs on the GPU in every preset. Eight-bit
+  capture goes to NVENC as a texture (conversion 19.5 ms → 0), and Grading and
+  HDR convert FP16 scRGB in a compute shader (about 14 ms and 38 ms per frame
+  → under 0.1 ms), with the stream truth unchanged. The CPU path remains an
+  explicit, logged fallback.
+- macOS Pier: no audio dropped on a calm path (was 14%); VideoToolbox runs
+  with low-latency rate control.
+
+### Displays
+
+- macOS Pier: a Deck with several displays gets one virtual display per Deck
+  display, arranged as the Deck's layout (including offset arrangements),
+  with region input.
+- Deck: a launch-time quick connect negotiates Match My Layout like the Home
+  screen, and a saved connection's own Displays choice applies to it. The
+  Deck's root window sits on its fastest display, and each display presents
+  at its own refresh. Known issue: with several displays the Deck's draw loop
+  runs far more often than frames arrive, which costs CPU.
+
+### macOS Pier installer
+
+- The first page says what is installed and why it is more than one app: a
+  network service running as the hidden `_arcen` account, and a helper in
+  each signed-in session. The full reasoning is public in
+  `docs/security/macos-pier-process-model.md`.
+- The Agent Helper moves to `/Library/PrivilegedHelperTools`, so
+  Applications shows one Arcen app. The package no longer asks for a
+  destination or install location.
+- Both launchd jobs declare `AssociatedBundleIdentifiers`, so System
+  Settings attributes them to Arcen Pier.
+- The helper asks for its three approvals as soon as it starts, one at a
+  time: system audio, Accessibility, then Screen Recording. Previously
+  Accessibility opened underneath Screen Recording, and system audio waited
+  for the first Deck.
+- Declining "Installer would like to administer your computer" (the
+  `_arcen` account) stops the install with a reason instead of leaving a
+  service that cannot start.
+- `uninstall.sh --purge` also resets the privacy approvals given to Arcen.
+
+### Fixed
+
+- Deck: *Forget and Verify* on a changed host identity reconnects at once and
+  shows the new fingerprint, reusing the password already given, instead of
+  returning to Home.
+- Deck: a host's reason for closing a session is shown rather than a bare
+  "Host closed the session"; the macOS Pier sends one when it refuses a
+  session after sign-in (for example while system audio is unapproved),
+  instead of resetting the connection.
+- Deck: a host that accepted the sign-in but could not start the session says
+  so ("the host signed you in but could not start the session") instead of
+  "authentication failed" (`AuthResult.session_setup_failed`).
+- macOS Pier: advertises its build identity like every other product, from
+  one shared `arcen_protocol::build_identity`.
+- Linux installer: an installed but stopped firewalld is reported as such,
+  not as a failed firewall update.
+- macOS Pier: the relay no longer sends path signals to the agent before the
+  Deck has authenticated, which could fail the handshake; a Deck can no
+  longer send service-only messages to an agent on macOS or Windows.
+- Windows installer: waits for the service as long as the service control
+  manager does (30 s) before reporting a failed install.
+- Windows Pier: the adaptive bitrate task stops with its attachment and
+  follows replaced pipelines; a fatal attachment cleanup still ends the
+  session's shared lifecycle.
+
+### Linux Pier
+
+- On a desktop declared `rec2100-pq`, Grading is converted to true BT.709 SDR
+  and eight-bit presets are refused with a clear message.
+
 ## [0.13.0] — 2026-09-27
 
 The first release with a macOS Pier package, Linux HDR, and hosts that follow
@@ -70,6 +238,17 @@ hosts with the Deck GUI.
 
 ### Fixed
 
+- Windows: an upgrade needs no flags and no second run. A self-signed key
+  pair from an older install is taken over automatically on every host,
+  keeping the key (a CA-issued certificate is served as it is and never
+  reissued); an access entry Explorer added to `ProgramData\Arcen` is removed
+  instead of failing the install; uninstall while the sign-in screen still
+  has the credential provider loaded sets it aside and finishes; the
+  transcript shows what changed, with command output behind `--verbose`.
+- Windows: a host without NVIDIA (VMware, Citrix, Proxmox and other VMs)
+  serves every preset as OpenH264 H.264 4:2:0 8-bit instead of failing the
+  session after sign-in, and a failure before streaming reaches the Deck with
+  its reason instead of as a dropped connection.
 - The Linux and Windows Piers build again (missing hello fields).
 - The shared codec resolver no longer turns Grading into H.264.
 - The Linux and Windows capture encoders no longer overshoot the bitrate cap.
@@ -363,5 +542,7 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
+[0.14.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.14.0
+[0.13.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.13.0
 [0.10.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.10.0
 [0.9.8]: https://github.com/Aanerud/arcen_public/releases/tag/v0.9.8

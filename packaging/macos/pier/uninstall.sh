@@ -45,12 +45,35 @@ if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null 
   /usr/libexec/ApplicationFirewall/socketfilterfw --remove "$ARCEN_PIER_BIN" >/dev/null 2>&1 || true
 fi
 
+# Privacy approvals outlive the apps: a later install found them already
+# switched on and looked as if it had granted them itself. tccutil only knows
+# bundles Launch Services has registered, so this runs while the apps are
+# still installed, in the system database and in every local user's own.
+if [ -n "$PURGE" ]; then
+  arcen_log "forgetting the privacy approvals given to Arcen"
+  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+  for app in "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP"; do
+    [ -d "$app" ] && "$LSREGISTER" -f "$app" >/dev/null 2>&1 || true
+  done
+  for bundle in $ARCEN_TCC_BUNDLES; do
+    /usr/bin/tccutil reset All "$bundle" >/dev/null 2>&1 || true
+  done
+  for user in $(dscl . -list /Users UniqueID | awk '$2 >= 500 { print $1 }'); do
+    uid="$(id -u "$user" 2>/dev/null)" || continue
+    for bundle in $ARCEN_TCC_BUNDLES; do
+      /bin/launchctl asuser "$uid" /usr/bin/sudo -u "$user" /usr/bin/tccutil reset All "$bundle" \
+        >/dev/null 2>&1 || true
+    done
+  done
+fi
+
 arcen_log "removing the applications"
 # This script lives inside the Pier bundle. Removing the bundle while it runs
 # is safe: bash already holds the file open.
 rm -rf "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" \
   "$ARCEN_PIER_APP.prev" "$ARCEN_PIER_APP.prev2" \
-  "$ARCEN_AGENT_APP.prev" "$ARCEN_AGENT_APP.prev2"
+  "$ARCEN_AGENT_APP.prev" "$ARCEN_AGENT_APP.prev2" \
+  "$ARCEN_LEGACY_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP.prev" "$ARCEN_LEGACY_AGENT_APP.prev2"
 pkgutil --forget pier.arcen.tech >/dev/null 2>&1 || true
 
 if [ -n "$PURGE" ]; then
@@ -76,7 +99,7 @@ if arcen_port_in_use; then
   /usr/sbin/lsof -nP -iUDP:"$ARCEN_PORT" >&2
   LEFT=1
 fi
-for path in "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" "$ARCEN_SERVICE_PLIST" "$ARCEN_AGENT_PLIST" "$ARCEN_PAM"; do
+for path in "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP" "$ARCEN_SERVICE_PLIST" "$ARCEN_AGENT_PLIST" "$ARCEN_PAM"; do
   if [ -e "$path" ]; then
     arcen_log "not removed: $path" >&2
     LEFT=1
@@ -92,6 +115,7 @@ if [ -z "$PURGE" ]; then
   echo "Kept: $ARCEN_SUPPORT (host identity and configuration), $ARCEN_LOGS,"
   echo "      and the $ARCEN_ACCOUNT account. Run again with --purge to remove them."
 fi
-echo "Privacy grants belong to each user; remove them with:"
-echo "  tccutil reset All pier.arcen.tech.agent   (as that user)"
+if [ -z "$PURGE" ]; then
+  echo "Privacy approvals (Screen Recording, Accessibility) are kept too; --purge forgets them."
+fi
 exit 0

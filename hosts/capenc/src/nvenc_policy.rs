@@ -1,3 +1,4 @@
+use arcen_media::video::MotionPriority;
 use arcen_media::{BitDepth, ChromaSubsampling, EncodeIntent};
 
 /// Bits/second and VBV sizing shared by the D3D11 and CUDA NVENC paths.
@@ -109,11 +110,8 @@ pub(crate) const fn output_drain_policy(
     }
 }
 
-pub(crate) const fn vbv_buffer_frames(intent: EncodeIntent) -> f64 {
-    match intent {
-        EncodeIntent::Interactive => 2.0,
-        EncodeIntent::Quality => 8.0,
-    }
+pub(crate) const fn vbv_buffer_frames(priority: MotionPriority, intent: EncodeIntent) -> f64 {
+    arcen_media::video::encoder_buffer_frames(priority, intent)
 }
 
 /// NVENC rate control for a session: the shared link-capped average
@@ -125,12 +123,13 @@ pub(crate) fn rate_control_sizing(
     fps: u32,
     chroma: ChromaSubsampling,
     depth: BitDepth,
+    priority: MotionPriority,
     intent: EncodeIntent,
 ) -> RateControlSizing {
     let average_bitrate_bps =
         arcen_media::video::link_capped_average_bitrate_bps(width, height, fps, chroma, depth);
-    let vbv_buffer_bits =
-        f64::from(average_bitrate_bps) / f64::from(fps.max(1)) * vbv_buffer_frames(intent);
+    let vbv_buffer_bits = f64::from(average_bitrate_bps) / f64::from(fps.max(1))
+        * vbv_buffer_frames(priority, intent);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let vbv_buffer_size_bits = vbv_buffer_bits.round().clamp(0.0, f64::from(u32::MAX)) as u32;
     RateControlSizing {

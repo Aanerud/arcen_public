@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use arcen_media::{AppliedRegionSet, LogicalPoint, RegionGeneration, RegionId};
 
-use crate::PenTool;
+use crate::{PenTool, ScrollPhase, ScrollUnit};
 
 /// Region identity and region-local fixed-point logical position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,8 @@ pub enum RegionInputEvent {
         position: RegionLogicalPosition,
         delta_x: i64,
         delta_y: i64,
+        unit: ScrollUnit,
+        phase: ScrollPhase,
         sequence: u64,
     },
     Pen {

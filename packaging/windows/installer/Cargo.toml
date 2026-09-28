@@ -11,6 +11,7 @@ name = "install-arcen-pier"
 path = "src/main.rs"
 
 [dependencies]
+arcen-session.workspace = true
 arcen-transport = { workspace = true, default-features = false }
 rcgen = "=0.14.8"
 serde_json.workspace = true

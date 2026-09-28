@@ -17,6 +17,7 @@ wss-compat = ["arcen-protocol/wss-compat", "rustls/tls12"]
 [dependencies]
 arcen-identity.workspace = true
 arcen-protocol = { workspace = true, default-features = false }
+arcen-telemetry.workspace = true
 bytes = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 rustls.workspace = true

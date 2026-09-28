@@ -62,6 +62,8 @@ pub struct MonitorPipelineTemplate {
     pub color_primaries: arcen_media::ColorPrimaries,
     /// Resolved encoder intent every worker in this session requests.
     pub intent: EncodeIntent,
+    /// Motion/detail preference every worker in this session requests.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// Damage-driven QP biasing every worker in this session requests.
     /// Roster-wide for the same reason the codec is.
     pub qp_map: arcen_media::video::QpMapPolicy,
@@ -281,6 +283,7 @@ pub fn resolve_pipeline_specs(
                 transfer: template.transfer,
                 color_primaries: template.color_primaries,
                 intent: template.intent,
+                motion_priority: template.motion_priority,
                 qp_map: template.qp_map,
                 fps: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
                     template.fps.min(
@@ -722,6 +725,7 @@ mod tests {
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
+            color: None,
         }
     }
 
@@ -798,6 +802,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             encoder: Some(EncoderSelection::Auto),
@@ -1144,6 +1149,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             width: 1_920,
@@ -1396,6 +1402,7 @@ mod tests {
                 refresh_hz: output.current_refresh_hz,
                 rotation: Rotation::Degrees0,
                 primary: index == 0,
+                color: None,
             })
             .collect::<Vec<_>>();
         let desktop_x = monitors.iter().map(|monitor| monitor.x).min().unwrap();
@@ -1429,6 +1436,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 60,
             encoder: Some(EncoderSelection::Nvenc),

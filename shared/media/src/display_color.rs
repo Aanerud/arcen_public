@@ -34,6 +34,8 @@ pub struct DisplayColor {
     stated: StatedLuminance,
 }
 
+impl Eq for DisplayColor {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct StatedLuminance {
     peak: Option<f32>,
@@ -41,26 +43,37 @@ struct StatedLuminance {
     min: Option<f32>,
 }
 
-/// Where a luminance figure came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LuminanceSource {
-    /// The client's OS stated it.
-    Stated,
-    /// Derived from the HDR headroom against [`EDR_REFERENCE_WHITE_NITS`].
-    Headroom,
+/// A luminance value and its provenance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Luminance {
+    /// The client's OS or display metadata stated this value.
+    Measured(f32),
+    /// Derived from HDR headroom against [`EDR_REFERENCE_WHITE_NITS`].
+    Derived(f32),
+    /// The client did not report enough information to know this value.
+    Unknown,
+}
+
+impl Luminance {
+    /// Returns the value in nits when this luminance is known.
+    #[must_use]
+    pub const fn nits(self) -> Option<f32> {
+        match self {
+            Self::Measured(nits) | Self::Derived(nits) => Some(nits),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// An HDR display's luminance, as far as it is known.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HdrLuminance {
-    /// Peak luminance in nits.
-    pub peak_nits: f32,
-    /// Maximum frame-average luminance in nits, when stated.
-    pub frame_average_nits: Option<f32>,
-    /// Minimum luminance in nits, when stated.
-    pub min_nits: Option<f32>,
-    /// Where `peak_nits` came from.
-    pub source: LuminanceSource,
+    /// Peak luminance and whether it was measured or derived.
+    pub peak: Luminance,
+    /// Maximum frame-average luminance and whether it was measured or unknown.
+    pub frame_average: Luminance,
+    /// Minimum luminance and whether it was measured or unknown.
+    pub min: Luminance,
 }
 
 impl DisplayColor {
@@ -116,12 +129,12 @@ impl DisplayColor {
 
     /// Whether the display can show more than SDR white.
     ///
-    /// A stated peak counts only above the BT.2408 203-nit reference white:
-    /// an SDR panel's brightness is not HDR.
+    /// Only measured headroom above SDR white makes the display HDR. A stated
+    /// peak belongs to the luminance description of an HDR display; by itself
+    /// it can also describe a bright SDR panel and must not flip the contract.
     #[must_use]
     pub fn is_hdr(self) -> bool {
         self.hdr_headroom.is_some_and(|headroom| headroom > 1.0)
-            || self.stated.peak.is_some_and(|peak| peak > 203.0)
     }
 
     /// The display's HDR luminance, or `None` for an SDR display.
@@ -130,19 +143,23 @@ impl DisplayColor {
         if !self.is_hdr() {
             return None;
         }
-        let (peak_nits, source) = match (self.stated.peak, self.hdr_headroom) {
-            (Some(peak), _) => (peak, LuminanceSource::Stated),
-            (None, Some(headroom)) => (
-                (headroom * EDR_REFERENCE_WHITE_NITS).min(PQ_PEAK_NITS),
-                LuminanceSource::Headroom,
-            ),
-            (None, None) => return None,
+        let peak = match (self.stated.peak, self.hdr_headroom) {
+            (Some(peak), _) => Luminance::Measured(peak),
+            (None, Some(headroom)) => {
+                Luminance::Derived((headroom * EDR_REFERENCE_WHITE_NITS).min(PQ_PEAK_NITS))
+            }
+            (None, None) => Luminance::Unknown,
         };
         Some(HdrLuminance {
-            peak_nits,
-            frame_average_nits: self.stated.frame_average,
-            min_nits: self.stated.min,
-            source,
+            peak,
+            frame_average: self
+                .stated
+                .frame_average
+                .map_or(Luminance::Unknown, Luminance::Measured),
+            min: self
+                .stated
+                .min
+                .map_or(Luminance::Unknown, Luminance::Measured),
         })
     }
 }
@@ -174,11 +191,10 @@ mod tests {
         assert!(xdr.is_hdr());
         assert_eq!(xdr.gamut(), ColorPrimaries::DisplayP3);
         let luminance = xdr.hdr_luminance().expect("HDR");
-        assert!((luminance.peak_nits - 1600.0).abs() < f32::EPSILON);
-        assert_eq!(luminance.source, LuminanceSource::Headroom);
+        assert_eq!(luminance.peak, Luminance::Derived(1600.0));
         assert_eq!(
-            (luminance.frame_average_nits, luminance.min_nits),
-            (None, None),
+            (luminance.frame_average, luminance.min),
+            (Luminance::Unknown, Luminance::Unknown),
             "macOS states neither, so neither is invented"
         );
     }
@@ -196,6 +212,15 @@ mod tests {
             !bright_sdr.is_hdr(),
             "brightness below reference white is not HDR"
         );
+        let bright_500_nit_sdr = DisplayColor::from_msg(&DisplayColorMsg {
+            peak_nits: Some(500.0),
+            ..msg(DisplayGamutMsg::Srgb, 1.0)
+        });
+        assert!(
+            !bright_500_nit_sdr.is_hdr(),
+            "a stated peak alone does not make a display HDR"
+        );
+        assert_eq!(bright_500_nit_sdr.hdr_luminance(), None);
     }
 
     #[test]
@@ -207,10 +232,9 @@ mod tests {
             ..msg(DisplayGamutMsg::Bt2020, 16.0)
         });
         let luminance = stated.hdr_luminance().expect("HDR");
-        assert_eq!(luminance.source, LuminanceSource::Stated);
-        assert!((luminance.peak_nits - 1000.0).abs() < f32::EPSILON);
-        assert_eq!(luminance.frame_average_nits, Some(600.0));
-        assert_eq!(luminance.min_nits, Some(0.05));
+        assert_eq!(luminance.peak, Luminance::Measured(1000.0));
+        assert_eq!(luminance.frame_average, Luminance::Measured(600.0));
+        assert_eq!(luminance.min, Luminance::Measured(0.05));
     }
 
     #[test]
@@ -230,11 +254,10 @@ mod tests {
             min_nits: Some(600.0),
             ..msg(DisplayGamutMsg::Srgb, 0.0)
         });
-        let luminance = inconsistent.hdr_luminance().expect("HDR by stated peak");
         assert_eq!(
-            (luminance.frame_average_nits, luminance.min_nits),
-            (None, None),
-            "an average or minimum above the peak is not a measurement"
+            inconsistent.hdr_luminance(),
+            None,
+            "a stated peak without headroom is not HDR"
         );
     }
 

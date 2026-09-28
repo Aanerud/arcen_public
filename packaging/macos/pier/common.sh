@@ -18,7 +18,10 @@ ARCEN_LEGACY_SERVICE_LABEL="com.arcen.pier"
 ARCEN_LEGACY_SERVICE_PLIST="/Library/LaunchDaemons/com.arcen.pier.plist"
 
 ARCEN_PIER_APP="/Applications/Arcen Pier.app"
-ARCEN_AGENT_APP="/Applications/Arcen Agent Helper.app"
+# The helper is a background component, so it lives with other privileged
+# helpers rather than in /Applications, where it looked like a second app.
+ARCEN_AGENT_APP="/Library/PrivilegedHelperTools/Arcen Agent Helper.app"
+ARCEN_LEGACY_AGENT_APP="/Applications/Arcen Agent Helper.app"
 ARCEN_PIER_BIN="$ARCEN_PIER_APP/Contents/MacOS/arcen-pier-macos"
 ARCEN_AGENT_BIN="$ARCEN_AGENT_APP/Contents/MacOS/arcen-agent-helper"
 
@@ -30,6 +33,8 @@ ARCEN_LOGS="/Library/Logs/Arcen/Pier"
 ARCEN_PAM="/etc/pam.d/arcen"
 ARCEN_NEWSYSLOG="/etc/newsyslog.d/pier.arcen.tech.conf"
 ARCEN_PORT=18444
+# The bundle identifiers Arcen asks privacy approvals for.
+ARCEN_TCC_BUNDLES="pier.arcen.tech pier.arcen.tech.agent"
 
 arcen_log() {
   echo "Arcen Pier: $*"

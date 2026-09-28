@@ -1,7 +1,7 @@
 # macOS Deck Packaging
 
-`build-deck-app.sh` builds `arcen-deck-macos` and assembles `Arcen Deck.app`
-using the checked-in plist and entitlements. It has three explicit,
+`build-deck-app.sh` builds `arcen-deck-macos` and assembles
+`dist/macos/Arcen Deck.app` using the checked-in plist and entitlements. It has three explicit,
 mutually exclusive modes and never discovers or ranks keychain identities:
 
 - **Unsigned** (default): rejects any protected release or development input.
@@ -81,8 +81,9 @@ traps that go with it, are documented in
 ## macOS Pier packaging status
 
 This directory now contains development packaging for the macOS Pier:
-`build-pier-app.sh` assembles `Arcen Pier.app` and `Arcen Agent Helper.app`, and
-`build-pier-pkg.sh` builds a `.pkg` around them. It is not a published host
+`build-pier-app.sh` assembles `dist/macos/Arcen Pier.app` and
+`dist/macos/Arcen Agent Helper.app`, and `build-pier-pkg.sh` builds
+`dist/macos/ArcenPier-<version>.pkg` around them. It is not a published host
 release and must not be described as one.
 
 One packaging bug is worth keeping visible. `build-pier-app.sh` used to check

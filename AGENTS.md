@@ -82,7 +82,7 @@ applied to one capture loop. Keep their capture providers separate:
 | --- | --- | --- | --- | --- |
 | Auto / Speed, 8-bit | NvFBC → CUDA → NVENC; preserve the device-to-device fast path | DDA after real-frame proof, otherwise WGC BGRA8 | ScreenCaptureKit `420v` → VideoToolbox, untouched | Ordinary SDR decode/presentation |
 | Grading, 10-bit SDR | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC | WGC FP16 scRGB → shared SDR transfer/matrix → NVENC P16 | SCK `xf44` → VideoToolbox HEVC Main 4:4:4 10, BT.709 tags, SPS-proven | Native `xf44` → 10-bit Metal, EDR off |
-| HDR | Xorg downgrades to Grading unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`, shared `constrain_to_desktop_encoding`); a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | HDR virtual panel, headroom proof → SCK `xf44` PQ/BT.2020 → Core Image 203-nit white → VideoToolbox Main 4:4:4 10 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
+| HDR | Xorg downgrades to Grading unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`, shared `resolve_desktop_plan`, which converts SDR sessions and refuses 8-bit ones); a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | HDR virtual panel, headroom proof → SCK `xf44` PQ/BT.2020 → Core Image 203-nit white → VideoToolbox Main 4:4:4 10 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
 
 Do not widen or refactor the 8-bit fast path to implement a fidelity path.
 Bit depth does not imply HDR. Capture source, transfer, primaries, matrix,

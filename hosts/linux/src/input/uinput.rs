@@ -35,6 +35,8 @@ pub struct InputController {
     region_input: Option<RegionInputAdapter>,
     held_keys: HashSet<u16>,
     held_buttons: HashSet<u16>,
+    vertical_scroll_remainder: i64,
+    horizontal_scroll_remainder: i64,
     lock_state: [bool; 3],
     pen_state: PenToolState,
     stats: Arc<InputStats>,
@@ -81,8 +83,12 @@ impl InputController {
         for code in [KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE] {
             keys.insert(code);
         }
-        let scroll_axes =
-            AttributeSet::from_iter([RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_HWHEEL]);
+        let scroll_axes = AttributeSet::from_iter([
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+        ]);
         let x_axis = UinputAbsSetup::new(
             AbsoluteAxisCode::ABS_X,
             AbsInfo::new(0, 0, width.saturating_sub(1) as i32, 0, 0, 1),
@@ -171,6 +177,8 @@ impl InputController {
                 region_input,
                 held_keys: HashSet::new(),
                 held_buttons: HashSet::new(),
+                vertical_scroll_remainder: 0,
+                horizontal_scroll_remainder: 0,
                 lock_state: [false; 3],
                 pen_state: PenToolState::default(),
                 stats: stats.clone(),
@@ -307,22 +315,22 @@ impl InputController {
         } else {
             Vec::with_capacity(2)
         };
-        let vertical = scroll_steps(message.dy);
-        let horizontal = scroll_steps(message.dx);
-        if vertical != 0 {
-            events.push(InputEvent::new(
-                EventType::RELATIVE.0,
-                RelativeAxisCode::REL_WHEEL.0,
-                vertical,
-            ));
-        }
-        if horizontal != 0 {
-            events.push(InputEvent::new(
-                EventType::RELATIVE.0,
-                RelativeAxisCode::REL_HWHEEL.0,
-                horizontal,
-            ));
-        }
+        let vertical = legacy_scroll_to_wheel_units(message.dy, message.unit.into());
+        let horizontal = legacy_scroll_to_wheel_units(message.dx, message.unit.into());
+        append_wheel_events(
+            &mut events,
+            &mut self.vertical_scroll_remainder,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            vertical,
+        );
+        append_wheel_events(
+            &mut events,
+            &mut self.horizontal_scroll_remainder,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+            horizontal,
+        );
         if !events.is_empty() {
             self.absolute_device.emit(&events)?;
         }
@@ -409,21 +417,26 @@ impl InputController {
             .ok_or(InputError::RegionUnavailable)?
             .pointer_scroll(message)?;
         let mut events = axis_position_events(mapped.position).to_vec();
-        let vertical = region_scroll_steps(mapped.delta_y);
-        let horizontal = region_scroll_steps(mapped.delta_x);
-        if vertical != 0 {
-            events.push(InputEvent::new(
-                EventType::RELATIVE.0,
-                RelativeAxisCode::REL_WHEEL.0,
-                vertical,
-            ));
-        }
-        if horizontal != 0 {
-            events.push(InputEvent::new(
-                EventType::RELATIVE.0,
-                RelativeAxisCode::REL_HWHEEL.0,
-                horizontal,
-            ));
+        append_wheel_events(
+            &mut events,
+            &mut self.vertical_scroll_remainder,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            mapped.delta_y,
+        );
+        append_wheel_events(
+            &mut events,
+            &mut self.horizontal_scroll_remainder,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+            mapped.delta_x,
+        );
+        if matches!(
+            mapped.phase,
+            arcen_input::ScrollPhase::Ended | arcen_input::ScrollPhase::Cancelled
+        ) {
+            self.vertical_scroll_remainder = 0;
+            self.horizontal_scroll_remainder = 0;
         }
         self.absolute_device.emit(&events)?;
         self.stats.scroll_events.fetch_add(1, Ordering::Relaxed);
@@ -811,18 +824,71 @@ fn scroll_steps(value: f64) -> i32 {
     }
 }
 
-fn region_scroll_steps(value: i64) -> i32 {
+fn legacy_scroll_to_wheel_units(value: f64, unit: arcen_input::ScrollUnit) -> i64 {
+    match unit {
+        arcen_input::ScrollUnit::Line => i64::from(scroll_steps(value)) * 120,
+        arcen_input::ScrollUnit::Point => {
+            if value == 0.0 || !value.is_finite() {
+                0
+            } else {
+                let rounded = value.round();
+                if rounded == 0.0 {
+                    value.signum() as i64
+                } else if rounded > i64::MAX as f64 {
+                    i64::MAX
+                } else if rounded < i64::MIN as f64 {
+                    i64::MIN
+                } else {
+                    rounded as i64
+                }
+            }
+        }
+    }
+}
+
+fn split_legacy_detents(remainder: &mut i64, hi_res_units: i64) -> i32 {
+    let total = remainder.saturating_add(hi_res_units);
+    let detents = total / 120;
+    *remainder = total % 120;
+    i32::try_from(detents).unwrap_or(if detents.is_negative() {
+        i32::MIN
+    } else {
+        i32::MAX
+    })
+}
+
+fn saturating_hi_res_units(value: i64) -> i32 {
     if value == 0 {
         return 0;
     }
-    let magnitude = u128::from(value.unsigned_abs());
-    let rounded = (magnitude + 60) / 120;
-    let bounded = rounded.clamp(1, 2_147_483_647_u128);
-    let signed = i32::try_from(bounded).unwrap_or(i32::MAX);
-    if value.is_negative() {
-        -signed
+    i32::try_from(value).unwrap_or(if value.is_negative() {
+        i32::MIN
     } else {
-        signed
+        i32::MAX
+    })
+}
+
+fn append_wheel_events(
+    events: &mut Vec<InputEvent>,
+    remainder: &mut i64,
+    legacy_axis: RelativeAxisCode,
+    hi_res_axis: RelativeAxisCode,
+    hi_res_units: i64,
+) {
+    if hi_res_units != 0 {
+        events.push(InputEvent::new(
+            EventType::RELATIVE.0,
+            hi_res_axis.0,
+            saturating_hi_res_units(hi_res_units),
+        ));
+    }
+    let legacy = split_legacy_detents(remainder, hi_res_units);
+    if legacy != 0 {
+        events.push(InputEvent::new(
+            EventType::RELATIVE.0,
+            legacy_axis.0,
+            legacy,
+        ));
     }
 }
 
@@ -965,17 +1031,49 @@ mod tests {
         assert_eq!(scroll_steps(0.1), 1);
         assert_eq!(scroll_steps(-0.1), -1);
         assert_eq!(scroll_steps(f64::NAN), 0);
+        assert_eq!(
+            legacy_scroll_to_wheel_units(0.1, arcen_input::ScrollUnit::Line),
+            120
+        );
+        assert_eq!(
+            legacy_scroll_to_wheel_units(30.4, arcen_input::ScrollUnit::Point),
+            30
+        );
     }
 
     #[test]
-    fn region_scroll_fixed_point_maps_to_signed_wheel_steps() {
-        assert_eq!(region_scroll_steps(0), 0);
-        assert_eq!(region_scroll_steps(1), 1);
-        assert_eq!(region_scroll_steps(120), 1);
-        assert_eq!(region_scroll_steps(180), 2);
-        assert_eq!(region_scroll_steps(-180), -2);
-        assert_eq!(region_scroll_steps(i64::MAX), i32::MAX);
-        assert_eq!(region_scroll_steps(i64::MIN), -i32::MAX);
+    fn hi_res_scroll_accumulates_legacy_detents() {
+        let mut remainder = 0;
+        assert_eq!(split_legacy_detents(&mut remainder, 30), 0);
+        assert_eq!(remainder, 30);
+        assert_eq!(split_legacy_detents(&mut remainder, 89), 0);
+        assert_eq!(remainder, 119);
+        assert_eq!(split_legacy_detents(&mut remainder, 1), 1);
+        assert_eq!(remainder, 0);
+        assert_eq!(split_legacy_detents(&mut remainder, -180), -1);
+        assert_eq!(remainder, -60);
+        assert_eq!(split_legacy_detents(&mut remainder, -60), -1);
+        assert_eq!(remainder, 0);
+        assert_eq!(saturating_hi_res_units(i64::MAX), i32::MAX);
+        assert_eq!(saturating_hi_res_units(i64::MIN), i32::MIN);
+    }
+
+    #[test]
+    fn wheel_events_emit_hi_res_and_legacy_axes() {
+        let mut remainder = 0;
+        let mut events = Vec::new();
+        append_wheel_events(
+            &mut events,
+            &mut remainder,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            120,
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].code(), RelativeAxisCode::REL_WHEEL_HI_RES.0);
+        assert_eq!(events[0].value(), 120);
+        assert_eq!(events[1].code(), RelativeAxisCode::REL_WHEEL.0);
+        assert_eq!(events[1].value(), 1);
     }
 
     #[test]

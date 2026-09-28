@@ -1932,7 +1932,7 @@ fn parse_dedicated_display(display: &str) -> Result<u16, LauncherError> {
 
 #[cfg(target_os = "linux")]
 fn validate_gpu_head(gpu_head: &str) -> Result<(), LauncherError> {
-    matches!(gpu_head, "DFP-0" | "DFP-1" | "DFP-2" | "DFP-3")
+    arcen_outputs::is_nvidia_dfp_head_token(gpu_head)
         .then_some(())
         .ok_or(LauncherError::XorgConfig)
 }
@@ -2807,7 +2807,8 @@ mod tests {
         assert!(parse_dedicated_display(":100").is_err());
         assert!(validate_gpu_head("DFP-0").is_ok());
         assert!(validate_gpu_head("DFP-3").is_ok());
-        assert!(validate_gpu_head("DFP-4").is_err());
+        assert!(validate_gpu_head("DFP-4").is_ok());
+        assert!(validate_gpu_head("HDMI-0").is_err());
     }
 
     #[cfg(target_os = "linux")]

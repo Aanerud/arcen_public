@@ -111,6 +111,11 @@ pub struct CapencConfig {
     pub transfer: TransferCharacteristics,
     /// Resolved colour primaries to encode and signal.
     pub color_primaries: ColorPrimaries,
+    /// What the captured desktop's code values mean. Sent whatever the
+    /// output contract is, because a PQ desktop stays PQ when the session is
+    /// SDR: capenc converts it (the shared desktop rule) instead of
+    /// relabelling it.
+    pub desktop_encoding: arcen_media::video::DesktopSignalEncoding,
     /// Whether codec fallback is host-ranked performance or an exact/fidelity
     /// request.
     pub video_selection: VideoSelectionIntent,
@@ -122,6 +127,8 @@ pub struct CapencConfig {
     pub variant_pinned: bool,
     /// Resolved encoder intent to request.
     pub intent: EncodeIntent,
+    /// What later bitrate controllers should preserve first under pressure.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// Damage-driven QP biasing to request. Roster-wide; see
     /// `docs/architecture/qp-maps.md`.
     pub qp_map: arcen_media::video::QpMapPolicy,
@@ -184,6 +191,7 @@ impl CapencConfig {
         plan: &ResolvedMediaPlan,
         encoder: EncoderRequest,
         intent: EncodeIntent,
+        motion_priority: arcen_media::video::MotionPriority,
     ) -> Self {
         self.codec = plan.codec_token().to_string();
         self.yuv444 = matches!(plan.video.chroma, ChromaSubsampling::Yuv444);
@@ -195,6 +203,7 @@ impl CapencConfig {
         self.fps = plan.fps;
         self.encoder = encoder;
         self.intent = intent;
+        self.motion_priority = motion_priority;
         self
     }
 
@@ -243,18 +252,18 @@ impl CapencConfig {
         if self.transfer != TransferCharacteristics::Bt709 {
             v.push(format!("transfer={}", self.transfer.token()));
         }
-        // PQ survives resolution only when something vouched for it: the lab
-        // pipe, or the operator's `video.desktop_encoding`. capenc refuses PQ
-        // from the Xorg framebuffer unless told which one it is.
-        if self.transfer == TransferCharacteristics::Pq {
-            if let Some(pipe) = crate::cli::experimental_rgb10_pipe() {
-                v.push(format!("rgb10-pipe={}", pipe.display()));
-            } else {
-                v.push(format!(
-                    "desktop-encoding={}",
-                    arcen_media::video::DesktopSignalEncoding::Rec2100Pq.token()
-                ));
-            }
+        // The lab pipe serves only PQ sessions. Otherwise the desktop's own
+        // encoding is sent whenever it is not SDR, so capenc can pass PQ
+        // through or convert it; absent means SDR.
+        let pipe = crate::cli::experimental_rgb10_pipe()
+            .filter(|_| self.transfer == TransferCharacteristics::Pq);
+        if let Some(pipe) = pipe {
+            v.push(format!("rgb10-pipe={}", pipe.display()));
+        } else if self.desktop_encoding != arcen_media::video::DesktopSignalEncoding::Sdr {
+            v.push(format!(
+                "desktop-encoding={}",
+                self.desktop_encoding.token()
+            ));
         }
         if self.color_primaries != ColorPrimaries::Bt709 {
             v.push(format!("primaries={}", self.color_primaries.token()));
@@ -266,6 +275,9 @@ impl CapencConfig {
         // those unchanged commands — while telling capenc nothing new.
         if self.intent != EncodeIntent::default() {
             v.push(format!("intent={}", self.intent.token()));
+        }
+        if self.motion_priority != arcen_media::video::MotionPriority::default() {
+            v.push(format!("priority={}", self.motion_priority.token()));
         }
         // Same conditional shape and same reason as `intent=`: absent already
         // means off, so a host that never opted into the experiment produces
@@ -416,6 +428,10 @@ where
 pub(crate) enum StdinCmd {
     /// Force a keyframe (`IDR\n`).
     Idr,
+    /// Apply a live bitrate target.
+    Bitrate(u64),
+    /// Apply a live frame-rate target.
+    Framerate(u32),
     /// Request graceful encoder teardown, then close stdin.
     Stop,
 }
@@ -435,6 +451,11 @@ enum ChildShutdown {
 /// including the one held by the backpressure queue — at the new child.
 #[derive(Clone)]
 pub struct IdrRequester {
+    tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
+}
+
+#[derive(Clone)]
+pub struct BitrateRequester {
     tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
 }
 
@@ -480,6 +501,34 @@ impl IdrRequester {
     }
 }
 
+impl BitrateRequester {
+    fn new(idr: &IdrRequester) -> Self {
+        Self {
+            tx: std::sync::Arc::clone(&idr.tx),
+        }
+    }
+
+    pub fn request(&self, bps: u64) -> bool {
+        self.send(StdinCmd::Bitrate(bps))
+    }
+
+    pub fn request_framerate(&self, fps: u32) -> bool {
+        self.send(StdinCmd::Framerate(fps))
+    }
+
+    fn send(&self, command: StdinCmd) -> bool {
+        let tx = self
+            .tx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tx.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
 /// A running `capenc` session: take the access-unit stream with
 /// [`take_frames`](Self::take_frames), request keyframes via [`idr`](Self::idr),
 /// and call [`shutdown`](Self::shutdown) (or drop) to stop the child.
@@ -494,6 +543,10 @@ impl CapencSession {
     /// Clone the keyframe-request handle (for IDR-on-drop and `request_full_frame`).
     pub fn idr(&self) -> IdrRequester {
         self.idr.clone()
+    }
+
+    pub fn bitrate(&self) -> BitrateRequester {
+        BitrateRequester::new(&self.idr)
     }
 
     /// Take the access-unit stream. Returns `None` if already taken.
@@ -1203,6 +1256,30 @@ async fn write_stdin(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiv
                     break;
                 }
             }
+            StdinCmd::Bitrate(bps) => {
+                let line = arcen_media::capenc_control::CapencControlCommand::Bitrate { bps }
+                    .as_wire_line();
+                if let Err(e) = stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .and(stdin.flush().await)
+                {
+                    tracing::warn!(target: target::CAPENC, error = %e, "capenc bitrate write failed");
+                    break;
+                }
+            }
+            StdinCmd::Framerate(fps) => {
+                let line = arcen_media::capenc_control::CapencControlCommand::Framerate { fps }
+                    .as_wire_line();
+                if let Err(e) = stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .and(stdin.flush().await)
+                {
+                    tracing::warn!(target: target::CAPENC, error = %e, "capenc framerate write failed");
+                    break;
+                }
+            }
             StdinCmd::Stop => {
                 let _ = stdin.write_all(b"STOP\n").await.and(stdin.flush().await);
                 break;
@@ -1285,7 +1362,7 @@ pub fn find_capenc_binary() -> Option<PathBuf> {
 /// Test-only helpers for exercising the IDR path without a real child.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{IdrRequester, StdinCmd};
+    use super::{BitrateRequester, IdrRequester, StdinCmd};
     use tokio::sync::mpsc;
 
     /// Build an [`IdrRequester`] backed by an observable channel. The returned
@@ -1294,6 +1371,10 @@ pub(crate) mod test_support {
     pub(crate) fn fake_idr() -> (IdrRequester, mpsc::Receiver<StdinCmd>) {
         let (tx, rx) = mpsc::channel::<StdinCmd>(8);
         (IdrRequester::new(tx), rx)
+    }
+
+    pub(crate) fn fake_bitrate(idr: &IdrRequester) -> BitrateRequester {
+        BitrateRequester::new(idr)
     }
 }
 
@@ -1321,10 +1402,12 @@ mod tests {
             color_matrix: ColorMatrix::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Sdr,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             width: 3840,
             height: 2160,
@@ -1350,10 +1433,12 @@ mod tests {
             color_matrix: ColorMatrix::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Sdr,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             width: 1920,
             height: 1080,
@@ -1452,10 +1537,9 @@ mod tests {
         );
 
         cfg.intent = EncodeIntent::Quality;
-        assert_eq!(
-            cfg.argv().last().map(String::as_str),
-            Some("intent=quality")
-        );
+        assert!(cfg.argv().iter().any(|arg| arg == "intent=quality"));
+        cfg.motion_priority = arcen_media::video::MotionPriority::Motion;
+        assert!(cfg.argv().iter().any(|arg| arg == "priority=motion"));
     }
 
     #[tokio::test]
@@ -1652,8 +1736,12 @@ mod tests {
             },
         )
         .expect("READY");
-        let resized =
-            cfg.pinned_to_active_plan(&plan, EncoderRequest::NativeNvenc, EncodeIntent::Quality);
+        let resized = cfg.pinned_to_active_plan(
+            &plan,
+            EncoderRequest::NativeNvenc,
+            EncodeIntent::Quality,
+            arcen_media::video::MotionPriority::Detail,
+        );
         assert_eq!(resized.intent, EncodeIntent::Quality);
         assert_eq!(resized.codec, "h265");
         assert!(resized.yuv444);

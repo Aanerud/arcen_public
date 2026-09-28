@@ -95,7 +95,8 @@ chmod 644 "$ARCEN_PAM"
 # --- What earlier builds left behind ----------------------------------------
 rm -f "$ARCEN_LEGACY_AGENT_PLIST" "$ARCEN_LEGACY_SERVICE_PLIST"
 rm -f /tmp/arcen-pier.out.log /tmp/arcen-pier.err.log
-rm -rf "$ARCEN_PIER_APP.prev" "$ARCEN_PIER_APP.prev2" "$ARCEN_AGENT_APP.prev" "$ARCEN_AGENT_APP.prev2"
+rm -rf "$ARCEN_PIER_APP.prev" "$ARCEN_PIER_APP.prev2" "$ARCEN_AGENT_APP.prev" "$ARCEN_AGENT_APP.prev2" \
+  "$ARCEN_LEGACY_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP.prev" "$ARCEN_LEGACY_AGENT_APP.prev2"
 
 # --- Firewall ----------------------------------------------------------------
 # Only when it is on: an operator who turned it off made that decision.
@@ -105,63 +106,23 @@ if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null 
   arcen_log "allowed incoming connections to the Pier service through the firewall"
 fi
 
-# --- Start -------------------------------------------------------------------
-launchctl enable "system/$ARCEN_SERVICE_LABEL" 2>/dev/null || true
-if ! OUTPUT="$(launchctl bootstrap system "$ARCEN_SERVICE_PLIST" 2>&1)"; then
-  if printf '%s' "$OUTPUT" | grep -qi "already"; then
-    launchctl kickstart -k "system/$ARCEN_SERVICE_LABEL" >/dev/null 2>&1 || true
-  else
-    fail "the network service could not be started: $OUTPUT"
-  fi
-fi
-
+# --- Start and prove it runs -----------------------------------------------
+# The Pier binary starts the network service and each signed-in user's
+# desktop agent, then checks that the service listens and every agent runs,
+# through the shared installer transaction. Its exit status is this
+# package's: an install that does not serve fails, instead of reporting
+# success over a host nobody can reach. Missing privacy approvals are not
+# checked here; they are onboarding, explained below.
 AGENT_UIDS=""
+set -- --port "$ARCEN_PORT"
 for uid in $(arcen_gui_uids); do
   [ "$uid" -eq 0 ] && continue
   AGENT_UIDS="$AGENT_UIDS $uid"
-  launchctl enable "gui/$uid/$ARCEN_AGENT_LABEL" 2>/dev/null || true
-  if ! OUTPUT="$(launchctl bootstrap "gui/$uid" "$ARCEN_AGENT_PLIST" 2>&1)"; then
-    if printf '%s' "$OUTPUT" | grep -qi "already"; then
-      launchctl kickstart -k "gui/$uid/$ARCEN_AGENT_LABEL" >/dev/null 2>&1 || true
-    else
-      fail "the desktop agent could not be started for uid $uid: $OUTPUT"
-    fi
-  fi
+  set -- "$@" --agent-uid "$uid"
 done
+ACTIVATION_STATUS=0
+"$ARCEN_PIER_BIN" activate "$@" || ACTIVATION_STATUS=$?
 
-# --- Check -------------------------------------------------------------------
-running() {
-  launchctl print "$1" 2>/dev/null | grep -q "state = running"
-}
-LISTENING=""
-for _ in $(seq 1 15); do
-  if running "system/$ARCEN_SERVICE_LABEL" && arcen_port_in_use; then
-    LISTENING="yes"
-    break
-  fi
-  sleep 1
-done
-if [ -n "$LISTENING" ]; then
-  arcen_log "network service running and listening on UDP $ARCEN_PORT"
-else
-  fail "the network service is not listening on UDP $ARCEN_PORT; see $ARCEN_LOGS/service.log"
-fi
-for uid in $AGENT_UIDS; do
-  STARTED=""
-  for _ in $(seq 1 10); do
-    if running "gui/$uid/$ARCEN_AGENT_LABEL"; then
-      STARTED="yes"
-      break
-    fi
-    sleep 1
-  done
-  USER_NAME="$(id -un "$uid" 2>/dev/null || echo "uid $uid")"
-  if [ -n "$STARTED" ]; then
-    arcen_log "desktop agent running for $USER_NAME"
-  else
-    fail "the desktop agent is not running for $USER_NAME; see ~$USER_NAME/Library/Logs/Arcen/Pier/agent.log"
-  fi
-done
 if [ -z "$AGENT_UIDS" ]; then
   # Nobody is logged in, so the login window is on screen. Its agents are
   # loaded when a login-window session starts, and launchctl offers no domain
@@ -195,7 +156,11 @@ To remove Arcen Pier:
 
 NOTE
 
-# A failed start is reported but does not fail the package: the files are in
-# place and correct, and the message above says exactly what is not running.
-# Failing here would leave Installer claiming nothing changed.
+# A failed start fails the package. The files stay in place, so a later
+# `launchctl kickstart` or reinstall can recover, and the lines above say
+# exactly what is not running.
+if [ "$ACTIVATION_STATUS" -ne 0 ]; then
+  fail "Arcen Pier is installed but not running; see the messages above"
+  exit "$ACTIVATION_STATUS"
+fi
 exit 0

@@ -96,6 +96,37 @@ impl Display for ReconnectPolicyError {
 
 impl Error for ReconnectPolicyError {}
 
+/// Fresh credential authentication decision while a direct reconnect slot exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshAuthenticatedReconnectDecision {
+    /// No detached session occupies the host; start an ordinary new session.
+    StartNewSession,
+    /// The same native OS principal authenticated again; drain the detached
+    /// owner now instead of reserving the display until the resume deadline.
+    TakeOverDetached,
+    /// A different native OS principal authenticated while the detached owner
+    /// still has a resume window. Keep the reservation for the original owner.
+    RefuseDifferentPrincipal,
+}
+
+/// Shared policy for a fresh credential authentication that encounters a
+/// detached direct-session owner. True resume-token authentication continues to
+/// use [`DirectReconnect`] and [`DirectResumeSlot`]; this rule is only for a
+/// newly authenticated connection without a resume token.
+#[must_use]
+pub fn decide_fresh_authenticated_reconnect<Principal: Eq>(
+    detached_owner: Option<&Principal>,
+    authenticated: &Principal,
+) -> FreshAuthenticatedReconnectDecision {
+    match detached_owner {
+        None => FreshAuthenticatedReconnectDecision::StartNewSession,
+        Some(owner) if owner == authenticated => {
+            FreshAuthenticatedReconnectDecision::TakeOverDetached
+        }
+        Some(_) => FreshAuthenticatedReconnectDecision::RefuseDifferentPrincipal,
+    }
+}
+
 /// Direct-session reconnect phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectState {
@@ -689,6 +720,22 @@ mod tests {
                 ReconnectActions::default()
             );
         }
+    }
+
+    #[test]
+    fn fresh_authenticated_reconnect_policy_only_takes_same_detached_principal() {
+        assert_eq!(
+            decide_fresh_authenticated_reconnect::<u32>(None, &501),
+            FreshAuthenticatedReconnectDecision::StartNewSession
+        );
+        assert_eq!(
+            decide_fresh_authenticated_reconnect(Some(&501), &501),
+            FreshAuthenticatedReconnectDecision::TakeOverDetached
+        );
+        assert_eq!(
+            decide_fresh_authenticated_reconnect(Some(&501), &502),
+            FreshAuthenticatedReconnectDecision::RefuseDifferentPrincipal
+        );
     }
 
     #[test]

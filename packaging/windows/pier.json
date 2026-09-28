@@ -12,6 +12,7 @@
     "expiry_warning_days": 30,
     "expected_sans": []
   },
+  "capture": {},
   "video": {
     "bit_depth": "10",
     "color_range": "full",
@@ -22,10 +23,10 @@
   },
   "audio": {
     "enabled": true,
-    "compressed": false
+    "compressed": true
   },
   "microphone_input": {
-    "enabled": false
+    "enabled": true
   },
   "clipboard": {
     "direction": "both",
@@ -41,7 +42,7 @@
     "reconnect_window_secs": 180
   },
   "redirection": {
-    "timezone": false
+    "timezone": true
   },
   "logging": {
     "level": 0,
@@ -71,11 +72,13 @@
       "render_adapter": {}
     },
     "multi_monitor": {
-      "advertise_enabled": false,
+      "advertise_enabled": true,
       "allowed_adapters": [],
+      "excluded_adapters": [],
       "max_monitors": null,
       "nvenc_session_limit": null,
-      "allow_software_fallback": false
+      "allow_software_fallback": true,
+      "nvidia_headless_enabled": null
     },
     "logging": {
       "rotate_mb": 32

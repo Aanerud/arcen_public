@@ -1136,6 +1136,8 @@ pub struct AppliedMonitorMediaPlanMsg {
     pub cursor_mode: CursorMode,
     #[serde(default, skip_serializing_if = "is_false")]
     pub degraded: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub degradation_reason: String,
 }
 
 /// Exact applied monitor descriptor carried inside
@@ -2210,6 +2212,7 @@ mod tests {
                     bitrate_kbps: 18_000,
                     cursor_mode: CursorMode::Local,
                     degraded: false,
+                    degradation_reason: String::new(),
                 },
             },
             AppliedMonitorDescriptorMsg {
@@ -2234,6 +2237,7 @@ mod tests {
                     bitrate_kbps: 4_000,
                     cursor_mode: CursorMode::Local,
                     degraded: true,
+                    degradation_reason: "bandwidth_optimized".to_owned(),
                 },
             },
         ]

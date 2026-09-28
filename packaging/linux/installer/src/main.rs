@@ -267,6 +267,22 @@ fn open_firewall(options: &Options) {
         return;
     }
     if Path::new("/usr/bin/firewall-cmd").exists() {
+        // `firewall-cmd --permanent` needs the daemon, so an installed but
+        // stopped firewalld used to read as a failed update and told the
+        // operator to fix a firewall that was not filtering anything.
+        let running = Command::new("/usr/bin/firewall-cmd")
+            .arg("--state")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !running {
+            println!(
+                "firewalld: installed but not running, so nothing was changed; if you start it, \
+                 open 18444/udp"
+            );
+            return;
+        }
         let quic = Command::new("/usr/bin/firewall-cmd")
             .args(["--permanent", "--add-port=18444/udp"])
             .status();
@@ -308,8 +324,61 @@ fn open_firewall(options: &Options) {
     );
 }
 
+/// What bringing the unit up achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceOutcome {
+    /// Dry run, staging prefix, or `--no-service`: nothing was started.
+    NotRequested,
+    /// systemd settled on `active`.
+    Running,
+    /// systemd settled on anything else.
+    NotRunning(String),
+}
+
+/// Carries the unit's outcome through the shared installer transaction, whose
+/// `finish` is the only thing that decides whether the install succeeded.
+fn finish_install(
+    mut transaction: arcen_session::install_lifecycle::InstallTransaction,
+    outcome: &ServiceOutcome,
+) -> Result<(), String> {
+    use arcen_session::install_lifecycle::InstallEvent;
+    let events: &[InstallEvent] = match outcome {
+        ServiceOutcome::NotRequested => &[InstallEvent::ServiceNotRequested],
+        ServiceOutcome::Running => &[
+            InstallEvent::ServiceQuiesced,
+            InstallEvent::ActivationCommitted,
+            InstallEvent::SmokePassed,
+        ],
+        ServiceOutcome::NotRunning(_) => &[
+            InstallEvent::ServiceQuiesced,
+            InstallEvent::ActivationCommitted,
+            InstallEvent::TransactionFailed,
+        ],
+    };
+    for event in events {
+        transaction
+            .apply(*event)
+            .map_err(|error| format!("installer transaction: {error}"))?;
+    }
+    transaction
+        .finish()
+        .map(|_| ())
+        .map_err(|error| match outcome {
+            ServiceOutcome::NotRunning(state) => format!(
+                "{error}: arcen-pier.service is {state:?}, not active. The files are installed; \
+             see `journalctl -u arcen-pier` for why the service stopped"
+            ),
+            _ => error.to_string(),
+        })
+}
+
 fn install(options: &Options) -> Result<(), String> {
+    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
+    let mut transaction = InstallTransaction::new();
     preflight(options)?;
+    transaction
+        .apply(InstallEvent::PreflightPassed)
+        .map_err(|error| format!("installer transaction: {error}"))?;
     create_dir(options, PIER_DIR, 0o755)?;
     create_dir(options, "/etc/arcen", 0o755)?;
     create_dir(options, "/var/log/arcen", 0o750)?;
@@ -346,8 +415,6 @@ fn install(options: &Options) -> Result<(), String> {
         0o644,
         true,
     )?;
-    let config_path = map_path(&options.prefix, "/etc/arcen/pier.json");
-    let fresh_config = !config_path.exists();
     write_atomic(
         options,
         "/etc/arcen/pier.json",
@@ -357,13 +424,6 @@ fn install(options: &Options) -> Result<(), String> {
     )?;
     if !options.force {
         migrate_existing_config(options)?;
-    }
-    if fresh_config || options.force {
-        println!(
-            "multi-monitor safe-auto: disabled; the installer cannot prove a Linux NVIDIA head \
-             roster without starting an X/NV-CONTROL session. Configure \
-             platform.multi_monitor.heads after validating the host, or leave it disabled."
-        );
     }
     write_atomic(
         options,
@@ -380,29 +440,32 @@ fn install(options: &Options) -> Result<(), String> {
     } else {
         println!("staging prefix: skipped systemctl daemon-reload");
     }
+    transaction
+        .apply(InstallEvent::PayloadStaged)
+        .map_err(|error| format!("installer transaction: {error}"))?;
     open_firewall(options);
-    enable_and_start(options)?;
+    let outcome = enable_and_start(options)?;
     report_pending_restart(options);
     if is_root_prefix(&options.prefix) && !options.dry_run {
         println!();
         println!("Administration guide: /usr/share/doc/arcen/pier-administration.md");
     }
-    Ok(())
+    finish_install(transaction, &outcome)
 }
 
 /// Register the unit and bring it up.
-fn enable_and_start(options: &Options) -> Result<(), String> {
+fn enable_and_start(options: &Options) -> Result<ServiceOutcome, String> {
     if options.dry_run {
         println!("dry-run: would enable and start arcen-pier.service");
-        return Ok(());
+        return Ok(ServiceOutcome::NotRequested);
     }
     if !is_root_prefix(&options.prefix) {
         println!("staging prefix: skipped enabling the service");
-        return Ok(());
+        return Ok(ServiceOutcome::NotRequested);
     }
     if options.no_service {
         println!("--no-service: installed without enabling the unit");
-        return Ok(());
+        return Ok(ServiceOutcome::NotRequested);
     }
     run_systemctl(&["enable", "arcen-pier.service"])?;
     let _ = Command::new("/usr/bin/systemctl")
@@ -443,10 +506,11 @@ fn enable_and_start(options: &Options) -> Result<(), String> {
     }
     if active == "active" {
         println!("service: enabled and running");
+        Ok(ServiceOutcome::Running)
     } else {
         println!("service: enabled but not running (state: {active})");
+        Ok(ServiceOutcome::NotRunning(active))
     }
-    Ok(())
 }
 
 /// Remove a Pier left behind by a pre-`/opt` install.
@@ -899,7 +963,7 @@ fn remove_symlink_if_ours(options: &Options) {
 /// The configuration is the one thing on a Pier the installer cannot
 /// reconstruct. GPU pinning, monitor layout and transport tuning are site
 /// facts, not product defaults, so a purge-and-reinstall silently reverted a
-/// hand-tuned host to whatever the safe-auto defaults happen to select.
+/// hand-tuned host to whatever the product defaults happen to select.
 ///
 /// The copy lands outside `/etc/arcen`, and purge still proceeds if it cannot
 /// be made: refusing to clean a machine because a backup failed is worse than
@@ -1000,6 +1064,32 @@ mod tests {
     use super::*;
 
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn staged() -> arcen_session::install_lifecycle::InstallTransaction {
+        use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
+        let mut transaction = InstallTransaction::new();
+        transaction
+            .apply(InstallEvent::PreflightPassed)
+            .expect("preflight");
+        transaction
+            .apply(InstallEvent::PayloadStaged)
+            .expect("staged");
+        transaction
+    }
+
+    #[test]
+    fn the_install_succeeds_only_when_the_service_is_proven_running() {
+        assert_eq!(finish_install(staged(), &ServiceOutcome::Running), Ok(()));
+        assert_eq!(
+            finish_install(staged(), &ServiceOutcome::NotRequested),
+            Ok(()),
+            "a dry run, staging prefix or --no-service claims no running service"
+        );
+        let error = finish_install(staged(), &ServiceOutcome::NotRunning("failed".into()))
+            .expect_err("a service that is not running fails the install");
+        assert!(error.contains("\"failed\""), "{error}");
+        assert!(error.contains("journalctl -u arcen-pier"), "{error}");
+    }
 
     #[test]
     fn purge_preserves_a_copy_of_the_configuration() {

@@ -811,6 +811,8 @@ fn connect_options_from_parts_with_monitors(
         color_primaries: flag_value(args, "--color-primaries")
             .unwrap_or(default_profile.color_primaries),
         encode_intent: flag_value(args, "--encode-intent").unwrap_or(default_profile.encode_intent),
+        motion_priority: flag_value(args, "--motion-priority")
+            .unwrap_or(default_profile.motion_priority),
     };
     let fixture_displays = smoke_monitor_fixture(args)?;
     let monitors = fixture_displays.as_ref().map_or(live_monitors, |displays| {

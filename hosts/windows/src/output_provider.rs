@@ -521,6 +521,7 @@ mod tests {
                     Rotation::Degrees0
                 },
                 primary: index == 0,
+                color: None,
             })
             .collect();
         WindowsTopologyPlan {

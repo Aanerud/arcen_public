@@ -5,15 +5,21 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use crate::{
-    ActivityClass, ChromaSubsampling, DirtyRatio, MAX_MULTI_MONITOR_COUNT,
-    RegionActivityDiagnostics, RegionGeneration, RegionId, RegionMediaPlan, RegionMediaRoster,
-    SessionMonitorId,
+    ActivityClass, BitrateBudgetKbps, ChromaSubsampling, DirtyRatio, MAX_MULTI_MONITOR_COUNT,
+    MediaContractError, RegionActivityDiagnostics, RegionGeneration, RegionId, RegionMediaPlan,
+    RegionMediaRoster, SessionMonitorId,
 };
 
 const BASIS_POINTS: u32 = 10_000;
 const BASIS_POINTS_U16: u16 = 10_000;
 const MILLIFPS_SCALE: u128 = 1_000;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const MIN_ENCODER_STEPDOWN_FPS: u32 = 24;
+const FPS_STEPDOWN_LADDER: [u32; 6] = [60, 50, 45, 40, 30, 24];
+
+/// Shared degradation reason published when measured encoder capacity reduces
+/// a preset's requested frame-rate ceiling.
+pub const ENCODER_CAPACITY_FPS_DEGRADATION_REASON: &str = "fps_reduced_by_encoder_capacity";
 
 /// Maximum number of exact encoder-set candidates admitted in one bounded run.
 ///
@@ -485,6 +491,14 @@ pub struct EncoderSetMeasurements {
     pub per_region: Vec<RegionEncoderMeasurements>,
 }
 
+/// Admitted frame-rate step-down for an otherwise usable encoder set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncoderFpsStepdown {
+    pub requested_fps: u32,
+    pub admitted_fps: u32,
+    pub reason: &'static str,
+}
+
 /// Measured threshold violation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EncoderThresholdViolation {
@@ -558,6 +572,12 @@ pub enum EncoderSetDecision {
     Reject {
         attempts: Vec<EncoderSetAttempt>,
     },
+    StepDown {
+        selected_candidate_index: usize,
+        requested_fps: u32,
+        admitted_fps: u32,
+        attempts: Vec<EncoderSetAttempt>,
+    },
 }
 
 impl EncoderSetDecision {
@@ -571,6 +591,10 @@ impl EncoderSetDecision {
             | Self::Reassign {
                 selected_candidate_index,
                 ..
+            }
+            | Self::StepDown {
+                selected_candidate_index,
+                ..
             } => Some(*selected_candidate_index),
             Self::Reject { .. } => None,
         }
@@ -581,7 +605,24 @@ impl EncoderSetDecision {
         match self {
             Self::Accept { attempts, .. }
             | Self::Reassign { attempts, .. }
+            | Self::StepDown { attempts, .. }
             | Self::Reject { attempts } => attempts,
+        }
+    }
+
+    #[must_use]
+    pub const fn fps_stepdown(&self) -> Option<EncoderFpsStepdown> {
+        match self {
+            Self::StepDown {
+                requested_fps,
+                admitted_fps,
+                ..
+            } => Some(EncoderFpsStepdown {
+                requested_fps: *requested_fps,
+                admitted_fps: *admitted_fps,
+                reason: ENCODER_CAPACITY_FPS_DEGRADATION_REASON,
+            }),
+            Self::Accept { .. } | Self::Reassign { .. } | Self::Reject { .. } => None,
         }
     }
 }
@@ -834,7 +875,141 @@ pub fn admit_encoder_sets<A: EncoderMeasurementAdapter>(
             });
         }
     }
+    if let Some((selected_candidate_index, requested_fps, admitted_fps)) =
+        fps_stepdown_candidate(&attempts, profiles, thresholds)
+    {
+        return Ok(EncoderSetDecision::StepDown {
+            selected_candidate_index,
+            requested_fps,
+            admitted_fps,
+            attempts,
+        });
+    }
     Ok(EncoderSetDecision::Reject { attempts })
+}
+
+/// Returns a lower uniform target when an exact candidate failed only because
+/// the requested ceiling exceeded measured encoder capacity.
+fn fps_stepdown_candidate(
+    attempts: &[EncoderSetAttempt],
+    profiles: &RegionActivityProfiles,
+    thresholds: EncoderAdmissionThresholds,
+) -> Option<(usize, u32, u32)> {
+    let requested_fps = profiles
+        .profiles()
+        .iter()
+        .filter(|profile| profile.target_fps > 1)
+        .map(|profile| profile.target_fps)
+        .max()?;
+    if requested_fps <= MIN_ENCODER_STEPDOWN_FPS {
+        return None;
+    }
+    attempts.iter().find_map(|attempt| {
+        let EncoderSetAttemptOutcome::ThresholdFailed {
+            measurements,
+            violations,
+        } = &attempt.outcome
+        else {
+            return None;
+        };
+        if !threshold_violations_can_step_down(violations, profiles) {
+            return None;
+        }
+        let admitted_fps =
+            sustainable_ladder_fps(measurements, profiles, thresholds, requested_fps)?;
+        Some((attempt.candidate_index, requested_fps, admitted_fps))
+    })
+}
+
+fn threshold_violations_can_step_down(
+    violations: &[EncoderThresholdViolation],
+    profiles: &RegionActivityProfiles,
+) -> bool {
+    let has_idle_regions = profiles
+        .profiles()
+        .iter()
+        .any(|profile| profile.target_fps <= 1);
+    violations.iter().all(|violation| match violation {
+        EncoderThresholdViolation::EncodeLatency { .. }
+        | EncoderThresholdViolation::QueueAge { .. }
+        | EncoderThresholdViolation::DeliveredFps { .. } => true,
+        EncoderThresholdViolation::Fairness { .. } => has_idle_regions,
+    })
+}
+
+fn sustainable_ladder_fps(
+    measurements: &EncoderSetMeasurements,
+    profiles: &RegionActivityProfiles,
+    thresholds: EncoderAdmissionThresholds,
+    requested_fps: u32,
+) -> Option<u32> {
+    let mut sustainable_millifps = u32::MAX;
+    for profile in profiles
+        .profiles()
+        .iter()
+        .filter(|profile| profile.target_fps > 1)
+    {
+        let region = measurements
+            .per_region
+            .iter()
+            .find(|region| region.session_monitor_id == profile.session_monitor_id)?;
+        let delivered_capacity = if thresholds.min_delivered_fps_basis_points == 0 {
+            0
+        } else {
+            u32::try_from(
+                u128::from(region.delivered_millifps).saturating_mul(u128::from(BASIS_POINTS))
+                    / u128::from(thresholds.min_delivered_fps_basis_points),
+            )
+            .unwrap_or(u32::MAX)
+        };
+        let latency_capacity = latency_capacity_millifps(region.p95_encode_latency);
+        sustainable_millifps = sustainable_millifps.min(delivered_capacity.min(latency_capacity));
+    }
+    snap_stepdown_fps(sustainable_millifps, requested_fps)
+}
+
+fn latency_capacity_millifps(latency: Duration) -> u32 {
+    if latency.is_zero() {
+        return u32::MAX;
+    }
+    let value = MILLIFPS_SCALE.saturating_mul(NANOS_PER_SECOND) / latency.as_nanos();
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn snap_stepdown_fps(sustainable_millifps: u32, requested_fps: u32) -> Option<u32> {
+    FPS_STEPDOWN_LADDER.iter().copied().find(|fps| {
+        *fps < requested_fps
+            && *fps >= MIN_ENCODER_STEPDOWN_FPS
+            && fps.saturating_mul(1_000) <= sustainable_millifps
+    })
+}
+
+/// Returns a media roster whose frame-rate/budget truth matches a lower
+/// admitted encoder target.
+///
+/// # Errors
+///
+/// Returns the same media-plan validation errors as constructing the
+/// underlying per-region plans.
+pub fn retarget_encoder_roster_fps(
+    roster: &RegionMediaRoster,
+    admitted_fps: u32,
+) -> Result<RegionMediaRoster, MediaContractError> {
+    let mut plans = Vec::with_capacity(roster.plans().len());
+    for plan in roster.plans() {
+        let fps = plan.fps.min(admitted_fps);
+        plans.push(RegionMediaPlan::new(
+            plan.session_monitor_id,
+            plan.stream_epoch,
+            plan.backend,
+            plan.video,
+            plan.width,
+            plan.height,
+            fps,
+            BitrateBudgetKbps::nominal_for_geometry(plan.width, plan.height, fps),
+        )?);
+    }
+    RegionMediaRoster::new(plans)
 }
 
 fn validate_candidates(
@@ -1250,6 +1425,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Behavior {
         Healthy,
+        LiveSpeedActive,
+        LiveSpeedIdle,
         Stall865Ms,
         DeliverQuarter,
         FailOpen,
@@ -1287,6 +1464,42 @@ mod tests {
                 return Err(EncoderProbeFailure::context_open(
                     "synthetic context open failed",
                 ));
+            }
+            if matches!(
+                behavior,
+                Behavior::LiveSpeedActive | Behavior::LiveSpeedIdle
+            ) {
+                let delivered_limit = if matches!(behavior, Behavior::LiveSpeedActive) {
+                    34
+                } else {
+                    usize::MAX
+                };
+                let elapsed = if matches!(behavior, Behavior::LiveSpeedIdle) {
+                    Duration::from_millis(1_001)
+                } else {
+                    request.measurement_window
+                };
+                let samples = request
+                    .sample_frames
+                    .iter()
+                    .enumerate()
+                    .map(|(index, frame)| EncoderProbeSample {
+                        sequence: frame.sequence,
+                        kind: frame.kind,
+                        queue_age: if matches!(behavior, Behavior::LiveSpeedActive) {
+                            Duration::from_millis(682)
+                        } else {
+                            Duration::from_millis(1)
+                        },
+                        encode_latency: if matches!(behavior, Behavior::LiveSpeedActive) {
+                            Duration::from_millis(32)
+                        } else {
+                            Duration::from_millis(5)
+                        },
+                        delivered: index < delivered_limit,
+                    })
+                    .collect();
+                return Ok(EncoderProbeTrace { elapsed, samples });
             }
             let encode_latency = if matches!(behavior, Behavior::Stall865Ms) {
                 Duration::from_millis(865)
@@ -1535,6 +1748,56 @@ mod tests {
     }
 
     #[test]
+    fn live_v100d_speed_trace_steps_down_to_thirty_instead_of_rejecting() {
+        let candidate = candidate(&[
+            (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 60),
+            (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 60),
+        ]);
+        let profiles = profiles(vec![
+            profile(
+                1,
+                ActivityClass::FullMotion,
+                60,
+                RegionAdmissionPriority::Standard,
+            ),
+            profile(2, ActivityClass::Idle, 1, RegionAdmissionPriority::Standard),
+        ]);
+        let adapter = FakeAdapter::new(BTreeMap::from([
+            ((0, 1), Behavior::LiveSpeedActive),
+            ((0, 2), Behavior::LiveSpeedIdle),
+        ]));
+
+        let decision =
+            admit_encoder_sets(vec![candidate], &profiles, thresholds(), &adapter).expect("step");
+
+        let stepdown = decision
+            .fps_stepdown()
+            .expect("Speed 60 should be admitted at a lower ladder step");
+        assert_eq!(stepdown.requested_fps, 60);
+        assert_eq!(stepdown.admitted_fps, 30);
+        assert_eq!(stepdown.reason, ENCODER_CAPACITY_FPS_DEGRADATION_REASON);
+        assert_eq!(decision.selected_candidate_index(), Some(0));
+    }
+
+    #[test]
+    fn auto_thirty_that_passes_is_unchanged() {
+        let candidate = candidate(&[(EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 30)]);
+        let profiles = profiles(vec![profile(
+            1,
+            ActivityClass::FullMotion,
+            30,
+            RegionAdmissionPriority::Standard,
+        )]);
+        let adapter = FakeAdapter::new(BTreeMap::new());
+
+        let decision =
+            admit_encoder_sets(vec![candidate], &profiles, thresholds(), &adapter).expect("accept");
+
+        assert!(matches!(decision, EncoderSetDecision::Accept { .. }));
+        assert_eq!(decision.fps_stepdown(), None);
+    }
+
+    #[test]
     fn all_motion_starvation_fails_fairness() {
         let candidate = candidate(&[
             (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 60),
@@ -1646,6 +1909,7 @@ mod tests {
         let decision =
             admit_encoder_sets(vec![candidate], &profiles, thresholds(), &adapter).expect("reject");
         assert_eq!(decision.selected_candidate_index(), None);
+        assert_eq!(decision.fps_stepdown(), None);
         assert!(matches!(decision, EncoderSetDecision::Reject { .. }));
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
     }

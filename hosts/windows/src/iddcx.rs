@@ -605,6 +605,7 @@ mod tests {
                 refresh_hz: 60,
                 rotation: Rotation::Degrees90,
                 primary: true,
+                color: None,
             }],
             requires_custom_timing: false,
         };

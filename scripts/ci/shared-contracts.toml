@@ -1,0 +1,208 @@
+# What shared/ promises and who must use it. Checked by
+# scripts/check_shared_contracts.py (CI job "Shared contracts").
+#
+# [[consumer]]  a shared symbol every listed product must call from
+#               production code (not tests). A shared policy nobody calls is a
+#               proposal, not parity.
+# [[forbid]]    a pattern marking a known duplicate or bypass of shared
+#               policy; must not appear in production code under `paths`.
+# [ratchet]     portable Rust under hosts/ (no OS API) may only shrink.
+
+# --- Gate 1: a desktop's colour truth ---------------------------------------
+
+[[consumer]]
+id = "desktop-plan"
+gate = 1
+symbol = "resolve_desktop_plan"
+products = ["hosts/linux"]
+reason = "A host that cannot report its desktop's encoding resolves sessions through the shared rule, so PQ is converted or refused, never relabelled."
+
+[[consumer]]
+id = "desktop-conversion"
+gate = 1
+symbol = "conversion_for_output"
+products = ["hosts/capenc"]
+reason = "capenc derives its source conversion from the shared rule instead of restating it."
+
+# --- Gates 1 and 4: installs that prove the Pier runs -----------------------
+
+[[consumer]]
+id = "install-transaction"
+gate = 4
+symbol = "InstallTransaction"
+products = ["packaging/linux/installer", "packaging/windows/installer", "hosts/macos"]
+reason = "Every installer's exit status comes from the shared transaction's finish(), so a Pier that is not running is never reported installed."
+
+[[forbid]]
+id = "ignored-install-step"
+gate = 4
+pattern = 'let\s+_\s*=\s*[A-Za-z_.]*transaction\s*\.\s*apply'
+paths = ["hosts", "packaging"]
+reason = "An ignored transaction step is the ceremony this gate removed; check the result."
+
+# --- Gate 4: every Pier drives the shared lifecycle -------------------------
+
+[[consumer]]
+id = "session-lifecycle"
+gate = 4
+symbol = "SessionLifecycles"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "Each Pier reports its session steps to the shared lifecycle, which enforces ordering and readiness evidence the same way on every host."
+
+# --- Gate 2: every host takes the Deck display's colour -----------------------
+
+[[consumer]]
+id = "display-colour"
+gate = 2
+symbol = "DisplayColor"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "A client display's gamut and HDR luminance are interpreted by the shared rule on every host."
+
+[[forbid]]
+id = "colourless-edid"
+gate = 2
+pattern = 'EdidRequest\s*\{[^}]*?color:\s*None'
+paths = ["hosts"]
+justified_by_comment = true
+reason = "A virtual display built for a Deck display carries that display's colour; say why none applies in a `// shared-contract colourless-edid: <reason>` comment."
+
+# --- Gate 3: one video queue policy and one priority-audio lifecycle --------
+
+[[consumer]]
+id = "video-queue"
+gate = 3
+symbol = "SharedVideoQueue"
+products = ["hosts/linux", "hosts/windows"]
+reason = "Drop, keyframe-recovery and IDR decisions come from the shared queue; hosts keep only wakeups."
+
+[[consumer]]
+id = "priority-audio"
+gate = 3
+symbol = "PriorityAudio"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "Audio's priority stream lifecycle is the shared one on every host."
+
+[[forbid]]
+id = "local-priority-audio"
+gate = 3
+pattern = 'struct\s+PriorityAudio\b'
+paths = ["hosts"]
+reason = "Use arcen_transport::quic::PriorityAudio instead of a host copy."
+
+[[forbid]]
+id = "local-keyframe-recovery"
+gate = 3
+pattern = 'awaiting_keyframe\s*:\s*bool'
+paths = ["hosts"]
+reason = "Keyframe-recovery state belongs to the shared video queue."
+
+# --- Gate 7: presets are stated trade-offs ----------------------------------
+
+[[consumer]]
+id = "streaming-preset-contract"
+gate = 7
+symbol = "StreamingPreset"
+products = ["clients/macos"]
+reason = "The Deck's preset UI must read the shared trade-off contract instead of restating marketing strings or frame-rate promises."
+
+[[consumer]]
+id = "motion-priority-capenc"
+gate = 7
+symbol = "requested_motion_priority"
+products = ["hosts/capenc"]
+reason = "capenc parses the shared detail/motion priority token once, so NVENC policy and future rate control read the same preference."
+
+[[consumer]]
+id = "motion-priority-macos"
+gate = 7
+symbol = "motion_priority"
+products = ["hosts/macos"]
+reason = "The macOS Pier carries the shared detail/motion preference into its VideoToolbox encoder config for the Gate 6 controller hook."
+
+[[forbid]]
+id = "deck-preset-marketing-copy"
+gate = 7
+pattern = '"(?:30|60) fps,\s*adaptive|"[^"]*GPU-only capture'
+paths = ["clients/macos"]
+reason = "Deck preset copy must come from the shared preset contract and must not promise delivered fps or unique GPU capture behaviour."
+
+# --- Gate 6: the backlog stays out of QUIC -----------------------------------
+
+[[consumer]]
+id = "interactive-send-window"
+gate = 6
+symbol = "keep_send_window_interactive"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "Every Deck connection's send window follows its congestion window, so video cannot pile up inside QUIC ahead of audio and input."
+
+# --- Ratchet ------------------------------------------------------------------
+
+[ratchet]
+baseline = "scripts/ci/portable-host-baseline.txt"
+paths = ["hosts"]
+minimum_lines = 40
+
+# --- Gate 6: one adaptive bitrate controller, applied live everywhere --------
+
+[[consumer]]
+id = "adaptive-rate-controller"
+gate = 6
+symbol = "RateController"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "Every Pier drives live bitrate changes through the shared transport-aware controller instead of a host-local rule."
+
+[[consumer]]
+id = "capenc-control-line"
+gate = 6
+symbol = "CapencControlCommand"
+products = ["hosts/capenc"]
+reason = "The capenc stdin protocol, including live BITRATE updates, is parsed and formatted by the shared helper."
+
+[[consumer]]
+id = "adaptive-rate-priority"
+gate = 7
+symbol = "for_bounds_and_priority"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+reason = "Every Pier applies the shared Detail/Motion trade-off to adaptive bitrate control."
+
+[[consumer]]
+id = "local-video-backlog-signal"
+gate = 6
+symbol = "take_wait_stats"
+products = ["hosts/linux", "hosts/windows"]
+reason = "Linux and Windows feed the shared controller real host-side video queue wait instead of hiding QUIC/application backlog."
+
+[[consumer]]
+id = "linux-nvidia-head-discovery"
+gate = 8
+symbol = "choose_nvidia_xorg_heads"
+products = ["hosts/linux"]
+reason = "Linux parses and ranks NVIDIA Xorg head discovery through the shared output rule instead of keeping product-local policy."
+
+[[forbid]]
+id = "zero-frame-wait-rate-sample"
+gate = 6
+pattern = 'mean_frame_wait:\s*Duration::ZERO'
+paths = ["hosts/linux", "hosts/windows"]
+reason = "Adaptive rate control must receive a real local backlog signal on split host queues."
+
+[[consumer]]
+id = "windows-multi-monitor-adapter-selection"
+gate = 2
+symbol = "resolve_windows_multi_monitor_adapter"
+products = ["hosts/windows"]
+reason = "Windows gathers DXGI/NVAPI facts locally but chooses the streaming adapter through the shared allow/exclude and headless policy."
+
+[default_configs]
+# One set of defaults on every host; the file is for turning things off.
+files = [
+  "packaging/linux/arcen-pier.json",
+  "packaging/windows/pier.json",
+  "packaging/macos/arcen-pier.json",
+]
+ignore = [
+  "tls.cert",
+  "tls.key",
+  "auth.disclaimer.directory",
+  "audio.local_playback",
+]

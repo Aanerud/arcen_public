@@ -23,7 +23,7 @@ use arcen_input::{
 use arcen_media::{AppliedPoint, AppliedRegionSet, RegionContractError, RegionSet};
 use arcen_protocol::messages::{
     RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg, RegionPointerEnterMsg,
-    RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
+    RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg, ScrollUnitMsg,
 };
 
 use crate::display::DesktopRect;
@@ -254,10 +254,8 @@ impl RegionInputAdapter {
         message: &RegionPointerScrollMsg,
     ) -> Result<MappedRegionScroll, RegionAdapterError> {
         message.validate()?;
-        let horizontal = i32::try_from(message.delta_x)
-            .map_err(|_| RegionAdapterError::WheelDeltaOverflow(message.delta_x))?;
-        let vertical = i32::try_from(message.delta_y)
-            .map_err(|_| RegionAdapterError::WheelDeltaOverflow(message.delta_y))?;
+        let horizontal = region_scroll_to_windows_wheel(message.delta_x, message.unit)?;
+        let vertical = region_scroll_to_windows_wheel(message.delta_y, message.unit)?;
         let mapped = self.pipeline.pointer_scroll(message)?;
         Ok(MappedRegionScroll {
             position: mapped.position,
@@ -277,6 +275,29 @@ impl RegionInputAdapter {
     ) -> Result<MappedRegionPen, RegionAdapterError> {
         Ok(self.pipeline.pen(message)?)
     }
+}
+
+fn region_scroll_to_windows_wheel(
+    delta: i64,
+    unit: ScrollUnitMsg,
+) -> Result<i32, RegionAdapterError> {
+    let value = match unit {
+        ScrollUnitMsg::Line => delta,
+        ScrollUnitMsg::Point => {
+            if delta == 0 {
+                return Ok(0);
+            }
+            let magnitude = u128::from(delta.unsigned_abs());
+            let rounded = ((magnitude + 60) / 120).max(1);
+            let bounded = rounded.min(i32::MAX as u128) as i64;
+            if delta.is_negative() {
+                -bounded
+            } else {
+                bounded
+            }
+        }
+    };
+    i32::try_from(value).map_err(|_| RegionAdapterError::WheelDeltaOverflow(delta))
 }
 
 fn validate_desktop(
@@ -580,6 +601,7 @@ mod tests {
             refresh_hz: 60,
             rotation: arcen_media::Rotation::Degrees0,
             primary,
+            color: None,
         }
     }
 
@@ -769,7 +791,7 @@ mod tests {
                         serde_json::from_value(event.clone()).unwrap();
                     let mapped = adapter.pointer_scroll(&message).unwrap();
                     assert_eq!(mapped.position, pointer_endpoint);
-                    assert_eq!((mapped.horizontal, mapped.vertical), (120, -240));
+                    assert_eq!((mapped.horizontal, mapped.vertical), (1, -2));
                 }
                 "region_pen_event" => {
                     let message: RegionPenEventMsg = serde_json::from_value(event.clone()).unwrap();
@@ -1045,12 +1067,34 @@ mod tests {
                 position: position(7, 2, 12_000, 24_000),
                 delta_x: -120,
                 delta_y: 240,
+                unit: ScrollUnitMsg::Line,
+                phase: arcen_protocol::messages::ScrollPhaseMsg::None,
                 metadata: metadata(2),
             })
             .expect("scroll");
         assert_eq!(scroll.position, entered);
         assert_eq!(scroll.horizontal, -120);
         assert_eq!(scroll.vertical, 240);
+    }
+
+    #[test]
+    fn point_scroll_uses_fractional_windows_wheel_delta_units() {
+        assert_eq!(
+            region_scroll_to_windows_wheel(30, ScrollUnitMsg::Point).expect("small point"),
+            1
+        );
+        assert_eq!(
+            region_scroll_to_windows_wheel(60, ScrollUnitMsg::Point).expect("half point"),
+            1
+        );
+        assert_eq!(
+            region_scroll_to_windows_wheel(-180, ScrollUnitMsg::Point).expect("negative point"),
+            -2
+        );
+        assert_eq!(
+            region_scroll_to_windows_wheel(120, ScrollUnitMsg::Line).expect("line"),
+            120
+        );
     }
 
     #[test]

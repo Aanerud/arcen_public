@@ -17,6 +17,7 @@ use arcen_protocol::messages::{
     REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL, RegionInputMetadataMsg,
     RegionInputPositionMsg, RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg,
     RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
+    ScrollPhaseMsg, ScrollUnitMsg,
 };
 
 const CROSS_COMPONENT_BASELINE: &str = include_str!(concat!(
@@ -218,6 +219,8 @@ fn scroll(
         position: position_msg(7, region, x, y),
         delta_x,
         delta_y,
+        unit: ScrollUnitMsg::Line,
+        phase: ScrollPhaseMsg::None,
         metadata: metadata_msg(sequence),
     }
 }
@@ -271,6 +274,8 @@ fn every_event_maps_through_one_shared_pipeline_and_advances_shared_state() {
             position: AppliedPoint::new(0, 12),
             delta_x: 120,
             delta_y: -240,
+            unit: arcen_input::ScrollUnit::Line,
+            phase: arcen_input::ScrollPhase::None,
         }
     );
     let mapped_pen = pipeline.pen(&pen(1, 600, 900, 44)).unwrap();

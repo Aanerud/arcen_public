@@ -45,7 +45,7 @@ use crate::logging::target::{AUDIO, AUTH, CAPENC, DISPLAY, HEALTH, INPUT, MEDIA,
 use crate::logging::LogController;
 use crate::media::annexb::NalCodec;
 use crate::media::audio::{self as audiocap, AudioConfig};
-use crate::media::capenc::{self, IdrRequester, ResolvedMediaPlan};
+use crate::media::capenc::{self, BitrateRequester, IdrRequester, ResolvedMediaPlan};
 use crate::media::encoder_admission;
 use crate::media::multi_capenc::{
     self, CapencHandle, MonitorPipelineTemplate, MultiCapencSupervisor,
@@ -344,6 +344,46 @@ const CRITICAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Every live session's shared Pier lifecycle. Steps are reported where this
+/// host already emits its session lifecycle telemetry; ordering and the
+/// readiness-evidence rule are the shared crate's.
+static LIFECYCLES: arcen_session::host_lifecycle::SessionLifecycles =
+    arcen_session::host_lifecycle::SessionLifecycles::new();
+
+/// A session's lifecycle key: the lease's session id, which survives a resume
+/// (the log id does not), or the log id for a session without a lease.
+fn lifecycle_key(lease: Option<&SessionLease>, session_log_id: &CorrelationId) -> String {
+    lease.map_or_else(
+        || session_log_id.to_string(),
+        |lease| lease.metadata.session_id.clone(),
+    )
+}
+
+fn log_lifecycle(
+    key: &str,
+    step: &'static str,
+    report: arcen_session::host_lifecycle::LifecycleReport,
+) {
+    match report.to {
+        Ok(state) => info!(
+            target: SESSION,
+            session = key,
+            step,
+            from = report.from.map(|state| state.token()),
+            state = state.token(),
+            "Pier lifecycle"
+        ),
+        Err(error) => warn!(
+            target: SESSION,
+            session = key,
+            step,
+            from = report.from.map(|state| state.token()),
+            %error,
+            "Pier lifecycle step refused"
+        ),
+    }
+}
+
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -591,6 +631,7 @@ where
         resume_window_secs,
         resumed,
         error_code,
+        session_setup_failed: false,
     };
     match serde_json::to_string(&result) {
         Ok(json) => {
@@ -710,8 +751,11 @@ fn build_auth_request(
 /// defensively (fully disabled, logged once) rather than panicking, in case
 /// a future hot-reload path ever bypasses that earlier validation.
 fn multi_monitor_gate(cfg: &Config) -> multi_monitor::MultiMonitorGate {
-    let gate =
-        multi_monitor::MultiMonitorGate::from_config(&cfg.multi_monitor, cfg.encoder).unwrap_or_else(
+    let gate = multi_monitor::MultiMonitorGate::from_config(
+        &cfg.multi_monitor,
+        cfg.resolved_multi_monitor_encoder(),
+    )
+    .unwrap_or_else(
         |error| {
             warn!(
                 target: SESSION,
@@ -733,7 +777,8 @@ fn multi_monitor_gate(cfg: &Config) -> multi_monitor::MultiMonitorGate {
             "runtime_probe"
         },
         allow_software_fallback = cfg.multi_monitor.allow_software_fallback,
-        encoder = ?cfg.encoder,
+        configured_encoder = ?cfg.encoder,
+        multi_monitor_encoder = ?cfg.resolved_multi_monitor_encoder(),
         "effective Linux multi-monitor admission policy"
     );
     gate
@@ -1436,6 +1481,47 @@ fn emit_session_stream_start(
     crate::emit_lifecycle_event_with_context(
         emitter,
         LifecycleEventKind::SessionStreamStart,
+        context,
+        fields,
+    );
+}
+
+fn emit_encoder_admission_fps_reduced(
+    emitter: &LifecycleEmitter,
+    session_log_id: CorrelationId,
+    stepdown: arcen_media::EncoderFpsStepdown,
+    selected_candidate_index: usize,
+    monitor_count: usize,
+    user: Option<&str>,
+    peer_addr: Option<&str>,
+) {
+    let mut fields = StructuredFields::default();
+    let _ = fields.insert(
+        "requested_fps",
+        FieldValue::Integer(i64::from(stepdown.requested_fps)),
+    );
+    let _ = fields.insert(
+        "admitted_fps",
+        FieldValue::Integer(i64::from(stepdown.admitted_fps)),
+    );
+    let _ = fields.insert("reason", FieldValue::String(stepdown.reason.to_owned()));
+    let _ = fields.insert(
+        "candidate",
+        FieldValue::Integer(i64::try_from(selected_candidate_index).unwrap_or(i64::MAX)),
+    );
+    let _ = fields.insert(
+        "monitor_count",
+        FieldValue::Integer(i64::try_from(monitor_count).unwrap_or(i64::MAX)),
+    );
+    let context = emitter.session_context(
+        session_log_id,
+        user.map(str::to_string),
+        peer_addr.map(str::to_string),
+        None,
+    );
+    crate::emit_lifecycle_event_with_context(
+        emitter,
+        LifecycleEventKind::EncoderAdmissionFpsReduced,
         context,
         fields,
     );
@@ -2517,6 +2603,12 @@ async fn handle_quic_connection(
         connection.close(0_u32.into(), b"TLS host identity changed during handshake");
         return Err("TLS host identity changed during QUIC handshake".into());
     }
+    // Keep the video backlog out of QUIC for this Deck's whole connection
+    // (resumes arrive on new connections and pass here too); the task ends
+    // when the connection closes.
+    tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
+        connection.clone(),
+    ));
     let stream = tokio::time::timeout(
         WEBSOCKET_HANDSHAKE_TIMEOUT,
         arcen_transport::quic::accept_direct(connection),
@@ -2914,6 +3006,11 @@ async fn run_ws(
                     Some(&remote_host),
                     lease.metadata.session_id.parse::<i64>().ok(),
                 );
+                log_lifecycle(
+                    &lease.metadata.session_id,
+                    "authenticated",
+                    LIFECYCLES.authenticated(&lease.metadata.session_id),
+                );
                 session_config = authenticated_config;
                 (Some(response), Some(lease))
             }
@@ -3212,6 +3309,7 @@ async fn run_ws(
         // to consume the lease even when `resume_setup` was `None`, causing
         // legacy/non-resumable clients to lose the committed multi-monitor
         // topology and start the single-primary capenc path.
+        let key = lifecycle_key(session_lease.as_ref(), &session_log_id);
         let end = run_attachment(
             ws,
             Arc::clone(&cfg),
@@ -3230,6 +3328,7 @@ async fn run_ws(
             Arc::clone(&qos_targets),
         )
         .await;
+        log_lifecycle(&key, "ended", LIFECYCLES.ended(&key));
         if let Some(resources) = display_resources.as_mut() {
             resources.restore().await;
         }
@@ -3582,6 +3681,11 @@ async fn run_resumable_session(
             reason_class = end.reason.reason_class(),
             "direct transport detached; desktop, display, and timezone leases retained"
         );
+        log_lifecycle(
+            &lease.metadata.session_id,
+            "transport_lost",
+            LIFECYCLES.transport_lost(&lease.metadata.session_id),
+        );
 
         loop {
             let (deadline, timer_generation) = match reconnect.state() {
@@ -3691,6 +3795,11 @@ async fn run_resumable_session(
                         );
                         display_resources = Some(resources);
                         session_log_id = handoff.session_log_id;
+                        log_lifecycle(
+                            &lease.metadata.session_id,
+                            "resumed",
+                            LIFECYCLES.authenticated(&lease.metadata.session_id),
+                        );
                         ws = handoff.socket;
                         if let Err(error) =
                             session_registry.resume().mark_attached(&active_session_id)
@@ -3737,6 +3846,11 @@ async fn run_resumable_session(
         }
     }
 
+    log_lifecycle(
+        &lease.metadata.session_id,
+        "ended",
+        LIFECYCLES.ended(&lease.metadata.session_id),
+    );
     if let Err(error) = session_registry.resume().begin_drain(&active_session_id) {
         tracing::error!(
             target: SESSION,
@@ -3852,6 +3966,7 @@ async fn run_attachment(
         .as_ref()
         .is_some_and(|resources| resources.can_reassign())
         && display_mode.allows_live_resize();
+    let path_signal_connection = ws.path_signal_connection();
     let priority_audio = ws.priority_audio();
     let (mut sink, mut stream) = ws.split();
     // Recovery is tied to the authenticated user environment, not to current
@@ -3928,6 +4043,7 @@ async fn run_attachment(
     // monitor's frame source (muxed in once `queue`/`pump` exist), and the
     // applied capability attached to `ServerHello` before any IDR flows.
     let mut primary_idr: Option<IdrRequester> = None;
+    let mut primary_bitrate: Option<BitrateRequester> = None;
     let mut primary_frames_rx: Option<mpsc::Receiver<crate::media::annexb::AccessUnit>> = None;
     let mut multi_monitor_secondary_sources: Vec<multi_capenc::MonitorFrameSource> = Vec::new();
     let mut applied_multi_monitor_capability: Option<ServerMultiMonitorMsg> = None;
@@ -3936,7 +4052,7 @@ async fn run_attachment(
             let template = MonitorPipelineTemplate {
                 binary: initial_capenc.binary.clone(),
                 codec: initial_capenc.codec.clone(),
-                encoder: initial_capenc.encoder,
+                encoder: cfg.resolved_multi_monitor_encoder(),
                 fps: initial_capenc.fps,
                 yuv444: initial_capenc.yuv444,
                 bit_depth: initial_capenc.bit_depth,
@@ -3944,7 +4060,9 @@ async fn run_attachment(
                 color_matrix: initial_capenc.color_matrix,
                 transfer: initial_capenc.transfer,
                 color_primaries: initial_capenc.color_primaries,
+                desktop_encoding: initial_capenc.desktop_encoding,
                 intent: initial_capenc.intent,
+                motion_priority: initial_capenc.motion_priority,
                 qp_map: initial_capenc.qp_map,
                 video_selection: initial_capenc.video_selection,
                 cursor_mode: initial_capenc.cursor_mode,
@@ -4018,11 +4136,12 @@ async fn run_attachment(
                 }
             };
             encoder_admission::emit_admission_telemetry(&decision);
+            let fps_stepdown = decision.fps_stepdown();
             // The accepted candidate's specs *and* the negotiated media roster
             // it was admitted with: the roster names each region's committed
             // bitrate budget, which the applied capability publishes verbatim
             // rather than re-deriving from the resolved geometry.
-            let Some((specs, negotiated_media)) = encoder_plan
+            let Some((mut specs, mut negotiated_media)) = encoder_plan
                 .selected_specs(&decision)
                 .map(<[_]>::to_vec)
                 .zip(encoder_plan.selected_media_roster(&decision).cloned())
@@ -4039,6 +4158,40 @@ async fn run_attachment(
                 .await;
                 return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
             };
+            if let Some(stepdown) = fps_stepdown {
+                for spec in &mut specs {
+                    spec.config.fps = spec.config.fps.min(stepdown.admitted_fps);
+                }
+                negotiated_media = match arcen_media::retarget_encoder_roster_fps(
+                    &negotiated_media,
+                    stepdown.admitted_fps,
+                ) {
+                    Ok(media) => media,
+                    Err(error) => {
+                        warn!(
+                            target: CAPENC,
+                            %error,
+                            "admitted fps step-down could not retarget media roster — closing connection"
+                        );
+                        send_critical_control(
+                            &mut sink,
+                            close_with_reason("encoder admission failed"),
+                            "multi_monitor_encoder_stepdown_close",
+                        )
+                        .await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
+                };
+                emit_encoder_admission_fps_reduced(
+                    emitter,
+                    session_log_id.clone(),
+                    stepdown,
+                    decision.selected_candidate_index().unwrap_or_default(),
+                    negotiated_media.plans().len(),
+                    session_user.as_deref(),
+                    Some(remote_host),
+                );
+            }
             let mut supervisor = match MultiCapencSupervisor::start(specs).await {
                 Ok(supervisor) => supervisor,
                 Err(error) => {
@@ -4096,6 +4249,7 @@ async fn run_attachment(
                 carrier,
                 &media_for_capability,
                 &negotiated_media,
+                fps_stepdown.map(|step| step.reason),
             ) {
                 Ok(capability) => capability,
                 Err(error) => {
@@ -4135,6 +4289,7 @@ async fn run_attachment(
             let primary_source = sources.remove(primary_position);
             let media_plan = primary_source.plan;
             primary_idr = Some(primary_source.idr);
+            primary_bitrate = Some(primary_source.bitrate);
             primary_frames_rx = Some(primary_source.frames);
             multi_monitor_secondary_sources = sources;
             applied_multi_monitor_capability = Some(capability);
@@ -4432,6 +4587,7 @@ async fn run_attachment(
     // every downstream component sees the client-requested plan.
     //
     let mut active_encode_intent = initial_capenc.intent;
+    let mut active_motion_priority = initial_capenc.motion_priority;
     let (mut capenc, media_plan) = match capenc {
         CapencHandle::Multi(supervisor) => {
             if cfg.auth_video_request.is_none() {
@@ -4469,7 +4625,16 @@ async fn run_attachment(
                     || color_matrix != media_plan.video.matrix;
                 let intent_mismatch = EncodeIntent::from_token(&initial_quality.encode_intent)
                     .is_some_and(|intent| intent != cfg.requested_encode_intent());
-                if codec_mismatch || chroma_mismatch || color_mismatch || intent_mismatch {
+                let priority_mismatch = arcen_media::video::MotionPriority::from_token(
+                    &initial_quality.motion_priority,
+                )
+                .is_some_and(|priority| priority != cfg.requested_motion_priority());
+                if codec_mismatch
+                    || chroma_mismatch
+                    || color_mismatch
+                    || intent_mismatch
+                    || priority_mismatch
+                {
                     warn!(
                         target: SESSION,
                         "legacy multi-monitor quality change requires a whole-roster reconnect"
@@ -4550,6 +4715,16 @@ async fn run_attachment(
                 );
             }
             let resolved_intent = requested_intent.unwrap_or(initial_capenc.intent);
+            let requested_priority =
+                arcen_media::video::MotionPriority::from_token(&initial_quality.motion_priority);
+            if requested_priority.is_none() {
+                warn!(
+                    target: SESSION,
+                    token = initial_quality.motion_priority.as_str(),
+                    "quality_settings motion_priority token not recognised — treating as no client preference"
+                );
+            }
+            let resolved_priority = requested_priority.unwrap_or(initial_capenc.motion_priority);
             // Policy precedence, then the absolute client-capability
             // cross-check: never grant more than `client_hello` claimed this
             // client can decode, regardless of what policy would otherwise
@@ -4586,8 +4761,14 @@ async fn run_attachment(
             // host's own 10-bit 4:4:4 plan — could never move the encoder off
             // latency-first at all.
             let intent_mismatch = resolved_intent != initial_capenc.intent;
+            let priority_mismatch = resolved_priority != initial_capenc.motion_priority;
 
-            if codec_mismatch || chroma_mismatch || color_mismatch || intent_mismatch {
+            if codec_mismatch
+                || chroma_mismatch
+                || color_mismatch
+                || intent_mismatch
+                || priority_mismatch
+            {
                 if let Some(concrete_encoder) = concrete_encoder_for(media_plan) {
                     // `codec_mismatch`/`chroma_mismatch` above read an empty
                     // field as "this client states no preference on that
@@ -4643,7 +4824,24 @@ async fn run_attachment(
                     // backend cannot serve (e.g. 12-bit on NVENC) falls back
                     // to the host's current plan with a logged reason,
                     // rather than being handed to capenc to reject blindly.
-                    if !color_contract_is_servable(candidate_video, &media_plan) {
+                    // The same desktop rule the auth-time plan went through:
+                    // a later request may not reach an eight-bit contract a
+                    // PQ desktop cannot serve, which capenc would refuse and
+                    // end the session over.
+                    let desktop_refusal = arcen_media::video::resolve_desktop_plan(
+                        candidate_video,
+                        initial_capenc.desktop_encoding,
+                    )
+                    .err();
+                    if let Some(error) = desktop_refusal {
+                        warn!(
+                            target: SESSION,
+                            %error,
+                            want_bit_depth = resolved_bit_depth.token(),
+                            "client quality_settings ask for a contract this desktop cannot serve truthfully — keeping host plan"
+                        );
+                        (CapencHandle::Single(session), media_plan)
+                    } else if !color_contract_is_servable(candidate_video, &media_plan) {
                         warn!(
                             target: SESSION,
                             want_codec,
@@ -4652,6 +4850,7 @@ async fn run_attachment(
                             want_color_range = resolved_color_range.token(),
                             want_color_matrix = resolved_color_matrix.token(),
                             want_encode_intent = resolved_intent.token(),
+                            want_motion_priority = resolved_priority.token(),
                             host_codec = media_plan.codec_token(),
                             host_chroma = media_plan.chroma_token(),
                             "resolved colour/codec request is incoherent or unsupported by this backend — keeping host plan"
@@ -4666,6 +4865,7 @@ async fn run_attachment(
                             want_color_range = resolved_color_range.token(),
                             want_color_matrix = resolved_color_matrix.token(),
                             want_encode_intent = resolved_intent.token(),
+                            want_motion_priority = resolved_priority.token(),
                             host_codec = media_plan.codec_token(),
                             host_chroma = media_plan.chroma_token(),
                             "client quality_settings differ from initial plan — respawning capenc"
@@ -4677,8 +4877,10 @@ async fn run_attachment(
                         override_config.color_range = resolved_color_range;
                         override_config.color_matrix = resolved_color_matrix;
                         override_config.intent = resolved_intent;
+                        override_config.motion_priority = resolved_priority;
                         override_config.encoder = concrete_encoder;
                         active_encode_intent = override_config.intent;
+                        active_motion_priority = override_config.motion_priority;
                         session.shutdown().await;
                         match capenc::spawn(override_config.clone()).await {
                             Ok((session, plan)) => {
@@ -4695,6 +4897,7 @@ async fn run_attachment(
                                     // announces, so the requested value is
                                     // the only truth there is to report.
                                     resolved_encode_intent = override_config.intent.token(),
+                                    resolved_motion_priority = override_config.motion_priority.token(),
                                     "capenc respawn for client codec request succeeded"
                                 );
                                 (CapencHandle::Single(session), plan)
@@ -4724,6 +4927,7 @@ async fn run_attachment(
                         want_color_range = resolved_color_range.token(),
                         want_color_matrix = resolved_color_matrix.token(),
                         want_encode_intent = resolved_intent.token(),
+                        want_motion_priority = resolved_priority.token(),
                         host_codec = media_plan.codec_token(),
                         "client requested codec unsupported by this backend — keeping host plan"
                     );
@@ -4739,6 +4943,7 @@ async fn run_attachment(
         &media_plan,
         active_encoder,
         active_encode_intent,
+        active_motion_priority,
     );
     if timezone_echo_mismatch(
         authoritative_timezone.as_ref(),
@@ -5051,12 +5256,20 @@ async fn run_attachment(
     #[cfg(not(target_os = "linux"))]
     let cursor_shape_rx: Option<tokio::sync::mpsc::Receiver<String>> = None;
 
+    let mut all_monitor_bitrates: Vec<BitrateRequester> = Vec::new();
     let idr = match &capenc {
         CapencHandle::Single(session) => session.idr(),
         CapencHandle::Multi(_) => primary_idr
             .clone()
             .expect("multi-monitor primary idr captured at spawn"),
     };
+    let bitrate = match &capenc {
+        CapencHandle::Single(session) => session.bitrate(),
+        CapencHandle::Multi(_) => primary_bitrate
+            .clone()
+            .expect("multi-monitor primary bitrate captured at spawn"),
+    };
+    all_monitor_bitrates.insert(0, bitrate.clone());
     if attachment_requires_fresh_idr(force_fresh_idr) {
         idr.request();
         // IDR barrier: every applied monitor's first frame must be a
@@ -5242,6 +5455,25 @@ async fn run_attachment(
         session_user.as_deref(),
         Some(remote_host),
     );
+    {
+        let key = lifecycle_key(session_lease, &session_log_id);
+        let evidence = arcen_session::host_lifecycle::NativeReadinessEvidence {
+            // PAM opened this desktop for the user, or the operator runs the
+            // Pier without authentication and serves its own display.
+            session_identity: session_lease.is_some() || cfg.auth_mode != AuthMode::Pam,
+            // capenc's READY resolved a real output geometry.
+            outputs_verified: media_plan.width > 0 && media_plan.height > 0,
+            // `media_plan` exists only once capenc announced READY.
+            media_verified: media_plan.fps > 0,
+            // Input setup completed above, before `server_hello`.
+            input_verified: true,
+        };
+        log_lifecycle(
+            &key,
+            "stream_started",
+            LIFECYCLES.stream_started(&key, evidence),
+        );
+    }
     emit_color_plan_resolved(
         emitter,
         session_log_id.clone(),
@@ -5334,6 +5566,8 @@ async fn run_attachment(
     // watch channel: latest-wins coalescing, no queue growth during storms.
     let (resize_tx, mut resize_rx) = tokio::sync::watch::channel::<Option<ResizeRequest>>(None);
 
+    let video_write_wait_micros = Arc::new(AtomicU64::new(0));
+
     // 3b. Sender: owns the sink; drains the queue + forwards control messages.
     //
     // Carrier A (multi-monitor): every other applied monitor gets its own
@@ -5373,6 +5607,9 @@ async fn run_attachment(
         topology_generation: u64,
         stream_epoch: u64,
     }
+    // Every monitor's queue, primary first: the rate controller samples the
+    // whole session, because its target is applied to every pipeline.
+    let mut rate_queues: Vec<Arc<FrameQueue>> = vec![queue.clone()];
     let video_source = match multi_monitor_committed {
         None => VideoSource::Single(queue.clone()),
         Some((plan, _carrier)) => {
@@ -5381,7 +5618,9 @@ async fn run_attachment(
             let mut pending_secondaries: Vec<PendingSecondaryPump> = Vec::new();
             for source in multi_monitor_secondary_sources {
                 all_monitor_idrs.push(source.idr.clone());
+                all_monitor_bitrates.push(source.bitrate.clone());
                 let secondary_queue = Arc::new(FrameQueue::new(source.idr));
+                rate_queues.push(secondary_queue.clone());
                 mux_queues.push((source.session_monitor_id, secondary_queue.clone()));
                 pending_secondaries.push(PendingSecondaryPump {
                     plan: source.plan,
@@ -5478,6 +5717,7 @@ async fn run_attachment(
             refresh,
             write_timeout,
             priority_audio,
+            Arc::clone(&video_write_wait_micros),
         )
         .instrument(tracing::Span::current()),
     );
@@ -6072,6 +6312,122 @@ async fn run_attachment(
         .instrument(dispatcher_span),
     );
 
+    let rate_control_enabled = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
+    let mut rate_task = path_signal_connection.map(|connection| {
+        let bitrate_senders = all_monitor_bitrates.clone();
+        let rate_queues = rate_queues.clone();
+        let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
+        let plan = media_plan;
+        let motion_priority = active_motion_priority;
+        tokio::spawn(async move {
+            let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+                plan.width,
+                plan.height,
+                plan.fps,
+                plan.video.chroma,
+                plan.video.bit_depth,
+            ));
+            let ceiling_bps = u64::from(arcen_media::video::average_bitrate_bps(
+                plan.width,
+                plan.height,
+                plan.fps,
+                plan.video.chroma,
+                plan.video.bit_depth,
+            ));
+            let mut controller = arcen_media::rate_control::RateController::new(
+                arcen_media::rate_control::RateControlPolicy::for_bounds_and_priority(
+                    start_bps,
+                    ceiling_bps,
+                    motion_priority,
+                ),
+            );
+            let mut pipeline_sync = arcen_media::rate_control::PipelineRateSync::new(
+                bitrate_senders.len(),
+                start_bps,
+                plan.fps.max(1),
+            );
+            let mut path_state = arcen_telemetry::PathSignalState::default();
+            let path_started = tokio::time::Instant::now();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let session_bytes = |queues: &[Arc<FrameQueue>]| {
+                queues.iter().map(|queue| queue.bytes_sent()).sum::<u64>()
+            };
+            let session_frames = |queues: &[Arc<FrameQueue>]| {
+                queues.iter().map(|queue| queue.frames_sent()).sum::<u64>()
+            };
+            let mut last_bytes = session_bytes(&rate_queues);
+            let mut last_frames = session_frames(&rate_queues);
+            loop {
+                ticker.tick().await;
+                if connection.close_reason().is_some() {
+                    break;
+                }
+                let bytes = session_bytes(&rate_queues);
+                let frames = session_frames(&rate_queues);
+                let wait = arcen_media::video::VideoQueueWaitStats::combine(
+                    rate_queues.iter().map(|queue| queue.take_wait_stats()),
+                );
+                let write_wait =
+                    Duration::from_micros(video_write_wait_micros.swap(0, Ordering::Relaxed));
+                let mean_write_wait = if wait.frames == 0 {
+                    Duration::ZERO
+                } else {
+                    write_wait / u32::try_from(wait.frames).unwrap_or(u32::MAX)
+                };
+                let sample = arcen_media::rate_control::RateSample {
+                    delivered_bytes: bytes.saturating_sub(last_bytes),
+                    elapsed: Duration::from_secs(1),
+                    mean_frame_wait: wait.mean.saturating_add(mean_write_wait),
+                    frames: frames.saturating_sub(last_frames),
+                    pipeline_count: u32::try_from(bitrate_senders.len()).unwrap_or(u32::MAX),
+                    path: Some(arcen_transport::observe_quinn_path_signal(
+                        &mut path_state,
+                        path_started.elapsed(),
+                        &connection,
+                    )),
+                };
+                last_bytes = bytes;
+                last_frames = frames;
+                if rate_control_enabled {
+                    let change = controller.observe(sample);
+                    let want_bps = controller.target_bps();
+                    let want_fps = (motion_priority == arcen_media::video::MotionPriority::Detail)
+                        .then(|| {
+                            arcen_media::rate_control::detail_framerate(
+                                plan.fps, start_bps, want_bps,
+                            )
+                        });
+                    // Every tick, not only on a change: a pipeline whose
+                    // mailbox was full catches up with the latest target.
+                    let outcome = pipeline_sync.sync(
+                        want_bps,
+                        want_fps,
+                        |index, bps| bitrate_senders[index].request(bps),
+                        |index, fps| bitrate_senders[index].request_framerate(fps),
+                    );
+                    if let Some(change) = change {
+                        tracing::info!(
+                            target: CAPENC,
+                            previous_bps = change.previous_bps,
+                            target_bps = change.target_bps,
+                            reason = change.reason.token(),
+                            pipelines = bitrate_senders.len(),
+                            pipelines_pending = outcome.pending,
+                            fps = want_fps,
+                            rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
+                            queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                            loss_rate_permille = sample
+                                .path
+                                .map(|path| (path.loss_rate() * 1000.0).round() as u64),
+                            "encoder bitrate follows QUIC path"
+                        );
+                    }
+                }
+            }
+        })
+    });
+
     // 3d. Health beat: periodic health_pong (server_state), like health_loop.py.
     let health_ctrl = ctrl_tx.clone();
     let health_span = tracing::Span::current();
@@ -6658,6 +7014,9 @@ async fn run_attachment(
     // continues to the terminal SESSION_END/final-telemetry emission below.
     // Awaiting the (now-aborted) handle guarantees no health-tick emission
     // can race with or follow SESSION_END.
+    if let Some(task) = rate_task.take() {
+        task.abort();
+    }
     health.abort();
     let _ = health.await;
     if let Some(process) = clipboard_process.take() {
@@ -7667,6 +8026,7 @@ async fn sender_loop<S>(
     // The Deck's audio priority stream, when it accepted one: audio then
     // never queues behind video this sink has already accepted.
     mut priority_audio: Option<arcen_transport::quic::PriorityAudio>,
+    video_write_wait_micros: Arc<AtomicU64>,
 ) -> SessionEndReason
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -7786,6 +8146,7 @@ where
             frame = video.dequeue() => match frame {
                 Some(bytes) => {
                     clipboard_allowed = true;
+                    let write_started = Instant::now();
                     if !send_ws_with_timeout(
                         &mut sink,
                         Message::Binary(bytes),
@@ -7794,6 +8155,8 @@ where
                     ).await {
                         break;
                     }
+                    let micros = u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    video_write_wait_micros.fetch_add(micros, Ordering::Relaxed);
                 },
                 None => break,
             },
@@ -9166,9 +9529,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_monitor_gate_defaults_to_disabled_from_default_config() {
+    fn multi_monitor_gate_offers_nothing_before_heads_are_discovered() {
+        // Multi-display is on by default, but a default config has no heads
+        // until startup discovery finds them, so nothing is offered yet.
         let gate = multi_monitor_gate(&Config::default());
-        assert!(!gate.advertise_enabled);
+        assert!(gate.advertise_enabled);
         assert!(gate.inventory.is_none());
     }
 
@@ -10126,6 +10491,7 @@ mod tests {
                 }),
                 Duration::from_millis(5),
                 None,
+                Arc::new(AtomicU64::new(0)),
             ),
         )
         .await
@@ -10248,6 +10614,7 @@ mod tests {
             None,
             Duration::from_millis(20),
             None,
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -10306,6 +10673,7 @@ mod tests {
                 None,
                 Duration::from_millis(5),
                 None,
+                Arc::new(AtomicU64::new(0)),
             ),
         )
         .await
@@ -11837,6 +12205,7 @@ mod tests {
             None,
             Duration::from_millis(100),
             None,
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::time::timeout(Duration::from_millis(100), async {

@@ -41,6 +41,18 @@ pub enum PierStream {
     Relayed(tokio::net::UnixStream),
 }
 
+impl PierStream {
+    /// Clones the live QUIC connection for direct sessions. Relayed agent
+    /// sessions receive path signal as injected relay control messages instead.
+    #[must_use]
+    pub fn path_signal_connection(&self) -> Option<quinn::Connection> {
+        match self {
+            Self::Quic(stream) => Some(stream.connection_handle()),
+            Self::Relayed(_) => None,
+        }
+    }
+}
+
 impl tokio::io::AsyncRead for PierStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -431,12 +443,33 @@ impl Listener {
 pub async fn refuse_with_reason(socket: &mut PierSocket, reason: &str) -> Result<(), String> {
     let frame = Message::Close(Some(CloseFrame {
         code: CloseCode::Policy,
-        reason: reason.to_owned().into(),
+        reason: close_reason_that_fits(reason).into(),
     }));
     tokio::time::timeout(REFUSAL_TIMEOUT, socket.send(frame))
         .await
         .map_err(|_| format!("timed out sending refusal: {reason}"))?
         .map_err(|error| format!("send refusal: {error}"))
+}
+
+/// Longest close reason a WebSocket peer accepts.
+///
+/// A control frame carries at most 125 bytes, two of which are the close
+/// code. The Deck's WebSocket stack rejects a longer frame as a protocol
+/// error, so an over-long reason would replace the explanation with a
+/// different failure.
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Shortens `reason` to fit a close frame, on a character boundary.
+fn close_reason_that_fits(reason: &str) -> String {
+    if reason.len() <= MAX_CLOSE_REASON_BYTES {
+        return reason.to_owned();
+    }
+    const ELLIPSIS: &str = "\u{2026}";
+    let mut end = MAX_CLOSE_REASON_BYTES - ELLIPSIS.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &reason[..end])
 }
 
 /// Sends one control message.
@@ -495,6 +528,16 @@ async fn wait_for_tls(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_close_reason_always_fits_a_control_frame() {
+        assert_eq!(close_reason_that_fits("busy"), "busy");
+        let long = "å".repeat(200);
+        let fitted = close_reason_that_fits(&long);
+        assert!(fitted.len() <= MAX_CLOSE_REASON_BYTES, "{}", fitted.len());
+        assert!(fitted.ends_with('\u{2026}'));
+        assert!(long.starts_with(fitted.trim_end_matches('\u{2026}')));
+    }
 
     #[test]
     fn missing_material_is_reported_rather_than_panicking() {

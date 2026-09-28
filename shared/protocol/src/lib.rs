@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod build_identity;
 pub mod clipboard;
 pub mod fsm;
 pub mod messages;

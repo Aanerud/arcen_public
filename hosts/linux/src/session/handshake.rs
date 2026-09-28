@@ -148,6 +148,7 @@ pub fn build_server_hello(
             } else {
                 InputCapabilityAvailability::Unavailable
             },
+            gestures: InputCapabilityAvailability::Unavailable,
             // Runtime-established truth only: `Available` exactly when the
             // separate tablet-tool uinput device was actually created before
             // this hello was built (see `InputController::pen_available`).
@@ -176,9 +177,10 @@ pub fn build_server_hello(
         clipboard: Some(crate::clipboard::advertised_policy(cfg, session)),
         device_capabilities: Default::default(),
         negotiated_transport: None, // set from the active socket before transmission
-        // This host takes wheel notches only, and always serves a signed-in
-        // desktop: never a login window that sign-in replaces.
-        precise_scroll_v1: false,
+        // This host emits REL_WHEEL_HI_RES/REL_HWHEEL_HI_RES (120 units per
+        // detent) plus compatible legacy detents, so trackpad point travel can
+        // stay precise when the Deck advertises it.
+        precise_scroll_v1: true,
         login_window: false,
     }
     .with_build_identity(crate::build_identity())

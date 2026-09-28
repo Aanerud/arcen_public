@@ -2,7 +2,15 @@ use std::hint::black_box;
 
 use arcen_keel::scenario::{Scenario, ScenarioKind};
 use arcen_keel::{BgraFrame, DamageTracker, KernelPreference};
-use arcen_media::video::{convert_bgra_to_nv12, convert_bgra_to_nv12_rows, Nv12FrameMut};
+use arcen_media::video::{
+    convert_bgra_to_nv12, convert_bgra_to_nv12_rows, ColorTransform, Nv12FrameMut,
+};
+use arcen_media::{BitDepth, ColorMatrix, ColorRange};
+
+/// The eight-bit BT.709 limited transform every fast-path session uses.
+fn sdr_transform() -> ColorTransform {
+    ColorTransform::new(ColorMatrix::Bt709, ColorRange::Limited, BitDepth::Eight)
+}
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 
 const WIDTH: usize = 1792;
@@ -30,7 +38,7 @@ fn bgra_to_nv12(
         uv_stride,
     )
     .expect("valid NV12 benchmark");
-    convert_bgra_to_nv12(source, &mut destination).expect("valid full conversion");
+    convert_bgra_to_nv12(source, &mut destination, sdr_transform()).expect("valid full conversion");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,7 +63,8 @@ fn bgra_to_nv12_rows(
         uv_stride,
     )
     .expect("valid NV12 benchmark");
-    convert_bgra_to_nv12_rows(source, &mut destination, rows).expect("valid selective conversion");
+    convert_bgra_to_nv12_rows(source, &mut destination, rows, sdr_transform())
+        .expect("valid selective conversion");
 }
 
 fn render_pair(kind: ScenarioKind) -> (Scenario, Vec<u8>, Vec<u8>) {

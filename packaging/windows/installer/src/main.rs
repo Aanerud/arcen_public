@@ -13,6 +13,8 @@ mod acl;
 /// whether an operator's configuration is preserved or replaced.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod diagnosis;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod service_outcome;
 
 /// Not `#[cfg(windows)]` for the same reason as `acl`: uninstall must not
 /// delete a binary whose service is still starting.
@@ -50,6 +52,8 @@ mod imp {
     use crate::acl::{AclClass, OWNER_SID, assert_acl_sddl, unexpected_trustees};
     use crate::diagnosis::is_tls_failure;
     use crate::scm_state::{ScmState, parse_state};
+    use crate::service_outcome::{ServiceOutcome, finish_install};
+    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
 
     /// Set by `--verbose`. Off by default, so an administrator sees what
     /// changed, not every icacls and reg.exe line behind it.
@@ -312,20 +316,35 @@ mod imp {
                 "install failed; restarting service {} as it was found",
                 opts.service_name
             );
-            if let Err(error) = start_service(opts) {
-                println!("warning: could not restart {}: {error}", opts.service_name);
+            match start_service(opts) {
+                Ok(ServiceOutcome::Running | ServiceOutcome::NotRequested) => {}
+                Ok(ServiceOutcome::NotRunning(state)) => println!(
+                    "warning: {} did not come back after the failed install (state: {state})",
+                    opts.service_name
+                ),
+                Err(error) => {
+                    println!("warning: could not restart {}: {error}", opts.service_name);
+                }
             }
         }
         outcome
     }
 
     fn install_files(opts: &Options) -> Result<(), String> {
+        // Elevation and argument checks already passed in `windows_main`.
+        let mut transaction = InstallTransaction::new();
+        transaction
+            .apply(InstallEvent::PreflightPassed)
+            .map_err(|error| format!("installer transaction: {error}"))?;
         remove_set_aside_credential_providers(opts);
         let logs = opts.programdata.join("logs");
         let sessions = logs.join("sessions");
         let runtime = opts.programdata.join("runtime");
         let tls = opts.programdata.join("tls");
         let rollback = opts.programdata.join("rollback");
+        // Crash-recovery journals (time zone, display) live here. Nothing
+        // created it, so time-zone redirection failed on every session.
+        let recovery = opts.programdata.join("recovery");
         for dir in [
             &opts.prefix,
             &opts.programdata,
@@ -334,6 +353,7 @@ mod imp {
             &runtime,
             &tls,
             &rollback,
+            &recovery,
         ] {
             create_dir(opts, dir)?;
         }
@@ -343,7 +363,7 @@ mod imp {
         // reachable because Windows gives Everyone bypass-traverse-checking by
         // default.
         apply_secret_dir_acl(opts, &opts.programdata)?;
-        for dir in [&logs, &sessions, &rollback] {
+        for dir in [&logs, &sessions, &rollback, &recovery] {
             apply_secret_dir_acl(opts, dir)?;
         }
         // The install prefix holds arcen-pier.exe and, below,
@@ -379,9 +399,10 @@ mod imp {
             println!("keeping existing config: {}", config.display());
             migrate_existing_config(opts, &config)?;
         } else {
-            let (payload, diagnostic) = safe_auto_windows_config(opts, &pier_path);
-            atomic_write(opts, &config, &payload, false)?;
-            println!("{diagnostic}");
+            atomic_write(opts, &config, DEFAULT_CONFIG.as_bytes(), false)?;
+            detail!(
+                "wrote the packaged default config; multi-monitor selection is resolved at Pier startup"
+            );
         }
         apply_secret_file_acl(opts, &config)?;
         ensure_tls(opts, &tls)?;
@@ -426,10 +447,13 @@ mod imp {
                  file logging remains active: {error}"
             );
         }
+        transaction
+            .apply(InstallEvent::PayloadStaged)
+            .map_err(|error| format!("installer transaction: {error}"))?;
         register_service(opts, &config)?;
         register_credential_provider(opts)?;
         open_firewall(opts);
-        start_service(opts)?;
+        let outcome = start_service(opts)?;
         if !opts.dry_run && !opts.staging() {
             println!();
             println!(
@@ -441,7 +465,7 @@ mod imp {
                 opts.programdata.join("pier-administration.md").display()
             );
         }
-        Ok(())
+        finish_install(transaction, &outcome, &opts.service_name)
     }
 
     /// Proves the kept configuration is one this binary can actually read.
@@ -504,150 +528,13 @@ mod imp {
         println!("existing config cannot be read by this build: {reason}");
         println!("preserved it as {}", preserved.display());
 
-        let (payload, diagnostic) = safe_auto_windows_config(opts, pier);
-        atomic_write(opts, config, &payload, false)?;
+        atomic_write(opts, config, DEFAULT_CONFIG.as_bytes(), false)?;
         println!("wrote a fresh default config: {}", config.display());
-        println!("{diagnostic}");
+        detail!(
+            "wrote the packaged default config; multi-monitor selection is resolved at Pier startup"
+        );
         println!("re-apply any settings you had customised, using the preserved copy.");
         Ok(())
-    }
-
-    fn safe_auto_windows_config(opts: &Options, pier_path: &Path) -> (Vec<u8>, String) {
-        if opts.dry_run {
-            return (
-                DEFAULT_CONFIG.as_bytes().to_vec(),
-                "multi-monitor safe-auto: left disabled during dry-run; no hardware probe was executed"
-                    .to_string(),
-            );
-        }
-        let diagnose = match diagnostic_json(pier_path, "diagnose-host") {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    DEFAULT_CONFIG.as_bytes().to_vec(),
-                    format!("multi-monitor safe-auto: disabled ({error})"),
-                );
-            }
-        };
-        let nvapi = match diagnostic_json(pier_path, "nvapi-inventory") {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    DEFAULT_CONFIG.as_bytes().to_vec(),
-                    format!("multi-monitor safe-auto: disabled ({error})"),
-                );
-            }
-        };
-        safe_auto_windows_config_from_reports(DEFAULT_CONFIG, &diagnose, &nvapi).unwrap_or_else(
-            |error| {
-                (
-                    DEFAULT_CONFIG.as_bytes().to_vec(),
-                    format!("multi-monitor safe-auto: disabled ({error})"),
-                )
-            },
-        )
-    }
-
-    fn diagnostic_json(pier_path: &Path, command: &str) -> Result<serde_json::Value, String> {
-        let output = Command::new(pier_path)
-            .args([command, "--json"])
-            .output()
-            .map_err(|error| format!("could not run {command}: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{command} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("{command} returned invalid JSON: {error}"))
-    }
-
-    fn safe_auto_windows_config_from_reports(
-        default_config: &str,
-        diagnose: &serde_json::Value,
-        nvapi: &serde_json::Value,
-    ) -> Result<(Vec<u8>, String), String> {
-        let adapters = diagnose
-            .get("adapters")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("diagnose-host did not report adapters")?;
-        let gpus = nvapi
-            .get("gpus")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("nvapi-inventory did not report GPUs")?;
-
-        let mut matches = Vec::new();
-        for adapter in adapters {
-            let description = adapter
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let eligible = adapter.get("vendor_id").and_then(serde_json::Value::as_u64)
-                == Some(0x10de)
-                && !adapter
-                    .get("software")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true)
-                && adapter
-                    .get("direct_nvenc_candidate")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-            if !eligible || description.is_empty() {
-                continue;
-            }
-            for gpu in gpus {
-                let full_name = gpu
-                    .get("full_name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                let quadro = gpu
-                    .get("quadro")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                let display_count = gpu
-                    .get("displays")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                if quadro
-                    && display_count >= 2
-                    && normalized_nvidia_name(description)
-                        .eq_ignore_ascii_case(normalized_nvidia_name(full_name))
-                {
-                    matches.push((description.to_string(), display_count));
-                }
-            }
-        }
-        if matches.len() != 1 {
-            return Err(format!(
-                "expected exactly one unambiguous NVENC-capable Quadro/GRID adapter, found {}",
-                matches.len()
-            ));
-        }
-        let (adapter, display_count) = &matches[0];
-        let max_monitors = (*display_count).min(2);
-        let mut config: serde_json::Value = serde_json::from_str(default_config)
-            .map_err(|error| format!("packaged default config is invalid: {error}"))?;
-        config["platform"]["multi_monitor"] = serde_json::json!({
-            "advertise_enabled": true,
-            "allowed_adapters": [adapter],
-            "max_monitors": max_monitors,
-            "nvenc_session_limit": null,
-            "allow_software_fallback": true,
-            "nvidia_headless_enabled": true
-        });
-        let payload = serde_json::to_vec_pretty(&config)
-            .map_err(|error| format!("serialize safe-auto config: {error}"))?;
-        Ok((
-            payload,
-            format!(
-                "multi-monitor safe-auto: enabled {max_monitors} native NVIDIA headless displays on {adapter}; NVENC capacity uses measured runtime admission"
-            ),
-        ))
-    }
-
-    fn normalized_nvidia_name(name: &str) -> &str {
-        name.strip_prefix("NVIDIA ").unwrap_or(name)
     }
 
     fn migrate_existing_config(opts: &Options, path: &Path) -> Result<(), String> {
@@ -708,10 +595,10 @@ mod imp {
     }
 
     /// Bring the service up after installation.
-    fn start_service(opts: &Options) -> Result<(), String> {
+    fn start_service(opts: &Options) -> Result<ServiceOutcome, String> {
         if opts.dry_run || opts.staging() {
             println!("staging or dry-run: service not started");
-            return Ok(());
+            return Ok(ServiceOutcome::NotRequested);
         }
         // Capture rather than inherit: sc.exe prints a status block that is
         // noise in an installer transcript.
@@ -723,8 +610,14 @@ mod imp {
         // Ask the service control manager what actually happened. sc.exe start
         // succeeds once the start is accepted, so reporting on its exit status
         // claims a running service for one that is about to fail.
+        // Wait as long as the service control manager itself does before it
+        // gives up on a start (30 s by default): a Pier that reads its
+        // configuration, certificate and display inventory legitimately takes
+        // longer than a few seconds, and reporting that as a failed install
+        // is as untruthful as reporting a failed start as success.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut state = String::new();
-        for _ in 0..20 {
+        while std::time::Instant::now() < deadline {
             let query = Command::new("sc.exe")
                 .arg("query")
                 .arg(&opts.service_name)
@@ -758,10 +651,11 @@ mod imp {
         }
         if state == "running" {
             println!("service: registered and running");
+            Ok(ServiceOutcome::Running)
         } else {
             println!("service: registered but not running (state: {state})");
+            Ok(ServiceOutcome::NotRunning(state))
         }
-        Ok(())
     }
 
     /// Stop the service and wait for it to actually be gone.
@@ -885,12 +779,9 @@ mod imp {
 
     /// Copy `pier.json` clear of the tree `--purge` is about to delete.
     ///
-    /// The configuration is the one thing on a Pier the installer cannot
-    /// reconstruct. GPU pinning, monitor layout and transport tuning are site
-    /// facts, not product defaults, and `safe_auto_windows_config` deliberately
-    /// pins no adapter. So a purge-and-reinstall on a multi-GPU workstation
-    /// silently moved streaming onto whichever adapter enumerated first —
-    /// observed on a host where the second card is reserved for other work.
+    /// The configuration is the one thing on a Pier the installer must not
+    /// reconstruct. GPU exclusions, monitor layout and transport tuning are
+    /// site facts, not product defaults.
     ///
     /// The copy lands beside the purged directory rather than inside it, and
     /// purge still proceeds if it cannot be made: refusing to clean a machine
@@ -1930,9 +1821,8 @@ mod imp {
         use super::*;
 
         /// `--purge` deletes ProgramData outright, and the configuration is the
-        /// one thing there the installer cannot rebuild: `safe_auto_windows_config`
-        /// pins no adapter, so a purge-and-reinstall on a multi-GPU host quietly
-        /// moved streaming to whichever adapter enumerated first.
+        /// one thing there the installer cannot rebuild: adapter exclusions,
+        /// monitor layout and transport tuning are site facts.
         #[test]
         fn purge_preserves_a_copy_of_the_configuration() {
             let unique = std::time::SystemTime::now()
@@ -2166,147 +2056,6 @@ mod imp {
             assert!(EVENTLOG_SOURCE_SCRIPT.contains("$script:TypesSupportedValue = 7"));
             assert_eq!(EventLogSourceAction::Install.switch(), "-Install");
             assert_eq!(EventLogSourceAction::Uninstall.switch(), "-Uninstall");
-        }
-
-        fn diagnose_adapter(description: &str) -> serde_json::Value {
-            serde_json::json!({
-                "adapters": [{
-                    "description": description,
-                    "vendor_id": 0x10de,
-                    "software": false,
-                    "direct_nvenc_candidate": true
-                }]
-            })
-        }
-
-        fn nvapi_gpu(full_name: &str, display_count: usize) -> serde_json::Value {
-            serde_json::json!({
-                "gpus": [{
-                    "full_name": full_name,
-                    "quadro": true,
-                    "displays": (0..display_count)
-                        .map(|display_id| serde_json::json!({"display_id": display_id + 1}))
-                        .collect::<Vec<_>>()
-                }]
-            })
-        }
-
-        #[test]
-        fn safe_auto_enables_one_unambiguous_quadro_grid_adapter() {
-            let (payload, diagnostic) = safe_auto_windows_config_from_reports(
-                DEFAULT_CONFIG,
-                &diagnose_adapter("NVIDIA GRID V100D-16Q"),
-                &nvapi_gpu("GRID V100D-16Q", 4),
-            )
-            .expect("unambiguous GRID adapter");
-            let config: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-            let multi = &config["platform"]["multi_monitor"];
-            assert_eq!(multi["advertise_enabled"], true);
-            assert_eq!(multi["allowed_adapters"][0], "NVIDIA GRID V100D-16Q");
-            assert_eq!(multi["max_monitors"], 2);
-            assert!(multi["nvenc_session_limit"].is_null());
-            assert_eq!(multi["allow_software_fallback"], true);
-            assert_eq!(multi["nvidia_headless_enabled"], true);
-            assert!(diagnostic.contains("measured runtime admission"));
-        }
-
-        #[test]
-        fn safe_auto_rejects_ambiguous_multi_gpu_hosts() {
-            let diagnose = serde_json::json!({
-                "adapters": [
-                    {
-                        "description": "NVIDIA GRID V100D-16Q",
-                        "vendor_id": 0x10de,
-                        "software": false,
-                        "direct_nvenc_candidate": true
-                    },
-                    {
-                        "description": "NVIDIA GRID RTX6000-8Q",
-                        "vendor_id": 0x10de,
-                        "software": false,
-                        "direct_nvenc_candidate": true
-                    }
-                ]
-            });
-            let nvapi = serde_json::json!({
-                "gpus": [
-                    {
-                        "full_name": "GRID V100D-16Q",
-                        "quadro": true,
-                        "displays": [{}, {}]
-                    },
-                    {
-                        "full_name": "GRID RTX6000-8Q",
-                        "quadro": true,
-                        "displays": [{}, {}]
-                    }
-                ]
-            });
-            assert!(
-                safe_auto_windows_config_from_reports(DEFAULT_CONFIG, &diagnose, &nvapi)
-                    .unwrap_err()
-                    .contains("found 2")
-            );
-        }
-
-        #[test]
-        fn safe_auto_rejects_identically_named_multi_gpu_hosts() {
-            let adapter = serde_json::json!({
-                "description": "NVIDIA RTX 6000 Ada Generation",
-                "vendor_id": 0x10de,
-                "software": false,
-                "direct_nvenc_candidate": true
-            });
-            let gpu = serde_json::json!({
-                "full_name": "NVIDIA RTX 6000 Ada Generation",
-                "quadro": true,
-                "displays": [{}, {}]
-            });
-            let diagnose = serde_json::json!({
-                "adapters": [adapter.clone(), adapter]
-            });
-            let nvapi = serde_json::json!({
-                "gpus": [gpu.clone(), gpu]
-            });
-            assert!(
-                safe_auto_windows_config_from_reports(DEFAULT_CONFIG, &diagnose, &nvapi)
-                    .unwrap_err()
-                    .contains("found 4")
-            );
-        }
-
-        #[test]
-        fn safe_auto_rejects_hosts_without_an_eligible_nvidia_adapter() {
-            let diagnose = serde_json::json!({
-                "adapters": [{
-                    "description": "Microsoft Basic Render Driver",
-                    "vendor_id": 0x1414,
-                    "software": true,
-                    "direct_nvenc_candidate": false
-                }]
-            });
-            assert!(
-                safe_auto_windows_config_from_reports(
-                    DEFAULT_CONFIG,
-                    &diagnose,
-                    &serde_json::json!({"gpus": []})
-                )
-                .unwrap_err()
-                .contains("found 0")
-            );
-        }
-
-        #[test]
-        fn safe_auto_rejects_incomplete_probe_output() {
-            assert_eq!(
-                safe_auto_windows_config_from_reports(
-                    DEFAULT_CONFIG,
-                    &serde_json::json!({}),
-                    &serde_json::json!({"gpus": []})
-                )
-                .unwrap_err(),
-                "diagnose-host did not report adapters"
-            );
         }
 
         /// A domain-joined host must answer to both names a person might type.

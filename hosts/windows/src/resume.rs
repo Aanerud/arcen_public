@@ -17,7 +17,8 @@ use arcen_identity::{
 use arcen_identity::{validate_direct_resume_grant, DirectResumeValidationContext};
 use arcen_protocol::messages::{AuthResponse, ResumeErrorCode, AUTH_METHOD_RESUME};
 use arcen_session::direct_reconnect::{
-    DirectResumeSlot, DirectResumeSlotResult, MonotonicMillis, ReconnectPolicy,
+    decide_fresh_authenticated_reconnect, DirectResumeSlot, DirectResumeSlotResult,
+    FreshAuthenticatedReconnectDecision, MonotonicMillis, ReconnectPolicy,
 };
 use arcen_transport::quic::DirectQuicStream;
 use arcen_transport::{ConnectionId, DirectResumeTransportBinding};
@@ -64,6 +65,15 @@ impl DirectSessionSocket {
             Self::Quic(socket) => Some(arcen_transport::quic::PriorityAudio::new(
                 socket.get_ref().connection_handle(),
             )),
+        }
+    }
+
+    /// Clones the live QUIC connection for transport path sampling.
+    pub(crate) fn path_signal_connection(&self) -> Option<quinn::Connection> {
+        match self {
+            #[cfg(feature = "wss-compat")]
+            Self::Wss(_) => None,
+            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
         }
     }
 
@@ -392,6 +402,49 @@ impl ResumeRegistry {
             .as_ref()
             .map(|entry| entry.state)
             .is_some_and(|state| matches!(state, EntryState::Detached | EntryState::Resuming)))
+    }
+
+    pub(crate) fn fresh_authentication_decision(
+        &self,
+        native_principal: &NativePrincipal,
+    ) -> Result<FreshAuthenticatedReconnectDecision, ResumeRegistryError> {
+        let guard = self.lock_entry()?;
+        let detached_owner = guard.as_ref().and_then(|entry| {
+            (entry.state == EntryState::Detached).then_some(&entry.bindings.native_principal)
+        });
+        Ok(decide_fresh_authenticated_reconnect(
+            detached_owner,
+            native_principal,
+        ))
+    }
+
+    pub(crate) fn begin_fresh_authenticated_takeover(
+        &self,
+        native_principal: &NativePrincipal,
+    ) -> Result<(), ResumeRegistryError> {
+        let owner = {
+            let mut guard = self.lock_entry()?;
+            let entry = guard
+                .as_mut()
+                .ok_or(ResumeRegistryError::SessionUnavailable)?;
+            match decide_fresh_authenticated_reconnect(
+                (entry.state == EntryState::Detached).then_some(&entry.bindings.native_principal),
+                native_principal,
+            ) {
+                FreshAuthenticatedReconnectDecision::TakeOverDetached => {}
+                FreshAuthenticatedReconnectDecision::StartNewSession => {
+                    return Err(ResumeRegistryError::SessionUnavailable);
+                }
+                FreshAuthenticatedReconnectDecision::RefuseDifferentPrincipal => {
+                    return Err(ResumeRegistryError::SessionMismatch);
+                }
+            }
+            entry.slot.revoke();
+            entry.state = EntryState::Draining;
+            entry.owner.clone()
+        };
+        let _ = owner.send(OwnerCommand::Terminal);
+        Ok(())
     }
 
     pub(crate) fn issue_initial(
@@ -1886,6 +1939,50 @@ mod tests {
         }
         assert!(commands.try_recv().is_err());
         assert!(registry.resume_handshake_available().unwrap());
+    }
+
+    #[test]
+    fn fresh_authenticated_takeover_drains_only_same_detached_principal() {
+        let registry = ResumeRegistry::with_clock(FakeClock::new(2_000)).unwrap();
+        let expected = bindings("fresh-takeover");
+        let same = expected.native_principal.clone();
+        let different = NativePrincipal::Windows {
+            sid: arcen_identity::WindowsSid::new("S-1-5-21-1-2-3-2002").unwrap(),
+            wts_session_id: 7,
+        };
+
+        assert_eq!(
+            registry.fresh_authentication_decision(&same).unwrap(),
+            FreshAuthenticatedReconnectDecision::StartNewSession
+        );
+
+        let (owner, mut commands) = mpsc::unbounded_channel();
+        let active_session_id = expected.active_session_id.clone();
+        registry
+            .issue_initial(
+                expected,
+                ReconnectPolicy::new(30).unwrap(),
+                owner,
+                &arcen_telemetry::CorrelationId::from_uuid_v4_bytes([31; 16]),
+            )
+            .unwrap();
+        registry.mark_detached(&active_session_id).unwrap();
+
+        assert_eq!(
+            registry.fresh_authentication_decision(&different).unwrap(),
+            FreshAuthenticatedReconnectDecision::RefuseDifferentPrincipal
+        );
+        assert_eq!(
+            registry.fresh_authentication_decision(&same).unwrap(),
+            FreshAuthenticatedReconnectDecision::TakeOverDetached
+        );
+
+        registry.begin_fresh_authenticated_takeover(&same).unwrap();
+        assert!(matches!(commands.try_recv(), Ok(OwnerCommand::Terminal)));
+        let guard = registry.entry.lock().unwrap();
+        let entry = guard.as_ref().unwrap();
+        assert_eq!(entry.state, EntryState::Draining);
+        assert_eq!(entry.slot.current(), None);
     }
 
     #[test]

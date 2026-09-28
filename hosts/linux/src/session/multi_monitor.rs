@@ -69,10 +69,10 @@ use crate::media::multi_capenc::{
 /// not select.
 const OFFERED_CARRIERS: [MultiMonitorCarrierMsg; 1] = [MultiMonitorCarrierMsg::MuxedReliableStream];
 
-/// Explicit operator-facing gate for `multi_monitor_v1`. Defaults to fully
-/// disabled; both `advertise_enabled` and a usable `inventory` must be
-/// explicitly set by configuration for this host to ever advertise
-/// multi-monitor support. `encoder` carries this host's configured
+/// Operator-facing gate for `multi_monitor_v1`. `advertise_enabled: false`
+/// disables the feature; otherwise a usable configured or discovered
+/// `inventory` is required before this host advertises multi-monitor support.
+/// `encoder` carries this host's configured/resolved
 /// `video.encoder` policy so [`build_offer`] and
 /// [`admit_requested_topology`] can apply the same fail-closed
 /// encoder-admission contract `media::multi_capenc` already enforces later
@@ -81,7 +81,7 @@ const OFFERED_CARRIERS: [MultiMonitorCarrierMsg; 1] = [MultiMonitorCarrierMsg::M
 /// request.
 #[derive(Debug, Clone, Default)]
 pub struct MultiMonitorGate {
-    /// Explicit config/CLI opt-in. `false` unless an operator turns it on.
+    /// Config/CLI advertisement switch. `false` is an administrator off switch.
     pub advertise_enabled: bool,
     /// Configured/discovered NVIDIA head inventory. `None`/empty means no
     /// heads are available to plan against regardless of `advertise_enabled`.
@@ -96,7 +96,7 @@ pub struct MultiMonitorGate {
 }
 
 impl MultiMonitorGate {
-    /// The fully disabled gate (today's legacy/default behavior).
+    /// The fully disabled gate.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
@@ -285,7 +285,8 @@ pub enum MultiMonitorDegradeReason {
 /// only narrows to `[Degrees0]` when at least one configured head is
 /// declared non-rotation-capable.
 fn advertised_capability(inventory: &HeadInventory) -> Option<(u8, Vec<RotationMsg>)> {
-    let max_monitors = u8::try_from(inventory.len().min(topology::VALID_HEAD_TOKENS.len())).ok()?;
+    let max_monitors =
+        u8::try_from(inventory.len().min(arcen_media::MAX_MULTI_MONITOR_COUNT)).ok()?;
     let supported_rotations = if inventory.heads().iter().all(|head| head.supports_rotation) {
         RotationMsg::ALL.to_vec()
     } else {
@@ -295,8 +296,8 @@ fn advertised_capability(inventory: &HeadInventory) -> Option<(u8, Vec<RotationM
 }
 
 /// Builds this host's pre-auth `multi_monitor_v1` offer for `AuthRequest`, or
-/// `None` when any gate is closed: operator gate disabled/no heads
-/// configured, the carrier gate is not yet open, or the configured
+/// `None` when any gate is closed: operator gate disabled/no heads discovered
+/// or configured, the carrier gate is not yet open, or the configured
 /// `video.encoder` policy is not one this offer can ever honor
 /// (`Auto`/`WindowsMediaFoundation` — see [`MultiMonitorGate::encoder`]).
 /// Withholding the offer itself (rather than only rejecting admission later)
@@ -559,6 +560,7 @@ pub fn build_applied_capability(
     carrier: MultiMonitorCarrierMsg,
     media: &[(SessionMonitorId, ResolvedMediaPlan)],
     negotiated: &RegionMediaRoster,
+    degradation_reason: Option<&'static str>,
 ) -> Result<ServerMultiMonitorMsg, AppliedCapabilityError> {
     let inventory = gate
         .usable_inventory()
@@ -574,7 +576,7 @@ pub fn build_applied_capability(
     // at a non-negative origin and the shared translation is the identity.
     let translation = OriginTranslation::to_origin(0, 0);
     let descriptors = assemble_applied_regions(
-        &LinuxAppliedRegions,
+        &LinuxAppliedRegions { degradation_reason },
         &plan.monitors,
         media,
         negotiated,
@@ -609,7 +611,9 @@ pub fn build_applied_capability(
 /// shape, the `client_display_id` re-validation, and this host's own
 /// `refresh_hz` placeholder. The join order and the budget rule are
 /// [`assemble_applied_regions`]'s.
-struct LinuxAppliedRegions;
+struct LinuxAppliedRegions {
+    degradation_reason: Option<&'static str>,
+}
 
 impl AppliedRegionAssembler for LinuxAppliedRegions {
     type Region = LinuxMonitorPlan;
@@ -673,7 +677,8 @@ impl AppliedRegionAssembler for LinuxAppliedRegions {
                 // here, so plan and wire cannot diverge.
                 bitrate_kbps: region.bitrate_kbps(),
                 cursor_mode: resolved.cursor_mode,
-                degraded: false,
+                degraded: self.degradation_reason.is_some(),
+                degradation_reason: self.degradation_reason.unwrap_or_default().to_owned(),
             },
         })
     }
@@ -773,9 +778,9 @@ mod tests {
 
     #[test]
     fn offer_is_withheld_when_the_encoder_policy_is_auto() {
-        // `Auto` can never be pinned to a concrete, exactly-supported
-        // backend before session commit, so this host must never advertise
-        // a capability it cannot honor.
+        // Startup discovery resolves `Auto` to `NativeNvenc` once heads are
+        // known. A raw `Auto` gate means discovery did not resolve a concrete
+        // backend, so this host must not advertise.
         let gate = enabled_gate_with_encoder(2, EncoderSelection::Auto);
         assert!(build_offer(&gate).is_none());
     }
@@ -808,13 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn from_config_default_is_the_fully_disabled_gate() {
+    fn from_config_default_offers_nothing_until_heads_are_discovered() {
+        // On by default; the offer appears once startup discovery fills heads.
         let gate = MultiMonitorGate::from_config(
             &LinuxMultiMonitorConfig::default(),
             EncoderSelection::NativeNvenc,
         )
         .expect("default config is always valid");
-        assert!(!gate.advertise_enabled);
+        assert!(gate.advertise_enabled);
         assert!(gate.inventory.is_none());
         assert!(build_offer(&gate).is_none());
     }
@@ -1395,7 +1401,7 @@ mod tests {
             .collect();
         let negotiated = negotiated_roster(&plan);
 
-        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated)
+        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated, None)
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1468,7 +1474,7 @@ mod tests {
             );
         }
 
-        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated)
+        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated, None)
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1506,7 +1512,7 @@ mod tests {
             .collect();
         let negotiated = negotiated_roster(&plan);
 
-        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated)
+        let capability = build_applied_capability(&gate, &plan, carrier, &media, &negotiated, None)
             .expect("applied capability must build");
         assert_eq!(capability.max_monitors(), 2);
         assert_eq!(
@@ -1542,7 +1548,7 @@ mod tests {
         )];
         let negotiated = negotiated_roster(&plan);
 
-        let error = build_applied_capability(&gate, &plan, carrier, &media, &negotiated)
+        let error = build_applied_capability(&gate, &plan, carrier, &media, &negotiated, None)
             .expect_err("must fail when a monitor's media plan is missing");
         assert!(matches!(error, AppliedCapabilityError::MissingMediaPlan(_)));
     }
@@ -1572,8 +1578,9 @@ mod tests {
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
         };
-        let error = build_applied_capability(&empty_gate, &plan, carrier, &media, &negotiated)
-            .expect_err("must fail without a usable inventory");
+        let error =
+            build_applied_capability(&empty_gate, &plan, carrier, &media, &negotiated, None)
+                .expect_err("must fail without a usable inventory");
         assert_eq!(error, AppliedCapabilityError::NoInventoryConfigured);
     }
 }

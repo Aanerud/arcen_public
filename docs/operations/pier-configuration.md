@@ -1,10 +1,30 @@
 # Unified Pier Configuration
 
-Windows and Linux Piers use the same strict JSON schema for common settings.
-The service paths are:
+Windows, Linux and macOS Piers use the same strict JSON schema for common
+settings. The service paths are:
 
 - Windows: `%ProgramData%\Arcen\pier.json`
 - Linux: `/etc/arcen/pier.json`
+- macOS: `/Library/Application Support/Arcen/pier.json`
+
+## Defaults: everything on, turn off what you don't want
+
+Every installer writes the same values for every common section, and each of
+them switches the feature on. The file is there for an administrator to turn
+things off. `scripts/check_shared_contracts.py` fails when the three packaged
+templates drift apart; only paths and the `platform` section may differ.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `video` | 10-bit, full range, BT.709, 60 fps, encoder `auto` | Each session still gets what its preset asks for and what the host can encode. |
+| `audio.enabled` / `audio.compressed` | on / Opus | Set `compressed` to `false` for PCM on a LAN. |
+| `microphone_input.enabled` | on | Linux creates a virtual source. Windows needs the optional microphone driver; without it the microphone is reported unavailable and the session carries on. macOS does not implement it yet. |
+| `clipboard` | both directions, all content | |
+| `redirection.timezone` | on | macOS does not implement it yet. |
+| Multi-display | on where the host can prove it | Windows resolves the streaming adapter at Pier startup from live DXGI/NVAPI inventory; `allowed_adapters` limits to named GPUs and `excluded_adapters` reserves GPUs for other work. Linux probes the NVIDIA Xorg head roster at service start; `platform.multi_monitor.heads` is only an administrator override. macOS advertises it when it can create virtual displays. `advertise_enabled: false` turns it off everywhere. |
+
+A configuration that is already installed is kept on upgrade; these defaults
+apply to new installs.
 
 Both packaged services pass that file explicitly with `--config`. Unknown
 fields, invalid values, missing files, and missing required policy fields fail
@@ -19,10 +39,10 @@ Every config must contain both objects:
 {
   "audio": {
     "enabled": true,
-    "compressed": false
+    "compressed": true
   },
   "microphone_input": {
-    "enabled": false
+    "enabled": true
   }
 }
 ```
@@ -40,9 +60,9 @@ is disabled with an actionable codec-unavailable event while video and control
 remain connected. Deck may mute audio, but its quality message cannot override
 the host codec or configured Opus bitrate.
 
-`microphone_input.enabled` is also host authority. Keep it `false` while input
-devices are parked. Linux creates no virtual source while it is false. Windows
-does not probe or feed the optional microphone driver while it is false.
+`microphone_input.enabled` is also host authority. Set it to `false` to refuse
+microphone audio from the Deck: Linux then creates no virtual source, and
+Windows does not probe or feed the optional microphone driver.
 
 ## Common sections
 

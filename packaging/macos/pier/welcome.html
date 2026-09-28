@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, sans-serif; line-height: 1.45; margin: 0 4px; }
+  h1 { font-size: 17px; margin: 0 0 10px; }
+  h2 { font-size: 13px; margin: 16px 0 4px; }
+  ul { padding-left: 20px; margin: 4px 0; }
+  li { margin: 3px 0; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+  .note { color: #555; }
+</style>
+</head>
+<body>
+<h1>Arcen Pier</h1>
+<p>Arcen Pier lets you use this Mac's desktop from another computer running
+Arcen Deck: its screens, sound, keyboard, pointer and clipboard, over an
+encrypted connection (QUIC with TLS 1.3 on UDP port 18444). People sign in
+with the accounts they already have on this Mac.</p>
+
+<h2>What is installed, and why it is more than one app</h2>
+<p>macOS allows screen capture and typing only inside a signed-in person's
+session, and only for that person. A remote host must also stay reachable
+when nobody is signed in. No single program can do both, so Arcen Pier is
+split, and each part gets only what it needs:</p>
+<ul>
+  <li><b>Arcen Pier</b> in Applications: the network service. It starts at
+      boot, listens for Decks, holds this Mac's encryption key and checks
+      passwords. It cannot see or control any screen. It runs as a hidden
+      service account, <code>_arcen</code>, never as an administrator or
+      root.</li>
+  <li><b>Arcen Agent Helper</b>, a background helper in
+      <code>/Library/PrivilegedHelperTools</code>. It runs inside each
+      signed-in person's session as that person, to capture the screen and
+      sound and to type and move the pointer. It has no network port and
+      cannot read the key. At the login window, before anyone has signed in,
+      macOS starts it as root.</li>
+  <li>A sign-in rule (<code>/etc/pam.d/arcen</code>) so a Deck is checked
+      against this Mac's own accounts, and an exception in the macOS firewall
+      when the firewall is on.</li>
+</ul>
+<p>Why a separate account: if the network service ever had a flaw, whoever
+exploited it would get an account that can read one key and use one port, not
+this Mac. <code>_arcen</code> has no password and no shell, is hidden from the
+login window, and nobody can sign in as it.</p>
+<p class="note">No kernel or system extension and no configuration profile is
+installed. The full explanation, with what each part can and cannot do:
+https://github.com/Aanerud/arcen_public/blob/main/docs/security/macos-pier-process-model.md</p>
+
+<h2>What macOS will ask you</h2>
+<ul>
+  <li>Your administrator password, to install into <code>/Library</code>.</li>
+  <li>The first time only: <b>"Installer would like to administer your
+      computer"</b>. That is macOS asking before the installer creates the
+      hidden <code>_arcen</code> service account. No other account or
+      password is changed. If you choose Don't Allow, the install stops and
+      nothing runs.</li>
+  <li>After installing, each person who will be served approves
+      <b>Screen &amp; System Audio Recording</b> and <b>Accessibility</b> for
+      Arcen Agent Helper, once.</li>
+  <li>A notification that background items were added: the network service
+      and the helper above. Both belong to Arcen Pier.</li>
+</ul>
+
+<p class="note">Arcen is free software under the GNU AGPL-3.0:
+https://github.com/Aanerud/arcen_public</p>
+</body>
+</html>

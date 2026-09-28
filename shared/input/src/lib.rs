@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod gestures;
 pub mod hid_reports;
+mod negotiation;
 mod pen_edges;
 mod region;
 mod region_emitter;
@@ -15,6 +17,10 @@ mod region_pipeline;
 mod region_state;
 mod region_wire;
 
+pub use negotiation::{
+    CursorModeNegotiationReason, ResolvedCursorMode, ResolvedTabletMode,
+    TabletModeNegotiationReason, resolve_cursor_mode, resolve_tablet_mode,
+};
 pub use pen_edges::{MAX_BARREL_BUTTONS, PenEdge, PenToolState, plan_pen_edges};
 pub use region::{CoordinateTransformError, RegionCoordinateTransformer};
 pub use region_emitter::{RegionInputEmitError, RegionInputEmitter};
@@ -333,6 +339,24 @@ pub enum ScrollUnit {
     Point,
 }
 
+impl From<arcen_protocol::messages::ScrollUnitMsg> for ScrollUnit {
+    fn from(value: arcen_protocol::messages::ScrollUnitMsg) -> Self {
+        match value {
+            arcen_protocol::messages::ScrollUnitMsg::Line => Self::Line,
+            arcen_protocol::messages::ScrollUnitMsg::Point => Self::Point,
+        }
+    }
+}
+
+impl From<ScrollUnit> for arcen_protocol::messages::ScrollUnitMsg {
+    fn from(value: ScrollUnit) -> Self {
+        match value {
+            ScrollUnit::Line => Self::Line,
+            ScrollUnit::Point => Self::Point,
+        }
+    }
+}
+
 /// Where a continuous scroll is in its gesture.
 ///
 /// A host that forwards this lets applications run their own momentum and
@@ -351,6 +375,30 @@ pub enum ScrollPhase {
     Ended,
     /// The gesture was interrupted.
     Cancelled,
+}
+
+impl From<arcen_protocol::messages::ScrollPhaseMsg> for ScrollPhase {
+    fn from(value: arcen_protocol::messages::ScrollPhaseMsg) -> Self {
+        match value {
+            arcen_protocol::messages::ScrollPhaseMsg::None => Self::None,
+            arcen_protocol::messages::ScrollPhaseMsg::Began => Self::Began,
+            arcen_protocol::messages::ScrollPhaseMsg::Changed => Self::Changed,
+            arcen_protocol::messages::ScrollPhaseMsg::Ended => Self::Ended,
+            arcen_protocol::messages::ScrollPhaseMsg::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl From<ScrollPhase> for arcen_protocol::messages::ScrollPhaseMsg {
+    fn from(value: ScrollPhase) -> Self {
+        match value {
+            ScrollPhase::None => Self::None,
+            ScrollPhase::Began => Self::Began,
+            ScrollPhase::Changed => Self::Changed,
+            ScrollPhase::Ended => Self::Ended,
+            ScrollPhase::Cancelled => Self::Cancelled,
+        }
+    }
 }
 
 /// Pointer scroll delta.
@@ -814,3 +862,6 @@ mod tests {
         assert_eq!(event.sequence(), 42);
     }
 }
+pub use gestures::{
+    GestureEvent, GestureState, GestureStateError, GestureWireRef, coalesce_gestures,
+};

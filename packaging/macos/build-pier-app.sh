@@ -29,7 +29,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 BIN="$REPO/target/release/arcen-pier-macos"
-APP="$REPO/Arcen Pier.app"
+OUT="$REPO/dist/macos"
+APP="$OUT/Arcen Pier.app"
 IDENTITY=""
 NOTARY_PROFILE=""
 PROVISIONING_PROFILE=""
@@ -112,7 +113,7 @@ echo "==> cargo build --locked --release -p arcen-pier-macos"
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/Cargo.toml")"
 [[ -n "$VERSION" ]] || { echo "error: could not read the workspace version" >&2; exit 1; }
 
-rm -rf "$APP" "$REPO/Arcen Agent Helper.app"
+rm -rf "$APP" "$OUT/Arcen Agent Helper.app"
 mkdir -p "$APP/Contents/MacOS"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -193,7 +194,7 @@ cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Today both roles are the same executable, so this bundle is the honest part
 # of the split - the identity that consent attaches to - and the process
 # separation follows. The helper is what the LaunchAgent runs.
-HELPER="$REPO/Arcen Agent Helper.app"
+HELPER="$OUT/Arcen Agent Helper.app"
 mkdir -p "$HELPER/Contents/MacOS"
 cat > "$HELPER/Contents/Info.plist" <<HPLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -23,10 +23,10 @@
   },
   "audio": {
     "enabled": true,
-    "compressed": false
+    "compressed": true
   },
   "microphone_input": {
-    "enabled": false
+    "enabled": true
   },
   "clipboard": {
     "direction": "both",
@@ -42,11 +42,22 @@
     "reconnect_window_secs": 180
   },
   "redirection": {
-    "timezone": false
+    "timezone": true
   },
   "logging": {
     "level": 0,
-    "retention_days": 30
+    "retention_days": 30,
+    "qos_targets": {
+      "fps_degraded_percent": 90,
+      "fps_critical_percent": 70,
+      "rtt_degraded_ms": 60,
+      "rtt_critical_ms": 150,
+      "drop_degraded_basis_points": 50,
+      "drop_critical_basis_points": 500,
+      "input_degraded_ms": 50,
+      "input_critical_ms": 120,
+      "heartbeat_critical_misses": 3
+    }
   },
   "platform": {
     "auth": {
@@ -84,6 +95,9 @@
       "firmware_sha256": "",
       "input_devices": [],
       "outputs": []
+    },
+    "multi_monitor": {
+      "advertise_enabled": true
     }
   }
 }

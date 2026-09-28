@@ -13,18 +13,14 @@
 //! a client that joins or reconnects mid-stream can start decoding.
 
 use std::ffi::c_void;
-use std::future::Future;
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use apple_cf::cf::{CFDictionary, CFString, CFType};
+use apple_cf::cf::{AsCFType, CFDictionary, CFString, CFType};
 use apple_cf::cm::CMSampleBuffer;
 use apple_cf::cv::CVPixelBuffer;
 use apple_cf::iosurface::IOSurface;
 use serde::Serialize;
 use videotoolbox::Codec;
-use videotoolbox::compression::{CompressionSession, CompressionSessionBuilder, ProfileLevel};
 
 use crate::capture::CapturedFrame;
 
@@ -214,6 +210,8 @@ pub struct EncoderConfig {
     pub fps: u32,
     /// Force a keyframe at least this often.
     pub max_keyframe_interval: i32,
+    /// What shared policy says to preserve under pressure.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// The profile the stream is encoded with.
     pub profile: EncodeProfile,
     /// The colour description written into the stream, when there is one.
@@ -283,6 +281,7 @@ impl EncoderConfig {
             .unwrap_or(i32::MAX),
             fps,
             max_keyframe_interval: 120,
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             profile: EncodeProfile::for_shape(codec, chroma, depth),
             colour: None,
         }
@@ -315,6 +314,16 @@ impl EncoderConfig {
     #[must_use]
     pub const fn with_colour(mut self, colour: Option<EncodeColour>) -> Self {
         self.colour = colour;
+        self
+    }
+
+    /// This plan with the shared motion/detail preference recorded.
+    #[must_use]
+    pub const fn with_motion_priority(
+        mut self,
+        priority: arcen_media::video::MotionPriority,
+    ) -> Self {
+        self.motion_priority = priority;
         self
     }
 }
@@ -364,7 +373,7 @@ pub struct EncodedAccessUnit {
 
 /// A running `VideoToolbox` compression session.
 pub struct Encoder {
-    session: Option<CompressionSession>,
+    session: Option<VtCompressionSession>,
     config: EncoderConfig,
     frame_index: i64,
     encode_split: EncodeSplit,
@@ -432,6 +441,263 @@ impl std::fmt::Debug for Encoder {
     }
 }
 
+/// A small `VTCompressionSession` wrapper that can pass an encoder
+/// specification at creation time.
+///
+/// The crate wrapper is still the model for ownership and callbacks, but the
+/// low-latency rate-control key is only accepted in `VTCompressionSessionCreate`
+///'s `encoderSpecification`, and `videotoolbox` 0.18.1 does not expose that
+/// argument. This wrapper keeps the raw pointer private and exposes only the
+/// operations this adapter already used.
+struct VtCompressionSession {
+    session: videotoolbox::ffi::VTCompressionSessionRef,
+}
+
+// SAFETY: matches the upstream `videotoolbox` wrapper. VideoToolbox owns the
+// encoder queue and documents the compression session API as thread-safe for
+// frame submission; this type adds no Rust aliasable state beyond the raw
+// session handle.
+unsafe impl Send for VtCompressionSession {}
+// SAFETY: as above. Shared references only call VideoToolbox functions that
+// synchronize internally.
+unsafe impl Sync for VtCompressionSession {}
+
+impl VtCompressionSession {
+    fn new(config: EncoderConfig) -> Result<Self, videotoolbox::VTError> {
+        let specification = encoder_specification(config);
+        let mut session = std::ptr::null_mut();
+        // SAFETY: all pointers either name live CoreFoundation objects for the
+        // duration of the call or are null by API contract. `session` is a live
+        // out-parameter. The callback is a C ABI function below.
+        let status = unsafe {
+            videotoolbox::ffi::VTCompressionSessionCreate(
+                videotoolbox::ffi::kCFAllocatorDefault,
+                config.width,
+                config.height,
+                config.codec.videotoolbox_codec().as_cm_codec_type(),
+                specification
+                    .as_ref()
+                    .map_or(std::ptr::null(), |spec| spec.as_ptr().cast_const().cast()),
+                std::ptr::null(),
+                videotoolbox::ffi::kCFAllocatorDefault,
+                Some(low_latency_encode_callback),
+                std::ptr::null_mut(),
+                &mut session,
+            )
+        };
+        if status != 0 || session.is_null() {
+            return Err(videotoolbox::VTError::SessionCreateFailed(status));
+        }
+        let session = Self { session };
+        session.apply_realtime_properties(config)?;
+        // SAFETY: the session was created successfully and is live.
+        let status = unsafe {
+            videotoolbox::ffi::VTCompressionSessionPrepareToEncodeFrames(session.session)
+        };
+        if status != 0 {
+            return Err(videotoolbox::VTError::PrepareFailed(status));
+        }
+        Ok(session)
+    }
+
+    fn apply_realtime_properties(
+        &self,
+        config: EncoderConfig,
+    ) -> Result<(), videotoolbox::VTError> {
+        let mut pairs = Vec::<(CFString, CFType)>::new();
+        // SAFETY: all keys passed here are process-lifetime VideoToolbox
+        // constants from the SDK.
+        unsafe {
+            push_bool_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_RealTime,
+                true,
+            )?;
+            push_bool_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_AllowFrameReordering,
+                false,
+            )?;
+            push_number_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_AverageBitRate,
+                i64::from(config.bitrate_bps),
+            )?;
+            push_number_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_ExpectedFrameRate,
+                i64::from(config.fps.max(1)),
+            )?;
+            push_number_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                i64::from(config.max_keyframe_interval),
+            )?;
+            push_number_property(
+                &mut pairs,
+                videotoolbox::ffi::kVTCompressionPropertyKey_MaxFrameDelayCount,
+                0,
+            )?;
+            if prioritizes_encode_speed(config) {
+                push_bool_property(
+                    &mut pairs,
+                    videotoolbox::ffi::kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                    true,
+                )?;
+            }
+        }
+        self.set_property_pairs(&pairs)
+    }
+
+    fn set_properties(&self, properties: &CFDictionary) -> Result<(), videotoolbox::VTError> {
+        // SAFETY: the session is live and `properties` is a valid
+        // CoreFoundation dictionary for this call.
+        let status = unsafe {
+            videotoolbox::ffi::VTSessionSetProperties(
+                self.session.cast(),
+                properties.as_ptr().cast_const().cast(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(videotoolbox::VTError::ApiFailed {
+                api: "VTSessionSetProperties",
+                status,
+            })
+        }
+    }
+
+    fn set_property_pairs(
+        &self,
+        pairs: &[(CFString, CFType)],
+    ) -> Result<(), videotoolbox::VTError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let borrowed: Vec<(&dyn AsCFType, &dyn AsCFType)> = pairs
+            .iter()
+            .map(|(key, value)| (key as &dyn AsCFType, value as &dyn AsCFType))
+            .collect();
+        self.set_properties(&CFDictionary::from_pairs(&borrowed))
+    }
+
+    unsafe fn copy_property(
+        &self,
+        key: videotoolbox::ffi::CFStringRef,
+    ) -> Result<Option<CFType>, videotoolbox::VTError> {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        // SAFETY: caller supplies a valid VideoToolbox property key; `out` is a
+        // live out-parameter and CoreFoundation returns a +1 object on success.
+        let status = unsafe {
+            videotoolbox::ffi::VTSessionCopyProperty(
+                self.session.cast(),
+                key,
+                videotoolbox::ffi::kCFAllocatorDefault,
+                (&mut out as *mut *mut c_void).cast(),
+            )
+        };
+        if status != 0 {
+            return Err(videotoolbox::VTError::ApiFailed {
+                api: "VTSessionCopyProperty",
+                status,
+            });
+        }
+        Ok(CFType::from_raw(out))
+    }
+
+    fn encode_frame(
+        &self,
+        image_buffer: CVPixelBuffer,
+        presentation_timestamp: apple_cf::cm::CMTime,
+        duration: apple_cf::cm::CMTime,
+        frame_properties: Option<CFDictionary>,
+        timeout: Duration,
+    ) -> Result<Result<CMSampleBuffer, videotoolbox::VTError>, ()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let context = Box::into_raw(Box::new(EncodeCallbackContext { tx }));
+        let frame_properties_ref = frame_properties.as_ref();
+        // SAFETY: the session and pixel buffer are live. `context` is consumed
+        // by `low_latency_encode_callback`; if VideoToolbox refuses submission
+        // synchronously it is reclaimed below.
+        let status = unsafe {
+            videotoolbox::ffi::VTCompressionSessionEncodeFrame(
+                self.session,
+                image_buffer.as_ptr().cast(),
+                presentation_timestamp,
+                duration,
+                frame_properties_ref
+                    .map_or(std::ptr::null(), |dict| dict.as_ptr().cast_const().cast()),
+                context.cast::<c_void>(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            // SAFETY: VideoToolbox did not take ownership when submission
+            // failed synchronously, so reclaim the box.
+            unsafe { drop(Box::from_raw(context)) };
+            return Ok(Err(videotoolbox::VTError::EncodeFailed(status)));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(result) => Ok(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                std::mem::forget(image_buffer);
+                if let Some(properties) = frame_properties {
+                    std::mem::forget(properties);
+                }
+                Err(())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Ok(Err(videotoolbox::VTError::EncoderCallback(-1)))
+            }
+        }
+    }
+}
+
+impl Drop for VtCompressionSession {
+    fn drop(&mut self) {
+        if !self.session.is_null() {
+            // SAFETY: this wrapper owns the +1 session returned by
+            // `VTCompressionSessionCreate`, and invalidation is the documented
+            // teardown operation before releasing it.
+            unsafe {
+                videotoolbox::ffi::VTCompressionSessionInvalidate(self.session);
+                videotoolbox::ffi::CFRelease(self.session.cast());
+            }
+        }
+    }
+}
+
+struct EncodeCallbackContext {
+    tx: std::sync::mpsc::SyncSender<Result<CMSampleBuffer, videotoolbox::VTError>>,
+}
+
+unsafe extern "C" fn low_latency_encode_callback(
+    _output_callback_ref_con: *mut c_void,
+    source_frame_ref_con: *mut c_void,
+    status: videotoolbox::ffi::OSStatus,
+    _info_flags: videotoolbox::ffi::VTEncodeInfoFlags,
+    sample_buffer: videotoolbox::ffi::CMSampleBufferRef,
+) {
+    if source_frame_ref_con.is_null() {
+        return;
+    }
+    // SAFETY: `encode_frame` allocated this exact box for the frame and
+    // VideoToolbox calls the callback at most once for that frame.
+    let context = unsafe { Box::from_raw(source_frame_ref_con.cast::<EncodeCallbackContext>()) };
+    let result = if status != 0 {
+        Err(videotoolbox::VTError::EncoderCallback(status))
+    } else if sample_buffer.is_null() {
+        Err(videotoolbox::VTError::EncoderCallback(-1))
+    } else {
+        // SAFETY: `sample_buffer` is valid for the callback; retaining it gives
+        // Rust an owned object after returning to VideoToolbox.
+        unsafe { CMSampleBuffer::from_raw_retained(sample_buffer.cast()) }
+            .ok_or(videotoolbox::VTError::EncoderCallback(-1))
+    };
+    let _ = context.tx.send(result);
+}
+
 impl Encoder {
     /// Creates a low-latency encoder for `config`.
     ///
@@ -440,23 +706,7 @@ impl Encoder {
     /// Returns [`EncodeError::SessionCreate`] when `VideoToolbox` refuses the
     /// requested size, codec, or profile.
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
-        let mut builder = CompressionSessionBuilder::new(
-            config.width,
-            config.height,
-            config.codec.videotoolbox_codec(),
-        )
-        .with_real_time(true)
-        // B-frames trade latency for size. A remote desktop cannot pay
-        // that, so reordering stays off on every preset.
-        .with_allow_frame_reordering(false)
-        .with_average_bit_rate(config.bitrate_bps)
-        .with_expected_frame_rate(f64::from(config.fps.max(1)))
-        .with_max_keyframe_interval(config.max_keyframe_interval);
-        if config.codec == EncoderCodec::H264 {
-            builder = builder.with_profile_level(ProfileLevel::H264HighAutoLevel);
-        }
-        let session = builder
-            .build()
+        let session = VtCompressionSession::new(config)
             .map_err(|error| EncodeError::SessionCreate(error.to_string()))?;
         apply_profile_and_colour(&session, config)?;
         Ok(Self {
@@ -674,19 +924,13 @@ impl Encoder {
             ));
         };
         let retained_frame = lease;
-        let future = async move {
-            let result = session
-                .encode_frame_async(
-                    pixel_buffer,
-                    apple_cf::cm::CMTime::new(pts, timescale),
-                    apple_cf::cm::CMTime::INVALID,
-                    options,
-                )
-                .await;
-            drop(retained_frame);
-            (session, result)
-        };
-        let (session, result) = match block_on_local_timeout(future, ENCODE_COMPLETION_TIMEOUT) {
+        let result = match session.encode_frame(
+            pixel_buffer,
+            apple_cf::cm::CMTime::new(pts, timescale),
+            apple_cf::cm::CMTime::INVALID,
+            options,
+            ENCODE_COMPLETION_TIMEOUT,
+        ) {
             Ok(completed) => completed,
             Err(()) => {
                 return Err(EncodeError::Encode(format!(
@@ -694,6 +938,7 @@ impl Encoder {
                 )));
             }
         };
+        drop(retained_frame);
         self.session = Some(session);
         // Three costs share the one number this host used to report. Wrapping
         // the IOSurface happens per frame and is ours; the wait is
@@ -711,6 +956,7 @@ impl Encoder {
                 "encode cost split",
             );
         }
+
         match result {
             Ok(sample) => Ok(Some(sample)),
             // A real-time session may drop a frame. VideoToolbox reports that
@@ -812,10 +1058,21 @@ impl Encoder {
 /// for a plan that promised Main 4:4:4 10 is exactly the silent downgrade
 /// this exists to end.
 fn apply_profile_and_colour(
-    session: &CompressionSession,
+    session: &VtCompressionSession,
     config: EncoderConfig,
 ) -> Result<(), EncodeError> {
     let mut pairs: Vec<(CFString, CFType)> = Vec::new();
+    if config.codec == EncoderCodec::H264 {
+        // SAFETY: process-lifetime VideoToolbox constants.
+        let key = unsafe {
+            cf_string_constant(videotoolbox::ffi::kVTCompressionPropertyKey_ProfileLevel)
+        }
+        .ok_or_else(|| EncodeError::SessionCreate("no ProfileLevel key".to_owned()))?;
+        let value =
+            unsafe { cf_string_constant(videotoolbox::ffi::kVTProfileLevel_H264_High_AutoLevel) }
+                .ok_or_else(|| EncodeError::SessionCreate("no H.264 High profile".to_owned()))?;
+        pairs.push((key, value.into()));
+    }
     if let Some(symbol) = config.profile.symbol() {
         let profile = exported_cf_string(symbol).ok_or_else(|| {
             EncodeError::SessionCreate(format!(
@@ -875,6 +1132,72 @@ fn apply_profile_and_colour(
                 config.profile, config.colour
             ))
         })
+}
+
+fn encoder_specification(config: EncoderConfig) -> Option<CFDictionary> {
+    if !uses_low_latency_rate_control(config) {
+        return None;
+    }
+    // SAFETY: process-lifetime VideoToolbox constant.
+    let key = unsafe {
+        cf_string_constant(
+            videotoolbox::ffi::kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+        )
+    }?;
+    let value = cf_bool(true);
+    Some(CFDictionary::from_pairs(&[(
+        &key as &dyn AsCFType,
+        &value as &dyn AsCFType,
+    )]))
+}
+
+const fn uses_low_latency_rate_control(config: EncoderConfig) -> bool {
+    prioritizes_encode_speed(config)
+}
+
+const fn prioritizes_encode_speed(config: EncoderConfig) -> bool {
+    matches!(config.profile, EncodeProfile::CodecDefault)
+}
+
+fn cf_bool(value: bool) -> CFType {
+    // SAFETY: CoreFoundation boolean singletons are process-lifetime CFType
+    // objects; retaining one gives this wrapper ordinary owned lifetime.
+    unsafe {
+        CFType::from_raw_retained(
+            (if value {
+                videotoolbox::ffi::kCFBooleanTrue
+            } else {
+                videotoolbox::ffi::kCFBooleanFalse
+            })
+            .cast_mut()
+            .cast(),
+        )
+    }
+    .expect("CoreFoundation boolean constants are non-null")
+}
+
+unsafe fn push_bool_property(
+    pairs: &mut Vec<(CFString, CFType)>,
+    key: videotoolbox::ffi::CFStringRef,
+    value: bool,
+) -> Result<(), videotoolbox::VTError> {
+    let key = unsafe { cf_string_constant(key) }.ok_or_else(|| {
+        videotoolbox::VTError::InvalidArgument("VideoToolbox property key is null".to_owned())
+    })?;
+    pairs.push((key, cf_bool(value)));
+    Ok(())
+}
+
+unsafe fn push_number_property(
+    pairs: &mut Vec<(CFString, CFType)>,
+    key: videotoolbox::ffi::CFStringRef,
+    value: i64,
+) -> Result<(), videotoolbox::VTError> {
+    let key = unsafe { cf_string_constant(key) }.ok_or_else(|| {
+        videotoolbox::VTError::InvalidArgument("VideoToolbox property key is null".to_owned())
+    })?;
+    pairs.push((key, apple_cf::cf::CFNumber::from_i64(value).into()));
+    Ok(())
 }
 
 /// Wraps a process-lifetime `CFStringRef` constant.
@@ -997,71 +1320,6 @@ fn fourcc(value: u32) -> String {
             }
         })
         .collect()
-}
-
-struct Parker {
-    ready: Mutex<bool>,
-    wake: Condvar,
-}
-
-impl Parker {
-    fn wait_until(&self, deadline: Instant) -> bool {
-        let mut ready = self
-            .ready
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*ready {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            ready = match self.wake.wait_timeout(ready, remaining) {
-                Ok((guard, _)) => guard,
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
-        *ready = false;
-        true
-    }
-}
-
-impl Wake for Parker {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        let mut ready = self
-            .ready
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *ready = true;
-        self.wake.notify_one();
-    }
-}
-
-fn block_on_local_timeout<F: Future>(future: F, timeout: Duration) -> Result<F::Output, ()> {
-    let parker = Arc::new(Parker {
-        ready: Mutex::new(false),
-        wake: Condvar::new(),
-    });
-    let waker = Waker::from(Arc::clone(&parker));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    let deadline = Instant::now() + timeout;
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return Ok(output),
-            Poll::Pending => {
-                if !parker.wait_until(deadline) {
-                    // VideoToolbox owns callback pointers after submission, so
-                    // timing out must not drop the future's frame, pixel buffer,
-                    // or completion storage while native code may still finish.
-                    std::mem::forget(future);
-                    return Err(());
-                }
-            }
-        }
-    }
 }
 
 fn force_keyframe_options() -> Result<CFDictionary, EncodeError> {
@@ -1214,9 +1472,30 @@ fn is_keyframe(sample: &[u8], codec: EncoderCodec) -> bool {
     arcen_media::annexb::length_prefixed_is_keyframe(sample, nal_codec(codec))
 }
 
+fn capped_bitrate_bps(
+    width: u32,
+    height: u32,
+    fps: u32,
+    chroma: arcen_media::ChromaSubsampling,
+    depth: arcen_media::BitDepth,
+) -> u32 {
+    arcen_media::video::link_capped_average_bitrate_bps(width, height, fps, chroma, depth)
+}
+
+#[cfg(test)]
+mod test_ffi {
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        pub(super) static kCVPixelBufferPixelFormatTypeKey: *const std::ffi::c_void;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_media::{BitDepth, ChromaSubsampling};
+
+    const SDR: (ChromaSubsampling, BitDepth) = (ChromaSubsampling::Yuv420, BitDepth::Eight);
 
     fn length_prefixed(units: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1492,83 +1771,6 @@ mod tests {
         append_annex_b(&mut out, &sample);
         assert!(out.is_empty());
     }
-
-    #[test]
-    fn local_block_on_returns_ready_future() {
-        assert_eq!(
-            block_on_local_timeout(async { 42_u8 }, Duration::from_secs(1)),
-            Ok(42)
-        );
-    }
-
-    #[test]
-    fn local_block_on_times_out_pending_future() {
-        let started = Instant::now();
-        assert_eq!(
-            block_on_local_timeout(std::future::pending::<()>(), Duration::from_millis(20)),
-            Err(())
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "a missing VideoToolbox callback must be reported rather than parking forever"
-        );
-    }
-
-    #[test]
-    fn timed_out_local_future_is_retained_for_a_late_native_completion() {
-        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
-
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let retained = DropFlag(Arc::clone(&dropped));
-        assert_eq!(
-            block_on_local_timeout(
-                async move {
-                    let _retained = retained;
-                    std::future::pending::<()>().await;
-                },
-                Duration::from_millis(20),
-            ),
-            Err(())
-        );
-        assert!(
-            !dropped.load(std::sync::atomic::Ordering::Relaxed),
-            "a timed-out VideoToolbox submission must retain frame ownership"
-        );
-    }
-}
-
-/// The shared link-capped sizing (`arcen_media::video::link_capped_average_bitrate_bps`),
-/// which carries the measurements that set it; every Pier encodes to it.
-fn capped_bitrate_bps(
-    width: u32,
-    height: u32,
-    fps: u32,
-    chroma: arcen_media::ChromaSubsampling,
-    depth: arcen_media::BitDepth,
-) -> u32 {
-    arcen_media::video::link_capped_average_bitrate_bps(width, height, fps, chroma, depth)
-}
-
-#[cfg(test)]
-mod test_ffi {
-    #[link(name = "CoreVideo", kind = "framework")]
-    unsafe extern "C" {
-        pub(super) static kCVPixelBufferPixelFormatTypeKey: *const std::ffi::c_void;
-    }
-}
-
-#[cfg(test)]
-mod bitrate_cap_tests {
-    use super::capped_bitrate_bps;
-    use arcen_media::{BitDepth, ChromaSubsampling};
-
-    const SDR: (ChromaSubsampling, BitDepth) = (ChromaSubsampling::Yuv420, BitDepth::Eight);
 
     #[test]
     fn a_1080p_session_is_not_capped_at_all() {

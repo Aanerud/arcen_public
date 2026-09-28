@@ -128,6 +128,8 @@ pub enum LifecycleEventKind {
     PermissionRevoked = 1902,
     /// An OS permission request is pending.
     PermissionPending = 1903,
+    /// Encoder admission reduced the requested frame-rate ceiling.
+    EncoderAdmissionFpsReduced = 1904,
 }
 
 impl LifecycleEventKind {
@@ -200,6 +202,7 @@ impl LifecycleEventKind {
             Self::PermissionDenied => &LIFECYCLE_EVENT_DEFINITIONS[47],
             Self::PermissionRevoked => &LIFECYCLE_EVENT_DEFINITIONS[48],
             Self::PermissionPending => &LIFECYCLE_EVENT_DEFINITIONS[49],
+            Self::EncoderAdmissionFpsReduced => &LIFECYCLE_EVENT_DEFINITIONS[50],
         }
     }
 }
@@ -380,6 +383,13 @@ const COLOR_PLAN_RESOLVED_FIELDS: &[LifecycleFieldSpec] = &[
     optional("requested_codec", LifecycleFieldType::String),
     optional("granted_codec", LifecycleFieldType::String),
     optional("reason", LifecycleFieldType::String),
+];
+const ENCODER_ADMISSION_FPS_REDUCED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("requested_fps", LifecycleFieldType::Integer),
+    required("admitted_fps", LifecycleFieldType::Integer),
+    required("reason", LifecycleFieldType::String),
+    optional("candidate", LifecycleFieldType::Integer),
+    optional("monitor_count", LifecycleFieldType::Integer),
 ];
 const SESSION_INTERRUPTED_FIELDS: &[LifecycleFieldSpec] = &[
     required("stage", LifecycleFieldType::String),
@@ -562,7 +572,7 @@ const PERMISSION_FIELDS: &[LifecycleFieldSpec] = &[
 ];
 
 /// Append-only v1 lifecycle event definitions, sorted by numeric identifier.
-pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 50] = &[
+pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 51] = &[
     LifecycleEventDefinition {
         kind: LifecycleEventKind::ServiceStart,
         name: "SERVICE_START",
@@ -1013,6 +1023,15 @@ pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 50] = &[
         minimum_profile: OperationalProfile::Info,
         fields: PERMISSION_FIELDS,
     },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::EncoderAdmissionFpsReduced,
+        name: "ENCODER_ADMISSION_FPS_REDUCED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Info,
+        fields: ENCODER_ADMISSION_FPS_REDUCED_FIELDS,
+    },
 ];
 
 /// Returns the definition for a stable numeric identifier.
@@ -1069,6 +1088,7 @@ pub const fn lifecycle_event_definition(id: u32) -> Option<&'static LifecycleEve
         1901 => Some(&LIFECYCLE_EVENT_DEFINITIONS[47]),
         1902 => Some(&LIFECYCLE_EVENT_DEFINITIONS[48]),
         1903 => Some(&LIFECYCLE_EVENT_DEFINITIONS[49]),
+        1904 => Some(&LIFECYCLE_EVENT_DEFINITIONS[50]),
         _ => None,
     }
 }
@@ -1264,6 +1284,7 @@ mod tests {
         (1901, "PERMISSION_DENIED"),
         (1902, "PERMISSION_REVOKED"),
         (1903, "PERMISSION_PENDING"),
+        (1904, "ENCODER_ADMISSION_FPS_REDUCED"),
     ];
 
     fn correlation_id() -> CorrelationId {
@@ -1315,7 +1336,7 @@ mod tests {
         }
         assert_eq!(lifecycle_event_definition(999), None);
         assert_eq!(lifecycle_event_definition(1405), None);
-        assert_eq!(lifecycle_event_definition(1904), None);
+        assert_eq!(lifecycle_event_definition(1905), None);
         assert_eq!(lifecycle_event_definition(2010), None);
     }
 

@@ -86,12 +86,6 @@ impl<T> LatestQueue<T> {
     }
 }
 
-struct VideoState<T> {
-    items: VecDeque<T>,
-    awaiting_keyframe: bool,
-    closed: bool,
-}
-
 pub enum VideoPushResult<T> {
     Enqueued {
         cleared: usize,
@@ -103,11 +97,10 @@ pub enum VideoPushResult<T> {
     Closed(T),
 }
 
-/// Platform-local video queue that never exposes a prediction chain after any
-/// AU loss. Audio intentionally continues to use [`LatestQueue`].
+/// Platform-local async wrapper around the shared video policy. Audio
+/// intentionally continues to use [`LatestQueue`].
 pub struct VideoQueue<T> {
-    capacity: usize,
-    state: Mutex<VideoState<T>>,
+    state: Mutex<arcen_media::video::SharedVideoQueue<T>>,
     notify: Notify,
 }
 
@@ -115,12 +108,10 @@ impl<T> VideoQueue<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
-            capacity,
-            state: Mutex::new(VideoState {
-                items: VecDeque::with_capacity(capacity),
-                awaiting_keyframe: false,
-                closed: false,
-            }),
+            state: Mutex::new(arcen_media::video::SharedVideoQueue::new(
+                capacity,
+                std::time::Duration::from_secs(1),
+            )),
             notify: Notify::new(),
         }
     }
@@ -128,37 +119,27 @@ impl<T> VideoQueue<T> {
     pub fn push(&self, item: T, keyframe: bool) -> VideoPushResult<T> {
         let result = {
             let mut state = self.state.lock().expect("video queue lock poisoned");
-            if state.closed {
-                return VideoPushResult::Closed(item);
-            }
-            if keyframe {
-                let cleared = state.items.len();
-                state.items.clear();
-                state.items.push_back(item);
-                state.awaiting_keyframe = false;
-                VideoPushResult::Enqueued { cleared }
-            } else if state.awaiting_keyframe {
-                VideoPushResult::Dropped {
-                    count: 1,
-                    recovery_started: false,
-                }
-            } else if state.items.len() == self.capacity {
-                let count = state.items.len() + 1;
-                state.items.clear();
-                state.awaiting_keyframe = true;
-                VideoPushResult::Dropped {
-                    count,
-                    recovery_started: true,
-                }
-            } else {
-                state.items.push_back(item);
-                VideoPushResult::Enqueued { cleared: 0 }
-            }
+            state.push(
+                item,
+                arcen_media::video::FrameClassification::keyframe_is_recovery(keyframe),
+                std::time::Instant::now(),
+            )
         };
-        if matches!(&result, VideoPushResult::Enqueued { .. }) {
-            self.notify.notify_one();
+        match result {
+            arcen_media::video::VideoQueuePush::Enqueued { cleared } => {
+                self.notify.notify_one();
+                VideoPushResult::Enqueued { cleared }
+            }
+            arcen_media::video::VideoQueuePush::Dropped {
+                count,
+                recovery_started,
+                ..
+            } => VideoPushResult::Dropped {
+                count,
+                recovery_started,
+            },
+            arcen_media::video::VideoQueuePush::Closed(item) => VideoPushResult::Closed(item),
         }
-        result
     }
 
     pub async fn pop(&self) -> Option<T> {
@@ -166,10 +147,10 @@ impl<T> VideoQueue<T> {
             let notified = self.notify.notified();
             {
                 let mut state = self.state.lock().expect("video queue lock poisoned");
-                if let Some(item) = state.items.pop_front() {
+                if let Some(item) = state.pop_front() {
                     return Some(item);
                 }
-                if state.closed {
+                if state.is_closed() {
                     return None;
                 }
             }
@@ -181,35 +162,40 @@ impl<T> VideoQueue<T> {
         self.state
             .lock()
             .expect("video queue lock poisoned")
-            .items
             .pop_front()
     }
 
     pub fn is_closed(&self) -> bool {
-        self.state.lock().expect("video queue lock poisoned").closed
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .is_closed()
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
+        self.state.lock().expect("video queue lock poisoned").len()
+    }
+
+    pub fn take_wait_stats(&self) -> arcen_media::video::VideoQueueWaitStats {
         self.state
             .lock()
             .expect("video queue lock poisoned")
-            .items
-            .len()
+            .take_wait_stats()
     }
 
     pub fn clear(&self) -> usize {
-        let mut state = self.state.lock().expect("video queue lock poisoned");
-        let len = state.items.len();
-        state.items.clear();
-        len
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .clear()
     }
 
     pub fn close(&self) {
-        {
-            let mut state = self.state.lock().expect("video queue lock poisoned");
-            state.closed = true;
-        }
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .close();
         self.notify.notify_waiters();
     }
 
@@ -224,12 +210,10 @@ impl<T> VideoQueue<T> {
     /// still-nominally-open sibling queue. Never call this for a queue that
     /// should keep draining; use [`close`](Self::close) there.
     pub fn close_and_clear(&self) {
-        {
-            let mut state = self.state.lock().expect("video queue lock poisoned");
-            state.closed = true;
-            state.items.clear();
-            state.awaiting_keyframe = false;
-        }
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .close_and_clear();
         self.notify.notify_waiters();
     }
 
@@ -238,7 +222,7 @@ impl<T> VideoQueue<T> {
         self.state
             .lock()
             .expect("video queue lock poisoned")
-            .awaiting_keyframe
+            .awaiting_keyframe()
     }
 }
 
@@ -267,7 +251,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_loss_clears_descendants_and_suppresses_future_p_frames() {
+    async fn video_push_wakes_a_waiting_pop() {
+        let queue = std::sync::Arc::new(VideoQueue::new(2));
+        let waiter = {
+            let queue = std::sync::Arc::clone(&queue);
+            tokio::spawn(async move { queue.pop().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(matches!(
+            queue.push(9, true),
+            VideoPushResult::Enqueued { cleared: 0 }
+        ));
+        assert_eq!(waiter.await.unwrap(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn video_try_pop_uses_shared_policy_output() {
         let queue = VideoQueue::new(2);
         assert!(matches!(
             queue.push(1, false),
@@ -278,51 +277,28 @@ mod tests {
             VideoPushResult::Enqueued { cleared: 0 }
         ));
         assert!(matches!(
-            queue.push(3, false),
-            VideoPushResult::Dropped {
-                count: 3,
-                recovery_started: true
-            }
-        ));
-        assert!(queue.awaiting_keyframe());
-        assert_eq!(queue.len(), 0);
-        assert!(matches!(
-            queue.push(4, false),
-            VideoPushResult::Dropped {
-                count: 1,
-                recovery_started: false
-            }
-        ));
-        assert_eq!(queue.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn keyframe_is_first_visible_item_and_resumes_prediction_chain() {
-        let queue = VideoQueue::new(2);
-        queue.push(1, false);
-        queue.push(2, false);
-        assert!(matches!(
             queue.push(9, true),
             VideoPushResult::Enqueued { cleared: 2 }
         ));
-        assert!(!queue.awaiting_keyframe());
-        assert_eq!(queue.pop().await, Some(9));
-        assert!(matches!(
-            queue.push(10, false),
-            VideoPushResult::Enqueued { cleared: 0 }
-        ));
-        assert_eq!(queue.pop().await, Some(10));
+        assert_eq!(queue.try_pop(), Some(9));
     }
 
     #[tokio::test]
-    async fn failed_keyframe_enqueue_does_not_leave_recovery() {
+    async fn video_close_rejects_new_frames_and_wakes_waiter() {
         let queue = VideoQueue::new(1);
-        queue.push(1, false);
-        queue.push(2, false);
-        assert!(queue.awaiting_keyframe());
         queue.close();
         assert!(matches!(queue.push(9, true), VideoPushResult::Closed(9)));
-        assert!(queue.awaiting_keyframe());
+        assert_eq!(queue.pop().await, None);
+    }
+
+    #[tokio::test]
+    async fn video_close_and_clear_wakes_without_draining() {
+        let queue = VideoQueue::new(2);
+        assert!(matches!(
+            queue.push(1, true),
+            VideoPushResult::Enqueued { cleared: 0 }
+        ));
+        queue.close_and_clear();
         assert_eq!(queue.pop().await, None);
     }
 }

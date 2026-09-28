@@ -30,6 +30,14 @@ logrotate rule renames and creates the file (never `copytruncate`) and sends
 applies shared 7–100-day archive cleanup. `Xorg.log` remains owned by the
 graphical-session lifecycle and is intentionally excluded.
 
+Multi-monitor is enabled in the packaged template. On startup the Pier runs a
+short NVIDIA Xorg probe with the packaged template, ranks the driver's `DFP-N`
+outputs by maximum pixel clock, caches the selected heads under the Arcen
+runtime tree, and advertises only when that discovery succeeds. Set
+`platform.multi_monitor.advertise_enabled` to `false` to turn the feature off,
+or set `platform.multi_monitor.heads` to an ordered `DFP-N` list to override
+automatic selection for a particular host.
+
 The `logging` section's canonical field is `logging.level` (an
 `OperationalProfile` discriminant, `0`–`3`); the packaged template above ships
 `0` (`Level0`/`Critical`), the production default. The legacy numeric

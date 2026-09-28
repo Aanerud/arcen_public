@@ -17,8 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcen_media::video::{
-    parse_ready_v1, parse_unavailable_v1, BackendUnavailableNotice, EncoderBackend, EncoderRequest,
-    MediaRequest, ReadyExpectation, ResolvedMediaPlan,
+    parse_ready_capture, parse_ready_conversion, parse_ready_v1, parse_unavailable_v1,
+    BackendUnavailableNotice, EncoderBackend, EncoderRequest, MediaRequest, ReadyExpectation,
+    ResolvedMediaPlan,
 };
 use arcen_media::{
     BitDepth, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent, TransferCharacteristics,
@@ -71,6 +72,8 @@ pub struct CapencConfig {
     pub color_primaries: ColorPrimaries,
     /// Resolved encoder intent to request.
     pub intent: EncodeIntent,
+    /// What later bitrate controllers should preserve first under pressure.
+    pub motion_priority: arcen_media::video::MotionPriority,
     /// Damage-driven QP biasing to request. Roster-wide; see
     /// `docs/architecture/qp-maps.md`.
     pub qp_map: arcen_media::video::QpMapPolicy,
@@ -371,11 +374,18 @@ fn format_ready_expectation(expectation: &ReadyExpectation<'_>) -> String {
 #[derive(Debug)]
 enum StdinCommand {
     Idr,
+    Bitrate(u64),
+    Framerate(u32),
     Shutdown,
 }
 
 #[derive(Clone)]
 pub struct IdrRequester {
+    tx: mpsc::Sender<StdinCommand>,
+}
+
+#[derive(Clone)]
+pub struct BitrateRequester {
     tx: mpsc::Sender<StdinCommand>,
 }
 
@@ -399,6 +409,20 @@ impl IdrRequester {
                 false
             }
         }
+    }
+}
+
+impl BitrateRequester {
+    fn new(tx: mpsc::Sender<StdinCommand>) -> Self {
+        Self { tx }
+    }
+
+    pub fn request(&self, bps: u64) -> bool {
+        self.tx.try_send(StdinCommand::Bitrate(bps)).is_ok()
+    }
+
+    pub fn request_framerate(&self, fps: u32) -> bool {
+        self.tx.try_send(StdinCommand::Framerate(fps)).is_ok()
     }
 }
 
@@ -682,6 +706,17 @@ impl Capenc {
                             }));
                         }
                     };
+                    if let Some(conversion) = parse_ready_conversion(&line) {
+                        tracing::info!(
+                            target: CAPENC,
+                            event = "capture_path_selected",
+                            capture_backend = parse_ready_capture(&line)
+                                .map(|backend| backend.ready_token())
+                                .unwrap_or("unreported"),
+                            conversion_backend = conversion.ready_token(),
+                            "capenc capture path selected"
+                        );
+                    }
                     forward_capenc_line(&line);
                     return Ok(Ok(plan));
                 }
@@ -773,6 +808,9 @@ impl Capenc {
         if cfg.intent != EncodeIntent::default() {
             args.push(format!("intent={}", cfg.intent.token()));
         }
+        if cfg.motion_priority != arcen_media::video::MotionPriority::default() {
+            args.push(format!("priority={}", cfg.motion_priority.token()));
+        }
         // Same conditional shape and same reason.
         if cfg.qp_map != arcen_media::video::QpMapPolicy::default() {
             args.push(format!("qp-map={}", cfg.qp_map.token()));
@@ -807,6 +845,10 @@ impl Capenc {
 
     pub fn idr(&self) -> IdrRequester {
         self.idr.clone()
+    }
+
+    pub fn bitrate(&self) -> BitrateRequester {
+        BitrateRequester::new(self.control.clone())
     }
 
     /// Stop the engine. Closing stdin signals the engine to exit; we then reap.
@@ -1018,6 +1060,36 @@ async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::Receiver<StdinCo
                         tracing::warn!(target: CAPENC, "capenc IDR write timed out");
                         return;
                     }
+                }
+            }
+            StdinCommand::Bitrate(bps) => {
+                let line = arcen_media::capenc_control::CapencControlCommand::Bitrate { bps }
+                    .as_wire_line();
+                let write = async {
+                    stdin.write_all(line.as_bytes()).await?;
+                    stdin.flush().await
+                };
+                if tokio::time::timeout(CAPENC_WRITE_TIMEOUT, write)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(target: CAPENC, "capenc bitrate write timed out");
+                    return;
+                }
+            }
+            StdinCommand::Framerate(fps) => {
+                let line = arcen_media::capenc_control::CapencControlCommand::Framerate { fps }
+                    .as_wire_line();
+                let write = async {
+                    stdin.write_all(line.as_bytes()).await?;
+                    stdin.flush().await
+                };
+                if tokio::time::timeout(CAPENC_WRITE_TIMEOUT, write)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(target: CAPENC, "capenc framerate write timed out");
+                    return;
                 }
             }
             StdinCommand::Shutdown => {
@@ -1357,6 +1429,7 @@ mod tests {
             transfer: arcen_media::TransferCharacteristics::Bt709,
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             intent: EncodeIntent::default(),
+            motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
             fps: 30,
             width: 1920,
@@ -1388,6 +1461,13 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "intent=quality"),
             "a requested intent must reach the engine verbatim"
+        );
+        cfg.motion_priority = arcen_media::video::MotionPriority::Motion;
+        assert!(
+            Capenc::build_args(&cfg)
+                .iter()
+                .any(|arg| arg == "priority=motion"),
+            "a requested motion priority must reach the engine verbatim"
         );
     }
 

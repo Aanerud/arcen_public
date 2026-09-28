@@ -205,11 +205,9 @@ pub struct Config {
     pub clipboard_policy: ClipboardPolicy,
     /// Operator-enforced physical-console privacy, disabled by default.
     pub deskside: crate::deskside::LinuxDesksideConfig,
-    /// Explicit `multi_monitor_v1` advertisement gate, fully disabled by
-    /// default. See `session::multi_monitor::MultiMonitorGate` — this is now
-    /// the sole production safety switch, since the separate hardcoded
-    /// `media::multi_capenc::MULTI_MONITOR_CARRIER_READY` gate is `true`
-    /// (Carrier A is fully wired end to end).
+    /// `multi_monitor_v1` advertisement gate. Defaults to advertised when
+    /// startup NVIDIA-head discovery succeeds; `advertise_enabled: false`
+    /// remains the administrator off switch.
     pub multi_monitor: crate::config::LinuxMultiMonitorConfig,
     /// Explicit acknowledgement that a no-auth host will accept remote clients.
     pub unsafe_allow_remote_no_auth: bool,
@@ -232,6 +230,15 @@ impl Config {
             .as_ref()
             .and_then(|request| {
                 arcen_media::EncodeIntent::from_token(&request.quality.encode_intent)
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn requested_motion_priority(&self) -> arcen_media::video::MotionPriority {
+        self.auth_video_request
+            .as_ref()
+            .and_then(|request| {
+                arcen_media::video::MotionPriority::from_token(&request.quality.motion_priority)
             })
             .unwrap_or_default()
     }
@@ -331,10 +338,12 @@ impl Config {
                 .resolve_color_matrix(self.color_matrix, None),
             transfer: self.transfer,
             color_primaries: self.color_primaries,
+            desktop_encoding: self.desktop_encoding,
             video_selection: self.video_selection,
             codec_pinned: self.codec_pinned,
             variant_pinned: self.variant_pinned,
             intent: self.requested_encode_intent(),
+            motion_priority: self.requested_motion_priority(),
             qp_map: self.qp_map,
             width,
             height,
@@ -380,24 +389,29 @@ impl Config {
         )
         .map_err(|error| format!("initial video request: {error}"))?;
         self.auth_video_request = Some(request.clone());
-        // The lab pipe carries compositor-tagged PQ, so it vouches for itself.
-        let desktop = if experimental_rgb10_pipe().is_some() {
+        // The lab pipe carries compositor-tagged PQ, so it vouches for itself,
+        // but only PQ sessions read it; every other session reads Xorg.
+        let desktop = if experimental_rgb10_pipe().is_some()
+            && resolved.video.transfer == arcen_media::TransferCharacteristics::Pq
+        {
             arcen_media::video::DesktopSignalEncoding::Rec2100Pq
         } else {
             self.desktop_encoding
         };
-        let video = arcen_media::video::constrain_to_desktop_encoding(resolved.video, desktop);
-        if !desktop.sdr_sessions_are_faithful()
-            && video.transfer != arcen_media::TransferCharacteristics::Pq
-        {
-            tracing::warn!(
+        let plan = arcen_media::video::resolve_desktop_plan(resolved.video, desktop)
+            .map_err(|error| error.to_string())?;
+        if plan.conversion != arcen_media::video::Rgb10Signal::Direct {
+            tracing::info!(
                 target: crate::logging::target::MEDIA,
-                desktop_encoding = desktop.token(),
-                transfer = video.transfer.token(),
-                "the desktop carries Rec.2100 PQ code values but this session is SDR; \
-                 the Deck will see them as SDR, as an SDR monitor would"
+                desktop_encoding = plan.source.token(),
+                conversion = ?plan.conversion,
+                "the desktop carries Rec.2100 PQ; this SDR session converts it to BT.709"
             );
         }
+        // This per-session copy carries the source the plan was resolved
+        // against, which is what capenc must be told.
+        self.desktop_encoding = plan.source;
+        let video = plan.video;
         self.fps = resolved.max_fps;
         self.codec = video.codec.token().to_string();
         self.chroma = video.chroma.token().to_string();
@@ -425,6 +439,17 @@ impl Config {
 
     pub fn resolve_audiocap_binary(&self) -> Option<PathBuf> {
         crate::current_pier_exe()
+    }
+
+    pub fn resolved_multi_monitor_encoder(&self) -> EncoderSelection {
+        if self.multi_monitor.advertise_enabled
+            && self.encoder == EncoderSelection::Auto
+            && !self.multi_monitor.heads.is_empty()
+        {
+            EncoderSelection::NativeNvenc
+        } else {
+            self.encoder
+        }
     }
 }
 
@@ -762,9 +787,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let multi_monitor_heads = flag_values(args, "--multi-monitor-head")?;
     if !multi_monitor_heads.is_empty() {
         for head in &multi_monitor_heads {
-            validate_gpu_head(head).map_err(|_| {
-                format!("--multi-monitor-head must be DFP-0, DFP-1, DFP-2, or DFP-3, got {head}")
-            })?;
+            validate_gpu_head(head)
+                .map_err(|_| format!("--multi-monitor-head must be DFP-N, got {head}"))?;
         }
         cfg.multi_monitor.heads = multi_monitor_heads;
     }
@@ -932,16 +956,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .map_err(|error| format!("platform.multi_monitor.heads is invalid: {error}"))?;
     }
     if cfg.multi_monitor.advertise_enabled
-        && matches!(
-            cfg.encoder,
-            EncoderSelection::Auto | EncoderSelection::WindowsMediaFoundation
-        )
+        && cfg.encoder == EncoderSelection::WindowsMediaFoundation
     {
         return Err(format!(
             "platform.multi_monitor.advertise_enabled requires an explicit encoder pin \
-             (nvenc or software-h264); {} is not permitted for a multi-monitor session, because \
-             its own per-attempt fallback could silently select a different backend/geometry per \
-             monitor after the Xorg multi-head commit",
+            (nvenc or software-h264) or auto with discovered NVIDIA heads; {} is not permitted for a multi-monitor session, because \
+            its own per-attempt fallback could silently select a different backend/geometry per \
+            monitor after the Xorg multi-head commit",
             cfg.encoder.as_arg()
         ));
     }
@@ -1319,11 +1340,8 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     cfg.managed_log = platform.logging.managed_log.map(PathBuf::from);
     cfg.deskside = platform.deskside;
     for head in &platform.multi_monitor.heads {
-        validate_gpu_head(head).map_err(|_| {
-            format!(
-                "platform.multi_monitor.heads must be DFP-0, DFP-1, DFP-2, or DFP-3, got {head}"
-            )
-        })?;
+        validate_gpu_head(head)
+            .map_err(|_| format!("platform.multi_monitor.heads must be DFP-N, got {head}"))?;
     }
     cfg.multi_monitor = platform.multi_monitor;
 
@@ -1372,10 +1390,9 @@ fn validate_session_display(display: &str) -> Result<(), String> {
 }
 
 fn validate_gpu_head(head: &str) -> Result<(), String> {
-    match head {
-        "DFP-0" | "DFP-1" | "DFP-2" | "DFP-3" => Ok(()),
-        _ => Err("--session-gpu-head must be DFP-0, DFP-1, DFP-2, or DFP-3".to_string()),
-    }
+    arcen_outputs::is_nvidia_dfp_head_token(head)
+        .then_some(())
+        .ok_or_else(|| "--session-gpu-head must be DFP-N".to_string())
 }
 
 fn parse_auth_mode(value: &str) -> Result<AuthMode, String> {
@@ -1856,8 +1873,49 @@ mod tests {
             )
             .argv();
         assert!(
+            argv.iter().any(|arg| arg == "desktop-encoding=rec2100-pq"),
+            "an SDR session on a PQ desktop still tells capenc its source, so the \
+             pixels are converted rather than relabelled: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("transfer=")),
+            "{argv:?}"
+        );
+
+        // An eight-bit session cannot be served truthfully from a PQ desktop.
+        let auto = initial_video(
+            VideoSelectionIntent::AdaptivePerformance,
+            "h264",
+            "yuv420",
+            "8",
+            "limited",
+        );
+        let mut eight = Config {
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Rec2100Pq,
+            ..Config::default()
+        };
+        let error = eight.apply_initial_video_request(&auto).unwrap_err();
+        assert!(error.contains("Choose Grading"), "{error}");
+
+        // An SDR desktop never sends the token.
+        let mut plain = Config {
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            chroma: "yuv444".to_string(),
+            ..Config::default()
+        };
+        plain.apply_initial_video_request(&grading).unwrap();
+        let argv = plain
+            .capenc_config(
+                PathBuf::from("arcen-pier"),
+                None,
+                arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+                arcen_protocol::messages::CursorMode::Local,
+            )
+            .argv();
+        assert!(
             !argv.iter().any(|arg| arg.starts_with("desktop-encoding=")),
-            "an SDR session never carries the declaration: {argv:?}"
+            "{argv:?}"
         );
     }
 
@@ -2934,7 +2992,7 @@ mod tests {
     #[test]
     fn multi_monitor_gate_defaults_to_disabled_with_no_heads() {
         let config = parse_ok(&["--auth-mode", "pam"]);
-        assert!(!config.multi_monitor.advertise_enabled);
+        assert!(config.multi_monitor.advertise_enabled);
         assert!(config.multi_monitor.heads.is_empty());
     }
 
@@ -3005,8 +3063,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_monitor_advertise_enabled_with_auto_encoder_fails_validate_config() {
-        let error = parse(&[
+    fn multi_monitor_advertise_enabled_with_auto_encoder_is_allowed_until_discovery() {
+        let config = parse(&[
             "--tls-cert".into(),
             "/tmp/cert".into(),
             "--tls-key".into(),
@@ -3017,13 +3075,9 @@ mod tests {
             "--multi-monitor-head".into(),
             "DFP-0".into(),
         ])
-        .expect_err(
-            "advertise_enabled with the default auto encoder must fail, not silently withhold",
-        );
-        assert!(
-            error.contains("encoder"),
-            "error must mention the encoder policy conflict: {error}"
-        );
+        .expect("auto is resolved once startup NVIDIA discovery has selected heads");
+        assert_eq!(config.encoder, EncoderSelection::Auto);
+        assert_eq!(config.multi_monitor.heads, ["DFP-0"]);
     }
 
     #[test]
@@ -3135,6 +3189,8 @@ mod tests {
         assert_eq!(config.session_display, ":12");
         assert_eq!(config.session_gpu_head, "DFP-3");
         assert!(parse(&["--session-display".into(), ":0".into()]).is_err());
-        assert!(parse(&["--session-gpu-head".into(), "DFP-4".into()]).is_err());
+        // Any NVIDIA DFP-N output may host the session, not only DFP-0..3.
+        assert!(validate_gpu_head("DFP-4").is_ok());
+        assert!(parse(&["--session-gpu-head".into(), "HDMI-0".into()]).is_err());
     }
 }

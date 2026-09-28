@@ -17,6 +17,13 @@ The package ships `logging.level: 0` plus shared QoS defaults. Development
 overrides (currently Level 2 on pier-windows.example.internal) belong in deployment configuration,
 never in this production template.
 
+Windows multi-display is automatic in the production template:
+`platform.multi_monitor.advertise_enabled` is `true`, `allowed_adapters` is
+empty ("any eligible NVIDIA/NVENC adapter"), and `nvidia_headless_enabled` is
+`null` so the Pier decides from live DXGI/NVAPI inventory at startup. Use
+`excluded_adapters` to reserve a GPU for local work; for example exclude an RTX
+card used by DaVinci Resolve so the Pier streams on a GRID V100D.
+
 The single Pier/installer payload includes all Windows streaming pipelines:
 eight-bit DDA/WGC for Auto/Speed, mandatory WGC FP16 scRGB for ten-bit
 Grading, and the exact-target HDR EDID/state plus FP16-to-PQ path for HDR.

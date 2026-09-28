@@ -77,22 +77,22 @@ pub struct LinuxLoggingConfig {
 }
 
 /// Operator-facing configuration gate for the `multi_monitor_v1` capability.
-/// Defaults to fully disabled (`advertise_enabled: false`, empty `heads`):
-/// this host advertises and admits nothing until an operator explicitly sets
-/// both fields, matching the "safe/off until target validation" requirement.
+/// Defaults to advertisement enabled with an empty `heads` roster: the Linux
+/// Pier discovers NVIDIA heads automatically at service startup. Empty
+/// `heads` means "discover"; non-empty `heads` is an administrator override;
+/// `advertise_enabled: false` is the administrator off switch.
 /// This gate is the sole production safety switch: the separate, hardcoded
 /// `media::multi_capenc::MULTI_MONITOR_CARRIER_READY` gate is `true` now
 /// that Carrier A is fully wired end to end (see `session::multi_monitor`),
 /// so it no longer withholds anything on its own.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LinuxMultiMonitorConfig {
-    /// Explicit operator opt-in. `false` unless set.
+    /// Advertisement switch. `false` is an explicit administrator off switch.
     pub advertise_enabled: bool,
     /// Ordered NVIDIA head tokens available to plan against, e.g.
-    /// `["DFP-0", "DFP-1"]`. Empty (the default) means no heads are
-    /// configured, which withholds the offer regardless of
-    /// `advertise_enabled`.
+    /// `["DFP-0", "DFP-1"]`. Empty (the default) means discover heads at
+    /// service startup.
     pub heads: Vec<String>,
     /// Optional operator ceiling for simultaneous NVENC sessions on the
     /// configured GPU.
@@ -100,6 +100,17 @@ pub struct LinuxMultiMonitorConfig {
     /// Whether monitors that explicitly permit 4:2:0 may use the software
     /// encoder when the NVENC ceiling is exhausted.
     pub allow_software_fallback: bool,
+}
+
+impl Default for LinuxMultiMonitorConfig {
+    fn default() -> Self {
+        Self {
+            advertise_enabled: true,
+            heads: Vec::new(),
+            nvenc_session_limit: None,
+            allow_software_fallback: false,
+        }
+    }
 }
 
 pub struct LoadedConfig {
@@ -211,8 +222,10 @@ mod tests {
         assert_eq!(parsed.video.bit_depth.as_deref(), Some("10"));
         assert_eq!(parsed.video.color_range.as_deref(), Some("full"));
         assert_eq!(parsed.video.encoder.as_deref(), Some("auto"));
+        // Everything is on by default; the file is for turning things off.
         assert!(parsed.audio.enabled);
-        assert!(!parsed.audio.compressed);
-        assert!(!parsed.microphone_input.enabled);
+        assert!(parsed.audio.compressed);
+        assert!(parsed.microphone_input.enabled);
+        assert_eq!(parsed.redirection.timezone, Some(true));
     }
 }

@@ -448,6 +448,9 @@ pub struct StreamProfile {
     /// how much the encoder is allowed to spend reaching them, so it takes
     /// no part in the negotiated-truth comparison the five axes above feed.
     pub encode_intent: String,
+    /// What the host should preserve when the link is tight (`detail` or
+    /// `motion`).
+    pub motion_priority: String,
 }
 
 impl Default for StreamProfile {
@@ -470,6 +473,7 @@ impl Default for StreamProfile {
             transfer: "bt709".to_string(),
             color_primaries: "bt709".to_string(),
             encode_intent: "interactive".to_string(),
+            motion_priority: "detail".to_string(),
         }
     }
 }
@@ -1378,10 +1382,17 @@ impl SessionEnd {
         }
     }
 
-    fn graceful_host() -> Self {
+    /// A host close, keeping the reason the host gave. A host that refuses a
+    /// session after sign-in says why in the close frame, and dropping it
+    /// left the user with no idea what to fix.
+    fn host_closed(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> Self {
+        let message = match frame.map(|frame| frame.reason.trim()) {
+            Some(reason) if !reason.is_empty() => format!("Host closed the session: {reason}"),
+            _ => "Host closed the session".to_string(),
+        };
         Self {
             reason: DisconnectReason::Terminal(TerminalDisconnect::GracefulHostClose),
-            message: "Host closed the session".to_string(),
+            message,
             observed_at: Instant::now(),
         }
     }
@@ -1539,6 +1550,9 @@ pub enum ConnectSmokeError {
     Timeout,
     #[error("authentication failed: {0}")]
     AuthFailed(String),
+    /// The host accepted the sign-in and then could not start the session.
+    #[error("the host signed you in but could not start the session: {0}")]
+    SessionSetupFailed(String),
     #[error("resume rejected: {message}")]
     ResumeRejected {
         message: String,
@@ -1656,7 +1670,7 @@ async fn connect_smoke_correlated(
             let auth_result: AuthResult =
                 serde_json::from_value(recv_json(&mut ws, options.timeout).await?)?;
             if !auth_result.success {
-                return Err(ConnectSmokeError::AuthFailed(auth_result.message));
+                return Err(auth_refusal(&auth_result));
             }
             let _ = fsm.send(ClientEvent::AuthOk);
             let hello = recv_json(&mut ws, options.timeout).await?;
@@ -1961,9 +1975,9 @@ async fn run_session_correlated(
                         message: bounded_message(&auth_result.message),
                         error_code: auth_result.error_code,
                     }),
-                    SessionAuth::Legacy | SessionAuth::InitialOptIn { .. } => Err(
-                        ConnectSmokeError::AuthFailed(bounded_message(&auth_result.message)),
-                    ),
+                    SessionAuth::Legacy | SessionAuth::InitialOptIn { .. } => {
+                        Err(auth_refusal(&auth_result))
+                    }
                 };
             }
             if let Some(authentication) =
@@ -2558,7 +2572,7 @@ async fn run_session_correlated(
                             }
                         }
                     }
-                    Message::Close(_) => return Ok(SessionEnd::graceful_host()),
+                    Message::Close(frame) => return Ok(SessionEnd::host_closed(frame.as_ref())),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
@@ -3941,6 +3955,7 @@ fn macos_input_capabilities(tablet_input_enabled: bool) -> InputCapabilitiesMsg 
         relative_pointer: InputCapabilityAvailability::Available,
         host_cursor: InputCapabilityAvailability::Available,
         region_input: InputCapabilityAvailability::Available,
+        gestures: InputCapabilityAvailability::Available,
         pen,
         pen_pressure: pen,
         pen_tilt: pen,
@@ -4482,6 +4497,17 @@ fn emit_auth_fail(
         "Deck authentication failed",
         None,
     );
+}
+
+/// Tells a refused sign-in from a host that signed the user in and then
+/// failed to start the session; both arrive as an unsuccessful `auth_result`.
+fn auth_refusal(result: &AuthResult) -> ConnectSmokeError {
+    let message = bounded_message(&result.message);
+    if result.session_setup_failed {
+        ConnectSmokeError::SessionSetupFailed(message)
+    } else {
+        ConnectSmokeError::AuthFailed(message)
+    }
 }
 
 fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
@@ -5134,7 +5160,8 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         ConnectSmokeError::Url(_)
         | ConnectSmokeError::Randomness(_)
         | ConnectSmokeError::TransportUnavailable(_)
-        | ConnectSmokeError::MultiMonitorUnsupported(_) => {
+        | ConnectSmokeError::MultiMonitorUnsupported(_)
+        | ConnectSmokeError::SessionSetupFailed(_) => {
             DisconnectReason::Terminal(TerminalDisconnect::Configuration)
         }
         ConnectSmokeError::Json(_)
@@ -5185,6 +5212,7 @@ fn rust_viewer_quality_settings(profile: &StreamProfile) -> QualitySettings {
         transfer: profile.transfer.clone(),
         color_primaries: profile.color_primaries.clone(),
         encode_intent: profile.encode_intent.clone(),
+        motion_priority: profile.motion_priority.clone(),
         force_lossless: false,
         intra_refresh: false,
         enable_audio: true,
@@ -6565,13 +6593,35 @@ mod tests {
     }
 
     #[test]
+    fn a_host_close_keeps_the_reason_the_host_gave() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let frame = CloseFrame {
+            code: CloseCode::Policy,
+            reason: "allow System Audio Recording".into(),
+        };
+        let end = SessionEnd::host_closed(Some(&frame));
+        assert_eq!(
+            end.message,
+            "Host closed the session: allow System Audio Recording"
+        );
+        assert!(matches!(
+            end.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::GracefulHostClose)
+        ));
+        assert_eq!(
+            SessionEnd::host_closed(None).message,
+            "Host closed the session"
+        );
+    }
+
+    #[test]
     fn microphone_teardown_reason_is_typed_by_terminal_outcome() {
         assert_eq!(
             microphone_teardown_reason(&Ok(SessionEnd::manual())),
             "manual"
         );
         assert_eq!(
-            microphone_teardown_reason(&Ok(SessionEnd::graceful_host())),
+            microphone_teardown_reason(&Ok(SessionEnd::host_closed(None))),
             "host_closed"
         );
         assert_eq!(
@@ -6657,7 +6707,30 @@ mod tests {
             resume_window_secs: window,
             resumed,
             error_code: None,
+            session_setup_failed: false,
         }
+    }
+
+    #[test]
+    fn a_host_that_signed_you_in_but_failed_is_not_a_wrong_password() {
+        let mut result = auth_result(None, None, false);
+        result.success = false;
+        result.message = "capenc READY failed".to_string();
+        assert!(matches!(
+            auth_refusal(&result),
+            ConnectSmokeError::AuthFailed(_)
+        ));
+        result.session_setup_failed = true;
+        let error = auth_refusal(&result);
+        assert!(matches!(error, ConnectSmokeError::SessionSetupFailed(_)));
+        assert!(error
+            .to_string()
+            .starts_with("the host signed you in but could not start"));
+        assert_eq!(
+            classify_disconnect(&error).reason,
+            DisconnectReason::Terminal(TerminalDisconnect::Configuration)
+        );
+        assert_ne!(connect_error_class(&error), "auth");
     }
 
     #[test]
@@ -7188,6 +7261,7 @@ mod tests {
             transfer: "bt709".to_string(),
             color_primaries: "bt709".to_string(),
             encode_intent: "quality".to_string(),
+            motion_priority: "motion".to_string(),
         });
         assert_eq!(quality.codec, "h265");
         assert_eq!(quality.chroma, "yuv444");
@@ -7200,6 +7274,10 @@ mod tests {
             quality.encode_intent, "quality",
             "the requested intent must reach the wire verbatim -- the host reads this token to \
              choose its encoder preset and buffering"
+        );
+        assert_eq!(
+            quality.motion_priority, "motion",
+            "the requested motion/detail priority must reach the wire verbatim"
         );
     }
 

@@ -6,7 +6,7 @@
 #                                     [--installer-identity "Developer ID Installer: ..."]
 #                                     [--with-virtual-hid --provisioning-profile FILE]
 #
-# Produces `dist/ArcenPier-<version>.pkg`, meant to be opened with
+# Produces `dist/macos/ArcenPier-<version>.pkg`, meant to be opened with
 # Installer.app on the Mac it installs. The command-line `installer` is refused
 # unless ARCEN_ALLOW_COMMAND_LINE_INSTALL=1 is set; see pier/distribution.xml.
 #
@@ -32,7 +32,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-APP="$REPO/Arcen Pier.app"
+OUT="$REPO/dist/macos"
+APP="$OUT/Arcen Pier.app"
 IDENTITY=""
 INSTALLER_IDENTITY=""
 NOTARY_PROFILE=""
@@ -73,23 +74,25 @@ SCRIPTS="$(mktemp -d)"
 trap 'rm -rf "$ROOT" "$SCRIPTS"' EXIT
 PIER_SCRIPTS="$HERE/pier"
 for file in common.sh preinstall postinstall uninstall.sh newsyslog.conf \
-            distribution.xml conclusion.html; do
+            distribution.xml welcome.html conclusion.html; do
   [[ -f "$PIER_SCRIPTS/$file" ]] || { echo "error: missing $PIER_SCRIPTS/$file" >&2; exit 1; }
 done
 for file in common.sh preinstall postinstall uninstall.sh; do
   bash -n "$PIER_SCRIPTS/$file" || { echo "error: $file does not parse" >&2; exit 1; }
 done
 
-mkdir -p "$ROOT/Applications" "$ROOT/Library/LaunchAgents" "$ROOT/Library/LaunchDaemons" \
+mkdir -p "$ROOT/Applications" "$ROOT/Library/PrivilegedHelperTools" \
+  "$ROOT/Library/LaunchAgents" "$ROOT/Library/LaunchDaemons" \
   "$ROOT/private/etc/pam.d" "$ROOT/private/etc/newsyslog.d"
 # COPYFILE_DISABLE stops macOS writing AppleDouble "._" sidecars for extended
 # attributes. Without it the package installs a shadow file beside every real
 # one, which is visible to anyone who looks and is the kind of detail that
 # makes an installer look unfinished.
 COPYFILE_DISABLE=1 cp -R "$APP" "$ROOT/Applications/"
-# The helper installs beside the Pier rather than inside it, so TCC credits
-# the helper's own identity instead of walking up to a container.
-COPYFILE_DISABLE=1 cp -R "$REPO/Arcen Agent Helper.app" "$ROOT/Applications/"
+# The helper is its own bundle, not nested in the Pier, so TCC credits the
+# helper's identity instead of walking up to a container. It is a background
+# component, so it goes with the other privileged helpers, not /Applications.
+COPYFILE_DISABLE=1 cp -R "$OUT/Arcen Agent Helper.app" "$ROOT/Library/PrivilegedHelperTools/"
 cp "$HERE/pam/arcen" "$ROOT/private/etc/pam.d/arcen"
 chmod 644 "$ROOT/private/etc/pam.d/arcen"
 cp "$PIER_SCRIPTS/newsyslog.conf" "$ROOT/private/etc/newsyslog.d/pier.arcen.tech.conf"
@@ -139,7 +142,7 @@ xattr -cr "$ROOT" 2>/dev/null || true
 # Re-sign the bundle: adding the uninstaller after signing broke the seal.
 if [[ -n "$IDENTITY" ]]; then
   codesign --force --options runtime --timestamp --identifier pier.arcen.tech.agent \
-    --sign "$IDENTITY" "$ROOT/Applications/Arcen Agent Helper.app"
+    --sign "$IDENTITY" "$ROOT/Library/PrivilegedHelperTools/Arcen Agent Helper.app"
   # The Pier's entitlements and embedded profile were set by the app build.
   # Re-sealing without preserving them strips the entitlement, and the
   # profile left behind no longer matches the signature.
@@ -154,20 +157,25 @@ fi
 # code, and refuses it with nothing more than "failed MACF" otherwise.
 if [[ -n "$NOTARY_PROFILE" ]]; then
   [[ -n "$IDENTITY" ]] || { echo "error: notarization requires --identity" >&2; exit 2; }
-  NOTARY_ZIP="$(mktemp -d)/ArcenPierApps.zip"
-  # The Applications directory holds exactly the two bundles.
-  ditto -c -k --keepParent "$ROOT/Applications" "$NOTARY_ZIP"
+  NOTARY_DIR="$(mktemp -d)"
+  NOTARY_ZIP="$NOTARY_DIR/ArcenPierApps.zip"
+  # Both bundles in one submission, wherever the payload puts them.
+  mkdir "$NOTARY_DIR/apps"
+  ditto "$ROOT/Applications/Arcen Pier.app" "$NOTARY_DIR/apps/Arcen Pier.app"
+  ditto "$ROOT/Library/PrivilegedHelperTools/Arcen Agent Helper.app" \
+    "$NOTARY_DIR/apps/Arcen Agent Helper.app"
+  ditto -c -k --keepParent "$NOTARY_DIR/apps" "$NOTARY_ZIP"
   echo "==> notarizing the applications (this waits for Apple)"
   xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
-  for app in "$ROOT/Applications/Arcen Pier.app" "$ROOT/Applications/Arcen Agent Helper.app"; do
+  for app in "$ROOT/Applications/Arcen Pier.app" "$ROOT/Library/PrivilegedHelperTools/Arcen Agent Helper.app"; do
     xcrun stapler staple "$app"
     spctl --assess --type exec -vv "$app" 2>&1 | sed 's/^/    /'
   done
-  rm -rf "$(dirname "$NOTARY_ZIP")"
+  rm -rf "$NOTARY_DIR"
 fi
 
-mkdir -p "$REPO/dist"
-PKG="$REPO/dist/ArcenPier-$VERSION.pkg"
+mkdir -p "$OUT"
+PKG="$OUT/ArcenPier-$VERSION.pkg"
 rm -f "$PKG"
 
 find "$ROOT" -name '.DS_Store' -delete
@@ -219,7 +227,7 @@ MINIMUM="$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist"
   exit 1
 }
 mkdir -p "$PRODUCT/resources"
-cp "$PIER_SCRIPTS/conclusion.html" "$PRODUCT/resources/"
+cp "$PIER_SCRIPTS/welcome.html" "$PIER_SCRIPTS/conclusion.html" "$PRODUCT/resources/"
 sed -e "s/@VERSION@/$VERSION/g" \
     -e "s/@COMPONENT@/$COMPONENT_PKG/g" \
     -e "s/@HOST_ARCHITECTURES@/$ARCHITECTURES/g" \

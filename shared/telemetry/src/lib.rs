@@ -15,6 +15,7 @@ pub mod lifecycle_fields;
 mod log_policy;
 pub mod names;
 mod network;
+mod path_signal;
 mod schema;
 mod stream_stats;
 mod support_bundle;
@@ -38,13 +39,15 @@ pub use network::{
     InterfaceKind, MAX_NETWORK_IDENTITY_BYTES, MAX_NETWORK_MTU, MIN_NETWORK_MTU, NetworkScope,
     NetworkSnapshot, NetworkValidationError, classify_ip, classify_ip_literal,
 };
+pub use path_signal::{PATH_BASELINE_WINDOW, PathSignal, PathSignalCounters, PathSignalState};
 pub use schema::{
     CANONICAL_SCHEMA_VERSION, CanonicalRecord, EventSeverity, MAX_IDENTITY_BYTES,
     MAX_MESSAGE_BYTES, SchemaValidationError, TelemetryComponent, TelemetryPlatform, TelemetryRole,
     TelemetryTarget,
 };
 pub use stream_stats::{
-    DEFAULT_SNAPSHOT_INTERVAL_SECS, SnapshotCadence, StageAverages, StageTotals, stage_averages,
+    DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SnapshotCadence, StageAverages,
+    StageTotals, rate_per_second, rounded_percentiles_ms, stage_averages,
 };
 pub use support_bundle::{
     BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey,

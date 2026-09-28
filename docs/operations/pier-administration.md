@@ -70,29 +70,30 @@ legacy `listen.quic_port` alias, and raising the TLS floor to TLS 1.3. Linux
 keeps `/etc/arcen/pier.json.pre-quic`; Windows retains the previous file under
 `%ProgramData%\Arcen\rollback`.
 
-Fresh installations apply a fail-closed multi-monitor safe-auto policy:
+Fresh packaged templates keep the common listener, media, audio,
+microphone, clipboard, timezone and multi-monitor sections on. The config file
+is the operator surface for turning capabilities off or narrowing them. Existing
+configurations are preserved on upgrade; the listener/TLS schema migration
+described above does not replace `platform.multi_monitor` or any other unrelated
+operator policy.
 
-- Windows first installs the trusted embedded Pier, then runs its read-only
-  `diagnose-host --json` and `nvapi-inventory --json` commands. It enables
-  native NVIDIA headless multi-monitor only when exactly one NVENC-capable
-  Quadro/GRID adapter matches across both inventories and exposes at least two
-  display IDs. The generated config names that exact adapter, enables the
-  hardware-validated two-display ceiling and optional software overflow, and
-  leaves NVENC capacity to measured runtime admission.
-- A Windows host with no eligible adapter, more than one eligible adapter, an
-  incomplete inventory, or a failed probe remains disabled. The installer
-  prints the exact reason. In particular, it never guesses which GPU a
-  multi-GPU host reserves for non-Arcen work.
-- Linux remains disabled on a fresh install because the installer cannot prove
-  the NVIDIA DFP head roster without creating a temporary X/NV-CONTROL
-  session. It does not mutate the display server merely to guess a default and
-  prints the `platform.multi_monitor.heads` action the operator must take. The
-  packaged JSON may omit `platform.multi_monitor`; omission is the disabled
-  default, not an incomplete installation.
+Multi-monitor advertisement still fails closed at runtime when the host cannot
+prove it can serve the requested topology:
 
-Safe-auto runs only when the config does not exist. Upgrades retain the
-operator's complete `platform.multi_monitor` policy; the listener/TLS schema
-migration described above does not replace that section.
+- Linux starts with `platform.multi_monitor.advertise_enabled: true` and an
+  empty `heads` list. Empty means Pier runs a short Xorg probe at service start,
+  discovers NVIDIA `DFP-N` heads, and advertises only if usable heads are found.
+  A non-empty `heads` list is an administrator override.
+- Windows starts with `platform.multi_monitor.advertise_enabled: true` and an
+  empty `allowed_adapters` list. Empty means any live NVIDIA/NVENC adapter that
+  remains after `excluded_adapters`; startup resolves one eligible streaming
+  adapter before the host advertises. `nvidia_headless_enabled: null` lets that
+  startup selection enable native NVIDIA headless mode for a GRID/Quadro-class
+  adapter.
+- macOS Pier packages set `platform.multi_monitor.advertise_enabled: true`.
+  The development host creates one session-owned virtual display per Deck
+  display when its native capture, input routing and virtual-display checks
+  pass.
 
 Both installers register and enable the Pier service but deliberately leave it
 stopped when no valid license is installed. Install the license and then start
@@ -212,11 +213,11 @@ Packaged services pass only `--config`, so the JSON file is the operator surface
 | `video.color_range` | string | Built-in `limited`; packages `full` | Both | Ceiling coded sample range: `limited` or `full`. Existing hand-written deployments that omit it retain `limited`; packaged hosts expose the full-range ceiling under `default-off`. | Restart |
 | `video.color_matrix` | string | `bt709` | Both | Ceiling matrix coefficients used to derive luma/chroma from RGB: `identity`, `bt709`, `bt601`, or `bt2020ncl`. | Restart |
 | `video.color_policy` | string | `default-off` | Both | `always-on`, `always-off`, `default-on`, or `default-off`. Governs how `bit_depth`/`color_range`/`color_matrix` interact with a negotiating client. See "Colour fidelity policy" below. | Restart |
-| `video.desktop_encoding` | string | `sdr` | Linux | What the Xorg desktop's code values mean, which Xorg cannot report: `sdr` or `rec2100-pq`. Set `rec2100-pq` only when a colour-managed application writes Rec.2100 PQ into the desktop (for example Flame's HDR UI with graphics monitor `Rec.2100-PQ`); a ten-bit HDR request then stays PQ / BT.2020 instead of resolving to Grading, and SDR sessions log a warning. Windows rejects any value but `sdr` because it reads HDR state from the OS. | Restart |
+| `video.desktop_encoding` | string | `sdr` | Linux | What the Xorg desktop's code values mean, which Xorg cannot report: `sdr` or `rec2100-pq`. Set `rec2100-pq` only when a colour-managed application writes Rec.2100 PQ into the desktop (for example Flame's HDR UI with graphics monitor `Rec.2100-PQ`); a ten-bit HDR request then stays PQ / BT.2020 instead of resolving to Grading, a Grading session is converted to true BT.709 SDR, and eight-bit sessions (Auto, Speed) are refused with a message naming Grading and HDR. Windows rejects any value but `sdr` because it reads HDR state from the OS. | Restart |
 | `video.variant` | string or absent | absent | Both | Strongest exact administrator pin: a complete probe-matrix variant id such as `hevc-444-10-full-bt709`. It overrides the individual format keys and the Deck's automatic codec choice. | Restart |
-| `audio.enabled` | bool | Required. Linux built-in `false`, packages `true`; Windows `true` | Both | Enables host-to-Deck audio. | Restart |
-| `audio.compressed` | bool | Required. `false` in packages | Both | `false` selects PCM; `true` selects fixed Opus policy. | Restart |
-| `microphone_input.enabled` | bool | Required. `false` | Both | Enables optional Deck microphone publication policy. | Restart |
+| `audio.enabled` | bool | Required. Built-in `false`; packaged templates `true` | Both | Enables host-to-Deck audio. | Restart |
+| `audio.compressed` | bool | Required. Built-in `false`; packaged templates `true` | Both | `false` selects PCM; `true` selects fixed Opus policy. | Restart |
+| `microphone_input.enabled` | bool | Required. Built-in `false`; packaged templates `true` | Both | Enables optional Deck microphone publication policy. | Restart |
 | `clipboard.direction` | string | policy default `both`; packages `both` | Both | `both`, `client_to_host`, `host_to_client`, or `disabled`. | Restart |
 | `clipboard.content` | string | policy default `all`; packages `all` | Both | `all`, `text`, or `image`. | Restart |
 | `clipboard.max_bytes` | usize | policy default and packages `8388608` | Both | Encoded clipboard cap. Valid 1 MiB through 20 MiB. | Restart |
@@ -224,7 +225,7 @@ Packaged services pass only `--config`, so the JSON file is the operator surface
 | `auth.disclaimer.locale` | string | `en_US` | Both | Locale file stem. | Restart |
 | `auth.disclaimer.directory` | path string | Linux `/etc/arcen/disclaimers`; Windows `disclaimers` relative to config | Both | Directory containing `<locale>.txt`. | Restart |
 | `auth.reconnect_window_secs` | u32 | `180` | Both | Direct resume window. Valid shared range is 0 through 7200. Zero disables resume. The host keeps its display authority for the whole window, so this is also how long another user waits after somebody disconnects. | Restart |
-| `redirection.timezone` | bool | `false` | Both | Linux sets `TZ` in authenticated desktop process tree. Windows temporarily changes machine time zone under journal. | Restart |
+| `redirection.timezone` | bool | Built-in `false`; packaged templates `true` | Both | Linux sets `TZ` in authenticated desktop process tree. Windows temporarily changes machine time zone under journal. | Restart |
 | `logging.level` | integer | `0` | Both | Operational profile: 0 Critical, 1 Error, 2 Info, 3 Debug. | Linux SIGHUP, Windows control 201, restart |
 | `logging.verbosity` | integer | unset | Both | Legacy one-release mapping: 0→Error, 1→Info, 2/3→Debug. Mutually exclusive with `logging.level`. | Linux SIGHUP, Windows control 201, restart |
 | `logging.retention_days` | u16 | `30`, normalized 7 through 100 | Both | Log archive retention. | Linux SIGHUP, Windows control 201 |
@@ -365,8 +366,8 @@ encoder tier.
 | `platform.session.launcher_bin` | path string | discovered or package path | Privileged PAM launcher. **Target state:** becomes `arcen-pier session-launcher`. | Restart |
 | `platform.session.zoneinfo_root` | path string | `/usr/share/zoneinfo` | Trusted IANA time-zone database root. | Restart |
 | `platform.session.disconnected_idle_timeout_secs` | u64 or null | unset/null | Linux-only opt-in hygiene. When set to a value greater than 0, a persistent desktop that has been continuously disconnected for longer than this limit is torn down before the next connection creates a fresh desktop. Omit or set `null` to preserve the default persistent-forever behaviour. | Restart |
-| `platform.multi_monitor.advertise_enabled` | bool | `false` | Advertise and admit fixed-topology multi-monitor sessions. | Restart |
-| `platform.multi_monitor.heads` | array of strings | `[]` (full `DFP-0`..`DFP-3` GPU capacity) | Optional ordered **allowlist ceiling** of NVIDIA heads this host may provision, for example `["DFP-0", "DFP-1"]`. Not a count of currently-lit displays: a headless GPU has none, and a session provisions the first N heads of the roster for an N-monitor request. Naming heads only narrows the ceiling. | Restart |
+| `platform.multi_monitor.advertise_enabled` | bool | `true` | Administrator off switch. `true` permits advertisement only after startup has found usable NVIDIA heads; `false` withholds `multi_monitor_v1`. | Restart |
+| `platform.multi_monitor.heads` | array of strings | `[]` (discover) | Empty means run the NVIDIA Xorg head probe at service start. A non-empty list is an administrator override and ordered ceiling, for example `["DFP-0", "DFP-1"]`; Pier provisions the first N heads of the roster for an N-monitor request. | Restart |
 | `platform.multi_monitor.nvenc_session_limit` | u8 or null | unset | Optional operator ceiling for simultaneous NVENC sessions. Unset uses measured runtime admission: Pier opens the planned encoder set rather than guessing from the GPU model. | Restart |
 | `platform.multi_monitor.allow_software_fallback` | bool | `false` | Permit exact overflow monitors to use OpenH264/H.264/4:2:0 when the NVENC ceiling is exhausted. Full-color displays receive NVENC priority and the complete roster still fails atomically if any software geometry is unsupported. | Restart |
 | `platform.input.mode` | string | built-in `none`, package `uinput` | `none` or `uinput`; `uinput` requires PAM. | Restart |
@@ -399,12 +400,13 @@ encoder tier.
 | `platform.iddcx.enabled` | bool | `false` | Dormant source-research gate. Supported packages do not ship an Arcen IddCx driver; leave `false`. | Restart |
 | `platform.iddcx.render_adapter.stable_id` | string | unset | Research-only exact adapter selector; has no supported packaged provider. | Restart |
 | `platform.iddcx.render_adapter.description` | string | unset | Research-only exact adapter selector; has no supported packaged provider. | Restart |
-| `platform.multi_monitor.advertise_enabled` | bool | `false` | Advertise and admit fixed-topology multi-monitor sessions through display paths Windows already enumerates. | Restart |
-| `platform.multi_monitor.allowed_adapters` | array of strings | `[]` | Exact case-insensitive DXGI adapter descriptions that multi-monitor may consume. Empty inherits `platform.desktop.adapter`; Deck never selects a GPU. | Restart |
-| `platform.multi_monitor.max_monitors` | u8 or null | unset | Optional operator ceiling on the advertised monitor count, 1 through 4. Native NVIDIA headless mode automatically clamps this to its hardware-validated safe provider maximum (currently 2); an explicit lower value still wins. Ordinary attached-output mode cannot probe the interactive desktop from session 0, so set a truthful ceiling there when fewer than four outputs are available. | Restart |
+| `platform.multi_monitor.advertise_enabled` | bool | `true` | Administrator off switch. `true` permits advertisement only after startup chooses an eligible live NVIDIA/NVENC streaming adapter; `false` withholds `multi_monitor_v1`. | Restart |
+| `platform.multi_monitor.allowed_adapters` | array of strings | `[]` | Exact case-insensitive DXGI adapter descriptions that multi-monitor may use. Empty means any eligible adapter that is not excluded; startup resolves the effective streaming adapter. | Restart |
+| `platform.multi_monitor.excluded_adapters` | array of strings | `[]` | Exact case-insensitive DXGI adapter descriptions multi-monitor must not use. Prefer this to reserve a GPU for other work. | Restart |
+| `platform.multi_monitor.max_monitors` | u8 or null | unset | Optional operator ceiling on the advertised monitor count, 1 through 4. Native NVIDIA headless mode clamps this to its hardware-validated safe provider maximum (currently 2); an explicit lower value still wins. Ordinary attached-output mode cannot probe the interactive desktop from session 0, so set a truthful ceiling there when fewer than four outputs are available. | Restart |
 | `platform.multi_monitor.nvenc_session_limit` | u8 or null | unset | Optional operator ceiling for simultaneous NVENC sessions across allowed adapters. Unset uses measured runtime admission: Pier attempts the complete planned encoder set and observes whether it meets the configured QoS thresholds. | Restart |
-| `platform.multi_monitor.allow_software_fallback` | bool | `false` | Allow eligible non-4:4:4 monitors to use MF/H.264/YUV420 when exact geometry is supported; otherwise reject the complete roster. | Restart |
-| `platform.multi_monitor.nvidia_headless_enabled` | bool | `false` | Provision missing monitors through unused native NVIDIA display IDs on the single allowed display/stream adapter. Requires exactly one `allowed_adapters` entry and cannot be combined with `platform.iddcx.enabled`. | Restart |
+| `platform.multi_monitor.allow_software_fallback` | bool | `true` | Allow eligible non-4:4:4 monitors to use MF/H.264/YUV420 when exact geometry is supported; otherwise reject the complete roster. | Restart |
+| `platform.multi_monitor.nvidia_headless_enabled` | bool or null | unset/null | Provision missing monitors through unused native NVIDIA display IDs on the selected streaming adapter. `null` lets startup enable it for a GRID/Quadro-class adapter, `false` is an off switch, and `true` forces the provider. Cannot be combined with `platform.iddcx.enabled`. | Restart |
 | `platform.logging.rotate_mb` | u64 | `32` | Active log rotation size in MiB. | Windows control 201 or restart |
 | `platform.first_login_timeout_secs` | u64 | `300` | CP first-login session wait. Valid 30 through 1800. | Restart |
 
@@ -417,30 +419,32 @@ enabling this research gate.
 
 #### Reserving a GPU on a multi-GPU host
 
-`allowed_adapters` is what decides which GPU captures and encodes. Capture and
-encode are bound together — a monitor is encoded on the adapter that owns its
-output — so listing a second adapter is what permits a session to consume it,
-whatever `platform.desktop.adapter` says. On a host where one card is reserved
-for other work, name only the streaming card:
+Use `excluded_adapters` first when a card must stay available for non-Arcen
+work. Capture and encode are bound together — a monitor is encoded on the
+adapter that owns its output — and startup chooses one eligible live
+NVIDIA/NVENC streaming adapter after applying the exclude list. Empty
+`allowed_adapters` means any eligible non-excluded adapter:
 
 ```json
 "multi_monitor": {
   "advertise_enabled": true,
-  "allowed_adapters": ["NVIDIA GRID V100D-16Q"],
-  "nvidia_headless_enabled": true
+  "excluded_adapters": ["NVIDIA GRID RTX6000-8Q"],
+  "nvidia_headless_enabled": null
 }
 ```
 
-Pier warns at startup when `allowed_adapters` permits an adapter other than
-`platform.desktop.adapter`, naming the borrowed GPU. It is a warning and not a
-rejection, because genuinely multi-GPU streaming hosts are supported; the point
-is that the choice is visible rather than silent.
+Use `allowed_adapters` only when the streaming GPU itself must be positively
+restricted. Pier warns at startup when a non-empty allow-list permits an adapter
+other than `platform.desktop.adapter`, naming the borrowed GPU. It is a warning
+and not a rejection, because genuinely multi-GPU streaming hosts are supported;
+the point is that the choice is visible rather than silent.
 
-Pinning to one adapter does not cost monitors. `nvidia_headless_enabled`
-provisions the remaining monitors from that adapter's own unused NVIDIA display
-IDs — a GRID vGPU typically exposes four output slots with only one connected —
-so a single card can still serve a multi-monitor session. It requires exactly
-one `allowed_adapters` entry.
+Pinning to one selected adapter does not cost monitors. Native NVIDIA headless
+provisioning uses that adapter's own unused NVIDIA display IDs — a GRID vGPU
+typically exposes four output slots with only one connected — so a single card
+can still serve a multi-monitor session. Leave `nvidia_headless_enabled` unset
+for startup auto-selection, set it to `false` as an off switch, or set it to
+`true` to force the provider.
 
 An administrator is not expected to know an older GPU's NVENC session count.
 Leave `nvenc_session_limit` unset for automatic measured admission: Pier opens
@@ -449,9 +453,11 @@ the QoS thresholds. Set the field only when policy/licensing requires a lower
 hard ceiling. With `allow_software_fallback: true`, eligible non-4:4:4 monitors
 can then move to OpenH264 after same-GPU hardware candidates are exhausted.
 
-At Level 2/3, every Windows connection logs one
-`effective Windows multi-monitor admission policy` record containing configured
-and effective monitor ceilings, `runtime_probe` versus
+At startup the `resolved Windows Pier settings` record reports
+`multi_monitor_streaming_adapter`, `multi_monitor_excluded_adapters` and
+`nvidia_headless` after adapter selection. At Level 2/3, every Windows
+connection logs one `effective Windows multi-monitor admission policy` record
+containing configured and effective monitor ceilings, `runtime_probe` versus
 `operator_ceiling_then_runtime_probe`, the fallback policy, and allowed
 adapters. Measured candidate results are logged separately as aggregate and
 per-region encoder-admission measurements.
@@ -521,7 +527,10 @@ cannot be verified.
 | `Pier config desktop.adapter must not be empty` | Empty adapter string. |
 | `Pier config desktop.output is valid only with desktop.adapter` | Windows output with global index. |
 | `Pier config desktop.output requires desktop.adapter` | Windows adapter-local output without adapter. |
-| `platform.multi_monitor.nvidia_headless_enabled requires exactly one allowed display/stream adapter` | Native NVIDIA headless provisioning was enabled without one unambiguous streaming GPU. |
+| `platform.multi_monitor.excluded_adapters contains a duplicate adapter` | Duplicate Windows multi-monitor exclude entry. |
+| `platform.multi_monitor.allowed_adapters and excluded_adapters overlap` | The same Windows adapter was both allowed and excluded. |
+| `platform.multi_monitor.allowed_adapters contains a duplicate adapter` | Duplicate Windows multi-monitor allow entry. |
+| `platform.multi_monitor.nvidia_headless_enabled requires exactly one allowed display/stream adapter` | Forced native NVIDIA headless provisioning named more than one allowed adapter. Leave the allow-list empty for startup resolution, or name exactly one adapter. |
 | `NVIDIA headless provisioning and platform.iddcx.enabled are mutually exclusive` | Two different dynamic-output providers were enabled at once. |
 | `--first-login-timeout-secs must be between 30 and 1800` | Bad Windows first-login timeout. |
 
@@ -704,7 +713,7 @@ Interpretation: service started, TLS material loaded, OS authentication succeede
 | Health reports `overall_state: unavailable` during a working session | Event 1806 `HEALTH_SNAPSHOT` | ERR-366: do not trust `overall_state` yet. Use `SESSION_STREAM_START`, frame/QoS fields, client behavior, and component logs. |
 | Capture or encode fails | capenc READY line and event 1102 fields | Auto/Speed rank AV1 → HEVC → H.264 on the approved NVENC adapter, then either host uses source-built OpenH264. Exact codec/variant pins reject substitution. Grading/HDR target HEVC 4:4:4 instead of silently becoming AV1. `not_built` means the selected backend was not compiled. `capenc READY protocol error: missing cursor` means an old Pier is deployed. Rebuild/deploy the fused Pier. |
 | Audio absent but video works | Logs for WASAPI or audiocap | Windows needs a default render endpoint for loopback. Linux audiocap can wait during idle PulseAudio monitor suspension and report a capture gap rather than killing the helper. |
-| Deck reports Match My Layout unsupported | Host `AuthRequest` has no `multi_monitor_v1`; Windows `diagnose-host` **in an interactive session** | The pre-auth offer is withheld until `platform.multi_monitor.advertise_enabled` is set. If it is set and Deck still refuses, compare Deck's display count against the host's attached-output count: a host advertises `platform.multi_monitor.max_monitors` (default 4) but can only serve one client monitor per attached capture-capable output, and Deck never silently serves a subset. Set `max_monitors` to the host's real output count so the refusal is immediate and honest. |
+| Deck reports Match My Layout unsupported | Host `AuthRequest` has no `multi_monitor_v1`; Windows `diagnose-host` **in an interactive session**; Linux startup discovery log | The pre-auth offer is withheld when `platform.multi_monitor.advertise_enabled` is `false`, Linux automatic head discovery found no usable NVIDIA heads, Windows startup found no eligible live NVIDIA/NVENC adapter after `allowed_adapters`/`excluded_adapters`, or the selected Windows adapter has no attached or provisionable outputs. `max_monitors` is only an operator ceiling; set it to a truthful lower value for attached-output hosts that cannot serve the Deck's full layout. |
 | Clipboard absent | ServerHello and session logs | Clipboard starts only after exact clipboard v1 negotiation and authenticated dedicated/user session. No-auth/shared-display sessions advertise disabled. |
 
 ## 8. Upgrade and rollback
@@ -887,7 +896,7 @@ or fails with an actionable reason; it never silently falls back to one display.
 
 | Deck mode | What Deck asks for | Linux + NVIDIA display guard | Windows + NVAPI-capable NVIDIA | Windows without the NVAPI retarget path |
 | --- | --- | --- | --- | --- |
-| Match my layout | Every active Mac display, up to four, with fixed topology for the attachment. | Available when `platform.multi_monitor.advertise_enabled` is enabled with an NVENC encoder and an explicit `platform.multi_monitor.heads` allowlist. The host provisions the first N allowed heads headlessly. | Available from already-active Windows paths, or from unused native NVIDIA display IDs when `nvidia_headless_enabled` is true. NVIDIA provisioning is journalled before the first EDID write, re-probed before planning, and committed or rolled back with the physical output transaction. Fixed-mode non-NVIDIA outputs may use OpenH264 at h264/yuv420; full-color 4:4:4 still requires NVENC. | Older or disabled hosts fail the complete Match My Layout request; display changes require reconnect. |
+| Match my layout | Every active Mac display, up to four, with fixed topology for the attachment. | Available when `platform.multi_monitor.advertise_enabled` is true, an NVENC-capable path is selected, and startup discovery or an explicit `platform.multi_monitor.heads` override supplies usable NVIDIA heads. The host provisions the first N heads headlessly. | Available from already-active Windows paths after startup selects an eligible NVIDIA/NVENC adapter, or from unused native NVIDIA display IDs when `nvidia_headless_enabled` resolves true. NVIDIA provisioning is journalled before the first EDID write, re-probed before planning, and committed or rolled back with the physical output transaction. Fixed-mode non-NVIDIA outputs may use OpenH264 at h264/yuv420; full-color 4:4:4 still requires NVENC. | Older or disabled hosts fail the complete Match My Layout request; display changes require reconnect. |
 | Primary display only | The primary client display at its fullscreen presentation size. | Works. The stream does not follow the Deck window. | Works. The stream does not follow the Deck window. | Works. The stream does not follow the Deck window. |
 | Windowed | One stream that follows the Deck app window. | Works only when the session holds a display guard and ServerHello reports `supports_display_update:true`. | Works when ServerHello reports `supports_display_update:true` and `device_capabilities.display_resolution.resize.available:true`. | Does not resize the remote desktop. The session starts at the initial primary-display size, then Deck cannot retarget it as the window changes. |
 
@@ -968,16 +977,20 @@ Pier consumes display paths that the operating system already exposes.
 
 - **Linux with NVIDIA:** the dedicated Xorg provider can create headless
   NVIDIA heads through the driver's `ConnectedMonitor` and `MetaModes`
-  configuration. The head roster is a capacity allowlist, not an
-  already-active display count — see "Linux multi-head capacity" below.
-  The selected Quadro/datacenter/vGPU profile
-  and its NVIDIA license must permit the requested heads and encoder workload.
+  configuration. Empty `platform.multi_monitor.heads` lets Pier discover and
+  rank the NVIDIA head roster at service start; a non-empty list is an
+  administrator override, not an already-active display count — see "Linux
+  multi-head capacity" below. The selected Quadro/datacenter/vGPU profile and
+  its NVIDIA license must permit the requested heads and encoder workload.
 - **Windows with native NVIDIA outputs:** on supported Quadro/datacenter/vGPU
   profiles, Pier can turn unused NVIDIA display IDs into monitors by writing a
-  bounded Arcen EDID. This is not IddCx and installs no driver. Enable it only
-  with one explicit `allowed_adapters` entry; that adapter owns the remote
-  displays, capture, and NVENC. A recovery journal and watchdog are armed before
-  the first EDID write.
+  bounded Arcen EDID. This is not IddCx and installs no driver. Startup selects
+  one eligible streaming adapter from `allowed_adapters`/`excluded_adapters`;
+  that adapter owns the remote displays, capture, and NVENC. A recovery journal
+  and watchdog are armed before the first EDID write.
+- **macOS Pier development host:** when enabled and native checks pass, the host
+  creates one session-owned virtual display per Deck display and arranges those
+  displays to match the Deck request.
 
 Inspect that capacity from the interactive console before enabling it:
 
@@ -995,22 +1008,21 @@ transaction requires it to become available and active before planning.
   expose at least as many targets as Deck requests.
 - **Windows with an external virtual-display driver:** an administrator may
   separately install a reputable, appropriately signed IddCx/indirect-display
-  driver (a common approach in some Sunshine/Moonlight headless setups). Arcen
-  can consume the resulting Windows display paths, but it does not distribute,
-  endorse, configure, service, or roll back that driver. Driver trust,
-  Secure-Boot compatibility, updates, and recovery remain the administrator's
-  responsibility.
+  driver. Arcen can consume the resulting Windows display paths, but it does
+  not distribute, endorse, configure, service, or roll back that driver. Driver
+  trust, Secure-Boot compatibility, updates, and recovery remain the
+  administrator's responsibility.
 
 Microsoft Basic Display Adapter cannot invent another target. It can drive only
 the paths supplied by the underlying device/hypervisor. Likewise, RDP's
 Microsoft Remote Display Adapter belongs to the RDP session and is not a
 general display provider that Arcen can reuse for its console/direct session.
 
-Set `platform.multi_monitor.max_monitors` to the number the host can truthfully
-serve. A one-output software host may advertise one monitor and work in Primary
-Display Only mode, but it must not claim two-monitor Match My Layout. A native
-NVIDIA headless host may advertise up to four only after its selected adapter's
-spare display IDs and rollback have been verified.
+Set `platform.multi_monitor.max_monitors` only when policy or attached-output
+truth requires a lower ceiling. A one-output software host may advertise one
+monitor and work in Primary Display Only mode, but it must not claim two-monitor
+Match My Layout. Windows native NVIDIA headless mode is clamped to the
+hardware-validated safe provider maximum, currently two monitors.
 
 ### Linux multi-head capacity
 
@@ -1034,12 +1046,16 @@ as connected. The X log states that capacity directly:
 (--) NVIDIA(0):     DFP-3
 ```
 
-Pier therefore treats `platform.multi_monitor.heads` as an explicit
-**allowlist ceiling** over that capacity. Empty remains fail-closed; pier-linux.example.internal
-uses `["DFP-0","DFP-1","DFP-2","DFP-3"]`. Pier provisions the first N allowed
-heads for an N-monitor request. Deck always sends a complete 1..=4 active
-layout; the host does not need the heads to exist beforehand. Narrow the list
-only to reserve heads for another workload on the same GPU.
+Pier therefore treats `platform.multi_monitor.heads` as an administrator
+override over that capacity. Empty means discover automatically: Pier starts a
+short Xorg probe, ranks clocked outputs first by maximum pixel clock, then
+connected outputs without a clock in index order, and caches the result at
+`/run/arcen/sessions/discovery/nvidia-heads.json`. A non-empty list skips
+startup discovery and becomes the ordered ceiling, for example
+`["DFP-0","DFP-1","DFP-2","DFP-3"]`. Pier provisions the first N heads for
+an N-monitor request. Deck always sends a complete 1..=4 active layout; the
+host does not need the heads to exist beforehand. Narrow the list only to
+reserve heads for another workload on the same GPU.
 
 Each provisioned head becomes its own RandR output. NVIDIA names RandR outputs
 after the connector (`DVI-D-0`..`DVI-D-3`), not after the `DFP-N` token used in
@@ -1107,8 +1123,10 @@ If a live resize is attempted without that proof, `retarget_exact` fails with
 ## Choosing which GPU encodes (Windows)
 
 On a host with more than one GPU, which card streams is an explicit operator
-decision. Capture and NVENC stay on the same allowed adapter; Arcen does not
-cross-copy a desktop from one GPU merely to encode it on another.
+decision. Capture and NVENC stay on the selected adapter; Arcen does not
+cross-copy a desktop from one GPU merely to encode it on another. Use
+`excluded_adapters` to reserve GPUs for non-Arcen work; use `allowed_adapters`
+only when the streaming set must be positively restricted.
 
 ### 1. List what the host actually has
 
@@ -1145,10 +1163,11 @@ What matters per adapter:
 | `primary=false` | Non-primary outputs rank ahead of the primary. |
 
 `Recommended:` is a generic display/VRAM ranking, not an application compute
-policy. Override it whenever the workstation role disagrees. On pier-windows.example.internal,
-DaVinci Resolve owns the stronger `GRID RTX6000-8Q`; Arcen uses
-`GRID V100D-16Q` for headless displays, capture, and NVENC. The DXGI config
-name includes the vendor prefix even though NVAPI's diagnostic name does not.
+policy. Override it whenever the workstation role disagrees. On
+pier-windows.example.internal, another local workload owns the stronger
+`GRID RTX6000-8Q`; Arcen uses `GRID V100D-16Q` for headless displays, capture,
+and NVENC. The DXGI config name includes the vendor prefix even though NVAPI's
+diagnostic name does not.
 
 ### 2. Name the adapter in the config
 
@@ -1163,11 +1182,11 @@ name includes the vendor prefix even though NVAPI's diagnostic name does not.
   },
   "multi_monitor": {
     "advertise_enabled": true,
-    "allowed_adapters": ["NVIDIA GRID V100D-16Q"],
-    "max_monitors": 4,
+    "excluded_adapters": ["NVIDIA GRID RTX6000-8Q"],
+    "max_monitors": 2,
     "nvenc_session_limit": 4,
     "allow_software_fallback": true,
-    "nvidia_headless_enabled": true
+    "nvidia_headless_enabled": null
   }
 }
 ```
@@ -1177,6 +1196,13 @@ name includes the vendor prefix even though NVAPI's diagnostic name does not.
   description are rejected rather than guessed between.
 - `output` — the output ordinal **on that adapter**, almost always `0`. This is
   not the global index.
+- `excluded_adapters` — exact case-insensitive DXGI descriptions that the
+  multi-monitor startup selector must not use. Empty `allowed_adapters` means
+  any remaining eligible adapter.
+- `nvidia_headless_enabled` — `null` lets startup enable native NVIDIA headless
+  mode for a GRID/Quadro-class adapter, `false` disables it, and `true` forces
+  it. If it is forced while `allowed_adapters` is non-empty, the allow-list must
+  name exactly one adapter.
 
 `adapter`/`output` and the legacy `output_index` are mutually exclusive; set one
 or the other, never both.
@@ -1206,8 +1232,10 @@ config=C:\ProgramData\Arcen\pier.json adapter=NVIDIA GRID V100D-16Q
 adapter_output=0 global_output=2 device=\\.\DISPLAY2
 ```
 
-Then `Restart-Service ArcenPier` and connect once. The session log records every
-attached output it saw and which one it took.
+Then `Restart-Service ArcenPier` and connect once. The startup log records the
+resolved Windows Pier settings, including `multi_monitor_streaming_adapter`,
+`multi_monitor_excluded_adapters` and `nvidia_headless`; the session log records
+every attached output it saw and which one it took.
 
 ### Why not just use `output_index`
 
@@ -1336,12 +1364,12 @@ These are open findings, listed so an administrator is not surprised by them.
   desktop. The logic is right; Deck does not show an operator-facing notice, so
   inspect `supports_display_update` and
   `device_capabilities.display_resolution.resize`.
-- **DISPLAY-380, validation remaining** — Linux dynamic NVIDIA heads and
-  Windows native-NVIDIA EDID provisioning are implemented. Release closure
+- **DISPLAY-380, validation remaining** — Linux automatic NVIDIA head discovery
+  and Windows native-NVIDIA EDID provisioning are implemented. Release closure
   still requires authenticated physical pointer, keyboard, Wacom, mixed-DPI,
   encoder-load, and reconnect evidence across the complete 1–4 display matrix.
-- **DISPLAY-381, Windows ongoing** — the default-off native-NVIDIA source can
-  activate spare display IDs. A two-output V100D transaction now passes:
+- **DISPLAY-381, Windows ongoing** — the native-NVIDIA source can activate
+  spare display IDs. A two-output V100D transaction now passes:
   NVAPI activates both extended heads, Windows applies the 4072x1700 geometry,
   two NVENC pipelines start, Deck decodes both streams, and all eight region
   input events complete. Three outputs remain blocked: after all three NVAPI

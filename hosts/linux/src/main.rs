@@ -120,7 +120,7 @@ fn main() -> ExitCode {
         };
     }
 
-    let (config, logging_options) = match resolve_startup(&args[1..]) {
+    let (mut config, logging_options) = match resolve_startup(&args[1..]) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("configuration failed: {error}");
@@ -135,6 +135,14 @@ fn main() -> ExitCode {
         }
     };
 
+    // Multi-monitor heads are discovered once, after logging is up and before
+    // the configuration is shared with the listener.
+    #[cfg(target_os = "linux")]
+    let config = {
+        let mut config = config;
+        arcen_pier_linux::display::nvidia_discovery::apply_startup_discovery(&mut config);
+        config
+    };
     let config = Arc::new(config);
 
     tracing::info!(
@@ -313,8 +321,8 @@ fn print_help() {
          \x20       --deskside-console-xauthority <PATH>  Physical console Xauthority\n\
          \x20       --deskside-input </dev/input/by-id/...>  Repeat for every keyboard/pointer\n\
          \x20       --deskside-output <NAME,DRM_SHA256,EDID_SHA256>  Repeat for every output\n\
-         \x20       --multi-monitor     Advertise multi_monitor_v1 (still gated off by default)\n\
-         \x20       --multi-monitor-head <DFP-N>  Repeat for every head this host may plan onto\n\
+         \x20       --multi-monitor / --no-multi-monitor  Enable/disable multi_monitor_v1 advertisement\n\
+         \x20       --multi-monitor-head <DFP-N>  Repeat to override automatic NVIDIA head discovery\n\
          \x20       --audio / --no-audio  Enable/disable host audio\n\
          \x20       --audio-compressed / --audio-uncompressed\n\
          \x20                           Force Opus 128 kbps or uncompressed PCM\n\

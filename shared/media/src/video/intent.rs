@@ -9,7 +9,7 @@ use crate::{
     TransferCharacteristics, VideoCodec, VideoConfiguration,
 };
 
-use super::{VideoVariant, adaptive_codec_ladder};
+use super::{MotionPriority, VideoVariant, adaptive_codec_ladder};
 
 /// Typed auth-time client request after wire-token and decode-capability
 /// validation, but before a host applies its own ceiling or probes encoders.
@@ -18,6 +18,7 @@ pub struct ResolvedClientVideoRequest {
     pub selection: VideoSelectionIntent,
     pub video: VideoConfiguration,
     pub encode_intent: EncodeIntent,
+    pub motion_priority: MotionPriority,
     pub max_fps: u32,
     pub capabilities: ClientVideoCapabilitiesMsg,
 }
@@ -50,6 +51,7 @@ fn validate_quality(quality: &QualitySettings) -> Result<(), ClientVideoRequestE
         ("color_range", quality.color_range.as_str()),
         ("color_matrix", quality.color_matrix.as_str()),
         ("encode_intent", quality.encode_intent.as_str()),
+        ("motion_priority", quality.motion_priority.as_str()),
     ] {
         if token.is_empty()
             || token.len() > 32
@@ -219,6 +221,13 @@ pub fn resolve_client_video_request(
             quality.encode_intent
         ))
     })?;
+    let motion_priority =
+        MotionPriority::from_token(&quality.motion_priority).ok_or_else(|| {
+            invalid(format!(
+                "unsupported motion priority {:?}",
+                quality.motion_priority
+            ))
+        })?;
     let variant = VideoVariant::new(video);
     if !variant.is_coherent() {
         return Err(invalid(format!(
@@ -230,6 +239,7 @@ pub fn resolve_client_video_request(
         selection: quality.video_selection,
         video,
         encode_intent,
+        motion_priority,
         max_fps: quality.max_fps,
         capabilities: request.capabilities,
     })

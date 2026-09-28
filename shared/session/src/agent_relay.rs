@@ -21,6 +21,7 @@
 //! from the kernel's peer credentials, so a registration can describe what the
 //! agent *is* but cannot claim who it runs as.
 
+use arcen_telemetry::PathSignal;
 use serde::{Deserialize, Serialize};
 
 /// Version of the exchange described in this module.
@@ -105,11 +106,35 @@ pub enum ServiceMessage {
         #[serde(default)]
         session: u64,
     },
+    /// Live transport signal forwarded by a split service to its desktop agent.
+    /// Old agents never see this before they have accepted an attachment; old
+    /// services never send it, so absence means "no path signal available".
+    PathSignal {
+        /// This session's id.
+        #[serde(default)]
+        session: u64,
+        /// Latest transport sample.
+        signal: PathSignal,
+    },
     /// The registration was refused; the service closes the connection.
     Refused {
         /// Why, in words an operator can act on.
         reason: String,
     },
+}
+
+impl ServiceMessage {
+    /// Every `type` this enum is tagged with.
+    pub const TYPES: [&'static str; 4] = ["registered", "attach", "path_signal", "refused"];
+
+    /// Whether a message `type` belongs to the service's own vocabulary to its
+    /// agent. Only the service speaks it: a relay must never forward such a
+    /// message when it arrived from a Deck, or a client could feed the agent
+    /// a forged path signal or attach command.
+    #[must_use]
+    pub fn is_service_type(message_type: &str) -> bool {
+        Self::TYPES.contains(&message_type)
+    }
 }
 
 /// Lines an agent sends after registering.
@@ -280,6 +305,42 @@ pub fn select_agent(agents: &[ParkedAgent], console: ConsoleHolder) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deck_frame_is_never_mistaken_for_the_service() {
+        let samples = [
+            ServiceMessage::Registered {
+                version: AGENT_RELAY_VERSION,
+            },
+            ServiceMessage::PathSignal {
+                session: 7,
+                signal: PathSignal {
+                    rtt_micros: 30_000,
+                    baseline_rtt_micros: 30_000,
+                    congestion_window_bytes: 64_000,
+                    bytes_in_flight: None,
+                    congestion_events_delta: 0,
+                    lost_packets_delta: 0,
+                    lost_bytes_delta: 0,
+                    sent_packets_delta: 10,
+                },
+            },
+            ServiceMessage::Refused {
+                reason: "no".to_string(),
+            },
+        ];
+        for sample in samples {
+            let value = serde_json::to_value(&sample).expect("encode");
+            let message_type = value["type"].as_str().expect("tagged");
+            assert!(
+                ServiceMessage::is_service_type(message_type),
+                "{message_type}"
+            );
+        }
+        assert!(ServiceMessage::is_service_type("attach"));
+        assert!(!ServiceMessage::is_service_type("client_hello"));
+        assert!(!ServiceMessage::is_service_type("auth_response"));
+    }
 
     fn parked(uid: u32, kind: DesktopSessionKind, sequence: u64) -> ParkedAgent {
         ParkedAgent {

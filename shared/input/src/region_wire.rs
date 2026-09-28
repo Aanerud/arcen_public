@@ -201,6 +201,8 @@ impl RegionInputWireRef<'_> {
                 position,
                 delta_x: message.delta_x,
                 delta_y: message.delta_y,
+                unit: message.unit.into(),
+                phase: message.phase.into(),
                 sequence,
             },
             Self::Pen(message) => RegionInputEvent::Pen {
@@ -318,12 +320,16 @@ impl RegionInputWireMessage {
                 position,
                 delta_x,
                 delta_y,
+                unit,
+                phase,
                 ..
             } => Self::PointerScroll(RegionPointerScrollMsg {
                 msg_type: REGION_POINTER_SCROLL.to_owned(),
                 position: wire_position(generation, position),
                 delta_x,
                 delta_y,
+                unit: unit.into(),
+                phase: phase.into(),
                 metadata,
             }),
             RegionInputEvent::Pen { sample, .. } => Self::Pen(RegionPenEventMsg {

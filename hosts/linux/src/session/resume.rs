@@ -69,6 +69,15 @@ impl DirectSessionSocket {
         }
     }
 
+    /// Clones the live QUIC connection for transport path sampling.
+    pub(crate) fn path_signal_connection(&self) -> Option<quinn::Connection> {
+        match self {
+            #[cfg(feature = "wss-compat")]
+            Self::Wss(_) => None,
+            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
+        }
+    }
+
     pub(crate) const fn transport_capability(&self) -> &'static str {
         match self {
             #[cfg(feature = "wss-compat")]
