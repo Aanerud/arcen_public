@@ -105,7 +105,16 @@ One abstraction, three producers, four consumers.
   probe every 16 frames; first frame, forced IDR, geometry reset, and a
   two-second periodic backstop always hash and fully convert.
 - **DDA (Windows NVENC path):** `IDXGIOutputDuplication::GetFrameDirtyRects` +
-  `GetMovedRects` mapped onto the same grid — hardware-provided damage, no hashing.
+  `GetFrameMoveRects` mapped onto the same grid — hardware-provided damage, no
+  hashing or readback. Move rects dirty the destination and, conservatively, the
+  source reveal.
+- **WGC (Windows NVENC fallback):** on Windows 11 24H2+ the adapter sets
+  `GraphicsCaptureSession.DirtyRegionMode = ReportOnly` and folds every
+  `Direct3D11CaptureFrame.DirtyRegions` list into the same `ExternalDamage`
+  accumulator. Latest-wins queues merge superseded raw-frame regions into the
+  newest encoded frame. Older runtimes have no WGC damage source, so the QP map
+  path reports `damage_source=none` and does not submit a neutral map as if it
+  were engaged.
 - **NvFBC (Linux path):** frame-level `bIsNewFrame` drives idle cadence now.
   Public NvFBC 1.7 and 1.9 expose diff maps only through ToSys/ToGL; the existing
   zero-copy ToCuda setup has no `bWithDiffMap`, map pointer, or geometry fields.

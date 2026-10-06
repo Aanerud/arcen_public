@@ -383,6 +383,22 @@ fn activation_matches(
         && current.ccd_available_target_ids.len() > baseline.ccd_available_target_ids.len()
 }
 
+/// NVIDIA lets software write a display's EDID (`NvAPI_GPU_SetEDID`) only on
+/// Quadro, RTX Pro and GRID GPUs. A GeForce answers `NVAPI_NOT_SUPPORTED`, and
+/// by then the recovery journal is armed and the rollback fails the same way,
+/// leaving a journal behind that no later session can restore. So the class is
+/// checked first, while the host is still only being inspected.
+fn require_edid_provisioning_class(adapter_name: &str, gpu: &GpuEntry) -> Result<(), String> {
+    if gpu.quadro == Some(true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{adapter_name} is not a Quadro, RTX Pro or GRID GPU, and NVIDIA allows EDID \
+             provisioning only on those"
+        ))
+    }
+}
+
 fn matching_gpu<'a>(
     report: &'a NvapiInventoryReport,
     adapter_name: &str,
@@ -553,6 +569,7 @@ pub(crate) fn prepare_provisioning(
 
     let report = crate::nvapi_inventory::inventory()?;
     let gpu = matching_gpu(&report, adapter_name)?;
+    require_edid_provisioning_class(adapter_name, gpu)?;
     let adapter_luid = gpu
         .adapter_luid
         .ok_or_else(|| format!("GPU {adapter_name:?} has no adapter LUID"))?;
@@ -1684,6 +1701,30 @@ mod tests {
             },
             in_nvapi_display_config: connected,
         }
+    }
+
+    #[test]
+    fn a_geforce_is_refused_before_any_edid_is_written() {
+        // An RTX 4080 answered NvAPI_GPU_SetEDID with NVAPI_NOT_SUPPORTED, and
+        // the rollback could not purge what it never wrote.
+        let mut geforce = gpu(vec![display(0x8006_1085, 0x100, false)]);
+        geforce.full_name = Some("GeForce RTX 4080".to_string());
+        geforce.quadro = Some(false);
+        let error = require_edid_provisioning_class("NVIDIA GeForce RTX 4080", &geforce)
+            .expect_err("GeForce cannot take an EDID");
+        assert!(
+            error.contains("not a Quadro, RTX Pro or GRID GPU"),
+            "{error}"
+        );
+
+        geforce.quadro = None;
+        assert!(
+            require_edid_provisioning_class("NVIDIA GeForce RTX 4080", &geforce).is_err(),
+            "an unknown class must not be assumed to be professional"
+        );
+
+        let grid = gpu(Vec::new());
+        assert!(require_edid_provisioning_class("NVIDIA GRID RTX6000-8Q", &grid).is_ok());
     }
 
     fn gpu(displays: Vec<DisplayIdEntry>) -> GpuEntry {

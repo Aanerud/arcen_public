@@ -17,6 +17,19 @@ use std::time::Duration;
 use crate::video::MotionPriority;
 pub use arcen_telemetry::PathSignal;
 
+/// How a clear path probes upward before it reaches a remembered knee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStep {
+    /// Today's behavior: use `max(ceiling * additive_increase, 250 kbps)`.
+    CeilingFraction,
+    /// Fidelity ceilings can be much larger than the safe start, so probe
+    /// from the current target instead of the ceiling.
+    TargetRelative,
+    /// Probe from the current target only after a host reports per-pipeline
+    /// delivery evidence close to the current target.
+    EvidenceGatedTargetRelative,
+}
+
 /// The rule every host applies.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateControlPolicy {
@@ -71,6 +84,8 @@ pub struct RateControlPolicy {
     pub severe_queue_delay_factor: u32,
     /// Changes smaller than this share are not worth reconfiguring for.
     pub min_change: f64,
+    /// How clear-path probe steps are sized for this pipeline.
+    pub probe_step: ProbeStep,
 }
 
 impl RateControlPolicy {
@@ -92,12 +107,28 @@ impl RateControlPolicy {
     pub fn for_bounds_and_priority(
         start_bps: u64,
         ceiling_bps: u64,
+        priority: MotionPriority,
+    ) -> Self {
+        Self::for_bounds_priority_probe_step(
+            start_bps,
+            ceiling_bps,
+            priority,
+            ProbeStep::CeilingFraction,
+        )
+    }
+
+    /// A policy for a session with an explicit pipeline probe-step rule.
+    #[must_use]
+    pub fn for_bounds_priority_probe_step(
+        start_bps: u64,
+        ceiling_bps: u64,
         _priority: MotionPriority,
+        probe_step: ProbeStep,
     ) -> Self {
         let ceiling_bps = ceiling_bps.max(1);
         let start_bps = start_bps.clamp(1, ceiling_bps);
         let floor_bps = (start_bps / 4).max(500_000).min(start_bps);
-        Self {
+        let mut policy = Self {
             floor_bps,
             start_bps,
             ceiling_bps,
@@ -123,7 +154,14 @@ impl RateControlPolicy {
             queue_delay_samples: 2,
             severe_queue_delay_factor: 3,
             min_change: 0.03,
+            probe_step,
+        };
+        if matches!(probe_step, ProbeStep::EvidenceGatedTargetRelative) {
+            policy.increase_factor = 1.25;
+            policy.hold_intervals = 1;
+            policy.min_change = 0.01;
         }
+        policy
     }
 }
 
@@ -132,6 +170,12 @@ impl RateControlPolicy {
 pub struct RateSample {
     /// Video bytes the transport took in the interval.
     pub delivered_bytes: u64,
+    /// Largest per-pipeline byte count delivered in this interval.
+    ///
+    /// Congestion backoff remains aggregate, but evidence-gated upward probes
+    /// use the busiest active pipeline so an idle keel monitor does not dilute
+    /// a saturated HDR monitor's capacity proof.
+    pub peak_pipeline_delivered_bytes: u64,
     /// How long the interval was.
     pub elapsed: Duration,
     /// Mean time finished frames waited for the host-side writer.
@@ -274,7 +318,7 @@ impl RateController {
                     self.knee_bps = None;
                     self.knee_repeats = 0;
                 }
-                if previous < self.policy.ceiling_bps {
+                if previous < self.policy.ceiling_bps && self.may_probe_up(sample, previous) {
                     self.target_bps = self.increased_target(previous);
                     reason = Some(RateChangeReason::ProbeIncrease);
                 }
@@ -359,10 +403,30 @@ impl RateController {
         if self.near_remembered_knee(previous) {
             return (previous as f64 * self.policy.knee_increase_factor).round() as u64;
         }
-        let additive =
-            (self.policy.ceiling_bps as f64 * self.policy.additive_increase).max(250_000.0);
+        let additive = match self.policy.probe_step {
+            ProbeStep::CeilingFraction => {
+                (self.policy.ceiling_bps as f64 * self.policy.additive_increase).max(250_000.0)
+            }
+            ProbeStep::TargetRelative | ProbeStep::EvidenceGatedTargetRelative => {
+                previous as f64 * (self.policy.increase_factor - 1.0)
+            }
+        };
         let multiplicative = previous as f64 * self.policy.increase_factor;
         multiplicative.max(previous as f64 + additive).round() as u64
+    }
+
+    fn may_probe_up(&self, sample: RateSample, previous: u64) -> bool {
+        if !matches!(
+            self.policy.probe_step,
+            ProbeStep::EvidenceGatedTargetRelative
+        ) {
+            return true;
+        }
+        if sample.path.is_none() || sample.frames == 0 {
+            return false;
+        }
+        let delivered = peak_pipeline_bps(sample);
+        delivered.is_finite() && delivered >= previous as f64 * 0.90
     }
 
     fn near_remembered_knee(&self, target: u64) -> bool {
@@ -626,6 +690,11 @@ fn delivered_bps(sample: RateSample) -> f64 {
     sample.delivered_bytes as f64 * 8.0 / sample.elapsed.as_secs_f64() / pipelines as f64
 }
 
+fn peak_pipeline_bps(sample: RateSample) -> f64 {
+    let fallback = sample.delivered_bytes / u64::from(sample.pipeline_count.max(1));
+    sample.peak_pipeline_delivered_bytes.max(fallback) as f64 * 8.0 / sample.elapsed.as_secs_f64()
+}
+
 fn within_share(value: u64, reference: u64, share: f64) -> bool {
     if reference == 0 {
         return value == 0;
@@ -726,6 +795,7 @@ mod tests {
     fn sample(delivered_mbps: f64, wait_ms: u64, path: PathSignal) -> RateSample {
         RateSample {
             delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
+            peak_pipeline_delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
             elapsed: Duration::from_secs(1),
             mean_frame_wait: Duration::from_millis(wait_ms),
             frames: 30,
@@ -840,6 +910,83 @@ mod tests {
             }
         }
         assert_eq!(reached, Some(10));
+    }
+
+    #[test]
+    fn ordinary_ceiling_ramp_matches_the_previous_probe_sequence() {
+        fn old_increased_target(previous: u64, ceiling: u64) -> u64 {
+            let additive = (ceiling as f64 * 0.025).max(250_000.0);
+            let multiplicative = previous as f64 * 1.08;
+            multiplicative.max(previous as f64 + additive).round() as u64
+        }
+
+        let mut rate = RateController::new(RateControlPolicy::for_bounds_and_priority(
+            START,
+            CEILING,
+            MotionPriority::Motion,
+        ));
+        let mut expected = START;
+        for _ in 0..12 {
+            let _ = rate.observe(sample(1000.0, 1, path(1, 1, 0, 0)));
+            expected = old_increased_target(expected, CEILING).min(CEILING);
+            assert_eq!(rate.target_bps(), expected);
+        }
+    }
+
+    #[test]
+    fn large_grading_ceiling_probes_multiplicatively_before_the_knee() {
+        let mut rate = RateController::new(RateControlPolicy::for_bounds_priority_probe_step(
+            START,
+            250_000_000,
+            MotionPriority::Detail,
+            ProbeStep::TargetRelative,
+        ));
+        let first = rate
+            .observe(sample(6.0, 1, path(45, 45, 0, 0)))
+            .expect("first clear interval probes");
+        assert_eq!(first.target_bps, (START as f64 * 1.08).round() as u64);
+
+        let second = rate
+            .observe(sample(6.0, 1, path(45, 45, 0, 0)))
+            .expect("second clear interval probes");
+        assert_eq!(
+            second.target_bps,
+            (first.target_bps as f64 * 1.08).round() as u64
+        );
+        assert!(
+            second.target_bps <= 6_000_000_u64.saturating_mul(108) / 100,
+            "large ceiling jumped past one 8% step over the constrained path: {}",
+            second.target_bps
+        );
+
+        assert!(rate.observe(sample(6.0, 5, path(75, 45, 0, 0))).is_none());
+        let cut = rate
+            .observe(sample(6.0, 5, path(75, 45, 0, 0)))
+            .expect("queue delay cuts after the multiplicative probe crosses the knee");
+        assert_eq!(cut.reason, RateChangeReason::QueueDelay);
+        assert!(rate.target_bps() < second.target_bps);
+    }
+
+    #[test]
+    fn speed_motion_policy_reaches_the_sixty_fps_ceiling_on_a_clean_path() {
+        let contract = crate::video::pipeline_contract(crate::video::PipelineId::Speed);
+        let (start, ceiling) = contract.bitrate_bounds(
+            1920,
+            1080,
+            contract.max_fps,
+            contract.colour.chroma,
+            contract.colour.bit_depth,
+        );
+        let mut rate = RateController::new(RateControlPolicy::for_bounds_and_priority(
+            u64::from(start),
+            u64::from(ceiling),
+            contract.priority,
+        ));
+        assert_eq!(rate.target_bps(), u64::from(start));
+        for _ in 0..12 {
+            let _ = rate.observe(sample(1000.0, 1, path(1, 1, 0, 0)));
+        }
+        assert_eq!(rate.target_bps(), u64::from(ceiling));
     }
 
     #[test]
@@ -1082,6 +1229,7 @@ mod tests {
             let delivered_mbps = target.min(capacity_bps) as f64 / 1_000_000.0;
             let _ = rate.observe(RateSample {
                 delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
+                peak_pipeline_delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
                 elapsed: Duration::from_secs(1),
                 mean_frame_wait: Duration::from_millis(wait_ms),
                 frames: motion_fps,
@@ -1125,6 +1273,7 @@ mod tests {
             let delivered_mbps = target.min(capacity_bps) as f64 / 1_000_000.0;
             let _ = rate.observe(RateSample {
                 delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
+                peak_pipeline_delivered_bytes: (delivered_mbps * 1_000_000.0 / 8.0) as u64,
                 elapsed: Duration::from_secs(1),
                 mean_frame_wait: Duration::from_millis(wait_ms),
                 frames: 60,
@@ -1244,6 +1393,7 @@ mod tests {
         let change = rate
             .observe(RateSample {
                 delivered_bytes: 6_000_000 / 8,
+                peak_pipeline_delivered_bytes: 6_000_000 / 8,
                 elapsed: Duration::from_secs(1),
                 mean_frame_wait: Duration::from_millis(1),
                 frames: 60,
@@ -1386,6 +1536,8 @@ mod tests {
             );
             let _ = rate.observe(RateSample {
                 delivered_bytes: (sample_second.delivered_mbps * 1_000_000.0 / 8.0) as u64,
+                peak_pipeline_delivered_bytes: (sample_second.delivered_mbps * 1_000_000.0 / 8.0)
+                    as u64,
                 elapsed: Duration::from_secs(1),
                 mean_frame_wait: Duration::from_millis(sample_second.wait_ms),
                 frames: 30,
@@ -1421,6 +1573,7 @@ mod tests {
         for wait_ms in [140, 120, 90, 70] {
             let _ = rate.observe(RateSample {
                 delivered_bytes: 3_000_000 / 8,
+                peak_pipeline_delivered_bytes: 3_000_000 / 8,
                 elapsed: Duration::from_secs(1),
                 mean_frame_wait: Duration::from_millis(wait_ms),
                 frames: 30,

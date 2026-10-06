@@ -9,7 +9,9 @@ use crate::{
     TransferCharacteristics, VideoCodec, VideoConfiguration,
 };
 
-use super::{MotionPriority, VideoVariant, adaptive_codec_ladder};
+use super::{
+    MotionPriority, PipelineId, VideoVariant, pipeline_codec_ladder, resolve_request_pipeline,
+};
 
 /// Typed auth-time client request after wire-token and decode-capability
 /// validation, but before a host applies its own ceiling or probes encoders.
@@ -19,6 +21,7 @@ pub struct ResolvedClientVideoRequest {
     pub video: VideoConfiguration,
     pub encode_intent: EncodeIntent,
     pub motion_priority: MotionPriority,
+    pub pipeline: Option<PipelineId>,
     pub max_fps: u32,
     pub capabilities: ClientVideoCapabilitiesMsg,
 }
@@ -73,10 +76,11 @@ fn validate_quality(quality: &QualitySettings) -> Result<(), ClientVideoRequestE
 
 fn resolve_codec(
     quality: &QualitySettings,
+    pipeline: Option<PipelineId>,
     capabilities: ClientVideoCapabilitiesMsg,
 ) -> Result<VideoCodec, ClientVideoRequestError> {
     if quality.video_selection == VideoSelectionIntent::AdaptivePerformance {
-        return adaptive_codec_ladder(VideoCodec::Av1)
+        return pipeline_codec_ladder(pipeline.unwrap_or(PipelineId::Auto), VideoCodec::Av1)
             .iter()
             .copied()
             .find(|codec| match codec {
@@ -109,6 +113,7 @@ fn resolve_codec(
 
 fn resolve_video(
     request: &InitialVideoRequestMsg,
+    pipeline: Option<PipelineId>,
 ) -> Result<VideoConfiguration, ClientVideoRequestError> {
     let quality = &request.quality;
     let capabilities = request.capabilities;
@@ -187,7 +192,7 @@ fn resolve_video(
     let transfer = TransferCharacteristics::from_token(&quality.transfer)
         .ok_or_else(|| invalid(format!("unsupported transfer {:?}", quality.transfer)))?;
     Ok(VideoConfiguration {
-        codec: resolve_codec(quality, capabilities)?,
+        codec: resolve_codec(quality, pipeline, capabilities)?,
         chroma,
         bit_depth,
         range,
@@ -214,20 +219,22 @@ pub fn resolve_client_video_request(
 ) -> Result<ResolvedClientVideoRequest, ClientVideoRequestError> {
     let quality = &request.quality;
     validate_quality(quality)?;
-    let video = resolve_video(request)?;
-    let encode_intent = EncodeIntent::from_token(&quality.encode_intent).ok_or_else(|| {
-        invalid(format!(
-            "unsupported encode intent {:?}",
-            quality.encode_intent
-        ))
-    })?;
-    let motion_priority =
+    let requested_priority =
         MotionPriority::from_token(&quality.motion_priority).ok_or_else(|| {
             invalid(format!(
                 "unsupported motion priority {:?}",
                 quality.motion_priority
             ))
         })?;
+    let pipeline = request.pipeline.as_ref().and_then(PipelineId::from_wire);
+    let video = resolve_video(request, pipeline)?;
+    let encode_intent = EncodeIntent::from_token(&quality.encode_intent).ok_or_else(|| {
+        invalid(format!(
+            "unsupported encode intent {:?}",
+            quality.encode_intent
+        ))
+    })?;
+    let motion_priority = requested_priority;
     let variant = VideoVariant::new(video);
     if !variant.is_coherent() {
         return Err(invalid(format!(
@@ -240,6 +247,13 @@ pub fn resolve_client_video_request(
         video,
         encode_intent,
         motion_priority,
+        pipeline: resolve_request_pipeline(
+            request.pipeline.as_ref(),
+            quality.video_selection,
+            video,
+            quality.max_fps,
+            motion_priority,
+        ),
         max_fps: quality.max_fps,
         capabilities: request.capabilities,
     })
@@ -273,6 +287,7 @@ mod tests {
                 full_range: true,
                 ..ClientVideoCapabilitiesMsg::default()
             },
+            pipeline: None,
         }
     }
 

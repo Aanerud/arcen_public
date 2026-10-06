@@ -19,5 +19,7 @@ mod video_render;
 /// reachable from [`run_native_app`] or any production session path.
 #[cfg(feature = "dev-tools")]
 pub mod virtual_monitor_lab;
+#[cfg(feature = "dev-tools")]
+pub mod windowed_monitor_test;
 
 pub use app::{run_native_app, AppScreen, ArcenApp};

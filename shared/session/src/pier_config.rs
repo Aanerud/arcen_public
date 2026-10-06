@@ -1,6 +1,8 @@
 //! Shared, platform-parameterized Pier configuration schema.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 use arcen_telemetry::{OperationalProfile, QosTargets};
 
@@ -74,7 +76,7 @@ pub struct VideoConfig {
     /// Operator-owned rather than client-negotiated: it redistributes bits
     /// within a frame without changing the format a client decodes, so there
     /// is nothing to negotiate. See `docs/architecture/qp-maps.md`.
-    pub qp_map: Option<String>,
+    pub qp_map: Option<QpMapConfig>,
     /// How the captured desktop's pixels are encoded where the platform
     /// cannot report it (Linux Xorg): `sdr` (default) or `rec2100-pq`, the
     /// operator's promise that a colour-managed application writes Rec.2100
@@ -99,6 +101,73 @@ pub enum LocalPlayback {
     Muted,
     /// Local speakers keep working. The operator asked for this explicitly.
     Audible,
+}
+
+/// Operator QP-map policy, either one policy for every served pipeline or a
+/// per-pipeline object whose missing entries fall back to the contract default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum QpMapConfig {
+    Single(String),
+    PerPipeline(BTreeMap<String, String>),
+}
+
+impl QpMapConfig {
+    const POLICIES: &'static [&'static str] = &["off", "on", "neutral"];
+    const PIPELINES: &'static [&'static str] =
+        &["auto", "speed", "grading", "hdr", "software", "custom"];
+
+    /// Validates all configured keys/tokens and returns a selected token for
+    /// the served pipeline. Missing object keys resolve to the pipeline
+    /// contract default, which is currently `off` for every pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a config-shaped error naming the bad key/token and allowed
+    /// values.
+    pub fn effective_token(&self, served_pipeline: &str) -> Result<&str, String> {
+        match self {
+            Self::Single(token) => {
+                let token = Self::normalize_policy(token, "video.qp_map")?;
+                Ok(token)
+            }
+            Self::PerPipeline(map) => {
+                for (key, value) in map {
+                    Self::normalize_pipeline_key(key)?;
+                    Self::normalize_policy(value, &format!("video.qp_map.{key}"))?;
+                }
+                let served = served_pipeline.to_ascii_lowercase();
+                let Some(token) = map.get(served.as_str()) else {
+                    return Ok("off");
+                };
+                let token = Self::normalize_policy(token, &format!("video.qp_map.{served}"))?;
+                Ok(token)
+            }
+        }
+    }
+
+    fn normalize_policy<'a>(value: &'a str, key: &str) -> Result<&'a str, String> {
+        let token = value.trim();
+        if Self::POLICIES.contains(&token) {
+            Ok(token)
+        } else {
+            Err(format!(
+                "Pier config {key} {value:?}: expected one of {}",
+                Self::POLICIES.join(", ")
+            ))
+        }
+    }
+
+    fn normalize_pipeline_key(key: &str) -> Result<(), String> {
+        if Self::PIPELINES.contains(&key) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Pier config video.qp_map key {key:?}: expected one of {}",
+                Self::PIPELINES.join(", ")
+            ))
+        }
+    }
 }
 
 impl LocalPlayback {
@@ -255,6 +324,46 @@ pub enum LoggingProfileSource {
     LegacyVerbosity,
     /// Built-in production Level 0.
     ProductionDefault,
+}
+
+#[cfg(test)]
+mod qp_map_tests {
+    use super::*;
+
+    #[test]
+    fn qp_map_string_form_applies_to_every_pipeline() {
+        let config: QpMapConfig = serde_json::from_str(r#""on""#).unwrap();
+        assert_eq!(config.effective_token("auto"), Ok("on"));
+        assert_eq!(config.effective_token("hdr"), Ok("on"));
+    }
+
+    #[test]
+    fn qp_map_object_form_resolves_served_pipeline_and_defaults_missing_to_off() {
+        let config: QpMapConfig =
+            serde_json::from_str(r#"{"auto":"on","speed":"neutral","hdr":"off"}"#).unwrap();
+        assert_eq!(config.effective_token("auto"), Ok("on"));
+        assert_eq!(config.effective_token("speed"), Ok("neutral"));
+        assert_eq!(config.effective_token("hdr"), Ok("off"));
+        assert_eq!(config.effective_token("grading"), Ok("off"));
+    }
+
+    #[test]
+    fn qp_map_bad_token_and_unknown_key_name_allowed_values() {
+        let bad_token: QpMapConfig = serde_json::from_str(r#"{"auto":"maybe"}"#).unwrap();
+        assert!(
+            bad_token
+                .effective_token("auto")
+                .unwrap_err()
+                .contains("video.qp_map.auto")
+        );
+        let bad_key: QpMapConfig = serde_json::from_str(r#"{"cinema":"on"}"#).unwrap();
+        assert!(
+            bad_key
+                .effective_token("cinema")
+                .unwrap_err()
+                .contains("expected one of auto, speed, grading, hdr, software, custom")
+        );
+    }
 }
 
 /// Effective profile and its configuration source.

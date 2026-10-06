@@ -1,6 +1,6 @@
 # Timezone Redirection
 
-**Status (2026-07-20):** implemented on macOS Deck and both active Piers.
+**Status (2026-10-05):** implemented on macOS Deck and all active Piers.
 The feature is opt-in and defaults off on both hosts. It is a convenience
 feature: failure warns and streaming continues.
 
@@ -53,7 +53,7 @@ The adapter:
 5. Holds the lease through the user-session agent, restores it before releasing
    the machine permit, and removes the journal only after confirmed restore.
 
-Startup reconciliation and the broker watchdog handle an interrupted owner.
+Helper startup reconciliation handles an interrupted owner.
 Current state equal to the target restores the original; current state equal to
 the original removes completed recovery state. If it matches neither snapshot,
 the journal is retained in conflict/hold state rather than overwriting an
@@ -67,6 +67,39 @@ sessions.
 
 Configuration: `redirection.timezone` in unified `pier.json`; omitted or
 `false` means disabled.
+
+
+## macOS Pier: GUI-session `TZ` scope
+
+macOS serves an existing Aqua desktop, so Arcen does not create a new process
+tree the way Linux does. The qualified scope is therefore the served user's GUI
+launchd domain, not the machine timezone. The existing Agent Helper validates
+the authenticated Deck IANA identifier against `/var/db/timezone/zoneinfo`,
+rejecting malformed names, `posix`/`right` alternates, non-files, and symlink
+escapes through the shared zoneinfo validator. It then sets
+`ARCEN_SESSION_TZ=<IANA>` followed by `TZ=<IANA>` in that user's GUI launchd
+domain from inside the LaunchAgent.
+
+This is intentionally session-scoped and unprivileged. Applications launched
+after the setting is applied inherit the Deck timezone. The menu bar clock, the
+system timezone, and applications already running before the session keep the
+Mac's local timezone or their cached environment. No root LaunchDaemon, socket,
+or machine-wide recovery journal is involved.
+
+The `ARCEN_SESSION_TZ` sentinel is the only state. On session end, SIGTERM, or
+the next agent start after a crash, the Agent Helper checks the sentinel: if
+`TZ` still equals it, both variables are unset; if another writer changed `TZ`,
+only the sentinel is removed. A pre-existing user `TZ` with no sentinel is
+reported as user-defined and Arcen does not redirect. If an Agent Helper is
+SIGKILLed before it can restore, `TZ` can remain in that GUI session until the
+user logs out; it never survives that launchd domain. Invalid, absent,
+unsupported, already-current, or failed launchctl requests warn and continue
+streaming.
+
+The package still removes the short-lived rc5 root timezone helper on upgrade
+and uninstall. If its old system-timezone journal is present and the Mac is
+still on the Deck target zone, the root install script restores the recorded
+original once before deleting the legacy plist/socket directory.
 
 ## Linux Pier: authenticated process-tree scope
 

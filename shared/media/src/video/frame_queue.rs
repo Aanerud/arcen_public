@@ -94,6 +94,98 @@ pub struct PinGenerationRecovery {
     pub requested_at: Option<Instant>,
 }
 
+/// Result of deciding whether a queued recovery needs a keyframe request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyframeRequestRetry {
+    /// Whether the adapter should try to hand the request to the encoder now.
+    pub due: bool,
+    /// Recovery remains pending until a handoff succeeds.
+    pub pending: bool,
+    /// When a pending request is throttled, the time at which it becomes due.
+    pub retry_at: Option<Instant>,
+}
+
+/// Decision returned by [`FullFrameRequestCoalescer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullFrameRequestDecision {
+    /// Deliver a keyframe request to every encoder now.
+    pub deliver_now: bool,
+    /// A client request arrived during the guard and is waiting.
+    pub pending: bool,
+    /// When the pending request should be delivered.
+    pub deliver_at: Option<Instant>,
+}
+
+/// Coalesces explicit Deck `request_full_frame` messages without dropping them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullFrameRequestCoalescer {
+    min_interval: Duration,
+    last_delivered_at: Option<Instant>,
+    pending: bool,
+}
+
+impl FullFrameRequestCoalescer {
+    #[must_use]
+    pub const fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            last_delivered_at: None,
+            pending: false,
+        }
+    }
+
+    #[must_use]
+    pub fn request(&mut self, now: Instant) -> FullFrameRequestDecision {
+        if self.deliver_due_at(now).is_none() {
+            self.last_delivered_at = Some(now);
+            self.pending = false;
+            FullFrameRequestDecision {
+                deliver_now: true,
+                pending: false,
+                deliver_at: None,
+            }
+        } else {
+            self.pending = true;
+            self.decision(now)
+        }
+    }
+
+    #[must_use]
+    pub fn poll(&mut self, now: Instant) -> FullFrameRequestDecision {
+        if self.pending && self.deliver_due_at(now).is_none() {
+            self.last_delivered_at = Some(now);
+            self.pending = false;
+            FullFrameRequestDecision {
+                deliver_now: true,
+                pending: false,
+                deliver_at: None,
+            }
+        } else {
+            self.decision(now)
+        }
+    }
+
+    #[must_use]
+    pub const fn pending(&self) -> bool {
+        self.pending
+    }
+
+    fn decision(&self, now: Instant) -> FullFrameRequestDecision {
+        FullFrameRequestDecision {
+            deliver_now: false,
+            pending: self.pending,
+            deliver_at: self.pending.then(|| self.deliver_due_at(now)).flatten(),
+        }
+    }
+
+    fn deliver_due_at(&self, now: Instant) -> Option<Instant> {
+        self.last_delivered_at.and_then(|last| {
+            let due = last + self.min_interval;
+            (now < due).then_some(due)
+        })
+    }
+}
+
 /// Wait-time statistics for frames handed from the shared queue to a host writer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VideoQueueWaitStats {
@@ -170,6 +262,7 @@ pub struct SharedVideoQueue<T> {
     require_generation_recovery: bool,
     protected_front: bool,
     awaiting_keyframe: bool,
+    keyframe_request_pending: bool,
     drops_since_keyframe: u64,
     last_keyframe_request_at: Option<Instant>,
     paused: bool,
@@ -200,6 +293,7 @@ impl<T> SharedVideoQueue<T> {
             require_generation_recovery: false,
             protected_front: false,
             awaiting_keyframe: false,
+            keyframe_request_pending: false,
             drops_since_keyframe: 0,
             last_keyframe_request_at: None,
             paused: false,
@@ -229,6 +323,7 @@ impl<T> SharedVideoQueue<T> {
                 self.deque.push_back(QueuedVideo::new(item, now));
                 self.require_generation_recovery = false;
                 self.awaiting_keyframe = false;
+                self.keyframe_request_pending = false;
                 self.drops_since_keyframe = 0;
                 self.last_keyframe_request_at = None;
                 if !self.paused {
@@ -237,7 +332,7 @@ impl<T> SharedVideoQueue<T> {
                 VideoQueuePush::Enqueued { cleared: 0 }
             } else {
                 self.record_drop(1);
-                let idr_request = self.idr_request_due(now);
+                let idr_request = self.keyframe_request_due(now);
                 VideoQueuePush::Dropped {
                     count: 1,
                     recovery_started: false,
@@ -256,8 +351,9 @@ impl<T> SharedVideoQueue<T> {
                 self.deque.clear();
                 self.require_generation_recovery = true;
                 self.awaiting_keyframe = true;
+                self.keyframe_request_pending = true;
                 self.record_drop(count);
-                let idr_request = self.idr_request_due(now);
+                let idr_request = self.keyframe_request_due(now);
                 VideoQueuePush::Dropped {
                     count,
                     recovery_started: true,
@@ -285,15 +381,17 @@ impl<T> SharedVideoQueue<T> {
                 self.generation_chain = true;
                 self.require_generation_recovery = !classification.recovery_point;
                 self.awaiting_keyframe = !classification.recovery_point;
+                self.keyframe_request_pending = !classification.recovery_point;
                 if classification.recovery_point {
                     self.deque.push_back(QueuedVideo::new(item, now));
                     self.drops_since_keyframe = 0;
+                    self.keyframe_request_pending = false;
                     self.last_keyframe_request_at = None;
                     self.frames_dropped = self.frames_dropped.saturating_add(count as u64);
                     VideoQueuePush::Enqueued { cleared: count }
                 } else {
                     self.record_drop(count);
-                    let idr_request = self.idr_request_due(now);
+                    let idr_request = self.keyframe_request_due(now);
                     VideoQueuePush::Dropped {
                         count,
                         recovery_started: true,
@@ -306,12 +404,14 @@ impl<T> SharedVideoQueue<T> {
             self.deque.clear();
             self.deque.push_back(QueuedVideo::new(item, now));
             self.awaiting_keyframe = false;
+            self.keyframe_request_pending = false;
             self.drops_since_keyframe = 0;
             self.last_keyframe_request_at = None;
             VideoQueuePush::Enqueued { cleared }
         } else if self.awaiting_keyframe {
+            self.keyframe_request_pending = true;
             self.record_drop(1);
-            let idr_request = self.idr_request_due(now);
+            let idr_request = self.keyframe_request_due(now);
             VideoQueuePush::Dropped {
                 count: 1,
                 recovery_started: false,
@@ -324,8 +424,9 @@ impl<T> SharedVideoQueue<T> {
             let count = self.deque.len() + 1;
             self.deque.clear();
             self.awaiting_keyframe = true;
+            self.keyframe_request_pending = true;
             self.record_drop(count);
-            let idr_request = self.idr_request_due(now);
+            let idr_request = self.keyframe_request_due(now);
             VideoQueuePush::Dropped {
                 count,
                 recovery_started: true,
@@ -351,14 +452,14 @@ impl<T> SharedVideoQueue<T> {
         self.generation_chain = true;
         self.require_generation_recovery = true;
         self.awaiting_keyframe = true;
+        self.keyframe_request_pending = true;
         self.drops_since_keyframe = 0;
-        self.last_keyframe_request_at = Some(now);
         self.frames_dropped = self.frames_dropped.saturating_add(dropped as u64);
         PinGenerationRecovery {
             accepted: true,
             dropped,
             idr_request: true,
-            requested_at: Some(now),
+            requested_at: None,
         }
     }
 
@@ -367,6 +468,32 @@ impl<T> SharedVideoQueue<T> {
     pub fn clear_keyframe_request_if_at(&mut self, requested_at: Instant) {
         if self.last_keyframe_request_at == Some(requested_at) {
             self.last_keyframe_request_at = None;
+            self.keyframe_request_pending = true;
+        }
+    }
+
+    /// Records whether a host adapter durably handed a pending recovery
+    /// keyframe request to the encoder.
+    pub fn note_keyframe_request_handoff(&mut self, success: bool, now: Instant) {
+        if success {
+            self.keyframe_request_pending = false;
+            self.last_keyframe_request_at = Some(now);
+        }
+    }
+
+    /// Stops retrying a pending recovery keyframe request when the adapter can
+    /// prove the encoder request path is permanently gone.
+    pub fn abandon_keyframe_request(&mut self) {
+        self.keyframe_request_pending = false;
+    }
+
+    /// Returns whether a pending recovery keyframe request should be retried.
+    #[must_use]
+    pub fn keyframe_request_retry(&self, now: Instant) -> KeyframeRequestRetry {
+        KeyframeRequestRetry {
+            due: self.keyframe_request_due_at(now),
+            pending: self.keyframe_request_pending,
+            retry_at: self.keyframe_request_retry_at(now),
         }
     }
 
@@ -441,6 +568,7 @@ impl<T> SharedVideoQueue<T> {
         self.drops_since_keyframe = 0;
         self.last_keyframe_request_at = None;
         self.paused = true;
+        self.keyframe_request_pending = true;
         self.frames_dropped = self.frames_dropped.saturating_add(dropped as u64);
     }
 
@@ -542,14 +670,26 @@ impl<T> SharedVideoQueue<T> {
         self.frames_dropped = self.frames_dropped.saturating_add(count as u64);
     }
 
-    fn idr_request_due(&mut self, now: Instant) -> bool {
-        let due = self
-            .last_keyframe_request_at
-            .is_none_or(|last| now.duration_since(last) >= self.keyframe_request_min_interval);
-        if due {
-            self.last_keyframe_request_at = Some(now);
+    fn keyframe_request_due(&mut self, now: Instant) -> bool {
+        self.keyframe_request_pending = true;
+        self.keyframe_request_due_at(now)
+    }
+
+    fn keyframe_request_due_at(&self, now: Instant) -> bool {
+        self.keyframe_request_pending
+            && self
+                .last_keyframe_request_at
+                .is_none_or(|last| now.duration_since(last) >= self.keyframe_request_min_interval)
+    }
+
+    fn keyframe_request_retry_at(&self, now: Instant) -> Option<Instant> {
+        if !self.keyframe_request_pending {
+            return None;
         }
-        due
+        self.last_keyframe_request_at.and_then(|last| {
+            let due = last + self.keyframe_request_min_interval;
+            (now < due).then_some(due)
+        })
     }
 }
 
@@ -674,6 +814,7 @@ mod tests {
             assert!(push_p(&mut q, byte(i), now).enqueued());
         }
         assert!(push_p(&mut q, 10, now).idr_request());
+        q.note_keyframe_request_handoff(true, now);
         assert_eq!(
             push_p(&mut q, 11, now),
             VideoQueuePush::Dropped {
@@ -698,6 +839,7 @@ mod tests {
             assert!(push_p(&mut q, 0, now).enqueued());
         }
         assert!(push_p(&mut q, 1, now).idr_request());
+        q.note_keyframe_request_handoff(true, now);
         assert!(!push_p(&mut q, 2, now).idr_request());
         assert!(push_key(&mut q, 3, now).enqueued());
         let mut requested = false;
@@ -719,8 +861,87 @@ mod tests {
             assert!(push_p(&mut q, byte(value), start).enqueued());
         }
         assert!(push_p(&mut q, 10, start).idr_request());
+        q.note_keyframe_request_handoff(true, start);
         assert!(!push_p(&mut q, 11, start + THROTTLE / 2).idr_request());
         assert!(push_p(&mut q, 12, start + THROTTLE).idr_request());
+    }
+
+    #[test]
+    fn failed_keyframe_handoff_stays_pending_until_retry_succeeds() {
+        let mut q = queue();
+        let start = Instant::now();
+        for value in 0..CAPACITY {
+            assert!(push_p(&mut q, byte(value), start).enqueued());
+        }
+        assert!(push_p(&mut q, 10, start).idr_request());
+        q.note_keyframe_request_handoff(false, start);
+        assert_eq!(
+            q.keyframe_request_retry(start + Duration::from_millis(1)),
+            KeyframeRequestRetry {
+                due: true,
+                pending: true,
+                retry_at: None
+            }
+        );
+        q.note_keyframe_request_handoff(true, start + Duration::from_millis(1));
+        assert_eq!(
+            q.keyframe_request_retry(start + THROTTLE / 2),
+            KeyframeRequestRetry {
+                due: false,
+                pending: false,
+                retry_at: None
+            }
+        );
+    }
+
+    #[test]
+    fn successful_handoff_throttles_retry_until_its_deadline() {
+        let mut q = queue();
+        let start = Instant::now();
+        for value in 0..CAPACITY {
+            assert!(push_p(&mut q, byte(value), start).enqueued());
+        }
+        assert!(push_p(&mut q, 10, start).idr_request());
+        q.note_keyframe_request_handoff(true, start);
+        assert!(!push_p(&mut q, 11, start + Duration::from_millis(1)).idr_request());
+        assert_eq!(
+            q.keyframe_request_retry(start + THROTTLE / 2),
+            KeyframeRequestRetry {
+                due: false,
+                pending: true,
+                retry_at: Some(start + THROTTLE)
+            }
+        );
+    }
+
+    #[test]
+    fn full_frame_requests_coalesce_instead_of_discarding() {
+        let start = Instant::now();
+        let mut coalescer = FullFrameRequestCoalescer::new(THROTTLE);
+        assert_eq!(
+            coalescer.request(start),
+            FullFrameRequestDecision {
+                deliver_now: true,
+                pending: false,
+                deliver_at: None
+            }
+        );
+        assert_eq!(
+            coalescer.request(start + THROTTLE / 2),
+            FullFrameRequestDecision {
+                deliver_now: false,
+                pending: true,
+                deliver_at: Some(start + THROTTLE)
+            }
+        );
+        assert_eq!(
+            coalescer.poll(start + THROTTLE),
+            FullFrameRequestDecision {
+                deliver_now: true,
+                pending: false,
+                deliver_at: None
+            }
+        );
     }
 
     #[test]
@@ -751,6 +972,7 @@ mod tests {
         assert!(q.awaiting_keyframe());
         assert!(q.pop_front().is_none());
         assert!(push_p(&mut q, 2, now).idr_request());
+        q.note_keyframe_request_handoff(true, now);
         let pinned = q.pin_generation_recovery(vec![3], now);
         assert!(pinned.accepted);
         assert!(pinned.idr_request);

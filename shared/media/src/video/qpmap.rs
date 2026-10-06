@@ -83,6 +83,45 @@ impl QpMapPolicy {
     }
 }
 
+/// Per-window evidence that the QP-map path is doing useful work.
+///
+/// Hosts log this at the Pier debug level so a live run can distinguish
+/// "maps are merely attached" from "dirty regions are receiving a non-zero
+/// bias", without each platform carrying its own counter vocabulary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QpMapStats {
+    pub biased_maps: u64,
+    pub neutral_maps: u64,
+    pub dirty_fraction_sum: f64,
+    pub dirty_fraction_samples: u64,
+}
+
+impl QpMapStats {
+    pub fn record_neutral(&mut self) {
+        self.neutral_maps = self.neutral_maps.saturating_add(1);
+    }
+
+    pub fn record_built_map(&mut self, entries: &[i8], dirty_fraction: f64) {
+        self.dirty_fraction_sum += dirty_fraction;
+        self.dirty_fraction_samples = self.dirty_fraction_samples.saturating_add(1);
+        if entries.iter().any(|delta| *delta != 0) {
+            self.biased_maps = self.biased_maps.saturating_add(1);
+        } else {
+            self.record_neutral();
+        }
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn mean_dirty_fraction(self) -> f64 {
+        if self.dirty_fraction_samples == 0 {
+            0.0
+        } else {
+            self.dirty_fraction_sum / self.dirty_fraction_samples as f64
+        }
+    }
+}
+
 /// The coding-block geometry NVENC expects a QP map to be expressed in.
 ///
 /// These sizes are **NVENC's QP-map granularity**, which is not always the

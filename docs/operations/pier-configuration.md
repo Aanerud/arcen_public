@@ -20,7 +20,7 @@ templates drift apart; only paths and the `platform` section may differ.
 | `audio.enabled` / `audio.compressed` | on / Opus | Set `compressed` to `false` for PCM on a LAN. |
 | `microphone_input.enabled` | on | Linux creates a virtual source. Windows needs the optional microphone driver; without it the microphone is reported unavailable and the session carries on. macOS does not implement it yet. |
 | `clipboard` | both directions, all content | |
-| `redirection.timezone` | on | macOS does not implement it yet. |
+| `redirection.timezone` | on | Linux sets `TZ` in the authenticated desktop process tree. Windows temporarily changes the system time zone under a recovery journal. macOS sets `TZ` in the served GUI launchd session for newly launched apps only. |
 | Multi-display | on where the host can prove it | Windows resolves the streaming adapter at Pier startup from live DXGI/NVAPI inventory; `allowed_adapters` limits to named GPUs and `excluded_adapters` reserves GPUs for other work. Linux probes the NVIDIA Xorg head roster at service start; `platform.multi_monitor.heads` is only an administrator override. macOS advertises it when it can create virtual displays. `advertise_enabled: false` turns it off everywhere. |
 
 A configuration that is already installed is kept on upgrade; these defaults

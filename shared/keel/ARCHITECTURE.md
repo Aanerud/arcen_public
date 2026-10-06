@@ -12,9 +12,11 @@ The Windows Media Foundation adapter is the first consumer. It hashes a captured
 BGRA frame, retains clean NV12 rows, and converts only dirty full-width block
 rows. The encoder still receives a complete frame.
 
-The Linux NvFBC/NVENC adapter consumes Keel's pure idle cadence. Driver-reported
-new frames submit immediately, while a parked desktop submits a one-second
-keepalive. `ExternalDamage` accepts future driver rectangles or one-byte block
+The Linux NvFBC/NVENC and Windows DDA/WGC NVENC adapters share Keel's
+`SubmissionGate`: a new frame or a requested keyframe submits immediately, one
+duplicate follows to flush NVENC's output queue, and a parked desktop submits a
+one-second keepalive. Measured on a Windows GRID host at 60 fps: an idle desktop
+went from a submission every frame to one a second, about 15-25 kbit/s. `ExternalDamage` accepts future driver rectangles or one-byte block
 maps without coupling Keel to a capture API.
 
 ## Invariants
@@ -36,7 +38,8 @@ maps without coupling Keel to a capture API.
 - `grid.rs`: checked frame/grid geometry and borrowed BGRA views.
 - `activity.rs`: reusable damage wrapper, fixed rolling dirty ratio, content
   class, and semantic cadence recommendation.
-- `cadence.rs`: deterministic first/activity/IDR/keepalive emission policy.
+- `cadence.rs`: deterministic first/activity/IDR/keepalive emission policy, and
+  the `SubmissionGate` NVENC adapters submit through.
 - `hash.rs`: enum-dispatched XXH3 and CRC32C kernels.
 - `damage.rs`: reusable hash grid, dirty bitset, summaries, and iterators.
 - `external.rs`: reusable conservative pixel-rect and source-block ingestion.

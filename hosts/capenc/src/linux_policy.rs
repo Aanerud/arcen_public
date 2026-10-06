@@ -1,8 +1,3 @@
-#[cfg(any(feature = "nvenc", test))]
-use core::time::Duration;
-
-#[cfg(any(feature = "nvenc", test))]
-use arcen_keel::{EmitMode, IdleCadence};
 use arcen_media::BitDepth;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,82 +59,8 @@ pub(crate) const fn startup_path(requested: RequestedEncoder, probe_token: bool)
 }
 
 #[cfg(any(feature = "nvenc", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubmissionMode {
-    FirstFrame,
-    Idr,
-    Activity,
-    Keepalive,
-    PipelineFlush,
-}
+pub(crate) use arcen_keel::{SubmissionGate, SubmissionMode};
 
-#[cfg(any(feature = "nvenc", test))]
-impl From<EmitMode> for SubmissionMode {
-    fn from(value: EmitMode) -> Self {
-        match value {
-            EmitMode::FirstFrame => Self::FirstFrame,
-            EmitMode::Idr => Self::Idr,
-            EmitMode::Activity => Self::Activity,
-            EmitMode::Keepalive => Self::Keepalive,
-        }
-    }
-}
-
-/// Idle cadence plus the one-deep CUDA NVENC pipeline flush.
-///
-/// Every first/activity/IDR submission leaves the newest frame in NVENC while
-/// returning the prior slot, so one duplicate submission is required when
-/// activity stops. Continuous activity supersedes that flush naturally.
-#[cfg(any(feature = "nvenc", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SubmissionGate {
-    cadence: IdleCadence,
-    pipeline_flush_pending: bool,
-}
-
-#[cfg(any(feature = "nvenc", test))]
-impl SubmissionGate {
-    pub(crate) const fn new(keepalive: Duration) -> Self {
-        Self {
-            cadence: IdleCadence::new(keepalive),
-            pipeline_flush_pending: false,
-        }
-    }
-
-    pub(crate) const fn note_frame(&mut self) {
-        self.cadence.note_frame();
-    }
-
-    pub(crate) const fn reset(&mut self) {
-        self.cadence.reset();
-        self.pipeline_flush_pending = false;
-    }
-
-    pub(crate) fn decision(
-        self,
-        idr_pending: bool,
-        elapsed_since_emit: Duration,
-    ) -> Option<SubmissionMode> {
-        self.cadence
-            .decision(idr_pending, elapsed_since_emit)
-            .map(SubmissionMode::from)
-            .or_else(|| {
-                self.pipeline_flush_pending
-                    .then_some(SubmissionMode::PipelineFlush)
-            })
-    }
-
-    pub(crate) const fn on_submitted(&mut self, mode: SubmissionMode, output_ready: bool) {
-        self.cadence.on_submitted();
-        self.pipeline_flush_pending = !output_ready
-            || matches!(
-                mode,
-                SubmissionMode::FirstFrame | SubmissionMode::Idr | SubmissionMode::Activity
-            );
-    }
-}
-
-/// Which Linux capture backend a colour contract needs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinuxCaptureBackend {
     /// NVIDIA Frame Buffer Capture straight into CUDA memory. The fast path,
@@ -182,8 +103,6 @@ pub(crate) const fn linux_capture_backend(bit_depth: BitDepth) -> LinuxCaptureBa
 mod tests {
     use super::*;
 
-    const KEEPALIVE: Duration = Duration::from_secs(1);
-
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -214,97 +133,6 @@ mod tests {
     // `variant_selection_drives_the_whole_colour_contract` and
     // `unknown_or_repeated_variants_fail_rather_than_defaulting` moved to
     // `lib.rs`'s test module along with `requested_variant`/`requested_color`.
-
-    fn primed_gate() -> SubmissionGate {
-        let mut gate = SubmissionGate::new(KEEPALIVE);
-        gate.note_frame();
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::FirstFrame)
-        );
-        gate.on_submitted(SubmissionMode::FirstFrame, false);
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::PipelineFlush)
-        );
-        gate.on_submitted(SubmissionMode::PipelineFlush, true);
-        gate
-    }
-
-    #[test]
-    fn no_frame_or_early_idle_tick_does_not_submit() {
-        let gate = SubmissionGate::new(KEEPALIVE);
-        assert_eq!(gate.decision(true, KEEPALIVE), None);
-
-        let gate = primed_gate();
-        assert_eq!(gate.decision(false, Duration::from_millis(999)), None);
-    }
-
-    #[test]
-    fn activity_and_idr_submit_on_the_next_tick_then_flush_once() {
-        let mut gate = primed_gate();
-        gate.note_frame();
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::Activity)
-        );
-        gate.on_submitted(SubmissionMode::Activity, true);
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::PipelineFlush)
-        );
-        gate.on_submitted(SubmissionMode::PipelineFlush, true);
-
-        assert_eq!(
-            gate.decision(true, Duration::ZERO),
-            Some(SubmissionMode::Idr)
-        );
-        gate.on_submitted(SubmissionMode::Idr, true);
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::PipelineFlush)
-        );
-    }
-
-    #[test]
-    fn continuous_activity_supersedes_pending_flush_and_keepalive_is_single() {
-        let mut gate = primed_gate();
-        gate.note_frame();
-        gate.on_submitted(SubmissionMode::Activity, true);
-        gate.note_frame();
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::Activity)
-        );
-        gate.on_submitted(SubmissionMode::Activity, true);
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::PipelineFlush)
-        );
-        gate.on_submitted(SubmissionMode::PipelineFlush, true);
-
-        assert_eq!(
-            gate.decision(false, KEEPALIVE),
-            Some(SubmissionMode::Keepalive)
-        );
-        gate.on_submitted(SubmissionMode::Keepalive, true);
-        assert_eq!(gate.decision(false, Duration::ZERO), None);
-    }
-
-    #[test]
-    fn capture_recreate_discards_retained_frame_and_pending_flush() {
-        let mut gate = primed_gate();
-        gate.note_frame();
-        gate.on_submitted(SubmissionMode::Activity, true);
-        gate.reset();
-        assert_eq!(gate.decision(true, KEEPALIVE), None);
-
-        gate.note_frame();
-        assert_eq!(
-            gate.decision(false, Duration::ZERO),
-            Some(SubmissionMode::FirstFrame)
-        );
-    }
 
     /// Eight-bit keeps the zero-copy NvFBC path.
     #[test]

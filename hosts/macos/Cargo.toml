@@ -27,6 +27,8 @@ arcen-telemetry.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom.workspace = true
+mach2.workspace = true
+libc = "0.2"
 quinn.workspace = true
 rcgen = "=0.14.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -43,6 +45,7 @@ thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["std"] }
 x509-parser.workspace = true
 zip.workspace = true
+zeroize.workspace = true
 
 # Native capture and encode. `apple-cf` is pinned to the version `videotoolbox`
 # links against so `IOSurface` is the same type across the hand-off.

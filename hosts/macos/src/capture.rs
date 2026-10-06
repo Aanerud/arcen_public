@@ -473,6 +473,16 @@ impl FrameDamage {
     pub fn is_known_clean(&self) -> bool {
         matches!(self, Self::Rects(rects) if rects.is_empty())
     }
+
+    /// Merges damage from a superseded frame into the newer frame that will be
+    /// encoded instead. Unknown dominates because a missing damage attachment
+    /// means the whole older frame may have changed.
+    pub fn merge_superseded(&mut self, superseded: Self) {
+        match (self, superseded) {
+            (current @ Self::Unknown, _) | (current, Self::Unknown) => *current = Self::Unknown,
+            (Self::Rects(current), Self::Rects(mut old)) => current.append(&mut old),
+        }
+    }
 }
 
 /// One captured frame, still on the GPU.
@@ -855,7 +865,8 @@ impl SourceCadence {
 unsafe fn sample_arrival_age(sample_buffer: &CMSampleBuffer) -> Option<Duration> {
     // SAFETY: the caller guarantees a live sample buffer.
     let stamped = unsafe { sample_buffer.presentation_time_stamp() };
-    let clock = objc2_core_media::CMClock::host_time_clock();
+    // SAFETY: CoreMedia's host clock is a process-lifetime singleton.
+    let clock = unsafe { objc2_core_media::CMClock::host_time_clock() };
     // SAFETY: the host time clock is a process-lifetime CoreMedia singleton.
     let now = unsafe { clock.time() };
     let seconds = |time: objc2_core_media::CMTime| -> Option<f64> {
@@ -1521,5 +1532,28 @@ mod damage_tests {
             }])
             .is_known_clean()
         );
+    }
+
+    #[test]
+    fn superseded_damage_merges_with_unknown_dominating() {
+        let mut newer = FrameDamage::Rects(Vec::new());
+        newer.merge_superseded(FrameDamage::Rects(vec![DamageRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        }]));
+        assert_eq!(
+            newer,
+            FrameDamage::Rects(vec![DamageRect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            }])
+        );
+
+        newer.merge_superseded(FrameDamage::Unknown);
+        assert_eq!(newer, FrameDamage::Unknown);
     }
 }

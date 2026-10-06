@@ -9,10 +9,14 @@ use openh264::encoder::{
     TransferCharacteristics as Oh264TransferCharacteristics, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
+use openh264_sys2::{
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo,
+    SPATIAL_LAYER_0,
+};
 
 use crate::{ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics};
 
-use super::I420Frame;
+use super::{I420Frame, KeyframePolicy};
 
 /// Hard cap for one software H.264 Annex-B access unit.
 pub const MAX_SOFTWARE_H264_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
@@ -47,6 +51,8 @@ pub struct SoftwareH264Config {
     pub primaries: ColorPrimaries,
     /// Transfer characteristics this stream's VUI must state truthfully.
     pub transfer: TransferCharacteristics,
+    /// Shared pipeline keyframe policy consumed by the native `OpenH264` GOP.
+    pub keyframe: KeyframePolicy,
 }
 
 impl SoftwareH264Config {
@@ -75,6 +81,7 @@ impl SoftwareH264Config {
             matrix: ColorMatrix::Bt709,
             primaries: ColorPrimaries::Bt709,
             transfer: TransferCharacteristics::Bt709,
+            keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
         }
     }
 }
@@ -260,6 +267,7 @@ pub struct SoftwareH264Encoder {
     output: Vec<u8>,
     parameter_sets: Vec<u8>,
     force_pending: bool,
+    native_initialized: bool,
     stats: SoftwareH264Stats,
 }
 
@@ -312,7 +320,7 @@ impl SoftwareH264Encoder {
             .bitrate(BitRate::from_bps(config.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(config.fps as f32))
             .intra_frame_period(IntraFramePeriod::from_num_frames(
-                config.fps.saturating_mul(2),
+                config.keyframe.scheduled_period_frames(config.fps),
             ))
             .num_threads(config.num_threads)
             .adaptive_quantization(false)
@@ -326,6 +334,7 @@ impl SoftwareH264Encoder {
             output: Vec::new(),
             parameter_sets: Vec::new(),
             force_pending: true,
+            native_initialized: false,
             stats: SoftwareH264Stats::default(),
         })
     }
@@ -334,6 +343,149 @@ impl SoftwareH264Encoder {
     pub fn force_idr(&mut self) {
         self.inner.force_intra_frame();
         self.force_pending = true;
+    }
+
+    /// Apply a new target bitrate without resetting codec state.
+    ///
+    /// `openh264` 0.9.7 exposes this only through its raw `SetOption` API.
+    /// This safe wrapper validates the public Arcen contract, keeps exclusive
+    /// access to the encoder while the native call runs, and does not force an
+    /// IDR: rate-control probes must not turn idle keepalives into recovery
+    /// keyframes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SoftwareH264Error::InvalidConfig`] for zero bitrate or native
+    /// failures from `OpenH264`.
+    pub fn reconfigure_bitrate(&mut self, bitrate_bps: u32) -> Result<(), SoftwareH264Error> {
+        if bitrate_bps == 0 {
+            return Err(SoftwareH264Error::InvalidConfig);
+        }
+        if bitrate_bps == self.config.bitrate_bps {
+            return Ok(());
+        }
+        if self.native_initialized {
+            self.set_native_bitrate(bitrate_bps)?;
+            self.config.bitrate_bps = bitrate_bps;
+            Ok(())
+        } else {
+            self.rebuild_before_first_frame(SoftwareH264Config {
+                bitrate_bps,
+                ..self.config
+            })
+        }
+    }
+
+    /// Apply a new frame-rate cap without resetting codec state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SoftwareH264Error::InvalidConfig`] outside the software H.264
+    /// `1..=30` fps contract or native failures from `OpenH264`.
+    pub fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), SoftwareH264Error> {
+        if fps == 0 || fps > MAX_SOFTWARE_FPS {
+            return Err(SoftwareH264Error::InvalidConfig);
+        }
+        if fps == self.config.fps {
+            return Ok(());
+        }
+        if self.native_initialized {
+            self.set_native_framerate(fps)?;
+            self.config.fps = fps;
+            Ok(())
+        } else {
+            self.rebuild_before_first_frame(SoftwareH264Config { fps, ..self.config })
+        }
+    }
+
+    fn rebuild_before_first_frame(
+        &mut self,
+        config: SoftwareH264Config,
+    ) -> Result<(), SoftwareH264Error> {
+        debug_assert!(!self.native_initialized);
+        let stats = self.stats;
+        let mut replacement = Self::new(config)?;
+        replacement.stats = stats;
+        *self = replacement;
+        Ok(())
+    }
+
+    fn set_native_bitrate(&mut self, bitrate_bps: u32) -> Result<(), SoftwareH264Error> {
+        let previous_bps = self.config.bitrate_bps;
+        if bitrate_bps == previous_bps {
+            return Ok(());
+        }
+        let result = if bitrate_bps > previous_bps {
+            self.set_native_bitrate_option(ENCODER_OPTION_MAX_BITRATE, bitrate_bps)
+                .and_then(|()| self.set_native_bitrate_option(ENCODER_OPTION_BITRATE, bitrate_bps))
+        } else {
+            self.set_native_bitrate_option(ENCODER_OPTION_BITRATE, bitrate_bps)
+                .and_then(|()| {
+                    self.set_native_bitrate_option(ENCODER_OPTION_MAX_BITRATE, bitrate_bps)
+                })
+        };
+        let original = match result {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let rollback = if bitrate_bps > previous_bps {
+            self.set_native_bitrate_option(ENCODER_OPTION_BITRATE, previous_bps)
+                .and_then(|()| {
+                    self.set_native_bitrate_option(ENCODER_OPTION_MAX_BITRATE, previous_bps)
+                })
+        } else {
+            self.set_native_bitrate_option(ENCODER_OPTION_MAX_BITRATE, previous_bps)
+                .and_then(|()| self.set_native_bitrate_option(ENCODER_OPTION_BITRATE, previous_bps))
+        };
+        match rollback {
+            Ok(()) => Err(original),
+            Err(rollback_error) => Err(SoftwareH264Error::Native(openh264::Error::msg_string(
+                format!(
+                    "OpenH264 bitrate update to {bitrate_bps} failed ({original}); rollback to {previous_bps} also failed ({rollback_error}); native bitrate may be partially applied"
+                ),
+            ))),
+        }
+    }
+
+    fn set_native_bitrate_option(
+        &mut self,
+        option: openh264_sys2::ENCODER_OPTION,
+        bitrate_bps: u32,
+    ) -> Result<(), SoftwareH264Error> {
+        let i_bitrate = i32::try_from(bitrate_bps).map_err(|_| SoftwareH264Error::InvalidConfig)?;
+        let mut bitrate = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_0,
+            iBitrate: i_bitrate,
+        };
+        // SAFETY: `self.inner` has completed at least one successful encode,
+        // so OpenH264 has initialized its native encoder context. `&mut self`
+        // guarantees no concurrent native access. `SBitrateInfo` is the
+        // `#[repr(C)]` struct OpenH264 documents for bitrate options, and the
+        // pointer is valid and uniquely mutable for this synchronous `SetOption`
+        // call. The call changes rate-control state only and does not alter
+        // picture geometry or buffer ownership. Callers choose target/max order
+        // so OpenH264's immediate `max >= target` verifier is always satisfied.
+        let status = unsafe {
+            self.inner
+                .raw_api()
+                .set_option(option, (&raw mut bitrate).cast())
+        };
+        native_status(status, bitrate_option_name(option))
+    }
+
+    fn set_native_framerate(&mut self, fps: u32) -> Result<(), SoftwareH264Error> {
+        let mut fps = f32::from(u16::try_from(fps).map_err(|_| SoftwareH264Error::InvalidConfig)?);
+        // SAFETY: same context/threading invariant as `set_native_bitrate`.
+        // OpenH264 documents `ENCODER_OPTION_FRAME_RATE` as a pointer to a
+        // `float`; `fps` is a local `f32` (C `float` on the supported targets),
+        // valid and uniquely mutable for the synchronous call. The value has
+        // already been range-checked to OpenH264's 1..=30 contract.
+        let status = unsafe {
+            self.inner
+                .raw_api()
+                .set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut fps).cast())
+        };
+        native_status(status, "ENCODER_OPTION_FRAME_RATE")
     }
 
     #[must_use]
@@ -381,6 +533,7 @@ impl SoftwareH264Encoder {
         let (y, u, v) = frame.planes();
         let yuv = YUVSlices::new((y, u, v), (frame.width(), frame.height()), strides);
         let bitstream = self.inner.encode(&yuv).map_err(SoftwareH264Error::Native)?;
+        self.native_initialized = true;
         let kind = match bitstream.frame_type() {
             FrameType::IDR => EncodedFrameKind::Idr,
             FrameType::I => EncodedFrameKind::Intra,
@@ -487,6 +640,24 @@ impl SoftwareH264Encoder {
         self.output.copy_within(0..old_len, prefix_len);
         self.output[..prefix_len].copy_from_slice(&self.parameter_sets);
         Ok(())
+    }
+}
+
+fn bitrate_option_name(option: openh264_sys2::ENCODER_OPTION) -> &'static str {
+    match option {
+        ENCODER_OPTION_BITRATE => "ENCODER_OPTION_BITRATE",
+        ENCODER_OPTION_MAX_BITRATE => "ENCODER_OPTION_MAX_BITRATE",
+        _ => "ENCODER_OPTION_UNKNOWN",
+    }
+}
+
+fn native_status(status: i32, option: &str) -> Result<(), SoftwareH264Error> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(SoftwareH264Error::Native(openh264::Error::msg_string(
+            format!("OpenH264 SetOption({option}) failed with native status {status}"),
+        )))
     }
 }
 
@@ -794,5 +965,93 @@ mod tests {
         assert_eq!(config.matrix, ColorMatrix::Bt709);
         assert_eq!(config.primaries, ColorPrimaries::Bt709);
         assert_eq!(config.transfer, TransferCharacteristics::Bt709);
+    }
+
+    #[test]
+    fn bitrate_reconfigure_uses_live_option_without_recovery_idr() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let (mut y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let _ = encoder.encode(frame).expect("first encode");
+        assert_eq!(encoder.config().bitrate_bps, 500_000);
+        let forced_after_startup = encoder.stats().forced_idrs;
+
+        encoder
+            .reconfigure_bitrate(900_000)
+            .expect("bitrate update");
+        assert_eq!(encoder.config().bitrate_bps, 900_000);
+        y[0] = 32;
+        let changed = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let delta = encoder
+            .encode(changed)
+            .expect("encode after bitrate update")
+            .expect("access unit");
+        assert!(!delta.is_keyframe);
+        assert!(!contains_nal_type(delta.bytes, 7));
+        assert!(!contains_nal_type(delta.bytes, 8));
+        assert_eq!(encoder.stats().forced_idrs, forced_after_startup);
+    }
+
+    #[test]
+    fn repeated_rate_updates_while_idle_do_not_encode_or_force_idr() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let (y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let _ = encoder.encode(frame).expect("first encode");
+        let stats = encoder.stats();
+        for bps in [550_000, 600_000, 700_000, 800_000, 900_000] {
+            encoder.reconfigure_bitrate(bps).expect("bitrate update");
+        }
+        assert_eq!(encoder.config().bitrate_bps, 900_000);
+        assert_eq!(encoder.stats().encoded_frames, stats.encoded_frames);
+        assert_eq!(encoder.stats().forced_idrs, stats.forced_idrs);
+    }
+
+    #[test]
+    fn bitrate_reconfigure_handles_downward_and_alternating_sequences() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let (y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let _ = encoder.encode(frame).expect("first encode");
+        let stats = encoder.stats();
+        for bps in [300_000, 800_000, 350_000, 900_000, 500_000] {
+            encoder.reconfigure_bitrate(bps).expect("bitrate update");
+            assert_eq!(encoder.config().bitrate_bps, bps);
+        }
+        assert_eq!(encoder.stats().encoded_frames, stats.encoded_frames);
+        assert_eq!(encoder.stats().forced_idrs, stats.forced_idrs);
+    }
+
+    #[test]
+    fn equal_bitrate_reconfigure_is_a_noop() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let (y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let _ = encoder.encode(frame).expect("first encode");
+        let stats = encoder.stats();
+        encoder.reconfigure_bitrate(500_000).expect("same bitrate");
+        assert_eq!(encoder.config().bitrate_bps, 500_000);
+        assert_eq!(encoder.stats(), stats);
+    }
+
+    #[test]
+    fn framerate_reconfigure_uses_live_option_and_validates_contract() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let (y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let _ = encoder.encode(frame).expect("first encode");
+        let forced_after_startup = encoder.stats().forced_idrs;
+        encoder.reconfigure_framerate(15).expect("fps update");
+        assert_eq!(encoder.config().fps, 15);
+        assert_eq!(encoder.stats().forced_idrs, forced_after_startup);
+        assert!(matches!(
+            encoder.reconfigure_framerate(31),
+            Err(SoftwareH264Error::InvalidConfig)
+        ));
     }
 }

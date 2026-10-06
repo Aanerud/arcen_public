@@ -15,6 +15,19 @@ const NVAPI_OK: i32 = 0;
 const NVAPI_END_ENUMERATION: i32 = -7;
 const NVAPI_INSUFFICIENT_BUFFER: i32 = -174;
 const NVAPI_DATA_NOT_FOUND: i32 = -121;
+const NVAPI_NVIDIA_DEVICE_NOT_FOUND: i32 = -6;
+
+/// Whether a failed NVAPI display lookup means NVIDIA does not drive the
+/// display at all, as opposed to a driver fault.
+///
+/// A virtual display adapter's monitor is rendered by the NVIDIA GPU, so
+/// Windows reports it under NVIDIA's vendor id, but NVAPI has never heard of
+/// it and answers `NVAPI_NVIDIA_DEVICE_NOT_FOUND`. Such an output is an
+/// ordinary Windows display, not a broken NVIDIA one.
+#[must_use]
+pub fn display_not_driven_by_nvidia(error: &str) -> bool {
+    error.contains(&format!("NVAPI status {NVAPI_NVIDIA_DEVICE_NOT_FOUND} "))
+}
 const NVAPI_MAX_PHYSICAL_GPUS: usize = 64;
 const NV_EDID_DATA_SIZE: usize = 256;
 const NVAPI_SHORT_STRING_MAX: usize = 64;
@@ -52,7 +65,7 @@ pub const ID_SYS_GET_GPU_AND_OUTPUT_ID: u32 = 0x112b_a1a5;
 type NvPhysicalGpuHandle = *mut c_void;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct AdapterLuid {
     pub low_part: u32,
     pub high_part: i32,
@@ -874,6 +887,26 @@ pub struct RecoveryData {
     pub intended_edid_sha256: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TimingRecoveryData {
+    pub device_name: String,
+    pub adapter_luid: AdapterLuid,
+    pub display_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+    #[serde(default)]
+    pub ownership: TimingOwnership,
+    #[serde(default)]
+    pub custom: Option<CustomDisplay>,
+    #[serde(default)]
+    pub custom_snapshot_complete: bool,
+    #[serde(default)]
+    pub pre_existing_custom: Vec<CustomDisplay>,
+    #[serde(default)]
+    pub cleanup_stage: CleanupStage,
+}
+
 pub trait NvapiDriver {
     fn map_display(
         &mut self,
@@ -1023,10 +1056,7 @@ where
     // the display, so the write buys nothing and costs HDR. Skipping it
     // keeps the desktop in HDR for the whole session.
     let already_correct = snapshot.original_edid.as_deref() == Some(edid);
-    if already_correct {
-        return apply_exact_topology(driver, snapshot, width, height, active);
-    }
-    if edid.len() > 128 {
+    if !already_correct && edid.len() > 128 {
         return Err(ApplyExactError {
             message: format!(
                 "HDR display EDID is not provisioned before session start on display id \
@@ -1037,32 +1067,34 @@ where
             topology_commit_failed: false,
         });
     }
-    active.edid_write_stage = EdidWriteStage::Attempted;
-    checkpoint(&active).map_err(|message| ApplyExactError {
-        message,
-        active: Some(active.clone()),
-        topology_commit_failed: false,
-    })?;
-    driver
-        .set_edid(snapshot.mapping, edid)
-        .map_err(|message| ApplyExactError {
+    if !already_correct {
+        active.edid_write_stage = EdidWriteStage::Attempted;
+        checkpoint(&active).map_err(|message| ApplyExactError {
             message,
             active: Some(active.clone()),
             topology_commit_failed: false,
         })?;
-    verify_effective_edid(driver, snapshot.mapping, Some(edid)).map_err(|message| {
-        ApplyExactError {
+        driver
+            .set_edid(snapshot.mapping, edid)
+            .map_err(|message| ApplyExactError {
+                message,
+                active: Some(active.clone()),
+                topology_commit_failed: false,
+            })?;
+        verify_effective_edid(driver, snapshot.mapping, Some(edid)).map_err(|message| {
+            ApplyExactError {
+                message,
+                active: Some(active.clone()),
+                topology_commit_failed: false,
+            }
+        })?;
+        active.edid_write_stage = EdidWriteStage::Verified;
+        checkpoint(&active).map_err(|message| ApplyExactError {
             message,
             active: Some(active.clone()),
             topology_commit_failed: false,
-        }
-    })?;
-    active.edid_write_stage = EdidWriteStage::Verified;
-    checkpoint(&active).map_err(|message| ApplyExactError {
-        message,
-        active: Some(active.clone()),
-        topology_commit_failed: false,
-    })?;
+        })?;
+    }
     let custom = driver
         .calculate_custom_display(snapshot.mapping.display_id, width, height, refresh_hz)
         .map_err(|message| ApplyExactError {
@@ -1375,6 +1407,14 @@ fn saved_custom_owned_by_us<D: NvapiDriver>(
     snapshot: &ExactModeSnapshot,
     active: &ActiveExactMode,
 ) -> Result<Option<CustomDisplay>, String> {
+    saved_custom_owned_by_us_on_display(driver, snapshot.mapping.display_id, active)
+}
+
+fn saved_custom_owned_by_us_on_display<D: NvapiDriver>(
+    driver: &mut D,
+    display_id: u32,
+    active: &ActiveExactMode,
+) -> Result<Option<CustomDisplay>, String> {
     let custom = active
         .custom
         .as_ref()
@@ -1382,7 +1422,7 @@ fn saved_custom_owned_by_us<D: NvapiDriver>(
     if active.pre_existing_custom.contains(custom) || !active.custom_snapshot_complete {
         return Ok(None);
     }
-    let current = driver.enum_custom_displays(snapshot.mapping.display_id)?;
+    let current = driver.enum_custom_displays(display_id)?;
     if active.ownership == TimingOwnership::SavedByUs {
         return Ok(current.contains(custom).then(|| custom.clone()));
     }
@@ -1401,6 +1441,38 @@ fn custom_refresh_hz(custom: &CustomDisplay) -> u32 {
     } else {
         u32::from(custom.raw.timing.extra.rr)
     }
+}
+
+pub fn timing_recovery_data(
+    device_name: String,
+    snapshot: &ExactModeSnapshot,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> TimingRecoveryData {
+    TimingRecoveryData {
+        device_name,
+        adapter_luid: snapshot.mapping.adapter_luid,
+        display_id: snapshot.mapping.display_id,
+        width,
+        height,
+        refresh_hz,
+        ownership: TimingOwnership::NotTried,
+        custom: None,
+        custom_snapshot_complete: snapshot.custom_snapshot_complete,
+        pre_existing_custom: snapshot.pre_existing_custom.clone(),
+        cleanup_stage: CleanupStage::Pending,
+    }
+}
+
+pub fn update_timing_recovery_from_active(
+    recovery: &mut TimingRecoveryData,
+    active: &ActiveExactMode,
+) {
+    recovery.ownership = active.ownership;
+    recovery.custom = active.custom.clone();
+    recovery.custom_snapshot_complete = active.custom_snapshot_complete;
+    recovery.pre_existing_custom = active.pre_existing_custom.clone();
 }
 
 pub fn recovery_data(
@@ -1427,6 +1499,65 @@ pub fn recovery_data(
         edid_write_stage: EdidWriteStage::None,
         intended_edid_sha256: None,
     }
+}
+
+pub(crate) fn restore_timing_recovery_staged<D, F>(
+    driver: &mut D,
+    recovery: &TimingRecoveryData,
+    mut checkpoint: F,
+) -> Result<(), String>
+where
+    D: NvapiDriver,
+    F: FnMut(CleanupStage) -> Result<(), String>,
+{
+    let mut stage = recovery.cleanup_stage;
+    let active = ActiveExactMode {
+        custom: recovery.custom.clone(),
+        ownership: recovery.ownership,
+        save_error: None,
+        custom_snapshot_complete: recovery.custom_snapshot_complete,
+        pre_existing_custom: recovery.pre_existing_custom.clone(),
+        edid_write_stage: EdidWriteStage::None,
+        intended_edid_sha256: None,
+    };
+
+    if stage < CleanupStage::TopologyRestored {
+        checkpoint_cleanup_stage(&mut checkpoint, &mut stage, CleanupStage::TopologyRestored)?;
+    }
+    if stage < CleanupStage::TrialReverted {
+        if active.ownership.trial_was_attempted() {
+            driver
+                .revert_custom_display(recovery.display_id)
+                .map_err(|error| format!("revert custom timing trial: {error}"))?;
+        }
+        checkpoint_cleanup_stage(&mut checkpoint, &mut stage, CleanupStage::TrialReverted)?;
+    }
+    if stage < CleanupStage::SavedTimingDeleted {
+        if matches!(
+            active.ownership,
+            TimingOwnership::SaveAttemptedByUs | TimingOwnership::SavedByUs
+        ) {
+            if let Some(custom) =
+                saved_custom_owned_by_us_on_display(driver, recovery.display_id, &active)?
+            {
+                driver
+                    .delete_custom_display(recovery.display_id, &custom)
+                    .map_err(|error| format!("delete saved custom timing: {error}"))?;
+            }
+        }
+        checkpoint_cleanup_stage(
+            &mut checkpoint,
+            &mut stage,
+            CleanupStage::SavedTimingDeleted,
+        )?;
+    }
+    if stage < CleanupStage::EdidRestored {
+        checkpoint_cleanup_stage(&mut checkpoint, &mut stage, CleanupStage::EdidRestored)?;
+    }
+    if stage < CleanupStage::Complete {
+        checkpoint_cleanup_stage(&mut checkpoint, &mut stage, CleanupStage::Complete)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2478,6 +2609,21 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    #[test]
+    fn a_display_nvapi_does_not_know_is_not_an_nvidia_fault() {
+        // The exact text a GeForce host with a virtual display adapter logged.
+        assert!(display_not_driven_by_nvidia(
+            "NvAPI_DISP_GetDisplayIdByDisplayName returned NVAPI status -6 \
+             (NVAPI_NVIDIA_DEVICE_NOT_FOUND)"
+        ));
+        assert!(!display_not_driven_by_nvidia(
+            "NvAPI_DISP_GetDisplayIdByDisplayName returned NVAPI status -60 (other)"
+        ));
+        assert!(!display_not_driven_by_nvidia(
+            "NvAPI_SYS_GetGpuAndOutputIdFromDisplayId returned NVAPI status -5 (NVAPI_INVALID_ARGUMENT)"
+        ));
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
         Map,
@@ -2726,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn preprovisioned_hdr_edid_applies_only_the_requested_topology() {
+    fn preprovisioned_hdr_edid_still_refreshes_the_exact_timing() {
         let mut driver = MockDriver::new();
         let hdr_edid = vec![0x55; 256];
         driver.current_edid = Some(hdr_edid.clone());
@@ -2748,9 +2894,10 @@ mod tests {
             !driver
                 .calls
                 .iter()
-                .any(|call| matches!(call, Call::SetEdid(_) | Call::Timing)),
-            "a preprovisioned HDR display needs no EDID or custom-timing mutation"
+                .any(|call| matches!(call, Call::SetEdid(_))),
+            "a preprovisioned HDR display must not rewrite the EDID"
         );
+        assert!(driver.calls.contains(&Call::Timing));
         assert!(driver.calls.contains(&Call::SetConfig(3600, 2338)));
     }
 
@@ -3694,6 +3841,126 @@ mod tests {
         assert_eq!(driver.custom_displays.len(), 2);
         restore_exact(&mut driver, &snapshot, Some(&active)).unwrap();
         assert_eq!(driver.custom_displays, vec![unrelated]);
+    }
+
+    #[test]
+    fn adopted_timing_recovery_reverts_trial_without_touching_edid_or_topology() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let original_config = driver.config.clone();
+        let original_edid = driver.current_edid.clone();
+        let mut timing =
+            timing_recovery_data(r"\\.\DISPLAY6".to_string(), &snapshot, 3600, 2338, 60);
+        timing.ownership = TimingOwnership::TrialAppliedByUs;
+        timing.custom = Some(custom_display(3600, 2338, 60));
+        driver.calls.clear();
+        let mut stages = Vec::new();
+
+        restore_timing_recovery_staged(&mut driver, &timing, |stage| {
+            stages.push(stage);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(driver.calls.contains(&Call::Revert));
+        assert!(!driver.calls.iter().any(|call| matches!(
+            call,
+            Call::SetEdid(_) | Call::SetConfig(_, _) | Call::Delete
+        )));
+        assert_eq!(driver.config, original_config);
+        assert_eq!(driver.current_edid, original_edid);
+        assert_eq!(stages.last(), Some(&CleanupStage::Complete));
+    }
+
+    #[test]
+    fn adopted_timing_recovery_deletes_only_saved_timing_owned_by_us() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let unrelated = custom_display(1920, 1080, 60);
+        let created = custom_display(3600, 2338, 60);
+        driver.custom_displays = vec![unrelated.clone(), created.clone()];
+        let mut timing =
+            timing_recovery_data(r"\\.\DISPLAY6".to_string(), &snapshot, 3600, 2338, 60);
+        timing.ownership = TimingOwnership::SavedByUs;
+        timing.custom = Some(created);
+        timing.custom_snapshot_complete = true;
+        timing.pre_existing_custom = vec![unrelated.clone()];
+        driver.calls.clear();
+
+        restore_timing_recovery_staged(&mut driver, &timing, |_| Ok(())).unwrap();
+
+        assert!(driver.calls.contains(&Call::Revert));
+        assert!(driver.calls.contains(&Call::Delete));
+        assert_eq!(driver.custom_displays, vec![unrelated]);
+    }
+
+    #[test]
+    fn adopted_timing_recovery_checkpoint_resume_skips_completed_cleanup() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let custom = custom_display(3600, 2338, 60);
+        driver.custom_displays = vec![custom.clone()];
+        let mut timing =
+            timing_recovery_data(r"\\.\DISPLAY6".to_string(), &snapshot, 3600, 2338, 60);
+        timing.ownership = TimingOwnership::SavedByUs;
+        timing.custom = Some(custom);
+        timing.custom_snapshot_complete = true;
+        timing.cleanup_stage = CleanupStage::SavedTimingDeleted;
+        driver.calls.clear();
+
+        restore_timing_recovery_staged(&mut driver, &timing, |_| Ok(())).unwrap();
+
+        assert!(!driver.calls.contains(&Call::Revert));
+        assert!(!driver.calls.contains(&Call::Delete));
+        assert_eq!(driver.custom_displays.len(), 1);
+    }
+
+    #[test]
+    fn adopted_timing_failure_keeps_session_identity_until_replay_deletes_timing() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let original_edid = vec![0xaa; 128];
+        let session_edid = vec![0x55; 128];
+        driver.current_edid = Some(session_edid.clone());
+        driver.config.paths[0].targets[0].display_id = 0x9999;
+        let custom = custom_display(3600, 2338, 60);
+        driver.custom_displays = vec![custom.clone()];
+        let mut timing =
+            timing_recovery_data(r"\\.\DISPLAY6".to_string(), &snapshot, 3600, 2338, 60);
+        timing.ownership = TimingOwnership::SavedByUs;
+        timing.custom = Some(custom);
+        timing.custom_snapshot_complete = true;
+        driver.failures.push_back(Call::Delete);
+        driver.calls.clear();
+
+        let error = restore_timing_recovery_staged(&mut driver, &timing, |_| Ok(())).unwrap_err();
+
+        assert!(error.contains("delete saved custom timing"));
+        assert_eq!(
+            driver.current_edid,
+            Some(session_edid.clone()),
+            "failed timing cleanup must not remove the session monitor identity needed for retry"
+        );
+        assert_eq!(driver.config.paths[0].targets[0].display_id, 0x9999);
+        assert_eq!(driver.custom_displays.len(), 1);
+
+        driver.calls.clear();
+        restore_timing_recovery_staged(&mut driver, &timing, |_| Ok(())).unwrap();
+        driver.set_edid(snapshot.mapping, &original_edid).unwrap();
+
+        let delete = driver
+            .calls
+            .iter()
+            .position(|call| *call == Call::Delete)
+            .expect("timing deleted on replay");
+        let edid_restore = driver
+            .calls
+            .iter()
+            .position(|call| *call == Call::SetEdid(original_edid.len()))
+            .expect("EDID restored after timing cleanup");
+        assert!(delete < edid_restore);
+        assert_eq!(driver.custom_displays, Vec::new());
+        assert_eq!(driver.current_edid, Some(original_edid));
     }
 
     #[test]

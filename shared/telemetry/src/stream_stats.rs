@@ -40,6 +40,7 @@ pub fn rounded_percentiles_ms(
     if sorted.is_empty() {
         return None;
     }
+
     sorted.sort_by(f64::total_cmp);
     let at = |numerator: u128, denominator: u128| {
         let last = u128::try_from(sorted.len().saturating_sub(1)).unwrap_or(u128::MAX);
@@ -51,6 +52,73 @@ pub fn rounded_percentiles_ms(
         p50_ms: at(50, 100),
         p95_ms: at(95, 100),
     })
+}
+
+/// Offset-free one-way delay estimate derived from host-wall-clock frame stamps.
+///
+/// The raw value is the Deck wall clock minus the host wall clock encoded in a
+/// frame stamp, so it includes any inter-machine clock offset. The delay sample
+/// subtracts the rolling minimum raw value observed in this connection. That
+/// preserves relative changes (queueing/network/decode ingress delay) without
+/// letting clock offset dominate decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireDelayEstimator {
+    baseline_ms: i32,
+    previous_raw_ms: i32,
+    initialized: bool,
+}
+
+impl WireDelayEstimator {
+    /// Raw-age drop beyond this bound means either a reconnect or a clock jump.
+    pub const REBASE_DROP_MS: i32 = 1_000;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            baseline_ms: 0,
+            previous_raw_ms: 0,
+            initialized: false,
+        }
+    }
+
+    /// Records one raw clock-age sample and returns the offset-free delay.
+    #[must_use]
+    pub fn observe(&mut self, raw_clock_age_ms: i32) -> i32 {
+        if !self.initialized
+            || raw_clock_age_ms.abs_diff(self.previous_raw_ms) > Self::REBASE_DROP_MS as u32
+        {
+            self.baseline_ms = raw_clock_age_ms;
+            self.previous_raw_ms = raw_clock_age_ms;
+            self.initialized = true;
+            return 0;
+        }
+        self.previous_raw_ms = raw_clock_age_ms;
+        if raw_clock_age_ms < self.baseline_ms {
+            self.baseline_ms = raw_clock_age_ms;
+            return 0;
+        }
+        raw_clock_age_ms.saturating_sub(self.baseline_ms)
+    }
+
+    /// Clears the rolling baseline, for an explicit reconnect boundary.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    #[must_use]
+    pub const fn baseline_ms(self) -> Option<i32> {
+        if self.initialized {
+            Some(self.baseline_ms)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for WireDelayEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[allow(
@@ -236,6 +304,33 @@ mod tests {
             })
         );
         assert_eq!(rounded_percentiles_ms([]), None);
+    }
+
+    #[test]
+    fn wire_delay_subtracts_positive_session_clock_offset() {
+        let mut estimator = WireDelayEstimator::new();
+        assert_eq!(estimator.observe(100), 0);
+        assert_eq!(estimator.observe(120), 20);
+        assert_eq!(estimator.observe(140), 40);
+    }
+
+    #[test]
+    fn wire_delay_subtracts_negative_session_clock_offset() {
+        let mut estimator = WireDelayEstimator::new();
+        assert_eq!(estimator.observe(-100), 0);
+        assert_eq!(estimator.observe(-80), 20);
+        assert_eq!(estimator.observe(-60), 40);
+    }
+
+    #[test]
+    fn wire_delay_rebaselines_on_clock_steps_in_both_directions() {
+        let mut estimator = WireDelayEstimator::new();
+        assert_eq!(estimator.observe(100), 0);
+        assert_eq!(estimator.observe(140), 40);
+        assert_eq!(estimator.observe(5_200), 0);
+        assert_eq!(estimator.observe(5_230), 30);
+        assert_eq!(estimator.observe(120), 0);
+        assert_eq!(estimator.observe(160), 40);
     }
 
     #[test]

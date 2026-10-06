@@ -1,0 +1,20 @@
+[package]
+name = "arcen-microphone-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "arcen_microphone_driver"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+mach2.workspace = true
+
+[lints]
+workspace = true

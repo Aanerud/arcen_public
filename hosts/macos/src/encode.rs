@@ -15,7 +15,7 @@
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use apple_cf::cf::{AsCFType, CFDictionary, CFString, CFType};
+use apple_cf::cf::{AsCFType, CFArray, CFDictionary, CFString, CFType};
 use apple_cf::cm::CMSampleBuffer;
 use apple_cf::cv::CVPixelBuffer;
 use apple_cf::iosurface::IOSurface;
@@ -206,10 +206,12 @@ pub struct EncoderConfig {
     pub codec: EncoderCodec,
     /// Target average bitrate in bits per second.
     pub bitrate_bps: i32,
+    /// Encoder-side ceiling in bits per second.
+    pub max_bitrate_bps: i32,
     /// Expected source frame rate.
     pub fps: u32,
-    /// Force a keyframe at least this often.
-    pub max_keyframe_interval: i32,
+    /// Shared pipeline keyframe cadence and recovery policy.
+    pub keyframe: arcen_media::video::KeyframePolicy,
     /// What shared policy says to preserve under pressure.
     pub motion_priority: arcen_media::video::MotionPriority,
     /// The profile the stream is encoded with.
@@ -279,8 +281,16 @@ impl EncoderConfig {
                 depth,
             ))
             .unwrap_or(i32::MAX),
+            max_bitrate_bps: i32::try_from(capped_bitrate_bps(
+                width.unsigned_abs(),
+                height.unsigned_abs(),
+                fps,
+                chroma,
+                depth,
+            ))
+            .unwrap_or(i32::MAX),
             fps,
-            max_keyframe_interval: 120,
+            keyframe: arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
             motion_priority: arcen_media::video::MotionPriority::Detail,
             profile: EncodeProfile::for_shape(codec, chroma, depth),
             colour: None,
@@ -310,6 +320,27 @@ impl EncoderConfig {
         self
     }
 
+    /// This plan with its average bitrate set by the served pipeline contract.
+    #[must_use]
+    pub const fn with_bitrate_bps(mut self, bitrate_bps: i32) -> Self {
+        self.bitrate_bps = bitrate_bps;
+        self.max_bitrate_bps = bitrate_bps;
+        self
+    }
+
+    /// This plan with its average and encoder ceiling set by the served
+    /// pipeline contract.
+    #[must_use]
+    pub const fn with_bitrate_bounds(mut self, bitrate_bps: i32, max_bitrate_bps: i32) -> Self {
+        self.bitrate_bps = bitrate_bps;
+        self.max_bitrate_bps = if max_bitrate_bps > bitrate_bps {
+            max_bitrate_bps
+        } else {
+            bitrate_bps
+        };
+        self
+    }
+
     /// This plan, tagged with a colour description.
     #[must_use]
     pub const fn with_colour(mut self, colour: Option<EncodeColour>) -> Self {
@@ -324,6 +355,16 @@ impl EncoderConfig {
         priority: arcen_media::video::MotionPriority,
     ) -> Self {
         self.motion_priority = priority;
+        self
+    }
+
+    /// This plan with the shared served-pipeline keyframe policy recorded.
+    #[must_use]
+    pub const fn with_keyframe_policy(
+        mut self,
+        keyframe: arcen_media::video::KeyframePolicy,
+    ) -> Self {
+        self.keyframe = keyframe;
         self
     }
 }
@@ -383,6 +424,11 @@ pub struct Encoder {
     stream_truth: Option<arcen_media::hevc_sps::HevcStreamTruth>,
     /// The `CoreVideo` layout of the last surface handed to `VideoToolbox`.
     input_pixel_format: u32,
+}
+
+/// Minimal read-back seam for classifying a session encoder.
+pub trait EncoderAcceleration {
+    fn uses_hardware_acceleration(&self) -> Option<bool>;
 }
 
 /// Where the time inside one encode call actually goes.
@@ -451,6 +497,10 @@ impl std::fmt::Debug for Encoder {
 /// operations this adapter already used.
 struct VtCompressionSession {
     session: videotoolbox::ffi::VTCompressionSessionRef,
+    /// Created with `RequireHardwareAcceleratedVideoEncoder`, so its existence
+    /// proves a hardware encoder even when the session does not report
+    /// `UsingHardwareAcceleratedVideoEncoder` (the low-latency encoder does not).
+    hardware_required: bool,
 }
 
 // SAFETY: matches the upstream `videotoolbox` wrapper. VideoToolbox owns the
@@ -464,7 +514,24 @@ unsafe impl Sync for VtCompressionSession {}
 
 impl VtCompressionSession {
     fn new(config: EncoderConfig) -> Result<Self, videotoolbox::VTError> {
-        let specification = encoder_specification(config);
+        if uses_low_latency_rate_control(config) {
+            match Self::create(config, true) {
+                Ok(session) => return Ok(session),
+                Err(error) => tracing::warn!(
+                    target: "arcen::media",
+                    %error,
+                    "no hardware low-latency VideoToolbox encoder; retrying without requiring one",
+                ),
+            }
+        }
+        Self::create(config, false)
+    }
+
+    fn create(
+        config: EncoderConfig,
+        require_hardware: bool,
+    ) -> Result<Self, videotoolbox::VTError> {
+        let specification = encoder_specification(config, require_hardware);
         let mut session = std::ptr::null_mut();
         // SAFETY: all pointers either name live CoreFoundation objects for the
         // duration of the call or are null by API contract. `session` is a live
@@ -488,7 +555,10 @@ impl VtCompressionSession {
         if status != 0 || session.is_null() {
             return Err(videotoolbox::VTError::SessionCreateFailed(status));
         }
-        let session = Self { session };
+        let session = Self {
+            session,
+            hardware_required: require_hardware,
+        };
         session.apply_realtime_properties(config)?;
         // SAFETY: the session was created successfully and is live.
         let status = unsafe {
@@ -523,6 +593,15 @@ impl VtCompressionSession {
                 videotoolbox::ffi::kVTCompressionPropertyKey_AverageBitRate,
                 i64::from(config.bitrate_bps),
             )?;
+            if config.max_bitrate_bps > config.bitrate_bps {
+                let (key, value) =
+                    data_rate_limits_property(config.max_bitrate_bps).ok_or_else(|| {
+                        videotoolbox::VTError::InvalidArgument(
+                            "VideoToolbox did not export DataRateLimits".to_owned(),
+                        )
+                    })?;
+                pairs.push((key, value));
+            }
             push_number_property(
                 &mut pairs,
                 videotoolbox::ffi::kVTCompressionPropertyKey_ExpectedFrameRate,
@@ -531,8 +610,18 @@ impl VtCompressionSession {
             push_number_property(
                 &mut pairs,
                 videotoolbox::ffi::kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                i64::from(config.max_keyframe_interval),
+                videotoolbox_max_keyframe_interval(config.keyframe, config.fps),
             )?;
+            push_named_number_property(
+                &mut pairs,
+                "MaxKeyFrameIntervalDuration",
+                config
+                    .keyframe
+                    .safety_refresh_interval()
+                    .map_or(0, |interval| {
+                        i64::try_from(interval.as_secs()).unwrap_or(i64::MAX)
+                    }),
+            );
             push_number_property(
                 &mut pairs,
                 videotoolbox::ffi::kVTCompressionPropertyKey_MaxFrameDelayCount,
@@ -758,6 +847,54 @@ impl Encoder {
         Ok(())
     }
 
+    /// Changes the average bitrate and native encoder ceiling for following frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError::Encode`] when `VideoToolbox` refuses either value.
+    pub fn set_bitrate_bounds(&mut self, bps: u64, max_bps: u64) -> Result<(), EncodeError> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        // SAFETY: VideoToolbox exports this process-lifetime `CFStringRef`,
+        // as for the keyframe option key below.
+        let Some(average_key) = (unsafe {
+            CFString::from_raw_retained(
+                videotoolbox::ffi::kVTCompressionPropertyKey_AverageBitRate
+                    .cast_mut()
+                    .cast(),
+            )
+        }) else {
+            return Err(EncodeError::Encode(
+                "VideoToolbox did not export AverageBitRate".to_owned(),
+            ));
+        };
+        let bounded_max = max_bps.max(bps).min(i32::MAX as u64);
+        let average_bps = bps.min(i32::MAX as u64);
+        let average_value: CFType =
+            apple_cf::cf::CFNumber::from_i64(i64::try_from(average_bps).unwrap_or(i64::MAX)).into();
+        if bounded_max > average_bps {
+            let (limit_key, limit_value) =
+                data_rate_limits_property(i32::try_from(bounded_max).unwrap_or(i32::MAX))
+                    .ok_or_else(|| {
+                        EncodeError::Encode("VideoToolbox did not export DataRateLimits".to_owned())
+                    })?;
+            session
+                .set_properties(&CFDictionary::from_pairs(&[
+                    (&average_key, &average_value),
+                    (&limit_key, &limit_value),
+                ]))
+                .map_err(|error| EncodeError::Encode(format!("bitrate bounds: {error}")))?;
+        } else {
+            session
+                .set_properties(&CFDictionary::from_pairs(&[(&average_key, &average_value)]))
+                .map_err(|error| EncodeError::Encode(format!("AverageBitRate: {error}")))?;
+        }
+        self.config.bitrate_bps = i32::try_from(average_bps).unwrap_or(i32::MAX);
+        self.config.max_bitrate_bps = i32::try_from(bounded_max).unwrap_or(i32::MAX);
+        Ok(())
+    }
+
     /// Whether `VideoToolbox` chose a hardware encoder for this session.
     ///
     /// `None` means the property could not be read at all, which is a
@@ -774,6 +911,7 @@ impl Encoder {
     #[must_use]
     pub fn uses_hardware_acceleration(&self) -> Option<bool> {
         let session = self.session.as_ref()?;
+        let hardware_required = session.hardware_required;
         // SAFETY: `kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder`
         // is a process-lifetime VideoToolbox constant, and the session is live
         // for this borrow.
@@ -782,11 +920,14 @@ impl Encoder {
                 videotoolbox::ffi::kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
             )
         }
-        .ok()??;
+        .ok()
+        .flatten();
         // SAFETY: `kCFBooleanTrue` is a process-lifetime Core Foundation
         // singleton; comparing pointers reads nothing through them.
         let expected = unsafe { videotoolbox::ffi::kCFBooleanTrue }.cast::<std::ffi::c_void>();
-        Some(property.as_ptr().cast_const().cast::<std::ffi::c_void>() == expected)
+        let readback = property
+            .map(|property| property.as_ptr().cast_const().cast::<std::ffi::c_void>() == expected);
+        classify_acceleration(readback, hardware_required)
     }
 
     /// Returns the plan this encoder was built with.
@@ -1051,6 +1192,26 @@ impl Encoder {
     }
 }
 
+impl EncoderAcceleration for Encoder {
+    fn uses_hardware_acceleration(&self) -> Option<bool> {
+        Self::uses_hardware_acceleration(self)
+    }
+}
+
+/// Converts VideoToolbox's read-back into the shared accelerator class.
+#[must_use]
+pub fn accelerator_class_from_encoder(
+    encoder: &impl EncoderAcceleration,
+) -> Option<arcen_media::video::AcceleratorClass> {
+    encoder.uses_hardware_acceleration().map(|hardware| {
+        if hardware {
+            arcen_media::video::AcceleratorClass::Hardware
+        } else {
+            arcen_media::video::AcceleratorClass::Software
+        }
+    })
+}
+
 /// Sets the profile and colour description a plan asks for, before the first
 /// frame.
 ///
@@ -1134,21 +1295,44 @@ fn apply_profile_and_colour(
         })
 }
 
-fn encoder_specification(config: EncoderConfig) -> Option<CFDictionary> {
+fn encoder_specification(config: EncoderConfig, require_hardware: bool) -> Option<CFDictionary> {
     if !uses_low_latency_rate_control(config) {
         return None;
     }
-    // SAFETY: process-lifetime VideoToolbox constant.
-    let key = unsafe {
+    // SAFETY: process-lifetime VideoToolbox constants.
+    let low_latency = unsafe {
         cf_string_constant(
             videotoolbox::ffi::kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
         )
     }?;
     let value = cf_bool(true);
-    Some(CFDictionary::from_pairs(&[(
-        &key as &dyn AsCFType,
-        &value as &dyn AsCFType,
-    )]))
+    if !require_hardware {
+        return Some(CFDictionary::from_pairs(&[(
+            &low_latency as &dyn AsCFType,
+            &value as &dyn AsCFType,
+        )]));
+    }
+    // SAFETY: as above.
+    let require = unsafe {
+        cf_string_constant(
+            videotoolbox::ffi::kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
+        )
+    }?;
+    Some(CFDictionary::from_pairs(&[
+        (&low_latency as &dyn AsCFType, &value as &dyn AsCFType),
+        (&require as &dyn AsCFType, &value as &dyn AsCFType),
+    ]))
+}
+
+/// The encoder's acceleration class: its own read-back when it reports one,
+/// otherwise hardware when the session could only have been created on a
+/// hardware encoder, otherwise unknown.
+const fn classify_acceleration(readback: Option<bool>, hardware_required: bool) -> Option<bool> {
+    match readback {
+        Some(value) => Some(value),
+        None if hardware_required => Some(true),
+        None => None,
+    }
 }
 
 const fn uses_low_latency_rate_control(config: EncoderConfig) -> bool {
@@ -1157,6 +1341,27 @@ const fn uses_low_latency_rate_control(config: EncoderConfig) -> bool {
 
 const fn prioritizes_encode_speed(config: EncoderConfig) -> bool {
     matches!(config.profile, EncodeProfile::CodecDefault)
+}
+
+fn videotoolbox_max_keyframe_interval(
+    keyframe: arcen_media::video::KeyframePolicy,
+    fps: u32,
+) -> i64 {
+    match keyframe.safety_refresh_interval() {
+        Some(_) => i64::from(keyframe.scheduled_period_frames(fps)),
+        None => i64::from(i32::MAX),
+    }
+}
+
+fn data_rate_limits_property(max_bitrate_bps: i32) -> Option<(CFString, CFType)> {
+    let key = exported_cf_string(c"kVTCompressionPropertyKey_DataRateLimits")?;
+    let bytes_per_second = apple_cf::cf::CFNumber::from_i64(i64::from(max_bitrate_bps.max(1)) / 8);
+    let one_second = apple_cf::cf::CFNumber::from_i64(1);
+    let values = CFArray::from_values(&[&bytes_per_second, &one_second]);
+    // SAFETY: `values` is a live CFArray object; retaining it as a generic
+    // CFType gives the property dictionary its own owned reference.
+    let value = unsafe { CFType::from_raw_retained(values.as_ptr().cast()) }?;
+    Some((key, value))
 }
 
 fn cf_bool(value: bool) -> CFType {
@@ -1198,6 +1403,13 @@ unsafe fn push_number_property(
     })?;
     pairs.push((key, apple_cf::cf::CFNumber::from_i64(value).into()));
     Ok(())
+}
+
+fn push_named_number_property(pairs: &mut Vec<(CFString, CFType)>, key: &str, value: i64) {
+    pairs.push((
+        CFString::new(key),
+        apple_cf::cf::CFNumber::from_i64(value).into(),
+    ));
 }
 
 /// Wraps a process-lifetime `CFStringRef` constant.
@@ -1599,6 +1811,7 @@ mod tests {
         // Generous, so the one frame is not starved of bits.
         let config = EncoderConfig {
             bitrate_bps: 40_000_000,
+            max_bitrate_bps: 40_000_000,
             ..config
         };
         let mut encoder = Encoder::new(config).expect("Grading session");
@@ -1688,6 +1901,92 @@ mod tests {
         assert!(
             worst_chroma <= 32,
             "single-pixel chroma drifted by {worst_chroma} codes"
+        );
+    }
+
+    fn assert_no_periodic_keyframes_then_forced_idr(
+        mut encoder: Encoder,
+        surface: &IOSurface,
+        frames: u32,
+        timescale: i32,
+        label: &str,
+    ) {
+        let mut keyframes = Vec::new();
+        for pts in 0..frames {
+            let sample = encoder
+                .encode_frame(surface, None, i64::from(pts), timescale, None, label)
+                .expect("encodes")
+                .expect("sample");
+            let Some(block) = sample.data_buffer() else {
+                panic!("sample data");
+            };
+            let Some(data) = block.copy_data_bytes(0, block.data_length()) else {
+                panic!("sample bytes");
+            };
+            if is_keyframe(&data, encoder.config().codec) {
+                keyframes.push(pts);
+            }
+        }
+        assert_eq!(keyframes, vec![0], "{label} inserted periodic keyframes");
+
+        let forced = encoder
+            .encode_frame(
+                surface,
+                None,
+                i64::from(frames),
+                timescale,
+                Some(force_keyframe_options().expect("force options")),
+                label,
+            )
+            .expect("forced encode")
+            .expect("forced sample");
+        let Some(block) = forced.data_buffer() else {
+            panic!("forced sample data");
+        };
+        let Some(data) = block.copy_data_bytes(0, block.data_length()) else {
+            panic!("forced sample bytes");
+        };
+        assert!(
+            is_keyframe(&data, encoder.config().codec),
+            "{label} did not honor forced IDR"
+        );
+    }
+
+    /// Native regression for VideoToolbox's undocumented `0 means automatic`
+    /// cadence: absent shared safety policy must become a huge finite
+    /// MaxKeyFrameInterval, not 0, on both encoder modes.
+    #[test]
+    fn on_demand_policy_disables_videotoolbox_periodic_keyframes() {
+        const FRAMES: u32 = 150;
+        let grading_surface = ten_bit_probe_surface(64, 64, true).expect("grading surface");
+        let grading = Encoder::new(
+            EncoderConfig::realtime_for(
+                64,
+                64,
+                EncoderCodec::Hevc,
+                30,
+                arcen_media::ChromaSubsampling::Yuv444,
+                arcen_media::BitDepth::Ten,
+            )
+            .with_colour(EncodeColour::from_plan_tokens("bt709", "bt709", "bt709")),
+        )
+        .expect("grading encoder");
+        assert_no_periodic_keyframes_then_forced_idr(
+            grading,
+            &grading_surface,
+            FRAMES,
+            30,
+            "grading",
+        );
+
+        let fast = Encoder::new(EncoderConfig::realtime(64, 64, EncoderCodec::Hevc, 30))
+            .expect("low-latency encoder");
+        assert_no_periodic_keyframes_then_forced_idr(
+            fast,
+            &grading_surface,
+            FRAMES,
+            30,
+            "low-latency",
         );
     }
 
@@ -1825,13 +2124,102 @@ mod tests {
     }
 
     #[test]
-    fn sixty_fps_pays_the_thirty_fps_bill() {
-        // Measured: a frame-rate-scaled 60 fps target put the lab link into a
-        // 670 ms backlog. Speed spends the same per second as Auto.
-        let fast = capped_bitrate_bps(1800, 1130, 60, SDR.0, SDR.1);
+    fn pipeline_bitrate_override_reaches_encoder_config() {
+        let config = EncoderConfig::realtime_for(
+            1800,
+            1168,
+            EncoderCodec::Hevc,
+            30,
+            ChromaSubsampling::Yuv444,
+            BitDepth::Ten,
+        )
+        .with_bitrate_bps(12_345_678);
+        assert_eq!(config.bitrate_bps, 12_345_678);
+        assert_eq!(config.max_bitrate_bps, 12_345_678);
+    }
+
+    #[test]
+    fn grading_pipeline_bounds_reach_videotoolbox_config() {
+        let config = EncoderConfig::realtime_for(
+            1800,
+            1168,
+            EncoderCodec::Hevc,
+            30,
+            ChromaSubsampling::Yuv444,
+            BitDepth::Ten,
+        )
+        .with_bitrate_bounds(4_665_600, 250_000_000);
+        assert_eq!(config.bitrate_bps, 4_665_600);
+        assert_eq!(config.max_bitrate_bps, 250_000_000);
+        let (_, value) = data_rate_limits_property(config.max_bitrate_bps)
+            .expect("VideoToolbox exports DataRateLimits");
+        assert!(
+            value.as_ptr().cast_const() as usize != 0,
+            "DataRateLimits must be a non-null CFArray property value"
+        );
+    }
+
+    #[test]
+    fn a_session_created_requiring_hardware_is_hardware_even_without_a_readback() {
+        assert_eq!(classify_acceleration(Some(false), true), Some(false));
+        assert_eq!(classify_acceleration(Some(true), false), Some(true));
+        assert_eq!(classify_acceleration(None, true), Some(true));
+        assert_eq!(classify_acceleration(None, false), None);
+    }
+
+    #[test]
+    fn the_low_latency_realtime_encoder_reports_its_acceleration_class() {
+        // The 8-bit Auto/Speed encoder uses low-latency rate control, whose
+        // sessions do not report UsingHardwareAcceleratedVideoEncoder. Without
+        // a class every macOS Auto/Speed session was served as `custom`.
+        for codec in [EncoderCodec::H264, EncoderCodec::Hevc] {
+            let config = EncoderConfig::realtime(1920, 1080, codec, 60);
+            let encoder = Encoder::new(config).expect("realtime encoder");
+            assert!(
+                encoder.uses_hardware_acceleration().is_some(),
+                "{codec:?} low-latency encoder must report hardware or software"
+            );
+        }
+    }
+
+    #[test]
+    fn accelerator_class_comes_from_the_session_encoder_readback() {
+        struct FakeEncoder(Option<bool>);
+        impl EncoderAcceleration for FakeEncoder {
+            fn uses_hardware_acceleration(&self) -> Option<bool> {
+                self.0
+            }
+        }
+
+        assert_eq!(
+            accelerator_class_from_encoder(&FakeEncoder(Some(true))),
+            Some(arcen_media::video::AcceleratorClass::Hardware)
+        );
+        assert_eq!(
+            accelerator_class_from_encoder(&FakeEncoder(Some(false))),
+            Some(arcen_media::video::AcceleratorClass::Software)
+        );
+        assert_eq!(accelerator_class_from_encoder(&FakeEncoder(None)), None);
+    }
+
+    #[test]
+    fn speed_start_keeps_the_thirty_fps_safe_bill_and_ceiling_can_reach_sixty() {
+        // Measured: a frame-rate-scaled 60 fps start put the lab link into a
+        // 670 ms backlog, so Speed still starts at the same safe bill as Auto.
+        let contract = arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Speed);
+        let (start, ceiling) = contract.bitrate_bounds(
+            1920,
+            1080,
+            60,
+            contract.colour.chroma,
+            contract.colour.bit_depth,
+        );
         let slow = capped_bitrate_bps(1920, 1080, 30, SDR.0, SDR.1);
-        assert_eq!(fast, slow, "60 fps capped to {fast}, not {slow}");
-        // Below the cap a small session still pays only for itself.
-        assert!(capped_bitrate_bps(640, 360, 60, SDR.0, SDR.1) < slow);
+        assert_eq!(start, slow);
+        assert_eq!(
+            ceiling,
+            arcen_media::video::average_bitrate_bps(1920, 1080, 60, SDR.0, SDR.1)
+        );
+        assert_eq!(ceiling, start * 2);
     }
 }

@@ -92,12 +92,62 @@ pub struct MonitorPipelineTemplate {
     pub motion_priority: arcen_media::video::MotionPriority,
     /// Damage-driven QP biasing for the whole roster.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    pub debug_diagnostics: bool,
+    pub qp_map_config: Option<arcen_session::pier_config::QpMapConfig>,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub codec_pinned: bool,
+    pub variant_pinned: bool,
+    /// Optional native encoder ceiling from the served pipeline contract.
+    pub encoder_max_bitrate_bps: Option<u32>,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
     pub cursor_mode: CursorMode,
     pub display: Option<String>,
     pub xauthority: Option<String>,
     pub execution: Option<UserExecution>,
     pub session_log_id: CorrelationId,
+}
+
+impl MonitorPipelineTemplate {
+    fn qp_map_for_config(&self, config: &CapencConfig) -> arcen_media::video::QpMapPolicy {
+        if config.encoder == EncoderSelection::SoftwareH264 {
+            return arcen_media::video::QpMapPolicy::Off;
+        }
+        let codec = arcen_media::VideoCodec::from_token(&config.codec)
+            .unwrap_or(arcen_media::VideoCodec::H264);
+        let video = arcen_media::VideoConfiguration {
+            codec,
+            chroma: if config.yuv444 {
+                arcen_media::ChromaSubsampling::Yuv444
+            } else {
+                arcen_media::ChromaSubsampling::Yuv420
+            },
+            bit_depth: config.bit_depth,
+            range: config.color_range,
+            matrix: config.color_matrix,
+            primaries: config.color_primaries,
+            transfer: config.transfer,
+        };
+        let resolved_video =
+            arcen_media::video::resolve_desktop_plan(video, config.desktop_encoding)
+                .map_or(video, |plan| plan.video);
+        let served = arcen_media::video::served_pipeline(
+            self.requested_pipeline,
+            resolved_video,
+            config.fps,
+            config.motion_priority,
+            arcen_media::video::ServedPipelineContext {
+                backend: Some(arcen_media::video::AcceleratorClass::Hardware),
+                exact_or_admin_override: self.codec_pinned
+                    || self.variant_pinned
+                    || self.requested_pipeline.is_none(),
+            },
+        );
+        self.qp_map_config
+            .as_ref()
+            .and_then(|config| config.effective_token(served.token()).ok())
+            .and_then(arcen_media::video::QpMapPolicy::from_token)
+            .unwrap_or(self.qp_map)
+    }
 }
 
 /// Typed rejection building [`MonitorPipelineSpec`]s from a [`LinuxTopologyPlan`].
@@ -311,7 +361,37 @@ pub fn build_pipeline_specs(
                     // silently encode to a different budget than its peers.
                     intent: template.intent,
                     motion_priority: template.motion_priority,
-                    qp_map: template.qp_map,
+                    qp_map: template.qp_map_for_config(&CapencConfig {
+                        binary: template.binary.clone(),
+                        output_index,
+                        codec: template.codec.clone(),
+                        encoder: template.encoder,
+                        fps: template.fps,
+                        yuv444: template.yuv444,
+                        bit_depth: template.bit_depth,
+                        color_range: template.color_range,
+                        color_matrix: template.color_matrix,
+                        transfer: template.transfer,
+                        color_primaries: template.color_primaries,
+                        desktop_encoding: template.desktop_encoding,
+                        video_selection: template.video_selection,
+                        codec_pinned: false,
+                        variant_pinned: false,
+                        intent: template.intent,
+                        motion_priority: template.motion_priority,
+                        qp_map: template.qp_map,
+                        debug_diagnostics: template.debug_diagnostics,
+                        encoder_max_bitrate_bps: template.encoder_max_bitrate_bps,
+                        width: monitor.width,
+                        height: monitor.height,
+                        cursor_mode: template.cursor_mode,
+                        display: template.display.clone(),
+                        xauthority: template.xauthority.clone(),
+                        execution: template.execution.clone(),
+                        session_log_id: template.session_log_id.clone(),
+                    }),
+                    debug_diagnostics: template.debug_diagnostics,
+                    encoder_max_bitrate_bps: template.encoder_max_bitrate_bps,
                     width: monitor.width,
                     height: monitor.height,
                     cursor_mode: template.cursor_mode,
@@ -415,6 +495,7 @@ pub fn build_pipeline_specs_with_resources(
             spec.config.encoder = EncoderSelection::SoftwareH264;
             spec.config.codec = "h264".to_string();
             spec.config.yuv444 = false;
+            spec.config.qp_map = arcen_media::video::QpMapPolicy::Off;
             spec.config.fps = spec.config.fps.min(30);
             // Colour must be degraded with the codec, not left at the
             // template's. OpenH264 is 8-bit 4:2:0 BT.709 only, and
@@ -431,6 +512,7 @@ pub fn build_pipeline_specs_with_resources(
                 spec.config.color_matrix = arcen_media::ColorMatrix::Bt709;
             }
         }
+        spec.config.qp_map = template.qp_map_for_config(&spec.config);
     }
     Ok(specs)
 }
@@ -749,6 +831,8 @@ mod tests {
             intent: arcen_media::EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            encoder_max_bitrate_bps: None,
             width: 1920,
             height: 1080,
             cursor_mode: CursorMode::Local,
@@ -822,6 +906,12 @@ mod tests {
             intent: arcen_media::EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            qp_map_config: None,
+            requested_pipeline: None,
+            codec_pinned: false,
+            variant_pinned: false,
+            encoder_max_bitrate_bps: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
             display: None,

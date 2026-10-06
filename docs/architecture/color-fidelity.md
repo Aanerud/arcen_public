@@ -31,14 +31,33 @@ capture implementation.
 
 | Preset | Windows source pipeline | Linux Xorg source pipeline | Deck presentation |
 | --- | --- | --- | --- |
-| Auto | DDA after real-frame proof, otherwise WGC BGRA8 → negotiated 8-bit encode | NvFBC → CUDA → NVENC | SDR |
-| Speed | Same 8-bit path at 60 fps | Same NvFBC device-to-device path at 60 fps | SDR |
+| Auto | DDA after real-frame proof, otherwise WGC BGRA8 → negotiated 8-bit 4:2:0 encode | NvFBC → CUDA → NVENC 8-bit 4:2:0 | Root window: VideoToolbox NV12 IOSurface → `CVMetalTextureCache` planes → dedicated display-synchronised 8-bit `CAMetalLayer`; egui upload fallback. Secondary windows still use the egui path. |
+| Speed | Same 8-bit path at 60 fps | Same NvFBC device-to-device path at 60 fps | Same dedicated root 8-bit layer and secondary-window fallback as Auto |
 | Grading | WGC FP16 scRGB → SDR transfer/matrix → HEVC I444 P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → HEVC I444 P16 | Native `xf44`, dedicated 10-bit Metal, EDR off |
 | HDR | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → HEVC I444 P16 | Declared `rec2100-pq` desktop: depth-30 XShm → BT.2020 NCL matrix → NVENC PQ; otherwise resolve to the Grading pipeline and report degradation | Native `xf44`, dedicated 10-bit Metal, PQ/EDR only when the resolved transfer remains PQ |
 
 Software encoding is another separate pipeline. Windows MF consumes WGC BGRA8
 through the shared NV12 conversion; source-built OpenH264 consumes checked
 BGRA/I420. Neither software path silently claims Grading or HDR.
+
+Grading's rate-control contract is deliberately asymmetric: it starts at the
+same link-capped budget used before this work, then the shared controller may
+probe as high as 250 Mbit/s when the path stays clean. NVENC sessions receive
+that value as `maxBitRate` while VBV is sized from the active target and grows
+only as the controller raises that target. The macOS Pier gives VideoToolbox the
+same ceiling through a one-second `DataRateLimits` window while keeping
+`AverageBitRate` at the active target. QP maps remain off for Grading so the
+quality field is uniform across the frame.
+
+HDR uses the same generic fixed-ceiling mechanism rather than a bespoke
+HDR-only encoder path: the shared HDR contract starts at the link-safe budget,
+sets a 500 Mbit/s ceiling, and uses an evidence-gated target-relative probe so
+the controller climbs only after a busy pipeline proves delivery near the
+current target. Linux and Windows NVENC sessions initialise with the resolved
+session frame rate, so 30 fps fidelity streams receive their configured target
+instead of a nominal-60-fps half-rate. HDR also owns only HDR-scoped queue
+budget increases: non-HDR host writer/video queues and Deck inbox limits remain
+unchanged.
 
 ## Why this exists
 
@@ -282,7 +301,7 @@ performance and colour switches:
 | Auto | 30 fps, adaptive 4:2:0 8-bit |
 | Speed | 60 fps, adaptive 4:2:0 8-bit |
 | Grading | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 |
-| HDR | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ |
+| HDR | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ; link-safe start, evidence-gated climb to 500 Mbit/s |
 
 HDR is active only when the host returns PQ. A Linux Xorg Pier resolves the HDR
 request to Grading and the Deck reports that permanent degradation while

@@ -198,20 +198,10 @@ pub fn color_contract_is_servable(video: VideoConfiguration, plan: &ResolvedMedi
         && (!video.matrix.is_identity() || plan.backend.contract().identity_matrix)
 }
 
-const ADAPTIVE_FROM_AV1: [VideoCodec; 3] = [VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264];
-const ADAPTIVE_FROM_HEVC: [VideoCodec; 2] = [VideoCodec::H265, VideoCodec::H264];
-const ADAPTIVE_FROM_H264: [VideoCodec; 1] = [VideoCodec::H264];
-const ADAPTIVE_UNSUPPORTED: [VideoCodec; 0] = [];
-
 /// Ordered hardware codec candidates for an ordinary adaptive session.
 #[must_use]
-pub const fn adaptive_codec_ladder(preferred: VideoCodec) -> &'static [VideoCodec] {
-    match preferred {
-        VideoCodec::Av1 => &ADAPTIVE_FROM_AV1,
-        VideoCodec::H265 => &ADAPTIVE_FROM_HEVC,
-        VideoCodec::H264 => &ADAPTIVE_FROM_H264,
-        VideoCodec::Jpeg | VideoCodec::Vp9 => &ADAPTIVE_UNSUPPORTED,
-    }
+pub fn adaptive_codec_ladder(preferred: VideoCodec) -> &'static [VideoCodec] {
+    crate::video::pipeline_codec_ladder(crate::video::PipelineId::Auto, preferred)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +217,7 @@ pub struct HostInitialVideoPolicy {
 pub struct ResolvedHostInitialVideo {
     pub video: VideoConfiguration,
     pub selection: VideoSelectionIntent,
+    pub pipeline: Option<crate::video::PipelineId>,
     pub encode_intent: EncodeIntent,
     pub max_fps: u32,
 }
@@ -282,6 +273,7 @@ fn codec_supported_by_client(
 
 fn resolve_codec(
     requested: VideoCodec,
+    requested_pipeline: Option<crate::video::PipelineId>,
     policy: HostInitialVideoPolicy,
     supported_codecs: CodecSet,
     capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg,
@@ -291,12 +283,15 @@ fn resolve_codec(
             && codec_supported_by_client(policy.current.codec, capabilities))
         .then_some(policy.current.codec);
     }
-    adaptive_codec_ladder(requested)
-        .iter()
-        .copied()
-        .find(|codec| {
-            supported_codecs.contains(*codec) && codec_supported_by_client(*codec, capabilities)
-        })
+    crate::video::pipeline_codec_ladder(
+        requested_pipeline.unwrap_or(crate::video::PipelineId::Auto),
+        requested,
+    )
+    .iter()
+    .copied()
+    .find(|codec| {
+        supported_codecs.contains(*codec) && codec_supported_by_client(*codec, capabilities)
+    })
 }
 
 /// Apply host colour policy and exact pins to a validated client request,
@@ -357,6 +352,7 @@ pub fn resolve_host_initial_video_with_supported_codecs(
         return Ok(ResolvedHostInitialVideo {
             video: policy.current,
             selection: VideoSelectionIntent::Exact,
+            pipeline: request.pipeline,
             encode_intent: request.encode_intent,
             max_fps: policy.max_fps.min(request.max_fps),
         });
@@ -385,6 +381,7 @@ pub fn resolve_host_initial_video_with_supported_codecs(
     );
     let codec = resolve_codec(
         request.video.codec,
+        request.pipeline,
         policy,
         supported_codecs,
         request.capabilities,
@@ -438,6 +435,7 @@ pub fn resolve_host_initial_video_with_supported_codecs(
         } else {
             request.selection
         },
+        pipeline: request.pipeline,
         encode_intent: request.encode_intent,
         max_fps: policy.max_fps.min(request.max_fps),
     })
@@ -507,6 +505,7 @@ mod tests {
             },
             encode_intent: EncodeIntent::Quality,
             motion_priority: crate::video::MotionPriority::Detail,
+            pipeline: Some(crate::video::PipelineId::Grading),
             max_fps: 60,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,
@@ -534,6 +533,50 @@ mod tests {
     }
 
     #[test]
+    fn host_codec_resolution_consumes_the_pipeline_ladder() {
+        let request = ResolvedClientVideoRequest {
+            selection: VideoSelectionIntent::ColorFidelity,
+            video: VideoConfiguration {
+                codec: VideoCodec::Av1,
+                chroma: ChromaSubsampling::Yuv444,
+                bit_depth: BitDepth::Ten,
+                ..video(VideoCodec::Av1)
+            },
+            encode_intent: EncodeIntent::Quality,
+            motion_priority: crate::video::MotionPriority::Detail,
+            pipeline: Some(crate::video::PipelineId::Grading),
+            max_fps: 30,
+            capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                av1: true,
+                yuv444: true,
+                main10: true,
+                ..Default::default()
+            },
+        };
+        let resolved = resolve_host_initial_video_with_supported_codecs(
+            request,
+            HostInitialVideoPolicy {
+                current: video(VideoCodec::H264),
+                color_policy: ColorPolicy::AlwaysOn,
+                codec_pinned: false,
+                variant_pinned: false,
+                max_fps: 30,
+            },
+            CodecSet::from_slice(&[VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264]),
+        )
+        .expect("grading ladder resolves");
+
+        assert_eq!(
+            resolved.video.codec,
+            VideoCodec::H265,
+            "Grading consumes its HEVC-first ladder instead of Auto's AV1-first ladder"
+        );
+        assert_eq!(resolved.video.chroma, ChromaSubsampling::Yuv444);
+    }
+
+    #[test]
     fn an_unmeasured_host_follows_the_requested_codec_unless_it_is_pinned() {
         let request = ResolvedClientVideoRequest {
             selection: VideoSelectionIntent::ColorFidelity,
@@ -544,6 +587,7 @@ mod tests {
             },
             encode_intent: EncodeIntent::Quality,
             motion_priority: crate::video::MotionPriority::Detail,
+            pipeline: Some(crate::video::PipelineId::Grading),
             max_fps: 30,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,
@@ -592,6 +636,7 @@ mod tests {
             video: video(VideoCodec::H265),
             encode_intent: EncodeIntent::Interactive,
             motion_priority: crate::video::MotionPriority::Detail,
+            pipeline: Some(crate::video::PipelineId::Auto),
             max_fps: 60,
             capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
                 h264: true,

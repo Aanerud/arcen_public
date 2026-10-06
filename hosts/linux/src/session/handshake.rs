@@ -37,9 +37,11 @@ use arcen_protocol::{
 /// `InputController::region_input_available`; it is true only when this
 /// attachment owns the shared region adapter for a committed Match My Layout
 /// session.
+#[allow(clippy::too_many_arguments)]
 pub fn build_server_hello(
     cfg: &Config,
     plan: &ResolvedMediaPlan,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
     session: Option<&SessionMetadata>,
     supports_display_update: bool,
     microphone_backend_available: bool,
@@ -92,14 +94,28 @@ pub fn build_server_hello(
         // client never sends display_update to a session that cannot resize.
         supports_display_update,
         requires_auth: cfg.auth_mode == AuthMode::Pam,
-        encoder_backend: plan.backend.ready_token().to_string(),
+        encoder_backend: served_encoder_backend_label(plan, aggregate_backend),
         // Declared by the backend rather than guessed by the client from the
         // token above, so a future hardware vendor is not shown as a fallback.
-        encoder_class: plan.backend.accelerator_class().token().to_string(),
+        encoder_class: aggregate_backend
+            .map_or("unknown", arcen_media::video::AcceleratorClass::token)
+            .to_string(),
         available_encoders: Default::default(),
         // Active codec so UDP-delivered frames (no in-band codec) would still
         // decode; also drives the client's codec badge.
         codec: plan.codec_token().to_string(),
+        active_pipeline: Some(arcen_media::video::served_pipeline(
+            cfg.requested_pipeline,
+            plan.video,
+            plan.fps,
+            cfg.requested_motion_priority(),
+            arcen_media::video::ServedPipelineContext {
+                backend: aggregate_backend,
+                exact_or_admin_override: cfg.codec_pinned
+                    || cfg.variant_pinned
+                    || cfg.requested_pipeline.is_none(),
+            },
+        )),
         color_caps: ServerColorCaps {
             // Backend capability -- what this resolved backend *could*
             // serve -- not what is currently active; `active_*` below
@@ -186,6 +202,19 @@ pub fn build_server_hello(
     .with_build_identity(crate::build_identity())
 }
 
+fn served_encoder_backend_label(
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> String {
+    if aggregate == Some(primary.backend.accelerator_class()) {
+        primary.backend.ready_token().to_string()
+    } else {
+        aggregate
+            .map_or("unknown", arcen_media::video::AcceleratorClass::token)
+            .to_string()
+    }
+}
+
 /// Validates that the client advertised the transport carrying this session.
 ///
 /// Returns `Some(capability_string)` on success, `None` when there is no common
@@ -252,7 +281,16 @@ mod tests {
             ..Config::default()
         };
         let plan = native_plan(VideoCodec::H265, true);
-        let hello = build_server_hello(&cfg, &plan, None, false, false, false, false);
+        let hello = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(hello.msg_type, SERVER_HELLO);
         assert_eq!(hello.codec, "h265");
         assert!(hello.color_caps.chroma_444, "444 must be advertised active");
@@ -294,13 +332,31 @@ mod tests {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H264, false);
 
-        let unavailable = build_server_hello(&cfg, &plan, None, false, false, false, false);
+        let unavailable = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             unavailable.input_capabilities.region_input,
             InputCapabilityAvailability::Unavailable
         );
 
-        let available = build_server_hello(&cfg, &plan, None, false, false, false, true);
+        let available = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(
             available.input_protocol_version,
             REGION_INPUT_PROTOCOL_VERSION
@@ -322,7 +378,16 @@ mod tests {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H264, false);
 
-        let unavailable = build_server_hello(&cfg, &plan, None, false, false, false, false);
+        let unavailable = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         for availability in [
             unavailable.input_capabilities.pen,
             unavailable.input_capabilities.pen_pressure,
@@ -333,7 +398,16 @@ mod tests {
             assert_eq!(availability, InputCapabilityAvailability::Unavailable);
         }
 
-        let available = build_server_hello(&cfg, &plan, None, false, false, true, false);
+        let available = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            true,
+            false,
+        );
         for availability in [
             available.input_capabilities.pen,
             available.input_capabilities.pen_pressure,
@@ -355,7 +429,16 @@ mod tests {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H264, false);
         for pen_available in [false, true] {
-            let hello = build_server_hello(&cfg, &plan, None, false, false, pen_available, false);
+            let hello = build_server_hello(
+                &cfg,
+                &plan,
+                Some(plan.backend.accelerator_class()),
+                None,
+                false,
+                false,
+                pen_available,
+                false,
+            );
             assert_eq!(
                 hello.input_capabilities.pen_rotation,
                 InputCapabilityAvailability::Unavailable
@@ -376,10 +459,19 @@ mod tests {
                 ..Config::default()
             };
             assert_eq!(
-                build_server_hello(&cfg, &plan, None, false, false, false, false)
-                    .audio_output
-                    .unwrap()
-                    .codecs,
+                build_server_hello(
+                    &cfg,
+                    &plan,
+                    Some(plan.backend.accelerator_class()),
+                    None,
+                    false,
+                    false,
+                    false,
+                    false
+                )
+                .audio_output
+                .unwrap()
+                .codecs,
                 vec![expected]
             );
         }
@@ -413,7 +505,16 @@ mod tests {
             cursor_mode: arcen_protocol::messages::CursorMode::Local,
             cursor_in_video: false,
         };
-        let hello = build_server_hello(&cfg, &plan, None, false, false, false, false);
+        let hello = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(hello.encoder_backend, "openh264-sw-h264");
         assert_eq!(hello.codec, "h264");
         assert!(!hello.color_caps.chroma_444);
@@ -431,7 +532,16 @@ mod tests {
     fn color_caps_report_real_backend_capability_not_hardcoded_false() {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H265, true);
-        let hello = build_server_hello(&cfg, &plan, None, false, false, false, false);
+        let hello = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
         // NativeNvenc's contract offers ten-bit, 4:4:4, an identity matrix,
         // and full range -- all real capability, not whatever `native_plan`'s
         // active axes happen to be set to.
@@ -462,7 +572,14 @@ mod tests {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H264, false);
         let json = serde_json::to_value(build_server_hello(
-            &cfg, &plan, None, false, false, false, false,
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            false,
+            false,
         ))
         .unwrap();
         assert_eq!(json["type"], "server_hello");
@@ -474,12 +591,30 @@ mod tests {
         let cfg = Config::default();
         let plan = native_plan(VideoCodec::H264, false);
         assert!(
-            !build_server_hello(&cfg, &plan, None, false, false, false, false)
-                .supports_display_update
+            !build_server_hello(
+                &cfg,
+                &plan,
+                Some(plan.backend.accelerator_class()),
+                None,
+                false,
+                false,
+                false,
+                false
+            )
+            .supports_display_update
         );
         assert!(
-            build_server_hello(&cfg, &plan, None, true, false, false, false)
-                .supports_display_update
+            build_server_hello(
+                &cfg,
+                &plan,
+                Some(plan.backend.accelerator_class()),
+                None,
+                true,
+                false,
+                false,
+                false
+            )
+            .supports_display_update
         );
     }
 
@@ -490,7 +625,19 @@ mod tests {
             ..Config::default()
         };
         let plan = native_plan(VideoCodec::H264, false);
-        assert!(build_server_hello(&cfg, &plan, None, false, false, false, false).requires_auth);
+        assert!(
+            build_server_hello(
+                &cfg,
+                &plan,
+                Some(plan.backend.accelerator_class()),
+                None,
+                false,
+                false,
+                false,
+                false
+            )
+            .requires_auth
+        );
     }
 
     #[test]
@@ -513,6 +660,7 @@ mod tests {
         let hello = build_server_hello(
             &Config::default(),
             &plan,
+            Some(plan.backend.accelerator_class()),
             Some(&metadata),
             false,
             false,

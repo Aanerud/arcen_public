@@ -9,6 +9,7 @@ use arcen_telemetry::{
 const HOST_SAMPLE_WINDOW_SECS: u32 = 2;
 const SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 const CLIENT_TELEMETRY_STALE_MS: u64 = 15_000;
+const FPS_WARMUP_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostCounters {
@@ -40,6 +41,7 @@ pub(crate) struct SessionHealth {
     first_timestamp_ms: Option<u64>,
     last_snapshot_ms: Option<u64>,
     unhealthy_since_ms: Option<u64>,
+    fps_warmup_enabled: bool,
 }
 
 impl SessionHealth {
@@ -54,6 +56,14 @@ impl SessionHealth {
             first_timestamp_ms: None,
             last_snapshot_ms: None,
             unhealthy_since_ms: None,
+            fps_warmup_enabled: false,
+        }
+    }
+
+    pub(crate) fn new_with_fps_warmup(targets: QosTargets) -> Self {
+        Self {
+            fps_warmup_enabled: true,
+            ..Self::new(targets)
         }
     }
 
@@ -110,6 +120,7 @@ impl SessionHealth {
         let dropped_delta = counters
             .frames_dropped
             .saturating_sub(self.previous.frames_dropped);
+        let first = *self.first_timestamp_ms.get_or_insert(timestamp_ms);
         let fps_actual = sent_delta
             .saturating_mul(1_000)
             .checked_div(elapsed_ms)
@@ -118,6 +129,8 @@ impl SessionHealth {
             timestamp_ms,
             fps_actual,
             fps_target: Some(fps_target),
+            fps_warmup: self.fps_warmup_enabled
+                && timestamp_ms.saturating_sub(first) < FPS_WARMUP_MS,
             frames_sent: Some(sent_delta),
             frames_dropped: Some(dropped_delta),
             input_events: Some(
@@ -130,6 +143,8 @@ impl SessionHealth {
         let mut client_sample = QosSample {
             timestamp_ms,
             fps_target: Some(fps_target),
+            fps_warmup: self.fps_warmup_enabled
+                && timestamp_ms.saturating_sub(first) < FPS_WARMUP_MS,
             ..QosSample::default()
         };
         apply_client_sample(&mut client_sample, self.client.as_ref());
@@ -181,7 +196,6 @@ impl SessionHealth {
                 (kind, fields)
             });
 
-        let first = *self.first_timestamp_ms.get_or_insert(timestamp_ms);
         let snapshot_due = timestamp_ms.saturating_sub(first) >= SNAPSHOT_INTERVAL_MS
             && self
                 .last_snapshot_ms

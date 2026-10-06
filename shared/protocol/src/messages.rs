@@ -2,7 +2,7 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Formatter};
 
 use crate::wire::AudioCodec;
 use arcen_usb_bridge::UsbSpeed;
@@ -36,6 +36,7 @@ pub const REQUEST_FULL_FRAME: &str = "request_full_frame";
 pub const HEALTH_PING: &str = "health_ping";
 pub const HEALTH_PONG: &str = "health_pong";
 pub const HEALTH_STATS: &str = "health_stats";
+pub const SERVED_PIPELINE: &str = "served_pipeline";
 pub const MOUSE_SCROLL: &str = "mouse_scroll";
 pub const GESTURE_MAGNIFY: &str = "gesture_magnify";
 pub const GESTURE_ROTATE: &str = "gesture_rotate";
@@ -527,6 +528,197 @@ const fn is_exact_video_selection(value: &VideoSelectionIntent) -> bool {
     matches!(value, VideoSelectionIntent::Exact)
 }
 
+/// User-visible stream pipeline named on the authenticated setup wire.
+///
+/// Unknown future tokens are preserved instead of rejected so a newer Deck or
+/// Pier can still parse the rest of the message and apply compatibility
+/// inference or an explicit refusal at the policy layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamPipeline {
+    Auto,
+    Speed,
+    Grading,
+    Hdr,
+    Unknown(String),
+}
+
+/// Pipeline the host actually served.
+///
+/// This is wider than [`StreamPipeline`]: Deck requests are limited to the
+/// four product pipelines or absent custom axes, while a host's truth also
+/// needs to name CPU software fallback and exact/custom streams. Unknown future
+/// tokens are preserved so a newer host does not break parsing of the whole
+/// hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedStreamPipeline {
+    Auto,
+    Speed,
+    Grading,
+    Hdr,
+    Software,
+    Custom,
+    Unknown(String),
+}
+
+impl ServedStreamPipeline {
+    /// Stable wire token.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Speed => "speed",
+            Self::Grading => "grading",
+            Self::Hdr => "hdr",
+            Self::Software => "software",
+            Self::Custom => "custom",
+            Self::Unknown(token) => token.as_str(),
+        }
+    }
+
+    /// Parse a stable token, preserving unknown future values.
+    #[must_use]
+    pub fn from_token(value: &str) -> Self {
+        match value {
+            "auto" => Self::Auto,
+            "speed" => Self::Speed,
+            "grading" => Self::Grading,
+            "hdr" => Self::Hdr,
+            "software" => Self::Software,
+            "custom" => Self::Custom,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+}
+
+impl Serialize for ServedStreamPipeline {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.token())
+    }
+}
+
+impl<'de> Deserialize<'de> for ServedStreamPipeline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ServedStreamPipelineVisitor;
+
+        impl Visitor<'_> for ServedStreamPipelineVisitor {
+            type Value = ServedStreamPipeline;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a served stream pipeline token")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(ServedStreamPipeline::from_token(value))
+            }
+        }
+
+        deserializer.deserialize_str(ServedStreamPipelineVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServedPipelineMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub served: ServedStreamPipeline,
+    /// `"hardware"`, `"software"`, or `"unknown"`.
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ServedPipelineMsg {
+    #[must_use]
+    pub fn new(
+        served: ServedStreamPipeline,
+        backend: impl Into<String>,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            msg_type: SERVED_PIPELINE.to_owned(),
+            served,
+            backend: backend.into(),
+            reason,
+        }
+    }
+}
+
+impl StreamPipeline {
+    /// Stable wire token.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Speed => "speed",
+            Self::Grading => "grading",
+            Self::Hdr => "hdr",
+            Self::Unknown(token) => token.as_str(),
+        }
+    }
+
+    /// Parse a stable token, preserving unknown future values.
+    #[must_use]
+    pub fn from_token(value: &str) -> Self {
+        match value {
+            "auto" => Self::Auto,
+            "speed" => Self::Speed,
+            "grading" => Self::Grading,
+            "hdr" => Self::Hdr,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
+    /// Whether this build knows the token's policy contract.
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        matches!(self, Self::Auto | Self::Speed | Self::Grading | Self::Hdr)
+    }
+}
+
+impl Serialize for StreamPipeline {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.token())
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamPipeline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StreamPipelineVisitor;
+
+        impl Visitor<'_> for StreamPipelineVisitor {
+            type Value = StreamPipeline;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a stream pipeline token")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(StreamPipeline::from_token(value))
+            }
+        }
+
+        deserializer.deserialize_str(StreamPipelineVisitor)
+    }
+}
+
 /// Client decode capabilities needed before the host creates its encoder.
 ///
 /// These mirror the video subset of `ClientHelloMsg`. They travel in the
@@ -587,6 +779,8 @@ impl ClientVideoCapabilitiesMsg {
 pub struct InitialVideoRequestMsg {
     pub quality: QualitySettings,
     pub capabilities: ClientVideoCapabilitiesMsg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<StreamPipeline>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1915,6 +2109,9 @@ pub struct ServerHelloMsg {
     pub available_encoders: BTreeMap<String, Value>,
     #[serde(default = "default_codec")]
     pub codec: String,
+    /// Pipeline the host actually served. Omitted by legacy hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pipeline: Option<ServedStreamPipeline>,
     #[serde(default)]
     pub color_caps: ServerColorCaps,
     #[serde(default)]
@@ -3661,6 +3858,78 @@ pub fn msg_type(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_fields_are_additive_and_round_trip() {
+        let old: InitialVideoRequestMsg = serde_json::from_str(
+            r#"{"quality":{"type":"quality_settings","quality_bias":0.5,"max_fps":30,"max_bandwidth_mbps":50.0,"codec":"h264","chroma":"yuv420","force_lossless":false,"intra_refresh":false,"enable_audio":true,"audio_bitrate_kbps":128},"capabilities":{"h264":true}}"#,
+        )
+        .expect("old request parses");
+        assert_eq!(old.pipeline, None);
+
+        let request = InitialVideoRequestMsg {
+            pipeline: Some(StreamPipeline::Speed),
+            ..old
+        };
+        let json = serde_json::to_string(&request).expect("request json");
+        assert!(json.contains(r#""pipeline":"speed""#));
+        let round_trip: InitialVideoRequestMsg = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(round_trip.pipeline, Some(StreamPipeline::Speed));
+    }
+
+    #[test]
+    fn unknown_pipeline_token_preserves_the_message() {
+        let request: InitialVideoRequestMsg = serde_json::from_str(
+            r#"{"pipeline":"cinema","quality":{"type":"quality_settings","quality_bias":0.5,"max_fps":30,"max_bandwidth_mbps":50.0,"codec":"h264","chroma":"yuv420","force_lossless":false,"intra_refresh":false,"enable_audio":true,"audio_bitrate_kbps":128},"capabilities":{"h264":true}}"#,
+        )
+        .expect("unknown future token parses");
+        assert_eq!(
+            request.pipeline,
+            Some(StreamPipeline::Unknown("cinema".to_string()))
+        );
+    }
+
+    #[test]
+    fn server_hello_active_pipeline_is_optional() {
+        let old: ServerHelloMsg = serde_json::from_str(r#"{"type":"server_hello","codec":"h264"}"#)
+            .expect("old hello parses");
+        assert_eq!(old.active_pipeline, None);
+        let mut hello = old;
+        hello.active_pipeline = Some(ServedStreamPipeline::Grading);
+        let round_trip: ServerHelloMsg =
+            serde_json::from_value(serde_json::to_value(&hello).expect("json")).expect("hello");
+        assert_eq!(
+            round_trip.active_pipeline,
+            Some(ServedStreamPipeline::Grading)
+        );
+    }
+
+    #[test]
+    fn served_pipeline_message_round_trips_and_preserves_unknown_served_token() {
+        let message = ServedPipelineMsg::new(
+            ServedStreamPipeline::Software,
+            "software",
+            Some("OpenH264 fallback".to_string()),
+        );
+        let json = serde_json::to_value(&message).expect("json");
+        assert_eq!(json["type"], SERVED_PIPELINE);
+        assert_eq!(json["served"], "software");
+        let decoded: ServedPipelineMsg = serde_json::from_value(json).expect("round trip");
+        assert_eq!(decoded, message);
+
+        let future: ServedPipelineMsg = serde_json::from_value(serde_json::json!({
+            "type": "served_pipeline",
+            "served": "cinema",
+            "backend": "hardware"
+        }))
+        .expect("unknown served token does not break message parsing");
+        assert_eq!(
+            future.served,
+            ServedStreamPipeline::Unknown("cinema".to_string())
+        );
+    }
+
     #[test]
     fn only_an_opted_in_client_hello_accepts_the_audio_priority_stream() {
         let hello = |flag: bool| {
@@ -3708,8 +3977,6 @@ mod tests {
         .expect("encode");
         assert!(precise.contains(r#""unit":"point""#) && precise.contains(r#""phase":"began""#));
     }
-
-    use super::*;
 
     #[test]
     fn client_hello_serializes_python_wire_type_field() {
@@ -3840,6 +4107,7 @@ mod tests {
                 av1: true,
                 ..ClientVideoCapabilitiesMsg::default()
             },
+            pipeline: Some(StreamPipeline::Auto),
         });
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(

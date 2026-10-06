@@ -157,6 +157,7 @@ impl PipelineStats {
         want_idr: bool,
         capture_backend: &str,
         damage_source: &str,
+        qp_stats: Option<arcen_media::video::QpMapStats>,
     ) {
         let average_encode_ms = if self.submitted == 0 {
             0.0
@@ -173,6 +174,14 @@ impl PipelineStats {
         } else {
             self.stage_ms_sum / self.stage_samples as f64
         };
+        let qp_stats = qp_stats.map_or_else(String::new, |stats| {
+            format!(
+                " qp_stats.biased_maps={} qp_stats.neutral_maps={} qp_stats.mean_dirty_fraction={:.4}",
+                stats.biased_maps,
+                stats.neutral_maps,
+                stats.mean_dirty_fraction()
+            )
+        });
         log(&format!(
             "enc_fps={} encode_submitted={} avg_capture_ms={average_capture_ms:.2} \
              max_capture_ms={:.2} avg_stage_ms={average_stage_ms:.2} max_stage_ms={:.2} \
@@ -181,7 +190,7 @@ impl PipelineStats {
              capture_direct={} want_idr={want_idr} emit_first={} emit_idr={} \
              emit_activity={} emit_keepalive={} pipeline_flush={} \
              capture_recreated={} stale_outputs_dropped={} \
-             damage_source={damage_source}",
+             damage_source={damage_source}{qp_stats}",
             self.emitted,
             self.submitted,
             self.capture_ms_max,
@@ -1470,7 +1479,13 @@ unsafe fn run_encode(
         }
 
         if sec.elapsed().as_secs_f64() >= 1.0 {
-            stats.log_and_reset(dbg, control.idr_pending(), "nvfbc", NVFBC_DAMAGE_SOURCE);
+            stats.log_and_reset(
+                dbg,
+                control.idr_pending(),
+                "nvfbc",
+                NVFBC_DAMAGE_SOURCE,
+                None,
+            );
             dbg = (0, 0, 0);
             sec = Instant::now();
         }
@@ -1702,7 +1717,13 @@ unsafe fn run_wide_encode(
             } else {
                 "full_poll"
             };
-            stats.log_and_reset(capture_counts, control.idr_pending(), "xshm", damage_source);
+            stats.log_and_reset(
+                capture_counts,
+                control.idr_pending(),
+                "xshm",
+                damage_source,
+                Some(encoder.take_qp_map_stats()),
+            );
             capture_counts = (0, 0, 0);
             sec = Instant::now();
         }
@@ -1733,6 +1754,7 @@ unsafe fn run_selftest(
     intent: arcen_media::EncodeIntent,
     priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
     yuv444: bool,
     framed: bool,
 ) -> i32 {
@@ -1756,6 +1778,9 @@ unsafe fn run_selftest(
         intent,
         priority,
         qp_map_policy,
+        fps,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -1984,6 +2009,9 @@ unsafe fn run_rgb10_pipe(
         intent,
         priority,
         qp_map_policy,
+        fps,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
         crate::nvenc_cuda::WideSource::ColorManagedPq,
     ) {
         Ok(encoder) => encoder,
@@ -2096,6 +2124,7 @@ unsafe fn run_admission_probe(
     intent: arcen_media::EncodeIntent,
     priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
     yuv444: bool,
     options: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
@@ -2133,6 +2162,9 @@ unsafe fn run_admission_probe(
         intent,
         priority,
         qp_map_policy,
+        fps,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -2192,6 +2224,7 @@ unsafe fn run_wide_admission_probe(
     intent: arcen_media::EncodeIntent,
     priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
     options: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
     if capture.width() != options.width || capture.height() != options.height {
@@ -2213,6 +2246,9 @@ unsafe fn run_wide_admission_probe(
         intent,
         priority,
         qp_map_policy,
+        fps,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -2318,6 +2354,13 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(2);
         }
     };
+    let max_bitrate_bps = match crate::requested_encoder_max_bitrate_bps(&args) {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(error) => {
+            log_error(&format!("invalid max-bitrate: {error}"));
+            std::process::exit(2);
+        }
+    };
     // NvFBC/CUDA buffer geometry and the encoder's own `chroma`/`bit_depth`
     // gate (`nvenc_cuda::Encoder::new`) must agree on this flag, or a variant
     // requesting 4:4:4 while the raw positional token still says 4:2:0 (or
@@ -2404,6 +2447,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         intent,
                         priority,
                         qp_map_policy,
+                        fps,
                         yuv444,
                         options,
                     )
@@ -2425,6 +2469,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         intent,
                         priority,
                         qp_map_policy,
+                        fps,
                         options,
                     )
                 }
@@ -2458,6 +2503,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                 intent,
                 priority,
                 qp_map_policy,
+                fps,
                 yuv444,
                 framed,
             );
@@ -2490,6 +2536,9 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                     intent,
                     priority,
                     qp_map_policy,
+                    fps,
+                    max_bitrate_bps,
+                    arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
                 ) {
                     Ok(mut encoder) => {
                         if qp_map_policy.submits_map() {
@@ -2532,6 +2581,9 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                     intent,
                     priority,
                     qp_map_policy,
+                    fps,
+                    max_bitrate_bps,
+                    arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
                     crate::nvenc_cuda::WideSource::xorg(desktop_encoding),
                 ) {
                     Ok(mut encoder) => {
@@ -2586,6 +2638,12 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
     let codec = args.get(2).map_or("h264", String::as_str);
+    let fps = args
+        .get(3)
+        .filter(|value| value.as_str() != "selftest")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(60)
+        .clamp(1, 240);
     let yuv444_token = args.iter().any(|value| value == "yuv444");
     // See `run_with_args`'s identical resolution: the single colour contract
     // this probe must actually attempt, and the capture/encoder-consistent
@@ -2678,6 +2736,9 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                     intent,
                     priority,
                     qp_map_policy,
+                    fps,
+                    None,
+                    arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
                 ) {
                     Ok(encoder) => encoder,
                     Err(error) => {
@@ -2710,6 +2771,9 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                     intent,
                     priority,
                     qp_map_policy,
+                    fps,
+                    None,
+                    arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
                     if pipe_source {
                         crate::nvenc_cuda::WideSource::ColorManagedPq
                     } else {
@@ -2958,6 +3022,9 @@ fn nvenc_attempt_for_row(
             arcen_media::EncodeIntent::Interactive,
             arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
+            30,
+            None,
+            arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
         )
     } {
         Ok(encoder) => {

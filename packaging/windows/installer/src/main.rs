@@ -21,6 +21,81 @@ mod service_outcome;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scm_state;
 
+/// Pure Windows SAN producer from discovered machine facts.
+///
+/// Kept outside the Windows-only installer module so migration comparisons are
+/// testable on every development host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_subject_alt_names_from_facts(
+    short: Option<&str>,
+    domain: Option<&str>,
+    dns_fqdn: Option<&str>,
+    ips: &[String],
+) -> Vec<String> {
+    let mut dns: Vec<String> = vec!["localhost".to_string(), "arcen-pier.local".to_string()];
+    let lower = |value: &str| value.trim().trim_matches('.').to_ascii_lowercase();
+    let push = |value: String, dns: &mut Vec<String>| {
+        if !value.is_empty() && !dns.contains(&value) {
+            dns.push(value);
+        }
+    };
+
+    if let Some(short) = short.map(lower).filter(|value| !value.is_empty()) {
+        push(short.clone(), &mut dns);
+        // `Win32_ComputerSystem.Domain` is "WORKGROUP" on a machine that is
+        // not domain-joined. Appending it would mint a name that resolves
+        // nowhere, so only a domain that actually looks like a DNS suffix
+        // is used.
+        if let Some(domain) = domain.map(lower).filter(|value| value.contains('.')) {
+            push(format!("{short}.{domain}"), &mut dns);
+        }
+    }
+    if let Some(fqdn) = dns_fqdn.map(lower).filter(|value| !value.is_empty()) {
+        push(fqdn.clone(), &mut dns);
+        // Mirror of the Linux defect: a host known only by its FQDN must
+        // still answer to the short name a person types.
+        if let Some((short, _)) = fqdn.split_once('.') {
+            push(short.to_string(), &mut dns);
+        }
+    }
+
+    let mut ordered = dns;
+    for address in ips {
+        if !ordered.contains(address) {
+            ordered.push(address.clone());
+        }
+    }
+    ordered
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn windows_generated_bare_sans_match_typed_certificate_sans() {
+        let facts = windows_subject_alt_names_from_facts(
+            Some("PIER-WINDOWS"),
+            Some("ad.example.internal"),
+            Some("pier-windows.ad.example.internal"),
+            &["127.0.0.1".to_string(), "203.0.113.55".to_string()],
+        );
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(facts.clone()).expect("params");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let cert = params.self_signed(&key).expect("cert");
+
+        assert!(
+            arcen_transport::cert_marker::subject_alt_names_match_pem(
+                cert.pem().as_bytes(),
+                &facts,
+            ),
+            "typed cert SANs must match the bare Windows producer output"
+        );
+    }
+}
+
 #[cfg(windows)]
 #[path = "../../../quic_config_migration.rs"]
 mod quic_config_migration;
@@ -953,40 +1028,7 @@ mod imp {
         dns_fqdn: Option<&str>,
         ips: &[String],
     ) -> Vec<String> {
-        let mut dns: Vec<String> = vec!["localhost".to_string(), "arcen-pier.local".to_string()];
-        let lower = |value: &str| value.trim().trim_matches('.').to_ascii_lowercase();
-        let push = |value: String, dns: &mut Vec<String>| {
-            if !value.is_empty() && !dns.contains(&value) {
-                dns.push(value);
-            }
-        };
-
-        if let Some(short) = short.map(lower).filter(|value| !value.is_empty()) {
-            push(short.clone(), &mut dns);
-            // `Win32_ComputerSystem.Domain` is "WORKGROUP" on a machine that is
-            // not domain-joined. Appending it would mint a name that resolves
-            // nowhere, so only a domain that actually looks like a DNS suffix
-            // is used.
-            if let Some(domain) = domain.map(lower).filter(|value| value.contains('.')) {
-                push(format!("{short}.{domain}"), &mut dns);
-            }
-        }
-        if let Some(fqdn) = dns_fqdn.map(lower).filter(|value| !value.is_empty()) {
-            push(fqdn.clone(), &mut dns);
-            // Mirror of the Linux defect: a host known only by its FQDN must
-            // still answer to the short name a person types.
-            if let Some((short, _)) = fqdn.split_once('.') {
-                push(short.to_string(), &mut dns);
-            }
-        }
-
-        let mut ordered = dns;
-        for address in ips {
-            if !ordered.contains(address) {
-                ordered.push(address.clone());
-            }
-        }
-        ordered
+        crate::windows_subject_alt_names_from_facts(short, domain, dns_fqdn, ips)
     }
 
     /// Names and addresses this host will actually be reached by.
@@ -1104,10 +1146,12 @@ mod imp {
 
         let bytes = std::fs::read(&cert).ok();
         let ownership = bytes.as_ref().map(|bytes| {
-            if marker_matches(tls, bytes) {
+            if !tls.join(MARKER_FILE).exists() {
+                MaterialOwnership::Foreign
+            } else if marker_matches(tls, bytes) {
                 MaterialOwnership::Owned
             } else {
-                MaterialOwnership::Foreign
+                MaterialOwnership::Ambiguous
             }
         });
         let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -1128,9 +1172,12 @@ mod imp {
             certificate_valid,
             expiring_or_expired,
             stale_staging_present: false,
-            self_signed: bytes
-                .as_ref()
-                .is_some_and(|bytes| cert_marker::is_self_signed_pem(bytes)),
+            legacy_arcen_self_signed: bytes.as_ref().is_some_and(|bytes| {
+                cert_marker::is_legacy_arcen_self_signed_pem(
+                    bytes,
+                    legacy_arcen_evidence(tls, bytes),
+                )
+            }),
         }
     }
 
@@ -1146,6 +1193,29 @@ mod imp {
             return false;
         };
         marker.matches(&pins.certificate, &pins.spki)
+    }
+
+    fn legacy_arcen_evidence(
+        tls: &Path,
+        certificate_bytes: &[u8],
+    ) -> cert_marker::LegacyArcenEvidence {
+        let companion_pins_match = std::fs::read_to_string(tls.join("host.cert-sha256"))
+            .ok()
+            .zip(std::fs::read_to_string(tls.join("host.spki-sha256")).ok())
+            .is_some_and(|(certificate_pin, spki_pin)| {
+                cert_marker::companion_pins_match_pem(
+                    certificate_bytes,
+                    &certificate_pin,
+                    &spki_pin,
+                )
+            });
+        let machine_sans_match =
+            cert_marker::subject_alt_names_match_pem(certificate_bytes, &subject_alt_names());
+        cert_marker::LegacyArcenEvidence {
+            arcen_tls_directory: true,
+            companion_pins_match,
+            machine_sans_match,
+        }
     }
 
     /// Writes the pin files and ownership marker beside the certificate.
@@ -1975,7 +2045,7 @@ mod imp {
             // enterprise certificate an operator placed deliberately.
             let foreign = MaterialState {
                 ownership: Some(MaterialOwnership::Foreign),
-                self_signed: false,
+                legacy_arcen_self_signed: false,
                 ..MaterialState::owned_valid()
             };
             assert_eq!(
@@ -1983,6 +2053,36 @@ mod imp {
                 Ok(ProvisioningAction::KeepExisting)
             );
             assert!(plan(ProvisioningRequest::Rekey, foreign).is_err());
+        }
+
+        #[test]
+        fn pre_marker_windows_pair_is_adopted_from_crt_and_key_only() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "arcen-windows-installer-legacy-cert-{}-{unique}",
+                std::process::id()
+            ));
+            let tls = root.join("tls");
+            fs::create_dir_all(&tls).expect("create tls dir");
+            let key = KeyPair::generate().expect("key");
+            let params = certificate_params(subject_alt_names()).expect("params");
+            let certificate = params.self_signed(&key).expect("cert");
+            fs::write(tls.join("host.crt"), certificate.pem()).expect("write cert");
+            fs::write(tls.join("host.key"), key.serialize_pem()).expect("write key");
+
+            let state = inspect_tls(&tls);
+            let decision = plan(ProvisioningRequest::Ensure, state).expect("adopt");
+
+            assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));
+            assert!(
+                state.legacy_arcen_self_signed,
+                "crt+key-only Windows legacy material must still be recognised"
+            );
+            assert_eq!(decision.action, ProvisioningAction::AdoptAndRenew);
+            assert!(!decision.invalidates_pins);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]

@@ -95,11 +95,11 @@ use arcen_media::{
 
 use crate::nvapi::AdapterLuid;
 
-/// Explicit shared transform convention for this planner: physical outputs are
-/// driven at their native pre-rotation mode and Windows applies the rotation,
-/// so region descriptors carry the native stream extent plus a separate output
-/// transform.
-const TRANSFORM_CONVENTION: TransformConvention = TransformConvention::NativeNeedsTransform;
+/// Explicit shared transform convention for this planner: Windows CCD source
+/// modes are already in rotated desktop coordinates, while the target keeps a
+/// native signal mode plus `DISPLAYCONFIG_PATH_TARGET_INFO::rotation`.
+/// Captured/READY regions therefore use compositor-oriented source extents.
+const TRANSFORM_CONVENTION: TransformConvention = TransformConvention::AlreadyCompositorOriented;
 /// Explicit shared origin policy for this planner: the Windows virtual desktop
 /// is natively signed and the OS anchors the primary's own origin at `(0, 0)`,
 /// so a computed layout is never translated to a non-negative origin.
@@ -207,6 +207,9 @@ pub struct AvailableOutput {
     /// only.
     pub device_name: String,
     pub mode_capability: OutputModeCapability,
+    /// Whether this CCD target should use panel rotation or a Pier-owned
+    /// native timing for portrait outputs.
+    pub ccd_output_kind: arcen_outputs::WindowsCcdOutputKind,
     /// Non-empty set of rotations this output's assigned pipe/CRTC can apply.
     pub supported_rotations: Vec<Rotation>,
     /// Current attached desktop rectangle and refresh, captured by the same
@@ -624,11 +627,15 @@ pub struct WindowsMonitorPlan {
     /// Host virtual-desktop vertical origin. Signed; same primary-at-`0`
     /// guarantee as `x`.
     pub y: i32,
-    /// Rotation-aware on-desktop footprint (swapped from `mode_width`/
-    /// `mode_height` at 90/270 degrees).
+    /// Windows CCD source mode and capture/READY desktop footprint. For
+    /// 90/270-degree targets this is the already-rotated portrait desktop
+    /// surface, not the native target timing.
     pub width: u32,
     pub height: u32,
-    /// Exact native (pre-rotation) mode this output must be set to.
+    /// Exact native target timing this output must be set to before CCD
+    /// applies `rotation`. For 90/270-degree targets this is swapped relative
+    /// to `width`/`height`, allowing a landscape EDID mode plus rotation to
+    /// serve a portrait desktop source.
     pub mode_width: u32,
     pub mode_height: u32,
     /// Requested logical desktop rectangle retained in shared fixed-point
@@ -686,7 +693,7 @@ impl WindowsTopologyPlan {
     /// Builds the shared requested and applied region aggregates represented
     /// by this committed Windows topology, through the shared
     /// [`arcen_media::build_region_sets`] constructor under this planner's
-    /// explicit [`TransformConvention::NativeNeedsTransform`] convention.
+    /// explicit [`TransformConvention::AlreadyCompositorOriented`] convention.
     ///
     /// # Errors
     ///
@@ -717,7 +724,7 @@ impl WindowsMonitorPlan {
                 self.adapter_luid.high_part, self.adapter_luid.low_part, self.target_id
             ))?,
             logical_rect: self.logical_rect,
-            stream_size: PhysicalSize::new(self.mode_width, self.mode_height)?,
+            stream_size: PhysicalSize::new(self.width, self.height)?,
             scale: self.scale,
             rotation: self.rotation,
             primary: self.primary,
@@ -832,10 +839,12 @@ pub fn plan_current_topology(
             output.current_width,
             output.current_height,
         )?;
-        let (mode_width, mode_height) = match monitor.rotation {
-            Rotation::Degrees0 | Rotation::Degrees180 => (rect.width, rect.height),
-            Rotation::Degrees90 | Rotation::Degrees270 => (rect.height, rect.width),
-        };
+        let ccd_mode = arcen_outputs::windows_ccd_mode_plan(
+            rect.width,
+            rect.height,
+            monitor.rotation,
+            output.ccd_output_kind,
+        );
         rects.push(rect);
         requires_custom_timing |= output.mode_capability.requires_custom_timing();
         plans[monitor_index] = Some(WindowsMonitorPlan {
@@ -851,12 +860,12 @@ pub fn plan_current_topology(
             y: rect.y,
             width: rect.width,
             height: rect.height,
-            mode_width,
-            mode_height,
+            mode_width: ccd_mode.target_width,
+            mode_height: ccd_mode.target_height,
             logical_rect: region_logical_rect(&requested_monitors[monitor_index])?,
             scale: region_scale(&monitor.identity.id, monitor.scale)?,
             refresh_hz: output.current_refresh_hz.max(1),
-            rotation: monitor.rotation,
+            rotation: ccd_mode.target_rotation,
             primary: monitor.primary,
             color: monitor
                 .color
@@ -955,9 +964,11 @@ pub fn plan_topology(
     }
 
     let topology = AppliedMonitorTopology::new(generation, applied_monitors)?;
-    // `AppliedMonitor::desktop_rect_px` already reports the rotation-aware
-    // on-desktop footprint (native dimensions swapped at 90/270 degrees), so
-    // every bounds/placement calculation below can use it directly.
+    // Windows CCD source modes are already in desktop orientation. Do not use
+    // `AppliedMonitor::desktop_rect_px` here: that helper swaps extents for
+    // native-mode-plus-transform hosts, while Windows needs the rotated source
+    // surface dimensions and stores the native target timing separately in
+    // `mode_width`/`mode_height`.
     //
     // Unlike an Xorg/RandR screen, the Windows virtual desktop is natively
     // signed and never translated to a non-negative origin here: shared
@@ -971,8 +982,16 @@ pub fn plan_topology(
     let footprint_rects = topology
         .monitors()
         .iter()
-        .map(AppliedMonitor::desktop_rect_px)
-        .collect::<Result<Vec<LayoutRect>, MediaContractError>>()?;
+        .map(|monitor| {
+            let raw = monitor.monitor();
+            LayoutRect::new(
+                monitor.desktop_x_px,
+                monitor.desktop_y_px,
+                raw.width_px,
+                raw.height_px,
+            )
+        })
+        .collect::<Result<Vec<_>, MediaContractError>>()?;
     let bounds = signed_desktop_bounds(footprint_rects.clone())?;
 
     if bounds.width > MAX_VIRTUAL_DESKTOP_DIMENSION_PX
@@ -1013,20 +1032,24 @@ pub fn plan_topology(
                 rotation,
             });
         }
-        let mode_width = applied_monitor.monitor().width_px;
-        let mode_height = applied_monitor.monitor().height_px;
+        let ccd_mode = arcen_outputs::windows_ccd_mode_plan(
+            applied_monitor.monitor().width_px,
+            applied_monitor.monitor().height_px,
+            rotation,
+            output.ccd_output_kind,
+        );
         let refresh_hz = applied_monitor.monitor().refresh_hz;
         let scale = region_scale(&client_display_id, applied_monitor.monitor().scale)?;
         let requested_mode = OutputMode {
-            width: mode_width,
-            height: mode_height,
+            width: ccd_mode.target_width,
+            height: ccd_mode.target_height,
             refresh_hz,
         };
         if !output.mode_capability.supports(requested_mode) {
             return Err(WindowsTopologyError::NoMatchingMode {
                 client_display_id,
-                width: mode_width,
-                height: mode_height,
+                width: ccd_mode.target_width,
+                height: ccd_mode.target_height,
                 refresh_hz,
             });
         }
@@ -1045,12 +1068,12 @@ pub fn plan_topology(
             y: rect.y,
             width: rect.width,
             height: rect.height,
-            mode_width,
-            mode_height,
+            mode_width: ccd_mode.target_width,
+            mode_height: ccd_mode.target_height,
             logical_rect: region_logical_rect(applied_monitor.requested_monitor())?,
             scale,
             refresh_hz,
-            rotation,
+            rotation: ccd_mode.target_rotation,
             primary: applied_monitor.monitor().primary,
             color: applied_monitor
                 .monitor()
@@ -1125,6 +1148,7 @@ mod tests {
                 min_refresh_hz: 30,
                 max_refresh_hz: 240,
             },
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             supported_rotations: vec![
                 Rotation::Degrees0,
                 Rotation::Degrees90,
@@ -1162,6 +1186,7 @@ mod tests {
             global_index: target_id,
             device_name: format!(r"\\.\DISPLAY{}", target_id + 1),
             mode_capability: OutputModeCapability::FixedModes(modes),
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             supported_rotations: vec![Rotation::Degrees0],
             current_x: if target_id == 0 {
                 0
@@ -1616,13 +1641,13 @@ mod tests {
     fn mixed_scale_chain_across_a_rotated_hop_stays_flush() {
         let inventory = PhysicalOutputInventory::new(vec![
             output(luid(1), 0, 1_920, 1_080),
-            output(luid(1), 1, 1_920, 1_080),
+            output(luid(1), 1, 1_080, 1_920),
             output(luid(1), 2, 1_280, 720),
         ])
         .expect("inventory");
-        // The middle monitor is driven at its native 1920x1080 mode but
-        // rotated 90 degrees, so it occupies a 1080x1920 desktop footprint
-        // and the chain must continue from that rotated width.
+        // The middle monitor's CCD source mode is already in desktop
+        // orientation. Windows rotates the target timing separately, so the
+        // chain continues from the source width, not the landscape timing.
         let requested = RequestedMonitorTopology::new(vec![
             monitor_scaled(
                 "primary",
@@ -1636,7 +1661,7 @@ mod tests {
             monitor_scaled(
                 "portrait",
                 (960, 0),
-                (1_920, 1_080),
+                (1_080, 1_920),
                 (540, 960),
                 2.0,
                 false,
@@ -1658,7 +1683,7 @@ mod tests {
         let portrait = monitor_plan(&plan, "portrait");
         let tail = monitor_plan(&plan, "tail");
         assert_eq!(placed_rect(primary), (0, 0, 1_920, 1_080));
-        // Native mode stays unswapped; only the desktop footprint rotates.
+        assert_eq!((portrait.width, portrait.height), (1_080, 1_920));
         assert_eq!((portrait.mode_width, portrait.mode_height), (1_920, 1_080));
         assert_eq!(placed_rect(portrait), (1_920, 0, 1_080, 1_920));
         assert_eq!(placed_rect(tail), (3_000, 0, 1_280, 720));
@@ -1671,9 +1696,9 @@ mod tests {
             .expect("portrait region");
         assert_eq!(
             portrait_region.physical_size(),
-            PhysicalSize::new(1_920, 1_080).unwrap()
+            PhysicalSize::new(1_080, 1_920).unwrap()
         );
-        assert_eq!(portrait_region.transform(), OutputTransform::Rotate90);
+        assert_eq!(portrait_region.transform(), OutputTransform::Normal);
         let applied_portrait = applied_regions
             .get(portrait_region.id())
             .expect("applied portrait");
@@ -1864,13 +1889,12 @@ mod tests {
     }
 
     #[test]
-    fn host_regions_use_native_needs_transform_convention() {
+    fn host_regions_use_windows_ccd_oriented_source_convention() {
         let inventory = PhysicalOutputInventory::new(vec![output(luid(1), 0, 1_080, 1_920)])
             .expect("inventory");
-        // Native (pre-rotation) mode is 1080x1920 portrait; the client's
-        // logical arrangement describes the already-rotated 1920x1080
-        // apparent footprint, matching `RequestedMonitor`'s documented
-        // contract.
+        // Windows CCD uses an already-oriented source surface and applies
+        // rotation to the native target timing separately.
+        // For a 90-degree 1080x1920 source, the target timing is 1920x1080.
         let rotated = Monitor {
             identity: MonitorIdentity {
                 id: "a".to_owned(),
@@ -1897,22 +1921,169 @@ mod tests {
             RequestedMonitorTopology::new(vec![requested_monitor]).expect("requested topology");
         let plan = plan_topology(&requested, generation(), &inventory).expect("plan");
         let applied = &plan.monitors[0];
-        assert_eq!(applied.mode_width, 1_080);
-        assert_eq!(applied.mode_height, 1_920);
-        // Host NativeNeedsTransform keeps the native stream extent and
-        // carries the 90-degree output transform separately.
-        assert_eq!(applied.width, 1_920);
-        assert_eq!(applied.height, 1_080);
+        assert_eq!((applied.width, applied.height), (1_080, 1_920));
+        assert_eq!((applied.mode_width, applied.mode_height), (1_920, 1_080));
         let (regions, applied_regions) = plan.region_sets().expect("rotated regions");
         let region = regions.primary();
         assert_eq!(
             region.physical_size(),
             PhysicalSize::new(1_080, 1_920).unwrap()
         );
-        assert_eq!(region.transform(), OutputTransform::Rotate90);
+        assert_eq!(region.transform(), OutputTransform::Normal);
         assert_eq!(
             applied_regions.primary().applied_rect().size(),
-            AppliedSize::new(1_920, 1_080).unwrap()
+            AppliedSize::new(1_080, 1_920).unwrap()
+        );
+    }
+
+    #[test]
+    fn physical_portrait_secondary_uses_portrait_source_and_landscape_target_timing() {
+        let mut primary_output = fixed_mode_output(
+            luid(1),
+            0,
+            vec![OutputMode {
+                width: 5_120,
+                height: 2_880,
+                refresh_hz: 60,
+            }],
+        );
+        primary_output.supported_rotations = Rotation::ALL.to_vec();
+        let mut portrait_output = fixed_mode_output(
+            luid(1),
+            1,
+            vec![OutputMode {
+                width: 5_120,
+                height: 2_880,
+                refresh_hz: 60,
+            }],
+        );
+        portrait_output.supported_rotations = Rotation::ALL.to_vec();
+        let inventory =
+            PhysicalOutputInventory::new(vec![primary_output, portrait_output]).expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor_scaled(
+                "primary",
+                (0, 0),
+                (5_120, 2_880),
+                (2_560, 1_440),
+                2.0,
+                true,
+                Rotation::Degrees0,
+            ),
+            monitor_scaled(
+                "portrait",
+                (-1_440, -1_120),
+                (2_880, 5_120),
+                (1_440, 2_560),
+                2.0,
+                false,
+                Rotation::Degrees270,
+            ),
+        ])
+        .expect("requested topology");
+
+        let plan = plan_topology(&requested, generation(), &inventory)
+            .expect("landscape timing plus target rotation should satisfy a portrait source");
+        let primary = monitor_plan(&plan, "primary");
+        let portrait = monitor_plan(&plan, "portrait");
+
+        assert_eq!(placed_rect(primary), (0, 0, 5_120, 2_880));
+        assert_eq!((primary.mode_width, primary.mode_height), (5_120, 2_880));
+        assert_eq!(placed_rect(portrait), (-2_880, -2_240, 2_880, 5_120));
+        assert_eq!((portrait.mode_width, portrait.mode_height), (5_120, 2_880));
+        assert_no_overlap_and_exact_signed_bounds(&plan);
+        assert_eq!((plan.desktop_x, plan.desktop_y), (-2_880, -2_240));
+        assert_eq!((plan.desktop_width, plan.desktop_height), (8_000, 5_120));
+        let (regions, applied_regions) = plan.region_sets().expect("regions");
+        let portrait_region = regions
+            .get(RegionId::new(u32::from(portrait.session_monitor_id.get())).expect("region id"))
+            .expect("portrait region");
+        assert_eq!(
+            portrait_region.physical_size(),
+            PhysicalSize::new(2_880, 5_120).unwrap()
+        );
+        assert_eq!(portrait_region.transform(), OutputTransform::Normal);
+        assert_eq!(
+            applied_regions
+                .get(portrait_region.id())
+                .expect("applied portrait")
+                .applied_rect()
+                .size(),
+            AppliedSize::new(2_880, 5_120).unwrap()
+        );
+    }
+
+    #[test]
+    fn pier_owned_portrait_secondary_uses_native_portrait_timing_and_identity_rotation() {
+        let mut primary_output = fixed_mode_output(
+            luid(1),
+            0,
+            vec![OutputMode {
+                width: 5_120,
+                height: 2_880,
+                refresh_hz: 60,
+            }],
+        );
+        primary_output.ccd_output_kind = arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming;
+        primary_output.supported_rotations = Rotation::ALL.to_vec();
+        let mut portrait_output = fixed_mode_output(
+            luid(1),
+            1,
+            vec![OutputMode {
+                width: 2_880,
+                height: 5_120,
+                refresh_hz: 60,
+            }],
+        );
+        portrait_output.ccd_output_kind = arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming;
+        portrait_output.supported_rotations = Rotation::ALL.to_vec();
+        let inventory =
+            PhysicalOutputInventory::new(vec![primary_output, portrait_output]).expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor_scaled(
+                "primary",
+                (0, 0),
+                (5_120, 2_880),
+                (2_560, 1_440),
+                2.0,
+                true,
+                Rotation::Degrees0,
+            ),
+            monitor_scaled(
+                "portrait",
+                (-1_440, -1_120),
+                (2_880, 5_120),
+                (1_440, 2_560),
+                2.0,
+                false,
+                Rotation::Degrees270,
+            ),
+        ])
+        .expect("requested topology");
+
+        let plan = plan_topology(&requested, generation(), &inventory)
+            .expect("native portrait timing should satisfy a Pier-owned output");
+        let portrait = monitor_plan(&plan, "portrait");
+
+        assert_eq!(placed_rect(portrait), (-2_880, -2_240, 2_880, 5_120));
+        assert_eq!((portrait.mode_width, portrait.mode_height), (2_880, 5_120));
+        assert_eq!(portrait.rotation, Rotation::Degrees0);
+        let (regions, applied_regions) = plan.region_sets().expect("regions");
+        let portrait_region = regions
+            .get(RegionId::new(u32::from(portrait.session_monitor_id.get())).expect("region id"))
+            .expect("portrait region");
+        assert_eq!(
+            portrait_region.physical_size(),
+            PhysicalSize::new(2_880, 5_120).unwrap()
+        );
+        assert_eq!(portrait_region.transform(), OutputTransform::Normal);
+        assert_eq!(
+            applied_regions
+                .get(portrait_region.id())
+                .expect("applied portrait")
+                .applied_rect()
+                .size(),
+            AppliedSize::new(2_880, 5_120).unwrap()
         );
     }
 
@@ -2529,6 +2700,7 @@ mod tests {
             global_index: 0,
             device_name: r"\\.\DISPLAY1".to_owned(),
             mode_capability: OutputModeCapability::FixedModes(modes),
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             supported_rotations: vec![Rotation::Degrees0],
             current_x: 0,
             current_y: 0,

@@ -77,6 +77,7 @@ impl<'a> QosSampler<'a> {
             input_latency_ms: caller.input_latency_ms,
             input_events: Some(self.counters.input_events.swap(0, Ordering::Relaxed)),
             heartbeat_misses: caller.heartbeat_misses,
+            ..QosSample::default()
         }
     }
 

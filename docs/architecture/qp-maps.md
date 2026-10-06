@@ -1,7 +1,7 @@
 # Damage-driven QP maps: Keel's 16×16 grid on hardware encoders
 
 **Status.** Implemented and unit-tested; **never run on a GPU**. Off by
-default. Selected per run with `qp-map=off|on|neutral`.
+default. Selected per Pier config with `video.qp_map`.
 
 ---
 
@@ -105,8 +105,8 @@ the encoder.
   clean-region penalty applied there is baked into the reference that every
   following frame predicts from.
 - **Suppressed without a fresh observation.** `restage_latest` and blank frames
-  from the frame policy get a neutral map; a stale one describes a frame that
-  has already been replaced.
+  from the frame policy get no bias; a stale one describes a frame that has
+  already been replaced.
 - **Capability is probed, not assumed.** There is no `NV_ENC_CAPS_*` boolean
   for delta-map support (unlike the emphasis map, which has one and is
   H.264-only), so support is probed by **trial init**: request `qpMapMode`, and
@@ -148,16 +148,59 @@ Measure, per the four axes that decide this:
 Suggested run, one variable at a time:
 
 ```sh
-# control arm first, on the same content
+# control arm first, on the same content (capenc-level diagnostic)
 capenc <args> qp-map=off
 capenc <args> qp-map=neutral
 capenc <args> qp-map=on
 ```
 
-Watch the log line `QP map policy=<p> engaged=<bool>`. **`engaged=false` means
-the feature is not running** — the driver refused `qpMapMode`, the codec has no
-geometry, or the tracker could not be built. Do not record a result from a run
-that never engaged.
+For a real Pier, configure either one policy for every served pipeline:
+
+```json
+{
+  "video": {
+    "qp_map": "neutral"
+  }
+}
+```
+
+or a per-served-pipeline map:
+
+```json
+{
+  "video": {
+    "qp_map": {
+      "auto": "on",
+      "speed": "on",
+      "grading": "off",
+      "hdr": "off",
+      "software": "off",
+      "custom": "off"
+    }
+  }
+}
+```
+
+Missing keys default to the pipeline contract default, currently `off` for
+every pipeline. Each capenc process resolves its policy from that encoder's own
+planned backend and video contract before launch; software encoders force
+`off`. If READY later reports a different truth than the launch plan, the Pier
+logs the policy the encoder actually runs and keeps that policy for that
+process lifetime rather than claiming automatic correction. Use three benchmark
+arms on identical content:
+
+1. `off` — shipped baseline;
+2. `neutral` — map construction/submission overhead only;
+3. `on` — damage-biased map.
+
+Watch the log line
+`QP map policy=<p> engaged=<bool> damage_source=<cpu-hash|dxgi-rects|wgc-dirty-regions|none>`.
+**`engaged=false` means the feature is not running** — the driver refused
+`qpMapMode`, the codec has no geometry, the tracker could not be built, or the
+selected Windows capture provider has no damage source. A run that reports
+`reason=no_damage_source` submits no map; it is not the Neutral control arm.
+Debug logging adds per-second counts of biased versus neutral maps and the mean
+dirty-block fraction.
 
 ## 7. What is not done
 
@@ -165,22 +208,31 @@ that never engaged.
   live grading sessions with `engaged=true`, but matched workload numbers are
   still required before changing the default. Off now initializes with
   `NV_ENC_QP_MAP_DISABLED`, so Off/Neutral/On are distinct experimental arms.
-- **Windows NVENC and the Linux CUDA ten-bit path.** Eight-bit formats on Linux
-  CUDA cannot carry a map, and that is a decision rather than an omission.
-  Damage hashing needs the frame on the CPU. On Windows every format already
-  round-trips through a mapped staging texture, so tracking is free. On CUDA
-  only `needs_own_conversion` formats — the two **ten-bit** ones — copy device
-  to host for their own conversion; eight-bit formats stage zero-copy
-  device-to-device. Engaging there would mean adding a full-frame readback
-  purely to feed the map (tens of megabytes per frame at 4K) on the tier whose
-  whole point is throughput, very likely swamping any bitrate saved and
-  corrupting the benchmark it serves.
+- **Linux CUDA eight-bit path.** Eight-bit formats on Linux CUDA cannot carry a
+  map, and that is a decision rather than an omission. Damage hashing needs the
+  frame on the CPU. On CUDA only `needs_own_conversion` formats — the two
+  **ten-bit** ones — copy device to host for their own conversion; eight-bit
+  formats stage zero-copy device-to-device. Engaging there would mean adding a
+  full-frame readback purely to feed the map (tens of megabytes per frame at
+  4K) on the tier whose whole point is throughput, very likely swamping any
+  bitrate saved and corrupting the benchmark it serves.
 
   **Practical consequence:** on Linux you can measure QP maps on the *grading*
   tier (HEVC 4:4:4 10-bit) but not on the *performance* tier (AV1/HEVC 4:2:0
   8-bit). Doing the latter needs either a CUDA damage kernel or an existing CPU
   copy to piggyback on — neither worth guessing at until the ten-bit numbers
   say whether the idea works at all.
+- **Windows WGC dirty regions require the OS contract.** Windows NVENC uses OS
+  damage instead of a readback on the 8-bit GPU path. Desktop Duplication feeds
+  `GetFrameDirtyRects` plus conservative source+destination `GetFrameMoveRects`
+  into Keel. WGC feeds `Direct3D11CaptureFrame.DirtyRegions` only when
+  `GraphicsCaptureSession.DirtyRegionMode = ReportOnly` succeeds (Windows 11
+  24H2+). If WGC cannot enable that mode, `damage_source=none`, `engaged=false`,
+  and no map is submitted.
+- **macOS VideoToolbox.** The macOS Pier accepts `video.qp_map` so a shared
+  `pier.json` does not fail to parse, logs once that it is unsupported there,
+  and serves without a map. VideoToolbox exposes no equivalent per-coding-block
+  QP delta input.
 - **No adaptive bias.** The bias is fixed per session. An obvious refinement is
   to scale it by the dirty ratio Keel already computes — spend harder when
   little changed, back off when everything did — but that is a second

@@ -350,6 +350,9 @@ impl Default for SessionColor {
 pub struct DecodedVideoFrame {
     pub width: usize,
     pub height: usize,
+    /// CPU-side RGBA fallback payload. Empty when the frame was deliberately
+    /// published for the zero-copy macOS layer path only; in that case
+    /// [`Self::native`] carries the real `CVPixelBuffer`.
     pub rgba: Vec<u8>,
     pub timestamp_ms: u32,
     pub pixel_format: String,
@@ -368,6 +371,26 @@ pub enum VideoDecodeError {
     InvalidWireColor(wire::ProtocolError),
     #[error("{0}")]
     Backend(String),
+}
+
+/// Decode backend contract used by the media worker and per-monitor router.
+///
+/// Production uses [`NativeVideoDecoder`]. Tests can substitute a scripted
+/// backend below the real worker batch/router entry points without changing
+/// those entry points or the production decoder's behavior.
+pub trait VideoDecoderBackend {
+    fn set_session_color(&mut self, session_color: SessionColor);
+    fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool;
+    fn set_decode_latency_policy(&mut self, policy: arcen_media::video::DecodeLatencyPolicy);
+    fn decode(
+        &mut self,
+        header: &VideoHeader,
+        payload: &[u8],
+    ) -> Result<Option<DecodedVideoFrame>, VideoDecodeError>;
+    fn backend_name(&self) -> &'static str;
+    fn is_hardware_accelerated(&self) -> Option<bool>;
+    fn wants_keyframe(&self) -> bool;
+    fn notify_discontinuity(&mut self);
 }
 
 /// The wire codecs the native VideoToolbox path decodes today. H.264 is
@@ -461,6 +484,16 @@ impl NativeVideoDecoder {
         self.inner.set_session_color(session_color);
     }
 
+    pub fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool {
+        self.inner.set_prefer_native_biplanar(prefer)
+    }
+
+    /// Applies served-pipeline latency policy to the next VideoToolbox
+    /// decompression session this decoder creates.
+    pub fn set_decode_latency_policy(&mut self, policy: arcen_media::video::DecodeLatencyPolicy) {
+        self.inner.set_decode_latency_policy(policy);
+    }
+
     pub fn decode(
         &mut self,
         header: &VideoHeader,
@@ -513,6 +546,44 @@ impl NativeVideoDecoder {
 
     pub fn notify_discontinuity(&mut self) {
         self.inner.notify_discontinuity();
+    }
+}
+
+impl VideoDecoderBackend for NativeVideoDecoder {
+    fn set_session_color(&mut self, session_color: SessionColor) {
+        Self::set_session_color(self, session_color);
+    }
+
+    fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool {
+        Self::set_prefer_native_biplanar(self, prefer)
+    }
+
+    fn set_decode_latency_policy(&mut self, policy: arcen_media::video::DecodeLatencyPolicy) {
+        Self::set_decode_latency_policy(self, policy);
+    }
+
+    fn decode(
+        &mut self,
+        header: &VideoHeader,
+        payload: &[u8],
+    ) -> Result<Option<DecodedVideoFrame>, VideoDecodeError> {
+        Self::decode(self, header, payload)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        Self::backend_name(self)
+    }
+
+    fn is_hardware_accelerated(&self) -> Option<bool> {
+        Self::is_hardware_accelerated(self)
+    }
+
+    fn wants_keyframe(&self) -> bool {
+        Self::wants_keyframe(self)
+    }
+
+    fn notify_discontinuity(&mut self) {
+        Self::notify_discontinuity(self);
     }
 }
 
@@ -1946,6 +2017,7 @@ mod platform {
         rx: Option<Receiver<DecodeMessage>>,
         waiting_for_keyframe: bool,
         hardware_accelerated: Option<bool>,
+        prefer_native_biplanar: bool,
         /// Decoded frames thrown away by [`Self::drain_decoded_messages`]
         /// because a later callback for the same submitted access unit
         /// superseded them.
@@ -1972,11 +2044,30 @@ mod platform {
         /// a negotiated PQ stream's own identity, so an HDR session is
         /// presented as SDR while every layer still agrees with itself.
         session_color: SessionColor,
+        decode_latency_policy: arcen_media::video::DecodeLatencyPolicy,
     }
 
     impl PlatformVideoDecoder {
         pub fn set_session_color(&mut self, session_color: SessionColor) {
             self.session_color = session_color;
+        }
+
+        pub fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool {
+            if self.prefer_native_biplanar == prefer {
+                return false;
+            }
+            self.prefer_native_biplanar = prefer;
+            self.format = None;
+            self.session = None;
+            self.waiting_for_keyframe = true;
+            true
+        }
+
+        pub fn set_decode_latency_policy(
+            &mut self,
+            policy: arcen_media::video::DecodeLatencyPolicy,
+        ) {
+            self.decode_latency_policy = policy;
         }
 
         pub fn decode(
@@ -2283,7 +2374,9 @@ mod platform {
             // exact FourCC `preferred_pixel_format` resolved for this stream's
             // negotiated chroma/depth/range, rather than letting VideoToolbox
             // guess.
-            let attributes = requested_pixel_format.and_then(build_destination_attributes);
+            let attributes = requested_pixel_format.and_then(|format| {
+                build_destination_attributes(format, self.prefer_native_biplanar)
+            });
 
             let (tx, rx) = mpsc::channel();
 
@@ -2291,6 +2384,7 @@ mod platform {
             // `PixelTransferSession` is neither `Clone` nor guaranteed `Sync`
             // and the callback must own it. The outer `Result` is a hard
             // failure; the inner one is the session creation we may retry.
+            let prefer_native_biplanar = self.prefer_native_biplanar;
             let build_session = |attributes: Option<&CFDictionary>| {
                 let transfer = PixelTransferSession::new().map_err(|error| {
                     VideoDecodeError::Backend(format!(
@@ -2302,8 +2396,13 @@ mod platform {
                     &format,
                     attributes,
                     move |frame| {
-                        let message = match copy_rgba_frame(frame, chroma, &transfer, native_video)
-                        {
+                        let message = match copy_rgba_frame(
+                            frame,
+                            chroma,
+                            &transfer,
+                            native_video,
+                            prefer_native_biplanar,
+                        ) {
                             Ok(frame) => DecodeMessage::Frame(frame),
                             Err(error) => DecodeMessage::Error(error),
                         };
@@ -2346,10 +2445,13 @@ mod platform {
                     )));
                 }
             };
-            session.set_real_time(true).map_err(|error| {
-                VideoDecodeError::Backend(format!("Could not enable VT real-time decode: {error}"))
-            })?;
-
+            session
+                .set_real_time(self.decode_latency_policy.realtime)
+                .map_err(|error| {
+                    VideoDecodeError::Backend(format!(
+                        "Could not enable VT real-time decode: {error}"
+                    ))
+                })?;
             let hardware_accelerated = query_hardware_accelerated(&session);
             tracing::info!(
                 target: crate::logging::target::VIDEO,
@@ -2359,6 +2461,7 @@ mod platform {
                 full_range,
                 ?matrix,
                 ?requested_pixel_format_name,
+                realtime = self.decode_latency_policy.realtime,
                 ?hardware_accelerated,
                 "VideoToolbox decompression session (re)configured",
             );
@@ -2609,14 +2712,39 @@ mod platform {
     /// `pixel_format`, or `None` if the (effectively unreachable in
     /// practice) key constant is unavailable — VideoToolbox is then left to
     /// choose its own native output, exactly as before this change.
-    fn build_destination_attributes(pixel_format: u32) -> Option<CFDictionary> {
+    fn build_destination_attributes(
+        pixel_format: u32,
+        require_iosurface: bool,
+    ) -> Option<CFDictionary> {
         // SAFETY: `kCVPixelBufferPixelFormatTypeKey` is a well-known,
         // process-wide singleton CFStringRef exported by CoreVideo.
         let key = unsafe {
             CFString::from_raw_retained(raw::kCVPixelBufferPixelFormatTypeKey.cast_mut().cast())
         }?;
         let value = CFNumber::from_i64(i64::from(pixel_format));
-        Some(CFDictionary::from_pairs(&[(&key, &value)]))
+        if !require_iosurface {
+            return Some(CFDictionary::from_pairs(&[(&key, &value)]));
+        }
+        // SAFETY: these are well-known CoreVideo/CoreFoundation constants.
+        let metal_key = unsafe {
+            CFString::from_raw_retained(raw::kCVPixelBufferMetalCompatibilityKey.cast_mut().cast())
+        }?;
+        // SAFETY: `kCVPixelBufferIOSurfacePropertiesKey` is a process-wide
+        // singleton CFStringRef; an empty dictionary is the documented way to
+        // ask CoreVideo for IOSurface-backed buffers without extra properties.
+        let iosurface_key = unsafe {
+            CFString::from_raw_retained(raw::kCVPixelBufferIOSurfacePropertiesKey.cast_mut().cast())
+        }?;
+        // SAFETY: `kCFBooleanTrue` is a borrowed singleton CFBooleanRef; this
+        // retains it into an owned, type-erased CF value for the dictionary.
+        let metal_true =
+            unsafe { CFType::from_raw_retained(raw::kCFBooleanTrue.cast_mut().cast()) }?;
+        let iosurface_properties = CFDictionary::from_pairs(&[]);
+        Some(CFDictionary::from_pairs(&[
+            (&key, &value),
+            (&metal_key, &metal_true),
+            (&iosurface_key, &iosurface_properties),
+        ]))
     }
 
     /// Resolves a [`ColorPrimariesToken`] to the actual Apple constant.
@@ -3008,6 +3136,7 @@ mod platform {
         expected_chroma: ChromaSubsampling,
         transfer: &PixelTransferSession,
         native_video: arcen_media::VideoConfiguration,
+        prefer_native_biplanar: bool,
     ) -> Result<DecodedVideoFrame, String> {
         if frame.status != 0 {
             return Err(format!("VT decoder callback status {}", frame.status));
@@ -3017,7 +3146,7 @@ mod platform {
             .ok_or_else(|| "VT decoder callback did not include an image buffer".to_string())?;
         let format = pixel_buffer.pixel_format();
         let timestamp_ms = timestamp_to_ms(frame.presentation_time);
-        match classify_pixel_buffer_format(format)? {
+        return match classify_pixel_buffer_format(format)? {
             PixelBufferFormat::Rgba | PixelBufferFormat::Bgra => {
                 copy_locked_pixels(&pixel_buffer, format, timestamp_ms)
             }
@@ -3034,6 +3163,17 @@ mod platform {
                         expected_chroma
                     ));
                 }
+                if prefer_native_biplanar {
+                    return native_biplanar_frame(
+                        &pixel_buffer,
+                        format,
+                        chroma,
+                        range,
+                        depth,
+                        timestamp_ms,
+                        actual_native_video_configuration(native_video, chroma, range, depth),
+                    );
+                }
                 copy_biplanar_to_rgba(
                     &pixel_buffer,
                     format,
@@ -3045,6 +3185,70 @@ mod platform {
                     actual_native_video_configuration(native_video, chroma, range, depth),
                 )
             }
+        };
+
+        fn native_biplanar_frame(
+            pixel_buffer: &CVPixelBuffer,
+            format: u32,
+            chroma: ChromaSubsampling,
+            range: ColorRange,
+            depth: BufferDepth,
+            timestamp_ms: u32,
+            native_video: arcen_media::VideoConfiguration,
+        ) -> Result<DecodedVideoFrame, String> {
+            let width = pixel_buffer.width();
+            let height = pixel_buffer.height();
+            let guard = pixel_buffer
+                .lock(CVPixelBufferLockFlags::READ_ONLY)
+                .map_err(|status| format!("CVPixelBufferLockBaseAddress failed: {status}"))?;
+            if guard.plane_count() != 2 {
+                return Err(format!(
+                    "{} buffer has {} planes; expected exactly 2",
+                    fourcc_string(format),
+                    guard.plane_count()
+                ));
+            }
+            let y_data = guard
+                .plane_data(0)
+                .ok_or_else(|| "missing luma plane data".to_string())?;
+            let cbcr_data = guard
+                .plane_data(1)
+                .ok_or_else(|| "missing CbCr plane data".to_string())?;
+            validate_biplanar_layout(
+                chroma,
+                depth,
+                width,
+                height,
+                PlaneLayout {
+                    width: guard.width_of_plane(0),
+                    height: guard.height_of_plane(0),
+                    bytes_per_row: guard.bytes_per_row_of_plane(0),
+                    byte_len: y_data.len(),
+                },
+                PlaneLayout {
+                    width: guard.width_of_plane(1),
+                    height: guard.height_of_plane(1),
+                    bytes_per_row: guard.bytes_per_row_of_plane(1),
+                    byte_len: cbcr_data.len(),
+                },
+            )?;
+            drop(guard);
+            let range_name = match range {
+                ColorRange::Video => "video",
+                ColorRange::Full => "full",
+            };
+            Ok(DecodedVideoFrame {
+                width,
+                height,
+                rgba: Vec::new(),
+                timestamp_ms,
+                pixel_format: format!("{}-{range_name}-iosurface", fourcc_string(format)),
+                backend: "videotoolbox-iosurface",
+                native: Some(NativeDecodedVideoFrame {
+                    pixel_buffer: pixel_buffer.clone(),
+                    video: native_video,
+                }),
+            })
         }
     }
 
@@ -3405,7 +3609,7 @@ mod platform {
         );
         let format = apply_color_extensions(format, StreamCodec::H265, plan);
         let attributes = preferred_pixel_format(profile.chroma(), profile.ten_bit(), full_range)
-            .and_then(build_destination_attributes);
+            .and_then(|format| build_destination_attributes(format, false));
         let session = DecompressionSession::new_with_image_buffer_attributes(
             &format,
             attributes.as_ref(),
@@ -3422,7 +3626,7 @@ mod platform {
         let pps = super::build_h264_pps();
         let format = make_h264_format_description(&sps, &pps).map_err(|error| error.to_string())?;
         let attributes = preferred_pixel_format(ChromaSubsampling::Yuv420, false, false)
-            .and_then(build_destination_attributes);
+            .and_then(|format| build_destination_attributes(format, false));
         let session = DecompressionSession::new_with_image_buffer_attributes(
             &format,
             attributes.as_ref(),
@@ -3430,6 +3634,47 @@ mod platform {
         )
         .map_err(|error| format!("VTDecompressionSessionCreate: {error}"))?;
         Ok(query_hardware_accelerated(&session))
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_speed_decode_latency_policy() -> Result<(), String> {
+        let policy = arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Speed)
+            .decode_latency;
+        let h264_sps = super::build_h264_sps();
+        let h264_pps = super::build_h264_pps();
+        let h264_format = make_h264_format_description(&h264_sps, &h264_pps)
+            .map_err(|error| error.to_string())?;
+        let h264_attributes = preferred_pixel_format(ChromaSubsampling::Yuv420, false, false)
+            .and_then(|format| build_destination_attributes(format, false));
+        let h264 = DecompressionSession::new_with_image_buffer_attributes(
+            &h264_format,
+            h264_attributes.as_ref(),
+            |_frame| {},
+        )
+        .map_err(|error| format!("H.264 VTDecompressionSessionCreate: {error}"))?;
+        h264.set_real_time(policy.realtime)
+            .map_err(|error| format!("H.264 RealTime: {error}"))?;
+
+        let profile = super::HevcProbeProfile {
+            chroma_format_idc: 1,
+            bit_depth: 8,
+        };
+        let vps = super::build_hevc_vps(profile);
+        let sps = super::build_hevc_sps(profile);
+        let pps = super::build_hevc_pps();
+        let hevc_format =
+            make_hevc_format_description(&vps, &sps, &pps).map_err(|error| error.to_string())?;
+        let hevc_attributes = preferred_pixel_format(profile.chroma(), profile.ten_bit(), false)
+            .and_then(|format| build_destination_attributes(format, false));
+        let hevc = DecompressionSession::new_with_image_buffer_attributes(
+            &hevc_format,
+            hevc_attributes.as_ref(),
+            |_frame| {},
+        )
+        .map_err(|error| format!("HEVC VTDecompressionSessionCreate: {error}"))?;
+        hevc.set_real_time(policy.realtime)
+            .map_err(|error| format!("HEVC RealTime: {error}"))?;
+        Ok(())
     }
 
     /// Whether this Mac's VideoToolbox claims AV1 hardware decode at all.
@@ -3472,6 +3717,16 @@ mod platform {
         /// cross-platform `NativeVideoDecoder` API stays uniform.
         pub fn set_session_color(&mut self, _session_color: SessionColor) {}
 
+        pub fn set_prefer_native_biplanar(&mut self, _prefer: bool) -> bool {
+            false
+        }
+
+        pub fn set_decode_latency_policy(
+            &mut self,
+            _policy: arcen_media::video::DecodeLatencyPolicy,
+        ) {
+        }
+
         pub fn decode(
             &mut self,
             _codec: StreamCodec,
@@ -3510,6 +3765,11 @@ mod platform {
     pub(super) fn probe_decode_capabilities() -> super::DecodeCapabilities {
         super::DecodeCapabilities::default()
     }
+
+    #[cfg(test)]
+    pub(super) fn probe_speed_decode_latency_policy() -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3529,6 +3789,12 @@ mod tests {
         assert_eq!(nal_kind(AnnexBCodec::H264, nals[0]), NalKind::Sps);
         assert_eq!(nal_kind(AnnexBCodec::H264, nals[1]), NalKind::Pps);
         assert_eq!(nal_kind(AnnexBCodec::H264, nals[2]), NalKind::Keyframe);
+    }
+
+    #[test]
+    fn speed_decode_latency_policy_does_not_block_real_vt_sessions() {
+        platform::probe_speed_decode_latency_policy()
+            .expect("Speed decode tuning must not reject H.264 or HEVC sessions");
     }
 
     #[test]

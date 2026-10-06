@@ -18,7 +18,8 @@ use serde::Serialize;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::capture::{
-    CaptureConfig, CaptureError, CapturePixelFormat, CaptureSession, CapturedFrame,
+    CaptureConfig, CaptureDynamicRange, CaptureError, CapturePixelFormat, CaptureSession,
+    CapturedFrame,
 };
 use crate::encode::{EncodedAccessUnit, Encoder, EncoderCodec, EncoderConfig};
 use crate::net::PierSocket;
@@ -72,6 +73,8 @@ pub struct StreamStats {
     /// still desktop. Both give a low delivered rate; only this tells them
     /// apart.
     pub frames_dropped: u64,
+    /// Raw frames replaced before encode by a newer captured frame.
+    pub raw_frames_superseded: u64,
     /// Audio packets sent to the client.
     pub audio_packets_sent: u64,
     /// Frames not encoded because the compositor reported no change.
@@ -685,6 +688,21 @@ async fn enqueue(
         .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))
 }
 
+async fn stage_produced_frame(
+    priority: &tokio::sync::mpsc::Sender<Message>,
+    mut produced: Produced,
+    pending_frame: &mut Option<Produced>,
+) -> Result<Option<arcen_protocol::messages::ServedPipelineMsg>, StreamError> {
+    let served = produced.served_pipeline.take();
+    if let Some(message) = served.as_ref()
+        && let Ok(text) = serde_json::to_string(&message)
+    {
+        enqueue(priority, Message::Text(text)).await?;
+    }
+    *pending_frame = Some(produced);
+    Ok(served)
+}
+
 async fn send_input_mode_results(
     writer: &tokio::sync::mpsc::Sender<Message>,
     results: &InputModeResults,
@@ -754,7 +772,7 @@ fn handle_control(
     text: &str,
     stats: &mut StreamStats,
     keyframe_requests: Option<&std::sync::atomic::AtomicU64>,
-    last_keyframe_request: Option<&mut Instant>,
+    full_frame_requests: Option<&mut arcen_media::video::FullFrameRequestCoalescer>,
 ) -> Option<Incoming> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str)? {
@@ -784,14 +802,9 @@ fn handle_control(
         }
         arcen_protocol::messages::REQUEST_FULL_FRAME => {
             stats.full_frame_requests += 1;
-            let request_keyframe = last_keyframe_request.is_none_or(|last_request| {
-                let now = Instant::now();
-                if now.duration_since(*last_request) < FULL_FRAME_KEYFRAME_GUARD {
-                    return false;
-                }
-                *last_request = now;
-                true
-            });
+            let request_keyframe = full_frame_requests
+                .map(|coalescer| coalescer.request(Instant::now()).deliver_now)
+                .unwrap_or(true);
             if request_keyframe && let Some(requests) = keyframe_requests {
                 requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -815,9 +828,14 @@ fn handle_incoming(
         &mut arcen_protocol::clipboard::ClipboardReassembler,
         &crate::clipboard_session::ClipboardWorker,
     )>,
+    microphone: Option<
+        &mut crate::microphone_input::MicrophoneIngress<
+            crate::microphone_input::NativeMicrophoneDevice,
+        >,
+    >,
     input: Option<&mut crate::input_session::InputSession>,
     keyframe_requests: Option<&std::sync::atomic::AtomicU64>,
-    last_keyframe_request: Option<&mut Instant>,
+    full_frame_requests: Option<&mut arcen_media::video::FullFrameRequestCoalescer>,
 ) -> Result<Incoming, StreamError> {
     let (reassembler, worker) = match clipboard {
         Some((reassembler, worker)) => (Some(reassembler), Some(worker)),
@@ -841,7 +859,7 @@ fn handle_incoming(
                 (Some(_), None) => stats.clipboard_rejected += 1,
                 (None, _) => {
                     if let Some(outcome) =
-                        handle_control(&text, stats, keyframe_requests, last_keyframe_request)
+                        handle_control(&text, stats, keyframe_requests, full_frame_requests)
                     {
                         return Ok(outcome);
                     }
@@ -856,11 +874,7 @@ fn handle_incoming(
         }
         Some(Ok(Message::Close(_))) | None => Ok(Incoming::PeerLeft),
         Some(Ok(Message::Binary(bytes))) => {
-            let Some((reassembler, worker)) = reassembler.zip(worker) else {
-                stats.clipboard_rejected += 1;
-                return Ok(Incoming::Continue);
-            };
-            match dispatch_binary(&bytes, reassembler, worker) {
+            match dispatch_binary(&bytes, reassembler.zip(worker), microphone) {
                 BinaryOutcome::Handled => {}
                 BinaryOutcome::Rejected => stats.clipboard_rejected += 1,
                 BinaryOutcome::Unsupported(kind) => {
@@ -937,6 +951,8 @@ struct Producer {
     keyframe_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Frames not encoded because the compositor reported no change.
     suppressed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Raw captured frames superseded before encode by the latest-wins handoff.
+    superseded: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The encoding rate the session wants, in bits per second; zero keeps
     /// the encoder's own.
     rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -957,6 +973,8 @@ struct ProducerSignals<'a> {
     keyframe_requests: &'a std::sync::atomic::AtomicU64,
     /// Frames not encoded because the compositor reported no change.
     suppressed: &'a std::sync::atomic::AtomicU64,
+    /// Raw captured frames superseded before encode by the latest-wins handoff.
+    superseded: &'a std::sync::atomic::AtomicU64,
     /// The encoding rate the session wants; zero keeps the encoder's own.
     rate: &'a std::sync::atomic::AtomicU64,
 }
@@ -975,6 +993,8 @@ fn spawn_producer(
     capture: CaptureConfig,
     codec: EncoderCodec,
     motion_priority: arcen_media::video::MotionPriority,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     frame_budget: Option<u64>,
 ) -> Producer {
     // Two, not eight. Encoded frames cannot be dropped to catch up — a P-frame
@@ -993,6 +1013,8 @@ fn spawn_producer(
     let producer_keyframe_requests = std::sync::Arc::clone(&keyframe_requests);
     let suppressed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_suppressed = std::sync::Arc::clone(&suppressed);
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let producer_superseded = std::sync::Arc::clone(&superseded);
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
     let producer = std::thread::spawn(move || {
@@ -1000,6 +1022,8 @@ fn spawn_producer(
             capture,
             codec,
             motion_priority,
+            requested_pipeline,
+            served_pipeline,
             frame_budget,
             &frames_tx,
             ProducerSignals {
@@ -1007,6 +1031,7 @@ fn spawn_producer(
                 dropped: &producer_dropped,
                 keyframe_requests: &producer_keyframe_requests,
                 suppressed: &producer_suppressed,
+                superseded: &producer_superseded,
                 rate: &producer_rate,
             },
         )
@@ -1018,17 +1043,22 @@ fn spawn_producer(
         dropped,
         keyframe_requests,
         suppressed,
+        superseded,
         rate,
     }
 }
 
 /// Spawns the multi-display capture and encode thread.
-fn spawn_multi_producer(
+struct MultiProducerConfig {
     monitors: Vec<RegionStreamPlan>,
     codec: EncoderCodec,
     motion_priority: arcen_media::video::MotionPriority,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     frame_budget: Option<u64>,
-) -> Producer {
+}
+
+fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
     // Two per monitor, for the reason given in `spawn_producer`.
     let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<Result<Produced, String>>(4);
     let cancelled = ProducerCancel::new();
@@ -1039,22 +1069,22 @@ fn spawn_multi_producer(
     let producer_keyframe_requests = std::sync::Arc::clone(&keyframe_requests);
     let suppressed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_suppressed = std::sync::Arc::clone(&suppressed);
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let producer_superseded = std::sync::Arc::clone(&superseded);
     // Multi-monitor encoders keep their own rates for now; the session does
     // not drive this one.
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
     let producer = std::thread::spawn(move || {
         produce_multi(
-            &monitors,
-            codec,
-            motion_priority,
-            frame_budget,
+            config,
             &frames_tx,
             ProducerSignals {
                 cancelled: &producer_cancel,
                 dropped: &producer_dropped,
                 keyframe_requests: &producer_keyframe_requests,
                 suppressed: &producer_suppressed,
+                superseded: &producer_superseded,
                 rate: &producer_rate,
             },
         )
@@ -1066,6 +1096,7 @@ fn spawn_multi_producer(
         dropped,
         keyframe_requests,
         suppressed,
+        superseded,
         rate,
     }
 }
@@ -1276,6 +1307,7 @@ fn emit_health_diagnostics(fps_actual: u32, stats: &StreamStats) {
         fps_actual,
         frames_captured = stats.frames_captured,
         frames_dropped = stats.frames_dropped,
+        raw_frames_superseded = stats.raw_frames_superseded,
         frames_encoded = stats.frames_encoded,
         frames_sent = stats.frames_sent,
         frames_suppressed = stats.frames_suppressed,
@@ -1315,6 +1347,10 @@ pub struct StreamSession<'a> {
     pub codec: EncoderCodec,
     /// Shared detail/motion trade-off hook for this session.
     pub motion_priority: arcen_media::video::MotionPriority,
+    /// What the Deck requested, retained for authoritative served-pipeline correction.
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    /// What the handshake resolved after native proof/fallback/admin policy.
+    pub served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     /// Stop after this many frames, for probes and tests.
     pub frame_budget: Option<u64>,
     /// Where normalized input coordinates land.
@@ -1331,6 +1367,12 @@ pub struct StreamSession<'a> {
     /// letting a policy refuse individual payloads still reads the local
     /// pasteboard on every poll, for a user who had switched clipboard off.
     pub clipboard: Option<arcen_media::clipboard::ClipboardNegotiation>,
+    /// Deck-to-host microphone ingress for this session, when negotiated.
+    pub microphone: Option<
+        &'a mut crate::microphone_input::MicrophoneIngress<
+            crate::microphone_input::NativeMicrophoneDevice,
+        >,
+    >,
     /// Who draws the pointer: the Deck locally, or the compositor into the
     /// picture. Only the local case wants a shape reported.
     pub cursor_mode: arcen_protocol::messages::CursorMode,
@@ -1430,6 +1472,8 @@ pub struct MultiStreamSession<'a> {
     pub monitors: Vec<RegionStreamPlan>,
     pub codec: EncoderCodec,
     pub motion_priority: arcen_media::video::MotionPriority,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub frame_budget: Option<u64>,
     pub input: crate::input_session::InputMode,
     pub telemetry: crate::observability::HostTelemetry,
@@ -1444,6 +1488,9 @@ pub struct MultiStreamSession<'a> {
     pub input_mode_results: InputModeResults,
     /// How audio is encoded for the wire.
     pub audio_encoding: AudioEncoding,
+    /// Direct QUIC connection for path sampling. Relayed agents receive the
+    /// same signal as local control messages injected by the service relay.
+    pub path_signal_connection: Option<quinn::Connection>,
 }
 
 /// A stream that stopped before the client left cleanly.
@@ -1489,13 +1536,18 @@ pub async fn stream(
         session_id,
         mut audio,
         clipboard: clipboard_negotiation,
+        mut microphone,
         cursor_mode: session_cursor_mode,
         input_mode_results,
         audio_channel,
         audio_encoding,
         path_signal_connection,
         motion_priority,
+        requested_pipeline,
+        served_pipeline,
     } = session;
+    let operational_motion_priority =
+        arcen_media::video::operational_motion_priority(served_pipeline.as_ref(), motion_priority);
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     let (side_audio, side_audio_writer) = spawn_audio_channel(audio_channel);
     let Producer {
@@ -1505,8 +1557,16 @@ pub async fn stream(
         dropped: capture_dropped,
         keyframe_requests,
         suppressed: capture_suppressed,
+        superseded: raw_superseded,
         rate: encode_rate,
-    } = spawn_producer(capture, codec, motion_priority, frame_budget);
+    } = spawn_producer(
+        capture,
+        codec,
+        operational_motion_priority,
+        requested_pipeline,
+        served_pipeline.clone(),
+        frame_budget,
+    );
     // What the path carries decides how fast to encode; see
     // `arcen_media::rate_control`. The ceiling is what this session was sized
     // for, the rate the encoder starts at.
@@ -1515,19 +1575,25 @@ pub async fn stream(
     let fps = capture.fps;
     let chroma = capture.pixel_format.chroma();
     let depth = capture.pixel_format.bit_depth();
-    let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
-        width, height, fps, chroma, depth,
-    ));
-    let ceiling_bps = u64::from(arcen_media::video::average_bitrate_bps(
-        width, height, fps, chroma, depth,
-    ));
-    let mut rate_controller = arcen_media::rate_control::RateController::new(
-        arcen_media::rate_control::RateControlPolicy::for_bounds_and_priority(
-            start_bps,
-            ceiling_bps,
-            motion_priority,
-        ),
+    let writer_queue_depth = served_pipeline
+        .as_ref()
+        .and_then(arcen_media::video::PipelineId::from_served_wire)
+        .map_or(WRITER_QUEUE_DEPTH, |pipeline| {
+            arcen_media::video::pipeline_contract(pipeline)
+                .queue
+                .host_writer_messages
+        });
+    let policy = arcen_media::video::operational_rate_control_policy(
+        served_pipeline.as_ref(),
+        width,
+        height,
+        fps,
+        chroma,
+        depth,
+        motion_priority,
     );
+    let mut rate_controller = arcen_media::rate_control::RateController::new(policy);
+    let mut current_served_pipeline = served_pipeline.clone();
     let mut path_state = arcen_telemetry::PathSignalState::default();
     let mut latest_path_signal: Option<arcen_media::rate_control::PathSignal> = None;
     let mut rate_tick = tokio::time::interval(RATE_TICK);
@@ -1587,7 +1653,7 @@ pub async fn stream(
         let (mut sink, mut incoming) = socket.split();
         // The writer owns the sink; the loop below owns a queue into it. See
         // `drive_writer` for why the session must not do its own flushing.
-        let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(WRITER_QUEUE_DEPTH);
+        let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(writer_queue_depth);
         let (priority, mut priority_queue) =
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
@@ -1614,11 +1680,13 @@ pub async fn stream(
         let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
         let mut clipboard_send_tick = tokio::time::interval(CLIPBOARD_SEND_TICK);
         let mut audio_tick = tokio::time::interval(AUDIO_POLL);
+        let mut microphone_tick = tokio::time::interval(AUDIO_POLL);
         let mut audio_clock = AudioTimeline::default();
         let mut clipboard_sender = ClipboardSender::new();
-        let mut last_keyframe_request = Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(Instant::now);
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_KEYFRAME_GUARD);
+        let mut full_frame_tick = tokio::time::interval(Duration::from_millis(50));
+        full_frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // The writer runs concurrently with the whole loop, not as one arm
         // inside it. As an arm it was polled only between iterations, so the
@@ -1648,9 +1716,10 @@ pub async fn stream(
                         message,
                         &mut stats,
                         clipboard_arg,
+                        microphone.as_deref_mut(),
                         input.as_mut(),
                         Some(&keyframe_requests),
-                        Some(&mut last_keyframe_request),
+                        Some(&mut full_frame_requests),
                     )? {
                         Incoming::Continue => continue,
                         Incoming::PathSignal(signal) => {
@@ -1663,6 +1732,18 @@ pub async fn stream(
                         }
                         Incoming::PeerLeft => break,
                     }
+                }
+                _ = full_frame_tick.tick() => {
+                    if full_frame_requests.poll(Instant::now()).deliver_now {
+                        keyframe_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                _ = microphone_tick.tick(), if microphone.is_some() => {
+                    if let Some(ingress) = microphone.as_deref_mut() {
+                        ingress.playout_tick().map_err(|error| StreamError::Protocol(format!("microphone playout: {error:?}")))?;
+                    }
+                    continue;
                 }
                 _ = audio_tick.tick() => {
                     // Audio is drained on its own cadence rather than between
@@ -1713,6 +1794,8 @@ pub async fn stream(
                         }
                         stats.frames_dropped =
                             capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
+                        stats.raw_frames_superseded =
+                            raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
                         finalize_timings(
                             &mut stats,
                             started.elapsed(),
@@ -1750,6 +1833,7 @@ pub async fn stream(
                         .or(latest_path_signal);
                     let sample = arcen_media::rate_control::RateSample {
                         delivered_bytes: stats.bytes_sent.saturating_sub(bytes),
+                        peak_pipeline_delivered_bytes: stats.bytes_sent.saturating_sub(bytes),
                         elapsed: RATE_TICK,
                         mean_frame_wait: total_queue
                             .saturating_sub(queued)
@@ -1762,20 +1846,18 @@ pub async fn stream(
                     rate_mark = (stats.bytes_sent, stats.frames_sent, total_queue);
                     if rate_control && let Some(change) = rate_controller.observe(sample) {
                         encode_rate.store(change.target_bps, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(
-                            target: arcen_telemetry::names::target::MEDIA,
-                            previous_bps = change.previous_bps,
-                            target_bps = change.target_bps,
-                            reason = change.reason.token(),
-                            delivered_bps = sample.delivered_bytes * 8,
-                            rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
-                            queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
-                                loss_rate_permille = sample
-                                    .path
-                                    .map(|path| (path.loss_rate() * 1000.0).round() as u64),
-                            mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
-                            "encoder rate follows the path"
-                        );
+                            tracing::info!(
+                                target: arcen_telemetry::names::target::MEDIA,
+                                previous_bps = change.previous_bps,
+                                target_bps = change.target_bps,
+                                reason = change.reason.token(),
+                                delivered_bps = sample.delivered_bytes * 8,
+                                rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
+                                queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                loss_rate_permille = sample.path.map(loss_rate_permille),
+                                mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
+                                "encoder rate follows the path"
+                            );
                     }
                     continue;
                 }
@@ -1789,7 +1871,33 @@ pub async fn stream(
                 ready = frames_rx.recv(), if pending_frame.is_none() && !cancelled.is_cancelled() => {
                     match ready {
                         Some(next) => {
-                            pending_frame = Some(next.map_err(StreamError::Encode)?);
+                            let served_update = stage_produced_frame(
+                                &priority,
+                                next.map_err(StreamError::Encode)?,
+                                &mut pending_frame,
+                            )
+                            .await?;
+                            if let Some(served_update) = served_update
+                                && Some(served_update.served.clone()) != current_served_pipeline
+                            {
+                                current_served_pipeline = Some(served_update.served.clone());
+                                let policy = arcen_media::video::operational_rate_control_policy(
+                                    current_served_pipeline.as_ref(),
+                                    width,
+                                    height,
+                                    fps,
+                                    chroma,
+                                    depth,
+                                    motion_priority,
+                                );
+                                let start_bps = policy.start_bps;
+                                rate_controller =
+                                    arcen_media::rate_control::RateController::new(policy);
+                                encode_rate.store(
+                                    start_bps,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                             continue;
                         }
                         None => break,
@@ -1845,6 +1953,7 @@ pub async fn stream(
     };
 
     stats.frames_dropped = capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
+    stats.raw_frames_superseded = raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
     stats.frames_suppressed = capture_suppressed.load(std::sync::atomic::Ordering::Relaxed);
 
     // On every ending, not only the clean one.
@@ -1876,7 +1985,7 @@ pub async fn stream(
 ///
 /// Returns [`StreamEnded`] when capture, encode, or the socket fails. It
 /// carries aggregate statistics across every monitor.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_continue, clippy::too_many_lines)]
 pub async fn stream_multi(
     socket: &mut PierSocket,
     session: MultiStreamSession<'_>,
@@ -1885,6 +1994,8 @@ pub async fn stream_multi(
         monitors,
         codec,
         motion_priority,
+        requested_pipeline,
+        served_pipeline,
         frame_budget,
         input,
         telemetry,
@@ -1894,6 +2005,7 @@ pub async fn stream_multi(
         cursor_mode: session_cursor_mode,
         input_mode_results,
         audio_encoding,
+        path_signal_connection,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     // Counted before the plans are moved into the producer.
@@ -1902,6 +2014,9 @@ pub async fn stream_multi(
         .first()
         .map_or(0, |monitor| monitor.capture.fps)
         .saturating_mul(region_count);
+    let primary_capture = monitors.first().map(|monitor| monitor.capture);
+    let operational_motion_priority =
+        arcen_media::video::operational_motion_priority(served_pipeline.as_ref(), motion_priority);
     let Producer {
         frames: mut frames_rx,
         cancelled,
@@ -1909,14 +2024,30 @@ pub async fn stream_multi(
         dropped: capture_dropped,
         keyframe_requests,
         suppressed: capture_suppressed,
-        rate: _,
-    } = spawn_multi_producer(monitors, codec, motion_priority, frame_budget);
+        superseded: raw_superseded,
+        rate: encode_rate,
+    } = spawn_multi_producer(MultiProducerConfig {
+        monitors,
+        codec,
+        motion_priority: operational_motion_priority,
+        requested_pipeline,
+        served_pipeline: served_pipeline.clone(),
+        frame_budget,
+    });
 
     // Every monitor in a multi-display session is captured at the same rate,
     // and the aggregate `frames_sent` counts all of them, so the target a
     // snapshot is judged against is that rate times the number of regions.
     // Comparing an aggregate against a single display's target would report a
     // healthy two-screen session as running at double its contract.
+    let writer_queue_depth = served_pipeline
+        .as_ref()
+        .and_then(arcen_media::video::PipelineId::from_served_wire)
+        .map_or(WRITER_QUEUE_DEPTH, |pipeline| {
+            arcen_media::video::pipeline_contract(pipeline)
+                .queue
+                .host_writer_messages
+        });
     let started = Instant::now();
     let mut cadence = snapshot_cadence();
     // Driven by a timer rather than by frame arrival. The check used to sit
@@ -1959,7 +2090,7 @@ pub async fn stream_multi(
         let (mut sink, mut incoming) = socket.split();
         // The writer owns the sink; the loop below owns a queue into it. See
         // `drive_writer` for why the session must not do its own flushing.
-        let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(WRITER_QUEUE_DEPTH);
+        let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(writer_queue_depth);
         let (priority, mut priority_queue) =
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
@@ -1986,9 +2117,39 @@ pub async fn stream_multi(
         let mut audio_tick = tokio::time::interval(AUDIO_POLL);
         let mut audio_clock = AudioTimeline::default();
         let mut clipboard_sender = ClipboardSender::new();
-        let mut last_keyframe_request = Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(Instant::now);
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_KEYFRAME_GUARD);
+        let mut full_frame_tick = tokio::time::interval(Duration::from_millis(50));
+        full_frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let primary_capture = primary_capture
+            .ok_or_else(|| StreamError::Capture(CaptureError::StartFailed("no monitors".to_owned())))?;
+        let (width, height, fps, chroma, depth) = (
+            u32::try_from(primary_capture.width).unwrap_or(u32::MAX),
+            u32::try_from(primary_capture.height).unwrap_or(u32::MAX),
+            primary_capture.fps,
+            primary_capture.pixel_format.chroma(),
+            primary_capture.pixel_format.bit_depth(),
+        );
+        let policy = arcen_media::video::operational_rate_control_policy(
+            served_pipeline.as_ref(),
+            width,
+            height,
+            fps,
+            chroma,
+            depth,
+            motion_priority,
+        );
+        let mut rate_controller = arcen_media::rate_control::RateController::new(policy);
+        let mut current_served_pipeline = served_pipeline.clone();
+        let mut path_state = arcen_telemetry::PathSignalState::default();
+        let mut latest_path_signal: Option<arcen_media::rate_control::PathSignal> = None;
+        let mut rate_tick = tokio::time::interval(RATE_TICK);
+        rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let rate_control = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
+        let mut rate_marks = MultiRateMarks::default();
+        let mut monitor_bytes: std::collections::BTreeMap<arcen_media::SessionMonitorId, u64> =
+            std::collections::BTreeMap::new();
+        let multi_pipeline_count = region_count;
 
         // Concurrent with the whole loop, not an arm inside it: see the
         // single-display path above for the deadlock that arrangement caused.
@@ -2009,18 +2170,28 @@ pub async fn stream_multi(
                         message,
                         &mut stats,
                         clipboard_arg,
+                        None,
                         input.as_mut(),
                         Some(&keyframe_requests),
-                        Some(&mut last_keyframe_request),
+                        Some(&mut full_frame_requests),
                     )? {
                         Incoming::Continue => continue,
-                        Incoming::PathSignal(_) => continue,
+                        Incoming::PathSignal(signal) => {
+                            latest_path_signal = Some(signal);
+                            continue;
+                        }
                         Incoming::Reply(text) => {
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
                         }
                         Incoming::PeerLeft => break,
                     }
+                }
+                _ = full_frame_tick.tick() => {
+                    if full_frame_requests.poll(Instant::now()).deliver_now {
+                        keyframe_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
                 }
                 _ = audio_tick.tick() => {
                     send_audio(
@@ -2039,6 +2210,7 @@ pub async fn stream_multi(
                     let permit = permit
                         .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))?;
                     if let Some(frame) = pending_frame.take() {
+                        account_monitor_bytes(&mut monitor_bytes, frame.monitor_id, frame.payload.len() as u64);
                         let accumulators = Accumulators {
                             total_queue: &mut total_queue,
                             total_send: &mut total_send,
@@ -2048,6 +2220,53 @@ pub async fn stream_multi(
                             worst_frame: &mut worst_frame,
                         };
                         send_frame(permit, frame, &mut stats, accumulators);
+                    }
+                    continue;
+                }
+                _ = rate_tick.tick() => {
+                    let frames_now = stats.frames_sent.saturating_sub(rate_marks.frames);
+                    let path = path_signal_connection
+                        .as_ref()
+                        .map(|connection| {
+                            arcen_transport::observe_quinn_path_signal(
+                                &mut path_state,
+                                started.elapsed(),
+                                connection,
+                            )
+                        })
+                        .or(latest_path_signal);
+                    let sample = arcen_media::rate_control::RateSample {
+                        delivered_bytes: stats.bytes_sent.saturating_sub(rate_marks.bytes),
+                        peak_pipeline_delivered_bytes: rate_marks.peak_monitor_delta(&monitor_bytes),
+                        elapsed: RATE_TICK,
+                        mean_frame_wait: total_queue
+                            .saturating_sub(rate_marks.queued)
+                            .checked_div(u32::try_from(frames_now).unwrap_or(u32::MAX))
+                            .unwrap_or_default(),
+                        frames: frames_now,
+                        pipeline_count: multi_pipeline_count,
+                        path,
+                    };
+                    rate_marks.update(stats.bytes_sent, stats.frames_sent, total_queue, &monitor_bytes);
+                    if rate_control {
+                        let change = rate_controller.observe(sample);
+                        let target_bps = rate_controller.target_bps();
+                        encode_rate.store(target_bps, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(change) = change {
+                            tracing::info!(
+                                target: arcen_telemetry::names::target::MEDIA,
+                                previous_bps = change.previous_bps,
+                                target_bps = change.target_bps,
+                                reason = change.reason.token(),
+                                delivered_bps = sample.delivered_bytes * 8,
+                                pipelines = multi_pipeline_count,
+                                rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
+                                queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                loss_rate_permille = sample.path.map(loss_rate_permille),
+                                mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
+                                "multi-monitor encoder rate follows the path"
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2066,6 +2285,8 @@ pub async fn stream_multi(
                         }
                         stats.frames_dropped =
                             capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
+                        stats.raw_frames_superseded =
+                            raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
                         finalize_timings(
                             &mut stats,
                             started.elapsed(),
@@ -2098,7 +2319,33 @@ pub async fn stream_multi(
                 ready = frames_rx.recv(), if pending_frame.is_none() && !cancelled.is_cancelled() => {
                     match ready {
                         Some(next) => {
-                            pending_frame = Some(next.map_err(StreamError::Encode)?);
+                            let served_update = stage_produced_frame(
+                                &priority,
+                                next.map_err(StreamError::Encode)?,
+                                &mut pending_frame,
+                            )
+                            .await?;
+                            if let Some(served_update) = served_update
+                                && Some(served_update.served.clone()) != current_served_pipeline
+                            {
+                                current_served_pipeline = Some(served_update.served.clone());
+                                let policy = arcen_media::video::operational_rate_control_policy(
+                                    current_served_pipeline.as_ref(),
+                                    width,
+                                    height,
+                                    fps,
+                                    chroma,
+                                    depth,
+                                    motion_priority,
+                                );
+                                let start_bps = policy.start_bps;
+                                rate_controller =
+                                    arcen_media::rate_control::RateController::new(policy);
+                                encode_rate.store(
+                                    start_bps,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                             continue;
                         }
                         None => break,
@@ -2152,6 +2399,7 @@ pub async fn stream_multi(
     };
 
     stats.frames_dropped = capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
+    stats.raw_frames_superseded = raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
     stats.frames_suppressed = capture_suppressed.load(std::sync::atomic::Ordering::Relaxed);
 
     // On every ending, not only the clean one.
@@ -2214,6 +2462,60 @@ fn send_frame(
     *totals.worst_frame = (*totals.worst_frame).max(frame.took);
     stats.frames_sent += 1;
     stats.bytes_sent += sent_bytes;
+}
+
+fn account_monitor_bytes(
+    monitor_bytes: &mut std::collections::BTreeMap<arcen_media::SessionMonitorId, u64>,
+    monitor_id: Option<arcen_media::SessionMonitorId>,
+    bytes: u64,
+) {
+    if let Some(monitor_id) = monitor_id {
+        let entry = monitor_bytes.entry(monitor_id).or_default();
+        *entry = entry.saturating_add(bytes);
+    }
+}
+
+fn loss_rate_permille(path: arcen_media::rate_control::PathSignal) -> u64 {
+    let permille = (path.loss_rate() * 1000.0).round().clamp(0.0, 1000.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        permille as u64
+    }
+}
+
+#[derive(Default)]
+struct MultiRateMarks {
+    bytes: u64,
+    frames: u64,
+    queued: Duration,
+    monitor_bytes: std::collections::BTreeMap<arcen_media::SessionMonitorId, u64>,
+}
+
+impl MultiRateMarks {
+    fn peak_monitor_delta(
+        &self,
+        now: &std::collections::BTreeMap<arcen_media::SessionMonitorId, u64>,
+    ) -> u64 {
+        now.iter()
+            .map(|(monitor_id, bytes)| {
+                bytes.saturating_sub(self.monitor_bytes.get(monitor_id).copied().unwrap_or(0))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn update(
+        &mut self,
+        bytes: u64,
+        frames: u64,
+        queued: Duration,
+        monitor_bytes: &std::collections::BTreeMap<arcen_media::SessionMonitorId, u64>,
+    ) {
+        self.bytes = bytes;
+        self.frames = frames;
+        self.queued = queued;
+        self.monitor_bytes = monitor_bytes.clone();
+    }
 }
 
 /// Finalises the timings, emits the summary, and reports what the session did.
@@ -2295,6 +2597,8 @@ struct Produced {
     took: Duration,
     capture_wait: Duration,
     encode_took: Duration,
+    monitor_id: Option<arcen_media::SessionMonitorId>,
+    served_pipeline: Option<arcen_protocol::messages::ServedPipelineMsg>,
 }
 
 struct EncodeCounters<'a> {
@@ -2341,6 +2645,8 @@ fn encode_single_frame(
         took: frame_started.elapsed(),
         capture_wait,
         encode_took,
+        monitor_id: None,
+        served_pipeline: None,
     }))
 }
 
@@ -2407,15 +2713,17 @@ impl LatestFrame {
     ///
     /// Returns false once the consumer is gone, which is how the capture thread
     /// learns to stop.
-    fn publish(&self, staged: StagedFrame) -> bool {
+    fn publish(&self, mut staged: StagedFrame) -> bool {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.replace(staged).is_some() {
+        if let Some(old) = slot.take() {
+            staged.frame.damage.merge_superseded(old.frame.damage);
             self.superseded
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        *slot = Some(staged);
         drop(slot);
         self.ready.notify_one();
         true
@@ -2477,6 +2785,8 @@ fn produce(
     capture: CaptureConfig,
     codec: EncoderCodec,
     motion_priority: arcen_media::video::MotionPriority,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     frame_budget: Option<u64>,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
     signals: ProducerSignals<'_>,
@@ -2486,6 +2796,7 @@ fn produce(
         dropped,
         keyframe_requests,
         suppressed,
+        superseded,
         rate,
     } = signals;
     let session = CaptureSession::start(capture).map_err(StreamError::Capture)?;
@@ -2499,6 +2810,8 @@ fn produce(
                     capture,
                     codec,
                     motion_priority,
+                    requested_pipeline,
+                    served_pipeline,
                     frame_budget,
                     frames,
                     cancelled,
@@ -2512,7 +2825,7 @@ fn produce(
             latest.close();
             result
         });
-        let capture_result = capture_loop(&session, &latest, cancelled, dropped);
+        let capture_result = capture_loop(&session, &latest, cancelled, dropped, superseded);
         latest.close();
         let encode_result = encode_side
             .join()
@@ -2593,6 +2906,7 @@ fn capture_loop(
     latest: &LatestFrame,
     cancelled: &std::sync::atomic::AtomicBool,
     dropped: &std::sync::atomic::AtomicU64,
+    superseded: &std::sync::atomic::AtomicU64,
 ) -> Result<(), StreamError> {
     let frame_timeout = capture_frame_timeout();
     let first_frame_limit = first_frame_timeout();
@@ -2643,6 +2957,7 @@ fn capture_loop(
                 }) {
                     break;
                 }
+                superseded.store(latest.superseded(), std::sync::atomic::Ordering::Relaxed);
             }
             Err(error) => match classify_capture_wait(
                 error,
@@ -2668,11 +2983,13 @@ fn capture_loop(
 }
 
 /// What the encode stage needs that is not the encoder or the frame source.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EncodeLoopContext<'a> {
     capture: CaptureConfig,
     codec: EncoderCodec,
     motion_priority: arcen_media::video::MotionPriority,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     frame_budget: Option<u64>,
     frames: &'a tokio::sync::mpsc::Sender<Result<Produced, String>>,
     cancelled: &'a std::sync::atomic::AtomicBool,
@@ -2694,6 +3011,139 @@ fn stream_is_finished(
     frame_budget.is_some_and(|budget| sent >= budget)
         || cancelled.load(std::sync::atomic::Ordering::Relaxed)
         || frames.is_closed()
+}
+
+fn video_config_for_capture(
+    codec: EncoderCodec,
+    capture: CaptureConfig,
+) -> arcen_media::VideoConfiguration {
+    arcen_media::VideoConfiguration {
+        codec: match codec {
+            EncoderCodec::H264 => arcen_media::VideoCodec::H264,
+            EncoderCodec::Hevc => arcen_media::VideoCodec::H265,
+        },
+        chroma: capture.pixel_format.chroma(),
+        bit_depth: capture.pixel_format.bit_depth(),
+        range: if matches!(
+            capture.pixel_format,
+            CapturePixelFormat::FourFourFourTenBitFullRange
+        ) {
+            arcen_media::ColorRange::Full
+        } else {
+            arcen_media::ColorRange::Limited
+        },
+        matrix: if matches!(capture.dynamic_range, CaptureDynamicRange::Sdr) {
+            arcen_media::ColorMatrix::Bt709
+        } else {
+            arcen_media::ColorMatrix::Bt2020Ncl
+        },
+        primaries: if matches!(capture.dynamic_range, CaptureDynamicRange::Sdr) {
+            arcen_media::ColorPrimaries::Bt709
+        } else {
+            arcen_media::ColorPrimaries::Bt2020
+        },
+        transfer: if matches!(capture.dynamic_range, CaptureDynamicRange::Sdr) {
+            arcen_media::TransferCharacteristics::Bt709
+        } else {
+            arcen_media::TransferCharacteristics::Pq
+        },
+    }
+}
+
+fn served_pipeline_msg(
+    requested: Option<arcen_media::video::PipelineId>,
+    codec: EncoderCodec,
+    capture: CaptureConfig,
+    motion_priority: arcen_media::video::MotionPriority,
+    encoder: &Encoder,
+) -> arcen_protocol::messages::ServedPipelineMsg {
+    let backend = crate::encode::accelerator_class_from_encoder(encoder);
+    served_pipeline_msg_for_backend(requested, codec, capture, motion_priority, backend)
+}
+
+fn served_pipeline_msg_for_backend(
+    requested: Option<arcen_media::video::PipelineId>,
+    codec: EncoderCodec,
+    capture: CaptureConfig,
+    motion_priority: arcen_media::video::MotionPriority,
+    backend: Option<arcen_media::video::AcceleratorClass>,
+) -> arcen_protocol::messages::ServedPipelineMsg {
+    let served = arcen_media::video::served_pipeline(
+        requested,
+        video_config_for_capture(codec, capture),
+        capture.fps,
+        motion_priority,
+        arcen_media::video::ServedPipelineContext {
+            backend,
+            exact_or_admin_override: requested.is_none(),
+        },
+    );
+    arcen_protocol::messages::ServedPipelineMsg::new(
+        served,
+        backend.map_or("unknown", arcen_media::video::AcceleratorClass::token),
+        backend
+            .is_none()
+            .then_some("VideoToolbox did not report encoder acceleration".to_string()),
+    )
+}
+
+fn operational_start_bps_for_capture(
+    served: &arcen_protocol::messages::ServedStreamPipeline,
+    capture: CaptureConfig,
+) -> u64 {
+    let (start, _) = arcen_media::video::operational_bitrate_bounds(
+        Some(served),
+        u32::try_from(capture.width).unwrap_or(u32::MAX),
+        u32::try_from(capture.height).unwrap_or(u32::MAX),
+        capture.fps,
+        capture.pixel_format.chroma(),
+        capture.pixel_format.bit_depth(),
+    );
+    u64::from(start)
+}
+
+fn operational_encoder_bitrate_bounds_for_capture(
+    served: Option<&arcen_protocol::messages::ServedStreamPipeline>,
+    capture: CaptureConfig,
+) -> (u64, u64) {
+    let (start, max) = arcen_media::video::operational_encoder_bitrate_bounds(
+        served,
+        u32::try_from(capture.width).unwrap_or(u32::MAX),
+        u32::try_from(capture.height).unwrap_or(u32::MAX),
+        capture.fps,
+        capture.pixel_format.chroma(),
+        capture.pixel_format.bit_depth(),
+    );
+    (u64::from(start), u64::from(max))
+}
+
+fn operational_live_bitrate_bounds_for_capture(
+    served: Option<&arcen_protocol::messages::ServedStreamPipeline>,
+    capture: CaptureConfig,
+) -> (u64, u64) {
+    let (start, max) = arcen_media::video::operational_bitrate_bounds(
+        served,
+        u32::try_from(capture.width).unwrap_or(u32::MAX),
+        u32::try_from(capture.height).unwrap_or(u32::MAX),
+        capture.fps,
+        capture.pixel_format.chroma(),
+        capture.pixel_format.bit_depth(),
+    );
+    (u64::from(start), u64::from(max))
+}
+
+fn reconfigure_encoder_for_served_pipeline(
+    encoder: &mut Encoder,
+    served: &arcen_protocol::messages::ServedStreamPipeline,
+    capture: CaptureConfig,
+    applied_rate: &mut u64,
+) -> Result<u64, StreamError> {
+    let start_bps = operational_start_bps_for_capture(served, capture);
+    encoder
+        .set_average_bitrate(start_bps)
+        .map_err(|error| StreamError::Encode(error.to_string()))?;
+    *applied_rate = start_bps;
+    Ok(start_bps)
 }
 
 /// Serves a full-frame request from the last picture, if one is owed.
@@ -2859,15 +3309,20 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         suppressed,
         rate,
         motion_priority,
+        requested_pipeline,
+        served_pipeline,
     } = context;
     let mut applied_rate = 0_u64;
-    let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+    let (start, max) = arcen_media::video::operational_encoder_bitrate_bounds(
+        served_pipeline.as_ref(),
         u32::try_from(capture.width).unwrap_or(u32::MAX),
         u32::try_from(capture.height).unwrap_or(u32::MAX),
         capture.fps,
         capture.pixel_format.chroma(),
         capture.pixel_format.bit_depth(),
-    ));
+    );
+    let start_bps = u64::from(start);
+    let max_bps = u64::from(max);
     let mut detail_interval = Duration::from_secs_f64(1.0 / f64::from(capture.fps.max(1)));
     let mut encoder = Encoder::new(
         EncoderConfig::realtime_for(
@@ -2878,12 +3333,35 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
             capture.pixel_format.chroma(),
             capture.pixel_format.bit_depth(),
         )
+        .with_bitrate_bounds(
+            i32::try_from(start_bps).unwrap_or(i32::MAX),
+            i32::try_from(max_bps).unwrap_or(i32::MAX),
+        )
         .with_motion_priority(motion_priority)
+        .with_keyframe_policy(arcen_media::video::operational_keyframe_policy(
+            served_pipeline.as_ref(),
+        ))
         .with_colour(crate::encode::colour_for_capture(&capture))
         .with_diagnostic_bitrate_override(),
     )
     .map_err(|error| StreamError::Encode(error.to_string()))?;
     report_encoder_backend(&encoder);
+    let mut served_pipeline_update = Some(served_pipeline_msg(
+        requested_pipeline,
+        codec,
+        capture,
+        motion_priority,
+        &encoder,
+    ));
+    if let Some(message) = served_pipeline_update.as_ref() {
+        let configured_start = reconfigure_encoder_for_served_pipeline(
+            &mut encoder,
+            &message.served,
+            capture,
+            &mut applied_rate,
+        )?;
+        rate.store(configured_start, std::sync::atomic::Ordering::Relaxed);
+    }
     let hdr_white = hdr_white_stage_for(&capture);
     let mut hdr_white_stats = HdrWhiteStats::default();
     let idle_timeout = capture_frame_timeout();
@@ -2968,6 +3446,8 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
             let Some(produced) = produced else {
                 continue;
             };
+            let mut produced = produced;
+            produced.served_pipeline = served_pipeline_update.take();
             if frames.blocking_send(Ok(produced)).is_err() {
                 break;
             }
@@ -3068,6 +3548,8 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         else {
             continue;
         };
+        let mut produced = produced;
+        produced.served_pipeline = served_pipeline_update.take();
         if frames.blocking_send(Ok(produced)).is_err() {
             // The client went away; stopping is correct, not an error.
             break;
@@ -3101,6 +3583,8 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
 struct RegionEncoder {
     plan: RegionStreamPlan,
     encoder: Encoder,
+    applied_rate_bps: u64,
+    live_max_rate_bps: u64,
     captured: u64,
     encoded: u64,
     encoded_keyframe_request: u64,
@@ -3204,11 +3688,16 @@ fn make_region_encoders(
     monitors: &[RegionStreamPlan],
     codec: EncoderCodec,
     motion_priority: arcen_media::video::MotionPriority,
+    served_pipeline: Option<&arcen_protocol::messages::ServedStreamPipeline>,
 ) -> Result<Vec<RegionEncoder>, StreamError> {
     monitors
         .iter()
         .copied()
         .map(|plan| {
+            let (start_bps, native_max_bps) =
+                operational_encoder_bitrate_bounds_for_capture(served_pipeline, plan.capture);
+            let (_, live_max_bps) =
+                operational_live_bitrate_bounds_for_capture(served_pipeline, plan.capture);
             let encoder = Encoder::new(
                 EncoderConfig::realtime_for(
                     i32::try_from(plan.capture.width).unwrap_or(1920),
@@ -3218,13 +3707,22 @@ fn make_region_encoders(
                     plan.capture.pixel_format.chroma(),
                     plan.capture.pixel_format.bit_depth(),
                 )
+                .with_bitrate_bounds(
+                    i32::try_from(start_bps).unwrap_or(i32::MAX),
+                    i32::try_from(native_max_bps).unwrap_or(i32::MAX),
+                )
                 .with_motion_priority(motion_priority)
+                .with_keyframe_policy(arcen_media::video::operational_keyframe_policy(
+                    served_pipeline,
+                ))
                 .with_colour(crate::encode::colour_for_capture(&plan.capture)),
             )
             .map_err(|error| StreamError::Encode(error.to_string()))?;
             Ok(RegionEncoder {
                 plan,
                 encoder,
+                applied_rate_bps: start_bps,
+                live_max_rate_bps: live_max_bps,
                 captured: 0,
                 encoded: 0,
                 encoded_keyframe_request: 0,
@@ -3236,28 +3734,105 @@ fn make_region_encoders(
         .collect()
 }
 
+fn served_pipeline_msg_for_region_encoders(
+    requested: Option<arcen_media::video::PipelineId>,
+    codec: EncoderCodec,
+    motion_priority: arcen_media::video::MotionPriority,
+    encoders: &[RegionEncoder],
+) -> Option<arcen_protocol::messages::ServedPipelineMsg> {
+    let capture = encoders.first()?.plan.capture;
+    let backend = arcen_media::video::aggregate_encoder_backend(
+        encoders
+            .iter()
+            .map(|encoder| crate::encode::accelerator_class_from_encoder(&encoder.encoder)),
+    );
+    Some(served_pipeline_msg_for_backend(
+        requested,
+        codec,
+        capture,
+        motion_priority,
+        backend,
+    ))
+}
+
+fn reconfigure_region_encoders_for_served_pipeline(
+    encoders: &mut [RegionEncoder],
+    served: &arcen_protocol::messages::ServedStreamPipeline,
+) -> Result<(), StreamError> {
+    for encoder in encoders {
+        let (start_bps, native_max_bps) =
+            operational_encoder_bitrate_bounds_for_capture(Some(served), encoder.plan.capture);
+        let (_, live_max_bps) =
+            operational_live_bitrate_bounds_for_capture(Some(served), encoder.plan.capture);
+        encoder
+            .encoder
+            .set_bitrate_bounds(start_bps, native_max_bps)
+            .map_err(|error| StreamError::Encode(error.to_string()))?;
+        encoder.applied_rate_bps = start_bps;
+        encoder.live_max_rate_bps = live_max_bps;
+    }
+    Ok(())
+}
+
+fn apply_rate_to_region_encoders(
+    encoders: &mut [RegionEncoder],
+    target_bps: u64,
+) -> Result<usize, StreamError> {
+    let mut changed = 0;
+    for encoder in encoders {
+        let clamped =
+            arcen_media::video::clamp_live_bitrate_target(target_bps, encoder.live_max_rate_bps);
+        if clamped == 0 || clamped == encoder.applied_rate_bps {
+            continue;
+        }
+        encoder
+            .encoder
+            .set_average_bitrate(clamped)
+            .map_err(|error| StreamError::Encode(error.to_string()))?;
+        encoder.applied_rate_bps = clamped;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// Captures and encodes every monitor in one blocking producer thread.
 #[allow(clippy::too_many_lines)]
 fn produce_multi(
-    monitors: &[RegionStreamPlan],
-    codec: EncoderCodec,
-    motion_priority: arcen_media::video::MotionPriority,
-    frame_budget: Option<u64>,
+    config: MultiProducerConfig,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
     signals: ProducerSignals<'_>,
 ) -> Result<(), StreamError> {
+    let MultiProducerConfig {
+        monitors,
+        codec,
+        motion_priority,
+        requested_pipeline,
+        served_pipeline,
+        frame_budget,
+    } = config;
     let ProducerSignals {
         cancelled,
         dropped,
         keyframe_requests,
         suppressed: _,
-        rate: _,
+        superseded: _superseded,
+        rate,
     } = signals;
     let capture = crate::multi_capture::MultiDisplayCapture::start_configured(
         monitors.iter().map(|monitor| monitor.capture).collect(),
     )
     .map_err(|error| StreamError::Capture(CaptureError::StartFailed(error.to_string())))?;
-    let mut encoders = make_region_encoders(monitors, codec, motion_priority)?;
+    let mut encoders =
+        make_region_encoders(&monitors, codec, motion_priority, served_pipeline.as_ref())?;
+    let mut served_pipeline_update = served_pipeline_msg_for_region_encoders(
+        requested_pipeline,
+        codec,
+        motion_priority,
+        &encoders,
+    );
+    if let Some(message) = served_pipeline_update.as_ref() {
+        reconfigure_region_encoders_for_served_pipeline(&mut encoders, &message.served)?;
+    }
     let mut sent = 0_u64;
     let mut total_captured = 0_u64;
     let mut total_encoded = 0_u64;
@@ -3274,6 +3849,16 @@ fn produce_multi(
             || cancelled.load(std::sync::atomic::Ordering::Relaxed)
         {
             break;
+        }
+        let wanted = rate.load(std::sync::atomic::Ordering::Relaxed);
+        if wanted != 0
+            && let Err(error) = apply_rate_to_region_encoders(&mut encoders, wanted)
+        {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::MEDIA,
+                %error,
+                "a region encoder refused a new rate"
+            );
         }
         dropped.store(
             capture.dropped_frames(),
@@ -3348,6 +3933,8 @@ fn produce_multi(
                             took: frame_started.elapsed(),
                             capture_wait,
                             encode_took,
+                            monitor_id: Some(encoder.plan.monitor_id),
+                            served_pipeline: served_pipeline_update.take(),
                         };
                         if frames.blocking_send(Ok(produced)).is_err() {
                             return Ok(());
@@ -3406,6 +3993,8 @@ fn produce_multi(
                 took: frame_started.elapsed(),
                 capture_wait,
                 encode_took,
+                monitor_id: Some(encoder.plan.monitor_id),
+                served_pipeline: served_pipeline_update.take(),
             };
             if frames.blocking_send(Ok(produced)).is_err() {
                 return Ok(());
@@ -3468,8 +4057,15 @@ pub enum UnsupportedBinary {
 /// real Deck's framed clipboard chunks are written including their header.
 fn dispatch_binary(
     bytes: &[u8],
-    reassembler: &mut arcen_protocol::clipboard::ClipboardReassembler,
-    clipboard: &crate::clipboard_session::ClipboardWorker,
+    clipboard: Option<(
+        &mut arcen_protocol::clipboard::ClipboardReassembler,
+        &crate::clipboard_session::ClipboardWorker,
+    )>,
+    microphone: Option<
+        &mut crate::microphone_input::MicrophoneIngress<
+            crate::microphone_input::NativeMicrophoneDevice,
+        >,
+    >,
 ) -> BinaryOutcome {
     use arcen_protocol::FrameType;
 
@@ -3483,6 +4079,9 @@ fn dispatch_binary(
 
     match kind {
         FrameType::Clipboard => {
+            let Some((reassembler, clipboard)) = clipboard else {
+                return BinaryOutcome::Rejected;
+            };
             let Ok((header, payload)) = arcen_protocol::decode_clipboard_chunk(bytes) else {
                 reassembler.abort();
                 return BinaryOutcome::Rejected;
@@ -3504,7 +4103,16 @@ fn dispatch_binary(
                 }
             }
         }
-        FrameType::AudioUpstream => BinaryOutcome::Unsupported(UnsupportedBinary::Microphone),
+        FrameType::AudioUpstream => {
+            let Some(microphone) = microphone else {
+                return BinaryOutcome::Unsupported(UnsupportedBinary::Microphone);
+            };
+            if microphone.ingest(bytes).is_ok() {
+                BinaryOutcome::Handled
+            } else {
+                BinaryOutcome::Rejected
+            }
+        }
         FrameType::HidDeviceAdded | FrameType::HidDeviceRemoved | FrameType::HidReport => {
             BinaryOutcome::Unsupported(UnsupportedBinary::RawHid)
         }
@@ -3614,6 +4222,363 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn served_pipeline_update_is_queued_before_first_region_frame() {
+        let (priority_tx, mut priority) = tokio::sync::mpsc::channel::<Message>(2);
+        let mut payload = region_header_for(
+            &unit(true),
+            EncoderCodec::Hevc,
+            CapturePixelFormat::Nv12VideoRange,
+            1,
+            arcen_media::SessionMonitorId::new(1).expect("monitor"),
+            arcen_media::TopologyGeneration::FIRST,
+            arcen_media::MediaStreamEpoch::new(1).expect("epoch"),
+        );
+        payload.extend_from_slice(&[0, 0, 0, 1, 0x26]);
+        let produced = Produced {
+            queued_at: Instant::now(),
+            payload,
+            keyframe: true,
+            captured: 1,
+            encoded: 1,
+            took: Duration::from_millis(1),
+            capture_wait: Duration::ZERO,
+            encode_took: Duration::from_millis(1),
+            monitor_id: Some(arcen_media::SessionMonitorId::new(1).expect("monitor")),
+            served_pipeline: Some(arcen_protocol::messages::ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Grading,
+                "hardware",
+                None,
+            )),
+        };
+        let mut pending = None;
+
+        let staged_update = stage_produced_frame(&priority_tx, produced, &mut pending)
+            .await
+            .expect("staged");
+        assert_eq!(
+            staged_update.as_ref().map(|message| &message.served),
+            Some(&arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
+
+        let message = priority.try_recv().expect("served truth queued first");
+        let Message::Text(text) = message else {
+            panic!("served truth is a JSON control message");
+        };
+        let served: arcen_protocol::messages::ServedPipelineMsg =
+            serde_json::from_str(&text).expect("served pipeline parses");
+        assert_eq!(
+            served.served,
+            arcen_protocol::messages::ServedStreamPipeline::Grading
+        );
+        let pending = pending.expect("region frame staged after truth");
+        let header = arcen_protocol::wire::decode_video_header(&pending.payload)
+            .expect("region header parses");
+        assert_eq!(header.frame_type, FrameType::RegionVideoH265);
+        assert!(pending.served_pipeline.is_none());
+    }
+
+    #[test]
+    fn multi_rate_marks_report_peak_region_delivery() {
+        let first = arcen_media::SessionMonitorId::new(1).expect("monitor");
+        let second = arcen_media::SessionMonitorId::new(2).expect("monitor");
+        let mut marks = MultiRateMarks::default();
+        let mut monitor_bytes = std::collections::BTreeMap::new();
+        account_monitor_bytes(&mut monitor_bytes, Some(first), 1_000);
+        account_monitor_bytes(&mut monitor_bytes, Some(second), 2_000);
+        marks.update(3_000, 2, Duration::from_millis(4), &monitor_bytes);
+
+        account_monitor_bytes(&mut monitor_bytes, Some(first), 500);
+        account_monitor_bytes(&mut monitor_bytes, Some(second), 3_000);
+        assert_eq!(marks.peak_monitor_delta(&monitor_bytes), 3_000);
+    }
+
+    #[test]
+    fn multi_rate_target_clamps_to_each_region_ceiling() {
+        assert_eq!(
+            arcen_media::video::clamp_live_bitrate_target(500_000_000, 250_000_000),
+            250_000_000
+        );
+        assert_eq!(
+            arcen_media::video::clamp_live_bitrate_target(4_000_000, 8_000_000),
+            4_000_000
+        );
+    }
+
+    fn assert_live_target_can_rise_above_start(
+        served: arcen_protocol::messages::ServedStreamPipeline,
+        capture: CaptureConfig,
+    ) {
+        let (encoder_start, encoder_max) =
+            operational_encoder_bitrate_bounds_for_capture(Some(&served), capture);
+        let (live_start, live_max) =
+            operational_live_bitrate_bounds_for_capture(Some(&served), capture);
+        assert_eq!(encoder_start, live_start);
+        assert!(
+            live_max > live_start,
+            "{served:?} live ceiling must allow rate-control growth"
+        );
+        assert_eq!(
+            arcen_media::video::clamp_live_bitrate_target(live_max, live_max),
+            live_max
+        );
+        assert_eq!(
+            arcen_media::video::clamp_live_bitrate_target(live_max, encoder_max),
+            encoder_max,
+            "this assertion documents the old bug: native encoder max is not the live ceiling"
+        );
+    }
+
+    #[test]
+    fn auto_speed_and_software_multi_region_live_targets_can_rise_above_start() {
+        assert_live_target_can_rise_above_start(
+            arcen_protocol::messages::ServedStreamPipeline::Auto,
+            CaptureConfig::sdr(1, 3840, 2160, 30),
+        );
+        assert_live_target_can_rise_above_start(
+            arcen_protocol::messages::ServedStreamPipeline::Speed,
+            CaptureConfig::sdr(1, 1920, 1080, 60),
+        );
+        assert_live_target_can_rise_above_start(
+            arcen_protocol::messages::ServedStreamPipeline::Software,
+            CaptureConfig::sdr(1, 1920, 1080, 30),
+        );
+    }
+
+    #[test]
+    fn grading_and_hdr_live_ceilings_match_native_encoder_ceilings() {
+        for (served, capture) in [
+            (
+                arcen_protocol::messages::ServedStreamPipeline::Grading,
+                CaptureConfig::grading(1, 3840, 2160, 30),
+            ),
+            (
+                arcen_protocol::messages::ServedStreamPipeline::Hdr,
+                CaptureConfig::hdr(1, 3840, 2160, 30),
+            ),
+        ] {
+            let (_, native_max) =
+                operational_encoder_bitrate_bounds_for_capture(Some(&served), capture);
+            let (_, live_max) = operational_live_bitrate_bounds_for_capture(Some(&served), capture);
+            assert_eq!(
+                live_max, native_max,
+                "{served:?} live target stays within VT DataRateLimits"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_region_encoder_bounds_follow_served_pipeline() {
+        let capture = CaptureConfig::grading(1, 3840, 2160, 30);
+        let served = arcen_protocol::messages::ServedStreamPipeline::Grading;
+        let (start, max) = operational_encoder_bitrate_bounds_for_capture(Some(&served), capture);
+        assert_eq!(
+            (start as u32, max as u32),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .encoder_bitrate_bounds(
+                    3840,
+                    2160,
+                    30,
+                    capture.pixel_format.chroma(),
+                    capture.pixel_format.bit_depth(),
+                )
+        );
+        assert!(max > start, "Grading carries a VideoToolbox ceiling");
+    }
+
+    #[test]
+    fn exact_request_matching_auto_shape_stays_custom_after_encoder_init() {
+        let capture = CaptureConfig::sdr(1, 1920, 1080, 30);
+        let message = served_pipeline_msg_for_backend(
+            None,
+            EncoderCodec::H264,
+            capture,
+            arcen_media::video::MotionPriority::Detail,
+            Some(arcen_media::video::AcceleratorClass::Hardware),
+        );
+        assert_eq!(
+            message.served,
+            arcen_protocol::messages::ServedStreamPipeline::Custom,
+            "an exact/custom request must not become Auto only because its shape matches Auto"
+        );
+    }
+
+    #[test]
+    fn exact_request_matching_grading_shape_stays_custom_after_encoder_init() {
+        let capture = CaptureConfig::grading(1, 1920, 1080, 30);
+        let message = served_pipeline_msg_for_backend(
+            None,
+            EncoderCodec::Hevc,
+            capture,
+            arcen_media::video::MotionPriority::Detail,
+            Some(arcen_media::video::AcceleratorClass::Hardware),
+        );
+        assert_eq!(
+            message.served,
+            arcen_protocol::messages::ServedStreamPipeline::Custom,
+            "an exact/custom request must not become Grading only because its shape matches Grading"
+        );
+    }
+
+    #[test]
+    fn macos_operational_bounds_follow_served_pipeline_truth() {
+        let grading_shape = (
+            3840,
+            2160,
+            30,
+            arcen_media::ChromaSubsampling::Yuv444,
+            arcen_media::BitDepth::Ten,
+        );
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Grading),
+                grading_shape.0,
+                grading_shape.1,
+                grading_shape.2,
+                grading_shape.3,
+                grading_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .bitrate_bounds(
+                    grading_shape.0,
+                    grading_shape.1,
+                    grading_shape.2,
+                    grading_shape.3,
+                    grading_shape.4,
+                ),
+            "an HDR request served as Grading must run the Grading contract"
+        );
+
+        let exact_shape = (
+            1920,
+            1080,
+            60,
+            arcen_media::ChromaSubsampling::Yuv420,
+            arcen_media::BitDepth::Eight,
+        );
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Custom),
+                exact_shape.0,
+                exact_shape.1,
+                exact_shape.2,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            (
+                arcen_media::video::link_capped_average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+                arcen_media::video::average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+            ),
+            "Exact/custom macOS sessions keep the legacy bounds"
+        );
+
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Software),
+                exact_shape.0,
+                exact_shape.1,
+                30,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Software)
+                .bitrate_bounds(
+                    exact_shape.0,
+                    exact_shape.1,
+                    30,
+                    exact_shape.3,
+                    exact_shape.4
+                ),
+            "software fallback uses the Software contract"
+        );
+    }
+
+    #[test]
+    fn actual_software_encoder_readback_changes_start_bitrate_before_first_frame() {
+        let capture = CaptureConfig::sdr(1, 1920, 1080, 30);
+        let provisional = operational_start_bps_for_capture(
+            &arcen_protocol::messages::ServedStreamPipeline::Auto,
+            capture,
+        );
+        let authoritative = served_pipeline_msg_for_backend(
+            Some(arcen_media::video::PipelineId::Auto),
+            EncoderCodec::H264,
+            capture,
+            arcen_media::video::MotionPriority::Detail,
+            Some(arcen_media::video::AcceleratorClass::Software),
+        );
+        assert_eq!(
+            authoritative.served,
+            arcen_protocol::messages::ServedStreamPipeline::Software
+        );
+        let actual = operational_start_bps_for_capture(&authoritative.served, capture);
+        assert_eq!(
+            actual,
+            u64::from(
+                arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Software)
+                    .bitrate_bounds(
+                        1920,
+                        1080,
+                        30,
+                        arcen_media::ChromaSubsampling::Yuv420,
+                        arcen_media::BitDepth::Eight,
+                    )
+                    .0
+            )
+        );
+        assert_ne!(
+            actual, provisional,
+            "the encoder and controller must leave the provisional Auto start when read-back says software"
+        );
+    }
+
+    #[test]
+    fn multi_monitor_aggregate_software_uses_software_start_for_every_region() {
+        let capture = CaptureConfig::sdr(1, 2560, 1440, 60);
+        let aggregate = arcen_media::video::aggregate_encoder_backend([
+            Some(arcen_media::video::AcceleratorClass::Hardware),
+            Some(arcen_media::video::AcceleratorClass::Software),
+        ]);
+        let message = served_pipeline_msg_for_backend(
+            Some(arcen_media::video::PipelineId::Speed),
+            EncoderCodec::H264,
+            capture,
+            arcen_media::video::MotionPriority::Motion,
+            aggregate,
+        );
+        assert_eq!(
+            message.served,
+            arcen_protocol::messages::ServedStreamPipeline::Software
+        );
+        assert_eq!(
+            operational_start_bps_for_capture(&message.served, capture),
+            u64::from(
+                arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Software)
+                    .bitrate_bounds(
+                        2560,
+                        1440,
+                        60,
+                        arcen_media::ChromaSubsampling::Yuv420,
+                        arcen_media::BitDepth::Eight,
+                    )
+                    .0
+            ),
+            "multi-monitor region encoders must use the aggregate served contract"
+        );
+    }
+
     use super::*;
     use arcen_protocol::wire::{BitDepth, ChromaSubsampling, FrameType, VideoCodec};
     use std::sync::{Arc, Mutex};
@@ -3666,6 +4631,7 @@ mod tests {
         encode: Option<f64>,
         send: Option<f64>,
         max_frame: Option<f64>,
+        raw_superseded: Option<u64>,
     }
 
     struct HealthVisitor<'a>(&'a mut HealthRecord);
@@ -3678,6 +4644,12 @@ mod tests {
                 "mean_send_ms" => self.0.send = Some(value),
                 "max_frame_ms" => self.0.max_frame = Some(value),
                 _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "raw_frames_superseded" {
+                self.0.raw_superseded = Some(value);
             }
         }
 
@@ -3859,6 +4831,7 @@ mod tests {
         });
         let mut stats = StreamStats {
             frames_captured: 2,
+            raw_frames_superseded: 3,
             frames_encoded: 2,
             frames_sent: 2,
             bytes_sent: 128,
@@ -3882,6 +4855,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || emit_health_diagnostics(2, &stats));
         let records = records.lock().expect("records lock");
         let record = records.first().expect("health diagnostic record");
+        assert_eq!(record.raw_superseded, Some(3));
         assert_eq!(record.capture_wait, Some(10.0));
         assert_eq!(record.encode, Some(20.0));
         assert_eq!(record.send, Some(5.0));
@@ -3989,9 +4963,8 @@ mod tests {
     fn a_full_frame_request_is_counted_and_published_to_the_encoder() {
         let mut stats = StreamStats::default();
         let requests = std::sync::atomic::AtomicU64::new(0);
-        let mut last_request = Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(Instant::now);
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_KEYFRAME_GUARD);
         let request =
             serde_json::json!({ "type": arcen_protocol::messages::REQUEST_FULL_FRAME }).to_string();
         assert!(matches!(
@@ -3999,7 +4972,7 @@ mod tests {
                 &request,
                 &mut stats,
                 Some(&requests),
-                Some(&mut last_request)
+                Some(&mut full_frame_requests)
             ),
             Some(Incoming::Continue)
         ));
@@ -4014,7 +4987,7 @@ mod tests {
                 &request,
                 &mut stats,
                 Some(&requests),
-                Some(&mut last_request)
+                Some(&mut full_frame_requests)
             ),
             Some(Incoming::Continue)
         ));
@@ -4024,6 +4997,13 @@ mod tests {
             1,
             "bursts should coalesce the same way Linux's IDR guard does"
         );
+        if full_frame_requests
+            .poll(Instant::now() + FULL_FRAME_KEYFRAME_GUARD)
+            .deliver_now
+        {
+            requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -4375,6 +5355,26 @@ mod damage_policy_tests {
             );
         }
         assert_eq!(damage.summary().dirty_blocks, 3);
+    }
+
+    #[test]
+    fn latest_handoff_merges_superseded_damage_into_clean_newer_frame() {
+        let (mut damage, mut cadence) = fixture();
+        settled(&mut damage, &mut cadence);
+        let mut newer = FrameDamage::Rects(Vec::new());
+        newer.merge_superseded(FrameDamage::Rects(vec![DamageRect {
+            x: 64,
+            y: 0,
+            width: 16,
+            height: 16,
+        }]));
+        observe_damage(&newer, &mut damage, &mut cadence, WIDTH, HEIGHT);
+        assert_eq!(damage.summary().dirty_blocks, 1);
+        assert_eq!(
+            cadence.decision(false, Duration::ZERO),
+            Some(EmitMode::Activity),
+            "a clean newer frame carrying superseded damage must encode immediately"
+        );
     }
 
     #[test]

@@ -163,4 +163,49 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, QpMapError::GridMismatch { .. }));
     }
+
+    #[test]
+    fn external_damage_observations_union_until_the_pending_frame_is_submitted() {
+        const W: u32 = 64;
+        const H: u32 = 16;
+        let mut first = arcen_keel::ExternalDamage::new(W as usize, H as usize).unwrap();
+        let mut second = arcen_keel::ExternalDamage::new(W as usize, H as usize).unwrap();
+        first.mark_rect(arcen_keel::PixelRect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        });
+        second.mark_rect(arcen_keel::PixelRect {
+            x: 48,
+            y: 0,
+            width: 16,
+            height: 16,
+        });
+
+        let mut pending = arcen_keel::PendingExternalDamage::new(W as usize, H as usize).unwrap();
+        pending.observe(first.damage_map()).unwrap();
+        pending.observe(second.damage_map()).unwrap();
+
+        let mut builder = QpDeltaMapBuilder::new(VideoCodec::H264, W, H).unwrap();
+        let bias = QpBias {
+            dirty: -4,
+            clean: 1,
+        };
+        let map = fill_qp_delta_map(&mut builder, pending.damage_map(), bias, false).unwrap();
+        assert_eq!(
+            map,
+            [-4, 1, 1, -4],
+            "A and B acquisitions before one encode must both bias the submitted map"
+        );
+
+        pending.mark_submitted();
+        pending.observe(second.damage_map()).unwrap();
+        let map = fill_qp_delta_map(&mut builder, pending.damage_map(), bias, false).unwrap();
+        assert_eq!(
+            map,
+            [1, 1, 1, -4],
+            "after submission, the next observation starts a fresh pending map"
+        );
+    }
 }

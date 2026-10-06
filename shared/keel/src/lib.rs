@@ -19,8 +19,11 @@ pub use activity::{
     ACTIVITY_ROLLING_WINDOW, ActivityClass, ActivityDiagnostics, ActivityGrid, ActivityHint,
     CadenceRecommendation, DIRTY_RATIO_BASIS_POINTS, DirtyRatio,
 };
-pub use cadence::{EmitMode, IdleCadence};
+pub use cadence::{EmitMode, IdleCadence, SubmissionGate, SubmissionMode};
 pub use damage::{DamageMap, DamageSummary, DamageTracker, DirtyBlockRows, DirtyBlocks};
-pub use external::{ExternalDamage, PixelRect};
+pub use external::{
+    DamageMetadataStatus, ExternalDamage, PendingExternalDamage, PixelRect,
+    coalesced_rect_metadata_status, report_only_dirty_regions_status,
+};
 pub use grid::{BLOCK_SIZE, BgraFrame, BlockBounds, BlockGrid, KeelError};
 pub use hash::{HashKernel, KernelPreference};

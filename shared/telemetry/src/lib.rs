@@ -47,7 +47,7 @@ pub use schema::{
 };
 pub use stream_stats::{
     DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SnapshotCadence, StageAverages,
-    StageTotals, rate_per_second, rounded_percentiles_ms, stage_averages,
+    StageTotals, WireDelayEstimator, rate_per_second, rounded_percentiles_ms, stage_averages,
 };
 pub use support_bundle::{
     BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey,

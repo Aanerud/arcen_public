@@ -101,14 +101,18 @@ impl TabletEventMonitor {
     /// no run loop yet). Returns the monitor guard plus a cloneable
     /// [`TabletSampleHandle`] for draining decoded samples.
     #[must_use]
-    pub fn start(mtm: MainThreadMarker) -> Option<(Self, TabletSampleHandle)> {
-        Self::start_with_capacity(mtm, DEFAULT_QUEUE_CAPACITY)
+    pub fn start(
+        mtm: MainThreadMarker,
+        wake: impl Fn() + 'static,
+    ) -> Option<(Self, TabletSampleHandle)> {
+        Self::start_with_capacity(mtm, DEFAULT_QUEUE_CAPACITY, wake)
     }
 
     #[must_use]
     pub fn start_with_capacity(
         mtm: MainThreadMarker,
         capacity: usize,
+        wake: impl Fn() + 'static,
     ) -> Option<(Self, TabletSampleHandle)> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(BoundedSampleQueue::new(capacity)),
@@ -150,6 +154,8 @@ impl TabletEventMonitor {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     queue.push(sample);
+                    drop(queue);
+                    wake();
                 }
                 Ok(None) => {}
                 Err(_) => {

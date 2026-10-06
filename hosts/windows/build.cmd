@@ -163,3 +163,4 @@ if errorlevel 1 exit /b %errorlevel%
 echo Built self-contained Windows x64 artifacts:
 echo   %DIST%
 endlocal
+exit /b 0

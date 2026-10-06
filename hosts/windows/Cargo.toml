@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-windows"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Arcen Pier (Windows) — native Rust QUIC host with LogonUser auth, WTS session attachment, SendInput injection, and DXGI/WGC->NVENC capture."
 publish.workspace = true
@@ -79,6 +79,7 @@ windows = { version = "0.58", features = [
     "Win32_System_RemoteDesktop",           # WTS session enumeration and user tokens
     "Win32_System_Registry",                # HKLM MachineGuid diagnostics
     "Win32_System_Services",                # SCM service entry/status/control handling
+    "Win32_System_StationsAndDesktops",     # per-session input desktop readiness gate
     "Win32_System_SystemInformation",        # read-only OS version and uptime diagnostics
     "Wdk_System_SystemServices",             # RtlGetVersion read-only OS build diagnostics
     "Win32_System_Threading",

@@ -26,7 +26,8 @@ use crate::CursorCaptureMode;
 use windows::core::Interface;
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem,
+    GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -57,6 +58,8 @@ pub struct WgcCapture {
     /// The monitor this captures, for questions about how Windows composes
     /// it, such as its SDR white level.
     monitor: HMONITOR,
+    raw_frames_superseded: u64,
+    dirty_regions_enabled: bool,
 }
 
 /// Readable name for a pool format, for logs that have to be diffable.
@@ -143,6 +146,20 @@ impl WgcCapture {
                 "WGC: SetIsBorderRequired(false) unavailable: {e:?}"
             ));
         }
+        let dirty_regions_enabled =
+            match session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly) {
+                Ok(()) => {
+                    log("WGC: dirty regions enabled (ReportOnly)");
+                    true
+                }
+                Err(e) => {
+                    log(&format!(
+                        "WGC: DirtyRegionMode ReportOnly unavailable; QP maps need another \
+                         damage source ({e:?})"
+                    ));
+                    false
+                }
+            };
 
         // Keep the item alive; if the monitor is removed WGC raises Closed.
         item.Closed(&TypedEventHandler::<GraphicsCaptureItem, _>::new(
@@ -165,6 +182,8 @@ impl WgcCapture {
             session,
             format,
             monitor,
+            raw_frames_superseded: 0,
+            dirty_regions_enabled,
         })
     }
 
@@ -189,6 +208,46 @@ impl WgcCapture {
         &self.context
     }
 
+    #[must_use]
+    pub const fn dirty_regions_enabled(&self) -> bool {
+        self.dirty_regions_enabled
+    }
+
+    fn merge_dirty_regions(
+        frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
+        damage: &mut arcen_keel::ExternalDamage,
+    ) -> bool {
+        let Ok(regions) = frame.DirtyRegions() else {
+            crate::debug_log("WGC dirty regions unavailable on frame");
+            return false;
+        };
+        let Ok(count) = regions.Size() else {
+            crate::debug_log("WGC dirty region count unavailable on frame");
+            return false;
+        };
+        let mut entry_read_failed = false;
+        for index in 0..count {
+            match regions.GetAt(index) {
+                Ok(rect) => {
+                    damage.mark_rect_bounds(
+                        i64::from(rect.X),
+                        i64::from(rect.Y),
+                        i64::from(rect.X.saturating_add(rect.Width)),
+                        i64::from(rect.Y.saturating_add(rect.Height)),
+                    );
+                }
+                Err(error) => {
+                    crate::debug_log(&format!(
+                        "WGC dirty region {index}/{count} unreadable ({error:?})"
+                    ));
+                    entry_read_failed = true;
+                }
+            }
+        }
+        arcen_keel::report_only_dirty_regions_status(count as usize, entry_read_failed)
+            == arcen_keel::DamageMetadataStatus::Complete
+    }
+
     /// Poll for the newest captured frame. On a new frame, extract its
     /// `ID3D11Texture2D` and hand it to `on_new` (which stages it into the
     /// encoder input) BEFORE closing the frame, then return true. Returns false
@@ -197,16 +256,41 @@ impl WgcCapture {
     pub unsafe fn acquire_into(
         &mut self,
         dbg: &mut (u64, u64, u64),
+        mut damage: Option<&mut arcen_keel::ExternalDamage>,
         on_new: &mut dyn FnMut(&ID3D11Texture2D),
     ) -> windows::core::Result<bool> {
+        let raw_policy =
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Auto)
+                .queue
+                .raw_overflow;
         // Drain to the newest frame so we never fall behind the pool.
         let mut newest: Option<windows::Graphics::Capture::Direct3D11CaptureFrame> = None;
+        let mut superseded = 0u64;
         while let Ok(frame) = self.frame_pool.TryGetNextFrame() {
+            if let Some(ref mut damage) = damage {
+                if !Self::merge_dirty_regions(&frame, damage) {
+                    damage.mark_rect(arcen_keel::PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: self.width as usize,
+                        height: self.height as usize,
+                    });
+                }
+            }
             // Close the previous (now stale) frame before overwriting.
             if let Some(prev) = newest.take() {
                 let _ = prev.Close();
+                superseded = superseded.saturating_add(1);
             }
             newest = Some(frame);
+        }
+        if superseded > 0 {
+            self.raw_frames_superseded = self.raw_frames_superseded.saturating_add(superseded);
+            crate::debug_log(&format!(
+                "WGC raw capture queue superseded {superseded} frame(s): policy={:?} \
+                 requires_idr={}",
+                raw_policy.disposition, raw_policy.requires_idr
+            ));
         }
         match newest {
             Some(frame) => {
@@ -228,6 +312,12 @@ impl WgcCapture {
                 Ok(false)
             }
         }
+    }
+
+    pub fn take_raw_frames_superseded(&mut self) -> u64 {
+        let value = self.raw_frames_superseded;
+        self.raw_frames_superseded = 0;
+        value
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "arcen-deck-macos"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -26,9 +26,11 @@ experimental-raw-hid = []
 # Wacom and is not a production bridge.
 usb-hard-lab = ["dep:rusb", "dep:objc2-service-management"]
 # Developer-only tooling. Default-off and never enabled in release/package
-# builds: it compiles in `crate::ui::virtual_monitor_lab` and the
-# `virtual-monitor-lab` CLI subcommand, which tile several decorated native
-# windows inside one display for single-display multi-monitor regression.
+# builds: it compiles in `crate::ui::virtual_monitor_lab`, the
+# `virtual-monitor-lab` CLI subcommand, and the env-gated
+# `crate::ui::windowed_monitor_test` live-session mode, which tile several
+# decorated native windows inside one display for single-display
+# multi-monitor regression.
 # Even when compiled in, the lab additionally refuses to run without an
 # explicit runtime opt-in (`ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1`), and it is
 # entirely parallel to the production session/fullscreen paths.
@@ -108,10 +110,11 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # `video_render.rs`'s module doc for why that crate's raw-pointer-based
 # approach was needed for the *pre-existing* wgpu/egui surface) since this
 # layer is typed end to end and needs no raw `msg_send!` at all.
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture"] }
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CAEDRMetadata", "CALayer", "CAMetalLayer", "objc2-metal"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CAEDRMetadata", "CALayer", "CAMetalLayer", "CATransaction", "objc2-metal"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor", "CGColorSpace"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVDisplayLink", "CVHostTime", "CVReturn", "objc2-core-graphics"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
 videotoolbox = "0.18.1"

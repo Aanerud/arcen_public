@@ -93,6 +93,7 @@ pub enum VideoPushResult<T> {
     Dropped {
         count: usize,
         recovery_started: bool,
+        idr_request: bool,
     },
     Closed(T),
 }
@@ -110,7 +111,10 @@ impl<T> VideoQueue<T> {
         Self {
             state: Mutex::new(arcen_media::video::SharedVideoQueue::new(
                 capacity,
-                std::time::Duration::from_secs(1),
+                arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Auto)
+                    .queue
+                    .encoded_overflow
+                    .keyframe_request_min_interval,
             )),
             notify: Notify::new(),
         }
@@ -133,13 +137,29 @@ impl<T> VideoQueue<T> {
             arcen_media::video::VideoQueuePush::Dropped {
                 count,
                 recovery_started,
-                ..
+                idr_request,
             } => VideoPushResult::Dropped {
                 count,
                 recovery_started,
+                idr_request,
             },
             arcen_media::video::VideoQueuePush::Closed(item) => VideoPushResult::Closed(item),
         }
+    }
+
+    pub fn note_keyframe_request_handoff(&self, success: bool) {
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .note_keyframe_request_handoff(success, std::time::Instant::now());
+    }
+
+    pub fn keyframe_request_due(&self) -> bool {
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .keyframe_request_retry(std::time::Instant::now())
+            .due
     }
 
     pub async fn pop(&self) -> Option<T> {
@@ -281,6 +301,32 @@ mod tests {
             VideoPushResult::Enqueued { cleared: 2 }
         ));
         assert_eq!(queue.try_pop(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn encoded_drop_exposes_rate_limited_idr_request() {
+        let queue = VideoQueue::new(1);
+        assert!(matches!(
+            queue.push(1, false),
+            VideoPushResult::Enqueued { cleared: 0 }
+        ));
+        assert!(matches!(
+            queue.push(2, false),
+            VideoPushResult::Dropped {
+                recovery_started: true,
+                idr_request: true,
+                ..
+            }
+        ));
+        queue.note_keyframe_request_handoff(true);
+        assert!(matches!(
+            queue.push(3, false),
+            VideoPushResult::Dropped {
+                recovery_started: false,
+                idr_request: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

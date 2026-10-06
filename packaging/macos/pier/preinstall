@@ -56,4 +56,9 @@ fi
 
 arcen_log "stopping any running version"
 arcen_stop_everything
+arcen_log "reconciling legacy timezone helper state"
+arcen_stop_legacy_timezone_helper
+arcen_restore_legacy_timezone_journal || exit 1
+rm -f "$ARCEN_LEGACY_TZ_HELPER_PLIST"
+rm -rf "$ARCEN_TZ_SOCKET_DIR"
 exit 0

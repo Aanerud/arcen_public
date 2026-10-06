@@ -2,6 +2,7 @@ use arcen_protocol::messages::{AuthResponse, VideoSelectionIntent};
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
 use arcen_telemetry::CorrelationId;
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
 
 use crate::ipc::PipeStream;
 use crate::{ColorPolicy, HostConfig};
@@ -14,6 +15,39 @@ pub const CONSOLE_MOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// How often to re-read the active console while that move is in flight.
 const CONSOLE_MOVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactBindLogKey {
+    session_id: u32,
+    user: String,
+    domain: String,
+    state: String,
+}
+
+#[derive(Debug, Default)]
+struct ExactBindLogDeduper {
+    last: Option<ExactBindLogKey>,
+}
+
+impl ExactBindLogDeduper {
+    fn should_log_info(&mut self, key: ExactBindLogKey) -> bool {
+        if self.last.as_ref() == Some(&key) {
+            false
+        } else {
+            self.last = Some(key);
+            true
+        }
+    }
+}
+
+fn exact_bind_log_repeats_at_debug(key: ExactBindLogKey) -> bool {
+    static LAST_EXACT_BIND: OnceLock<Mutex<ExactBindLogDeduper>> = OnceLock::new();
+    let mut deduper = LAST_EXACT_BIND
+        .get_or_init(|| Mutex::new(ExactBindLogDeduper::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !deduper.should_log_info(key)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowsSessionIdentity {
@@ -54,6 +88,8 @@ pub struct AgentConfig {
     #[serde(default = "default_qp_map")]
     qp_map: String,
     #[serde(default)]
+    qp_map_config: Option<arcen_session::pier_config::QpMapConfig>,
+    #[serde(default)]
     video_selection: VideoSelectionIntent,
     #[serde(default)]
     codec_pinned: bool,
@@ -74,6 +110,8 @@ pub struct AgentConfig {
     timezone_redirection: bool,
     #[serde(default)]
     qos_targets: arcen_telemetry::QosTargets,
+    #[serde(default)]
+    debug_diagnostics: bool,
     #[serde(default)]
     deskside: crate::deskside::DesksideConfig,
     #[serde(default)]
@@ -125,6 +163,7 @@ impl AgentConfig {
             color_matrix: config.color_matrix.token().to_string(),
             color_policy: config.color_policy.token().to_string(),
             qp_map: config.qp_map.token().to_string(),
+            qp_map_config: config.qp_map_config.clone(),
             video_selection: config.video_selection,
             codec_pinned: config.codec_pinned,
             variant_pinned: config.variant_pinned,
@@ -137,6 +176,7 @@ impl AgentConfig {
             clipboard_policy: config.clipboard_policy,
             timezone_redirection: config.timezone_redirection,
             qos_targets: config.qos_targets,
+            debug_diagnostics: config.debug_diagnostics,
             deskside: config.deskside.clone(),
             iddcx: config.iddcx.clone(),
             multi_monitor: config.multi_monitor.clone(),
@@ -231,10 +271,13 @@ impl AgentConfig {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy,
             qp_map,
+            qp_map_config: self.qp_map_config,
             video_selection: self.video_selection,
             codec_pinned: self.codec_pinned,
             variant_pinned: self.variant_pinned,
             auth_video_request: self.auth_video_request,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: self.fps,
             encoder,
             audio_enabled: self.audio_enabled,
@@ -244,6 +287,7 @@ impl AgentConfig {
             timezone_redirection: self.timezone_redirection,
             reconnect_window_secs: 0,
             qos_targets: self.qos_targets,
+            debug_diagnostics: self.debug_diagnostics,
             deskside: self.deskside,
             iddcx: self.iddcx,
             multi_monitor: self.multi_monitor,
@@ -1248,15 +1292,33 @@ mod platform {
                     state: candidate.state.label(),
                     launch_backend: "wts-query-user-token-create-process-as-user".to_string(),
                 };
-                tracing::info!(
-                    target: crate::logging::SESSION,
-                    requested_account = account.requested_name(),
-                    windows_session_id = identity.session_id,
-                    windows_user = %identity.user,
-                    windows_domain = %identity.domain,
-                    windows_state = %identity.state,
-                    "bound authenticated account to exact active console WTS session"
-                );
+                let repeat = super::exact_bind_log_repeats_at_debug(super::ExactBindLogKey {
+                    session_id: identity.session_id,
+                    user: identity.user.clone(),
+                    domain: identity.domain.clone(),
+                    state: identity.state.clone(),
+                });
+                if repeat {
+                    tracing::debug!(
+                        target: crate::logging::SESSION,
+                        requested_account = account.requested_name(),
+                        windows_session_id = identity.session_id,
+                        windows_user = %identity.user,
+                        windows_domain = %identity.domain,
+                        windows_state = %identity.state,
+                        "bound authenticated account to exact active console WTS session"
+                    );
+                } else {
+                    tracing::info!(
+                        target: crate::logging::SESSION,
+                        requested_account = account.requested_name(),
+                        windows_session_id = identity.session_id,
+                        windows_user = %identity.user,
+                        windows_domain = %identity.domain,
+                        windows_state = %identity.state,
+                        "bound authenticated account to exact active console WTS session"
+                    );
+                }
                 Ok(BindOutcome::Bound(
                     identity.clone(),
                     SelectedSession {
@@ -2407,6 +2469,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_bind_log_deduper_allows_first_observation_and_changes_only() {
+        let mut deduper = ExactBindLogDeduper::default();
+        let key = ExactBindLogKey {
+            session_id: 4,
+            user: "placeholder".to_string(),
+            domain: "EXAMPLE".to_string(),
+            state: "active".to_string(),
+        };
+        assert!(deduper.should_log_info(key.clone()));
+        assert!(!deduper.should_log_info(key.clone()));
+        assert!(deduper.should_log_info(ExactBindLogKey {
+            state: "connected".to_string(),
+            ..key
+        }));
+    }
+
+    #[test]
     fn attachment_command_round_trips_quic_transport() {
         let sid = CorrelationId::from_uuid_v4_bytes([7; 16]);
         let command =
@@ -2418,6 +2497,46 @@ mod tests {
             decoded.transport_capability.as_deref(),
             Some(arcen_protocol::CAPABILITY_TRANSPORT_QUIC)
         );
+    }
+
+    #[test]
+    fn agent_config_ipc_preserves_per_pipeline_qp_map_config() {
+        let mut qp_map = std::collections::BTreeMap::new();
+        qp_map.insert("auto".to_string(), "on".to_string());
+        qp_map.insert("grading".to_string(), "off".to_string());
+        let config = AgentConfig {
+            capenc_bin: "capenc".to_string(),
+            global_output_index: Some(0),
+            adapter_name: None,
+            adapter_output_index: None,
+            codec: "h264".to_string(),
+            chroma: "yuv420".to_string(),
+            bit_depth: default_bit_depth(),
+            color_range: default_color_range(),
+            color_matrix: default_color_matrix(),
+            color_policy: default_color_policy(),
+            qp_map: "on".to_string(),
+            qp_map_config: Some(arcen_session::pier_config::QpMapConfig::PerPipeline(qp_map)),
+            video_selection: VideoSelectionIntent::Exact,
+            codec_pinned: false,
+            variant_pinned: false,
+            auth_video_request: None,
+            fps: 30,
+            encoder: None,
+            audio_enabled: true,
+            audio_compressed: false,
+            microphone_input_enabled: false,
+            clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
+            timezone_redirection: false,
+            qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
+            deskside: crate::deskside::DesksideConfig::default(),
+            iddcx: crate::config::WindowsIddCxConfig::default(),
+            multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+        };
+        let decoded: AgentConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.qp_map_config, config.qp_map_config);
     }
 
     #[test]
@@ -3472,6 +3591,7 @@ mod tests {
             color_matrix: default_color_matrix(),
             color_policy: default_color_policy(),
             qp_map: default_qp_map(),
+            qp_map_config: None,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
@@ -3484,6 +3604,7 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -3505,6 +3626,7 @@ mod tests {
             color_matrix: default_color_matrix(),
             color_policy: default_color_policy(),
             qp_map: default_qp_map(),
+            qp_map_config: None,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: true,
             variant_pinned: false,
@@ -3517,6 +3639,7 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -3538,6 +3661,7 @@ mod tests {
             color_matrix: default_color_matrix(),
             color_policy: default_color_policy(),
             qp_map: default_qp_map(),
+            qp_map_config: None,
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
@@ -3550,6 +3674,7 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),

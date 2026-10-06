@@ -123,10 +123,12 @@ fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> MaterialState {
 
     let certificate_bytes = std::fs::read(&paths.certificate).ok();
     let ownership = certificate_bytes.as_ref().map(|bytes| {
-        if marker_matches(paths, bytes) {
+        if !paths.marker.exists() {
+            MaterialOwnership::Foreign
+        } else if marker_matches(paths, bytes) {
             MaterialOwnership::Owned
         } else {
-            MaterialOwnership::Foreign
+            MaterialOwnership::Ambiguous
         }
     });
 
@@ -150,9 +152,9 @@ fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> MaterialState {
         // The helper script owns transaction recovery on this platform, so
         // this path does not claim to detect its staging files.
         stale_staging_present: false,
-        self_signed: certificate_bytes
-            .as_ref()
-            .is_some_and(|bytes| cert_marker::is_self_signed_pem(bytes)),
+        legacy_arcen_self_signed: certificate_bytes.as_ref().is_some_and(|bytes| {
+            cert_marker::is_legacy_arcen_self_signed_pem(bytes, legacy_arcen_evidence(paths, bytes))
+        }),
     }
 }
 
@@ -168,6 +170,23 @@ fn marker_matches(paths: &MaterialPaths, certificate_bytes: &[u8]) -> bool {
         return false;
     };
     marker.matches(&pins.certificate, &pins.spki)
+}
+
+fn legacy_arcen_evidence(
+    paths: &MaterialPaths,
+    certificate_bytes: &[u8],
+) -> cert_marker::LegacyArcenEvidence {
+    let companion_pins_match = std::fs::read_to_string(&paths.certificate_pin)
+        .ok()
+        .zip(std::fs::read_to_string(&paths.spki_pin).ok())
+        .is_some_and(|(certificate_pin, spki_pin)| {
+            cert_marker::companion_pins_match_pem(certificate_bytes, &certificate_pin, &spki_pin)
+        });
+    cert_marker::LegacyArcenEvidence {
+        arcen_tls_directory: true,
+        companion_pins_match,
+        machine_sans_match: false,
+    }
 }
 
 /// Generates material through `openssl` and publishes it.

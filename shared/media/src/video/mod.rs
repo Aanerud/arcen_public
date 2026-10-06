@@ -7,6 +7,7 @@ mod frame;
 mod frame_queue;
 mod intent;
 mod obu;
+pub mod pipeline;
 mod plan;
 mod policy;
 pub mod pq_white;
@@ -15,6 +16,7 @@ mod qpmap;
 #[cfg(feature = "software-av1-source")]
 mod software_av1;
 #[cfg(feature = "software-h264-source")]
+#[allow(unsafe_code)]
 mod software_h264;
 mod variant;
 mod wire_frame;
@@ -39,13 +41,25 @@ pub use frame::{
     Nv12FrameMut,
 };
 pub use frame_queue::{
-    FrameClassification, PinGenerationRecovery, RoomState, SharedVideoQueue, VideoQueuePush,
-    VideoQueueWaitStats,
+    FrameClassification, FullFrameRequestCoalescer, FullFrameRequestDecision, KeyframeRequestRetry,
+    PinGenerationRecovery, RoomState, SharedVideoQueue, VideoQueuePush, VideoQueueWaitStats,
 };
 pub use intent::{
     ClientVideoRequestError, ResolvedClientVideoRequest, resolve_client_video_request,
 };
 pub use obu::av1_low_overhead_has_sequence_header;
+pub use pipeline::{
+    BitratePolicy, CodecPolicy, DecodeLatencyPolicy, EncodedFrameOverflowDisposition,
+    EncodedFrameOverflowPolicy, KeelPolicy, KeyframePolicy, PipelineContract, PipelineId,
+    PipelineQpMapDefault, QueuePolicy, RawFrameOverflowDisposition, RawFrameOverflowPolicy,
+    ServedPipelineContext, SoftwareFallbackDecision, aggregate_encoder_backend,
+    aggregate_plan_encoder_backend, clamp_live_bitrate_target, operational_bitrate_bounds,
+    operational_encode_intent, operational_encoder_bitrate_bounds, operational_keyframe_policy,
+    operational_motion_priority, operational_pipeline, operational_rate_control_policy,
+    pipeline_codec_ladder, pipeline_contract, pipeline_for_request, resolve_request_pipeline,
+    served_pipeline, served_pipeline_wants_display_hdr, session_wants_display_hdr,
+    software_fallback_decision,
+};
 pub use plan::{
     AcceleratorClass, BackendAvailability, BackendCandidate, BackendLimits,
     BackendUnavailableNotice, BackendUnavailableReason, CaptureBackend, ConversionBackend,
@@ -67,7 +81,7 @@ pub use preset::{
 };
 pub use qpmap::{
     KEEL_BLOCK_SIZE, MAX_ABS_QP_DELTA, QpBias, QpDeltaMapBuilder, QpMapError, QpMapGeometry,
-    QpMapPolicy,
+    QpMapPolicy, QpMapStats,
 };
 #[cfg(feature = "software-av1-source")]
 pub use software_av1::{

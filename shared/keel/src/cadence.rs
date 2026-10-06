@@ -86,6 +86,103 @@ impl IdleCadence {
     }
 }
 
+/// What a submission was for, from an encoder adapter's point of view.
+///
+/// The [`EmitMode`] cadence plus one encoder-pipeline concern: an encoder that
+/// returns the access unit for a submission only on the next one (NVENC with a
+/// one-deep output queue) needs a duplicate submission after any change, or the
+/// newest frame stays queued until the next keepalive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmissionMode {
+    FirstFrame,
+    Idr,
+    Activity,
+    Keepalive,
+    PipelineFlush,
+}
+
+impl SubmissionMode {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "first",
+            Self::Idr => "idr",
+            Self::Activity => "activity",
+            Self::Keepalive => "keepalive",
+            Self::PipelineFlush => "pipeline_flush",
+        }
+    }
+}
+
+impl From<EmitMode> for SubmissionMode {
+    fn from(value: EmitMode) -> Self {
+        match value {
+            EmitMode::FirstFrame => Self::FirstFrame,
+            EmitMode::Idr => Self::Idr,
+            EmitMode::Activity => Self::Activity,
+            EmitMode::Keepalive => Self::Keepalive,
+        }
+    }
+}
+
+/// When a hardware encoder submits a frame: on change, on a requested keyframe,
+/// once more to flush its pipeline, and otherwise only at keepalive.
+///
+/// Shared by every NVENC adapter so a still desktop costs a keepalive per
+/// second rather than a full encode per frame on any host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmissionGate {
+    cadence: IdleCadence,
+    pipeline_flush_pending: bool,
+}
+
+impl SubmissionGate {
+    #[must_use]
+    pub const fn new(keepalive: Duration) -> Self {
+        Self {
+            cadence: IdleCadence::new(keepalive),
+            pipeline_flush_pending: false,
+        }
+    }
+
+    /// A new frame with changed content is ready.
+    pub const fn note_frame(&mut self) {
+        self.cadence.note_frame();
+    }
+
+    /// The capture source was recreated; nothing retained may be re-sent.
+    pub const fn reset(&mut self) {
+        self.cadence.reset();
+        self.pipeline_flush_pending = false;
+    }
+
+    #[must_use]
+    pub fn decision(
+        self,
+        idr_pending: bool,
+        elapsed_since_emit: Duration,
+    ) -> Option<SubmissionMode> {
+        self.cadence
+            .decision(idr_pending, elapsed_since_emit)
+            .map(SubmissionMode::from)
+            .or_else(|| {
+                self.pipeline_flush_pending
+                    .then_some(SubmissionMode::PipelineFlush)
+            })
+    }
+
+    /// Records a submission. `output_ready` is whether the encoder returned an
+    /// access unit for it.
+    pub const fn on_submitted(&mut self, mode: SubmissionMode, output_ready: bool) {
+        self.cadence.on_submitted();
+        self.pipeline_flush_pending = !output_ready
+            || matches!(
+                mode,
+                SubmissionMode::FirstFrame | SubmissionMode::Idr | SubmissionMode::Activity
+            );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +245,7 @@ mod tests {
 
 #[cfg(test)]
 mod unchanged_frame_tests {
-    use super::{EmitMode, IdleCadence};
+    use super::{EmitMode, IdleCadence, SubmissionGate, SubmissionMode};
     use core::time::Duration;
 
     const KEEPALIVE: Duration = Duration::from_secs(1);
@@ -213,6 +310,97 @@ mod unchanged_frame_tests {
         assert_eq!(
             cadence.decision(false, Duration::ZERO),
             Some(EmitMode::Activity)
+        );
+    }
+
+    fn primed_gate() -> SubmissionGate {
+        let mut gate = SubmissionGate::new(KEEPALIVE);
+        gate.note_frame();
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::FirstFrame)
+        );
+        gate.on_submitted(SubmissionMode::FirstFrame, false);
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::PipelineFlush)
+        );
+        gate.on_submitted(SubmissionMode::PipelineFlush, true);
+        gate
+    }
+
+    #[test]
+    fn no_frame_or_early_idle_tick_does_not_submit() {
+        let gate = SubmissionGate::new(KEEPALIVE);
+        assert_eq!(gate.decision(true, KEEPALIVE), None);
+
+        let gate = primed_gate();
+        assert_eq!(gate.decision(false, Duration::from_millis(999)), None);
+    }
+
+    #[test]
+    fn activity_and_idr_submit_on_the_next_tick_then_flush_once() {
+        let mut gate = primed_gate();
+        gate.note_frame();
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::Activity)
+        );
+        gate.on_submitted(SubmissionMode::Activity, true);
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::PipelineFlush)
+        );
+        gate.on_submitted(SubmissionMode::PipelineFlush, true);
+
+        assert_eq!(
+            gate.decision(true, Duration::ZERO),
+            Some(SubmissionMode::Idr)
+        );
+        gate.on_submitted(SubmissionMode::Idr, true);
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::PipelineFlush)
+        );
+    }
+
+    #[test]
+    fn continuous_activity_supersedes_pending_flush_and_keepalive_is_single() {
+        let mut gate = primed_gate();
+        gate.note_frame();
+        gate.on_submitted(SubmissionMode::Activity, true);
+        gate.note_frame();
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::Activity)
+        );
+        gate.on_submitted(SubmissionMode::Activity, true);
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::PipelineFlush)
+        );
+        gate.on_submitted(SubmissionMode::PipelineFlush, true);
+
+        assert_eq!(
+            gate.decision(false, KEEPALIVE),
+            Some(SubmissionMode::Keepalive)
+        );
+        gate.on_submitted(SubmissionMode::Keepalive, true);
+        assert_eq!(gate.decision(false, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn capture_recreate_discards_retained_frame_and_pending_flush() {
+        let mut gate = primed_gate();
+        gate.note_frame();
+        gate.on_submitted(SubmissionMode::Activity, true);
+        gate.reset();
+        assert_eq!(gate.decision(true, KEEPALIVE), None);
+
+        gate.note_frame();
+        assert_eq!(
+            gate.decision(false, Duration::ZERO),
+            Some(SubmissionMode::FirstFrame)
         );
     }
 }

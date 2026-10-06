@@ -42,7 +42,7 @@ use arcen_media::{
 };
 
 use crate::pipeline::video_decoder::{
-    DecodedVideoFrame, NativeVideoDecoder, SessionColor, VideoDecodeError,
+    DecodedVideoFrame, NativeVideoDecoder, SessionColor, VideoDecodeError, VideoDecoderBackend,
 };
 use crate::protocol::VideoHeader;
 
@@ -127,8 +127,8 @@ pub enum RouteOutcome {
 /// One monitor's bounded decode + presentation state: exactly one in-flight
 /// decoder and exactly one latest decoded frame, mirroring the single-monitor
 /// architecture's bound but per admitted monitor instead of globally.
-struct MonitorSlot {
-    decoder: NativeVideoDecoder,
+struct MonitorSlot<D = NativeVideoDecoder> {
+    decoder: D,
     latest_frame: Option<DecodedVideoFrame>,
     frames_routed: u64,
     frames_rejected: u64,
@@ -144,10 +144,10 @@ struct MonitorSlot {
     waiting_for_keyframe: bool,
 }
 
-impl MonitorSlot {
-    fn new() -> Self {
+impl<D> MonitorSlot<D> {
+    fn with_decoder(decoder: D) -> Self {
         Self {
-            decoder: NativeVideoDecoder::new(),
+            decoder,
             latest_frame: None,
             frames_routed: 0,
             frames_rejected: 0,
@@ -159,13 +159,13 @@ impl MonitorSlot {
 /// Routes per-monitor wire video frames to independent bounded decode +
 /// latest-frame slots, admitting only frames that match this router's
 /// committed topology generation and roster.
-pub struct MonitorFrameRouter {
+pub struct MonitorFrameRouter<D = NativeVideoDecoder> {
     /// The shared, immutable admission fence this router owns its native
     /// slots for: the committed generation, the admitted routes, and each
     /// route's advertised media plan. Every rejection decision is delegated
     /// to it; `slots` below is keyed by exactly the routes it admits.
     admission: RegionFrameRoster,
-    slots: BTreeMap<MonitorRoute, MonitorSlot>,
+    slots: BTreeMap<MonitorRoute, MonitorSlot<D>>,
     /// The explicit negotiated primary monitor id this router was built
     /// for -- [`Self::new`]'s `monitor_ids[0]`, matching
     /// `ValidatedAppliedTopology::monitor_ids()`'s own "primary first"
@@ -180,7 +180,7 @@ pub struct MonitorFrameRouter {
     primary_monitor_id: Option<SessionMonitorId>,
 }
 
-impl fmt::Debug for MonitorFrameRouter {
+impl<D> fmt::Debug for MonitorFrameRouter<D> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MonitorFrameRouter")
@@ -191,7 +191,7 @@ impl fmt::Debug for MonitorFrameRouter {
     }
 }
 
-impl MonitorFrameRouter {
+impl MonitorFrameRouter<NativeVideoDecoder> {
     /// Shared slot-building constructor for [`Self::new`],
     /// [`Self::new_with_media_roster`], and [`Self::single_monitor`]: the
     /// empty/too-many/duplicate roster checks belong to
@@ -200,15 +200,7 @@ impl MonitorFrameRouter {
     /// `None`; the negotiated constructors fill it in afterward from their
     /// own explicit primary, which this routine has no access to.
     fn from_admission(admission: RegionFrameRoster) -> Self {
-        let slots = admission
-            .routes()
-            .map(|route| (route, MonitorSlot::new()))
-            .collect();
-        Self {
-            admission,
-            slots,
-            primary_monitor_id: None,
-        }
+        Self::from_admission_with_decoder_factory(admission, |_| NativeVideoDecoder::default())
     }
 
     /// Builds a router admitting exactly the negotiated `monitor_ids`,
@@ -278,6 +270,39 @@ impl MonitorFrameRouter {
     pub fn single_monitor() -> Self {
         Self::from_admission(RegionFrameRoster::legacy_primary())
     }
+}
+
+impl<D: VideoDecoderBackend> MonitorFrameRouter<D> {
+    fn from_admission_with_decoder_factory(
+        admission: RegionFrameRoster,
+        mut decoder_for_route: impl FnMut(MonitorRoute) -> D,
+    ) -> Self {
+        let slots = admission
+            .routes()
+            .map(|route| (route, MonitorSlot::with_decoder(decoder_for_route(route))))
+            .collect();
+        Self {
+            admission,
+            slots,
+            primary_monitor_id: None,
+        }
+    }
+
+    /// Test-only constructor that keeps production routing/admission intact
+    /// while swapping the per-monitor decoder below the router.
+    #[cfg(test)]
+    pub(crate) fn new_with_decoder_factory_for_test(
+        generation: TopologyGeneration,
+        monitor_ids: &[SessionMonitorId],
+        decoder_for_route: impl FnMut(MonitorRoute) -> D,
+    ) -> Result<Self, RouterBuildError> {
+        let mut router = Self::from_admission_with_decoder_factory(
+            RegionFrameRoster::negotiated(generation, monitor_ids)?,
+            decoder_for_route,
+        );
+        router.primary_monitor_id = monitor_ids.first().copied();
+        Ok(router)
+    }
 
     /// The topology generation this router is fenced to.
     #[must_use]
@@ -340,6 +365,28 @@ impl MonitorFrameRouter {
         for slot in self.slots.values_mut() {
             slot.decoder.set_session_color(session_color);
         }
+    }
+
+    /// Applies the served pipeline's decoder latency policy to every admitted
+    /// monitor's decoder.
+    pub fn set_decode_latency_policy(&mut self, policy: arcen_media::video::DecodeLatencyPolicy) {
+        for slot in self.slots.values_mut() {
+            slot.decoder.set_decode_latency_policy(policy);
+        }
+    }
+
+    /// Requests native biplanar output for one negotiated monitor's decoder.
+    /// Root uses this for the dedicated Grading/HDR layer; secondary windows
+    /// keep RGBA output for their existing egui/wgpu path.
+    pub fn set_prefer_native_biplanar(
+        &mut self,
+        monitor_id: SessionMonitorId,
+        prefer: bool,
+    ) -> bool {
+        let Some(slot) = self.slots.get_mut(&MonitorRoute::Negotiated(monitor_id)) else {
+            return false;
+        };
+        slot.decoder.set_prefer_native_biplanar(prefer)
     }
 
     #[must_use]
@@ -424,7 +471,7 @@ impl MonitorFrameRouter {
         &mut self,
         generation: TopologyGeneration,
         route: MonitorRoute,
-    ) -> Result<&mut MonitorSlot, RouterAdmissionError> {
+    ) -> Result<&mut MonitorSlot<D>, RouterAdmissionError> {
         self.admission.admit_route(generation, route)?;
         self.slots
             .get_mut(&route)
@@ -595,6 +642,16 @@ impl MonitorFrameRouter {
         if let Some(slot) = self.slots.get_mut(&route) {
             slot.waiting_for_keyframe = false;
         }
+    }
+
+    /// Test-only cross-module accessor for the decoder seam below the real
+    /// router. Production callers intentionally cannot observe decoder
+    /// internals; media-worker integration tests need to assert that the
+    /// production routing entry point pushed native/RGBA preference changes
+    /// into the routed root decoder.
+    #[cfg(test)]
+    pub(crate) fn decoder_for_route_for_test(&self, route: MonitorRoute) -> Option<&D> {
+        self.slots.get(&route).map(|slot| &slot.decoder)
     }
 }
 

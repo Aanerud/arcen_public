@@ -86,7 +86,7 @@ use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_MEMORY_HEAP::*;
 use crate::nvenc_sys::nvEncodeAPI::_NV_ENC_QP_MAP_MODE::*;
 use crate::nvenc_sys::nvEncodeAPI::NV_ENC_TUNING_INFO::*;
 
-use arcen_keel::BgraFrame;
+use arcen_keel::{BgraFrame, PendingExternalDamage};
 use arcen_media::video::{
     convert_bgra_to_i444, convert_bgra_to_i444_p16_rows, convert_bgra_to_nv12,
     convert_scrgb_to_pq_i444_p16, convert_scrgb_to_sdr_i444_p16, ColorTransform, I444FrameMut,
@@ -342,8 +342,53 @@ impl Drop for NvencLibrary {
 ///
 /// Separate from [`Encoder`] only so the three pieces that must agree on one
 /// frame geometry are constructed together and cannot drift apart.
+enum QpDamage {
+    CpuHash(arcen_keel::DamageTracker),
+    External(PendingExternalDamage),
+}
+
+impl QpDamage {
+    fn damage_map(&self) -> arcen_keel::DamageMap<'_> {
+        match self {
+            Self::CpuHash(tracker) => tracker.damage_map(),
+            Self::External(damage) => damage.damage_map(),
+        }
+    }
+
+    fn mark_submitted(&mut self) {
+        if let Self::External(damage) = self {
+            damage.mark_submitted();
+        }
+    }
+
+    fn discard_pending(&mut self) {
+        if let Self::External(damage) = self {
+            damage.discard_pending();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QpDamageSource {
+    CpuHash,
+    DxgiRects,
+    WgcDirtyRegions,
+    None,
+}
+
+impl QpDamageSource {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::CpuHash => "cpu-hash",
+            Self::DxgiRects => "dxgi-rects",
+            Self::WgcDirtyRegions => "wgc-dirty-regions",
+            Self::None => "none",
+        }
+    }
+}
+
 struct QpMapState {
-    tracker: arcen_keel::DamageTracker,
+    damage: QpDamage,
     builder: arcen_media::video::QpDeltaMapBuilder,
     bias: arcen_media::video::QpBias,
     policy: crate::qp_map::QpMapPolicy,
@@ -352,6 +397,7 @@ struct QpMapState {
     /// policy — carries no new damage, and biasing it from a stale map would
     /// describe a frame that is no longer on screen.
     observed: bool,
+    stats: arcen_media::video::QpMapStats,
 }
 
 pub struct Encoder {
@@ -419,6 +465,7 @@ pub struct Encoder {
     reconfig_config: NV_ENC_CONFIG,
     frame_rate: u32,
     vbv_buffer_frames: f64,
+    max_bitrate_bps: Option<u32>,
     width: u32,
     height: u32,
     i444_conversion_workers: usize,
@@ -1611,6 +1658,26 @@ fn resolve_pixel_format(
     })
 }
 
+fn apply_keyframe_policy(
+    config: &mut NV_ENC_CONFIG,
+    codec: NvencCodec,
+    policy: arcen_media::video::KeyframePolicy,
+    fps: u32,
+) {
+    let scheduled = policy.scheduled_period_frames(fps);
+    config.gopLength = if scheduled == 0 {
+        NVENC_INFINITE_GOPLENGTH
+    } else {
+        scheduled
+    };
+    let idr_period = config.gopLength;
+    match codec {
+        NvencCodec::H264 => config.encodeCodecConfig.h264Config.idrPeriod = idr_period,
+        NvencCodec::Hevc => config.encodeCodecConfig.hevcConfig.idrPeriod = idr_period,
+        NvencCodec::Av1 => config.encodeCodecConfig.av1Config.idrPeriod = idr_period,
+    }
+}
+
 /// Profile GUID to set for `codec`+`format`, when it differs from the
 /// preset's own default.
 ///
@@ -1675,16 +1742,12 @@ fn frame_bytes(format: PixelFormat, pitch: u32, height: u32) -> usize {
     }
 }
 
-/// `NvEncGetEncodePresetConfigEx`'s frame-rate hint. NVENC's own rate
-/// pacing (and therefore anything sized relative to it) is driven by this,
-/// not by whatever real capture cadence the caller happens to run —
-/// `Encoder::new` takes no `fps` parameter at all, so `rate_control_sizing`
-/// is called with this exact constant to keep the two in agreement; see
-/// `Encoder::new`'s `init.frameRateNum` assignment, the only other reader.
-const NVENC_FRAME_RATE_HINT: u32 = 60;
 #[cfg(test)]
 use crate::nvenc_policy::RateControlSizing;
-use crate::nvenc_policy::{output_drain_policy, rate_control_sizing, vbv_buffer_frames};
+use crate::nvenc_policy::{
+    latency_tuning, max_bitrate_for_target, output_drain_policy, rate_control_sizing,
+    vbv_bits_for_frames, vbv_buffer_frames,
+};
 use arcen_media::video::MotionPriority;
 
 /// `NvEncReconfigureEncoder` cannot change bit depth or chroma format — the
@@ -1765,6 +1828,7 @@ impl Encoder {
     /// resolved `PixelFormat`, never from `color` directly, so a new
     /// combination can't drift between what was resolved and what NVENC was
     /// actually configured for.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -1775,6 +1839,9 @@ impl Encoder {
         intent: EncodeIntent,
         priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
+        fps: u32,
+        max_bitrate_bps: Option<u32>,
+        keyframe_policy: arcen_media::video::KeyframePolicy,
         // `wide_source` is true when the capture delivers FP16 scRGB rather
         // than 8-bit BGRA. It drives the staging texture format, which
         // `CopyResource` requires to match the source exactly.
@@ -1949,6 +2016,7 @@ impl Encoder {
         // pays on every frame.
         preset.presetCfg.rcParams.lookaheadDepth = 0;
         preset.presetCfg.rcParams.set_zeroReorderDelay(1);
+        apply_keyframe_policy(&mut preset.presetCfg, nvenc_codec, keyframe_policy, fps);
         match nvenc_codec {
             NvencCodec::Hevc => {
                 preset
@@ -2144,14 +2212,16 @@ impl Encoder {
         // the preset chose.
         {
             let (rc_chroma, rc_depth) = format.chroma_and_depth();
+            let latency = latency_tuning(priority, intent);
             let sizing = rate_control_sizing(
                 width,
                 height,
-                NVENC_FRAME_RATE_HINT,
+                fps,
                 rc_chroma,
                 rc_depth,
                 priority,
                 intent,
+                max_bitrate_bps,
             );
             preset.presetCfg.rcParams.averageBitRate = sizing.average_bitrate_bps;
             preset.presetCfg.rcParams.maxBitRate = sizing.max_bitrate_bps;
@@ -2159,8 +2229,20 @@ impl Encoder {
             preset.presetCfg.rcParams.vbvInitialDelay = sizing.vbv_buffer_size_bits;
             crate::log(&format!(
                 "rate control: {width}x{height} chroma={rc_chroma:?} depth={rc_depth:?}-bit -> \
-                 average={} max={} vbv_bits={} (preset default replaced; see rate_control_sizing)",
-                sizing.average_bitrate_bps, sizing.max_bitrate_bps, sizing.vbv_buffer_size_bits,
+                 intent={} priority={} preset={} tuning={} frame_interval_p={} \
+                 lookahead_depth={} zero_reorder_delay={} vbv_frames={} average={} max={} \
+                 vbv_bits={} (preset default replaced; see rate_control_sizing)",
+                intent.token(),
+                priority.token(),
+                latency.preset,
+                latency.tuning,
+                latency.frame_interval_p,
+                latency.lookahead_depth,
+                latency.zero_reorder_delay,
+                latency.vbv_buffer_frames,
+                sizing.average_bitrate_bps,
+                sizing.max_bitrate_bps,
+                sizing.vbv_buffer_size_bits,
             ));
         }
         // Ask for a per-block QP delta map only when the caller selected a
@@ -2192,7 +2274,7 @@ impl Encoder {
         init.encodeHeight = height;
         init.darWidth = width;
         init.darHeight = height;
-        init.frameRateNum = NVENC_FRAME_RATE_HINT;
+        init.frameRateNum = fps.max(1);
         init.frameRateDen = 1;
         init.enablePTD = 1;
         init.tuningInfo = tuning;
@@ -2503,8 +2585,9 @@ impl Encoder {
             preset_guid,
             tuning,
             reconfig_config: preset.presetCfg,
-            frame_rate: NVENC_FRAME_RATE_HINT,
+            frame_rate: fps.max(1),
             vbv_buffer_frames: vbv_buffer_frames(priority, intent),
+            max_bitrate_bps,
             width,
             height,
             i444_conversion_workers,
@@ -2574,13 +2657,10 @@ impl Encoder {
     /// Reconfigures NVENC's average/max bitrate and VBV without forcing an IDR.
     pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
         let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
-        let vbv = ((f64::from(bitrate) / f64::from(self.frame_rate.max(1)))
-            * self.vbv_buffer_frames)
-            .round()
-            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let vbv = vbv_bits_for_frames(bitrate, self.frame_rate, self.vbv_buffer_frames);
         let mut config = self.reconfig_config;
         config.rcParams.averageBitRate = bitrate;
-        config.rcParams.maxBitRate = bitrate;
+        config.rcParams.maxBitRate = max_bitrate_for_target(bitrate, self.max_bitrate_bps);
         config.rcParams.vbvBufferSize = vbv;
         config.rcParams.vbvInitialDelay = vbv;
         let mut init: NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
@@ -2613,7 +2693,8 @@ impl Encoder {
         }
         self.reconfig_config = config;
         crate::log(&format!(
-            "NVENC live bitrate reconfigured: average={bitrate} max={bitrate} vbv_bits={vbv}"
+            "NVENC live bitrate reconfigured: average={bitrate} max={} vbv_bits={vbv}",
+            config.rcParams.maxBitRate,
         ));
         Ok(())
     }
@@ -3092,14 +3173,16 @@ impl Encoder {
                 // Observe damage from the same frame that is about to be
                 // converted and encoded, before `publish_bgra` consumes it.
                 if let Some(state) = self.qp_state.as_mut() {
-                    match state.tracker.update(bgra) {
-                        Ok(_) => state.observed = true,
-                        Err(error) => {
-                            // Damage is an optimisation, never a correctness
-                            // requirement: a tracker failure must cost this
-                            // frame its bias, not the session its encode.
-                            state.observed = false;
-                            crate::log(&format!("QP map: damage update failed: {error}"));
+                    if let QpDamage::CpuHash(tracker) = &mut state.damage {
+                        match tracker.update(bgra) {
+                            Ok(_) => state.observed = true,
+                            Err(error) => {
+                                // Damage is an optimisation, never a correctness
+                                // requirement: a tracker failure must cost this
+                                // frame its bias, not the session its encode.
+                                state.observed = false;
+                                crate::log(&format!("QP map: damage update failed: {error}"));
+                            }
                         }
                     }
                 }
@@ -3376,8 +3459,12 @@ impl Encoder {
         policy: crate::qp_map::QpMapPolicy,
         bias: arcen_media::video::QpBias,
         codec: arcen_media::VideoCodec,
+        damage_source: QpDamageSource,
     ) -> bool {
-        if !policy.submits_map() || self.qp_map_entries == 0 {
+        if !policy.submits_map()
+            || self.qp_map_entries == 0
+            || matches!(damage_source, QpDamageSource::None)
+        {
             self.qp_state = None;
             return false;
         }
@@ -3399,22 +3486,81 @@ impl Encoder {
             self.qp_state = None;
             return false;
         }
-        let Ok(tracker) = arcen_keel::DamageTracker::new(
-            self.width as usize,
-            self.height as usize,
-            arcen_keel::KernelPreference::Auto,
-        ) else {
-            self.qp_state = None;
-            return false;
+        let damage = match damage_source {
+            QpDamageSource::CpuHash => {
+                let Ok(tracker) = arcen_keel::DamageTracker::new(
+                    self.width as usize,
+                    self.height as usize,
+                    arcen_keel::KernelPreference::Auto,
+                ) else {
+                    self.qp_state = None;
+                    return false;
+                };
+                QpDamage::CpuHash(tracker)
+            }
+            QpDamageSource::DxgiRects | QpDamageSource::WgcDirtyRegions => {
+                let Ok(damage) =
+                    PendingExternalDamage::new(self.width as usize, self.height as usize)
+                else {
+                    self.qp_state = None;
+                    return false;
+                };
+                QpDamage::External(damage)
+            }
+            QpDamageSource::None => {
+                self.qp_state = None;
+                return false;
+            }
         };
         self.qp_state = Some(QpMapState {
-            tracker,
+            damage,
             builder,
             bias,
             policy,
             observed: false,
+            stats: arcen_media::video::QpMapStats::default(),
         });
         true
+    }
+
+    pub fn observe_external_damage(
+        &mut self,
+        damage: arcen_keel::DamageMap<'_>,
+    ) -> Result<(), String> {
+        let Some(state) = self.qp_state.as_mut() else {
+            return Ok(());
+        };
+        let QpDamage::External(external) = &mut state.damage else {
+            return Ok(());
+        };
+        external
+            .observe(damage)
+            .map_err(|error| format!("QP map external damage mismatch: {error}"))?;
+        state.observed = true;
+        Ok(())
+    }
+
+    pub fn clear_qp_observation(&mut self) {
+        if let Some(state) = self.qp_state.as_mut() {
+            state.observed = false;
+            state.damage.discard_pending();
+        }
+    }
+
+    #[must_use]
+    pub fn prefers_cpu_qp_damage(&self) -> bool {
+        self.format != PixelFormat::Bgra8
+            && self.wide_gpu.is_none()
+            && self.wide_transform.is_none()
+    }
+
+    #[must_use]
+    pub fn take_qp_map_stats(&mut self) -> arcen_media::video::QpMapStats {
+        self.qp_state
+            .as_mut()
+            .map_or_else(arcen_media::video::QpMapStats::default, |state| {
+                std::mem::take(&mut state.stats)
+            })
     }
 
     fn next_writable_slot(&self) -> usize {
@@ -3514,20 +3660,26 @@ impl Encoder {
         let expected_entries = self.qp_map_entries;
         if let Some(state) = self.qp_state.as_mut() {
             let fresh = std::mem::take(&mut state.observed);
+            if fresh {
+                state.damage.mark_submitted();
+            }
             let map = if force_idr || !fresh {
+                state.stats.record_neutral();
                 Some(state.builder.build_neutral())
             } else {
+                let damage = state.damage.damage_map();
+                let dirty_blocks = damage.dirty_blocks().count();
+                let total_blocks = damage.grid().block_count().max(1);
+                let dirty_fraction = dirty_blocks as f64 / total_blocks as f64;
                 let bias = match state.policy {
                     crate::qp_map::QpMapPolicy::Neutral => arcen_media::video::QpBias::NEUTRAL,
                     _ => state.bias,
                 };
-                match crate::qp_map::fill_qp_delta_map(
-                    &mut state.builder,
-                    state.tracker.damage_map(),
-                    bias,
-                    false,
-                ) {
-                    Ok(map) => Some(map),
+                match crate::qp_map::fill_qp_delta_map(&mut state.builder, damage, bias, false) {
+                    Ok(map) => {
+                        state.stats.record_built_map(map, dirty_fraction);
+                        Some(map)
+                    }
                     Err(error) => {
                         crate::log(&format!("QP map: build failed, encoding unbiased: {error}"));
                         None
@@ -5292,6 +5444,7 @@ mod rate_control_tests {
             depth,
             MotionPriority::Detail,
             EncodeIntent::Interactive,
+            None,
         )
     }
 
@@ -5312,6 +5465,7 @@ mod rate_control_tests {
             args.4,
             MotionPriority::Detail,
             EncodeIntent::Interactive,
+            None,
         );
         let quality = rate_control_sizing(
             args.0,
@@ -5321,6 +5475,7 @@ mod rate_control_tests {
             args.4,
             MotionPriority::Detail,
             EncodeIntent::Quality,
+            None,
         );
 
         assert_eq!(
@@ -5345,6 +5500,7 @@ mod rate_control_tests {
             args.4,
             MotionPriority::Motion,
             EncodeIntent::Interactive,
+            None,
         );
         assert!(
             motion.vbv_buffer_size_bits < interactive.vbv_buffer_size_bits,

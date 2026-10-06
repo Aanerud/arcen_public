@@ -45,6 +45,24 @@ monitor roster. Admission measures uniform AV1 first, then uniform HEVC, then
 uniform H.264 on the approved adapter set; only afterward may an
 operator-enabled mixed hardware/software candidate be considered. Per-monitor
 codec fallback is forbidden.
+The macOS multi-monitor Pier follows the same truth boundary for its
+ScreenCaptureKit-per-display -> VideoToolbox-per-region -> region-video ->
+macOS Deck presentation pipeline: after every region encoder is initialized,
+the host reads back each encoder's acceleration class and sends one aggregate
+`served_pipeline` message before the first region frame. All-hardware regions
+allow the resolved product pipeline to stand, any software region reports the
+software fallback, and unknown acceleration reports custom until the host can
+prove more.
+The Windows Pier applies the same aggregate rule to its admitted multi-monitor
+roster (per-monitor DXGI/WGC capture -> NVENC/OpenH264 -> region-video ->
+macOS Deck presentation): the primary monitor may stay on hardware, but any
+software secondary makes the session-wide hello and served-pipeline correction
+report the software fallback.
+Operational encoder/rate-control policy is selected from that served truth, not
+from the original request. A request for HDR that is served as Grading runs the
+Grading bitrate/priority/intent contract; Software runs the Software contract;
+Custom/exact/admin streams keep the legacy link-capped start and shape-formula
+ceiling instead of borrowing a product pipeline.
 
 The implementation is split across:
 
@@ -64,9 +82,12 @@ The implementation is split across:
   enabled only by `software-h264-source`; and
 - `shared/media/src/video/mod.rs`: the public video surface.
 
-`arcen-media` remains `#![forbid(unsafe_code)]`, platform-free, and free of
-hidden I/O. The safe wrapper does not make the underlying C/C++ codec
-memory-safe. Platform FFI and native resource ownership stay in `arcen-capenc`.
+`arcen-media` remains platform-free and free of hidden I/O. Its crate-wide
+unsafe lint is `deny`; the only allowed unsafe exception is the reviewed
+OpenH264 raw `SetOption` bridge in `software_h264.rs`, which exposes safe
+bitrate and frame-rate setters and documents the native-call invariants. The
+safe wrapper does not make the underlying C/C++ codec memory-safe. Platform FFI
+and native resource ownership stay in `arcen-capenc`.
 
 ## Resolved-plan and failure contract
 

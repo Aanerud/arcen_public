@@ -215,47 +215,23 @@ impl CpCoordinator {
         );
 
         // Re-run SID matching (never trust the CP-reported username) until an
-        // unlocked SID-matching session remains continuously stable through the
-        // LogonUI -> user-desktop transition or the bounded deadline passes.
+        // unlocked SID-matching session appears. The per-session agent then
+        // waits for the target session's input desktop to become Default before
+        // starting capture; session 0 cannot observe that desktop reliably.
         let deadline = tokio::time::Instant::now() + self.session_timeout;
-        let stability_clock = tokio::time::Instant::now();
-        let mut stability = crate::first_login::SessionStability::default();
-        let mut stability_announced = false;
         loop {
             match crate::windows_session::reclassify_expected_console(account, target_session) {
                 Ok(Some((identity, selected))) => {
-                    let stable = stability
-                        .observe_strict(stability_clock.elapsed(), Ok(true))
-                        .unwrap_or(false);
-                    if !stable {
-                        if !stability_announced {
-                            tracing::info!(
-                                target: crate::logging::CPPIPE,
-                                correlation_id,
-                                windows_session_id = identity.session_id,
-                                stability_ms = crate::first_login::POST_LOGIN_STABILITY.as_millis(),
-                                "remote first-login: exact session observed; waiting for desktop transition stability"
-                            );
-                            stability_announced = true;
-                        }
-                        drop(selected);
-                    } else {
-                        tracing::info!(
-                            target: crate::logging::CPPIPE,
-                            correlation_id,
-                            windows_session_id = identity.session_id,
-                            "remote first-login: exact session remained stable through desktop transition"
-                        );
-                        return Ok((identity, selected));
-                    }
+                    tracing::info!(
+                        target: crate::logging::CPPIPE,
+                        correlation_id,
+                        windows_session_id = identity.session_id,
+                        "remote first-login: exact session observed; launching agent for desktop transition gate"
+                    );
+                    return Ok((identity, selected));
                 }
-                Ok(None) => {
-                    let _ = stability.observe_strict(stability_clock.elapsed(), Ok(false));
-                    stability_announced = false;
-                }
+                Ok(None) => {}
                 Err(error) => {
-                    let _ =
-                        stability.observe_strict(stability_clock.elapsed(), Err(error.as_str()));
                     return Err(FirstLoginError::SessionProbe(error));
                 }
             }

@@ -741,6 +741,11 @@ async fn serve_desktop(
     stream_frames: Option<u64>,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
     session_id: arcen_telemetry::CorrelationId,
+    microphone: Option<
+        &mut arcen_pier_macos::microphone_input::MicrophoneIngress<
+            arcen_pier_macos::microphone_input::NativeMicrophoneDevice,
+        >,
+    >,
     audio: Option<&mut arcen_pier_macos::audio::AudioCaptureSession>,
     audio_channel: Option<tokio::net::UnixStream>,
 ) -> Result<u64, Box<arcen_pier_macos::stream::StreamEnded>> {
@@ -806,6 +811,8 @@ async fn serve_desktop(
             capture,
             codec: handshake.codec,
             motion_priority: handshake.motion_priority,
+            requested_pipeline: handshake.requested_pipeline,
+            served_pipeline: handshake.active_pipeline.clone(),
             // The login window has no pasteboard: AppKit returns none, and
             // asking for one panicked the clipboard thread.
             clipboard: handshake.clipboard.filter(|_| !handshake.login_window),
@@ -837,6 +844,7 @@ async fn serve_desktop(
             ),
             telemetry,
             session_id,
+            microphone,
             audio,
             path_signal_connection: socket.get_ref().path_signal_connection(),
         },
@@ -891,6 +899,8 @@ async fn serve_multi_desktop(
             monitors,
             codec: handshake.codec,
             motion_priority: handshake.motion_priority,
+            requested_pipeline: handshake.requested_pipeline,
+            served_pipeline: handshake.active_pipeline.clone(),
             // The login window has no pasteboard: AppKit returns none, and
             // asking for one panicked the clipboard thread.
             clipboard: handshake.clipboard.filter(|_| !handshake.login_window),
@@ -921,6 +931,7 @@ async fn serve_multi_desktop(
             telemetry,
             session_id,
             audio,
+            path_signal_connection: socket.get_ref().path_signal_connection(),
         },
     )
     .await?;
@@ -1129,6 +1140,12 @@ fn load_session_host(config_path: &std::path::Path) -> Result<SessionHost, ExitC
             return Err(ExitCode::FAILURE);
         }
     };
+    if file_config.video.qp_map.is_some() {
+        tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            "video.qp_map is accepted but not supported by the macOS Pier VideoToolbox encoder"
+        );
+    }
     Ok(SessionHost {
         _observability: observability,
         telemetry,
@@ -1218,6 +1235,7 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         first_login_timeout,
         session_policy,
         host_setup.telemetry,
+        arcen_pier_macos::timezone_redirection_enabled(&host_setup.file_config),
     ))
 }
 
@@ -1273,7 +1291,18 @@ fn run_daemon(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(daemon_loop(config, host, port, host_setup.telemetry))
+    let reconnect_window_secs = host_setup
+        .file_config
+        .auth
+        .reconnect_window_secs
+        .unwrap_or(arcen_session::direct_reconnect::DEFAULT_RECONNECT_WINDOW_SECONDS);
+    runtime.block_on(daemon_loop(
+        config,
+        host,
+        port,
+        host_setup.telemetry,
+        reconnect_window_secs,
+    ))
 }
 
 async fn daemon_loop(
@@ -1281,6 +1310,7 @@ async fn daemon_loop(
     host: String,
     port: u16,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
+    reconnect_window_secs: u32,
 ) -> ExitCode {
     let address = match resolve_bind_addr(&host, port).await {
         Ok(address) => address,
@@ -1313,11 +1343,19 @@ async fn daemon_loop(
     if expected_agent.is_none() {
         eprintln!("daemon: not running from a bundle; any local agent may register");
     }
+    let _ = reconnect_window_secs;
     let registry = arcen_pier_macos::relay::AgentRegistry::new(
         (own_uid != 0).then_some(own_uid),
         expected_agent,
     );
     tokio::spawn(std::sync::Arc::clone(&registry).run(agent_listener));
+    match arcen_pier_macos::microphone_input::MicrophoneHub::start() {
+        Ok(hub) => {
+            let _hub = Box::leak(Box::new(hub));
+            eprintln!("daemon: microphone Mach service ready");
+        }
+        Err(error) => eprintln!("daemon: microphone Mach service unavailable: {error:?}"),
+    }
 
     if let Some(fields) = arcen_telemetry::lifecycle_fields::service_start(
         "arcen-pier-macos",
@@ -1585,6 +1623,9 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
             "no window-server connection; cursor shapes will not be reported"
         );
     }
+    if arcen_pier_macos::timezone::supported_in_this_process(session_policy.login_window) {
+        restore_stale_agent_timezone("startup");
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1600,6 +1641,7 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         ask_audio_consent,
         session_policy,
         host_setup.telemetry,
+        arcen_pier_macos::timezone_redirection_enabled(&host_setup.file_config),
     ))
 }
 
@@ -1654,17 +1696,78 @@ fn client_accepts_priority_audio(client_hello: &str) -> bool {
 /// can go on to hold the session: the slot is taken after the password.
 const AGENT_SIGN_IN_SLOTS: usize = 3;
 
+fn restore_stale_agent_timezone(reason: &str) {
+    match arcen_pier_macos::timezone::restore_stale_session_timezone() {
+        Ok(Some(restored)) => tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            target_timezone = %restored.target,
+            unset_tz = restored.unset_tz,
+            %reason,
+            "restored stale session timezone from Agent Helper launchd sentinel"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            %error,
+            %reason,
+            "could not restore stale session timezone"
+        ),
+    }
+}
+
+fn arm_timezone_sigterm_restore() {
+    tokio::spawn(async move {
+        let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            return;
+        };
+        let _ = signal.recv().await;
+        let (done, wait_done) = tokio::sync::oneshot::channel();
+        let _ = std::thread::Builder::new()
+            .name("arcen-tz-sigterm-restore".to_owned())
+            .spawn(move || {
+                let _ = done.send(
+                    arcen_pier_macos::timezone::restore_active_session_timezone_for_shutdown(),
+                );
+            });
+        match tokio::time::timeout(std::time::Duration::from_secs(2), wait_done).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                %error,
+                "could not restore active session timezone before SIGTERM exit"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                %error,
+                "timezone restore task failed before SIGTERM exit"
+            ),
+            Err(_) => tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                "timed out restoring active session timezone before SIGTERM exit"
+            ),
+        }
+        std::process::exit(0);
+    });
+}
+
 async fn agent_loop(
     kind: arcen_session::agent_relay::DesktopSessionKind,
     local_playback: arcen_session::pier_config::LocalPlayback,
     ask_audio_consent: bool,
     session_policy: arcen_pier_macos::session::SessionPolicy,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
+    timezone_redirection: bool,
 ) -> ExitCode {
+    advertise_host_audio();
     // A signed-in person can answer the prompts, so ask them all now, one at a
     // time. The login window has nobody to ask.
     if kind == arcen_session::agent_relay::DesktopSessionKind::User {
         tokio::spawn(ask_for_permissions_in_turn(ask_audio_consent));
+        if arcen_pier_macos::timezone::supported_in_this_process(false) {
+            arm_timezone_sigterm_restore();
+        }
     } else {
         announce_permissions();
     }
@@ -1683,6 +1786,7 @@ async fn agent_loop(
             local_playback,
             session_policy.clone(),
             telemetry.clone(),
+            timezone_redirection,
             std::sync::Arc::clone(&admission),
             std::rc::Rc::clone(&waiting_reported),
         ));
@@ -1691,12 +1795,14 @@ async fn agent_loop(
     ExitCode::FAILURE
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn agent_slot(
     kind: arcen_session::agent_relay::DesktopSessionKind,
     service_uid: Option<u32>,
     local_playback: arcen_session::pier_config::LocalPlayback,
     session_policy: arcen_pier_macos::session::SessionPolicy,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
+    timezone_redirection: bool,
     admission: std::sync::Arc<arcen_session::session_admission::SessionAdmissionRuntime>,
     waiting_reported: std::rc::Rc<std::cell::Cell<bool>>,
 ) {
@@ -1727,6 +1833,7 @@ async fn agent_slot(
                     AGENT_CONSOLE_GRACE,
                     &session_policy,
                     &telemetry,
+                    timezone_redirection,
                     Some(&admission),
                     Some(AudioChannelRequest {
                         kind,
@@ -2101,6 +2208,10 @@ fn stream_start_fields(
         width: handshake.capture_width,
         height: handshake.capture_height,
         fps: Some(handshake.fps),
+        pipeline: handshake
+            .active_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.token()),
         color: Some(arcen_telemetry::lifecycle_fields::ColorIdentity {
             bit_depth: match plan.bit_depth {
                 PlanBitDepth::Eight => "8",
@@ -2373,6 +2484,108 @@ impl Drop for LifecycleEnd {
     }
 }
 
+fn apply_session_timezone(
+    running_in_agent: bool,
+    login_window: bool,
+    enabled: bool,
+    timezone: Option<&str>,
+    session_id: &arcen_telemetry::CorrelationId,
+) -> Option<arcen_pier_macos::timezone::SessionTimezoneLease> {
+    if !enabled {
+        return None;
+    }
+    if !running_in_agent {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            sid = %session_id,
+            "macOS timezone redirection is available only in the per-session Agent Helper"
+        );
+        return None;
+    }
+    match arcen_pier_macos::timezone::begin_session_timezone(enabled, timezone, login_window) {
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Applied(lease) => {
+            let target = lease.target().to_owned();
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                to_timezone = %target,
+                scope = "launchd_gui_session",
+                "session timezone redirected for newly launched macOS apps"
+            );
+            Some(lease)
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::UnsupportedAtLoginWindow => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                "timezone redirection is unsupported at the macOS login window"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::UserDefinedTimezone => {
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                "timezone redirection skipped because the user already defines TZ"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::UnsupportedNotSessionAgent => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                "timezone redirection is unsupported outside the launchd-managed Agent Helper"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::ShuttingDown => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                "timezone redirection refused because the Agent Helper is shutting down"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Absent => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                "timezone redirection enabled but client timezone is absent; continuing without redirection"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Invalid(message) => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                timezone = %message,
+                "authenticated client timezone is invalid; redirection skipped"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Unsupported(timezone) => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                %timezone,
+                "authenticated client timezone is unavailable on this Mac; redirection skipped"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Warning(message) => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::SESSION,
+                sid = %session_id,
+                error = %message,
+                "timezone redirection failed; authenticated streaming continues"
+            );
+            None
+        }
+        arcen_pier_macos::timezone::SessionTimezoneOutcome::Disabled => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_one(
     socket: &mut arcen_pier_macos::net::PierSocket,
     peer: std::net::SocketAddr,
@@ -2381,11 +2594,15 @@ async fn serve_one(
     first_login_timeout: std::time::Duration,
     session_policy: &arcen_pier_macos::session::SessionPolicy,
     telemetry: &arcen_pier_macos::observability::HostTelemetry,
+    timezone_redirection: bool,
     admission: Option<&std::sync::Arc<arcen_session::session_admission::SessionAdmissionRuntime>>,
     audio_channel_request: Option<AudioChannelRequest>,
 ) -> SessionOutcome {
     let mut stream_failed = false;
     println!("client connected from {peer}");
+    let mut session_policy = session_policy.clone();
+    session_policy.microphone_backend_available =
+        arcen_pier_macos::microphone_input::backend_available();
     // One correlation id per accepted connection, so the auth result, the
     // stream start and the session end can be gathered from a log that
     // holds many sessions at once.
@@ -2393,7 +2610,7 @@ async fn serve_one(
         arcen_pier_macos::observability::random_correlation_bytes(),
     );
     let session_started = std::time::Instant::now();
-    match arcen_pier_macos::session::perform_for_peer(socket, peer.ip(), session_policy, admission)
+    match arcen_pier_macos::session::perform_for_peer(socket, peer.ip(), &session_policy, admission)
         .await
     {
         Ok(handshake) => {
@@ -2408,6 +2625,13 @@ async fn serve_one(
                 arcen_telemetry::lifecycle_fields::session_auth_ok("pam", "console_user", None),
                 arcen_telemetry::names::target::AUTH,
                 "session auth ok",
+            );
+            let _timezone_lease = apply_session_timezone(
+                audio_channel_request.is_some(),
+                session_policy.login_window,
+                timezone_redirection,
+                handshake.authenticated_timezone.as_deref(),
+                &session_id,
             );
             let lifecycle = LifecycleEnd(session_id.to_string());
             log_lifecycle(
@@ -2482,7 +2706,45 @@ async fn serve_one(
                 }
                 _ => None,
             };
-            if let Err(error) = send_microphone_result(socket, handshake.microphone).await {
+            let mut session_microphone = if handshake.microphone.is_enabled() {
+                match arcen_pier_macos::microphone_input::MicrophoneSessionBinding::new(
+                    handshake.microphone.generation,
+                )
+                .and_then(|binding| {
+                    arcen_pier_macos::microphone_input::NativeMicrophoneDevice::open(&binding)
+                        .map(|device| (binding, device))
+                }) {
+                    Ok((binding, device)) => {
+                        match arcen_pier_macos::microphone_input::MicrophoneIngress::new(
+                            binding,
+                            handshake.microphone,
+                            device,
+                        ) {
+                            Ok(ingress) => Some(ingress.with_session_log_id(session_id.clone())),
+                            Err(error) => {
+                                eprintln!("microphone disabled after negotiation: {error:?}");
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("microphone device unavailable after negotiation: {error:?}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let delivered_microphone =
+                if handshake.microphone.is_enabled() && session_microphone.is_none() {
+                    arcen_media::audio::ResolvedMicrophoneStream::disabled(
+                        handshake.microphone.generation,
+                        arcen_protocol::messages::MicrophoneStreamReason::BackendUnavailable,
+                    )
+                } else {
+                    handshake.microphone
+                };
+            if let Err(error) = send_microphone_result(socket, delivered_microphone).await {
                 eprintln!(
                     "ending session because the microphone result was not delivered: {error}"
                 );
@@ -2524,6 +2786,7 @@ async fn serve_one(
                 stream_frames,
                 telemetry.clone(),
                 session_id.clone(),
+                session_microphone.as_mut(),
                 // The capture this session negotiated, not `None`. The lease
                 // was started, announced to the Deck as enabled, and released
                 // at the end — and never handed to the streamer, so nothing
@@ -2540,6 +2803,9 @@ async fn serve_one(
                 audio_channel,
             )
             .await;
+            if let Some(microphone) = session_microphone.as_mut() {
+                let _ = microphone.shutdown_wait("session_end").await;
+            }
             let (reason_class, frames_sent) = match &outcome {
                 Ok(frames) => ("completed", *frames),
                 Err(ended) => {
@@ -2636,6 +2902,16 @@ fn announce_permissions() {
          keyboard injection will not reach applications."
         );
     }
+    advertise_host_audio();
+}
+
+/// Advertises host audio on every agent and serve path.
+///
+/// Called before any permission prompt so the hello does not depend on which
+/// prompt path ran: when asking for permissions in turn replaced
+/// `announce_permissions` for signed-in sessions, nothing set this any more,
+/// every hello said `audio: false`, and the Deck never asked for sound.
+fn advertise_host_audio() {
     // Audio is advertised, not proved, and deliberately not derived from the
     // screen-recording grant. Those are two different TCC services:
     // `kTCCServiceScreenCapture` backs "Screen & System Audio Recording" and
@@ -2680,6 +2956,7 @@ async fn serve_loop(
     first_login_timeout: std::time::Duration,
     session_policy: arcen_pier_macos::session::SessionPolicy,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
+    timezone_redirection: bool,
 ) -> ExitCode {
     let address = match resolve_bind_addr(&host, port).await {
         Ok(address) => address,
@@ -2770,6 +3047,7 @@ async fn serve_loop(
                 first_login_timeout,
                 &session_policy,
                 &telemetry,
+                timezone_redirection,
                 None,
                 None,
             );

@@ -62,10 +62,11 @@ if cargo tree --locked -p arcen-outputs -e all | grep -E "$forbidden_pattern"; t
   exit 1
 fi
 ```
-There is no single-platform `--workspace` build. `arcen-protocol` and
-`arcen-input`, `arcen-protocol`, and `arcen-transport` retain crate-level
-`unsafe_code = "forbid"`; `arcen-media` does the same. Shared manifests must not reference
-`hosts/`, `clients/`, or `packaging/`.
+There is no single-platform `--workspace` build. `arcen-protocol`,
+`arcen-input`, and `arcen-transport` retain crate-level `unsafe_code = "forbid"`;
+`arcen-media` is crate-wide `unsafe_code = "deny"` with a single reviewed
+OpenH264 raw `SetOption` exception in `software_h264.rs`. Shared manifests must
+not reference `hosts/`, `clients/`, or `packaging/`.
 
 Escalate public API, wire compatibility, trust-boundary, cryptography, and new
 third-party dependency changes to Release/Security. Notify every affected

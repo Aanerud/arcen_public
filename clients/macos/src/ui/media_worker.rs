@@ -21,29 +21,42 @@ use crate::pipeline::frame_queue::{
     IncomingMediaBatch, IncomingMediaReceiver, IncomingMediaTelemetry,
 };
 use crate::pipeline::monitor_router::{MonitorFrameRouter, MonitorRoute, RouteOutcome};
-use crate::pipeline::video_decoder::{DecodedVideoFrame, NativeVideoDecoder, SessionColor};
+use crate::pipeline::video_decoder::{
+    DecodedVideoFrame, NativeVideoDecoder, SessionColor, VideoDecoderBackend,
+};
 use crate::protocol::messages::{
     msg_type, AudioStreamResultMsg, AuthRequest, CursorModeResultMsg, CursorShapeMsg,
-    DisplayUpdateResultMsg, HealthPongMsg, HealthStatsMsg, ServerHelloMsg, TabletModeResultMsg,
-    AUDIO_STREAM_RESULT, CURSOR_MODE_RESULT, CURSOR_SHAPE, DISPLAY_UPDATE_RESULT, HEALTH_PONG,
-    HEALTH_STATS, TABLET_MODE_RESULT,
+    DisplayUpdateResultMsg, HealthPongMsg, HealthStatsMsg, ServedPipelineMsg, ServerHelloMsg,
+    TabletModeResultMsg, AUDIO_STREAM_RESULT, CURSOR_MODE_RESULT, CURSOR_SHAPE,
+    DISPLAY_UPDATE_RESULT, HEALTH_PONG, HEALTH_STATS, SERVED_PIPELINE, TABLET_MODE_RESULT,
 };
 use crate::protocol::VideoHeader;
 use crate::transport::tls::CertInfo;
 use crate::transport::websocket::{
-    FullFrameRequestGate, SessionAuthentication, SessionCommandSender, SessionEnd, SessionEvent,
+    DisconnectReason, FullFrameRequestGate, SessionAuthentication, SessionCommandSender,
+    SessionEnd, SessionEvent, TerminalDisconnect,
 };
 use crate::ui::session_truth::ActiveContract;
-use arcen_media::{
-    classify_presentation_window, ColorPrimaries, PresentationWindow, TransferCharacteristics,
+use crate::ui::video_metal_layer::{
+    DedicatedEightBitLayerFrame, DedicatedEightBitPresentationStatus,
+    DedicatedEightBitVideoPresenter, DedicatedLayerFrame, DedicatedPresentationStatus,
+    DedicatedVideoPresenter,
 };
-use arcen_telemetry::rounded_percentiles_ms;
+use arcen_media::{classify_presentation_window, PresentationWindow, TransferCharacteristics};
+use arcen_telemetry::{rounded_percentiles_ms, WireDelayEstimator};
 
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(2);
 /// How often the worker emits an INFO "stream healthy" heartbeat while frames
 /// are flowing. At INFO this is the sysadmin's "OK working" signal; DEBUG adds
 /// the per-event drop/keyframe/decode detail around it.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerLoopStep {
+    Event,
+    PendingPolled,
+    Disconnected,
+}
 
 /// One negotiated monitor's own media counters.
 ///
@@ -133,6 +146,70 @@ struct MonitorWindowRates {
     frames_dropped_before_presentation: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NativePresentationMetadata {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) timestamp_ms: u32,
+    pub(crate) pixel_format: String,
+    pub(crate) backend: &'static str,
+    pub(crate) video: arcen_media::VideoConfiguration,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PresentationRecovery {
+    pending: bool,
+}
+
+impl PresentationRecovery {
+    fn arm(&mut self, gate: &mut FullFrameRequestGate) {
+        self.pending = true;
+        gate.request();
+    }
+
+    const fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn clear_after_fallback_handoff(&mut self) -> bool {
+        if !self.pending {
+            return false;
+        }
+        self.pending = false;
+        true
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct LatestFrameMailbox<T> {
+    slot: Option<T>,
+    accepted: u64,
+    dropped: u64,
+}
+
+#[cfg(test)]
+impl<T> LatestFrameMailbox<T> {
+    pub(crate) fn submit(&mut self, frame: T) {
+        if self.slot.replace(frame).is_some() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.accepted = self.accepted.saturating_add(1);
+    }
+
+    pub(crate) fn take(&mut self) -> Option<T> {
+        self.slot.take()
+    }
+
+    pub(crate) const fn accepted(&self) -> u64 {
+        self.accepted
+    }
+
+    pub(crate) const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 fn monitor_stream_window(
     elapsed: Duration,
     previous: Option<MonitorRateSnapshot>,
@@ -170,8 +247,29 @@ pub struct SharedMediaState {
     pub certificate_untrusted: Option<CertInfo>,
     pub pending_auth: Option<AuthRequest>,
     pub pending_authentication: Option<SessionAuthentication>,
+    pub connection_status_hint: Option<String>,
     /// Newest decoded frame, taken (and uploaded) by the UI thread.
     pub latest_frame: Option<DecodedVideoFrame>,
+    /// Main-thread-attached root 8-bit presenter, rendered from the media
+    /// worker when Auto/Speed zero-copy presentation is available.
+    pub(crate) eight_bit_video_presenter: Option<Arc<Mutex<DedicatedEightBitVideoPresenter>>>,
+    pub(crate) eight_bit_layer_ready: bool,
+    pub(crate) eight_bit_layer_has_picture: bool,
+    pub(crate) eight_bit_layer_disabled: bool,
+    pub(crate) eight_bit_presentation_status: DedicatedEightBitPresentationStatus,
+    /// Main-thread-attached root Grading/HDR presenter, rendered from the
+    /// media worker when the native `xf44`/RGB10A2 path is available.
+    pub(crate) ten_bit_video_presenter: Option<Arc<Mutex<DedicatedVideoPresenter>>>,
+    pub(crate) ten_bit_layer_ready: bool,
+    pub(crate) ten_bit_layer_has_picture: bool,
+    pub(crate) ten_bit_layer_disabled: bool,
+    pub(crate) ten_bit_presentation_status: DedicatedPresentationStatus,
+    pub(crate) dedicated_presenter_drops: u64,
+    pub(crate) dedicated_presenter_skips: u64,
+    pub(crate) layer_present_ms_samples: VecDeque<f64>,
+    pub(crate) latest_native_frame_metadata: Option<NativePresentationMetadata>,
+    pub(crate) last_native_frame_size: Option<[usize; 2]>,
+    pub(crate) presentation_recovery: PresentationRecovery,
     /// The primary/root decoder's own backend label, snapshotted alongside
     /// every frame it publishes (see `publish_decoded_frame`). Empty before
     /// any frame has decoded. Independent of `encoder_backend`/`encoder_class`
@@ -185,6 +283,8 @@ pub struct SharedMediaState {
     /// pre-session answer.
     pub decoder_hardware_accelerated: Option<bool>,
     pub server_hello: Option<ServerHelloMsg>,
+    pub served_pipeline: Option<ServedPipelineMsg>,
+    pub served_source_fps: Option<u32>,
     pub cursor_mode_result: Option<CursorModeResultMsg>,
     pub tablet_mode_result: Option<TabletModeResultMsg>,
     pub pending_cursor_shape: Option<arcen_protocol::messages::CursorShapeKind>,
@@ -220,12 +320,16 @@ pub struct SharedMediaState {
     pub last_decode_ms: f64,
     pub decode_ms_samples: VecDeque<f64>,
     pub video_packet_times: VecDeque<Instant>,
-    pub last_wire_frame_age_ms: Option<i32>,
-    /// Recent wire ages of video and audio frames at arrival, for the
-    /// "stream delay" heartbeat. Both use the host's wire clock, so they
-    /// are only as exact as the two clocks agree.
-    pub video_wire_age_samples: VecDeque<f64>,
-    pub audio_wire_age_samples: VecDeque<f64>,
+    pub last_wire_clock_age_ms: Option<i32>,
+    pub last_wire_delay_ms: Option<i32>,
+    pub wire_delay_estimator: WireDelayEstimator,
+    /// Recent raw clock ages and offset-free delays at arrival. Clock age uses
+    /// the host wall clock and therefore includes inter-machine clock offset;
+    /// delay subtracts the session rolling minimum for decisions and overlays.
+    pub video_wire_clock_age_samples: VecDeque<f64>,
+    pub video_wire_delay_samples: VecDeque<f64>,
+    pub audio_wire_clock_age_samples: VecDeque<f64>,
+    pub audio_wire_delay_samples: VecDeque<f64>,
     pub waiting_for_keyframe: bool,
     pub inbox: IncomingMediaTelemetry,
     pub ingress_idr_requests: u64,
@@ -290,9 +394,8 @@ pub struct SharedMediaState {
     /// (`arcen_media::MAX_MULTI_MONITOR_COUNT`), so this map can never grow
     /// beyond four entries.
     pub monitor_media: BTreeMap<arcen_media::SessionMonitorId, MonitorMediaCounters>,
-    /// Recent video wire-age samples by negotiated monitor, using the same
-    /// host timestamp clock as the session-wide `video_wire_age_samples`.
-    pub monitor_wire_age_samples: BTreeMap<arcen_media::SessionMonitorId, VecDeque<f64>>,
+    /// Recent offset-free video wire-delay samples by negotiated monitor.
+    pub monitor_wire_delay_samples: BTreeMap<arcen_media::SessionMonitorId, VecDeque<f64>>,
     /// Cumulative UI presentations by monitor. Decode/receive counters are
     /// worker-owned, but presentation happens on the UI thread.
     pub monitor_presented_frames: BTreeMap<arcen_media::SessionMonitorId, u64>,
@@ -347,46 +450,30 @@ pub fn spawn_media_worker(
             // Seeded by `ServerHello` and applied to every decoder, including
             // the per-monitor ones the router builds later in the session.
             let mut session_color = SessionColor::default();
+            let mut decode_latency_policy = arcen_media::video::DecodeLatencyPolicy::default();
             tracing::info!(target: crate::logging::target::VIDEO, "media worker started");
 
             loop {
-                if full_frame_requests
-                    .retry_after()
-                    .is_some_and(|delay| delay.is_zero())
-                    && full_frame_requests.send_due(&commands)
-                    && pending_ingress_idr
-                {
-                    shared
-                        .lock()
-                        .expect("media state poisoned")
-                        .ingress_idr_requests += 1;
-                }
-                let event = if full_frame_requests.is_pending() {
-                    match events.try_recv() {
-                        Ok(event) => Some(event),
-                        Err(mpsc::error::TryRecvError::Empty) => {
-                            if full_frame_requests.send_due(&commands) {
-                                if pending_ingress_idr {
-                                    shared
-                                        .lock()
-                                        .expect("media state poisoned")
-                                        .ingress_idr_requests += 1;
-                                }
-                            } else {
-                                std::thread::sleep(
-                                    full_frame_requests
-                                        .retry_after()
-                                        .unwrap_or_default()
-                                        .min(Duration::from_millis(10)),
-                                );
-                            }
-                            continue;
+                let mut event = None;
+                match service_worker_loop_step(
+                    &shared,
+                    &commands,
+                    &mut full_frame_requests,
+                    pending_ingress_idr,
+                    |blocking| {
+                        if blocking {
+                            Ok(events.blocking_recv())
+                        } else {
+                            events.try_recv().map(Some)
                         }
-                        Err(mpsc::error::TryRecvError::Disconnected) => None,
-                    }
-                } else {
-                    events.blocking_recv()
-                };
+                    },
+                    std::thread::sleep,
+                    &mut event,
+                ) {
+                    WorkerLoopStep::PendingPolled => continue,
+                    WorkerLoopStep::Disconnected => break,
+                    WorkerLoopStep::Event => {}
+                }
                 let Some(event) = event else {
                     break;
                 };
@@ -430,13 +517,28 @@ pub fn spawn_media_worker(
                         // does not report the axis at all) keeps the
                         // BT.709 SDR default rather than guessing.
                         let active = ActiveContract::from_hello(&hello);
+                        decode_latency_policy = hello
+                            .active_pipeline
+                            .as_ref()
+                            .and_then(arcen_media::video::PipelineId::from_served_wire)
+                            .map_or_else(arcen_media::video::DecodeLatencyPolicy::default, |id| {
+                                arcen_media::video::pipeline_contract(id).decode_latency
+                            });
                         {
                             let mut state = shared.lock().expect("media state poisoned");
                             state.server_hello = Some(hello);
                         }
+                        let color_metadata =
+                            arcen_media::VideoColorMetadata::from_optional_or_legacy(
+                                active.range,
+                                active.matrix,
+                                active.primaries,
+                                active.transfer,
+                            );
+                        let presentation_metadata = color_metadata.presentation_axes();
                         session_color = SessionColor {
-                            primaries: active.primaries.unwrap_or(ColorPrimaries::Bt709),
-                            transfer: active.transfer.unwrap_or(TransferCharacteristics::Bt709),
+                            primaries: presentation_metadata.primaries,
+                            transfer: presentation_metadata.transfer,
                         };
                         tracing::info!(
                             target: crate::logging::target::VIDEO,
@@ -449,8 +551,10 @@ pub fn spawn_media_worker(
                             "deck resolved session colour from host caps",
                         );
                         decoder.set_session_color(session_color);
+                        decoder.set_decode_latency_policy(decode_latency_policy);
                         if let Some(router) = secondary_router.as_mut() {
                             router.set_session_color(session_color);
+                            router.set_decode_latency_policy(decode_latency_policy);
                         }
                         full_frame_requests.request();
                         let _ = full_frame_requests.send_due(&commands);
@@ -466,16 +570,25 @@ pub fn spawn_media_worker(
                     }
                     SessionEvent::Json(value) => {
                         let mut state = shared.lock().expect("media state poisoned");
+                        // Results the UI acts on wake it; health samples
+                        // wait for its next pass.
+                        let mut wake = true;
                         match msg_type(&value) {
                             Some(HEALTH_STATS) => {
                                 if let Ok(stats) = serde_json::from_value::<HealthStatsMsg>(value) {
+                                    let served_fps = served_fps_from_health(&stats);
                                     state.host_health = Some(stats);
+                                    if served_fps.is_some() {
+                                        state.served_source_fps = served_fps;
+                                    }
                                 }
+                                wake = false;
                             }
                             Some(HEALTH_PONG) => {
                                 if let Ok(pong) = serde_json::from_value::<HealthPongMsg>(value) {
                                     state.last_health_pong = Some(pong);
                                 }
+                                wake = false;
                             }
                             Some(CURSOR_MODE_RESULT) => {
                                 if let Ok(result) =
@@ -515,8 +628,19 @@ pub fn spawn_media_worker(
                                 {
                                     audio.set_stream_result(&result);
                                 }
+                                wake = false;
                             }
-                            _ => {}
+                            Some(SERVED_PIPELINE) => {
+                                if let Ok(message) =
+                                    serde_json::from_value::<ServedPipelineMsg>(value)
+                                {
+                                    state.served_pipeline = Some(message);
+                                }
+                            }
+                            _ => wake = false,
+                        }
+                        if wake {
+                            repaint.request_repaint();
                         }
                     }
                     SessionEvent::MicrophoneActive(active) => {
@@ -535,6 +659,7 @@ pub fn spawn_media_worker(
                             &shared,
                             &mut secondary_router,
                             session_color,
+                            decode_latency_policy,
                         );
                         handle_media_batch(
                             &shared,
@@ -549,10 +674,23 @@ pub fn spawn_media_worker(
                             &repaint,
                         );
                         maybe_heartbeat(&shared, &mut last_heartbeat, &mut monitor_rate_snapshots);
+                        // No wake here: a decoded frame wakes the UI where it
+                        // is published, and waking for every batch woke it
+                        // ~50 times a second for audio alone.
+                    }
+                    SessionEvent::PresentationRecoveryRequested => {
+                        request_presentation_recovery(&shared, &commands, &mut full_frame_requests);
+                        repaint.request_repaint();
+                    }
+                    SessionEvent::ConnectionStatusHint(hint) => {
+                        shared
+                            .lock()
+                            .expect("media state poisoned")
+                            .connection_status_hint = hint;
                         repaint.request_repaint();
                     }
                     SessionEvent::Ended(end) => {
-                        let error = Some(end.message.clone());
+                        let error = session_end_worker_error(&end);
                         shared.lock().expect("media state poisoned").end = Some(end);
                         finish(&shared, &repaint, error);
                         return;
@@ -562,6 +700,15 @@ pub fn spawn_media_worker(
             finish(&shared, &repaint, None);
         })
         .expect("failed to spawn media worker");
+}
+
+fn session_end_worker_error(end: &SessionEnd) -> Option<String> {
+    match end.reason {
+        DisconnectReason::Terminal(
+            TerminalDisconnect::Manual | TerminalDisconnect::GracefulHostClose,
+        ) => None,
+        _ => Some(end.message.clone()),
+    }
 }
 
 fn finish(shared: &Arc<Mutex<SharedMediaState>>, repaint: &egui::Context, error: Option<String>) {
@@ -583,6 +730,57 @@ fn finish(shared: &Arc<Mutex<SharedMediaState>>, repaint: &egui::Context, error:
         state.error = error;
     }
     repaint.request_repaint();
+}
+
+fn service_worker_loop_step(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: bool,
+    mut recv: impl FnMut(bool) -> Result<Option<SessionEvent>, mpsc::error::TryRecvError>,
+    sleep: impl FnOnce(Duration),
+    event: &mut Option<SessionEvent>,
+) -> WorkerLoopStep {
+    if full_frame_requests
+        .retry_after()
+        .is_some_and(|delay| delay.is_zero())
+    {
+        let _ =
+            send_due_full_frame_request(shared, commands, full_frame_requests, pending_ingress_idr);
+    }
+    if full_frame_requests.is_pending() {
+        match recv(false) {
+            Ok(Some(next)) => {
+                *event = Some(next);
+                WorkerLoopStep::Event
+            }
+            Ok(None) => WorkerLoopStep::Disconnected,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if !send_due_full_frame_request(
+                    shared,
+                    commands,
+                    full_frame_requests,
+                    pending_ingress_idr,
+                ) {
+                    sleep(
+                        full_frame_requests
+                            .retry_after()
+                            .unwrap_or_default()
+                            .min(Duration::from_millis(10)),
+                    );
+                }
+                WorkerLoopStep::PendingPolled
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => WorkerLoopStep::Disconnected,
+        }
+    } else {
+        *event = recv(true).unwrap_or(None);
+        if event.is_some() {
+            WorkerLoopStep::Event
+        } else {
+            WorkerLoopStep::Disconnected
+        }
+    }
 }
 
 /// Emit an INFO "stream healthy" heartbeat at most every HEARTBEAT_INTERVAL.
@@ -609,7 +807,8 @@ fn maybe_heartbeat(
         audio_batch_high_water = state.audio_batch_high_water,
         audio_frames = state.audio_frames_seen,
         decode_ms = state.last_decode_ms,
-        wire_age_ms = ?state.last_wire_frame_age_ms,
+        wire_clock_age_ms = ?state.last_wire_clock_age_ms,
+        wire_delay_ms = ?state.last_wire_delay_ms,
         waiting_for_keyframe = state.waiting_for_keyframe,
         video_queue_drops = state.inbox.video_dropped_packets,
         video_queue_superseded = state.inbox.video_superseded_packets,
@@ -637,16 +836,24 @@ fn maybe_heartbeat(
     );
     // Its own record: the heartbeat above is at the per-record field cap.
     // Audio heard = its wire age + what waits in the playout queue.
-    let video_age = rounded_percentiles_ms(state.video_wire_age_samples.iter().copied());
-    let audio_age = rounded_percentiles_ms(state.audio_wire_age_samples.iter().copied());
+    let video_clock_age =
+        rounded_percentiles_ms(state.video_wire_clock_age_samples.iter().copied());
+    let video_delay = rounded_percentiles_ms(state.video_wire_delay_samples.iter().copied());
+    let audio_clock_age =
+        rounded_percentiles_ms(state.audio_wire_clock_age_samples.iter().copied());
+    let audio_delay = rounded_percentiles_ms(state.audio_wire_delay_samples.iter().copied());
     tracing::info!(
         target: crate::logging::target::VIDEO,
-        video_age_p50_ms = ?video_age.map(|age| age.p50_ms),
-        video_age_p95_ms = ?video_age.map(|age| age.p95_ms),
-        audio_age_p50_ms = ?audio_age.map(|age| age.p50_ms),
-        audio_age_p95_ms = ?audio_age.map(|age| age.p95_ms),
+        video_clock_age_p50_ms = ?video_clock_age.map(|age| age.p50_ms),
+        video_clock_age_p95_ms = ?video_clock_age.map(|age| age.p95_ms),
+        video_delay_p50_ms = ?video_delay.map(|delay| delay.p50_ms),
+        video_delay_p95_ms = ?video_delay.map(|delay| delay.p95_ms),
+        audio_clock_age_p50_ms = ?audio_clock_age.map(|age| age.p50_ms),
+        audio_clock_age_p95_ms = ?audio_clock_age.map(|age| age.p95_ms),
+        audio_delay_p50_ms = ?audio_delay.map(|delay| delay.p50_ms),
+        audio_delay_p95_ms = ?audio_delay.map(|delay| delay.p95_ms),
         audio_queued_ms = state.last_audio_queued_ms,
-        audio_heard_ms = ?audio_age.map(|age| age.p50_ms + state.last_audio_queued_ms as i64),
+        audio_heard_ms = ?audio_delay.map(|delay| delay.p50_ms + state.last_audio_queued_ms as i64),
         "stream delay",
     );
     // One bounded record per negotiated monitor (never more than
@@ -669,15 +876,15 @@ fn maybe_heartbeat(
             target.map_or(0, |target| target.display_refresh_hz),
         );
         monitor_rate_snapshots.insert(*monitor_id, current);
-        let video_age = state
-            .monitor_wire_age_samples
+        let video_delay = state
+            .monitor_wire_delay_samples
             .get(monitor_id)
             .and_then(|samples| rounded_percentiles_ms(samples.iter().copied()));
         tracing::info!(
             target: crate::logging::target::VIDEO,
             monitor_id = monitor_id.get(),
-            video_age_p50_ms = ?video_age.map(|age| age.p50_ms),
-            video_age_p95_ms = ?video_age.map(|age| age.p95_ms),
+            video_delay_p50_ms = ?video_delay.map(|delay| delay.p50_ms),
+            video_delay_p95_ms = ?video_delay.map(|delay| delay.p95_ms),
             fps_received = rates.fps_received,
             fps_presented = rates.fps_presented,
             frames_dropped = rates.frames_dropped,
@@ -721,6 +928,7 @@ fn maybe_commit_secondary_router(
     shared: &Arc<Mutex<SharedMediaState>>,
     secondary_router: &mut Option<MonitorFrameRouter>,
     session_color: SessionColor,
+    decode_latency_policy: arcen_media::video::DecodeLatencyPolicy,
 ) {
     if secondary_router.is_some() {
         return;
@@ -747,6 +955,7 @@ fn maybe_commit_secondary_router(
             // display silently presents an HDR session as BT.709 SDR.
             let mut router = router;
             router.set_session_color(session_color);
+            router.set_decode_latency_policy(decode_latency_policy);
             *secondary_router = Some(router);
         }
         Err(error) => {
@@ -794,21 +1003,28 @@ fn handle_media_batch(
             push_instant_sample(&mut state.video_packet_times, now);
         }
         for (header, _) in &batch.video {
+            let clock_age = wire_clock_age_ms(header.timestamp_ms);
+            let delay = state.wire_delay_estimator.observe(clock_age);
             if let Ok(monitor_id) = arcen_media::SessionMonitorId::new(header.monitor_id) {
-                let age = wire_frame_age_ms(header.timestamp_ms);
                 push_ms_sample(
                     state
-                        .monitor_wire_age_samples
+                        .monitor_wire_delay_samples
                         .entry(monitor_id)
                         .or_default(),
-                    f64::from(age),
+                    f64::from(delay),
                 );
             }
         }
         if let Some((header, payload)) = batch.video.last() {
-            let age = wire_frame_age_ms(header.timestamp_ms);
-            state.last_wire_frame_age_ms = Some(age);
-            push_ms_sample(&mut state.video_wire_age_samples, f64::from(age));
+            let clock_age = wire_clock_age_ms(header.timestamp_ms);
+            let delay = state.wire_delay_estimator.observe(clock_age);
+            state.last_wire_clock_age_ms = Some(clock_age);
+            state.last_wire_delay_ms = Some(delay);
+            push_ms_sample(
+                &mut state.video_wire_clock_age_samples,
+                f64::from(clock_age),
+            );
+            push_ms_sample(&mut state.video_wire_delay_samples, f64::from(delay));
             state.last_wire_video_summary = format!(
                 "{:?} {:?} {:?} monitor={} ts={} payload={} bytes",
                 header.frame_type,
@@ -829,10 +1045,15 @@ fn handle_media_batch(
     }
 
     for (header, payload) in batch.audio {
-        let age = wire_frame_age_ms(header.timestamp_ms);
+        let clock_age = wire_clock_age_ms(header.timestamp_ms);
         let status = audio.feed(header, &payload);
         let mut state = shared.lock().expect("media state poisoned");
-        push_ms_sample(&mut state.audio_wire_age_samples, f64::from(age));
+        let delay = state.wire_delay_estimator.observe(clock_age);
+        push_ms_sample(
+            &mut state.audio_wire_clock_age_samples,
+            f64::from(clock_age),
+        );
+        push_ms_sample(&mut state.audio_wire_delay_samples, f64::from(delay));
         let previous_underruns = state.audio_playback_underruns;
         let previous_trim_events = state.audio_buffer_trim_events;
         let previous_trimmed_samples = state.audio_buffer_trimmed_samples;
@@ -929,12 +1150,12 @@ fn handle_media_batch(
     if batch.idr_needed {
         *pending_ingress_idr = true;
         full_frame_requests.request();
-        if full_frame_requests.send_due(commands) {
-            shared
-                .lock()
-                .expect("media state poisoned")
-                .ingress_idr_requests += 1;
-        }
+        let _ = send_due_full_frame_request(
+            shared,
+            commands,
+            full_frame_requests,
+            *pending_ingress_idr,
+        );
     }
 
     if decode_batch(
@@ -943,12 +1164,16 @@ fn handle_media_batch(
         secondary_router,
         commands,
         full_frame_requests,
+        pending_ingress_idr,
         &batch.video,
         telemetry,
         repaint,
     ) {
-        full_frame_requests.cancel_pending();
-        *pending_ingress_idr = false;
+        keep_or_cancel_full_frame_gate_after_recovery(
+            shared,
+            full_frame_requests,
+            pending_ingress_idr,
+        );
     }
 }
 
@@ -969,16 +1194,21 @@ fn handle_media_batch(
 /// -- is dropped before it ever reaches `decoder`, never silently decoded
 /// into the single legacy texture.
 #[allow(clippy::too_many_arguments)]
-fn decode_batch(
+fn decode_batch<PrimaryDecoder, RouteDecoder>(
     shared: &Arc<Mutex<SharedMediaState>>,
-    decoder: &mut NativeVideoDecoder,
-    secondary_router: &mut Option<MonitorFrameRouter>,
+    decoder: &mut PrimaryDecoder,
+    secondary_router: &mut Option<MonitorFrameRouter<RouteDecoder>>,
     commands: &SessionCommandSender,
     full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
     packets: &[(VideoHeader, Vec<u8>)],
     telemetry: &ClientTelemetry,
     repaint: &egui::Context,
-) -> bool {
+) -> bool
+where
+    PrimaryDecoder: VideoDecoderBackend,
+    RouteDecoder: VideoDecoderBackend,
+{
     if packets.is_empty() {
         return false;
     }
@@ -994,6 +1224,7 @@ fn decode_batch(
             router,
             commands,
             full_frame_requests,
+            pending_ingress_idr,
             packets,
             telemetry,
             repaint,
@@ -1041,6 +1272,22 @@ fn decode_batch(
             let _ = full_frame_requests.send_due(commands);
             continue;
         }
+        let prefer_native_biplanar = {
+            let state = shared.lock().expect("media state poisoned");
+            (state.eight_bit_video_presenter.is_some()
+                && state.eight_bit_layer_ready
+                && !state.eight_bit_layer_disabled)
+                || (state.ten_bit_video_presenter.is_some()
+                    && state.ten_bit_layer_ready
+                    && !state.ten_bit_layer_disabled)
+        };
+        let native_preference_changed = decoder.set_prefer_native_biplanar(prefer_native_biplanar);
+        request_decoder_recovery_for_native_preference_change(
+            native_preference_changed,
+            shared,
+            commands,
+            full_frame_requests,
+        );
         let decode_start = Instant::now();
         match decoder.decode(header, payload) {
             Ok(Some(frame)) => {
@@ -1054,6 +1301,9 @@ fn decode_batch(
                     decoder.is_hardware_accelerated(),
                     telemetry,
                     repaint,
+                    commands,
+                    full_frame_requests,
+                    pending_ingress_idr,
                 );
             }
             Ok(None) => {
@@ -1155,15 +1405,20 @@ struct SecondaryDecodeOutcome {
 /// no per-monitor full-frame request today). This is an intentional,
 /// honestly-scoped simplification for this additive, still env-gated-off
 /// path; the legacy hot path above is completely unaffected.
-fn decode_secondary_packets(
+#[allow(clippy::too_many_arguments)]
+fn decode_secondary_packets<RouteDecoder>(
     shared: &Arc<Mutex<SharedMediaState>>,
-    router: &mut MonitorFrameRouter,
+    router: &mut MonitorFrameRouter<RouteDecoder>,
     commands: &SessionCommandSender,
     full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
     packets: &[(VideoHeader, Vec<u8>)],
     telemetry: &ClientTelemetry,
     repaint: &egui::Context,
-) -> SecondaryDecodeOutcome {
+) -> SecondaryDecodeOutcome
+where
+    RouteDecoder: VideoDecoderBackend,
+{
     // The monitor the Deck root viewport presents. Defaults to the router's
     // explicit negotiated primary, but multi-window presentation can choose
     // a faster local display for root so a slow primary display cannot pace
@@ -1176,12 +1431,30 @@ fn decode_secondary_packets(
     let mut decoded_any = false;
     for (header, payload) in packets {
         let monitor_id = arcen_media::SessionMonitorId::new(header.monitor_id).ok();
+        let route = MonitorRoute::from_wire_monitor_id(header.monitor_id);
+        let root_route = is_primary_route(route, root_monitor_id);
+        if root_route {
+            if let Some(root_id) = root_monitor_id {
+                let prefer_native_biplanar = {
+                    let state = shared.lock().expect("media state poisoned");
+                    state.ten_bit_video_presenter.is_some()
+                        && state.ten_bit_layer_ready
+                        && !state.ten_bit_layer_disabled
+                };
+                let changed = router.set_prefer_native_biplanar(root_id, prefer_native_biplanar);
+                request_decoder_recovery_for_native_preference_change(
+                    changed,
+                    shared,
+                    commands,
+                    full_frame_requests,
+                );
+            }
+        }
         let started = Instant::now();
         let outcome = router.route_and_decode(header, payload);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         match outcome {
             Ok(RouteOutcome::FreshFrame) => {
-                let route = MonitorRoute::from_wire_monitor_id(header.monitor_id);
                 // `FreshFrame` guarantees this call just set the slot's
                 // cached frame; look it up as an explicit, separate
                 // *presentation* read rather than trusting the route result
@@ -1197,24 +1470,27 @@ fn decode_secondary_packets(
                     continue;
                 };
                 decoded_any = true;
-                let mut state = shared.lock().expect("media state poisoned");
-                let superseded = if is_primary_route(route, root_monitor_id) {
-                    state.latest_frame.replace(frame).is_some()
+                let superseded = if root_route {
+                    publish_routed_primary_frame(
+                        shared,
+                        frame,
+                        telemetry,
+                        repaint,
+                        commands,
+                        full_frame_requests,
+                        pending_ingress_idr,
+                    )
+                    .0
                 } else {
+                    let mut state = shared.lock().expect("media state poisoned");
                     match route {
                         MonitorRoute::Negotiated(id) => {
                             state.secondary_frames.insert(id, frame).is_some()
                         }
-                        MonitorRoute::LegacyPrimary => {
-                            // Unreachable once committed: a committed
-                            // roster is always all-`Negotiated`
-                            // (`MonitorFrameRouter::new` never admits wire
-                            // id 0). Defensive no-op if it ever somehow
-                            // occurred.
-                            false
-                        }
+                        MonitorRoute::LegacyPrimary => false,
                     }
                 };
+                let mut state = shared.lock().expect("media state poisoned");
                 // The routed path publishes into `latest_frame`/
                 // `secondary_frames` directly rather than through
                 // `publish_decoded_frame`, so every shared counter that
@@ -1349,6 +1625,343 @@ fn record_monitor_decode(
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DedicatedLayerRoute {
+    Egui,
+    EightBit,
+    TenBit,
+}
+
+pub(crate) fn dedicated_layer_route_for_video(
+    video: Option<arcen_media::VideoConfiguration>,
+    has_rgba: bool,
+    eight_bit_disabled: bool,
+    ten_bit_disabled: bool,
+) -> DedicatedLayerRoute {
+    if has_rgba {
+        return DedicatedLayerRoute::Egui;
+    }
+    let Some(video) = video else {
+        return DedicatedLayerRoute::Egui;
+    };
+    if !eight_bit_disabled
+        && video.bit_depth == arcen_media::BitDepth::Eight
+        && video.chroma == arcen_media::ChromaSubsampling::Yuv420
+    {
+        if matches!(
+            video.transfer,
+            arcen_media::TransferCharacteristics::Pq | arcen_media::TransferCharacteristics::Hlg
+        ) {
+            tracing::warn!(
+                target: crate::logging::target::VIDEO,
+                transfer = video.transfer.token(),
+                "host tagged an 8-bit stream as HDR; presenting on the SDR 8-bit path with EDR off"
+            );
+        }
+        return DedicatedLayerRoute::EightBit;
+    }
+    if !ten_bit_disabled
+        && video.bit_depth >= arcen_media::BitDepth::Ten
+        && video.chroma == arcen_media::ChromaSubsampling::Yuv444
+    {
+        return DedicatedLayerRoute::TenBit;
+    }
+    DedicatedLayerRoute::Egui
+}
+
+pub(crate) fn should_use_dedicated_eight_bit_layer(
+    frame: &DecodedVideoFrame,
+    disabled: bool,
+) -> bool {
+    let video = frame.native.as_ref().map(|native| native.video);
+    dedicated_layer_route_for_video(video, !frame.rgba.is_empty(), disabled, true)
+        == DedicatedLayerRoute::EightBit
+}
+
+pub(crate) fn should_use_dedicated_ten_bit_layer(
+    frame: &DecodedVideoFrame,
+    disabled: bool,
+) -> bool {
+    let video = frame.native.as_ref().map(|native| native.video);
+    dedicated_layer_route_for_video(video, !frame.rgba.is_empty(), true, disabled)
+        == DedicatedLayerRoute::TenBit
+}
+
+fn record_primary_decode_state(
+    state: &mut SharedMediaState,
+    decode_ms: f64,
+    decoder_backend_name: &'static str,
+    decoder_hardware_accelerated: Option<bool>,
+    telemetry: &ClientTelemetry,
+) {
+    state.last_decode_ms = decode_ms;
+    push_ms_sample(&mut state.decode_ms_samples, decode_ms);
+    state.last_decode_error = None;
+    state.waiting_for_keyframe = false;
+    state.video_frames_decoded = state.video_frames_decoded.saturating_add(1);
+    state.decoder_backend_name = decoder_backend_name;
+    state.decoder_hardware_accelerated = decoder_hardware_accelerated;
+    telemetry.record_media(
+        state.video_frames_seen,
+        state.video_frames_decoded,
+        state.inbox.video_dropped_packets,
+        Duration::from_secs_f64((decode_ms / 1_000.0).max(0.0)),
+    );
+}
+
+fn record_layer_submission(state: &mut SharedMediaState, present_elapsed: Duration) {
+    push_ms_sample(
+        &mut state.layer_present_ms_samples,
+        present_elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+fn publish_native_metadata(
+    state: &mut SharedMediaState,
+    frame: &DecodedVideoFrame,
+    video: arcen_media::VideoConfiguration,
+) -> bool {
+    let size = [frame.width, frame.height];
+    let changed = state.last_native_frame_size != Some(size);
+    state.last_native_frame_size = Some(size);
+    state.latest_native_frame_metadata = Some(NativePresentationMetadata {
+        width: frame.width,
+        height: frame.height,
+        timestamp_ms: frame.timestamp_ms,
+        pixel_format: frame.pixel_format.clone(),
+        backend: frame.backend,
+        video,
+    });
+    changed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenBitFailureFallback {
+    PublishRgbaFallback,
+    KeepExistingFallback,
+}
+
+fn ten_bit_failure_fallback(has_rgba: bool) -> TenBitFailureFallback {
+    if has_rgba {
+        TenBitFailureFallback::PublishRgbaFallback
+    } else {
+        TenBitFailureFallback::KeepExistingFallback
+    }
+}
+
+fn publish_ten_bit_failure_fallback(state: &mut SharedMediaState, frame: DecodedVideoFrame) {
+    state.ten_bit_layer_disabled = true;
+    clear_native_layer_history(state);
+    let counts_as_fallback_present = !frame.rgba.is_empty();
+    if ten_bit_failure_fallback(!frame.rgba.is_empty())
+        == TenBitFailureFallback::PublishRgbaFallback
+        && state.latest_frame.replace(frame).is_some()
+    {
+        state.presentation_superseded_frames =
+            state.presentation_superseded_frames.saturating_add(1);
+    }
+
+    if counts_as_fallback_present {
+        state.presentation_recovery.clear_after_fallback_handoff();
+    }
+}
+
+fn clear_native_layer_history(state: &mut SharedMediaState) {
+    state.layer_present_ms_samples.clear();
+    state.eight_bit_layer_has_picture = false;
+    state.ten_bit_layer_has_picture = false;
+}
+
+fn request_presentation_recovery(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+) {
+    let sent = {
+        let mut state = shared.lock().expect("media state poisoned");
+        state.waiting_for_keyframe = true;
+        state.presentation_recovery.arm(full_frame_requests);
+        full_frame_requests.send_due(commands)
+    };
+    if sent {
+        shared
+            .lock()
+            .expect("media state poisoned")
+            .ingress_idr_requests += 1;
+    }
+}
+
+fn presentation_recovery_pending(shared: &Arc<Mutex<SharedMediaState>>) -> bool {
+    shared
+        .lock()
+        .expect("media state poisoned")
+        .presentation_recovery
+        .is_pending()
+}
+
+fn keep_or_cancel_full_frame_gate_after_recovery(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
+) {
+    if presentation_recovery_pending(shared) {
+        full_frame_requests.request();
+        *pending_ingress_idr = false;
+    } else {
+        full_frame_requests.cancel_pending();
+        *pending_ingress_idr = false;
+    }
+}
+
+fn send_due_full_frame_request(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: bool,
+) -> bool {
+    if !full_frame_requests.send_due(commands) {
+        return false;
+    }
+    let should_count = pending_ingress_idr || presentation_recovery_pending(shared);
+    if should_count {
+        shared
+            .lock()
+            .expect("media state poisoned")
+            .ingress_idr_requests += 1;
+    }
+    true
+}
+
+fn request_decoder_recovery_for_native_preference_change(
+    changed: bool,
+    shared: &Arc<Mutex<SharedMediaState>>,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+) {
+    if !changed {
+        return;
+    }
+    {
+        let mut state = shared.lock().expect("media state poisoned");
+        state.waiting_for_keyframe = true;
+    }
+    full_frame_requests.request();
+    let _ = send_due_full_frame_request(shared, commands, full_frame_requests, true);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutedPrimaryPresentation {
+    DedicatedTenBit,
+    EguiFallback,
+    DedicatedFailure,
+}
+
+fn served_fps_from_health(stats: &HealthStatsMsg) -> Option<u32> {
+    let fps = if stats.fps_target.is_finite() && stats.fps_target > 0.0 {
+        stats.fps_target
+    } else if stats.fps_actual.is_finite() && stats.fps_actual > 0.0 {
+        stats.fps_actual
+    } else {
+        return None;
+    };
+    Some(fps.round().clamp(1.0, 240.0) as u32)
+}
+
+fn source_fps_for_state(state: &SharedMediaState) -> Option<u32> {
+    state.served_source_fps
+}
+
+fn routed_primary_presentation_for_frame(
+    frame: &DecodedVideoFrame,
+    ten_bit_disabled: bool,
+) -> RoutedPrimaryPresentation {
+    if should_use_dedicated_ten_bit_layer(frame, ten_bit_disabled) {
+        RoutedPrimaryPresentation::DedicatedTenBit
+    } else {
+        RoutedPrimaryPresentation::EguiFallback
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_routed_primary_frame(
+    shared: &Arc<Mutex<SharedMediaState>>,
+    frame: DecodedVideoFrame,
+    _telemetry: &ClientTelemetry,
+    repaint: &egui::Context,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    _pending_ingress_idr: &mut bool,
+) -> (bool, RoutedPrimaryPresentation) {
+    let presentation = {
+        let state = shared.lock().expect("media state poisoned");
+        routed_primary_presentation_for_frame(&frame, state.ten_bit_layer_disabled)
+    };
+    if presentation == RoutedPrimaryPresentation::DedicatedTenBit {
+        let (presenter, source_fps) = {
+            let state = shared.lock().expect("media state poisoned");
+            (
+                state.ten_bit_video_presenter.clone(),
+                source_fps_for_state(&state),
+            )
+        };
+        if let (Some(presenter), Some(native)) = (presenter, frame.native.as_ref()) {
+            let layer_frame = DedicatedLayerFrame {
+                pixel_buffer: native.pixel_buffer.clone(),
+                contract: native.video.into(),
+                arrival_host_time: crate::ui::video_metal_layer::current_host_time(),
+                source_fps,
+            };
+            let present_start = Instant::now();
+            let status = presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .present(&layer_frame);
+            let present_elapsed = present_start.elapsed();
+            let mut state = shared.lock().expect("media state poisoned");
+            state.ten_bit_presentation_status = state
+                .ten_bit_presentation_status
+                .preserve_established_on_transient(status, state.ten_bit_layer_has_picture);
+            let metadata_changed =
+                if status.is_dedicated_ten_bit() || status.is_transient_drop_or_skip() {
+                    publish_native_metadata(&mut state, &frame, native.video)
+                } else {
+                    false
+                };
+            if status.is_dedicated_ten_bit() {
+                record_layer_submission(&mut state, present_elapsed);
+                if metadata_changed {
+                    drop(state);
+                    repaint.request_repaint();
+                }
+                return (false, RoutedPrimaryPresentation::DedicatedTenBit);
+            }
+            if status.is_eight_bit_fallback() {
+                publish_ten_bit_failure_fallback(&mut state, frame);
+                drop(state);
+                request_presentation_recovery(shared, commands, full_frame_requests);
+                repaint.request_repaint();
+                return (false, RoutedPrimaryPresentation::DedicatedFailure);
+            }
+            if metadata_changed {
+                drop(state);
+                repaint.request_repaint();
+            }
+            return (false, RoutedPrimaryPresentation::DedicatedTenBit);
+        }
+    }
+
+    let mut state = shared.lock().expect("media state poisoned");
+    let counts_as_fallback_present = !frame.rgba.is_empty();
+    let superseded = state.latest_frame.replace(frame).is_some();
+    if counts_as_fallback_present {
+        state.presentation_recovery.clear_after_fallback_handoff();
+    }
+    drop(state);
+    repaint.request_repaint();
+    (superseded, RoutedPrimaryPresentation::EguiFallback)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_decoded_frame(
     shared: &Arc<Mutex<SharedMediaState>>,
     frame: DecodedVideoFrame,
@@ -1357,25 +1970,174 @@ fn publish_decoded_frame(
     decoder_hardware_accelerated: Option<bool>,
     telemetry: &ClientTelemetry,
     repaint: &egui::Context,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    _pending_ingress_idr: &mut bool,
 ) {
+    enum DedicatedRoute {
+        EightBit(Arc<Mutex<DedicatedEightBitVideoPresenter>>),
+        TenBit(Arc<Mutex<DedicatedVideoPresenter>>),
+        Egui,
+    }
+
+    let (route, source_fps) = {
+        let state = shared.lock().expect("media state poisoned");
+        let source_fps = source_fps_for_state(&state);
+        let route = if should_use_dedicated_eight_bit_layer(&frame, state.eight_bit_layer_disabled)
+        {
+            if let Some(presenter) = state.eight_bit_video_presenter.as_ref() {
+                DedicatedRoute::EightBit(presenter.clone())
+            } else {
+                DedicatedRoute::Egui
+            }
+        } else if should_use_dedicated_ten_bit_layer(&frame, state.ten_bit_layer_disabled) {
+            if let Some(presenter) = state.ten_bit_video_presenter.as_ref() {
+                DedicatedRoute::TenBit(presenter.clone())
+            } else {
+                DedicatedRoute::Egui
+            }
+        } else {
+            DedicatedRoute::Egui
+        };
+        (route, source_fps)
+    };
+
+    match route {
+        DedicatedRoute::EightBit(presenter) => {
+            if let Some(native) = frame.native.as_ref() {
+                {
+                    let mut state = shared.lock().expect("media state poisoned");
+                    record_primary_decode_state(
+                        &mut state,
+                        decode_ms,
+                        decoder_backend_name,
+                        decoder_hardware_accelerated,
+                        telemetry,
+                    );
+                }
+                let layer_frame = DedicatedEightBitLayerFrame {
+                    pixel_buffer: native.pixel_buffer.clone(),
+                    contract: native.video.into(),
+                    arrival_host_time: crate::ui::video_metal_layer::current_host_time(),
+                    source_fps,
+                };
+                let present_start = Instant::now();
+                let status = presenter
+                    .lock()
+                    .expect("8-bit presenter poisoned")
+                    .present(&layer_frame);
+                let present_elapsed = present_start.elapsed();
+                let mut state = shared.lock().expect("media state poisoned");
+                state.eight_bit_presentation_status = state
+                    .eight_bit_presentation_status
+                    .preserve_established_on_transient(status, state.eight_bit_layer_has_picture);
+                let metadata_changed =
+                    if status.is_dedicated_eight_bit() || status.is_transient_drop_or_skip() {
+                        publish_native_metadata(&mut state, &frame, native.video)
+                    } else {
+                        false
+                    };
+                if status.is_dedicated_eight_bit() {
+                    record_layer_submission(&mut state, present_elapsed);
+                    if metadata_changed {
+                        drop(state);
+                        repaint.request_repaint();
+                    }
+                    return;
+                }
+                if status.is_fallback() {
+                    state.eight_bit_layer_disabled = true;
+                    clear_native_layer_history(&mut state);
+                    drop(state);
+                    request_presentation_recovery(shared, commands, full_frame_requests);
+                    repaint.request_repaint();
+                    return;
+                }
+                if metadata_changed {
+                    drop(state);
+                    repaint.request_repaint();
+                }
+                return;
+            }
+        }
+        DedicatedRoute::TenBit(presenter) => {
+            if let Some(native) = frame.native.as_ref() {
+                {
+                    let mut state = shared.lock().expect("media state poisoned");
+                    record_primary_decode_state(
+                        &mut state,
+                        decode_ms,
+                        decoder_backend_name,
+                        decoder_hardware_accelerated,
+                        telemetry,
+                    );
+                }
+                let layer_frame = DedicatedLayerFrame {
+                    pixel_buffer: native.pixel_buffer.clone(),
+                    contract: native.video.into(),
+                    arrival_host_time: crate::ui::video_metal_layer::current_host_time(),
+                    source_fps,
+                };
+                let present_start = Instant::now();
+                let status = presenter
+                    .lock()
+                    .expect("10-bit presenter poisoned")
+                    .present(&layer_frame);
+                let present_elapsed = present_start.elapsed();
+                let mut state = shared.lock().expect("media state poisoned");
+                state.ten_bit_presentation_status = state
+                    .ten_bit_presentation_status
+                    .preserve_established_on_transient(status, state.ten_bit_layer_has_picture);
+                let metadata_changed =
+                    if status.is_dedicated_ten_bit() || status.is_transient_drop_or_skip() {
+                        publish_native_metadata(&mut state, &frame, native.video)
+                    } else {
+                        false
+                    };
+                if status.is_dedicated_ten_bit() {
+                    record_layer_submission(&mut state, present_elapsed);
+                    if metadata_changed {
+                        drop(state);
+                        repaint.request_repaint();
+                    }
+                    return;
+                }
+                if status.is_eight_bit_fallback() {
+                    publish_ten_bit_failure_fallback(&mut state, frame);
+                    drop(state);
+                    request_presentation_recovery(shared, commands, full_frame_requests);
+                    repaint.request_repaint();
+                    return;
+                }
+                if metadata_changed {
+                    drop(state);
+                    repaint.request_repaint();
+                }
+                return;
+            }
+        }
+        DedicatedRoute::Egui => {}
+    }
+
     let mut state = shared.lock().expect("media state poisoned");
-    state.last_decode_ms = decode_ms;
-    push_ms_sample(&mut state.decode_ms_samples, decode_ms);
-    state.last_decode_error = None;
-    state.waiting_for_keyframe = false;
-    state.video_frames_decoded = state.video_frames_decoded.saturating_add(1);
-    state.decoder_backend_name = decoder_backend_name;
-    state.decoder_hardware_accelerated = decoder_hardware_accelerated;
+    record_primary_decode_state(
+        &mut state,
+        decode_ms,
+        decoder_backend_name,
+        decoder_hardware_accelerated,
+        telemetry,
+    );
     if state.latest_frame.replace(frame).is_some() {
         state.presentation_superseded_frames =
             state.presentation_superseded_frames.saturating_add(1);
     }
-    telemetry.record_media(
-        state.video_frames_seen,
-        state.video_frames_decoded,
-        state.inbox.video_dropped_packets,
-        Duration::from_secs_f64((decode_ms / 1_000.0).max(0.0)),
-    );
+    if !state
+        .latest_frame
+        .as_ref()
+        .is_some_and(|frame| frame.rgba.is_empty())
+    {
+        state.presentation_recovery.clear_after_fallback_handoff();
+    }
     // Release the lock before requesting a repaint so the UI thread can
     // immediately take the frame without contending on the mutex.
     drop(state);
@@ -1411,7 +2173,7 @@ fn push_ms_sample(samples: &mut VecDeque<f64>, value: f64) {
     }
 }
 
-fn wire_frame_age_ms(timestamp_ms: u32) -> i32 {
+fn wire_clock_age_ms(timestamp_ms: u32) -> i32 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1422,7 +2184,12 @@ fn wire_frame_age_ms(timestamp_ms: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::video_decoder::{
+        NativeDecodedVideoFrame, VideoDecodeError, VideoDecoderBackend,
+    };
     use crate::protocol::{ChromaSubsampling, FrameType, VideoCodec, VIDEO_KEYFRAME_FLAG};
+    use crate::transport::websocket::SessionCommand;
+    use apple_cf::cv::CVPixelBuffer;
 
     #[test]
     fn per_monitor_window_rates_use_counter_deltas() {
@@ -1446,6 +2213,31 @@ mod tests {
         assert_eq!(rates.frames_dropped, 100);
         assert_eq!(rates.frames_superseded_by_refresh, 0);
         assert_eq!(rates.frames_dropped_before_presentation, 100);
+    }
+
+    #[test]
+    fn manual_session_end_is_not_a_media_worker_error() {
+        let end = SessionEnd {
+            reason: DisconnectReason::Terminal(TerminalDisconnect::Manual),
+            message: "Disconnected".to_string(),
+            observed_at: Instant::now(),
+        };
+        assert_eq!(session_end_worker_error(&end), None);
+    }
+
+    #[test]
+    fn abnormal_session_end_remains_a_media_worker_error() {
+        let end = SessionEnd {
+            reason: DisconnectReason::Transient(
+                crate::transport::websocket::TransientTransportError::ConnectionReset,
+            ),
+            message: "transport reset".to_string(),
+            observed_at: Instant::now(),
+        };
+        assert_eq!(
+            session_end_worker_error(&end),
+            Some("transport reset".to_string())
+        );
     }
 
     #[test]
@@ -1490,6 +2282,7 @@ mod tests {
         let (sender, mut received) = mpsc::unbounded_channel();
         let commands = SessionCommandSender::for_test(sender);
         let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
         let mut decoder = NativeVideoDecoder::new();
         let telemetry = ClientTelemetry::default();
         decoder.notify_discontinuity();
@@ -1514,6 +2307,7 @@ mod tests {
             &mut secondary_router,
             &commands,
             &mut gate,
+            &mut pending_ingress_idr,
             &packets,
             &telemetry,
             &egui::Context::default(),
@@ -1543,6 +2337,205 @@ mod tests {
         )
     }
 
+    #[derive(Debug)]
+    enum ScriptedDecode {
+        Frame(DecodedVideoFrame),
+        NoOutput,
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedVideoDecoder {
+        outcomes: VecDeque<ScriptedDecode>,
+        prefer_native_biplanar: bool,
+        prefer_history: Vec<bool>,
+        wants_keyframe: bool,
+    }
+
+    impl ScriptedVideoDecoder {
+        fn new(outcomes: impl Into<VecDeque<ScriptedDecode>>) -> Self {
+            Self {
+                outcomes: outcomes.into(),
+                ..Self::default()
+            }
+        }
+
+        fn prefers_native_biplanar(&self) -> bool {
+            self.prefer_native_biplanar
+        }
+    }
+
+    impl VideoDecoderBackend for ScriptedVideoDecoder {
+        fn set_session_color(&mut self, _session_color: SessionColor) {}
+
+        fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool {
+            if self.prefer_native_biplanar == prefer {
+                return false;
+            }
+            self.prefer_native_biplanar = prefer;
+            self.prefer_history.push(prefer);
+            self.wants_keyframe = true;
+            true
+        }
+
+        fn set_decode_latency_policy(&mut self, _policy: arcen_media::video::DecodeLatencyPolicy) {}
+
+        fn decode(
+            &mut self,
+            _header: &VideoHeader,
+            _payload: &[u8],
+        ) -> Result<Option<DecodedVideoFrame>, VideoDecodeError> {
+            match self
+                .outcomes
+                .pop_front()
+                .unwrap_or(ScriptedDecode::NoOutput)
+            {
+                ScriptedDecode::Frame(frame) => {
+                    self.wants_keyframe = false;
+                    Ok(Some(frame))
+                }
+                ScriptedDecode::NoOutput => Ok(None),
+            }
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn is_hardware_accelerated(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        fn wants_keyframe(&self) -> bool {
+            self.wants_keyframe
+        }
+
+        fn notify_discontinuity(&mut self) {
+            self.wants_keyframe = true;
+        }
+    }
+
+    fn rgba_frame(timestamp_ms: u32, tag: u8) -> DecodedVideoFrame {
+        DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![tag; 16],
+            timestamp_ms,
+            pixel_format: "rgba".to_string(),
+            backend: "scripted",
+            native: None,
+        }
+    }
+
+    fn ten_bit_video() -> arcen_media::VideoConfiguration {
+        arcen_media::VideoConfiguration {
+            chroma: arcen_media::ChromaSubsampling::Yuv444,
+            bit_depth: arcen_media::BitDepth::Ten,
+            range: arcen_media::ColorRange::Full,
+            matrix: arcen_media::ColorMatrix::Bt709,
+            primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            ..arcen_media::VideoConfiguration::legacy_h264()
+        }
+    }
+
+    fn native_ten_bit_frame(timestamp_ms: u32) -> DecodedVideoFrame {
+        native_ten_bit_frame_sized(timestamp_ms, 2, 2)
+    }
+
+    fn native_ten_bit_frame_sized(
+        timestamp_ms: u32,
+        width: usize,
+        height: usize,
+    ) -> DecodedVideoFrame {
+        let pixel_buffer = CVPixelBuffer::create(width, height, u32::from_be_bytes(*b"xf44"))
+            .expect("test CVPixelBuffer");
+        DecodedVideoFrame {
+            width,
+            height,
+            rgba: Vec::new(),
+            timestamp_ms,
+            pixel_format: "xf44-full-iosurface".to_string(),
+            backend: "scripted-native",
+            native: Some(NativeDecodedVideoFrame {
+                pixel_buffer,
+                video: ten_bit_video(),
+            }),
+        }
+    }
+
+    fn native_eight_bit_frame_sized(
+        timestamp_ms: u32,
+        width: usize,
+        height: usize,
+    ) -> DecodedVideoFrame {
+        let video = arcen_media::VideoConfiguration::legacy_h264();
+        let pixel_buffer = CVPixelBuffer::create(width, height, u32::from_be_bytes(*b"420v"))
+            .expect("test CVPixelBuffer");
+        DecodedVideoFrame {
+            width,
+            height,
+            rgba: Vec::new(),
+            timestamp_ms,
+            pixel_format: "420v-iosurface".to_string(),
+            backend: "scripted-native",
+            native: Some(NativeDecodedVideoFrame {
+                pixel_buffer,
+                video,
+            }),
+        }
+    }
+
+    fn legacy_video_packet(timestamp_ms: u32, keyframe: bool) -> (VideoHeader, Vec<u8>) {
+        (
+            VideoHeader {
+                frame_type: FrameType::VideoH264,
+                codec: VideoCodec::H264,
+                chroma: ChromaSubsampling::Yuv420,
+                flags: if keyframe { VIDEO_KEYFRAME_FLAG } else { 0 },
+                timestamp_ms,
+                monitor_id: 0,
+                topology_generation: 0,
+                stream_epoch: 0,
+            },
+            vec![u8::from(keyframe)],
+        )
+    }
+
+    fn routed_video_packet(
+        monitor_id: arcen_media::SessionMonitorId,
+        generation: arcen_media::TopologyGeneration,
+        timestamp_ms: u32,
+        keyframe: bool,
+    ) -> (VideoHeader, Vec<u8>) {
+        (
+            VideoHeader {
+                frame_type: FrameType::RegionVideoH264,
+                codec: VideoCodec::H264,
+                chroma: ChromaSubsampling::Yuv420,
+                flags: if keyframe { VIDEO_KEYFRAME_FLAG } else { 0 },
+                timestamp_ms,
+                monitor_id: monitor_id.get(),
+                topology_generation: generation.get(),
+                stream_epoch: 1,
+            },
+            vec![monitor_id.get() as u8, u8::from(keyframe)],
+        )
+    }
+
+    fn visible_ten_bit_presenter() -> Arc<Mutex<DedicatedVideoPresenter>> {
+        let mut presenter = DedicatedVideoPresenter::new();
+        presenter.set_surface_visible(true);
+        Arc::new(Mutex::new(presenter))
+    }
+
+    fn drain_commands(rx: &mut mpsc::UnboundedReceiver<SessionCommand>) -> usize {
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        count
+    }
+
     #[test]
     fn resumed_media_state_is_fresh_and_waits_for_keyframe() {
         let state = SharedMediaState::fresh(42, true);
@@ -1560,12 +2553,731 @@ mod tests {
     }
 
     #[test]
+    fn served_fps_uses_actual_health_target_not_pipeline_ceiling() {
+        let state = SharedMediaState {
+            served_source_fps: Some(15),
+            served_pipeline: Some(ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Auto,
+                "hardware",
+                None,
+            )),
+            ..SharedMediaState::default()
+        };
+        assert_eq!(source_fps_for_state(&state), Some(15));
+        assert_ne!(
+            source_fps_for_state(&state),
+            Some(arcen_media::video::contract(arcen_media::video::StreamingPreset::Auto).max_fps)
+        );
+    }
+
+    #[test]
+    fn served_fps_from_health_prefers_target_over_ceiling() {
+        let stats = HealthStatsMsg {
+            fps_target: 15.0,
+            fps_actual: 14.8,
+            ..HealthStatsMsg::default()
+        };
+        assert_eq!(served_fps_from_health(&stats), Some(15));
+    }
+
+    #[test]
+    fn dedicated_layer_route_keeps_pipelines_separate() {
+        let eight_bit = arcen_media::VideoConfiguration::legacy_h264();
+        let grading = arcen_media::VideoConfiguration {
+            chroma: arcen_media::ChromaSubsampling::Yuv444,
+            bit_depth: arcen_media::BitDepth::Ten,
+            range: arcen_media::ColorRange::Full,
+            matrix: arcen_media::ColorMatrix::Bt709,
+            primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            ..arcen_media::VideoConfiguration::legacy_h264()
+        };
+        let hdr = arcen_media::VideoConfiguration {
+            primaries: arcen_media::ColorPrimaries::Bt2020,
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            ..grading
+        };
+        let invalid_eight_bit_hdr = arcen_media::VideoConfiguration {
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            ..eight_bit
+        };
+
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(eight_bit), false, false, false),
+            DedicatedLayerRoute::EightBit
+        );
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(invalid_eight_bit_hdr), false, false, false),
+            DedicatedLayerRoute::EightBit,
+            "8-bit HDR tags are a logged contract violation, not a reason to widen the path"
+        );
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(grading), false, false, false),
+            DedicatedLayerRoute::TenBit
+        );
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(hdr), false, false, false),
+            DedicatedLayerRoute::TenBit,
+            "PQ/BT.2020 HDR uses the same 10-bit layer, with EDR decided by colour config"
+        );
+    }
+
+    #[test]
+    fn dedicated_layer_route_falls_back_when_disabled_or_rgba_is_present() {
+        let grading = arcen_media::VideoConfiguration {
+            chroma: arcen_media::ChromaSubsampling::Yuv444,
+            bit_depth: arcen_media::BitDepth::Ten,
+            range: arcen_media::ColorRange::Full,
+            matrix: arcen_media::ColorMatrix::Bt709,
+            primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            ..arcen_media::VideoConfiguration::legacy_h264()
+        };
+
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(grading), false, false, true),
+            DedicatedLayerRoute::Egui
+        );
+        assert_eq!(
+            dedicated_layer_route_for_video(Some(grading), true, false, false),
+            DedicatedLayerRoute::Egui,
+            "CPU RGBA payloads stay on the existing egui fallback path"
+        );
+    }
+
+    #[test]
+    fn ten_bit_failure_keeps_existing_fallback_for_empty_native_frames() {
+        assert_eq!(
+            ten_bit_failure_fallback(false),
+            TenBitFailureFallback::KeepExistingFallback
+        );
+        assert_eq!(
+            ten_bit_failure_fallback(true),
+            TenBitFailureFallback::PublishRgbaFallback
+        );
+    }
+
+    fn drive_sync_presenter_failure_recovery() -> (
+        Arc<Mutex<SharedMediaState>>,
+        SessionCommandSender,
+        mpsc::UnboundedReceiver<SessionCommand>,
+        FullFrameRequestGate,
+        bool,
+        ScriptedVideoDecoder,
+    ) {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(visible_ten_bit_presenter()),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let mut gate = FullFrameRequestGate::with_interval(Duration::from_millis(5));
+        let mut pending_ingress_idr = false;
+        let mut decoder = ScriptedVideoDecoder::new(VecDeque::from([
+            ScriptedDecode::Frame(native_ten_bit_frame(1)),
+            ScriptedDecode::Frame(rgba_frame(2, 7)),
+        ]));
+        let mut secondary_router: Option<MonitorFrameRouter<ScriptedVideoDecoder>> = None;
+
+        gate.request();
+        assert!(gate.send_due(&commands));
+        assert_eq!(drain_commands(&mut commands_rx), 1);
+
+        let failed_native_keyframe = vec![legacy_video_packet(1, true)];
+        assert!(decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &failed_native_keyframe,
+            &telemetry,
+            &repaint,
+        ));
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+        assert!(gate.is_pending());
+        assert!(presentation_recovery_pending(&shared));
+        assert!(
+            shared
+                .lock()
+                .expect("media state poisoned")
+                .ten_bit_layer_disabled
+        );
+
+        let mut event = None;
+        assert_eq!(
+            service_worker_loop_step(
+                &shared,
+                &commands,
+                &mut gate,
+                false,
+                |_| Err(mpsc::error::TryRecvError::Empty),
+                |_| {},
+                &mut event,
+            ),
+            WorkerLoopStep::PendingPolled
+        );
+        assert_eq!(drain_commands(&mut commands_rx), 0);
+        std::thread::sleep(Duration::from_millis(6));
+        assert_eq!(
+            service_worker_loop_step(
+                &shared,
+                &commands,
+                &mut gate,
+                false,
+                |_| Err(mpsc::error::TryRecvError::Empty),
+                |_| {},
+                &mut event,
+            ),
+            WorkerLoopStep::PendingPolled
+        );
+        assert_eq!(drain_commands(&mut commands_rx), 1);
+
+        let fallback_keyframe = vec![legacy_video_packet(2, true)];
+        assert!(decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &fallback_keyframe,
+            &telemetry,
+            &repaint,
+        ));
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+        assert!(!decoder.prefers_native_biplanar());
+        assert!(!presentation_recovery_pending(&shared));
+        assert!(!gate.is_pending());
+        assert!(!shared
+            .lock()
+            .expect("media state poisoned")
+            .latest_frame
+            .as_ref()
+            .expect("fallback frame")
+            .rgba
+            .is_empty());
+
+        (
+            shared,
+            commands,
+            commands_rx,
+            gate,
+            pending_ingress_idr,
+            decoder,
+        )
+    }
+
+    #[test]
+    fn warmed_gate_sync_presenter_failure_in_batch_holds_until_post_failure_rgba() {
+        let (_shared, _commands, _commands_rx, _gate, _pending_ingress_idr, decoder) =
+            drive_sync_presenter_failure_recovery();
+        assert_eq!(decoder.prefer_history, [true, false]);
+    }
+
+    #[test]
+    fn decode_batch_presentation_recovery_counts_native_failure_and_rgba_fallback_decodes() {
+        let (shared, _commands, _commands_rx, _gate, _pending_ingress_idr, _decoder) =
+            drive_sync_presenter_failure_recovery();
+        let state = shared.lock().expect("media state poisoned");
+        assert_eq!(state.video_frames_decoded, 2);
+        assert_eq!(
+            state.latest_frame.as_ref().map(|frame| frame.timestamp_ms),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn host_throttled_presentation_recovery_retries_by_worker_servicing() {
+        let shared = Arc::new(Mutex::new(SharedMediaState::default()));
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::with_interval(Duration::from_millis(20));
+        let mut event = None;
+
+        request_presentation_recovery(&shared, &commands, &mut gate);
+        assert!(commands_rx.try_recv().is_ok());
+        assert!(gate.is_pending());
+        assert_eq!(
+            service_worker_loop_step(
+                &shared,
+                &commands,
+                &mut gate,
+                false,
+                |_| Err(mpsc::error::TryRecvError::Empty),
+                |_| {},
+                &mut event,
+            ),
+            WorkerLoopStep::PendingPolled
+        );
+        assert!(commands_rx.try_recv().is_err());
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            service_worker_loop_step(
+                &shared,
+                &commands,
+                &mut gate,
+                false,
+                |_| Err(mpsc::error::TryRecvError::Empty),
+                |_| {},
+                &mut event,
+            ),
+            WorkerLoopStep::PendingPolled
+        );
+        assert!(commands_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn routed_root_native_switch_delta_then_keyframe_recovers_through_router() {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(Arc::new(Mutex::new(DedicatedVideoPresenter::new()))),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::with_interval(Duration::from_millis(1));
+        let mut pending_ingress_idr = false;
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let root = arcen_media::SessionMonitorId::new(1).expect("nonzero");
+        let generation = arcen_media::TopologyGeneration::new(1).expect("nonzero generation");
+        let mut router =
+            MonitorFrameRouter::new_with_decoder_factory_for_test(generation, &[root], |_| {
+                ScriptedVideoDecoder::new(VecDeque::from([
+                    ScriptedDecode::NoOutput,
+                    ScriptedDecode::Frame(rgba_frame(2, 9)),
+                ]))
+            })
+            .expect("single routed root is valid");
+        router.force_recovered_for_test(MonitorRoute::Negotiated(root));
+        gate.request();
+        assert!(gate.send_due(&commands));
+        assert_eq!(drain_commands(&mut commands_rx), 1);
+        gate.cancel_pending();
+        let delta = vec![(
+            VideoHeader {
+                frame_type: FrameType::RegionVideoH264,
+                codec: VideoCodec::H264,
+                chroma: ChromaSubsampling::Yuv420,
+                flags: 0,
+                timestamp_ms: 1,
+                monitor_id: root.get(),
+                topology_generation: generation.get(),
+                stream_epoch: 1,
+            },
+            vec![9, 9, 9],
+        )];
+
+        let outcome = decode_secondary_packets(
+            &shared,
+            &mut router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &delta,
+            &telemetry,
+            &repaint,
+        );
+
+        assert!(!outcome.all_recovered);
+        assert!(gate.is_pending());
+        assert_eq!(drain_commands(&mut commands_rx), 0);
+        assert!(!presentation_recovery_pending(&shared));
+
+        std::thread::sleep(Duration::from_millis(1));
+        let mut event = None;
+        assert_eq!(
+            service_worker_loop_step(
+                &shared,
+                &commands,
+                &mut gate,
+                true,
+                |_| Err(mpsc::error::TryRecvError::Empty),
+                |_| {},
+                &mut event,
+            ),
+            WorkerLoopStep::PendingPolled
+        );
+        assert_eq!(drain_commands(&mut commands_rx), 1);
+
+        let keyframe = vec![routed_video_packet(root, generation, 2, true)];
+        let outcome = decode_secondary_packets(
+            &shared,
+            &mut router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &keyframe,
+            &telemetry,
+            &repaint,
+        );
+        assert!(outcome.all_recovered);
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+        assert!(!gate.is_pending());
+        assert!(!shared
+            .lock()
+            .expect("media state poisoned")
+            .latest_frame
+            .as_ref()
+            .expect("root frame")
+            .rgba
+            .is_empty());
+    }
+
+    #[test]
+    fn routed_root_presentation_failure_reverts_to_rgba_fallback() {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(visible_ten_bit_presenter()),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        let root = arcen_media::SessionMonitorId::new(1).expect("nonzero");
+        let generation = arcen_media::TopologyGeneration::new(1).expect("nonzero generation");
+        let mut router =
+            MonitorFrameRouter::new_with_decoder_factory_for_test(generation, &[root], |_| {
+                ScriptedVideoDecoder::new(VecDeque::from([
+                    ScriptedDecode::Frame(native_ten_bit_frame(1)),
+                    ScriptedDecode::Frame(rgba_frame(2, 3)),
+                ]))
+            })
+            .expect("single routed root is valid");
+
+        let native_keyframe = vec![routed_video_packet(root, generation, 1, true)];
+        let outcome = decode_secondary_packets(
+            &shared,
+            &mut router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &native_keyframe,
+            &telemetry,
+            &repaint,
+        );
+        assert!(outcome.all_recovered);
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+        assert!(gate.is_pending());
+        assert!(presentation_recovery_pending(&shared));
+        assert!(
+            shared
+                .lock()
+                .expect("media state poisoned")
+                .ten_bit_layer_disabled
+        );
+        assert_eq!(drain_commands(&mut commands_rx), 1);
+
+        let fallback_keyframe = vec![routed_video_packet(root, generation, 2, true)];
+        let outcome = decode_secondary_packets(
+            &shared,
+            &mut router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &fallback_keyframe,
+            &telemetry,
+            &repaint,
+        );
+        assert!(outcome.all_recovered);
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+
+        let decoder = router
+            .decoder_for_route_for_test(MonitorRoute::Negotiated(root))
+            .expect("root decoder");
+        assert!(!decoder.prefers_native_biplanar());
+        let state = shared.lock().expect("media state poisoned");
+        assert!(!state.presentation_recovery.is_pending());
+        assert!(!state
+            .latest_frame
+            .as_ref()
+            .expect("fallback frame")
+            .rgba
+            .is_empty());
+    }
+
+    fn assert_native_metadata_size(
+        shared: &Arc<Mutex<SharedMediaState>>,
+        width: usize,
+        height: usize,
+        timestamp_ms: u32,
+    ) {
+        let metadata = shared
+            .lock()
+            .expect("media state poisoned")
+            .latest_native_frame_metadata
+            .clone()
+            .expect("native metadata");
+        assert_eq!(metadata.width, width);
+        assert_eq!(metadata.height, height);
+        assert_eq!(metadata.timestamp_ms, timestamp_ms);
+    }
+
+    #[test]
+    fn hidden_root_eight_bit_frame_publishes_native_metadata_before_restore() {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            eight_bit_video_presenter: Some(Arc::new(Mutex::new(
+                DedicatedEightBitVideoPresenter::new(),
+            ))),
+            eight_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let mut decoder = ScriptedVideoDecoder::new(VecDeque::from([ScriptedDecode::Frame(
+            native_eight_bit_frame_sized(21, 7, 5),
+        )]));
+        let mut secondary_router: Option<MonitorFrameRouter<ScriptedVideoDecoder>> = None;
+
+        assert!(decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[legacy_video_packet(21, true)],
+            &telemetry,
+            &repaint,
+        ));
+
+        assert_native_metadata_size(&shared, 7, 5, 21);
+    }
+
+    #[test]
+    fn hidden_root_ten_bit_frame_publishes_native_metadata_before_restore() {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(Arc::new(Mutex::new(DedicatedVideoPresenter::new()))),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let mut decoder = ScriptedVideoDecoder::new(VecDeque::from([ScriptedDecode::Frame(
+            native_ten_bit_frame_sized(22, 9, 6),
+        )]));
+        let mut secondary_router: Option<MonitorFrameRouter<ScriptedVideoDecoder>> = None;
+
+        assert!(decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[legacy_video_packet(22, true)],
+            &telemetry,
+            &repaint,
+        ));
+
+        assert_native_metadata_size(&shared, 9, 6, 22);
+    }
+
+    #[test]
+    fn hidden_routed_primary_frame_publishes_native_metadata_before_restore() {
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(Arc::new(Mutex::new(DedicatedVideoPresenter::new()))),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let root = arcen_media::SessionMonitorId::new(1).expect("nonzero");
+        let generation = arcen_media::TopologyGeneration::new(1).expect("nonzero generation");
+        let mut router =
+            MonitorFrameRouter::new_with_decoder_factory_for_test(generation, &[root], |_| {
+                ScriptedVideoDecoder::new(VecDeque::from([ScriptedDecode::Frame(
+                    native_ten_bit_frame_sized(23, 11, 8),
+                )]))
+            })
+            .expect("single routed root is valid");
+
+        let outcome = decode_secondary_packets(
+            &shared,
+            &mut router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[routed_video_packet(root, generation, 23, true)],
+            &telemetry,
+            &repaint,
+        );
+
+        assert!(outcome.all_recovered);
+        assert_native_metadata_size(&shared, 11, 8, 23);
+    }
+
+    #[test]
+    fn presentation_obligation_never_cancels_while_routed_sibling_awaits_keyframe() {
+        let root = arcen_media::SessionMonitorId::new(1).expect("nonzero");
+        let sibling = arcen_media::SessionMonitorId::new(2).expect("nonzero");
+        let generation = arcen_media::TopologyGeneration::new(1).expect("nonzero generation");
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            ten_bit_video_presenter: Some(visible_ten_bit_presenter()),
+            ten_bit_layer_ready: true,
+            ..SharedMediaState::default()
+        }));
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let telemetry = ClientTelemetry::default();
+        let repaint = egui::Context::default();
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        let mut decoder = NativeVideoDecoder::new();
+        let mut secondary_router = Some(
+            MonitorFrameRouter::new_with_decoder_factory_for_test(
+                generation,
+                &[root, sibling],
+                |route| match route {
+                    MonitorRoute::Negotiated(id) if id == root => {
+                        ScriptedVideoDecoder::new(VecDeque::from([
+                            ScriptedDecode::Frame(native_ten_bit_frame(1)),
+                            ScriptedDecode::Frame(rgba_frame(2, 4)),
+                        ]))
+                    }
+                    _ => ScriptedVideoDecoder::new(VecDeque::from([ScriptedDecode::Frame(
+                        rgba_frame(3, 5),
+                    )])),
+                },
+            )
+            .expect("two-monitor router is valid"),
+        );
+
+        assert!(!decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[routed_video_packet(root, generation, 1, true)],
+            &telemetry,
+            &repaint,
+        ));
+        assert!(gate.is_pending());
+        assert!(presentation_recovery_pending(&shared));
+
+        assert!(!decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[routed_video_packet(root, generation, 2, true)],
+            &telemetry,
+            &repaint,
+        ));
+        assert!(!presentation_recovery_pending(&shared));
+        assert!(gate.is_pending());
+
+        assert!(decode_batch(
+            &shared,
+            &mut decoder,
+            &mut secondary_router,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+            &[routed_video_packet(sibling, generation, 3, true)],
+            &telemetry,
+            &repaint,
+        ));
+        keep_or_cancel_full_frame_gate_after_recovery(&shared, &mut gate, &mut pending_ingress_idr);
+        assert!(!gate.is_pending());
+    }
+
+    #[test]
+    fn post_recovery_idle_worker_blocks_without_requests() {
+        let (shared, commands, mut commands_rx, mut gate, _pending_ingress_idr, _decoder) =
+            drive_sync_presenter_failure_recovery();
+        assert_eq!(drain_commands(&mut commands_rx), 0);
+        for _ in 0..3 {
+            let mut event = None;
+            assert_eq!(
+                service_worker_loop_step(
+                    &shared,
+                    &commands,
+                    &mut gate,
+                    false,
+                    |blocking| {
+                        assert!(blocking, "idle recovered stream must block, not poll");
+                        Ok(None)
+                    },
+                    |_| panic!("idle recovered stream must not sleep-poll"),
+                    &mut event,
+                ),
+                WorkerLoopStep::Disconnected
+            );
+            assert_eq!(drain_commands(&mut commands_rx), 0);
+        }
+    }
+
+    #[test]
+    fn ten_bit_async_failure_does_not_replace_fallback_with_empty_native_frame() {
+        let fallback = DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![0, 0, 0, 255],
+            timestamp_ms: 7,
+            pixel_format: "rgba".to_string(),
+            backend: "test",
+            native: None,
+        };
+        let empty_native = DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Vec::new(),
+            timestamp_ms: 8,
+            pixel_format: "xf44-full-iosurface".to_string(),
+            backend: "videotoolbox-iosurface",
+            native: None,
+        };
+        let mut state = SharedMediaState {
+            latest_frame: Some(fallback),
+            ..SharedMediaState::default()
+        };
+
+        publish_ten_bit_failure_fallback(&mut state, empty_native);
+
+        assert!(state.ten_bit_layer_disabled);
+        assert_eq!(
+            state.latest_frame.as_ref().map(|frame| frame.timestamp_ms),
+            Some(7),
+            "an async 10-bit layer failure must not publish an empty-RGBA frame over the fallback"
+        );
+    }
+
+    #[test]
     fn decoded_frames_are_published_individually_without_building_a_backlog() {
         let shared = Arc::new(Mutex::new(SharedMediaState {
             video_frames_seen: 2,
             ..SharedMediaState::default()
         }));
         let telemetry = ClientTelemetry::default();
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
         let frame = |timestamp_ms| DecodedVideoFrame {
             width: 1,
             height: 1,
@@ -1584,6 +3296,9 @@ mod tests {
             Some(true),
             &telemetry,
             &egui::Context::default(),
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
         );
         publish_decoded_frame(
             &shared,
@@ -1593,6 +3308,9 @@ mod tests {
             Some(true),
             &telemetry,
             &egui::Context::default(),
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
         );
 
         let state = shared.lock().expect("media state poisoned");
@@ -1693,6 +3411,7 @@ mod tests {
         let (sender, _received) = mpsc::unbounded_channel();
         let commands = SessionCommandSender::for_test(sender);
         let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
         let mut decoder = NativeVideoDecoder::new();
         let telemetry = ClientTelemetry::default();
         let repaint = egui::Context::default();
@@ -1739,6 +3458,7 @@ mod tests {
                 &mut secondary_router,
                 &commands,
                 &mut gate,
+                &mut pending_ingress_idr,
                 &delta_for(2),
                 &telemetry,
                 &repaint,
@@ -1761,6 +3481,7 @@ mod tests {
                 &mut secondary_router,
                 &commands,
                 &mut gate,
+                &mut pending_ingress_idr,
                 &unrouted_noop,
                 &telemetry,
                 &repaint,
@@ -1783,6 +3504,7 @@ mod tests {
                 &mut secondary_router,
                 &commands,
                 &mut gate,
+                &mut pending_ingress_idr,
                 &unrouted_noop,
                 &telemetry,
                 &repaint,
@@ -1809,6 +3531,7 @@ mod tests {
         let (sender, _received) = mpsc::unbounded_channel();
         let commands = SessionCommandSender::for_test(sender);
         let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
         let mut decoder = NativeVideoDecoder::new();
         let telemetry = ClientTelemetry::default();
         let repaint = egui::Context::default();
@@ -1842,6 +3565,7 @@ mod tests {
             &mut secondary_router,
             &commands,
             &mut gate,
+            &mut pending_ingress_idr,
             &unrouted,
             &telemetry,
             &repaint,
@@ -1884,8 +3608,10 @@ mod tests {
     /// "decode kept up but presentation did not" from ordinary throughput.
     #[test]
     fn recording_a_routed_decode_moves_both_aggregate_and_monitor_counters() {
-        let mut state = SharedMediaState::default();
-        state.waiting_for_keyframe = true;
+        let mut state = SharedMediaState {
+            waiting_for_keyframe: true,
+            ..SharedMediaState::default()
+        };
         let sid = arcen_media::SessionMonitorId::new(2).expect("nonzero");
 
         record_monitor_decode(&mut state, Some(sid), 4.0, false);
@@ -1906,5 +3632,17 @@ mod tests {
         record_monitor_decode(&mut state, None, 1.0, false);
         assert_eq!(state.video_frames_decoded, 3);
         assert_eq!(state.monitor_media.len(), 1);
+    }
+
+    #[test]
+    fn latest_frame_mailbox_is_bounded_and_latest_wins() {
+        let mut mailbox = LatestFrameMailbox::default();
+        mailbox.submit(1);
+        mailbox.submit(2);
+        mailbox.submit(3);
+        assert_eq!(mailbox.accepted(), 3);
+        assert_eq!(mailbox.dropped(), 2);
+        assert_eq!(mailbox.take(), Some(3));
+        assert_eq!(mailbox.take(), None);
     }
 }

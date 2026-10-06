@@ -13,8 +13,8 @@
 #![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arcen_session::agent_relay::{
@@ -149,6 +149,7 @@ pub struct AgentRegistry {
     sequence: AtomicU64,
     /// Attached sessions whose agent may still open an audio side channel.
     audio_channels: Mutex<std::collections::HashMap<u64, AudioChannelSlot>>,
+    active_sessions: Arc<Mutex<std::collections::HashMap<u64, u32>>>,
     /// The service's own account, which is never handed a Deck.
     service_uid: Option<u32>,
     /// The only executable allowed to register, when known.
@@ -172,14 +173,12 @@ impl AgentRegistry {
     /// any program running as a permitted account, which is only for a service
     /// run by hand out of a build tree.
     #[must_use]
-    pub fn new(
-        service_uid: Option<u32>,
-        expected_program: Option<PathBuf>,
-    ) -> std::sync::Arc<Self> {
+    pub fn new(service_uid: Option<u32>, expected_program: Option<PathBuf>) -> Arc<Self> {
         std::sync::Arc::new(Self {
             parked: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(1),
             audio_channels: Mutex::new(std::collections::HashMap::new()),
+            active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             service_uid,
             expected_program,
         })
@@ -358,10 +357,13 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Forgets a session's audio slot once its relay ends.
+    /// Forgets a session's side channels once its relay ends.
     pub fn end_session(&self, session: u64) {
         if let Ok(mut slots) = self.audio_channels.lock() {
             slots.remove(&session);
+        }
+        if let Ok(mut sessions) = self.active_sessions.lock() {
+            sessions.remove(&session);
         }
     }
 
@@ -416,6 +418,9 @@ impl AgentRegistry {
                     }
                     match offer(&mut stream, peer, session).await {
                         Ok(()) => {
+                            if let Ok(mut sessions) = self.active_sessions.lock() {
+                                sessions.insert(session, agent.uid);
+                            }
                             return Ok(AttachedAgent {
                                 stream,
                                 agent,

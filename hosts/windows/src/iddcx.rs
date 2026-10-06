@@ -44,6 +44,7 @@ pub(crate) fn planning_inventory(
                 min_refresh_hz: arcen_iddcx_provider::abi::MIN_REFRESH_MILLIHZ / 1_000,
                 max_refresh_hz: arcen_iddcx_provider::abi::MAX_REFRESH_MILLIHZ / 1_000,
             },
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming,
             supported_rotations: vec![
                 arcen_media::Rotation::Degrees0,
                 arcen_media::Rotation::Degrees90,
@@ -464,6 +465,7 @@ fn active_outputs(config: &WindowsIddCxConfig) -> Result<Vec<(u32, AvailableOutp
                         global_index,
                         device_name: output.device_name,
                         mode_capability: OutputModeCapability::FixedModes(modes),
+                        ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming,
                         supported_rotations: vec![
                             arcen_media::Rotation::Degrees0,
                             arcen_media::Rotation::Degrees90,

@@ -1,6 +1,6 @@
 [package]
 name = "arcen-capenc"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -44,9 +44,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_System_Power",          # SetThreadExecutionState — keep the display awake
     "Win32_System_LibraryLoader",  # LoadLibrary/GetProcAddress for nvEncodeAPI64.dll
+    "Win32_System_StationsAndDesktops", # name the input desktop when duplication is refused
+    "Win32_System_Diagnostics_ToolHelp", # which secure-desktop process holds input
+    "Win32_System_RemoteDesktop",        # ProcessIdToSessionId
     # Windows.Graphics.Capture (WGC) — DWM-based capture that works on headless
     # NVIDIA vGPU / RDP where DXGI Desktop Duplication delivers no frames.
     "Foundation",
+    "Foundation_Collections",
     "Graphics",
     "Graphics_Capture",
     "Graphics_DirectX",

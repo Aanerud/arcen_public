@@ -4,6 +4,62 @@
 //! portable policy deterministic: administrator lists only constrain the
 //! choice, and an empty allow-list means any eligible streaming adapter.
 
+use arcen_media::Rotation;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsCcdOutputKind {
+    /// A real monitor/panel whose preferred/native timing may be landscape
+    /// even when Windows presents it as portrait through CCD target rotation.
+    PhysicalPanel,
+    /// A Pier-owned virtual/headless timing where Arcen writes the mode list,
+    /// so portrait can be represented directly as a native portrait timing.
+    PierOwnedTiming,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsCcdModePlan {
+    /// Windows source-surface size in desktop coordinates. For rotated
+    /// targets this is the already-rotated desktop footprint.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Native target timing sent to the monitor before CCD applies
+    /// `DISPLAYCONFIG_PATH_TARGET_INFO::rotation`.
+    pub target_width: u32,
+    pub target_height: u32,
+    /// Rotation to place in `DISPLAYCONFIG_PATH_TARGET_INFO::rotation`.
+    pub target_rotation: Rotation,
+}
+
+/// Plans Windows CCD source and target extents from the host-authoritative
+/// desktop source size.
+///
+/// Windows CCD treats source modes as desktop-coordinate surfaces and target
+/// modes as native signal timings. A portrait desktop therefore keeps its
+/// portrait source size while the target timing is the corresponding
+/// landscape mode plus target rotation.
+#[must_use]
+pub const fn windows_ccd_mode_plan(
+    source_width: u32,
+    source_height: u32,
+    rotation: Rotation,
+    output_kind: WindowsCcdOutputKind,
+) -> WindowsCcdModePlan {
+    let (target_width, target_height, target_rotation) = match output_kind {
+        WindowsCcdOutputKind::PhysicalPanel => match rotation {
+            Rotation::Degrees0 | Rotation::Degrees180 => (source_width, source_height, rotation),
+            Rotation::Degrees90 | Rotation::Degrees270 => (source_height, source_width, rotation),
+        },
+        WindowsCcdOutputKind::PierOwnedTiming => (source_width, source_height, Rotation::Degrees0),
+    };
+    WindowsCcdModePlan {
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        target_rotation,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AdminHeadlessMode {
     #[default]
@@ -180,6 +236,97 @@ fn adapter_list_contains(list: &[String], description: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ccd_source_stays_oriented_while_target_mode_rotates() {
+        for (rotation, expected_target) in [
+            (Rotation::Degrees0, (2_880, 5_120)),
+            (Rotation::Degrees90, (5_120, 2_880)),
+            (Rotation::Degrees180, (2_880, 5_120)),
+            (Rotation::Degrees270, (5_120, 2_880)),
+        ] {
+            let plan =
+                windows_ccd_mode_plan(2_880, 5_120, rotation, WindowsCcdOutputKind::PhysicalPanel);
+            assert_eq!(
+                (plan.source_width, plan.source_height),
+                (2_880, 5_120),
+                "{rotation:?} source mode is the rotated desktop surface"
+            );
+            assert_eq!(
+                (plan.target_width, plan.target_height),
+                expected_target,
+                "{rotation:?} target mode is the native timing"
+            );
+            assert_eq!(plan.target_rotation, rotation);
+        }
+    }
+
+    #[test]
+    fn ccd_pier_owned_timing_uses_native_portrait_without_rotation() {
+        for rotation in [
+            Rotation::Degrees0,
+            Rotation::Degrees90,
+            Rotation::Degrees180,
+            Rotation::Degrees270,
+        ] {
+            let plan = windows_ccd_mode_plan(
+                1_440,
+                2_560,
+                rotation,
+                WindowsCcdOutputKind::PierOwnedTiming,
+            );
+            assert_eq!((plan.source_width, plan.source_height), (1_440, 2_560));
+            assert_eq!((plan.target_width, plan.target_height), (1_440, 2_560));
+            assert_eq!(plan.target_rotation, Rotation::Degrees0);
+        }
+    }
+
+    #[test]
+    fn ccd_mixed_orientation_negative_origin_layout_is_non_overlapping() {
+        let primary = windows_ccd_mode_plan(
+            5_120,
+            2_880,
+            Rotation::Degrees0,
+            WindowsCcdOutputKind::PhysicalPanel,
+        );
+        let portrait = windows_ccd_mode_plan(
+            2_880,
+            5_120,
+            Rotation::Degrees270,
+            WindowsCcdOutputKind::PhysicalPanel,
+        );
+
+        assert_eq!(
+            (primary.source_width, primary.source_height),
+            (5_120, 2_880)
+        );
+        assert_eq!(
+            (primary.target_width, primary.target_height),
+            (5_120, 2_880)
+        );
+        assert_eq!(
+            (portrait.source_width, portrait.source_height),
+            (2_880, 5_120)
+        );
+        assert_eq!(
+            (portrait.target_width, portrait.target_height),
+            (5_120, 2_880)
+        );
+
+        let primary_rect = (0_i32, 0_i32, primary.source_width, primary.source_height);
+        let portrait_rect = (
+            -2_880_i32,
+            -2_240_i32,
+            portrait.source_width,
+            portrait.source_height,
+        );
+        let separated_on_x =
+            i64::from(portrait_rect.0) + i64::from(portrait_rect.2) <= i64::from(primary_rect.0);
+        let overlaps_y = i64::from(portrait_rect.1)
+            < i64::from(primary_rect.1) + i64::from(primary_rect.3)
+            && i64::from(primary_rect.1) < i64::from(portrait_rect.1) + i64::from(portrait_rect.3);
+        assert!(separated_on_x && overlaps_y);
+    }
 
     fn adapter(
         description: &str,

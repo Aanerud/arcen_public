@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>ArcenMicrophone</string>
+  <key>CFBundleIdentifier</key>
+  <string>tech.arcen.microphone.driver</string>
+  <key>CFBundleName</key>
+  <string>Arcen Microphone</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.15.0</string>
+  <key>CFBundleVersion</key>
+  <string>0.15.0</string>
+  <key>CFPlugInFactories</key>
+  <dict>
+    <key>8F053A96-2B8D-4F88-8F90-B2E6B0F0E0A1</key>
+    <string>ArcenMicrophoneFactory</string>
+  </dict>
+  <key>CFPlugInTypes</key>
+  <dict>
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+    <array>
+      <string>8F053A96-2B8D-4F88-8F90-B2E6B0F0E0A1</string>
+    </array>
+  </dict>
+  <key>AudioServerPlugIn_MachServices</key>
+  <array>
+    <string>tech.arcen.microphone</string>
+  </array>
+</dict>
+</plist>

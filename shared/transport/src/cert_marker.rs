@@ -111,6 +111,19 @@ pub struct CertificatePins {
     pub spki: String,
 }
 
+/// Evidence outside the certificate that narrows automatic legacy adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyArcenEvidence {
+    /// The material was found in the platform's configured Arcen TLS directory.
+    pub arcen_tls_directory: bool,
+    /// Companion pin files written by an Arcen issuer are present and match the
+    /// certificate. A marker is stronger evidence and is handled separately.
+    pub companion_pins_match: bool,
+    /// The certificate SAN set exactly matches what the platform's historical
+    /// issuer would have generated from local machine facts.
+    pub machine_sans_match: bool,
+}
+
 /// Computes both pins from a PEM certificate.
 ///
 /// This is shared because every host needs the same answer. The digests are
@@ -130,6 +143,19 @@ pub fn pins_from_pem(pem_bytes: &[u8]) -> Option<CertificatePins> {
     Some(CertificatePins {
         certificate: hex_lower(&sha2::Sha256::digest(&der)),
         spki: format!("sha256/{}", base64_encode(&sha2::Sha256::digest(spki_der))),
+    })
+}
+
+/// Returns whether companion pin file contents describe the PEM certificate.
+#[must_use]
+pub fn companion_pins_match_pem(
+    pem_bytes: &[u8],
+    certificate_pin_text: &str,
+    spki_pin_text: &str,
+) -> bool {
+    pins_from_pem(pem_bytes).is_some_and(|pins| {
+        normalize_certificate_pin(certificate_pin_text).is_some_and(|pin| pin == pins.certificate)
+            && normalize_spki_pin(spki_pin_text).is_some_and(|pin| pin == pins.spki)
     })
 }
 
@@ -254,12 +280,12 @@ impl ValidityWindow {
     }
 }
 
-/// Returns whether the certificate names itself as its issuer.
+/// Returns whether the certificate names itself as its issuer and verifies
+/// with its own public key.
 ///
-/// Every certificate an Arcen installer or helper generates is self-signed.
-/// An enterprise CA-issued certificate is not, which is what lets a host tell
-/// material an earlier Arcen install left behind from material an operator
-/// provisioned on purpose. `false` when the PEM does not parse.
+/// This is a cryptographic self-signature check, not just an issuer/subject
+/// name comparison. `false` when the PEM does not parse or the signature
+/// algorithm is unsupported.
 #[must_use]
 pub fn is_self_signed_pem(pem_bytes: &[u8]) -> bool {
     let Some(der) = std::str::from_utf8(pem_bytes).ok().and_then(pem_to_der) else {
@@ -267,7 +293,270 @@ pub fn is_self_signed_pem(pem_bytes: &[u8]) -> bool {
     };
     x509_parser::parse_x509_certificate(&der).is_ok_and(|(_, certificate)| {
         certificate.issuer().as_raw() == certificate.subject().as_raw()
+            && certificate.verify_signature(None).is_ok()
     })
+}
+
+fn has_single_common_name(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    expected: &str,
+) -> bool {
+    let mut common_names = certificate
+        .subject()
+        .iter_common_name()
+        .filter_map(|name| name.as_str().ok());
+    common_names.next() == Some(expected)
+        && common_names.next().is_none()
+        && certificate.subject().iter_organization().next().is_none()
+}
+
+fn has_825_day_window(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    let validity = certificate.validity();
+    let lifetime = validity.not_after.timestamp() - validity.not_before.timestamp();
+    let expected = 825 * 24 * 60 * 60;
+    (expected - 5 * 60..=expected + 5 * 60).contains(&lifetime)
+}
+
+fn has_rcgen_default_window(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    let validity = certificate.validity();
+    validity.not_before.timestamp() <= 157_766_400
+        && validity.not_after.timestamp() >= 67_090_118_400
+}
+
+fn has_no_basic_constraints(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    certificate
+        .basic_constraints()
+        .is_ok_and(|value| value.is_none())
+}
+
+fn has_linux_basic_constraints(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+) -> bool {
+    certificate.basic_constraints().is_ok_and(|value| {
+        value.is_some_and(|basic_constraints| {
+            basic_constraints.critical
+                && !basic_constraints.value.ca
+                && basic_constraints.value.path_len_constraint.is_none()
+        })
+    })
+}
+
+fn has_no_key_usage(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    certificate.key_usage().is_ok_and(|value| value.is_none())
+}
+
+fn has_digital_signature_key_usage(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+) -> bool {
+    certificate.key_usage().is_ok_and(|value| {
+        value.is_some_and(|key_usage| {
+            key_usage.critical && key_usage.value.flags == 1 && key_usage.value.digital_signature()
+        })
+    })
+}
+
+fn has_server_auth_eku(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    certificate.extended_key_usage().is_ok_and(|value| {
+        value.is_some_and(|extended_key_usage| {
+            !extended_key_usage.critical
+                && extended_key_usage.value.server_auth
+                && !extended_key_usage.value.any
+                && !extended_key_usage.value.client_auth
+                && !extended_key_usage.value.code_signing
+                && !extended_key_usage.value.email_protection
+                && !extended_key_usage.value.time_stamping
+                && !extended_key_usage.value.ocsp_signing
+                && extended_key_usage.value.other.is_empty()
+        })
+    })
+}
+
+fn has_dns_or_ip_san(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    certificate.subject_alternative_name().is_ok_and(|san| {
+        san.is_some_and(|san| {
+            san.value.general_names.iter().any(|name| {
+                matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(_)
+                        | x509_parser::extensions::GeneralName::IPAddress(_)
+                )
+            })
+        })
+    })
+}
+
+/// Returns whether an unmarked certificate matches Arcen's legacy Linux
+/// installer profile closely enough to be adopted automatically.
+///
+/// The marker remains the normal ownership proof. This predicate is only for
+/// the one historical gap: Linux installer output before marker files existed.
+/// It is intentionally narrow, because an operator can also deploy a
+/// self-signed certificate. Ambiguous material is preserved untouched.
+#[must_use]
+pub fn is_legacy_arcen_self_signed_pem(pem_bytes: &[u8], evidence: LegacyArcenEvidence) -> bool {
+    let Some(der) = std::str::from_utf8(pem_bytes).ok().and_then(pem_to_der) else {
+        return false;
+    };
+    let Ok((_, certificate)) = x509_parser::parse_x509_certificate(&der) else {
+        return false;
+    };
+    if certificate.issuer().as_raw() != certificate.subject().as_raw()
+        || certificate.verify_signature(None).is_err()
+        || !evidence.arcen_tls_directory
+    {
+        return false;
+    }
+
+    let linux_openssl_profile = has_single_common_name(&certificate, "Arcen Pier")
+        && has_825_day_window(&certificate)
+        && has_linux_basic_constraints(&certificate)
+        && has_digital_signature_key_usage(&certificate)
+        && has_server_auth_eku(&certificate);
+    if linux_openssl_profile {
+        // Early Linux installers were SAN-less; later ones added DNS/IP SANs
+        // with the same subject, key-usage and validity profile.
+        return true;
+    }
+
+    let rcgen_mac_profile = has_single_common_name(&certificate, "rcgen self signed cert")
+        && (has_825_day_window(&certificate) || has_rcgen_default_window(&certificate))
+        && has_no_basic_constraints(&certificate)
+        && has_no_key_usage(&certificate)
+        && has_server_auth_eku(&certificate)
+        && has_dns_or_ip_san(&certificate)
+        && evidence.companion_pins_match;
+    if rcgen_mac_profile {
+        return true;
+    }
+
+    let rcgen_windows_profile = has_single_common_name(&certificate, "rcgen self signed cert")
+        && (has_825_day_window(&certificate) || has_rcgen_default_window(&certificate))
+        && has_no_basic_constraints(&certificate)
+        && has_digital_signature_key_usage(&certificate)
+        && has_server_auth_eku(&certificate)
+        && has_dns_or_ip_san(&certificate)
+        && (evidence.companion_pins_match || evidence.machine_sans_match);
+    if rcgen_windows_profile {
+        return true;
+    }
+
+    let rcgen_legacy_windows_profile =
+        has_single_common_name(&certificate, "rcgen self signed cert")
+            && has_rcgen_default_window(&certificate)
+            && has_no_basic_constraints(&certificate)
+            && has_no_key_usage(&certificate)
+            && has_server_auth_eku(&certificate)
+            && has_dns_or_ip_san(&certificate)
+            && (evidence.companion_pins_match || evidence.machine_sans_match);
+    if rcgen_legacy_windows_profile {
+        return true;
+    }
+
+    false
+}
+
+/// Returns DNS/IP SAN entries in the OpenSSL `DNS:name` / `IP:address` form.
+#[must_use]
+pub fn subject_alt_names_from_pem(pem_bytes: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(pem_bytes).ok()?;
+    let der = pem_to_der(text)?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(&der).ok()?;
+    let san = certificate.subject_alternative_name().ok()??;
+    let mut entries = Vec::new();
+    for name in &san.value.general_names {
+        match name {
+            x509_parser::extensions::GeneralName::DNSName(name) => {
+                entries.push(format!("DNS:{name}"));
+            }
+            x509_parser::extensions::GeneralName::IPAddress(bytes) if bytes.len() == 4 => {
+                entries.push(format!(
+                    "IP:{}.{}.{}.{}",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                ));
+            }
+            x509_parser::extensions::GeneralName::IPAddress(bytes) if bytes.len() == 16 => {
+                let mut segments = [0_u16; 8];
+                for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+                    segments[index] = u16::from_be_bytes([chunk[0], chunk[1]]);
+                }
+                entries.push(format!(
+                    "IP:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    segments[4],
+                    segments[5],
+                    segments[6],
+                    segments[7]
+                ));
+            }
+            _ => {}
+        }
+    }
+    Some(entries)
+}
+
+/// Normalises a DNS/IP SAN token into the same typed comparison form.
+///
+/// Accepts both the OpenSSL-style tagged form (`DNS:name`, `IP:address`) and
+/// the bare form used by `rcgen` callers, where IP addresses are inferred by
+/// parsing. DNS names and IP addresses stay distinct: `DNS:127.0.0.1` is not
+/// the same SAN as `IP:127.0.0.1`.
+#[must_use]
+pub fn normalize_subject_alt_name_entry(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(dns) = value
+        .strip_prefix("DNS:")
+        .or_else(|| value.strip_prefix("dns:"))
+    {
+        let dns = dns.trim().trim_matches('.').to_ascii_lowercase();
+        return (!dns.is_empty()).then(|| format!("DNS:{dns}"));
+    }
+    if let Some(ip) = value
+        .strip_prefix("IP:")
+        .or_else(|| value.strip_prefix("ip:"))
+    {
+        return ip
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| format!("IP:{ip}"));
+    }
+    value.parse::<std::net::IpAddr>().map_or_else(
+        |_| {
+            let dns = value.trim_matches('.').to_ascii_lowercase();
+            (!dns.is_empty()).then(|| format!("DNS:{dns}"))
+        },
+        |ip| Some(format!("IP:{ip}")),
+    )
+}
+
+/// Returns whether two SAN lists describe the same typed DNS/IP set.
+#[must_use]
+pub fn subject_alt_name_sets_match(left: &[String], right: &[String]) -> bool {
+    fn normalise_all(values: &[String]) -> Option<Vec<String>> {
+        let mut values: Vec<_> = values
+            .iter()
+            .map(|value| normalize_subject_alt_name_entry(value))
+            .collect::<Option<Vec<_>>>()?;
+        values.sort();
+        values.dedup();
+        Some(values)
+    }
+    normalise_all(left)
+        .zip(normalise_all(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+/// Returns whether a PEM certificate's DNS/IP SANs match the expected set.
+#[must_use]
+pub fn subject_alt_names_match_pem(pem_bytes: &[u8], expected: &[String]) -> bool {
+    subject_alt_names_from_pem(pem_bytes)
+        .is_some_and(|actual| subject_alt_name_sets_match(&actual, expected))
 }
 
 /// Reads a PEM certificate's validity window.
@@ -390,14 +679,86 @@ impl OwnershipMarker {
 mod tests {
     use super::*;
 
+    fn legacy_arcen_certificate() -> String {
+        legacy_linux_certificate(true)
+    }
+
+    fn legacy_linux_certificate(with_san: bool) -> String {
+        let key = rcgen::KeyPair::generate().expect("legacy key");
+        let names = if with_san {
+            vec!["pier.example.internal".to_owned()]
+        } else {
+            Vec::new()
+        };
+        let mut params = rcgen::CertificateParams::new(names).expect("legacy params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Arcen Pier");
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2028, 4, 5);
+        params.self_signed(&key).expect("legacy cert").pem()
+    }
+
+    fn legacy_macos_certificate() -> String {
+        let key = rcgen::KeyPair::generate().expect("mac key");
+        let mut params = rcgen::CertificateParams::new(vec!["pier.example.internal".to_owned()])
+            .expect("mac params");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2028, 4, 5);
+        params.self_signed(&key).expect("mac cert").pem()
+    }
+
+    fn legacy_windows_certificate(with_key_usage: bool, bounded_validity: bool) -> String {
+        let key = rcgen::KeyPair::generate().expect("windows key");
+        let mut params = rcgen::CertificateParams::new(vec!["pier.example.internal".to_owned()])
+            .expect("windows params");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        if with_key_usage {
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        }
+        if bounded_validity {
+            params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2028, 4, 5);
+        }
+        params.self_signed(&key).expect("windows cert").pem()
+    }
+
+    fn legacy_evidence() -> LegacyArcenEvidence {
+        LegacyArcenEvidence {
+            arcen_tls_directory: true,
+            companion_pins_match: true,
+            machine_sans_match: true,
+        }
+    }
+
+    fn weak_evidence() -> LegacyArcenEvidence {
+        LegacyArcenEvidence {
+            arcen_tls_directory: true,
+            companion_pins_match: false,
+            machine_sans_match: false,
+        }
+    }
+
+    fn windows_machine_evidence() -> LegacyArcenEvidence {
+        LegacyArcenEvidence {
+            arcen_tls_directory: true,
+            companion_pins_match: false,
+            machine_sans_match: true,
+        }
+    }
+
     #[test]
-    fn a_generated_certificate_is_self_signed_and_a_ca_issued_one_is_not() {
+    fn self_signed_requires_a_valid_self_signature_not_just_matching_names() {
         let ca_key = rcgen::KeyPair::generate().expect("ca key");
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "Example Enterprise CA");
+            .push(rcgen::DnType::CommonName, "Arcen Pier");
         let ca = ca_params.self_signed(&ca_key).expect("ca cert");
         assert!(is_self_signed_pem(ca.pem().as_bytes()));
 
@@ -406,13 +767,103 @@ mod tests {
             rcgen::CertificateParams::new(vec!["pier.example".to_owned()]).expect("leaf");
         leaf_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "pier.example");
+            .push(rcgen::DnType::CommonName, "Arcen Pier");
         let issuer = rcgen::Issuer::new(ca_params, ca_key);
         let leaf = leaf_params
             .signed_by(&leaf_key, &issuer)
             .expect("leaf cert");
         assert!(!is_self_signed_pem(leaf.pem().as_bytes()));
         assert!(!is_self_signed_pem(b"not a certificate"));
+    }
+
+    #[test]
+    fn legacy_arcen_detection_is_narrow_and_positive() {
+        let legacy = legacy_arcen_certificate();
+        assert!(is_self_signed_pem(legacy.as_bytes()));
+        assert!(is_legacy_arcen_self_signed_pem(
+            legacy.as_bytes(),
+            legacy_evidence()
+        ));
+        assert!(is_legacy_arcen_self_signed_pem(
+            legacy_linux_certificate(false).as_bytes(),
+            weak_evidence()
+        ));
+        assert!(is_legacy_arcen_self_signed_pem(
+            legacy_macos_certificate().as_bytes(),
+            legacy_evidence()
+        ));
+        assert!(is_legacy_arcen_self_signed_pem(
+            legacy_windows_certificate(true, true).as_bytes(),
+            windows_machine_evidence()
+        ));
+        assert!(is_legacy_arcen_self_signed_pem(
+            legacy_windows_certificate(false, false).as_bytes(),
+            windows_machine_evidence()
+        ));
+        assert!(
+            !is_legacy_arcen_self_signed_pem(
+                legacy_macos_certificate().as_bytes(),
+                weak_evidence()
+            ),
+            "generic rcgen profiles need matching Arcen companion pins"
+        );
+        assert!(
+            !is_legacy_arcen_self_signed_pem(
+                legacy_windows_certificate(true, true).as_bytes(),
+                weak_evidence()
+            ),
+            "unpinned Windows rcgen profiles need exact machine-generated SAN evidence"
+        );
+
+        let operator_key = rcgen::KeyPair::generate().expect("operator key");
+        let mut operator = rcgen::CertificateParams::new(vec!["pier.example.internal".to_owned()])
+            .expect("operator params");
+        operator
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Operator Pier");
+        let operator = operator
+            .self_signed(&operator_key)
+            .expect("operator cert")
+            .pem();
+        assert!(is_self_signed_pem(operator.as_bytes()));
+        assert!(
+            !is_legacy_arcen_self_signed_pem(operator.as_bytes(), legacy_evidence()),
+            "operator self-signed material is not automatically adoptable"
+        );
+
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Arcen Pier");
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["pier.example.internal".to_owned()]).expect("leaf");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Arcen Pier");
+        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2028, 4, 5);
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &rcgen::Issuer::new(ca_params, ca_key))
+            .expect("same-DN CA leaf")
+            .pem();
+        assert!(!is_self_signed_pem(leaf.as_bytes()));
+        assert!(!is_legacy_arcen_self_signed_pem(
+            leaf.as_bytes(),
+            legacy_evidence()
+        ));
+    }
+
+    #[test]
+    fn dns_and_ip_subject_alt_names_are_extracted_in_openssl_form() {
+        let cert = legacy_arcen_certificate();
+        let names = subject_alt_names_from_pem(cert.as_bytes()).expect("SANs");
+        assert!(names.contains(&"DNS:pier.example.internal".to_string()));
     }
 
     const HEX: &str = "2bfdf2fb2c67e38c2569c09b243fed94be54eefe2aba3c1815b24cd6e6cf86d4";

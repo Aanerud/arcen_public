@@ -61,8 +61,10 @@ pub struct GestureRuntime {
 }
 
 impl GestureRuntime {
+    /// `wake` runs on the main thread after each queued sample, so the UI
+    /// drains it promptly instead of on its next idle poll.
     #[must_use]
-    pub fn install() -> Option<Self> {
+    pub fn install(wake: impl Fn() + 'static) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let shared = Arc::new(Shared {
             queue: Mutex::new(GestureQueue::default()),
@@ -79,6 +81,8 @@ impl GestureRuntime {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.push(sample);
+                drop(queue);
+                wake();
             }
             event.as_ptr()
         });

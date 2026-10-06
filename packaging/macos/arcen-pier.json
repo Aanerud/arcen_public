@@ -19,7 +19,11 @@
     "color_matrix": "bt709",
     "color_policy": "default-off",
     "fps": 60,
-    "encoder": "auto"
+    "encoder": "auto",
+    "qp_map": {
+      "auto": "on",
+      "speed": "on"
+    }
   },
   "audio": {
     "enabled": true,
