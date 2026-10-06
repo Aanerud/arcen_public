@@ -82,9 +82,11 @@ newer or less widely decodable.
 
 Portable, CPU-side codecs live in `shared/media` behind a Cargo feature, next to
 `software_h264.rs`. Platform or vendor encoders live in `hosts/capenc`, because
-they need FFI and native resource ownership, and `shared/media` is
-`#![forbid(unsafe_code)]` and platform-free. **Do not** relax that to make a
-binding fit.
+they need FFI and native resource ownership. `shared/media` is platform-free and
+crate-wide `unsafe_code = "deny"`; the only allowed unsafe exception is the
+reviewed OpenH264 raw `SetOption` calls inside `software_h264.rs`, wrapped by
+safe setters and documented with `SAFETY` comments. **Do not** relax that to make
+a new binding fit.
 
 If the backend is new rather than just the codec, see the next section.
 

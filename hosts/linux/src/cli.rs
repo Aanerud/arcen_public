@@ -146,6 +146,7 @@ pub struct Config {
     ///
     /// See `docs/architecture/qp-maps.md` for how to benchmark it.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    pub qp_map_config: Option<arcen_session::pier_config::QpMapConfig>,
     /// `video.desktop_encoding`: what the Xorg desktop's code values mean.
     /// Xorg cannot say, so only the operator can; `rec2100-pq` lets an HDR
     /// request keep PQ / BT.2020 (a colour-managed application such as Flame
@@ -156,6 +157,8 @@ pub struct Config {
     pub variant_pinned: bool,
     /// Exact auth-time request retained for the post-hello consistency echo.
     pub auth_video_request: Option<InitialVideoRequestMsg>,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
     /// 1-based monitor index (runtime convention); `output_index` subtracts 1.
     pub monitor: u32,
@@ -225,7 +228,27 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn effective_qp_map_policy(&self) -> Option<arcen_media::video::QpMapPolicy> {
+        let config = self.qp_map_config.as_ref()?;
+        let served_pipeline;
+        let served = if let Some(active) = self.active_pipeline.as_ref() {
+            active.token()
+        } else {
+            served_pipeline = self.requested_pipeline?.served_wire();
+            served_pipeline.token()
+        };
+        let token = config.effective_token(served).ok()?;
+        arcen_media::video::QpMapPolicy::from_token(token)
+    }
+
     pub(crate) fn requested_encode_intent(&self) -> arcen_media::EncodeIntent {
+        if let Some(active) = self.active_pipeline.as_ref() {
+            if let Some(pipeline) = arcen_media::video::PipelineId::from_served_wire(active) {
+                return arcen_media::video::pipeline_contract(pipeline).intent;
+            }
+        } else if let Some(pipeline) = self.requested_pipeline {
+            return arcen_media::video::pipeline_contract(pipeline).intent;
+        }
         self.auth_video_request
             .as_ref()
             .and_then(|request| {
@@ -235,6 +258,13 @@ impl Config {
     }
 
     pub(crate) fn requested_motion_priority(&self) -> arcen_media::video::MotionPriority {
+        if let Some(active) = self.active_pipeline.as_ref() {
+            if let Some(pipeline) = arcen_media::video::PipelineId::from_served_wire(active) {
+                return arcen_media::video::pipeline_contract(pipeline).priority;
+            }
+        } else if let Some(pipeline) = self.requested_pipeline {
+            return arcen_media::video::pipeline_contract(pipeline).priority;
+        }
         self.auth_video_request
             .as_ref()
             .and_then(|request| {
@@ -344,7 +374,19 @@ impl Config {
             variant_pinned: self.variant_pinned,
             intent: self.requested_encode_intent(),
             motion_priority: self.requested_motion_priority(),
-            qp_map: self.qp_map,
+            qp_map: self.effective_qp_map_policy().unwrap_or(self.qp_map),
+            debug_diagnostics: self.logging.resolved_profile().is_ok_and(|resolved| {
+                resolved
+                    .profile
+                    .includes(arcen_telemetry::OperationalProfile::Debug)
+            }),
+            encoder_max_bitrate_bps: self
+                .active_pipeline
+                .as_ref()
+                .and_then(arcen_media::video::PipelineId::from_served_wire)
+                .and_then(|pipeline| {
+                    arcen_media::video::pipeline_contract(pipeline).encoder_ceiling_bps()
+                }),
             width,
             height,
             cursor_mode,
@@ -389,6 +431,7 @@ impl Config {
         )
         .map_err(|error| format!("initial video request: {error}"))?;
         self.auth_video_request = Some(request.clone());
+        self.requested_pipeline = resolved.pipeline;
         // The lab pipe carries compositor-tagged PQ, so it vouches for itself,
         // but only PQ sessions read it; every other session reads Xorg.
         let desktop = if experimental_rgb10_pipe().is_some()
@@ -400,6 +443,18 @@ impl Config {
         };
         let plan = arcen_media::video::resolve_desktop_plan(resolved.video, desktop)
             .map_err(|error| error.to_string())?;
+        self.active_pipeline = Some(arcen_media::video::served_pipeline(
+            self.requested_pipeline,
+            plan.video,
+            resolved.max_fps,
+            client.motion_priority,
+            arcen_media::video::ServedPipelineContext {
+                backend: Some(arcen_media::video::AcceleratorClass::Hardware),
+                exact_or_admin_override: self.codec_pinned
+                    || self.variant_pinned
+                    || self.requested_pipeline.is_none(),
+            },
+        ));
         if plan.conversion != arcen_media::video::Rgb10Signal::Direct {
             tracing::info!(
                 target: crate::logging::target::MEDIA,
@@ -476,9 +531,12 @@ impl Default for Config {
             video_selection: VideoSelectionIntent::Exact,
             codec_pinned: false,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             desktop_encoding: arcen_media::video::DesktopSignalEncoding::default(),
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 60,
             monitor: 1,
             display: ":0".to_string(),
@@ -628,6 +686,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
                     .join(", ");
                 format!("invalid --qp-map {v:?}: expected one of {known}")
             })?;
+        cfg.qp_map_config = None;
     }
     if let Some(v) = flag_value(args, "--variant") {
         apply_variant(&mut cfg, &v)?;
@@ -1196,15 +1255,9 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
             .map_err(|error| format!("Pier config video.color_policy: {error}"))?;
     }
     if let Some(value) = file.video.qp_map {
-        cfg.qp_map = arcen_media::video::QpMapPolicy::from_token(&value.to_ascii_lowercase())
-            .ok_or_else(|| {
-                let known = arcen_media::video::QpMapPolicy::ALL
-                    .iter()
-                    .map(|policy| policy.token())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("Pier config video.qp_map {value:?}: expected one of {known}")
-            })?;
+        let effective = value.effective_token("auto")?;
+        cfg.qp_map = arcen_media::video::QpMapPolicy::from_token(effective).unwrap_or_default();
+        cfg.qp_map_config = Some(value);
     }
     if let Some(value) = file.video.desktop_encoding {
         cfg.desktop_encoding =
@@ -1701,6 +1754,7 @@ mod tests {
                 bt601_matrix: true,
                 bt2020_ncl_matrix: true,
             },
+            pipeline: None,
         }
     }
 
@@ -1731,6 +1785,42 @@ mod tests {
         request.capabilities.av1 = false;
         no_av1.apply_initial_video_request(&request).unwrap();
         assert_eq!(no_av1.codec, "h265");
+    }
+
+    #[test]
+    fn speed_pipeline_contract_drives_motion_priority() {
+        let mut request = initial_video(
+            VideoSelectionIntent::AdaptivePerformance,
+            "h264",
+            "yuv420",
+            "8",
+            "limited",
+        );
+        request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Speed);
+        request.quality.max_fps = 60;
+        request.quality.motion_priority = "detail".to_string();
+        let mut config = Config::default();
+        config.apply_initial_video_request(&request).unwrap();
+        config.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Speed);
+        assert_eq!(
+            config.requested_motion_priority(),
+            arcen_media::video::MotionPriority::Motion,
+            "served Speed uses the shared contract's motion priority"
+        );
+        assert_eq!(
+            config.requested_encode_intent(),
+            arcen_media::EncodeIntent::Interactive
+        );
+        let capenc = config.capenc_config(
+            PathBuf::from("arcen-pier"),
+            None,
+            arcen_telemetry::CorrelationId::from_uuid_v4_bytes([2; 16]),
+            arcen_protocol::messages::CursorMode::Local,
+        );
+        assert_eq!(
+            capenc.motion_priority,
+            arcen_media::video::MotionPriority::Motion
+        );
     }
 
     #[test]
@@ -1773,6 +1863,15 @@ mod tests {
         assert_eq!(pinned.chroma, "yuv420");
         assert_eq!(pinned.color_range, arcen_media::ColorRange::Full);
         assert!(pinned.auth_video_request.is_some());
+        assert_eq!(
+            pinned.requested_pipeline,
+            Some(arcen_media::video::PipelineId::Grading)
+        );
+        assert_eq!(
+            pinned.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Custom),
+            "a pinned exact/custom variant is not a served product pipeline"
+        );
     }
 
     #[test]
@@ -1787,6 +1886,7 @@ mod tests {
         hdr.quality.color_matrix = "bt2020ncl".to_string();
         hdr.quality.color_primaries = "bt2020".to_string();
         hdr.quality.transfer = "pq".to_string();
+        hdr.quality.max_fps = 30;
         let mut config = Config {
             bit_depth: arcen_media::BitDepth::Ten,
             color_range: arcen_media::ColorRange::Full,
@@ -1802,6 +1902,14 @@ mod tests {
         assert_eq!(config.color_matrix, arcen_media::ColorMatrix::Bt709);
         assert_eq!(config.color_primaries, arcen_media::ColorPrimaries::Bt709);
         assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Bt709);
+        assert_eq!(
+            config.requested_pipeline,
+            Some(arcen_media::video::PipelineId::Hdr)
+        );
+        assert_eq!(
+            config.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
         assert_eq!(
             config.auth_video_request.as_ref().unwrap().quality.transfer,
             "pq",
@@ -1821,6 +1929,7 @@ mod tests {
         hdr.quality.color_matrix = "bt2020ncl".to_string();
         hdr.quality.color_primaries = "bt2020".to_string();
         hdr.quality.transfer = "pq".to_string();
+        hdr.quality.max_fps = 30;
         let mut config = Config {
             bit_depth: arcen_media::BitDepth::Ten,
             color_range: arcen_media::ColorRange::Full,
@@ -1833,6 +1942,10 @@ mod tests {
         assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Pq);
         assert_eq!(config.color_primaries, arcen_media::ColorPrimaries::Bt2020);
         assert_eq!(config.color_matrix, arcen_media::ColorMatrix::Bt2020Ncl);
+        assert_eq!(
+            config.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Hdr)
+        );
         let argv = config
             .capenc_config(
                 PathBuf::from("arcen-pier"),
@@ -1946,6 +2059,37 @@ mod tests {
         let error = apply_file_config(&mut Config::default(), file_with("hdr"))
             .expect_err("unknown token must fail");
         assert!(error.contains("video.desktop_encoding"), "{error}");
+    }
+
+    #[test]
+    fn qp_map_object_uses_the_served_pipeline() {
+        let file: crate::config::PierFileConfig = serde_json::from_str(
+            r#"{
+                "audio":{"enabled":true,"compressed":false},
+                "microphone_input":{"enabled":false},
+                "video":{"qp_map":{"speed":"on","grading":"neutral"}},
+                "platform": {}
+            }"#,
+        )
+        .expect("config");
+        let mut cfg = Config::default();
+        apply_file_config(&mut cfg, file).expect("apply file config");
+        assert_eq!(cfg.qp_map, arcen_media::video::QpMapPolicy::default());
+        cfg.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Speed);
+        assert_eq!(
+            cfg.effective_qp_map_policy(),
+            Some(arcen_media::video::QpMapPolicy::On)
+        );
+        cfg.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Grading);
+        assert_eq!(
+            cfg.effective_qp_map_policy(),
+            Some(arcen_media::video::QpMapPolicy::Neutral)
+        );
+        cfg.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Hdr);
+        assert_eq!(
+            cfg.effective_qp_map_policy(),
+            Some(arcen_media::video::QpMapPolicy::Off)
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arcen_protocol::messages::{
@@ -6,9 +7,12 @@ use arcen_protocol::messages::{
 };
 use arcen_telemetry::{assess_health, HealthAssessment, HealthState, QosSample, QosTargets};
 
+const FPS_WARMUP: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub struct ClientTelemetry {
     session_started: Instant,
+    media_started: Mutex<Option<Instant>>,
     frames_received: AtomicU64,
     frames_decoded: AtomicU64,
     frames_presented: AtomicU64,
@@ -31,6 +35,7 @@ impl Default for ClientTelemetry {
     fn default() -> Self {
         Self {
             session_started: Instant::now(),
+            media_started: Mutex::new(None),
             frames_received: AtomicU64::new(0),
             frames_decoded: AtomicU64::new(0),
             frames_presented: AtomicU64::new(0),
@@ -74,6 +79,13 @@ pub struct SessionTelemetrySummary {
 
 impl ClientTelemetry {
     pub fn record_media(&self, received: u64, decoded: u64, dropped: u64, decode: Duration) {
+        if received != 0 || decoded != 0 {
+            let mut media_started = self
+                .media_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            media_started.get_or_insert_with(Instant::now);
+        }
         self.frames_received.store(received, Ordering::Relaxed);
         self.frames_decoded.store(decoded, Ordering::Relaxed);
         self.frames_dropped.store(dropped, Ordering::Relaxed);
@@ -106,6 +118,14 @@ impl ClientTelemetry {
 
     pub fn record_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
+        self.reset_media_warmup();
+    }
+
+    pub fn reset_media_warmup(&self) {
+        *self
+            .media_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     pub fn window(&self, timestamp_ms: u64) -> TelemetryWindow {
@@ -160,6 +180,11 @@ impl ClientTelemetry {
             timestamp_ms,
             fps_target: Some(target_fps),
             fps_actual,
+            fps_warmup: self
+                .media_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|started| started.elapsed() < FPS_WARMUP),
             frames_decoded: window.ever_streamed.then_some(decoded_delta),
             frames_presented: window.ever_streamed.then_some(presented_delta),
             decode_time_ms: observed_nonzero(&self.media_observed, &self.decode_time_ms),
@@ -317,9 +342,17 @@ pub fn health_state_msg(state: HealthState) -> HealthStateMsg {
 mod tests {
     use super::*;
 
+    fn warmed_telemetry() -> ClientTelemetry {
+        ClientTelemetry {
+            session_started: Instant::now() - FPS_WARMUP - Duration::from_secs(1),
+            media_started: Mutex::new(Some(Instant::now() - FPS_WARMUP - Duration::from_secs(1))),
+            ..ClientTelemetry::default()
+        }
+    }
+
     #[test]
     fn hot_path_updates_are_atomic_and_snapshot_serializes() {
-        let telemetry = ClientTelemetry::default();
+        let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
         telemetry.record_media(10, 9, 1, Duration::from_millis(7));
         telemetry.record_presented(Duration::from_millis(2));
@@ -341,7 +374,7 @@ mod tests {
 
     #[test]
     fn shared_health_thresholds_drive_client_state() {
-        let telemetry = ClientTelemetry::default();
+        let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
         telemetry.record_rtt(Duration::from_millis(151));
         let (snapshot, health, _) = telemetry.snapshot(&mut window, None, 5_000, 60, 0);
@@ -370,8 +403,21 @@ mod tests {
     }
 
     #[test]
-    fn windowed_fps_stall_transitions_ok_degraded_critical_with_hysteresis() {
+    fn startup_warmup_suppresses_client_fps_only() {
         let telemetry = ClientTelemetry::default();
+        let mut window = telemetry.window(0);
+        telemetry.record_media(1, 1, 0, Duration::from_millis(2));
+        let (_, health, sample) = telemetry.snapshot(&mut window, None, 5_000, 60, 0);
+        assert!(sample.fps_warmup);
+        assert_ne!(
+            health.client_experience.dominant_cause,
+            Some(arcen_telemetry::HealthCause::Fps)
+        );
+    }
+
+    #[test]
+    fn windowed_fps_stall_transitions_ok_degraded_critical_with_hysteresis() {
+        let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
         let mut tracker = arcen_telemetry::HealthTracker::default();
 

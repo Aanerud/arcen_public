@@ -6,13 +6,16 @@ use crate::protocol::{
     decode_audio_header, decode_video_header, AudioHeader, FrameType, ProtocolError, VideoHeader,
     AUDIO_HEADER_SIZE,
 };
+use arcen_protocol::messages::ServedStreamPipeline;
 
-/// Four was too small for the 5-7 frame bursts QUIC delivers after congestion
-/// window expansion at ~33ms RTT. Eight covers the observed worst-case burst
-/// depth without inflating decode-queue latency at 60fps (8 × 16.7ms = 133ms
-/// ceiling, well within a tolerable display latency budget).
-pub const VIDEO_PACKET_LIMIT: usize = 8;
+/// Matches the shared pipeline contract (`arcen_media::video::pipeline::
+/// DECK_BURST_ABSORB`): ~500 ms at 60 fps, so the burst a Wi-Fi stall
+/// releases is decoded rather than discarded. The decoder drains far faster
+/// than real time, so a deep inbox holds frames only across such a burst.
+pub const VIDEO_PACKET_LIMIT: usize = 30;
 pub const VIDEO_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+pub const HDR_VIDEO_PACKET_LIMIT: usize = 30;
+pub const HDR_VIDEO_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 pub const AUDIO_PACKET_LIMIT: usize = 8;
 pub const AUDIO_BYTE_LIMIT: usize = 32 * 1024;
 
@@ -196,6 +199,20 @@ impl IncomingMediaLimits {
             audio_bytes,
         }
     }
+
+    pub fn for_pipeline(pipeline: Option<&ServedStreamPipeline>) -> Self {
+        pipeline
+            .and_then(arcen_media::video::PipelineId::from_served_wire)
+            .map_or_else(Self::default, |pipeline| {
+                let queue = arcen_media::video::pipeline_contract(pipeline).queue;
+                Self::new(
+                    queue.deck_video_packets,
+                    queue.deck_video_bytes,
+                    AUDIO_PACKET_LIMIT,
+                    AUDIO_BYTE_LIMIT,
+                )
+            })
+    }
 }
 
 impl Default for IncomingMediaLimits {
@@ -252,6 +269,16 @@ pub fn incoming_media_inbox_with_limits(
 }
 
 impl IncomingMediaSender {
+    pub fn set_limits(&self, limits: IncomingMediaLimits) {
+        let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
+        inner.limits = IncomingMediaLimits {
+            video_packets: limits.video_packets.max(1),
+            video_bytes: limits.video_bytes.max(1),
+            audio_packets: limits.audio_packets.max(1),
+            audio_bytes: limits.audio_bytes.max(1),
+        };
+    }
+
     pub fn enqueue_bytes(&self, bytes: &[u8]) -> Result<IncomingMediaEnqueue, ProtocolError> {
         match parse_media_packet(bytes)? {
             Some(packet) => Ok(self.enqueue(packet)),
@@ -1113,6 +1140,23 @@ mod tests {
         let recovery = rx.take_batch();
         assert_eq!(video_timestamps(&recovery), vec![10]);
         assert!(!recovery.idr_needed);
+    }
+
+    #[test]
+    fn a_wifi_stall_burst_is_decoded_not_discarded() {
+        // 2026-10-06 RTX session: 250-300 ms stalls released 14-17 frames at
+        // once; an eight-packet inbox turned each into a keyframe request.
+        let (tx, rx) = incoming_media_inbox();
+        tx.enqueue(video(0, true, 64 * 1024));
+        for sequence in 1..18_u32 {
+            tx.enqueue(video(sequence, false, 16 * 1024));
+        }
+
+        let batch = rx.take_batch();
+        assert_eq!(batch.video.len(), 18);
+        assert!(!batch.video_discontinuity);
+        assert!(!batch.idr_needed);
+        assert_eq!(rx.snapshot().video_loss_epochs, 0);
     }
 
     #[test]

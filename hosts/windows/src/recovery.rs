@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const JOURNAL_VERSION: u32 = 5;
+const JOURNAL_VERSION: u32 = 7;
 const MIN_SUPPORTED_JOURNAL_VERSION: u32 = 1;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -132,9 +132,15 @@ pub struct DisplayRecoveryJournal {
     pub devmode_hex: String,
     pub nvapi: Option<crate::nvapi::RecoveryData>,
     #[serde(default)]
+    pub nvapi_timings: Vec<crate::nvapi::TimingRecoveryData>,
+    #[serde(default)]
     pub headless_nvapi_edids: Vec<crate::nvapi_headless::HeadlessEdidRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_topology: Option<StableTopologySnapshot>,
+    #[serde(default)]
+    pub advanced_color: Vec<AdvancedColorRecoveryEntry>,
+    #[serde(default)]
+    pub advanced_color_only: bool,
 }
 
 impl DisplayRecoveryJournal {
@@ -161,8 +167,33 @@ impl DisplayRecoveryJournal {
             topology_modes_hex: encode_hex(topology_modes),
             devmode_hex: encode_hex(devmode),
             nvapi,
+            nvapi_timings: Vec::new(),
             headless_nvapi_edids: Vec::new(),
             stable_topology: None,
+            advanced_color: Vec::new(),
+            advanced_color_only: false,
+        }
+    }
+
+    pub fn advanced_color_only(entries: Vec<AdvancedColorRecoveryEntry>) -> Self {
+        Self {
+            version: JOURNAL_VERSION,
+            mutation_started: true,
+            deskside: None,
+            device_name: "advanced-color".to_string(),
+            selected_path_index: 0,
+            original_width: 0,
+            original_height: 0,
+            original_refresh_hz: 0,
+            topology_paths_hex: String::new(),
+            topology_modes_hex: String::new(),
+            devmode_hex: String::new(),
+            nvapi: None,
+            nvapi_timings: Vec::new(),
+            headless_nvapi_edids: Vec::new(),
+            stable_topology: None,
+            advanced_color: entries,
+            advanced_color_only: true,
         }
     }
 
@@ -200,6 +231,28 @@ impl DisplayRecoveryJournal {
         self.headless_nvapi_edids = entries;
         self
     }
+
+    pub fn with_advanced_color(mut self, entries: Vec<AdvancedColorRecoveryEntry>) -> Self {
+        self.advanced_color = entries;
+        self
+    }
+
+    pub fn is_advanced_color_only(&self) -> bool {
+        self.advanced_color_only && !self.advanced_color.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdvancedColorRecoveryEntry {
+    #[serde(default)]
+    pub adapter_device_path: String,
+    #[serde(default)]
+    pub monitor_device_path: String,
+    pub adapter_low: u32,
+    pub adapter_high: i32,
+    pub target_id: u32,
+    pub original_hdr_enabled: bool,
+    pub arcen_changed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -530,6 +583,45 @@ fn require_v5_authority(value: &serde_json::Value) -> Result<(), String> {
     )
 }
 
+fn require_v6_authority(value: &serde_json::Value) -> Result<(), String> {
+    if value
+        .get("advanced_color_only")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        require_object_fields(
+            value,
+            &[
+                "version",
+                "mutation_started",
+                "device_name",
+                "advanced_color",
+                "advanced_color_only",
+            ],
+            "display recovery journal v6 Advanced Color-only",
+        )?;
+        return Ok(());
+    }
+    require_v5_authority(value)?;
+    require_object_fields(
+        value,
+        &["advanced_color", "advanced_color_only"],
+        "display recovery journal v6",
+    )
+}
+
+fn require_v7_authority(value: &serde_json::Value) -> Result<(), String> {
+    require_v6_authority(value)?;
+    if value
+        .get("advanced_color_only")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Ok(());
+    }
+    require_object_fields(value, &["nvapi_timings"], "display recovery journal v7")
+}
+
 pub fn read(path: &Path) -> Result<DisplayRecoveryJournal, String> {
     reject_reparse_point(path, "display recovery journal")?;
     let metadata = std::fs::metadata(path)
@@ -549,6 +641,10 @@ pub fn read(path: &Path) -> Result<DisplayRecoveryJournal, String> {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "display recovery journal lacks a numeric version".to_string())?;
     if version == JOURNAL_VERSION as u64 {
+        require_v7_authority(&value)?;
+    } else if version == 6 {
+        require_v6_authority(&value)?;
+    } else if version == 5 {
         require_v5_authority(&value)?;
     } else if version == 4 {
         require_v4_authority(&value)?;
@@ -572,7 +668,24 @@ pub fn read(path: &Path) -> Result<DisplayRecoveryJournal, String> {
             return Err("display recovery journal has invalid deskside metadata".to_string());
         }
     }
-    if journal.version >= 4 {
+    if journal.is_advanced_color_only() {
+        if journal.device_name != "advanced-color"
+            || journal.original_width != 0
+            || journal.original_height != 0
+            || journal.original_refresh_hz != 0
+            || !journal.topology_paths()?.is_empty()
+            || !journal.topology_modes()?.is_empty()
+            || !journal.devmode()?.is_empty()
+            || journal.stable_topology.is_some()
+            || journal.nvapi.is_some()
+            || !journal.nvapi_timings.is_empty()
+            || !journal.headless_nvapi_edids.is_empty()
+        {
+            return Err(
+                "Advanced Color-only display recovery journal carries topology state".to_string(),
+            );
+        }
+    } else if journal.version >= 4 {
         if journal.topology_paths()?.is_empty()
             || journal.topology_modes()?.is_empty()
             || journal.devmode()?.is_empty()
@@ -682,6 +795,32 @@ pub fn read(path: &Path) -> Result<DisplayRecoveryJournal, String> {
             _ => {}
         }
     }
+    if journal.advanced_color.len() > arcen_media::MAX_MULTI_MONITOR_COUNT {
+        return Err("display recovery journal has too many Advanced Color entries".to_string());
+    }
+    let mut advanced_color_targets = std::collections::BTreeSet::new();
+    for entry in &journal.advanced_color {
+        if !advanced_color_targets.insert((entry.adapter_low, entry.adapter_high, entry.target_id))
+        {
+            return Err("display recovery journal repeats an Advanced Color target".to_string());
+        }
+        if entry.adapter_device_path.is_empty() || entry.monitor_device_path.is_empty() {
+            return Err(
+                "display recovery journal Advanced Color entry lacks stable target identity"
+                    .to_string(),
+            );
+        }
+        if !entry.arcen_changed {
+            return Err(
+                "display recovery journal Advanced Color entry was not changed by Arcen"
+                    .to_string(),
+            );
+        }
+    }
+    if journal.is_advanced_color_only() {
+        validate_nvapi_timing_entries(&journal.nvapi_timings)?;
+        return Ok(journal);
+    }
     if journal.original_width == 0
         || journal.original_height == 0
         || journal.original_width > 16_384
@@ -782,7 +921,58 @@ pub fn read(path: &Path) -> Result<DisplayRecoveryJournal, String> {
             );
         }
     }
+    validate_nvapi_timing_entries(&journal.nvapi_timings)?;
     Ok(journal)
+}
+
+fn validate_nvapi_timing_entries(
+    entries: &[crate::nvapi::TimingRecoveryData],
+) -> Result<(), String> {
+    if entries.len() > arcen_media::MAX_MULTI_MONITOR_COUNT {
+        return Err("display recovery journal has too many NVAPI timing entries".to_string());
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in entries {
+        if entry.device_name.is_empty()
+            || entry.device_name.len() > 128
+            || entry.display_id == 0
+            || entry.width == 0
+            || entry.height == 0
+            || entry.width > 16_384
+            || entry.height > 8_640
+            || entry.refresh_hz == 0
+            || entry.refresh_hz > 1_000
+            || !keys.insert((entry.adapter_luid, entry.display_id))
+        {
+            return Err(
+                "display recovery journal has invalid or duplicate NVAPI timing entry".to_string(),
+            );
+        }
+        if entry
+            .custom
+            .as_ref()
+            .is_some_and(|custom| !custom.is_valid())
+            || entry
+                .pre_existing_custom
+                .iter()
+                .any(|custom| !custom.is_valid())
+            || entry.pre_existing_custom.len() > 64
+        {
+            return Err("display recovery journal has invalid NVAPI timing state".to_string());
+        }
+        if !matches!(
+            entry.ownership,
+            crate::nvapi::TimingOwnership::NotTried
+                | crate::nvapi::TimingOwnership::CleanupComplete
+        ) && entry.custom.is_none()
+        {
+            return Err(
+                "display recovery journal claims NVAPI timing ownership without timing data"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn remove(path: &Path) -> Result<(), String> {
@@ -790,6 +980,50 @@ pub fn remove(path: &Path) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("remove display recovery journal {path:?}: {error}")),
+    }
+}
+
+pub fn remove_preserving_advanced_color(path: &Path) -> Result<(), String> {
+    match read(path) {
+        Ok(journal) => match journal_preserving_advanced_color(journal) {
+            Some(journal) => write_atomic(path, &journal),
+            None => remove(path),
+        },
+        Err(_) => remove(path),
+    }
+}
+
+fn journal_preserving_advanced_color(
+    journal: DisplayRecoveryJournal,
+) -> Option<DisplayRecoveryJournal> {
+    if journal.advanced_color.is_empty() {
+        None
+    } else {
+        Some(DisplayRecoveryJournal::advanced_color_only(
+            journal.advanced_color,
+        ))
+    }
+}
+
+pub fn clear_advanced_color_entries(path: &Path) -> Result<(), String> {
+    let journal = read(path)?;
+    match journal_after_clearing_advanced_color(journal) {
+        Some(journal) => write_atomic(path, &journal),
+        None => remove(path),
+    }
+}
+
+fn journal_after_clearing_advanced_color(
+    mut journal: DisplayRecoveryJournal,
+) -> Option<DisplayRecoveryJournal> {
+    if journal.advanced_color.is_empty() {
+        return Some(journal);
+    }
+    journal.advanced_color.clear();
+    if journal.advanced_color_only {
+        None
+    } else {
+        Some(journal)
     }
 }
 
@@ -1061,6 +1295,114 @@ pub fn rearm_nvapi(path: &Path, replacement: crate::nvapi::RecoveryData) -> Resu
     write_atomic(path, &journal)
 }
 
+pub fn rearm_nvapi_timing(
+    path: &Path,
+    replacement: crate::nvapi::TimingRecoveryData,
+) -> Result<(), String> {
+    let mut journal = read(path)?;
+    match journal.nvapi_timings.iter_mut().find(|entry| {
+        entry.adapter_luid == replacement.adapter_luid && entry.display_id == replacement.display_id
+    }) {
+        Some(current) => {
+            let unowned_pending = current.cleanup_stage == crate::nvapi::CleanupStage::Pending
+                && current.ownership == crate::nvapi::TimingOwnership::NotTried
+                && current.custom.is_none();
+            let cleaned = current.cleanup_stage == crate::nvapi::CleanupStage::Complete
+                && current.ownership == crate::nvapi::TimingOwnership::CleanupComplete;
+            if !unowned_pending && !cleaned {
+                return Err(
+                    "cannot rearm NVAPI timing recovery before prior cleanup completes".to_string(),
+                );
+            }
+            *current = replacement;
+        }
+        None => journal.nvapi_timings.push(replacement),
+    }
+    write_atomic(path, &journal)
+}
+
+pub fn mark_nvapi_timing_ownership(
+    path: &Path,
+    adapter_luid: crate::nvapi::AdapterLuid,
+    display_id: u32,
+    active: &crate::nvapi::ActiveExactMode,
+) -> Result<(), String> {
+    let mut journal = read(path)?;
+    let timing = journal
+        .nvapi_timings
+        .iter_mut()
+        .find(|entry| entry.adapter_luid == adapter_luid && entry.display_id == display_id)
+        .ok_or_else(|| "display recovery journal has no NVAPI timing entry".to_string())?;
+    let valid_transition = matches!(
+        (timing.ownership, active.ownership),
+        (
+            crate::nvapi::TimingOwnership::NotTried,
+            crate::nvapi::TimingOwnership::TrialAttemptedByUs
+        ) | (
+            crate::nvapi::TimingOwnership::TrialAttemptedByUs,
+            crate::nvapi::TimingOwnership::TrialAppliedByUs
+        ) | (
+            crate::nvapi::TimingOwnership::TrialAppliedByUs,
+            crate::nvapi::TimingOwnership::SaveAttemptedByUs
+        ) | (
+            crate::nvapi::TimingOwnership::SaveAttemptedByUs,
+            crate::nvapi::TimingOwnership::SavedByUs
+                | crate::nvapi::TimingOwnership::TrialAppliedByUs
+                | crate::nvapi::TimingOwnership::SaveAttemptedByUs
+        )
+    ) || timing.ownership == active.ownership;
+    if !valid_transition {
+        return Err(format!(
+            "invalid NVAPI timing ownership transition {:?} -> {:?}",
+            timing.ownership, active.ownership
+        ));
+    }
+    crate::nvapi::update_timing_recovery_from_active(timing, active);
+    write_atomic(path, &journal)
+}
+
+pub fn nvapi_timing_cleanup_stage(
+    path: &Path,
+    adapter_luid: crate::nvapi::AdapterLuid,
+    display_id: u32,
+) -> Result<crate::nvapi::CleanupStage, String> {
+    read(path)?
+        .nvapi_timings
+        .into_iter()
+        .find(|entry| entry.adapter_luid == adapter_luid && entry.display_id == display_id)
+        .map(|entry| entry.cleanup_stage)
+        .ok_or_else(|| "display recovery journal has no NVAPI timing entry".to_string())
+}
+
+pub fn mark_nvapi_timing_cleanup_stage(
+    path: &Path,
+    adapter_luid: crate::nvapi::AdapterLuid,
+    display_id: u32,
+    next: crate::nvapi::CleanupStage,
+) -> Result<(), String> {
+    let mut journal = read(path)?;
+    let timing = journal
+        .nvapi_timings
+        .iter_mut()
+        .find(|entry| entry.adapter_luid == adapter_luid && entry.display_id == display_id)
+        .ok_or_else(|| "display recovery journal has no NVAPI timing entry".to_string())?;
+    if timing.cleanup_stage == next {
+        return Ok(());
+    }
+    if timing.cleanup_stage.next() != Some(next) {
+        return Err(format!(
+            "invalid NVAPI timing cleanup transition {:?} -> {next:?}",
+            timing.cleanup_stage
+        ));
+    }
+    timing.cleanup_stage = next;
+    if next == crate::nvapi::CleanupStage::Complete {
+        timing.ownership = crate::nvapi::TimingOwnership::CleanupComplete;
+        timing.custom = None;
+    }
+    write_atomic(path, &journal)
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -1181,6 +1523,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_journal_without_advanced_color_remains_compatible() {
+        let mut value = serde_json::to_value(journal()).unwrap();
+        value["version"] = serde_json::json!(5);
+        value
+            .as_object_mut()
+            .expect("journal object")
+            .remove("advanced_color");
+        let decoded: DisplayRecoveryJournal = serde_json::from_value(value).unwrap();
+        assert!(decoded.advanced_color.is_empty());
+    }
+
+    #[test]
     fn legacy_journal_without_stable_topology_deserializes_for_fail_closed_recovery() {
         let mut value = serde_json::to_value(journal()).unwrap();
         value["version"] = serde_json::json!(3);
@@ -1198,7 +1552,7 @@ mod tests {
         let value = journal();
         let encoded = serde_json::to_vec(&value).unwrap();
         let decoded: DisplayRecoveryJournal = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.version, 5);
+        assert_eq!(decoded.version, 7);
         assert_eq!(decoded.stable_topology, value.stable_topology);
     }
 
@@ -1217,10 +1571,140 @@ mod tests {
         }];
         let encoded = serde_json::to_vec(&value).unwrap();
         let decoded: DisplayRecoveryJournal = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.version, 5);
+        assert_eq!(decoded.version, 7);
         assert_eq!(decoded.headless_nvapi_edids.len(), 1);
         assert_eq!(decoded.headless_nvapi_edids[0].display_id, 0x8206_1081);
         assert_eq!(decoded.headless_nvapi_edids[0].output_id, 0x400);
+    }
+
+    #[test]
+    fn current_journal_round_trips_advanced_color_rollback_authority() {
+        let mut value = journal();
+        value.advanced_color = vec![advanced_color_entry()];
+        let encoded = serde_json::to_vec(&value).unwrap();
+        let decoded: DisplayRecoveryJournal = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.version, 7);
+        assert_eq!(decoded.advanced_color, value.advanced_color);
+    }
+
+    #[test]
+    fn current_journal_round_trips_adopted_nvapi_timing_authority() {
+        let mut value = journal();
+        value.nvapi_timings = vec![nvapi_timing_entry()];
+        let encoded = serde_json::to_vec(&value).unwrap();
+        let decoded: DisplayRecoveryJournal = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.version, 7);
+        assert_eq!(decoded.nvapi_timings.len(), 1);
+        assert_eq!(decoded.nvapi_timings[0].display_id, 0x8206_1081);
+    }
+
+    fn advanced_color_entry() -> AdvancedColorRecoveryEntry {
+        AdvancedColorRecoveryEntry {
+            adapter_device_path: r"\\?\PCI#TEST".to_string(),
+            monitor_device_path: r"\\?\DISPLAY#TEST".to_string(),
+            adapter_low: 42,
+            adapter_high: 1,
+            target_id: 7,
+            original_hdr_enabled: false,
+            arcen_changed: true,
+        }
+    }
+
+    fn nvapi_timing_entry() -> crate::nvapi::TimingRecoveryData {
+        crate::nvapi::TimingRecoveryData {
+            device_name: r"\\.\DISPLAY6".to_string(),
+            adapter_luid: crate::nvapi::AdapterLuid {
+                low_part: 47_171,
+                high_part: 0,
+            },
+            display_id: 0x8206_1081,
+            width: 1512,
+            height: 950,
+            refresh_hz: 60,
+            ownership: crate::nvapi::TimingOwnership::TrialAppliedByUs,
+            custom: Some(crate::nvapi::CustomDisplay::test_value(1512, 950, 60)),
+            custom_snapshot_complete: true,
+            pre_existing_custom: Vec::new(),
+            cleanup_stage: crate::nvapi::CleanupStage::Pending,
+        }
+    }
+
+    #[test]
+    fn clearing_advanced_color_disarms_hdr_only_journal() {
+        let value = DisplayRecoveryJournal::advanced_color_only(vec![advanced_color_entry()]);
+        assert!(journal_after_clearing_advanced_color(value).is_none());
+    }
+
+    #[test]
+    fn clearing_advanced_color_keeps_topology_journal_without_hdr_entries() {
+        let mut value = journal();
+        value.advanced_color = vec![advanced_color_entry()];
+        let cleared = journal_after_clearing_advanced_color(value).expect("topology retained");
+        assert!(cleared.advanced_color.is_empty());
+        assert!(!cleared.advanced_color_only);
+        assert!(cleared.stable_topology.is_some());
+    }
+
+    #[test]
+    fn clearing_advanced_color_keeps_headless_topology_recovery_authority() {
+        let mut value = journal();
+        value.headless_nvapi_edids = vec![crate::nvapi_headless::HeadlessEdidRecovery {
+            display_id: 0x8206_1081,
+            output_id: 0x400,
+            adapter_luid: crate::nvapi::AdapterLuid {
+                low_part: 47_171,
+                high_part: 0,
+            },
+            original_edid: None,
+            intended_edid_sha256: "0".repeat(64),
+        }];
+        value.advanced_color = vec![advanced_color_entry()];
+
+        let cleared = journal_after_clearing_advanced_color(value).expect("topology retained");
+
+        assert!(cleared.advanced_color.is_empty());
+        assert!(!cleared.advanced_color_only);
+        assert_eq!(cleared.headless_nvapi_edids.len(), 1);
+        assert!(cleared.stable_topology.is_some());
+    }
+
+    #[test]
+    fn adopted_nvapi_timing_retarget_rearms_after_cleanup() {
+        let path = std::env::temp_dir().join(format!(
+            "arcen-display-recovery-timing-rearm-test-{}.json",
+            std::process::id()
+        ));
+        remove(&path).unwrap();
+        let mut value = journal();
+        value.nvapi_timings = vec![nvapi_timing_entry()];
+        value.nvapi_timings[0].cleanup_stage = crate::nvapi::CleanupStage::Complete;
+        value.nvapi_timings[0].ownership = crate::nvapi::TimingOwnership::CleanupComplete;
+        value.nvapi_timings[0].custom = None;
+        write_atomic(&path, &value).unwrap();
+
+        let mut replacement = nvapi_timing_entry();
+        replacement.width = 1800;
+        replacement.height = 1130;
+        replacement.ownership = crate::nvapi::TimingOwnership::NotTried;
+        replacement.custom = None;
+        replacement.cleanup_stage = crate::nvapi::CleanupStage::Pending;
+        rearm_nvapi_timing(&path, replacement).unwrap();
+
+        let mut loaded = read(&path).unwrap();
+        let rearmed = loaded.nvapi_timings.remove(0);
+        assert_eq!((rearmed.width, rearmed.height), (1800, 1130));
+        assert_eq!(rearmed.cleanup_stage, crate::nvapi::CleanupStage::Pending);
+        assert_eq!(rearmed.ownership, crate::nvapi::TimingOwnership::NotTried);
+        remove(&path).unwrap();
+    }
+
+    #[test]
+    fn preserving_advanced_color_keeps_only_outstanding_hdr_entries() {
+        let mut value = journal();
+        value.advanced_color = vec![advanced_color_entry()];
+        let preserved = journal_preserving_advanced_color(value).expect("advanced color retained");
+        assert!(preserved.is_advanced_color_only());
+        assert_eq!(preserved.advanced_color.len(), 1);
     }
 
     #[test]
@@ -1351,7 +1835,7 @@ mod tests {
 
         upgrade_legacy_stable_topology(&path, stable.clone(), 0).unwrap();
         let upgraded = read(&path).unwrap();
-        assert_eq!(upgraded.version, 5);
+        assert_eq!(upgraded.version, 7);
         assert!(upgraded.mutation_started);
         assert_eq!(upgraded.stable_topology, Some(stable));
         remove(&path).unwrap();

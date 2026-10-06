@@ -32,7 +32,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-OUT="$REPO/dist/macos"
+OUT="${ARCEN_MACOS_OUT:-$REPO/dist/macos}"
+SCRATCH="${ARCEN_BUILD_SCRATCH:-$REPO/.arcen-build}/macos-pkg.$$"
+rm -rf "$SCRATCH"
+mkdir -p "$SCRATCH"
 APP="$OUT/Arcen Pier.app"
 IDENTITY=""
 INSTALLER_IDENTITY=""
@@ -66,11 +69,12 @@ APP_ARGS=()
 # bash 3.2 is the newest bash macOS ships, and there `"${arr[@]}"` on an empty
 # array is an unbound-variable error under `set -u`. An unsigned build passes
 # no arguments, so the default invocation is exactly the case that fails.
-"$HERE/build-pier-app.sh" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
+ARCEN_MACOS_OUT="$OUT" ARCEN_BUILD_SCRATCH="${ARCEN_BUILD_SCRATCH:-$REPO/.arcen-build}" "$HERE/build-pier-app.sh" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
 [[ -d "$APP" ]] || { echo "error: $APP was not produced" >&2; exit 1; }
 
-ROOT="$(mktemp -d)"
-SCRIPTS="$(mktemp -d)"
+ROOT="$SCRATCH/root"
+SCRIPTS="$SCRATCH/scripts"
+mkdir -p "$ROOT" "$SCRIPTS"
 trap 'rm -rf "$ROOT" "$SCRIPTS"' EXIT
 PIER_SCRIPTS="$HERE/pier"
 for file in common.sh preinstall postinstall uninstall.sh newsyslog.conf \
@@ -83,6 +87,7 @@ done
 
 mkdir -p "$ROOT/Applications" "$ROOT/Library/PrivilegedHelperTools" \
   "$ROOT/Library/LaunchAgents" "$ROOT/Library/LaunchDaemons" \
+  "$ROOT/Library/Audio/Plug-Ins/HAL/ArcenMicrophone.driver/Contents/MacOS" \
   "$ROOT/private/etc/pam.d" "$ROOT/private/etc/newsyslog.d"
 # COPYFILE_DISABLE stops macOS writing AppleDouble "._" sidecars for extended
 # attributes. Without it the package installs a shadow file beside every real
@@ -93,6 +98,18 @@ COPYFILE_DISABLE=1 cp -R "$APP" "$ROOT/Applications/"
 # helper's identity instead of walking up to a container. It is a background
 # component, so it goes with the other privileged helpers, not /Applications.
 COPYFILE_DISABLE=1 cp -R "$OUT/Arcen Agent Helper.app" "$ROOT/Library/PrivilegedHelperTools/"
+
+# Build and stage the HAL input driver. It is a CFPlugIn bundle loaded by coreaudiod.
+echo "==> cargo build --locked --release -p arcen-microphone-driver"
+( cd "$REPO" && cargo build --locked --release -p arcen-microphone-driver )
+DRIVER_SRC="$REPO/hosts/macos/microphone-driver/ArcenMicrophone.driver"
+DRIVER_DST="$ROOT/Library/Audio/Plug-Ins/HAL/ArcenMicrophone.driver"
+COPYFILE_DISABLE=1 cp -R "$DRIVER_SRC/Contents" "$DRIVER_DST/"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+cp "$TARGET_DIR/release/libarcen_microphone_driver.dylib" "$DRIVER_DST/Contents/MacOS/ArcenMicrophone"
+chmod 755 "$DRIVER_DST/Contents/MacOS/ArcenMicrophone"
+chmod 644 "$DRIVER_DST/Contents/Info.plist"
+
 cp "$HERE/pam/arcen" "$ROOT/private/etc/pam.d/arcen"
 chmod 644 "$ROOT/private/etc/pam.d/arcen"
 cp "$PIER_SCRIPTS/newsyslog.conf" "$ROOT/private/etc/newsyslog.d/pier.arcen.tech.conf"
@@ -120,7 +137,7 @@ CONFIG_TEMPLATE="$HERE/arcen-pier.json"
 [[ -f "$CONFIG_TEMPLATE" ]] || { echo "missing configuration template: $CONFIG_TEMPLATE" >&2; exit 1; }
 RESOURCES="$ROOT/Applications/Arcen Pier.app/Contents/Resources"
 mkdir -p "$RESOURCES"
-python3 -m json.tool "$CONFIG_TEMPLATE" >/dev/null || { echo "error: $CONFIG_TEMPLATE is not JSON" >&2; exit 1; }
+plutil -convert xml1 -o /dev/null "$CONFIG_TEMPLATE" || { echo "error: $CONFIG_TEMPLATE is not JSON" >&2; exit 1; }
 cp "$CONFIG_TEMPLATE" "$RESOURCES/pier.json"
 chmod 644 "$RESOURCES/pier.json"
 
@@ -143,6 +160,8 @@ xattr -cr "$ROOT" 2>/dev/null || true
 if [[ -n "$IDENTITY" ]]; then
   codesign --force --options runtime --timestamp --identifier pier.arcen.tech.agent \
     --sign "$IDENTITY" "$ROOT/Library/PrivilegedHelperTools/Arcen Agent Helper.app"
+  codesign --force --options runtime --timestamp --identifier tech.arcen.microphone.driver \
+    --sign "$IDENTITY" "$ROOT/Library/Audio/Plug-Ins/HAL/ArcenMicrophone.driver"
   # The Pier's entitlements and embedded profile were set by the app build.
   # Re-sealing without preserving them strips the entitlement, and the
   # profile left behind no longer matches the signature.
@@ -157,7 +176,9 @@ fi
 # code, and refuses it with nothing more than "failed MACF" otherwise.
 if [[ -n "$NOTARY_PROFILE" ]]; then
   [[ -n "$IDENTITY" ]] || { echo "error: notarization requires --identity" >&2; exit 2; }
-  NOTARY_DIR="$(mktemp -d)"
+  NOTARY_DIR="$SCRATCH/notary"
+  rm -rf "$NOTARY_DIR"
+  mkdir -p "$NOTARY_DIR"
   NOTARY_ZIP="$NOTARY_DIR/ArcenPierApps.zip"
   # Both bundles in one submission, wherever the payload puts them.
   mkdir "$NOTARY_DIR/apps"
@@ -195,7 +216,9 @@ done
 trap 'rm -rf "$ROOT" "$SCRIPTS" "$COMPONENTS"' EXIT
 
 echo "==> building $PKG"
-PRODUCT="$(mktemp -d)"
+PRODUCT="$SCRATCH/product"
+rm -rf "$PRODUCT"
+mkdir -p "$PRODUCT"
 trap 'rm -rf "$ROOT" "$SCRIPTS" "$COMPONENTS" "$PRODUCT"' EXIT
 COMPONENT_PKG="pier.arcen.tech.pkg"
 pkgbuild \

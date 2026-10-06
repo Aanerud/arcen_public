@@ -29,7 +29,8 @@ The fixed v1 media shape is:
 `arcen-media/audio-opus` is non-default. The default shared graph contains no
 `opusic-c`, `opusic-sys`, or `cmake`. The enabled adapter uses safe
 `opusic-c` APIs with caller-owned reusable input, output, and conversion
-buffers. Arcen's shared media code remains `#![forbid(unsafe_code)]`.
+buffers. Arcen's shared audio code remains safe Rust; the only shared-media
+unsafe exception is the reviewed OpenH264 raw `SetOption` bridge.
 
 ## Protocol-v3 compatibility and audio-v1 selection
 

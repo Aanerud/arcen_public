@@ -9,6 +9,42 @@ pub(crate) struct RateControlSizing {
     pub(crate) vbv_buffer_size_bits: u32,
 }
 
+/// Pipeline contract facts NVENC consumes at initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LatencyTuning {
+    pub(crate) preset: &'static str,
+    pub(crate) tuning: &'static str,
+    pub(crate) frame_interval_p: u32,
+    pub(crate) lookahead_depth: u32,
+    pub(crate) zero_reorder_delay: bool,
+    pub(crate) vbv_buffer_frames: u32,
+}
+
+pub(crate) const fn latency_tuning(
+    priority: MotionPriority,
+    intent: EncodeIntent,
+) -> LatencyTuning {
+    LatencyTuning {
+        preset: match intent {
+            EncodeIntent::Interactive => "p4",
+            EncodeIntent::Quality => "p6",
+        },
+        tuning: match intent {
+            EncodeIntent::Interactive => "ultra-low-latency",
+            EncodeIntent::Quality => "high-quality",
+        },
+        frame_interval_p: EncodeIntent::REQUIRED_FRAME_INTERVAL_P,
+        lookahead_depth: 0,
+        zero_reorder_delay: true,
+        vbv_buffer_frames: match (priority, intent) {
+            (MotionPriority::Motion, EncodeIntent::Interactive) => 1,
+            (MotionPriority::Motion, EncodeIntent::Quality) => 1,
+            (MotionPriority::Detail, EncodeIntent::Interactive) => 2,
+            (MotionPriority::Detail, EncodeIntent::Quality) => 8,
+        },
+    }
+}
+
 /// The bounded number of input/output slots NVENC may retain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputDrainPolicy {
@@ -114,9 +150,34 @@ pub(crate) const fn vbv_buffer_frames(priority: MotionPriority, intent: EncodeIn
     arcen_media::video::encoder_buffer_frames(priority, intent)
 }
 
+pub(crate) fn vbv_bits_for_target(
+    target_bps: u32,
+    fps: u32,
+    priority: MotionPriority,
+    intent: EncodeIntent,
+) -> u32 {
+    vbv_bits_for_frames(target_bps, fps, vbv_buffer_frames(priority, intent))
+}
+
+pub(crate) fn vbv_bits_for_frames(target_bps: u32, fps: u32, buffer_frames: f64) -> u32 {
+    let vbv_buffer_bits = f64::from(target_bps.max(1)) / f64::from(fps.max(1)) * buffer_frames;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        vbv_buffer_bits.round().clamp(1.0, f64::from(u32::MAX)) as u32
+    }
+}
+
+pub(crate) const fn max_bitrate_for_target(target_bps: u32, ceiling_bps: Option<u32>) -> u32 {
+    match ceiling_bps {
+        Some(ceiling) if ceiling > target_bps => ceiling,
+        Some(_) | None => target_bps,
+    }
+}
+
 /// NVENC rate control for a session: the shared link-capped average
 /// (`arcen_media::video::link_capped_average_bitrate_bps`), the same bill
 /// every Pier encodes to, with a VBV buffer of a few frames of it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rate_control_sizing(
     width: u32,
     height: u32,
@@ -125,17 +186,17 @@ pub(crate) fn rate_control_sizing(
     depth: BitDepth,
     priority: MotionPriority,
     intent: EncodeIntent,
+    max_bitrate_bps: Option<u32>,
 ) -> RateControlSizing {
     let average_bitrate_bps =
         arcen_media::video::link_capped_average_bitrate_bps(width, height, fps, chroma, depth);
-    let vbv_buffer_bits = f64::from(average_bitrate_bps) / f64::from(fps.max(1))
-        * vbv_buffer_frames(priority, intent);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let vbv_buffer_size_bits = vbv_buffer_bits.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    let max_bitrate_bps = max_bitrate_bps
+        .unwrap_or(average_bitrate_bps)
+        .max(average_bitrate_bps);
     RateControlSizing {
         average_bitrate_bps,
-        max_bitrate_bps: average_bitrate_bps,
-        vbv_buffer_size_bits,
+        max_bitrate_bps,
+        vbv_buffer_size_bits: vbv_bits_for_target(average_bitrate_bps, fps, priority, intent),
     }
 }
 
@@ -148,6 +209,18 @@ mod tests {
         let policy = output_drain_policy(EncodeIntent::Interactive, 4, 32, 3);
         assert_eq!(policy.max_inflight(), 2);
         assert_eq!(policy.slot_count(), 2);
+    }
+
+    #[test]
+    fn speed_latency_tuning_is_one_frame_zero_reorder_ultra_low_latency() {
+        let contract = arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Speed);
+        let tuning = latency_tuning(contract.priority, contract.intent);
+        assert_eq!(tuning.preset, "p4");
+        assert_eq!(tuning.tuning, "ultra-low-latency");
+        assert_eq!(tuning.frame_interval_p, 1);
+        assert_eq!(tuning.lookahead_depth, 0);
+        assert!(tuning.zero_reorder_delay);
+        assert_eq!(tuning.vbv_buffer_frames, 1);
     }
 
     #[test]
@@ -201,5 +274,55 @@ mod tests {
         let policy = output_drain_policy(EncodeIntent::Quality, i32::MIN, u16::MAX, -1);
         assert_eq!(policy.max_inflight(), 33);
         assert_eq!(policy.slot_count(), 33);
+    }
+
+    #[test]
+    fn grading_max_bitrate_keeps_vbv_from_silently_clamping_the_ceiling() {
+        let sizing = rate_control_sizing(
+            1800,
+            1168,
+            30,
+            ChromaSubsampling::Yuv444,
+            BitDepth::Ten,
+            MotionPriority::Detail,
+            EncodeIntent::Quality,
+            Some(250_000_000),
+        );
+        assert_eq!(sizing.average_bitrate_bps, 4_665_600);
+        assert_eq!(sizing.max_bitrate_bps, 250_000_000);
+        assert_eq!(
+            sizing.vbv_buffer_size_bits,
+            ((4_665_600_f64 / 30.0) * 8.0).round() as u32,
+            "startup VBV is sized from the active start target, not the contract ceiling"
+        );
+    }
+
+    #[test]
+    fn vbv_grows_with_active_reconfigured_target_not_contract_ceiling() {
+        let start =
+            vbv_bits_for_target(4_665_600, 30, MotionPriority::Detail, EncodeIntent::Quality);
+        let raised = vbv_bits_for_target(
+            10_000_000,
+            30,
+            MotionPriority::Detail,
+            EncodeIntent::Quality,
+        );
+        assert_eq!(start, ((4_665_600_f64 / 30.0) * 8.0).round() as u32);
+        assert_eq!(raised, ((10_000_000_f64 / 30.0) * 8.0).round() as u32);
+        assert!(raised > start);
+    }
+
+    #[test]
+    fn max_bitrate_tracks_target_unless_contract_supplies_a_ceiling() {
+        assert_eq!(max_bitrate_for_target(2_000_000, None), 2_000_000);
+        assert_eq!(
+            max_bitrate_for_target(2_000_000, Some(250_000_000)),
+            250_000_000
+        );
+        assert_eq!(
+            max_bitrate_for_target(300_000_000, Some(250_000_000)),
+            300_000_000,
+            "do not configure maxBitRate below the active average"
+        );
     }
 }

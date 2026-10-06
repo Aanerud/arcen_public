@@ -83,6 +83,8 @@ pub struct AdvertisedCapabilities {
     pub audio_policy: arcen_media::audio::ConfiguredAudioPolicy,
     /// The configured host clipboard policy advertised to the Deck.
     pub clipboard_policy: arcen_media::clipboard::ClipboardPolicy,
+    /// The configured Deck-to-host microphone policy advertised to the Deck.
+    pub microphone_policy: arcen_media::audio::MicrophonePolicy,
     /// The pre-auth multi-monitor offer sent on this connection, if any.
     pub multi_monitor_v1: Option<arcen_protocol::messages::AuthMultiMonitorOfferMsg>,
 }
@@ -121,6 +123,8 @@ pub struct SessionPolicy {
     pub multi_monitor: crate::MacOsMultiMonitorConfig,
     pub audio_enabled: bool,
     pub audio_compressed: bool,
+    pub microphone_enabled: bool,
+    pub microphone_backend_available: bool,
     pub clipboard: arcen_media::clipboard::ClipboardPolicy,
     pub encoder: EncoderCapabilityEvidence,
     /// The only account this process may serve, when it is a desktop agent.
@@ -145,6 +149,8 @@ impl SessionPolicy {
             multi_monitor: config.platform.multi_monitor.clone(),
             audio_enabled: config.audio.enabled,
             audio_compressed: config.audio.compressed,
+            microphone_enabled: config.microphone_input.enabled,
+            microphone_backend_available: crate::microphone_input::backend_available(),
             clipboard: crate::clipboard_policy_from_config(config)?,
             encoder: encoder_capabilities(),
             serving_uid: None,
@@ -159,6 +165,8 @@ impl Default for SessionPolicy {
             multi_monitor: crate::MacOsMultiMonitorConfig::default(),
             audio_enabled: true,
             audio_compressed: false,
+            microphone_enabled: false,
+            microphone_backend_available: false,
             clipboard: arcen_media::clipboard::ClipboardPolicy::default(),
             encoder: encoder_capabilities(),
             serving_uid: None,
@@ -199,6 +207,8 @@ pub struct Handshake {
     pub fps: u32,
     /// Shared detail/motion preference for later encoder/rate-control choices.
     pub motion_priority: arcen_media::video::MotionPriority,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     /// The codec this session will encode with.
     ///
     /// Negotiated, not assumed. The encoder was pinned to HEVC while the
@@ -274,6 +284,8 @@ pub struct Handshake {
     pub cursor_mode: arcen_protocol::messages::CursorMode,
     /// Authoritative cursor/tablet negotiation results, sent before input begins.
     pub input_mode_results: crate::stream::InputModeResults,
+    /// The Deck time-zone identifier supplied with the authenticated request.
+    pub authenticated_timezone: Option<String>,
 }
 
 /// The desktop size the Deck asked to be sent.
@@ -605,6 +617,14 @@ pub fn advertise_with_config(
     // configuration: 128 kbit/s instead of 1.5 Mbit/s of PCM, measured as 30%
     // of a 5 Mbit/s WAN path that video then could not have.
     let audio_policy = arcen_media::audio::AudioPolicy::configured(audio, policy.audio_compressed);
+    let microphone_policy = arcen_media::audio::MicrophonePolicy {
+        operator_enabled: policy.microphone_enabled,
+        backend_available: policy.microphone_backend_available,
+        codecs: arcen_media::audio::MicrophoneCodecAvailability {
+            opus: true,
+            pcm: true,
+        },
+    };
     Ok(AdvertisedCapabilities {
         display_id: primary.display_id,
         login_window: policy.login_window,
@@ -626,6 +646,7 @@ pub fn advertise_with_config(
         audio,
         audio_policy,
         clipboard_policy: policy.clipboard,
+        microphone_policy,
         multi_monitor_v1: offer,
     })
 }
@@ -817,6 +838,7 @@ pub fn server_hello_json_for(
         plan,
         codec,
         None,
+        None,
         (capabilities.width, capabilities.height),
     )
 }
@@ -829,6 +851,7 @@ pub fn server_hello_json_for_multi(
     os_user: &str,
     plan: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
+    active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     multi_monitor: Option<&crate::multi_monitor::MacOsMultiMonitorPlan>,
     picture: (u32, u32),
 ) -> String {
@@ -869,7 +892,7 @@ pub fn server_hello_json_for_multi(
         audio_output: capabilities
             .audio
             .then(|| capabilities.audio_policy.capabilities()),
-        microphone_input: None,
+        microphone_input: capabilities.microphone_policy.capabilities(),
         supports_pen: true,
         experimental_raw_hid: false,
         usb_hard_v1: false,
@@ -932,6 +955,7 @@ pub fn server_hello_json_for_multi(
             }
             .to_owned(),
         },
+        active_pipeline,
         input_protocol_version: arcen_protocol::messages::INPUT_PROTOCOL_VERSION,
         input_capabilities: InputCapabilitiesMsg {
             absolute_pointer: available,
@@ -1241,6 +1265,7 @@ async fn perform_application_handshake(
         requested_desktop,
         client_display,
         cursor_mode,
+        authenticated_timezone,
         admission,
     ) = authenticate(
         socket,
@@ -1341,6 +1366,8 @@ async fn perform_application_handshake(
     let codec = resolved_video.codec;
     let fps = resolved_video.fps;
     let motion_priority = resolved_video.motion_priority;
+    let requested_pipeline = resolved_video.requested_pipeline;
+    let active_pipeline = resolved_video.active_pipeline;
     let multi_monitor = crate::multi_monitor::admit_virtual_request(
         advertised.multi_monitor_v1.as_ref(),
         requested_multi_monitor.as_ref(),
@@ -1363,6 +1390,7 @@ async fn perform_application_handshake(
             &user,
             plan,
             codec,
+            active_pipeline.clone(),
             multi_monitor.as_ref(),
             (capture_width, capture_height),
         ),
@@ -1401,6 +1429,17 @@ async fn perform_application_handshake(
     // tap is ever created.
     let client_hello =
         serde_json::from_str::<arcen_protocol::messages::ClientHelloMsg>(&reply).ok();
+    let echoed_timezone = client_hello
+        .as_ref()
+        .and_then(|hello| hello.timezone.as_deref());
+    if authenticated_timezone.as_deref() != echoed_timezone {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            authenticated_timezone = ?authenticated_timezone,
+            client_hello_timezone = ?echoed_timezone,
+            "ClientHello timezone differs from authenticated decision; retaining AuthResponse value"
+        );
+    }
     let input_mode_results = client_hello.as_ref().map_or_else(
         || {
             input_mode_results(
@@ -1428,17 +1467,30 @@ async fn perform_application_handshake(
     let clipboard = client_hello
         .as_ref()
         .and_then(|hello| clipboard_negotiation(hello, advertised.clipboard_policy));
-    // Refused rather than ignored. This host has no microphone importer, so
-    // the honest answer is that the backend is unavailable; saying it quickly
-    // is what lets a Deck stop waiting and tell the person why.
-    let microphone = arcen_media::audio::ResolvedMicrophoneStream::disabled(
-        MICROPHONE_GENERATION,
-        arcen_protocol::messages::MicrophoneStreamReason::BackendUnavailable,
-    );
+    let microphone = if requested_multi_monitor.is_some() {
+        arcen_media::audio::ResolvedMicrophoneStream::disabled(
+            MICROPHONE_GENERATION,
+            arcen_protocol::messages::MicrophoneStreamReason::BackendUnavailable,
+        )
+    } else {
+        advertised.microphone_policy.resolve(
+            client_hello
+                .as_ref()
+                .and_then(|hello| hello.microphone_output.as_ref()),
+            client_hello
+                .as_ref()
+                .and_then(|hello| hello.microphone_output.as_ref())
+                .is_some(),
+            MICROPHONE_GENERATION,
+            64,
+        )
+    };
 
     Ok(Handshake {
         fps,
         motion_priority,
+        requested_pipeline,
+        active_pipeline,
         user,
         display_id,
         advertised,
@@ -1459,6 +1511,7 @@ async fn perform_application_handshake(
         input_mode_results,
         admission,
         login_window: policy.login_window,
+        authenticated_timezone,
     })
 }
 
@@ -1638,12 +1691,39 @@ const fn advertised_pix_fmt(
         (PlanChroma::Yuv444, PlanBitDepth::Ten) => "yuv444p10le",
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedInitialVideo {
     plan: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
     fps: u32,
     motion_priority: arcen_media::video::MotionPriority,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
+}
+
+fn video_configuration_from_plan(
+    plan: arcen_media::session_plan::ResolvedVideoPlan,
+) -> arcen_media::VideoConfiguration {
+    use arcen_media::session_plan::{PlanBitDepth, PlanChroma};
+    arcen_media::VideoConfiguration {
+        codec: plan.codec,
+        chroma: match plan.chroma {
+            PlanChroma::Yuv420 => arcen_media::ChromaSubsampling::Yuv420,
+            PlanChroma::Yuv444 => arcen_media::ChromaSubsampling::Yuv444,
+        },
+        bit_depth: match plan.bit_depth {
+            PlanBitDepth::Eight => arcen_media::BitDepth::Eight,
+            PlanBitDepth::Ten => arcen_media::BitDepth::Ten,
+        },
+        range: arcen_media::ColorRange::from_token(plan.range)
+            .unwrap_or(arcen_media::ColorRange::Limited),
+        matrix: arcen_media::ColorMatrix::from_token(plan.matrix)
+            .unwrap_or(arcen_media::ColorMatrix::Bt709),
+        primaries: arcen_media::ColorPrimaries::from_token(plan.primaries)
+            .unwrap_or(arcen_media::ColorPrimaries::Bt709),
+        transfer: arcen_media::TransferCharacteristics::from_token(plan.transfer)
+            .unwrap_or(arcen_media::TransferCharacteristics::Bt709),
+    }
 }
 
 /// Whether an HDR request may be served as HDR: only when the display the
@@ -1711,6 +1791,8 @@ fn resolve_initial_video(
             },
             fps: 60,
             motion_priority: arcen_media::video::MotionPriority::Detail,
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Speed),
         });
     };
 
@@ -1794,6 +1876,26 @@ fn resolve_initial_video(
             hdr_output,
         },
     );
+    let served_pipeline = arcen_media::video::served_pipeline(
+        host_resolved.pipeline,
+        video_configuration_from_plan(plan),
+        host_resolved.max_fps,
+        client.motion_priority,
+        arcen_media::video::ServedPipelineContext {
+            backend: capabilities.encoder_hardware.map(|hardware| {
+                if hardware {
+                    arcen_media::video::AcceleratorClass::Hardware
+                } else {
+                    arcen_media::video::AcceleratorClass::Software
+                }
+            }),
+            exact_or_admin_override: host_resolved.pipeline.is_none(),
+        },
+    );
+    let motion_priority = arcen_media::video::PipelineId::from_served_wire(&served_pipeline)
+        .map_or(client.motion_priority, |pipeline| {
+            arcen_media::video::pipeline_contract(pipeline).priority
+        });
     Ok(ResolvedInitialVideo {
         plan,
         codec: match host_resolved.video.codec {
@@ -1807,7 +1909,9 @@ fn resolve_initial_video(
             }
         },
         fps: host_resolved.max_fps,
-        motion_priority: client.motion_priority,
+        motion_priority,
+        requested_pipeline: host_resolved.pipeline,
+        active_pipeline: Some(served_pipeline),
     })
 }
 
@@ -1850,6 +1954,7 @@ async fn authenticate(
         RequestedDesktop,
         Option<arcen_protocol::messages::ClientMonitor>,
         arcen_protocol::messages::CursorMode,
+        Option<String>,
         Option<AdmissionGuard>,
     ),
     HandshakeError,
@@ -1968,6 +2073,7 @@ async fn authenticate(
                 .find(|monitor| monitor.is_primary)
                 .cloned(),
             response.cursor_preference,
+            response.timezone,
             admission,
         )),
         Err(failure) => Err(HandshakeError::Rejected(failure)),
@@ -2049,6 +2155,14 @@ mod tests {
             encoder_hardware: Some(true),
             audio: false,
             audio_policy: arcen_media::audio::AudioPolicy::configured(false, false),
+            microphone_policy: arcen_media::audio::MicrophonePolicy {
+                operator_enabled: false,
+                backend_available: false,
+                codecs: arcen_media::audio::MicrophoneCodecAvailability {
+                    opus: true,
+                    pcm: true,
+                },
+            },
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             multi_monitor_v1: None,
         }
@@ -2068,6 +2182,7 @@ mod tests {
                     ..Default::default()
                 },
                 capabilities: ClientVideoCapabilitiesMsg::default(),
+                pipeline: None,
             }
         }
 
@@ -2084,6 +2199,44 @@ mod tests {
     }
 
     #[test]
+    fn speed_pipeline_resolves_to_sixty_fps_motion_contract() {
+        use arcen_protocol::messages::{
+            ClientVideoCapabilitiesMsg, InitialVideoRequestMsg, QualitySettings, StreamPipeline,
+        };
+
+        let request = InitialVideoRequestMsg {
+            quality: QualitySettings {
+                msg_type: "quality_settings".to_owned(),
+                codec: "h264".to_owned(),
+                chroma: "yuv420".to_owned(),
+                bit_depth: "8".to_owned(),
+                color_range: "limited".to_owned(),
+                color_matrix: "bt709".to_owned(),
+                max_fps: 60,
+                motion_priority: "detail".to_owned(),
+                ..Default::default()
+            },
+            capabilities: ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                ..Default::default()
+            },
+            pipeline: Some(StreamPipeline::Speed),
+        };
+        let resolved =
+            resolve_initial_video(Some(&request), &capabilities(), false).expect("Speed resolves");
+        assert_eq!(resolved.fps, 60);
+        assert_eq!(
+            resolved.motion_priority,
+            arcen_media::video::MotionPriority::Motion
+        );
+        assert_eq!(
+            resolved.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Speed)
+        );
+    }
+
+    #[test]
     fn the_server_hello_states_the_size_the_deck_will_receive() {
         // Not the host's own screen. A Deck told 3600x2338 and then sent
         // 1920x1080 has no way to reconcile the two.
@@ -2092,6 +2245,7 @@ mod tests {
             "alice",
             arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             crate::encode::EncoderCodec::H264,
+            None,
             None,
             (1280, 720),
         );
@@ -2293,6 +2447,7 @@ mod tests {
                 main10: true,
                 ..Default::default()
             },
+            pipeline: None,
         };
         let error = resolve_initial_video(Some(&request), &capabilities(), false).unwrap_err();
         assert!(
@@ -2329,6 +2484,7 @@ mod tests {
                     h265,
                     ..Default::default()
                 },
+                pipeline: None,
             }
         }
 
@@ -2405,6 +2561,7 @@ mod tests {
                 yuv444: true,
                 ..Default::default()
             },
+            pipeline: None,
         };
         let resolved = resolve_initial_video(
             Some(&request),
@@ -2421,6 +2578,69 @@ mod tests {
             Some(arcen_media::session_plan::Degradation::HostLacksExactContract),
         );
         assert!(!resolved.plan.is_exact());
+    }
+
+    #[test]
+    fn hdr_without_headroom_reports_grading_as_the_served_pipeline() {
+        use arcen_protocol::messages::{
+            ClientVideoCapabilitiesMsg, InitialVideoRequestMsg, QualitySettings, StreamPipeline,
+            VideoSelectionIntent,
+        };
+
+        let request = InitialVideoRequestMsg {
+            quality: QualitySettings {
+                msg_type: "quality_settings".to_owned(),
+                codec: "h265".to_owned(),
+                chroma: "yuv444".to_owned(),
+                bit_depth: "10".to_owned(),
+                max_fps: 30,
+                color_range: "full".to_owned(),
+                color_matrix: "bt2020ncl".to_owned(),
+                color_primaries: "bt2020".to_owned(),
+                transfer: "pq".to_owned(),
+                video_selection: VideoSelectionIntent::ColorFidelity,
+                ..Default::default()
+            },
+            capabilities: ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                yuv444: true,
+                main10: true,
+                full_range: true,
+                bt2020_ncl_matrix: true,
+                ..Default::default()
+            },
+            pipeline: Some(StreamPipeline::Hdr),
+        };
+        let caps = AdvertisedCapabilities {
+            main10: true,
+            chroma_444: true,
+            ..capabilities()
+        };
+        let resolved = resolve_initial_video(Some(&request), &caps, false).expect("degrades");
+        assert_eq!(
+            resolved.plan.tier,
+            arcen_media::session_plan::VideoTier::Grading
+        );
+        assert_eq!(
+            resolved.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
+        let hello: arcen_protocol::messages::ServerHelloMsg =
+            serde_json::from_str(&server_hello_json_for_multi(
+                &caps,
+                "alice",
+                resolved.plan,
+                resolved.codec,
+                resolved.active_pipeline,
+                None,
+                (1920, 1080),
+            ))
+            .expect("hello");
+        assert_eq!(
+            hello.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
     }
 
     #[test]
@@ -2445,6 +2665,7 @@ mod tests {
                 av1: true,
                 ..Default::default()
             },
+            pipeline: None,
         };
         let resolved =
             resolve_initial_video(Some(&request), &capabilities(), false).expect("valid 4:2:2");
@@ -2488,6 +2709,7 @@ mod tests {
                 full_range: true,
                 ..Default::default()
             },
+            pipeline: None,
         };
         let resolved =
             resolve_initial_video(Some(&request), &capabilities(), false).expect("valid");
@@ -2511,6 +2733,7 @@ mod tests {
                 h265: true,
                 ..Default::default()
             },
+            pipeline: None,
         };
         let resolved =
             resolve_initial_video(Some(&request), &capabilities(), false).expect("valid");

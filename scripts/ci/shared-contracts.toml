@@ -161,9 +161,9 @@ reason = "The capenc stdin protocol, including live BITRATE updates, is parsed a
 [[consumer]]
 id = "adaptive-rate-priority"
 gate = 7
-symbol = "for_bounds_and_priority"
+symbol = "operational_rate_control_policy"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-reason = "Every Pier applies the shared Detail/Motion trade-off to adaptive bitrate control."
+reason = "Every Pier applies the served pipeline's complete shared rate-control policy to adaptive bitrate control."
 
 [[consumer]]
 id = "local-video-backlog-signal"

@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-audiocap"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-telemetry",
  "libpulse-binding",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-capenc"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-cp-ipc"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ring",
  "serde",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-credential-provider"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-cp-ipc",
  "windows 0.58.0",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-macos"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -243,6 +243,7 @@ dependencies = [
  "objc2-avf-audio",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
@@ -273,11 +274,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-iddcx-provider"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "arcen-identity"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -288,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-input"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-media",
  "arcen-protocol",
@@ -298,11 +299,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-input-helper"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "arcen-keel"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -311,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-media"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-keel",
  "arcen-protocol",
@@ -327,8 +328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcen-microphone-driver"
+version = "0.15.0"
+dependencies = [
+ "libc",
+ "mach2",
+]
+
+[[package]]
 name = "arcen-observability"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-telemetry",
  "serde_json",
@@ -338,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-outputs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-media",
  "arcen-telemetry",
@@ -346,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-audiocap",
  "arcen-capenc",
@@ -389,15 +398,17 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux-installer"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-session",
+ "arcen-transport",
+ "rustix 1.1.4",
  "serde_json",
 ]
 
 [[package]]
 name = "arcen-pier-macos"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -413,6 +424,8 @@ dependencies = [
  "dispatch2",
  "futures-util",
  "getrandom 0.2.17",
+ "libc",
+ "mach2",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-audio",
@@ -439,12 +452,13 @@ dependencies = [
  "tracing-subscriber",
  "videotoolbox",
  "x509-parser",
+ "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "arcen-pier-windows"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-capenc",
  "arcen-cp-ipc",
@@ -481,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows-installer"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-session",
  "arcen-transport",
@@ -492,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-protocol"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-usb-bridge",
  "getrandom 0.2.17",
@@ -504,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-region-patch-benchmark"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -513,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-session"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-telemetry",
  "serde",
@@ -524,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-telemetry"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -533,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-transport"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-identity",
  "arcen-protocol",
@@ -551,14 +565,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-bridge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "arcen-usb-helper"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arcen-protocol",
  "arcen-usb-bridge",
@@ -3209,6 +3223,7 @@ dependencies = [
  "bitflags 2.13.1",
  "block2 0.6.2",
  "objc2 0.6.4",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
 

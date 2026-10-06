@@ -8,6 +8,9 @@ required.
 Audio payloads, device-private data, SIDs, credentials, profiles, certificates,
 and customer data must not enter logs or support bundles.
 
+
+On macOS Pier, the installer places `ArcenMicrophone.driver` in `/Library/Audio/Plug-Ins/HAL` and restarts coreaudiod. With `microphone_input.enabled=true`, a Deck that opts in to microphone capture negotiates microphone-v1 and apps can select `Arcen Microphone` as their recording input. The device is intentionally always visible and emits silence while no authenticated session is bound. If the HAL bundle is absent or the LaunchDaemon Mach service is unavailable, the host refuses the stream with `BackendUnavailable` rather than letting the Deck wait. Uninstall removes the driver and restarts coreaudiod again.
+
 On Linux, configure the absolute `pactl` path and enable microphone input for the
 dedicated session-user backend with `microphone_input.enabled=true`.
 A startup refusal is an operational failure, not

@@ -43,6 +43,17 @@ mkdir -p "$ARCEN_RUN"
 chown "$ARCEN_ACCOUNT":wheel "$ARCEN_RUN"
 chmod 755 "$ARCEN_RUN"
 
+# Crash recovery journals for machine-wide redirection are root-owned.
+mkdir -p "$ARCEN_RECOVERY"
+chown root:wheel "$ARCEN_RECOVERY"
+chmod 700 "$ARCEN_RECOVERY"
+find "$ARCEN_RECOVERY" -mindepth 1 -type f -exec chown root:wheel {} +
+find "$ARCEN_RECOVERY" -mindepth 1 -type f -exec chmod 600 {} +
+arcen_stop_legacy_timezone_helper
+arcen_restore_legacy_timezone_journal || exit 1
+rm -f "$ARCEN_LEGACY_TZ_HELPER_PLIST"
+rm -rf "$ARCEN_TZ_SOCKET_DIR"
+
 # --- Host identity: readable by the service alone --------------------------
 mkdir -p "$ARCEN_TLS"
 if [ -d "$ARCEN_TLS" ]; then
@@ -105,6 +116,14 @@ if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null 
   /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$ARCEN_PIER_BIN" >/dev/null 2>&1 || true
   arcen_log "allowed incoming connections to the Pier service through the firewall"
 fi
+
+# --- Core Audio --------------------------------------------------------------
+chown -R root:wheel "$ARCEN_MICROPHONE_DRIVER" 2>/dev/null || true
+chmod 755 "$ARCEN_MICROPHONE_DRIVER" "$ARCEN_MICROPHONE_DRIVER/Contents" "$ARCEN_MICROPHONE_DRIVER/Contents/MacOS" 2>/dev/null || true
+chmod 644 "$ARCEN_MICROPHONE_DRIVER/Contents/Info.plist" 2>/dev/null || true
+chmod 755 "$ARCEN_MICROPHONE_DRIVER/Contents/MacOS/ArcenMicrophone" 2>/dev/null || true
+arcen_restart_coreaudiod
+arcen_log "installed the Arcen Microphone Core Audio driver"
 
 # --- Start and prove it runs -----------------------------------------------
 # The Pier binary starts the network service and each signed-in user's

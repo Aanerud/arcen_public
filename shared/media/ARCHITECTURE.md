@@ -284,6 +284,55 @@ Wayland provider may retain PQ. Windows
 retains PQ only after exact-target HDR proof. Those platform decisions consume
 the shared contract rather than redefining it.
 
+### Pipeline contracts
+
+`shared/media/src/video/pipeline/` is the shared foundation for the four
+product stream pipelines plus the software fallback. `mod.rs` owns the typed
+contract surface (`PipelineId`, `PipelineContract`, `CodecPolicy`,
+`BitratePolicy`, `KeelPolicy`) and the legacy inference helper for Decks that
+do not send a wire pipeline. Each named file owns one contract:
+
+- `auto.rs`: adaptive 8-bit 4:2:0, 30 fps, detail-first.
+- `speed.rs`: adaptive 8-bit 4:2:0, 60 fps, motion-first, one-frame buffer,
+  a safe link-capped start with a true 60 fps shape ceiling, and
+  Speed-specific low-latency decode policy for clients that consume the
+  served pipeline.
+- `grading.rs`: HEVC 4:4:4 10-bit full-range BT.709 SDR, quality intent.
+- `hdr.rs`: HEVC 4:4:4 10-bit full-range PQ/BT.2020, quality intent,
+  conservative start, 500 Mbit/s ceiling, evidence-gated target-relative probe,
+  and HDR-scoped queue budgets.
+- `software.rs`: CPU fallback H.264 4:2:0 up to 30 fps. It starts from a CPU-conscious shared bitrate policy (about 4 Mbit/s at 1080p30, scaled by picture shape) and lets the shared live rate controller climb toward an 8 Mbit/s-class ceiling only when the path proves clear. Speed is served visibly as Software/Auto at 30 fps; Grading and HDR are refused on software-only hosts. macOS Pier does not need this fallback because VideoToolbox is always present.
+
+To change one pipeline, edit only its file and update the pinned tests in
+`pipeline/mod.rs`; platform code should keep reading `pipeline_contract`.
+Grading is the first fidelity contract with a fixed shared ceiling: it starts
+at the previous link-capped value and may climb to 250 Mbit/s. Platform
+encoders consume the paired `encoder_bitrate_bounds` so their native
+`maxBitRate`/`DataRateLimits` ceilings do not clamp below the shared policy,
+while VBV and average bitrate stay tied to the active target. The host adapters
+carry the optional served-pipeline ceiling as data, not by matching colour
+axes, so Custom streams cannot inherit a product ceiling by accident and later
+pipelines can reuse the same mechanism. HDR reuses that same
+`LinkCappedWithCeiling`/served-pipeline ceiling path at 500 Mbit/s rather than
+adding an HDR-specific encoder-ceiling branch; its difference is the
+evidence-gated probe step, which requires peak per-pipeline delivered evidence
+before climbing.
+To add a codec, add one `VideoCodec` variant with token/capability entries,
+then add it to the relevant pipeline ladder. Auto/Speed codec ordering remains
+data-driven (`AV1 -> HEVC -> H.264`) and `adaptive_codec_ladder` delegates to
+that contract so callers do not hard-code the order.
+
+The Deck's old per-preset colour table is now represented by the shared
+pipeline contracts. Deck-local developer-only Custom/Exact axes remain outside
+the four pipelines and do not send a `pipeline` token.
+
+`server_hello.active_pipeline` is authoritative on hosts that know their final
+encoder backend before hello. macOS creates the real VideoToolbox encoder only
+after capture starts, so its hello value is provisional; it sends the additive
+`served_pipeline` control message as soon as the session encoder's hardware /
+software / unknown class is read back, and again after any encoder recreation.
+Decks use the latest served-pipeline truth for the persistent degradation badge.
+
 ## Video plan and portable software H.264
 
 `video::{frame,convert,plan}` provides checked NV12/I420 views, allocation-free

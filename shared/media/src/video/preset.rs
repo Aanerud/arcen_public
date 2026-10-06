@@ -1,5 +1,7 @@
 use crate::EncodeIntent;
 
+use super::pipeline::{PipelineContract, PipelineId, pipeline_contract};
+
 /// User-facing streaming presets are complete trade-off contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamingPreset {
@@ -7,6 +9,23 @@ pub enum StreamingPreset {
     Speed,
     Grading,
     Hdr,
+}
+
+impl StreamingPreset {
+    #[must_use]
+    pub const fn pipeline(self) -> PipelineId {
+        match self {
+            Self::Auto => PipelineId::Auto,
+            Self::Speed => PipelineId::Speed,
+            Self::Grading => PipelineId::Grading,
+            Self::Hdr => PipelineId::Hdr,
+        }
+    }
+
+    #[must_use]
+    pub const fn pipeline_contract(self) -> PipelineContract {
+        pipeline_contract(self.pipeline())
+    }
 }
 
 /// What the session preserves first when the link cannot carry every frame
@@ -77,55 +96,15 @@ pub const fn encoder_buffer_frames(priority: MotionPriority, intent: EncodeInten
 /// Returns the shared contract for a user-facing streaming preset.
 #[must_use]
 pub const fn contract(preset: StreamingPreset) -> PresetContract {
-    match preset {
-        StreamingPreset::Auto => PresetContract {
-            max_fps: 30,
-            priority: MotionPriority::Detail,
-            intent: EncodeIntent::Interactive,
-            encoder_buffer_frames: encoder_buffer_frames(
-                MotionPriority::Detail,
-                EncodeIntent::Interactive,
-            ),
-            favours: "a sharp picture, up to 30 fps",
-            gives_up: "frame rate when the link is tight",
-            summary: "Favours a sharp picture, up to 30 fps; gives up frame rate when the link is tight.",
-        },
-        StreamingPreset::Speed => PresetContract {
-            max_fps: 60,
-            priority: MotionPriority::Motion,
-            intent: EncodeIntent::Interactive,
-            encoder_buffer_frames: encoder_buffer_frames(
-                MotionPriority::Motion,
-                EncodeIntent::Interactive,
-            ),
-            favours: "smooth motion, up to 60 fps",
-            gives_up: "sharpness when the link is tight, and uses the lowest-latency encoder settings (1-frame buffer)",
-            summary: "Favours smooth motion, up to 60 fps; gives up sharpness when the link is tight and uses the lowest-latency encoder settings (1-frame buffer).",
-        },
-        StreamingPreset::Grading => PresetContract {
-            max_fps: 30,
-            priority: MotionPriority::Detail,
-            intent: EncodeIntent::Quality,
-            encoder_buffer_frames: encoder_buffer_frames(
-                MotionPriority::Detail,
-                EncodeIntent::Quality,
-            ),
-            favours: "10-bit 4:4:4 BT.709 SDR detail, up to 30 fps",
-            gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer",
-            summary: "Favours 10-bit 4:4:4 BT.709 SDR detail, up to 30 fps; gives up interaction latency by using the quality encoder path with an 8-frame buffer.",
-        },
-        StreamingPreset::Hdr => PresetContract {
-            max_fps: 30,
-            priority: MotionPriority::Detail,
-            intent: EncodeIntent::Quality,
-            encoder_buffer_frames: encoder_buffer_frames(
-                MotionPriority::Detail,
-                EncodeIntent::Quality,
-            ),
-            favours: "proven HDR10 PQ/BT.2020 fidelity, up to 30 fps",
-            gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer; falls back visibly when the host cannot prove HDR",
-            summary: "Favours proven HDR10 PQ/BT.2020 fidelity, up to 30 fps; gives up interaction latency by using the quality encoder path with an 8-frame buffer and falls back visibly when the host cannot prove HDR.",
-        },
+    let pipeline = preset.pipeline_contract();
+    PresetContract {
+        max_fps: pipeline.max_fps,
+        priority: pipeline.priority,
+        intent: pipeline.intent,
+        encoder_buffer_frames: pipeline.encoder_buffer_frames,
+        favours: pipeline.favours,
+        gives_up: pipeline.gives_up,
+        summary: pipeline.summary,
     }
 }
 

@@ -153,6 +153,16 @@ fn network_scope_name(scope: NetworkScope) -> &'static str {
 }
 
 #[cfg(windows)]
+pub(crate) fn local_interface_addresses() -> Vec<String> {
+    platform_adapter_addresses()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn local_interface_addresses() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(windows)]
 fn platform_adapters() -> Option<Vec<AdapterFacts>> {
     use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -213,6 +223,104 @@ fn platform_adapters() -> Option<Vec<AdapterFacts>> {
         current = adapter.Next;
     }
     Some(adapters)
+}
+
+#[cfg(windows)]
+fn platform_adapter_addresses() -> Vec<String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    fn sockaddr_to_ip(address: *const SOCKADDR) -> Option<IpAddr> {
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: the caller passes a pointer from GetAdaptersAddresses; the
+        // family tag determines which sockaddr layout is valid to read.
+        let family = unsafe { (*address).sa_family };
+        if family == AF_INET {
+            // SAFETY: AF_INET identifies SOCKADDR_IN.
+            let socket = unsafe { &*(address.cast::<SOCKADDR_IN>()) };
+            // SAFETY: reading the active S_addr union field is valid for IPv4 addresses.
+            let octets = unsafe { socket.sin_addr.S_un.S_addr.to_ne_bytes() };
+            Some(IpAddr::V4(Ipv4Addr::from(octets)))
+        } else if family == AF_INET6 {
+            // SAFETY: AF_INET6 identifies SOCKADDR_IN6.
+            let socket = unsafe { &*(address.cast::<SOCKADDR_IN6>()) };
+            // SAFETY: reading the active Byte union field is valid for IPv6 addresses.
+            let octets = unsafe { socket.sin6_addr.u.Byte };
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        } else {
+            None
+        }
+    }
+
+    let mut length = 0u32;
+    // SAFETY: sizing call provides a valid length out-parameter and no output buffer.
+    let sizing = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC.0 as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            None,
+            None,
+            &mut length,
+        )
+    };
+    if sizing != ERROR_BUFFER_OVERFLOW.0 || length == 0 {
+        return Vec::new();
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return Vec::new();
+    };
+    let records = length.div_ceil(std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>());
+    let mut storage: Vec<std::mem::MaybeUninit<IP_ADAPTER_ADDRESSES_LH>> =
+        Vec::with_capacity(records);
+    storage.resize_with(records, std::mem::MaybeUninit::uninit);
+    let head = storage.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    let mut api_length = match u32::try_from(length) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    // SAFETY: storage is writable for the byte count returned by the sizing call.
+    let status = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC.0 as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            None,
+            Some(head),
+            &mut api_length,
+        )
+    };
+    if status != NO_ERROR.0 {
+        return Vec::new();
+    }
+    let mut addresses = Vec::new();
+    let mut current = head;
+    while !current.is_null() {
+        // SAFETY: current is a node in the API-populated linked list.
+        let adapter = unsafe { &*current };
+        if adapter.OperStatus == IfOperStatusUp {
+            let mut unicast = adapter.FirstUnicastAddress;
+            while !unicast.is_null() {
+                // SAFETY: unicast is a node in this adapter's API-populated address list.
+                let item = unsafe { &*unicast };
+                if let Some(ip) = sockaddr_to_ip(item.Address.lpSockaddr) {
+                    addresses.push(ip.to_string());
+                }
+                unicast = item.Next;
+            }
+        }
+        current = adapter.Next;
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
 }
 
 #[cfg(not(windows))]

@@ -1,3 +1,6 @@
+use arcen_session::network_reachability::{
+    classify_reachability_error, should_preflight_local_network, ReachabilityFailure,
+};
 use arcen_telemetry::{
     CorrelationId, FieldValue, HealthCause, HealthState, HealthTracker, LifecycleEventKind,
     StructuredFields,
@@ -12,7 +15,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(feature = "experimental-raw-hid")]
 use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -40,7 +43,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::clipboard::{media_policy, ClipboardItem, ClipboardSession};
 use crate::observability::ClientTelemetry;
 use crate::pipeline::frame_queue::{
-    incoming_media_inbox, IncomingMediaReceiver, IncomingMediaSender, VIDEO_BYTE_LIMIT,
+    incoming_media_inbox, IncomingMediaLimits, IncomingMediaReceiver, IncomingMediaSender,
+    HDR_VIDEO_BYTE_LIMIT,
 };
 use crate::pipeline::video_decoder::{probe_decode_capabilities, DecodeCapabilities};
 use crate::protocol::auth::hash_password;
@@ -69,7 +73,7 @@ use crate::transport::tls::{
 };
 
 const MAX_INCOMING_MESSAGE_SIZE: usize =
-    VIDEO_BYTE_LIMIT + crate::protocol::REGION_VIDEO_HEADER_SIZE;
+    HDR_VIDEO_BYTE_LIMIT + crate::protocol::REGION_VIDEO_HEADER_SIZE;
 const MAX_INCOMING_CONTROL_SIZE: usize = 1024 * 1024;
 const MAX_RESUME_GRANT_BYTES: usize = 8_192;
 const MAX_DISCLAIMER_CONTENT_BYTES: usize = 16 * 1024;
@@ -451,6 +455,8 @@ pub struct StreamProfile {
     /// What the host should preserve when the link is tight (`detail` or
     /// `motion`).
     pub motion_priority: String,
+    /// Named product pipeline. `None` is Custom/developer exact axes.
+    pub pipeline: Option<arcen_protocol::messages::StreamPipeline>,
 }
 
 impl Default for StreamProfile {
@@ -474,6 +480,7 @@ impl Default for StreamProfile {
             color_primaries: "bt709".to_string(),
             encode_intent: "interactive".to_string(),
             motion_priority: "detail".to_string(),
+            pipeline: None,
         }
     }
 }
@@ -617,6 +624,8 @@ pub enum SessionEvent {
     Json(Value),
     MicrophoneActive(bool),
     MediaReady,
+    PresentationRecoveryRequested,
+    ConnectionStatusHint(Option<String>),
     Ended(SessionEnd),
 }
 
@@ -1505,7 +1514,7 @@ impl FullFrameRequestGate {
     }
 
     #[cfg(test)]
-    fn with_interval(min_interval: Duration) -> Self {
+    pub(crate) fn with_interval(min_interval: Duration) -> Self {
         Self {
             min_interval,
             ..Self::default()
@@ -1515,6 +1524,7 @@ impl FullFrameRequestGate {
 
 pub struct SessionHandle {
     pub events: mpsc::UnboundedReceiver<SessionEvent>,
+    pub event_sender: mpsc::UnboundedSender<SessionEvent>,
     pub media: IncomingMediaReceiver,
     pub commands: SessionCommandSender,
     pub clipboard: ClipboardSession,
@@ -1548,6 +1558,8 @@ pub enum ConnectSmokeError {
     CertificateUntrusted(CertInfo),
     #[error("connection timed out")]
     Timeout,
+    #[error("{0}")]
+    NetworkReachability(ReachabilityFailure),
     #[error("authentication failed: {0}")]
     AuthFailed(String),
     /// The host accepted the sign-in and then could not start the session.
@@ -1617,11 +1629,7 @@ pub async fn connect_smoke(
             emit_client_session_end(&session_log_id, identity, &telemetry, "smoke_complete");
         }
         Err(error) => {
-            let mut fields = StructuredFields::default();
-            let _ = fields.insert(
-                "reason_class",
-                FieldValue::String(connect_error_class(error).to_owned()),
-            );
+            let mut fields = connect_fail_fields(error);
             let _ = fields.insert("stage", FieldValue::String("smoke".to_owned()));
             crate::logging::emit(
                 LifecycleEventKind::ClientConnectFail,
@@ -1641,7 +1649,7 @@ async fn connect_smoke_correlated(
     mut options: ConnectOptions,
     session_log_id: CorrelationId,
 ) -> Result<ConnectSmokeResult, ConnectSmokeError> {
-    let (mut ws, uri, mut fsm) = open_websocket(&options).await?;
+    let (mut ws, uri, mut fsm) = open_websocket(&options, None).await?;
 
     let first = recv_json(&mut ws, options.timeout).await?;
     match msg_type(&first).unwrap_or("<missing>") {
@@ -1733,6 +1741,7 @@ fn spawn_session_with_auth(
     resume_deadline: Option<Instant>,
 ) -> SessionHandle {
     let (event_tx, events) = mpsc::unbounded_channel();
+    let event_sender = event_tx.clone();
     let (command_tx, commands) = mpsc::unbounded_channel();
     let (cancellation, close_receiver) = SessionCancellation::new();
     let (media_tx, media) = incoming_media_inbox();
@@ -1755,6 +1764,7 @@ fn spawn_session_with_auth(
     });
     SessionHandle {
         events,
+        event_sender,
         media,
         commands: SessionCommandSender {
             sender: command_tx,
@@ -1873,8 +1883,12 @@ async fn run_session_correlated(
     resume_deadline: Option<Instant>,
     session_log_id: CorrelationId,
 ) -> Result<SessionEnd, ConnectSmokeError> {
-    let (mut ws, _uri, mut fsm) =
-        cancellable_setup(open_websocket(&options), &cancellation, &mut close_receiver).await?;
+    let (mut ws, _uri, mut fsm) = cancellable_setup(
+        open_websocket(&options, Some(&tx)),
+        &cancellation,
+        &mut close_receiver,
+    )
+    .await?;
 
     let first = cancellable_setup(
         recv_json(&mut ws, options.timeout),
@@ -2031,6 +2045,9 @@ async fn run_session_correlated(
     match msg_type(&hello).unwrap_or("<missing>") {
         SERVER_HELLO => {
             let server_hello: ServerHelloMsg = serde_json::from_value(hello)?;
+            media.set_limits(IncomingMediaLimits::for_pipeline(
+                server_hello.active_pipeline.as_ref(),
+            ));
             validate_server_transport(&options, &server_hello)?;
             validate_server_region_input(&options, &server_hello)?;
             #[cfg(feature = "usb-hard-lab")]
@@ -2970,6 +2987,7 @@ async fn run_session_correlated(
 
 async fn open_websocket(
     options: &ConnectOptions,
+    status_tx: Option<&mpsc::UnboundedSender<SessionEvent>>,
 ) -> Result<(DirectSessionSocket, Url, ClientFsm), ConnectSmokeError> {
     let transport = resolve_transport(options)
         .map_err(|message| ConnectSmokeError::TransportUnavailable(message.to_string()))?;
@@ -2996,7 +3014,7 @@ async fn open_websocket(
         DirectTransportKind::WebSocket => {
             open_wss_socket(options).await.map(DirectSessionSocket::Wss)
         }
-        DirectTransportKind::Quic => open_quic_socket(options)
+        DirectTransportKind::Quic => open_quic_socket(options, status_tx)
             .await
             .map(DirectSessionSocket::Quic),
     };
@@ -3063,7 +3081,10 @@ async fn open_wss_socket(options: &ConnectOptions) -> Result<DirectWssSocket, Co
     Ok(socket)
 }
 
-async fn open_quic_socket(options: &ConnectOptions) -> Result<DirectQuicSocket, ConnectSmokeError> {
+async fn open_quic_socket(
+    options: &ConnectOptions,
+    status_tx: Option<&mpsc::UnboundedSender<SessionEvent>>,
+) -> Result<DirectQuicSocket, ConnectSmokeError> {
     // The TLS configuration is built per attempt, below, so that each dialled
     // address captures into its own slot. Nothing shared is constructed here.
     let addresses = timeout(
@@ -3083,9 +3104,14 @@ async fn open_quic_socket(options: &ConnectOptions) -> Result<DirectQuicSocket, 
         )));
     }
 
+    let mut probe_book = AdvisoryProbeBook::new(&addresses);
     let mut last_error = None;
     let mut attempts = FuturesUnordered::new();
-    for remote_addr in addresses {
+    let mut probes = FuturesUnordered::new();
+    for remote_addr in addresses.iter().copied() {
+        if let Some(delay) = probe_book.next_delay(remote_addr, Duration::ZERO) {
+            probes.push(scheduled_udp_reachability_probe(remote_addr, delay));
+        }
         let bind_addr = if remote_addr.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
@@ -3140,51 +3166,230 @@ async fn open_quic_socket(options: &ConnectOptions) -> Result<DirectQuicSocket, 
         });
     }
 
-    let deadline = Instant::now() + options.timeout;
+    let started = Instant::now();
+    let deadline = started + options.timeout;
+    // No queued attempt means every candidate failed during local setup; the
+    // advisory probes alone must not turn that error into a timeout.
     while !attempts.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(ConnectSmokeError::Timeout);
+            return Err(probe_book
+                .timeout_failure()
+                .map(ConnectSmokeError::NetworkReachability)
+                .unwrap_or(ConnectSmokeError::Timeout));
         }
-        match timeout(remaining, attempts.next()).await {
-            Ok(Some((Ok(stream), _attempt_tls, _remote_addr))) => {
-                tracing::debug!(
-                    target: crate::logging::target::TRANSPORT,
-                    remote_addr = %stream.remote_address(),
-                    "QUIC TLS handshake and direct stream completed",
-                );
-                return Ok(WebSocketStream::from_raw_socket(
-                    stream,
-                    Role::Client,
-                    Some(direct_websocket_config()),
-                )
-                .await);
-            }
-            Ok(Some((Err(error), attempt_tls, remote_addr))) => {
-                let mapped = quic_connect_error(error);
-                if is_tofu_capture_reject_message(&mapped.to_string()) {
-                    // Read the capture from the attempt that actually failed,
-                    // and record which peer it was, so the user is approving a
-                    // fingerprint whose origin the dialog can name.
-                    if let Some(mut info) = attempt_tls.take_captured_certificate() {
-                        info.peer_address = Some(remote_addr.to_string());
-                        return Err(ConnectSmokeError::CertificateUntrusted(info));
+        tokio::select! {
+            attempt = attempts.next(), if !attempts.is_empty() => {
+                match attempt {
+                    Some((Ok(stream), _attempt_tls, _remote_addr)) => {
+                        tracing::debug!(
+                            target: crate::logging::target::TRANSPORT,
+                            remote_addr = %stream.remote_address(),
+                            "QUIC TLS handshake and direct stream completed",
+                        );
+                        publish_reachability_hint(status_tx, None);
+                        return Ok(WebSocketStream::from_raw_socket(
+                            stream,
+                            Role::Client,
+                            Some(direct_websocket_config()),
+                        )
+                        .await);
                     }
-                    return Err(mapped);
+                    Some((Err(error), attempt_tls, remote_addr)) => {
+                        let mapped = quic_connect_error(error);
+                        if is_tofu_capture_reject_message(&mapped.to_string()) {
+                            // Read the capture from the attempt that actually failed,
+                            // and record which peer it was, so the user is approving a
+                            // fingerprint whose origin the dialog can name.
+                            if let Some(mut info) = attempt_tls.take_captured_certificate() {
+                                info.peer_address = Some(remote_addr.to_string());
+                                return Err(ConnectSmokeError::CertificateUntrusted(info));
+                            }
+                            return Err(mapped);
+                        }
+                        last_error = Some(mapped);
+                    }
+                    None => {}
                 }
-                last_error = Some(mapped);
             }
-            Ok(None) => break,
-            Err(_) => return Err(ConnectSmokeError::Timeout),
+            probe = probes.next(), if !probes.is_empty() => {
+                if let Some((remote_addr, failure)) = probe {
+                    if let Some(failure) = failure {
+                        tracing::debug!(
+                            target: crate::logging::target::TRANSPORT,
+                            %remote_addr,
+                            errno = failure.os_code,
+                            reason_class = failure.reason_class(),
+                            network_scope = failure.scope.as_str(),
+                            "QUIC UDP advisory probe reported unreachable"
+                        );
+                    }
+                    probe_book.record_probe(remote_addr, failure);
+                    publish_reachability_hint(status_tx, probe_book.status_hint());
+                    if let Some(delay) = probe_book.next_delay(remote_addr, started.elapsed()) {
+                        probes.push(scheduled_udp_reachability_probe(remote_addr, delay));
+                    }
+                }
+            }
+            () = tokio::time::sleep(remaining) => {
+                return Err(probe_book
+                    .timeout_failure()
+                    .map(ConnectSmokeError::NetworkReachability)
+                    .unwrap_or(ConnectSmokeError::Timeout));
+            }
+            else => break,
         }
     }
 
     Err(last_error.unwrap_or_else(|| {
-        ConnectSmokeError::WebSocket(WebSocketError::Io(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "QUIC connection had no usable remote address",
-        )))
+        probe_book
+            .timeout_failure()
+            .map(ConnectSmokeError::NetworkReachability)
+            .unwrap_or_else(|| {
+                ConnectSmokeError::WebSocket(WebSocketError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "QUIC connection had no usable remote address",
+                )))
+            })
     }))
+}
+
+fn publish_reachability_hint(
+    status_tx: Option<&mpsc::UnboundedSender<SessionEvent>>,
+    hint: Option<String>,
+) {
+    if let Some(tx) = status_tx {
+        let _ = tx.send(SessionEvent::ConnectionStatusHint(hint));
+    }
+}
+
+async fn scheduled_udp_reachability_probe(
+    remote_addr: SocketAddr,
+    delay: Duration,
+) -> (SocketAddr, Option<ReachabilityFailure>) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    (remote_addr, udp_reachability_probe(remote_addr).await)
+}
+
+async fn udp_reachability_probe(remote_addr: SocketAddr) -> Option<ReachabilityFailure> {
+    let bind_addr = if remote_addr.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0_u16; 8], 0))
+    };
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::debug!(
+                target: crate::logging::target::TRANSPORT,
+                %error,
+                "QUIC UDP advisory probe bind failed; ignoring probe"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = socket.connect(remote_addr).await {
+        return classify_reachability_error(&error, remote_addr);
+    }
+    if let Err(error) = socket.send(&[]).await {
+        return classify_reachability_error(&error, remote_addr);
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct AddressProbeEvidence {
+    next_probe: usize,
+    last_failure: Option<ReachabilityFailure>,
+}
+
+impl AddressProbeEvidence {
+    const fn new() -> Self {
+        Self {
+            next_probe: 0,
+            last_failure: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdvisoryProbeBook {
+    addresses: BTreeMap<SocketAddr, AddressProbeEvidence>,
+}
+
+impl AdvisoryProbeBook {
+    const PROBE_DELAYS: [Duration; 4] = [
+        Duration::from_millis(0),
+        Duration::from_secs(1),
+        Duration::from_millis(2_500),
+        Duration::from_secs(5),
+    ];
+
+    fn new(addresses: &[SocketAddr]) -> Self {
+        Self {
+            addresses: addresses
+                .iter()
+                .copied()
+                .filter(|address| should_preflight_local_network(address.ip()))
+                .map(|address| (address, AddressProbeEvidence::new()))
+                .collect(),
+        }
+    }
+
+    fn next_delay(&self, address: SocketAddr, elapsed: Duration) -> Option<Duration> {
+        let evidence = self.addresses.get(&address)?;
+        let target = Self::PROBE_DELAYS.get(evidence.next_probe).copied()?;
+        Some(target.saturating_sub(elapsed))
+    }
+
+    fn record_probe(&mut self, address: SocketAddr, failure: Option<ReachabilityFailure>) {
+        let Some(evidence) = self.addresses.get_mut(&address) else {
+            return;
+        };
+        evidence.next_probe = evidence.next_probe.saturating_add(1);
+        evidence.last_failure = failure;
+    }
+
+    fn status_hint(&self) -> Option<String> {
+        self.timeout_failure()
+            .map(|failure| failure.user_message().to_owned())
+    }
+
+    fn timeout_failure(&self) -> Option<ReachabilityFailure> {
+        self.addresses
+            .values()
+            .filter_map(|evidence| evidence.last_failure)
+            .fold(None, prefer_failure)
+    }
+
+    #[cfg(test)]
+    fn probed_addresses(&self) -> Vec<SocketAddr> {
+        self.addresses.keys().copied().collect()
+    }
+}
+fn prefer_failure(
+    current: Option<ReachabilityFailure>,
+    candidate: ReachabilityFailure,
+) -> Option<ReachabilityFailure> {
+    match current {
+        Some(current) if current.scope == candidate.scope => Some(current),
+        _ => Some(candidate),
+    }
+}
+
+#[cfg(test)]
+fn synthetic_reachability_error(
+    kind: std::io::ErrorKind,
+    os_code: Option<i32>,
+    remote_addr: SocketAddr,
+) -> Option<ConnectSmokeError> {
+    let error = match os_code {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::from(kind),
+    };
+    classify_reachability_error(&error, remote_addr).map(ConnectSmokeError::NetworkReachability)
 }
 
 /// Maps every [`QuicTransportError`] variant to a typed, user-safe
@@ -3638,6 +3843,7 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
         target: crate::logging::target::SESSION,
         event = "deck_color_request",
         hdr_requested,
+        pipeline = options.profile.pipeline.as_ref().map(|pipeline| pipeline.token()),
         transfer = %quality.transfer,
         primaries = %quality.color_primaries,
         bit_depth = %quality.bit_depth,
@@ -3662,6 +3868,7 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
             bt601_matrix: capabilities.bt601_matrix,
             bt2020_ncl_matrix: capabilities.bt2020_ncl_matrix,
         },
+        pipeline: options.profile.pipeline.clone(),
     });
     // Only ever set from an explicit user choice; the host treats it as
     // authorisation to destroy a running desktop.
@@ -4350,6 +4557,24 @@ fn emit_connect_ok(
     );
 }
 
+fn connect_fail_fields(error: &ConnectSmokeError) -> StructuredFields {
+    let mut fields = StructuredFields::default();
+    let _ = fields.insert(
+        "reason_class",
+        FieldValue::String(connect_error_class(error).to_owned()),
+    );
+    if let ConnectSmokeError::NetworkReachability(failure) = error {
+        if let Some(code) = failure.os_code {
+            let _ = fields.insert("errno", FieldValue::Integer(i64::from(code)));
+        }
+        let _ = fields.insert(
+            "network_scope",
+            FieldValue::String(failure.scope.as_str().to_owned()),
+        );
+    }
+    fields
+}
+
 fn emit_session_result(
     sid: &CorrelationId,
     identity: crate::logging::EventIdentity,
@@ -4363,11 +4588,7 @@ fn emit_session_result(
     };
     if result.is_err() {
         let error = result.as_ref().err().unwrap();
-        let mut fields = StructuredFields::default();
-        let _ = fields.insert(
-            "reason_class",
-            FieldValue::String(connect_error_class(error).to_owned()),
-        );
+        let mut fields = connect_fail_fields(error);
         let _ = fields.insert("stage", FieldValue::String("session".to_owned()));
         crate::logging::emit(
             LifecycleEventKind::ClientConnectFail,
@@ -4513,6 +4734,7 @@ fn auth_refusal(result: &AuthResult) -> ConnectSmokeError {
 fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
     match error {
         ConnectSmokeError::Timeout => "timeout",
+        ConnectSmokeError::NetworkReachability(failure) => failure.reason_class(),
         ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
         | ConnectSmokeError::CertificateUntrusted(_) => "tls",
@@ -5109,6 +5331,14 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         ConnectSmokeError::Timeout => {
             DisconnectReason::Transient(TransientTransportError::TimedOut)
         }
+        ConnectSmokeError::NetworkReachability(failure) => match failure.class {
+            arcen_session::network_reachability::ReachabilityFailureClass::HostUnreachable => {
+                DisconnectReason::Transient(TransientTransportError::HostUnreachable)
+            }
+            arcen_session::network_reachability::ReachabilityFailureClass::NetworkUnreachable => {
+                DisconnectReason::Transient(TransientTransportError::NetworkUnreachable)
+            }
+        },
         ConnectSmokeError::UnexpectedEof => {
             DisconnectReason::Transient(TransientTransportError::UnexpectedEof)
         }
@@ -5470,6 +5700,50 @@ mod tests {
             attempt: 1,
             gap: Duration::from_millis(0),
         }
+    }
+
+    #[tokio::test]
+    async fn quic_setup_failure_on_every_candidate_returns_the_setup_error_not_a_timeout() {
+        let options = ConnectOptions {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            use_tls: true,
+            username: String::new(),
+            password: String::new(),
+            timeout: Duration::from_secs(30),
+            tls: TlsTrustConfig::private_ca(std::path::PathBuf::from(
+                "/nonexistent/arcen-test/missing-ca-bundle.pem",
+            )),
+            profile: StreamProfile::default(),
+            monitors: Vec::new(),
+            displays_mode: String::new(),
+            multi_monitor_topology: None,
+            replace_incompatible_desktop: false,
+            timezone: None,
+            cursor_preference: CursorMode::Local,
+            clipboard_enabled: false,
+            microphone_enabled: false,
+            tablet_input_enabled: false,
+            tablet_mode_requested: TabletModeMsg::LocalTermination,
+            telemetry: Arc::new(ClientTelemetry::default()),
+            quic_enabled: true,
+        };
+        let started = Instant::now();
+        let error = match open_quic_socket(&options, None).await {
+            Ok(_) => panic!("a missing CA bundle cannot produce a connection"),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "setup failure must not wait for the connect deadline"
+        );
+        assert!(
+            !matches!(
+                error,
+                ConnectSmokeError::Timeout | ConnectSmokeError::NetworkReachability(_)
+            ),
+            "expected the TLS setup error, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -6381,7 +6655,7 @@ mod tests {
             telemetry: Arc::new(ClientTelemetry::default()),
             quic_enabled: true,
         };
-        let mut ws = open_quic_socket(&options).await.unwrap();
+        let mut ws = open_quic_socket(&options, None).await.unwrap();
         assert_eq!(
             ws.next().await.unwrap().unwrap(),
             Message::Text("pier-quic".into())
@@ -6905,6 +7179,118 @@ mod tests {
         }
     }
 
+    fn failure_for(address: &str) -> ReachabilityFailure {
+        synthetic_reachability_error(
+            std::io::ErrorKind::HostUnreachable,
+            None,
+            SocketAddr::new(address.parse().unwrap(), 18_444),
+        )
+        .and_then(|error| match error {
+            ConnectSmokeError::NetworkReachability(failure) => Some(failure),
+            _ => None,
+        })
+        .expect("classified failure")
+    }
+
+    #[test]
+    fn probe_book_excludes_public_and_loopback_addresses() {
+        let local = SocketAddr::new("192.168.1.44".parse().unwrap(), 18_444);
+        let public = SocketAddr::new("203.0.113.44".parse().unwrap(), 18_444);
+        let loopback = SocketAddr::new("127.0.0.1".parse().unwrap(), 18_444);
+
+        let book = AdvisoryProbeBook::new(&[local, public, loopback]);
+
+        assert_eq!(book.probed_addresses(), vec![local]);
+        assert_eq!(book.next_delay(local, Duration::ZERO), Some(Duration::ZERO));
+        assert_eq!(book.next_delay(public, Duration::ZERO), None);
+        assert_eq!(book.next_delay(loopback, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn diagnostic_hint_appears_and_clears_from_lan_probe_evidence() {
+        let address = SocketAddr::new("192.168.1.44".parse().unwrap(), 18_444);
+        let mut book = AdvisoryProbeBook::new(&[address]);
+
+        book.record_probe(address, Some(failure_for("192.168.1.44")));
+        let hint = book.status_hint().expect("unreachable LAN hint");
+        assert!(hint.contains("Local Network"));
+
+        book.record_probe(address, None);
+        assert!(book.status_hint().is_none());
+        assert!(book.timeout_failure().is_none());
+    }
+
+    #[test]
+    fn final_timeout_uses_lan_probe_evidence_when_present() {
+        let address = SocketAddr::new("192.168.1.44".parse().unwrap(), 18_444);
+        let mut book = AdvisoryProbeBook::new(&[address]);
+
+        book.record_probe(address, Some(failure_for("192.168.1.44")));
+
+        let error = ConnectSmokeError::NetworkReachability(
+            book.timeout_failure()
+                .expect("timeout should use probe evidence"),
+        );
+        assert_eq!(connect_error_class(&error), "local_network_unreachable");
+        assert!(error.to_string().contains("Local Network"));
+    }
+
+    #[test]
+    fn final_timeout_without_lan_evidence_stays_generic() {
+        let public = SocketAddr::new("203.0.113.44".parse().unwrap(), 18_444);
+        let book = AdvisoryProbeBook::new(&[public]);
+
+        let error = book
+            .timeout_failure()
+            .map(ConnectSmokeError::NetworkReachability)
+            .unwrap_or(ConnectSmokeError::Timeout);
+
+        assert!(matches!(error, ConnectSmokeError::Timeout));
+        assert_eq!(connect_error_class(&error), "timeout");
+    }
+
+    #[test]
+    fn preflight_unreachable_errors_map_to_specific_user_messages() {
+        use std::io::ErrorKind;
+
+        let local = SocketAddr::new("192.168.1.44".parse().unwrap(), 18_444);
+        let public = SocketAddr::new("203.0.113.44".parse().unwrap(), 18_444);
+        let local = synthetic_reachability_error(ErrorKind::HostUnreachable, None, local)
+            .expect("classified local failure");
+        let public = synthetic_reachability_error(ErrorKind::HostUnreachable, None, public)
+            .expect("classified public failure");
+
+        assert_eq!(connect_error_class(&local), "local_network_unreachable");
+        assert!(local.to_string().contains("Local Network"));
+        assert!(local.to_string().contains("host may also be offline"));
+        assert_eq!(connect_error_class(&public), "host_unreachable");
+        assert!(!public.to_string().contains("Local Network"));
+        assert_eq!(
+            classify_disconnect(&local).reason,
+            DisconnectReason::Transient(TransientTransportError::HostUnreachable)
+        );
+    }
+
+    #[test]
+    fn connect_fail_fields_include_errno_for_reachability_failures() {
+        use std::io::ErrorKind;
+
+        let local = SocketAddr::new("192.168.1.44".parse().unwrap(), 18_444);
+        let error = synthetic_reachability_error(ErrorKind::HostUnreachable, Some(65), local)
+            .expect("classified local failure");
+        let fields = connect_fail_fields(&error);
+
+        assert_eq!(
+            fields.as_map().get("reason_class"),
+            Some(&FieldValue::String("local_network_unreachable".to_string()))
+        );
+        assert_eq!(fields.as_map().get("errno"), Some(&FieldValue::Integer(65)));
+        assert_eq!(
+            fields.as_map().get("network_scope"),
+            Some(&FieldValue::String("local_network".to_string()))
+        );
+    }
+
     #[test]
     fn quic_connection_failures_preserve_resume_and_tls_classification() {
         for connection_error in [
@@ -7262,6 +7648,7 @@ mod tests {
             color_primaries: "bt709".to_string(),
             encode_intent: "quality".to_string(),
             motion_priority: "motion".to_string(),
+            pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
         });
         assert_eq!(quality.codec, "h265");
         assert_eq!(quality.chroma, "yuv444");
@@ -7953,7 +8340,9 @@ mod tests {
             let _client_hello = ws.next().await.unwrap().unwrap();
             let _quality_settings = ws.next().await.unwrap().unwrap();
 
-            for timestamp_ms in 0..10 {
+            let flood = u32::try_from(crate::pipeline::frame_queue::VIDEO_PACKET_LIMIT + 2)
+                .expect("small inbox limit");
+            for timestamp_ms in 0..flood {
                 let mut bytes = encode_video_header(VideoHeader {
                     frame_type: FrameType::VideoH264,
                     codec: VideoCodec::H264,
@@ -8023,6 +8412,7 @@ mod tests {
                 | SessionEvent::AuthRequired(_)
                 | SessionEvent::Authenticated(_)
                 | SessionEvent::MicrophoneActive(_)
+                | SessionEvent::ConnectionStatusHint(_)
                 | SessionEvent::BrokerHello(_) => {}
             }
         }

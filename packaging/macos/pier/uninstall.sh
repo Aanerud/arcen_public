@@ -31,15 +31,24 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+
 arcen_log "stopping the service and every session's agent"
+arcen_stop_service_and_agents
+
+arcen_log "reconciling legacy timezone helper state"
+arcen_stop_legacy_timezone_helper
+arcen_restore_legacy_timezone_journal || exit 1
 arcen_stop_everything
+arcen_log "if an Agent Helper was forcibly killed before restoring TZ, that TZ can remain only until that user logs out"
 
 arcen_log "removing launchd definitions, PAM policy and log rotation"
 rm -f "$ARCEN_SERVICE_PLIST" "$ARCEN_AGENT_PLIST" \
-  "$ARCEN_LEGACY_SERVICE_PLIST" "$ARCEN_LEGACY_AGENT_PLIST" \
+  "$ARCEN_LEGACY_SERVICE_PLIST" "$ARCEN_LEGACY_AGENT_PLIST" "$ARCEN_LEGACY_TZ_HELPER_PLIST" \
   "$ARCEN_PAM" "$ARCEN_NEWSYSLOG"
 rm -f /tmp/arcen-pier.out.log /tmp/arcen-pier.err.log
-rm -rf "$ARCEN_RUN"
+rm -rf "$ARCEN_RUN" "$ARCEN_TZ_SOCKET_DIR"
+rm -rf "$ARCEN_MICROPHONE_DRIVER"
+arcen_restart_coreaudiod
 
 if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q "enabled"; then
   /usr/libexec/ApplicationFirewall/socketfilterfw --remove "$ARCEN_PIER_BIN" >/dev/null 2>&1 || true
@@ -99,7 +108,15 @@ if arcen_port_in_use; then
   /usr/sbin/lsof -nP -iUDP:"$ARCEN_PORT" >&2
   LEFT=1
 fi
-for path in "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP" "$ARCEN_SERVICE_PLIST" "$ARCEN_AGENT_PLIST" "$ARCEN_PAM"; do
+if arcen_microphone_driver_process_running; then
+  arcen_log "Core Audio is still hosting the microphone driver:" >&2
+  pgrep -lf 'ArcenMicrophone[.]driver' >&2
+  LEFT=1
+fi
+for path in "$ARCEN_PIER_APP" "$ARCEN_AGENT_APP" "$ARCEN_LEGACY_AGENT_APP" \
+  "$ARCEN_SERVICE_PLIST" "$ARCEN_LEGACY_TZ_HELPER_PLIST" "$ARCEN_AGENT_PLIST" \
+  "$ARCEN_RUN" "$ARCEN_TZ_SOCKET_DIR" "$ARCEN_PAM" "$ARCEN_NEWSYSLOG" \
+  "$ARCEN_MICROPHONE_DRIVER"; do
   if [ -e "$path" ]; then
     arcen_log "not removed: $path" >&2
     LEFT=1

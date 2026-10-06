@@ -119,6 +119,8 @@ use arcen_telemetry::{
     CorrelationId, FieldValue, LifecycleEventKind, OperationalProfile, QosSample, QosTargets,
     StructuredFields, TelemetryTarget,
 };
+
+const CAPTURE_ENCODER_INIT_FAILED: &str = "capture/encoder initialization failed";
 use serde::de::DeserializeOwned;
 use zeroize::Zeroize;
 
@@ -522,6 +524,28 @@ fn close_with_reason(reason: &str) -> Message {
         code: CloseCode::Error,
         reason: reason.into(),
     }))
+}
+
+fn capenc_start_close_reason(error: &capenc::CapencStartError) -> &'static str {
+    match error {
+        capenc::CapencStartError::PipelineRefused(reason) => reason,
+        capenc::CapencStartError::InvalidConfig(_)
+        | capenc::CapencStartError::Spawn(_)
+        | capenc::CapencStartError::BackendUnavailable(_)
+        | capenc::CapencStartError::ReadyProtocol(_)
+        | capenc::CapencStartError::ExitedBeforeReady(_)
+        | capenc::CapencStartError::ReadyTimeout => CAPTURE_ENCODER_INIT_FAILED,
+    }
+}
+
+fn multi_capenc_start_close_reason(error: &multi_capenc::MultiCapencStartError) -> &'static str {
+    match error {
+        multi_capenc::MultiCapencStartError::PipelineStartFailed { source, .. } => {
+            capenc_start_close_reason(source)
+        }
+        multi_capenc::MultiCapencStartError::CarrierNotYetEnabled
+        | multi_capenc::MultiCapencStartError::InvalidConfig(_) => CAPTURE_ENCODER_INIT_FAILED,
+    }
 }
 
 async fn send_critical_control_with_timeout<S>(
@@ -1447,17 +1471,61 @@ impl SessionEndReason {
     }
 }
 
+fn aggregate_plan_acceleration<'a>(
+    plans: impl IntoIterator<Item = &'a ResolvedMediaPlan>,
+) -> Option<arcen_media::video::AcceleratorClass> {
+    arcen_media::video::aggregate_plan_encoder_backend(plans)
+}
+
+fn aggregate_encoder_backend_label(
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> String {
+    if aggregate == Some(primary.backend.accelerator_class()) {
+        primary.backend.ready_token().to_string()
+    } else {
+        aggregate
+            .map_or("unknown", arcen_media::video::AcceleratorClass::token)
+            .to_string()
+    }
+}
+
+fn served_stream_pipeline_for_backend(
+    cfg: &Config,
+    media_plan: &ResolvedMediaPlan,
+    motion_priority: arcen_media::video::MotionPriority,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
+) -> arcen_protocol::messages::ServedStreamPipeline {
+    arcen_media::video::served_pipeline(
+        cfg.requested_pipeline,
+        media_plan.video,
+        media_plan.fps,
+        motion_priority,
+        arcen_media::video::ServedPipelineContext {
+            backend: aggregate_backend,
+            exact_or_admin_override: cfg.codec_pinned
+                || cfg.variant_pinned
+                || cfg.requested_pipeline.is_none(),
+        },
+    )
+}
+
 fn emit_session_stream_start(
     emitter: &LifecycleEmitter,
     session_log_id: CorrelationId,
     media_plan: &ResolvedMediaPlan,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
+    pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     user: Option<&str>,
     peer_addr: Option<&str>,
 ) {
     let mut fields = StructuredFields::default();
     let _ = fields.insert(
         "encoder",
-        FieldValue::String(media_plan.backend.ready_token().to_string()),
+        FieldValue::String(aggregate_encoder_backend_label(
+            media_plan,
+            aggregate_backend,
+        )),
     );
     let _ = fields.insert(
         "codec",
@@ -1470,6 +1538,9 @@ fn emit_session_stream_start(
     let _ = fields.insert("width", FieldValue::Integer(i64::from(media_plan.width)));
     let _ = fields.insert("height", FieldValue::Integer(i64::from(media_plan.height)));
     let _ = fields.insert("fps", FieldValue::Integer(i64::from(media_plan.fps)));
+    if let Some(pipeline) = pipeline {
+        let _ = fields.insert("pipeline", FieldValue::String(pipeline.token().to_string()));
+    }
     let _ = fields.insert("display_backend", FieldValue::String("nvctrl".to_string()));
     insert_color_identity(&mut fields, media_plan);
     let context = emitter.session_context(
@@ -3096,7 +3167,7 @@ async fn run_ws(
                         );
                         send_critical_control(
                             &mut ws,
-                            close_with_reason("capture/encoder initialization failed"),
+                            close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                             "fitted_resolution_invalid_close",
                         )
                         .await;
@@ -3109,7 +3180,7 @@ async fn run_ws(
                         warn!(target: CAPENC, "no capenc binary — refusing display mutation");
                         send_critical_control(
                             &mut ws,
-                            close_with_reason("capture/encoder initialization failed"),
+                            close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                             "capenc_preflight_missing_close",
                         )
                         .await;
@@ -3131,7 +3202,7 @@ async fn run_ws(
                     );
                     send_critical_control(
                         &mut ws,
-                        close_with_reason("capture/encoder initialization failed"),
+                        close_with_reason(capenc_start_close_reason(&error)),
                         "capenc_preflight_close",
                     )
                     .await;
@@ -4064,6 +4135,12 @@ async fn run_attachment(
                 intent: initial_capenc.intent,
                 motion_priority: initial_capenc.motion_priority,
                 qp_map: initial_capenc.qp_map,
+                debug_diagnostics: initial_capenc.debug_diagnostics,
+                qp_map_config: cfg.qp_map_config.clone(),
+                requested_pipeline: cfg.requested_pipeline,
+                codec_pinned: initial_capenc.codec_pinned,
+                variant_pinned: initial_capenc.variant_pinned,
+                encoder_max_bitrate_bps: initial_capenc.encoder_max_bitrate_bps,
                 video_selection: initial_capenc.video_selection,
                 cursor_mode: initial_capenc.cursor_mode,
                 display: initial_capenc.display.clone(),
@@ -4086,7 +4163,7 @@ async fn run_attachment(
                     );
                     send_critical_control(
                         &mut sink,
-                        close_with_reason("capture/encoder initialization failed"),
+                        close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                         "multi_monitor_config_close",
                     )
                     .await;
@@ -4202,7 +4279,7 @@ async fn run_attachment(
                     );
                     send_critical_control(
                         &mut sink,
-                        close_with_reason("capture/encoder initialization failed"),
+                        close_with_reason(multi_capenc_start_close_reason(&error)),
                         "multi_monitor_capenc_startup_close",
                     )
                     .await;
@@ -4232,7 +4309,7 @@ async fn run_attachment(
                 supervisor.shutdown().await;
                 send_critical_control(
                     &mut sink,
-                    close_with_reason("capture/encoder initialization failed"),
+                    close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                     "multi_monitor_geometry_mismatch_close",
                 )
                 .await;
@@ -4261,7 +4338,7 @@ async fn run_attachment(
                     supervisor.shutdown().await;
                     send_critical_control(
                         &mut sink,
-                        close_with_reason("capture/encoder initialization failed"),
+                        close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                         "multi_monitor_capability_close",
                     )
                     .await;
@@ -4280,7 +4357,7 @@ async fn run_attachment(
                 supervisor.shutdown().await;
                 send_critical_control(
                     &mut sink,
-                    close_with_reason("capture/encoder initialization failed"),
+                    close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
                     "multi_monitor_primary_missing_close",
                 )
                 .await;
@@ -4305,7 +4382,7 @@ async fn run_attachment(
                 );
                 send_critical_control(
                     &mut sink,
-                    close_with_reason("capture/encoder initialization failed"),
+                    close_with_reason(capenc_start_close_reason(&error)),
                     "capenc_startup_close",
                 )
                 .await;
@@ -4419,9 +4496,17 @@ async fn run_attachment(
         },
         "Linux microphone backend probe completed"
     );
+    let hello_aggregate_backend = aggregate_plan_acceleration(
+        std::iter::once(&media_plan).chain(
+            multi_monitor_secondary_sources
+                .iter()
+                .map(|source| &source.plan),
+        ),
+    );
     let mut hello = build_server_hello(
         &cfg,
         &media_plan,
+        hello_aggregate_backend,
         session_lease.map(|lease| &lease.metadata),
         resize_supported,
         microphone_backend_available,
@@ -4586,8 +4671,17 @@ async fn run_attachment(
     // respawn capenc now — before any frame pump or queue is created — so
     // every downstream component sees the client-requested plan.
     //
-    let mut active_encode_intent = initial_capenc.intent;
-    let mut active_motion_priority = initial_capenc.motion_priority;
+    let served_contract = served_pipeline_contract_for_quality(
+        cfg.requested_pipeline,
+        media_plan,
+        initial_capenc.motion_priority,
+        hello_aggregate_backend,
+        cfg.codec_pinned || cfg.variant_pinned || cfg.requested_pipeline.is_none(),
+    );
+    let mut active_encode_intent =
+        served_contract.map_or(initial_capenc.intent, |contract| contract.intent);
+    let mut active_motion_priority =
+        served_contract.map_or(initial_capenc.motion_priority, |contract| contract.priority);
     let (mut capenc, media_plan) = match capenc {
         CapencHandle::Multi(supervisor) => {
             if cfg.auth_video_request.is_none() {
@@ -4706,25 +4800,38 @@ async fn run_attachment(
             // asked for. Unlike them it has no operator-configured ceiling to
             // resolve against, so "no preference" is simply what this session
             // already spawned with.
-            let requested_intent = EncodeIntent::from_token(&initial_quality.encode_intent);
-            if requested_intent.is_none() {
+            let requested_intent = served_contract
+                .is_none()
+                .then(|| EncodeIntent::from_token(&initial_quality.encode_intent))
+                .flatten();
+            if served_contract.is_none() && requested_intent.is_none() {
                 warn!(
                     target: SESSION,
                     token = initial_quality.encode_intent.as_str(),
                     "quality_settings encode_intent token not recognised — treating as no client preference"
                 );
             }
-            let resolved_intent = requested_intent.unwrap_or(initial_capenc.intent);
-            let requested_priority =
-                arcen_media::video::MotionPriority::from_token(&initial_quality.motion_priority);
-            if requested_priority.is_none() {
+            let resolved_intent = served_contract.map_or_else(
+                || requested_intent.unwrap_or(initial_capenc.intent),
+                |contract| contract.intent,
+            );
+            let requested_priority = served_contract
+                .is_none()
+                .then(|| {
+                    arcen_media::video::MotionPriority::from_token(&initial_quality.motion_priority)
+                })
+                .flatten();
+            if served_contract.is_none() && requested_priority.is_none() {
                 warn!(
                     target: SESSION,
                     token = initial_quality.motion_priority.as_str(),
                     "quality_settings motion_priority token not recognised — treating as no client preference"
                 );
             }
-            let resolved_priority = requested_priority.unwrap_or(initial_capenc.motion_priority);
+            let resolved_priority = served_contract.map_or_else(
+                || requested_priority.unwrap_or(initial_capenc.motion_priority),
+                |contract| contract.priority,
+            );
             // Policy precedence, then the absolute client-capability
             // cross-check: never grant more than `client_hello` claimed this
             // client can decode, regardless of what policy would otherwise
@@ -4944,6 +5051,13 @@ async fn run_attachment(
         active_encoder,
         active_encode_intent,
         active_motion_priority,
+    );
+    let active_aggregate_backend = aggregate_plan_acceleration(
+        std::iter::once(&media_plan).chain(
+            multi_monitor_secondary_sources
+                .iter()
+                .map(|source| &source.plan),
+        ),
     );
     if timezone_echo_mismatch(
         authoritative_timezone.as_ref(),
@@ -5446,12 +5560,44 @@ async fn run_attachment(
     );
     let audio_runtime = Arc::new(tokio::sync::Mutex::new(audio_session.take()));
 
+    let active_served_pipeline = served_stream_pipeline_for_backend(
+        &cfg,
+        &media_plan,
+        active_motion_priority,
+        active_aggregate_backend,
+    );
+    let effective_qp_map = active_capenc_config.qp_map;
+    if let Some(served_policy) = cfg
+        .qp_map_config
+        .as_ref()
+        .and_then(|config| config.effective_token(active_served_pipeline.token()).ok())
+        .and_then(arcen_media::video::QpMapPolicy::from_token)
+    {
+        if served_policy != effective_qp_map {
+            tracing::info!(
+                target: SESSION,
+                pipeline = active_served_pipeline.token(),
+                configured_qp_map = served_policy.token(),
+                running_qp_map = effective_qp_map.token(),
+                "served pipeline changed after capenc launch; keeping the running QP map policy until the next encoder restart"
+            );
+        }
+    }
+    tracing::info!(
+        target: SESSION,
+        pipeline = active_served_pipeline.token(),
+        qp_map = effective_qp_map.token(),
+        "effective QP map policy"
+    );
+
     // Media, display, input, and audio setup have all completed and
     // `server_hello` was delivered: the stream is now truly active.
     emit_session_stream_start(
         emitter,
         session_log_id.clone(),
         &media_plan,
+        active_aggregate_backend,
+        Some(active_served_pipeline.clone()),
         session_user.as_deref(),
         Some(remote_host),
     );
@@ -5490,7 +5636,7 @@ async fn run_attachment(
         requested_fps = initial_quality.max_fps,
         requested_bandwidth_mbps = initial_quality.max_bandwidth_mbps,
         resolved_codec = media_plan.codec_token(),
-        resolved_encoder_backend = media_plan.backend.ready_token(),
+        resolved_encoder_backend = aggregate_encoder_backend_label(&media_plan, active_aggregate_backend),
         resolved_width = media_plan.width,
         resolved_height = media_plan.height,
         resolved_fps = media_plan.fps,
@@ -5506,12 +5652,14 @@ async fn run_attachment(
     // counters below. Seeded from the shared, SIGHUP-reloadable cell rather
     // than `cfg`'s startup snapshot, so a session started before a reload
     // still begins with the latest validated thresholds.
-    let session_health = Arc::new(Mutex::new(crate::observability::SessionHealth::new(
-        qos_targets
-            .read()
-            .map(|targets| *targets)
-            .unwrap_or(cfg.logging.qos_targets),
-    )));
+    let session_health = Arc::new(Mutex::new(
+        crate::observability::SessionHealth::new_with_fps_warmup(
+            qos_targets
+                .read()
+                .map(|targets| *targets)
+                .unwrap_or(cfg.logging.qos_targets),
+        ),
+    ));
 
     // One-time bounded network-path probe (sysfs/procfs; no packet capture,
     // no SSID/RSSI disclosure). Absent entirely when no usable interface is
@@ -5780,10 +5928,11 @@ async fn run_attachment(
     let mut dispatcher = tokio::spawn(
         async move {
             let mut last_display_update_seq: u64 = 0;
-            let mut last_full_frame_idr = Instant::now()
-                .checked_sub(Duration::from_secs(10))
-                .unwrap_or_else(Instant::now);
+            let mut full_frame_requests =
+                arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
             let mut input_sequence = InputSequenceTracker::default();
+            let mut full_frame_tick = tokio::time::interval(Duration::from_millis(50));
+            full_frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut clipboard_agent = disp_clipboard;
             let mut deck_reassembler = clipboard_negotiation
                 .and_then(|negotiation| {
@@ -5830,6 +5979,11 @@ async fn run_attachment(
                         }
                         if let Some(reassembler) = agent_reassembler.as_mut() {
                             let _ = reassembler.expire(Instant::now());
+                        }
+                    }
+                    _ = full_frame_tick.tick() => {
+                        if full_frame_requests.poll(Instant::now()).deliver_now {
+                            request_full_frame_idr(&disp_idrs);
                         }
                     }
                     cursor_json = async { cursor_shape_rx.as_mut()?.recv().await },
@@ -6034,7 +6188,7 @@ async fn run_attachment(
                                 &disp_session_log_id,
                                 disp_timezone.as_ref(),
                                 input.as_mut(),
-                                &mut last_full_frame_idr,
+                                &mut full_frame_requests,
                                 &mut input_sequence,
                                 disp_plan.cursor_mode,
                                 &disp_session_health,
@@ -6318,29 +6472,23 @@ async fn run_attachment(
         let rate_queues = rate_queues.clone();
         let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
         let plan = media_plan;
-        let motion_priority = active_motion_priority;
+        let served_pipeline = active_served_pipeline.clone();
+        let motion_priority = arcen_media::video::operational_motion_priority(
+            Some(&served_pipeline),
+            active_motion_priority,
+        );
         tokio::spawn(async move {
-            let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+            let policy = arcen_media::video::operational_rate_control_policy(
+                Some(&served_pipeline),
                 plan.width,
                 plan.height,
                 plan.fps,
                 plan.video.chroma,
                 plan.video.bit_depth,
-            ));
-            let ceiling_bps = u64::from(arcen_media::video::average_bitrate_bps(
-                plan.width,
-                plan.height,
-                plan.fps,
-                plan.video.chroma,
-                plan.video.bit_depth,
-            ));
-            let mut controller = arcen_media::rate_control::RateController::new(
-                arcen_media::rate_control::RateControlPolicy::for_bounds_and_priority(
-                    start_bps,
-                    ceiling_bps,
-                    motion_priority,
-                ),
+                active_motion_priority,
             );
+            let start_bps = policy.start_bps;
+            let mut controller = arcen_media::rate_control::RateController::new(policy);
             let mut pipeline_sync = arcen_media::rate_control::PipelineRateSync::new(
                 bitrate_senders.len(),
                 start_bps,
@@ -6353,11 +6501,18 @@ async fn run_attachment(
             let session_bytes = |queues: &[Arc<FrameQueue>]| {
                 queues.iter().map(|queue| queue.bytes_sent()).sum::<u64>()
             };
+            let pipeline_bytes = |queues: &[Arc<FrameQueue>]| {
+                queues
+                    .iter()
+                    .map(|queue| queue.bytes_sent())
+                    .collect::<Vec<_>>()
+            };
             let session_frames = |queues: &[Arc<FrameQueue>]| {
                 queues.iter().map(|queue| queue.frames_sent()).sum::<u64>()
             };
             let mut last_bytes = session_bytes(&rate_queues);
             let mut last_frames = session_frames(&rate_queues);
+            let mut last_pipeline_bytes = pipeline_bytes(&rate_queues);
             loop {
                 ticker.tick().await;
                 if connection.close_reason().is_some() {
@@ -6365,6 +6520,13 @@ async fn run_attachment(
                 }
                 let bytes = session_bytes(&rate_queues);
                 let frames = session_frames(&rate_queues);
+                let pipeline_bytes_now = pipeline_bytes(&rate_queues);
+                let peak_pipeline_delivered_bytes = pipeline_bytes_now
+                    .iter()
+                    .zip(&last_pipeline_bytes)
+                    .map(|(now, last)| now.saturating_sub(*last))
+                    .max()
+                    .unwrap_or(0);
                 let wait = arcen_media::video::VideoQueueWaitStats::combine(
                     rate_queues.iter().map(|queue| queue.take_wait_stats()),
                 );
@@ -6377,6 +6539,7 @@ async fn run_attachment(
                 };
                 let sample = arcen_media::rate_control::RateSample {
                     delivered_bytes: bytes.saturating_sub(last_bytes),
+                    peak_pipeline_delivered_bytes,
                     elapsed: Duration::from_secs(1),
                     mean_frame_wait: wait.mean.saturating_add(mean_write_wait),
                     frames: frames.saturating_sub(last_frames),
@@ -6389,6 +6552,7 @@ async fn run_attachment(
                 };
                 last_bytes = bytes;
                 last_frames = frames;
+                last_pipeline_bytes = pipeline_bytes_now;
                 if rate_control_enabled {
                     let change = controller.observe(sample);
                     let want_bps = controller.target_bps();
@@ -7264,6 +7428,29 @@ fn concrete_encoder_for(plan: ResolvedMediaPlan) -> Option<EncoderRequest> {
         EncoderBackend::WindowsMediaFoundation | EncoderBackend::VideoToolbox => None,
         EncoderBackend::Rav1e => Some(EncoderRequest::SoftwareAv1),
     }
+}
+
+fn served_pipeline_contract_for_quality(
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    media_plan: ResolvedMediaPlan,
+    current_priority: arcen_media::video::MotionPriority,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
+    exact_or_admin_override: bool,
+) -> Option<arcen_media::video::PipelineContract> {
+    requested_pipeline.and_then(|_| {
+        let served = arcen_media::video::served_pipeline(
+            requested_pipeline,
+            media_plan.video,
+            media_plan.fps,
+            current_priority,
+            arcen_media::video::ServedPipelineContext {
+                backend: aggregate_backend,
+                exact_or_admin_override,
+            },
+        );
+        arcen_media::video::PipelineId::from_served_wire(&served)
+            .map(arcen_media::video::pipeline_contract)
+    })
 }
 
 fn resize_contract_matches(current: ResolvedMediaPlan, candidate: ResolvedMediaPlan) -> bool {
@@ -8192,7 +8379,7 @@ fn handle_control_json(
     session_log_id: &CorrelationId,
     authoritative_timezone: Option<&IanaTimeZone>,
     input: Option<&mut InputController>,
-    last_full_frame_idr: &mut Instant,
+    full_frame_requests: &mut arcen_media::video::FullFrameRequestCoalescer,
     input_sequence: &mut InputSequenceTracker,
     active_cursor_mode: CursorMode,
     session_health: &Mutex<crate::observability::SessionHealth>,
@@ -8225,19 +8412,15 @@ fn handle_control_json(
                 debug!(target: NET, %error, "invalid request_full_frame message");
                 return;
             }
-            let now = Instant::now();
-            if now.duration_since(*last_full_frame_idr) >= FULL_FRAME_IDR_GUARD {
-                *last_full_frame_idr = now;
-                for monitor_idr in idr {
-                    monitor_idr.request();
-                }
+            if full_frame_requests.request(Instant::now()).deliver_now {
+                request_full_frame_idr(idr);
                 debug!(
                     target: MEDIA,
                     monitor_count = idr.len(),
                     "request_full_frame → IDR (all applied monitors)"
                 );
             } else {
-                trace!(target: MEDIA, "request_full_frame throttled (<500ms)");
+                trace!(target: MEDIA, "request_full_frame coalesced (<500ms)");
             }
         }
         CLIENT_HELLO => {
@@ -8702,6 +8885,12 @@ where
     Ok(())
 }
 
+fn request_full_frame_idr(idr: &[IdrRequester]) {
+    for monitor_idr in idr {
+        monitor_idr.request();
+    }
+}
+
 fn parse_sequenced_input<T>(
     text: &str,
     input_sequence: &mut InputSequenceTracker,
@@ -8761,7 +8950,7 @@ fn now_ms_u32() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::capenc::{test_support::fake_idr, ResolvedMediaPlan, StdinCmd};
+    use crate::media::capenc::{test_support::fake_idr, ResolvedMediaPlan};
     use arcen_protocol::messages::{
         ClientQosSampleMsg, ClientTelemetrySnapshotMsg, SampleWindowSecs,
     };
@@ -8804,6 +8993,7 @@ mod tests {
                 full_range: true,
                 ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
             },
+            pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
         });
 
         let resolved =
@@ -8813,6 +9003,79 @@ mod tests {
         assert_eq!(resolved.bit_depth, BitDepth::Ten);
         assert_eq!(resolved.color_range, ColorRange::Full);
         assert_eq!(resolved.requested_encode_intent(), EncodeIntent::Quality);
+    }
+
+    #[test]
+    fn linux_operational_bounds_follow_served_pipeline_truth() {
+        let grading_shape = (3840, 2160, 30, ChromaSubsampling::Yuv444, BitDepth::Ten);
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Grading),
+                grading_shape.0,
+                grading_shape.1,
+                grading_shape.2,
+                grading_shape.3,
+                grading_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .bitrate_bounds(
+                    grading_shape.0,
+                    grading_shape.1,
+                    grading_shape.2,
+                    grading_shape.3,
+                    grading_shape.4,
+                ),
+            "an HDR request served as Grading must run the Grading contract"
+        );
+
+        let exact_shape = (1920, 1080, 60, ChromaSubsampling::Yuv420, BitDepth::Eight);
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Custom),
+                exact_shape.0,
+                exact_shape.1,
+                exact_shape.2,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            (
+                arcen_media::video::link_capped_average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+                arcen_media::video::average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+            ),
+            "Exact/custom Linux sessions keep the legacy bounds"
+        );
+
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Software),
+                exact_shape.0,
+                exact_shape.1,
+                30,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Software)
+                .bitrate_bounds(
+                    exact_shape.0,
+                    exact_shape.1,
+                    30,
+                    exact_shape.3,
+                    exact_shape.4
+                ),
+            "software fallback uses the Software contract"
+        );
     }
 
     #[tokio::test]
@@ -9718,6 +9981,63 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_refusal_becomes_specific_close_reason() {
+        let reason = arcen_media::video::software_fallback_decision(
+            Some(arcen_media::video::PipelineId::Grading),
+            arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+        )
+        .reason();
+        assert_eq!(
+            capenc_start_close_reason(&capenc::CapencStartError::PipelineRefused(reason)),
+            reason
+        );
+    }
+
+    #[test]
+    fn generic_capenc_start_errors_keep_generic_close_reason() {
+        assert_eq!(
+            capenc_start_close_reason(&capenc::CapencStartError::InvalidConfig(
+                "internal parser detail".to_string()
+            )),
+            CAPTURE_ENCODER_INIT_FAILED
+        );
+    }
+
+    #[test]
+    fn multi_monitor_pipeline_refusal_preserves_specific_close_reason() {
+        let reason = arcen_media::video::software_fallback_decision(
+            Some(arcen_media::video::PipelineId::Hdr),
+            arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+        )
+        .reason();
+        let error = multi_capenc::MultiCapencStartError::PipelineStartFailed {
+            session_monitor_id: arcen_media::SessionMonitorId::new(2).expect("monitor"),
+            head: "DFP-1".to_string(),
+            output_index: 1,
+            failure_index: 0,
+            source: capenc::CapencStartError::PipelineRefused(reason),
+            rollback_failures: Vec::new(),
+        };
+        assert_eq!(multi_capenc_start_close_reason(&error), reason);
+    }
+
+    #[test]
+    fn multi_monitor_generic_start_errors_keep_generic_close_reason() {
+        let error = multi_capenc::MultiCapencStartError::PipelineStartFailed {
+            session_monitor_id: arcen_media::SessionMonitorId::new(2).expect("monitor"),
+            head: "DFP-1".to_string(),
+            output_index: 1,
+            failure_index: 0,
+            source: capenc::CapencStartError::InvalidConfig("internal".to_string()),
+            rollback_failures: Vec::new(),
+        };
+        assert_eq!(
+            multi_capenc_start_close_reason(&error),
+            CAPTURE_ENCODER_INIT_FAILED
+        );
+    }
+
+    #[test]
     fn multi_monitor_attachment_must_terminate_desktop_when_it_never_became_usable() {
         // The very first attachment against a freshly committed plan
         // (never yet proven usable) that failed to reach a usable state
@@ -9846,6 +10166,107 @@ mod tests {
             cursor_mode: CursorMode::Local,
             cursor_in_video: false,
         }
+    }
+
+    #[test]
+    fn speed_quality_echo_uses_served_contract_not_raw_detail_token() {
+        let plan = resolved_media_plan();
+        let contract = served_pipeline_contract_for_quality(
+            Some(arcen_media::video::PipelineId::Speed),
+            plan,
+            arcen_media::video::MotionPriority::Detail,
+            Some(plan.backend.accelerator_class()),
+            false,
+        )
+        .expect("Speed served contract");
+        assert_eq!(contract.intent, EncodeIntent::Interactive);
+        assert_eq!(
+            contract.priority,
+            arcen_media::video::MotionPriority::Motion
+        );
+        assert_eq!(contract.encoder_buffer_frames, 1.0);
+    }
+
+    #[test]
+    fn linux_multi_monitor_mixed_nvenc_openh264_serves_software() {
+        let primary = resolved_media_plan();
+        let mut secondary = resolved_media_plan();
+        secondary.backend = EncoderBackend::OpenH264;
+        secondary.fps = 30;
+        let mut cfg = Config {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            ..Config::default()
+        };
+        cfg.codec_pinned = false;
+        cfg.variant_pinned = false;
+
+        let aggregate = aggregate_plan_acceleration([&primary, &secondary]);
+        assert_eq!(
+            aggregate,
+            Some(arcen_media::video::AcceleratorClass::Software)
+        );
+        assert_eq!(
+            served_stream_pipeline_for_backend(
+                &cfg,
+                &primary,
+                arcen_media::video::MotionPriority::Motion,
+                aggregate,
+            ),
+            arcen_protocol::messages::ServedStreamPipeline::Software,
+            "any software monitor must badge the whole session as software fallback"
+        );
+    }
+
+    #[test]
+    fn linux_multi_monitor_all_nvenc_preserves_product_pipeline() {
+        let primary = resolved_media_plan();
+        let secondary = resolved_media_plan();
+        let mut cfg = Config {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            ..Config::default()
+        };
+        cfg.codec_pinned = false;
+        cfg.variant_pinned = false;
+
+        let aggregate = aggregate_plan_acceleration([&primary, &secondary]);
+        assert_eq!(
+            aggregate,
+            Some(arcen_media::video::AcceleratorClass::Hardware)
+        );
+        assert_eq!(
+            served_stream_pipeline_for_backend(
+                &cfg,
+                &primary,
+                arcen_media::video::MotionPriority::Motion,
+                aggregate,
+            ),
+            arcen_protocol::messages::ServedStreamPipeline::Speed
+        );
+    }
+
+    #[test]
+    fn linux_single_monitor_served_pipeline_is_unchanged() {
+        let primary = resolved_media_plan();
+        let mut cfg = Config {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            ..Config::default()
+        };
+        cfg.codec_pinned = false;
+        cfg.variant_pinned = false;
+
+        let single = served_stream_pipeline_for_backend(
+            &cfg,
+            &primary,
+            arcen_media::video::MotionPriority::Motion,
+            Some(primary.backend.accelerator_class()),
+        );
+        let aggregate = served_stream_pipeline_for_backend(
+            &cfg,
+            &primary,
+            arcen_media::video::MotionPriority::Motion,
+            aggregate_plan_acceleration([&primary]),
+        );
+        assert_eq!(aggregate, single);
     }
 
     mod color_negotiation {
@@ -11118,7 +11539,8 @@ mod tests {
         let (idr, mut idr_rx) = fake_idr();
         let (control, _control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let json = serde_json::to_string(&RequestFullFrameMsg::default()).unwrap();
         let session_health = Mutex::new(crate::observability::SessionHealth::new(
@@ -11134,14 +11556,14 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
             Instant::now(),
         );
 
-        assert!(matches!(idr_rx.try_recv(), Ok(StdinCmd::Idr)));
+        assert!(matches!(idr_rx.try_recv(), Ok(())));
 
         handle_control_json(
             &json,
@@ -11151,7 +11573,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11159,8 +11581,13 @@ mod tests {
         );
         assert!(
             idr_rx.try_recv().is_err(),
-            "the existing 500ms guard must suppress repeated typed requests"
+            "the 500ms guard must coalesce repeated typed requests"
         );
+        let due = Instant::now() + FULL_FRAME_IDR_GUARD;
+        if full_frame_requests.poll(due).deliver_now {
+            request_full_frame_idr(std::slice::from_ref(&idr));
+        }
+        assert!(matches!(idr_rx.try_recv(), Ok(())));
     }
 
     #[test]
@@ -11176,7 +11603,8 @@ mod tests {
         let all_monitor_idrs = [primary_idr, secondary_a_idr, secondary_b_idr];
         let (control, _control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let json = serde_json::to_string(&RequestFullFrameMsg::default()).unwrap();
         let session_health = Mutex::new(crate::observability::SessionHealth::new(
@@ -11192,7 +11620,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11200,7 +11628,7 @@ mod tests {
         );
 
         for rx in [&mut primary_rx, &mut secondary_a_rx, &mut secondary_b_rx] {
-            assert!(matches!(rx.try_recv(), Ok(StdinCmd::Idr)));
+            assert!(matches!(rx.try_recv(), Ok(())));
             assert!(
                 rx.try_recv().is_err(),
                 "each monitor's idr must be requested exactly once per request_full_frame"
@@ -11213,7 +11641,8 @@ mod tests {
         let (idr, _idr_rx) = fake_idr();
         let (control, mut control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let ping = HealthPingMsg {
             timestamp_ms: 1_700_000_000_000,
@@ -11243,7 +11672,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11275,7 +11704,8 @@ mod tests {
         let (idr, _idr_rx) = fake_idr();
         let (control, _control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let ping = HealthPingMsg {
             client_telemetry: Some(ClientTelemetrySnapshotMsg {
@@ -11303,7 +11733,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11483,7 +11913,8 @@ mod tests {
         let (idr, _idr_rx) = fake_idr();
         let (control, _control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
         let session_health = Mutex::new(crate::observability::SessionHealth::new(
@@ -11506,7 +11937,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11519,7 +11950,8 @@ mod tests {
         let (idr, _idr_rx) = fake_idr();
         let (control, mut control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
         let session_health = Mutex::new(crate::observability::SessionHealth::new(
@@ -11534,7 +11966,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11557,7 +11989,8 @@ mod tests {
         let (idr, _idr_rx) = fake_idr();
         let (control, mut control_rx) = ControlSender::channel(1);
         let plan = resolved_media_plan();
-        let mut last_request = Instant::now();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
         let session_health = Mutex::new(crate::observability::SessionHealth::new(
@@ -11572,7 +12005,7 @@ mod tests {
             &session_log_id,
             None,
             None,
-            &mut last_request,
+            &mut full_frame_requests,
             &mut input_sequence,
             plan.cursor_mode,
             &session_health,
@@ -11741,6 +12174,8 @@ mod tests {
             &emitter,
             test_session_log_id(),
             &plan,
+            Some(plan.backend.accelerator_class()),
+            Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
             Some("alice"),
             Some("198.51.100.7"),
         );
@@ -11757,6 +12192,10 @@ mod tests {
             fields.get("codec"),
             Some(&FieldValue::String(plan.codec_token().to_string()))
         );
+        assert_eq!(
+            fields.get("pipeline"),
+            Some(&FieldValue::String("auto".to_string()))
+        );
     }
 
     /// The colour identity fields are *optional* in the lifecycle schema, so
@@ -11772,6 +12211,8 @@ mod tests {
             &emitter,
             test_session_log_id(),
             &plan,
+            Some(plan.backend.accelerator_class()),
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
             Some("alice"),
             Some("198.51.100.7"),
         );
@@ -11977,6 +12418,8 @@ mod tests {
             &emitter,
             test_session_log_id(),
             &resolved_media_plan(),
+            Some(EncoderBackend::NativeNvenc.accelerator_class()),
+            None,
             Some("alice"),
             Some("198.51.100.7"),
         );

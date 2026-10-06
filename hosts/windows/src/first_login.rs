@@ -66,23 +66,188 @@ pub fn acceptable_scenarios(expected: UsageScenario) -> &'static [UsageScenario]
 /// permanently black capture item.
 pub const POST_LOGIN_STABILITY: Duration = Duration::from_secs(15);
 
+/// Continuous positive input-desktop evidence required in the per-session
+/// agent before capture starts.
+pub const INPUT_DESKTOP_READY_STABILITY: Duration = Duration::from_millis(1_500);
+
+/// Positive evidence that the user desktop has replaced LogonUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopReadinessEvidence {
+    /// The target session's input desktop is the ordinary user desktop.
+    InputDesktopDefault,
+}
+
+impl DesktopReadinessEvidence {
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::InputDesktopDefault => "desktop_default",
+        }
+    }
+
+    #[must_use]
+    pub const fn detail(self) -> Option<&'static str> {
+        match self {
+            Self::InputDesktopDefault => Some("Default"),
+        }
+    }
+}
+
+/// One broker observation of a candidate session and any desktop-readiness
+/// evidence gathered for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct SessionStabilityObservation {
+    pub exact_bound: bool,
+    pub desktop_ready: Option<DesktopReadinessEvidence>,
+}
+
+impl SessionStabilityObservation {
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn exact_without_desktop_evidence(exact_bound: bool) -> Self {
+        Self {
+            exact_bound,
+            desktop_ready: None,
+        }
+    }
+}
+
+/// Why the stability gate completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStabilityReady {
+    /// The conservative fixed wait elapsed.
+    Ceiling { waited: Duration },
+    /// Positive desktop-readiness evidence remained continuously true.
+    DesktopEvidence {
+        evidence: DesktopReadinessEvidence,
+        waited: Duration,
+    },
+}
+
+impl SessionStabilityReady {
+    #[must_use]
+    pub const fn waited(self) -> Duration {
+        match self {
+            Self::Ceiling { waited } | Self::DesktopEvidence { waited, .. } => waited,
+        }
+    }
+
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Ceiling { .. } => "post_login_ceiling",
+            Self::DesktopEvidence { evidence, .. } => evidence.kind(),
+        }
+    }
+
+    #[must_use]
+    pub const fn evidence_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Ceiling { .. } => None,
+            Self::DesktopEvidence { evidence, .. } => evidence.detail(),
+        }
+    }
+}
+
+/// Per-session input-desktop gate used immediately before capture starts.
+#[derive(Debug, Default)]
+pub struct InputDesktopGate {
+    first_default: Option<Duration>,
+}
+
+impl InputDesktopGate {
+    /// Observe whether `OpenInputDesktop` reported the ordinary Default
+    /// desktop. Probe errors reset only the positive-evidence sequence; they
+    /// never reset the ceiling timer and never mean ready.
+    #[must_use]
+    pub fn observe<E>(
+        &mut self,
+        elapsed: Duration,
+        desktop_default: Result<bool, E>,
+    ) -> Option<SessionStabilityReady> {
+        if elapsed >= POST_LOGIN_STABILITY {
+            return Some(SessionStabilityReady::Ceiling { waited: elapsed });
+        }
+        match desktop_default {
+            Ok(true) => {
+                let first = self.first_default.get_or_insert(elapsed);
+                if elapsed.saturating_sub(*first) >= INPUT_DESKTOP_READY_STABILITY {
+                    Some(SessionStabilityReady::DesktopEvidence {
+                        evidence: DesktopReadinessEvidence::InputDesktopDefault,
+                        waited: elapsed,
+                    })
+                } else {
+                    None
+                }
+            }
+            Ok(false) | Err(_) => {
+                self.first_default = None;
+                None
+            }
+        }
+    }
+}
+
 /// Pure gate used by the Windows WTS poll to require a continuous exact bind
 /// before launching the user-session agent.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SessionStability {
     first_exact: Option<Duration>,
+    first_desktop_ready: Option<Duration>,
+    desktop_ready_kind: Option<&'static str>,
 }
 
 impl SessionStability {
+    #[allow(dead_code)]
     pub fn observe(&mut self, elapsed: Duration, exact_bound: bool) -> bool {
-        if !exact_bound {
-            self.first_exact = None;
-            return false;
-        }
-        let first_exact = self.first_exact.get_or_insert(elapsed);
-        elapsed.saturating_sub(*first_exact) >= POST_LOGIN_STABILITY
+        self.observe_desktop(
+            elapsed,
+            SessionStabilityObservation::exact_without_desktop_evidence(exact_bound),
+        )
+        .is_some()
     }
 
+    #[allow(dead_code)]
+    pub fn observe_desktop(
+        &mut self,
+        elapsed: Duration,
+        observation: SessionStabilityObservation,
+    ) -> Option<SessionStabilityReady> {
+        let exact_bound = observation.exact_bound;
+        if !exact_bound {
+            self.reset();
+            return None;
+        }
+        let first_exact = self.first_exact.get_or_insert(elapsed);
+        if let Some(evidence) = observation.desktop_ready {
+            if self.desktop_ready_kind == Some(evidence.kind()) {
+                let first_desktop_ready = self.first_desktop_ready.get_or_insert(elapsed);
+                if elapsed.saturating_sub(*first_desktop_ready) >= INPUT_DESKTOP_READY_STABILITY {
+                    return Some(SessionStabilityReady::DesktopEvidence {
+                        evidence,
+                        waited: elapsed.saturating_sub(*first_exact),
+                    });
+                }
+            } else {
+                self.desktop_ready_kind = Some(evidence.kind());
+                self.first_desktop_ready = Some(elapsed);
+            }
+        } else {
+            self.first_desktop_ready = None;
+            self.desktop_ready_kind = None;
+        }
+        if elapsed.saturating_sub(*first_exact) >= POST_LOGIN_STABILITY {
+            Some(SessionStabilityReady::Ceiling {
+                waited: elapsed.saturating_sub(*first_exact),
+            })
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn observe_strict<'a>(
         &mut self,
         elapsed: Duration,
@@ -91,10 +256,32 @@ impl SessionStability {
         match observation {
             Ok(exact_bound) => Ok(self.observe(elapsed, exact_bound)),
             Err(error) => {
-                self.first_exact = None;
+                self.reset();
                 Err(error)
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn observe_desktop_strict<'a>(
+        &mut self,
+        elapsed: Duration,
+        observation: Result<SessionStabilityObservation, &'a str>,
+    ) -> Result<Option<SessionStabilityReady>, &'a str> {
+        match observation {
+            Ok(observation) => Ok(self.observe_desktop(elapsed, observation)),
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        self.first_exact = None;
+        self.first_desktop_ready = None;
+        self.desktop_ready_kind = None;
     }
 }
 
@@ -369,6 +556,71 @@ mod tests {
         assert_eq!(
             gate.observe_strict(Duration::from_secs(30), Ok(true)),
             Ok(true)
+        );
+    }
+
+    #[test]
+    fn input_desktop_default_for_one_and_a_half_seconds_is_ready() {
+        let mut gate = InputDesktopGate::default();
+        assert_eq!(gate.observe::<()>(Duration::ZERO, Ok(true)), None);
+        assert_eq!(
+            gate.observe::<()>(Duration::from_millis(1_499), Ok(true)),
+            None
+        );
+        assert_eq!(
+            gate.observe::<()>(Duration::from_millis(1_500), Ok(true)),
+            Some(SessionStabilityReady::DesktopEvidence {
+                evidence: DesktopReadinessEvidence::InputDesktopDefault,
+                waited: Duration::from_millis(1_500),
+            })
+        );
+    }
+
+    #[test]
+    fn input_desktop_flapping_resets_default_evidence() {
+        let mut gate = InputDesktopGate::default();
+        assert_eq!(gate.observe::<()>(Duration::ZERO, Ok(false)), None);
+        assert_eq!(gate.observe::<()>(Duration::from_secs(1), Ok(true)), None);
+        assert_eq!(gate.observe::<()>(Duration::from_secs(2), Ok(false)), None);
+        assert_eq!(gate.observe::<()>(Duration::from_secs(3), Ok(true)), None);
+        assert_eq!(
+            gate.observe::<()>(Duration::from_millis(4_499), Ok(true)),
+            None
+        );
+        assert_eq!(
+            gate.observe::<()>(Duration::from_millis(4_500), Ok(true)),
+            Some(SessionStabilityReady::DesktopEvidence {
+                evidence: DesktopReadinessEvidence::InputDesktopDefault,
+                waited: Duration::from_millis(4_500),
+            })
+        );
+    }
+
+    #[test]
+    fn input_desktop_errors_only_allow_the_ceiling() {
+        let mut gate = InputDesktopGate::default();
+        assert_eq!(gate.observe(Duration::ZERO, Err("access_denied")), None);
+        assert_eq!(
+            gate.observe(Duration::from_secs(14), Err("access_denied")),
+            None
+        );
+        assert_eq!(
+            gate.observe(Duration::from_secs(15), Err("access_denied")),
+            Some(SessionStabilityReady::Ceiling {
+                waited: Duration::from_secs(15),
+            })
+        );
+    }
+
+    #[test]
+    fn input_desktop_ceiling_is_ready_without_default_evidence() {
+        let mut gate = InputDesktopGate::default();
+        assert_eq!(gate.observe::<()>(Duration::ZERO, Ok(false)), None);
+        assert_eq!(
+            gate.observe::<()>(Duration::from_secs(15), Ok(false)),
+            Some(SessionStabilityReady::Ceiling {
+                waited: Duration::from_secs(15),
+            })
         );
     }
 }

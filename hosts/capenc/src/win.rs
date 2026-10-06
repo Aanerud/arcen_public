@@ -10,9 +10,9 @@ use crate::log;
 use std::time::Instant;
 
 use windows::core::Interface;
-use windows::Win32::Foundation::E_ACCESSDENIED;
 #[cfg(feature = "mf")]
 use windows::Win32::Foundation::E_INVALIDARG;
+use windows::Win32::Foundation::{E_ACCESSDENIED, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 #[cfg(feature = "nvenc")]
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Resource, D3D11_CPU_ACCESS_WRITE, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE,
-    D3D11_USAGE_STAGING,
+    ID3D11Resource, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_MAP_WRITE, D3D11_USAGE_STAGING,
 };
 #[cfg(feature = "nvenc")]
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -30,8 +30,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MORE_DATA,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::System::Power::{
@@ -367,6 +367,16 @@ struct Capture {
     dupl: IDXGIOutputDuplication,
     width: u32,
     height: u32,
+    dirty_rects: Vec<RECT>,
+    move_rects: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    damage_first_frame: bool,
+    /// Frames on which Desktop Duplication reported pointer movement.
+    ///
+    /// A display with a hardware cursor reports every pointer move here and
+    /// keeps the pointer out of the picture. One whose driver leaves the
+    /// pointer to Windows reports none, because Windows draws it into the
+    /// picture instead, and a Deck that draws its own pointer then shows two.
+    pointer_updates: u64,
 }
 
 impl Capture {
@@ -397,6 +407,10 @@ impl Capture {
             dupl,
             width,
             height,
+            dirty_rects: Vec::new(),
+            move_rects: Vec::new(),
+            damage_first_frame: true,
+            pointer_updates: 0,
         })
     }
 
@@ -463,6 +477,7 @@ impl Capture {
                     self.dupl = dupl;
                     self.width = w;
                     self.height = h;
+                    self.damage_first_frame = true;
                     if (w, h) != (prev_w, prev_h) {
                         log(&format!(
                             "duplication re-established at {w}x{h} (was {prev_w}x{prev_h}) \
@@ -538,6 +553,139 @@ impl Capture {
         &self._context
     }
 
+    #[cfg(feature = "nvenc")]
+    fn mark_whole_frame(&self, damage: &mut arcen_keel::ExternalDamage) {
+        damage.mark_rect(arcen_keel::PixelRect {
+            x: 0,
+            y: 0,
+            width: self.width as usize,
+            height: self.height as usize,
+        });
+    }
+
+    #[cfg(feature = "nvenc")]
+    unsafe fn collect_move_rects(
+        &mut self,
+        damage: &mut arcen_keel::ExternalDamage,
+    ) -> windows::core::Result<usize> {
+        let mut required = 0u32;
+        let bytes = self
+            .move_rects
+            .len()
+            .saturating_mul(std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
+        let status = self.dupl.GetFrameMoveRects(
+            u32::try_from(bytes).unwrap_or(u32::MAX),
+            self.move_rects.as_mut_ptr(),
+            &mut required,
+        );
+        if let Err(error) = status {
+            if error.code() != DXGI_ERROR_MORE_DATA {
+                return Err(error);
+            }
+            let needed = required as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+            self.move_rects
+                .resize(needed, DXGI_OUTDUPL_MOVE_RECT::default());
+            self.dupl
+                .GetFrameMoveRects(required, self.move_rects.as_mut_ptr(), &mut required)?;
+        }
+        let count = required as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+        for rect in &self.move_rects[..count] {
+            damage.mark_move_rect(
+                i64::from(rect.SourcePoint.x),
+                i64::from(rect.SourcePoint.y),
+                i64::from(rect.DestinationRect.left),
+                i64::from(rect.DestinationRect.top),
+                i64::from(rect.DestinationRect.right),
+                i64::from(rect.DestinationRect.bottom),
+            );
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "nvenc")]
+    unsafe fn collect_dirty_rects(
+        &mut self,
+        damage: &mut arcen_keel::ExternalDamage,
+    ) -> windows::core::Result<usize> {
+        let mut required = 0u32;
+        let bytes = self
+            .dirty_rects
+            .len()
+            .saturating_mul(std::mem::size_of::<RECT>());
+        let status = self.dupl.GetFrameDirtyRects(
+            u32::try_from(bytes).unwrap_or(u32::MAX),
+            self.dirty_rects.as_mut_ptr(),
+            &mut required,
+        );
+        if let Err(error) = status {
+            if error.code() != DXGI_ERROR_MORE_DATA {
+                return Err(error);
+            }
+            let needed = required as usize / std::mem::size_of::<RECT>();
+            self.dirty_rects.resize(needed, RECT::default());
+            self.dupl
+                .GetFrameDirtyRects(required, self.dirty_rects.as_mut_ptr(), &mut required)?;
+        }
+        let count = required as usize / std::mem::size_of::<RECT>();
+        for rect in &self.dirty_rects[..count] {
+            damage.mark_rect_bounds(
+                i64::from(rect.left),
+                i64::from(rect.top),
+                i64::from(rect.right),
+                i64::from(rect.bottom),
+            );
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "nvenc")]
+    unsafe fn collect_frame_damage(
+        &mut self,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+        damage: &mut arcen_keel::ExternalDamage,
+    ) {
+        if self.damage_first_frame {
+            self.damage_first_frame = false;
+            self.mark_whole_frame(damage);
+            return;
+        }
+        let move_count = match self.collect_move_rects(damage) {
+            Ok(count) => count,
+            Err(error) => {
+                crate::debug_log(&format!(
+                    "DXGI move-rect damage unavailable for this frame ({error:?}); marking full \
+                     frame"
+                ));
+                self.mark_whole_frame(damage);
+                return;
+            }
+        };
+        let dirty_count = match self.collect_dirty_rects(damage) {
+            Ok(count) => count,
+            Err(error) => {
+                crate::debug_log(&format!(
+                    "DXGI dirty-rect damage unavailable for this frame ({error:?}); marking full \
+                     frame"
+                ));
+                self.mark_whole_frame(damage);
+                return;
+            }
+        };
+        if arcen_keel::coalesced_rect_metadata_status(
+            false,
+            info.AccumulatedFrames,
+            move_count.saturating_add(dirty_count),
+        ) == arcen_keel::DamageMetadataStatus::Unknown
+        {
+            crate::debug_log(&format!(
+                "DXGI damage metadata ambiguous (accumulated={} move_rects={} dirty_rects={}); \
+                 marking full frame",
+                info.AccumulatedFrames, move_count, dirty_count
+            ));
+            self.mark_whole_frame(damage);
+        }
+    }
+
     /// Acquire one frame and, if it's a NEW desktop image, hand it to `on_new`
     /// BEFORE `ReleaseFrame` (so the callback can CopyResource the still-valid
     /// surface). Returns true if a new image was staged. Recreates on
@@ -547,6 +695,7 @@ impl Capture {
         &mut self,
         timeout_ms: u32,
         dbg: &mut (u64, u64, u64),
+        mut damage: Option<&mut arcen_keel::ExternalDamage>,
         mut on_new: impl FnMut(&ID3D11Texture2D),
     ) -> windows::core::Result<bool> {
         let mut info: DXGI_OUTDUPL_FRAME_INFO = Default::default();
@@ -557,9 +706,15 @@ impl Capture {
         {
             Ok(()) => {
                 let new_image = info.AccumulatedFrames > 0 || info.LastPresentTime != 0;
+                if info.LastMouseUpdateTime != 0 {
+                    self.pointer_updates += 1;
+                }
                 if new_image {
                     dbg.0 += 1;
                     let tex: ID3D11Texture2D = resource.unwrap().cast()?;
+                    if let Some(ref mut damage) = damage {
+                        self.collect_frame_damage(&info, damage);
+                    }
                     on_new(&tex); // stage (GPU copy) while the frame is still held
                 } else {
                     dbg.2 += 1;
@@ -619,6 +774,25 @@ impl Source {
         }
     }
 
+    fn qp_damage_source(&self) -> crate::nvenc::QpDamageSource {
+        match self {
+            Source::Dda { .. } => crate::nvenc::QpDamageSource::DxgiRects,
+            Source::Wgc(w) if w.dirty_regions_enabled() => {
+                crate::nvenc::QpDamageSource::WgcDirtyRegions
+            }
+            Source::Wgc(_) => crate::nvenc::QpDamageSource::None,
+        }
+    }
+
+    /// Pointer updates Desktop Duplication reported since the last call.
+    /// WGC reports none: it is configured to leave the pointer out.
+    fn take_pointer_updates(&mut self) -> u64 {
+        match self {
+            Source::Dda { capture, .. } => std::mem::take(&mut capture.pointer_updates),
+            Source::Wgc(_) => 0,
+        }
+    }
+
     fn device(&self) -> &ID3D11Device {
         match self {
             Source::Dda { capture, .. } => capture.device(),
@@ -629,6 +803,12 @@ impl Source {
         match self {
             Source::Dda { capture, .. } => capture.context(),
             Source::Wgc(w) => w.context(),
+        }
+    }
+    fn take_raw_frames_superseded(&mut self) -> u64 {
+        match self {
+            Source::Dda { .. } => 0,
+            Source::Wgc(w) => w.take_raw_frames_superseded(),
         }
     }
     fn width(&self) -> u32 {
@@ -647,19 +827,23 @@ impl Source {
         &mut self,
         timeout_ms: u32,
         dbg: &mut (u64, u64, u64),
+        mut damage: Option<&mut arcen_keel::ExternalDamage>,
         mut on_new: impl FnMut(&ID3D11Texture2D),
     ) -> windows::core::Result<bool> {
         match self {
             Source::Dda { capture, primed } => {
                 if let Some(texture) = primed.take() {
                     dbg.0 += 1;
+                    if let Some(ref mut damage) = damage {
+                        capture.mark_whole_frame(damage);
+                    }
                     on_new(&texture);
                     Ok(true)
                 } else {
-                    capture.acquire_into(timeout_ms, dbg, on_new)
+                    capture.acquire_into(timeout_ms, dbg, damage, on_new)
                 }
             }
-            Source::Wgc(w) => w.acquire_into(dbg, &mut on_new),
+            Source::Wgc(w) => w.acquire_into(dbg, damage, &mut on_new),
         }
     }
 }
@@ -679,6 +863,109 @@ unsafe fn retain_texture(
     let dst: ID3D11Resource = retained.cast()?;
     context.CopyResource(&dst, &src);
     Ok(retained)
+}
+
+#[cfg(feature = "nvenc")]
+fn bgra_sample_has_visible_rgb(
+    data: &[u8],
+    row_pitch: usize,
+    width: u32,
+    height: u32,
+    samples_per_axis: u32,
+) -> Result<bool, String> {
+    if width == 0 || height == 0 || samples_per_axis == 0 {
+        return Err("mapped DDA probe texture has invalid geometry".to_string());
+    }
+    let rows = height.min(samples_per_axis);
+    let cols = width.min(samples_per_axis);
+    let row_step = (height / rows.max(1)).max(1);
+    let col_step = (width / cols.max(1)).max(1);
+    for y in 0..rows {
+        let row_offset = ((y * row_step).min(height - 1) as usize)
+            .checked_mul(row_pitch)
+            .ok_or_else(|| "DDA probe row offset overflowed".to_string())?;
+        for x in 0..cols {
+            let px_offset = ((x * col_step).min(width - 1) as usize)
+                .checked_mul(4)
+                .and_then(|value| row_offset.checked_add(value))
+                .ok_or_else(|| "DDA probe pixel offset overflowed".to_string())?;
+            let pixel = data
+                .get(px_offset..px_offset + 3)
+                .ok_or_else(|| "DDA probe sample exceeded mapped texture bounds".to_string())?;
+            if pixel.iter().any(|channel| *channel != 0) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "nvenc")]
+unsafe fn texture_has_visible_bgra_rgb(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+) -> Result<bool, String> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    texture.GetDesc(&mut desc);
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        return Err(format!(
+            "DDA probe cannot classify unsupported texture format {:?}",
+            desc.Format
+        ));
+    }
+    let staging_desc = D3D11_TEXTURE2D_DESC {
+        Width: desc.Width,
+        Height: desc.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: desc.Format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut staging = None;
+    device
+        .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+        .map_err(|error| format!("create DDA probe staging texture: {error:?}"))?;
+    let staging = staging.ok_or_else(|| "DDA probe staging texture was null".to_string())?;
+    let src: ID3D11Resource = texture
+        .cast()
+        .map_err(|error| format!("cast DDA probe source texture: {error:?}"))?;
+    let dst: ID3D11Resource = staging
+        .cast()
+        .map_err(|error| format!("cast DDA probe staging texture: {error:?}"))?;
+    context.CopyResource(&dst, &src);
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    context
+        .Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        .map_err(|error| format!("map DDA probe staging texture: {error:?}"))?;
+    if mapped.pData.is_null() {
+        context.Unmap(&dst, 0);
+        return Err("mapped DDA probe texture returned a null data pointer".to_string());
+    }
+    let mapped_len = (desc.Height.saturating_sub(1) as usize)
+        .checked_mul(mapped.RowPitch as usize)
+        .and_then(|value| value.checked_add(desc.Width as usize * 4))
+        .ok_or_else(|| "mapped DDA probe texture size overflowed".to_string())?;
+    // SAFETY: D3D11 `Map(READ)` returned a non-null pointer to at least every
+    // row described by `RowPitch` for this staging texture until `Unmap`.
+    let mapped_bytes = unsafe { std::slice::from_raw_parts(mapped.pData.cast(), mapped_len) };
+    let visible = bgra_sample_has_visible_rgb(
+        mapped_bytes,
+        mapped.RowPitch as usize,
+        desc.Width,
+        desc.Height,
+        64,
+    );
+    context.Unmap(&dst, 0);
+    visible
 }
 
 /// Pick the live capture backend. Order: forced flag > DXGI DD (probed for
@@ -734,7 +1021,33 @@ unsafe fn select_source(
         log(reason);
         return build_wgc(selector, cursor_mode, wide_capture, hdr_required);
     }
-    match Capture::new(selector) {
+    let mut capture = Capture::new(selector);
+    if matches!(&capture, Err(error) if error.code() == E_ACCESSDENIED) {
+        // Duplication is refused while the secure desktop is showing, and
+        // right after a sign-in that is usually only for a moment. Settling
+        // for WGC at once would keep a capture that may never deliver a frame
+        // of the desktop that follows, so wait for it first.
+        log(&format!(
+            "DXGI Desktop Duplication refused; input desktop: {}; retrying for up to {} s",
+            input_desktop_state(),
+            SECURE_DESKTOP_WAIT.as_secs()
+        ));
+        let waited = Instant::now();
+        while waited.elapsed() < SECURE_DESKTOP_WAIT {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            capture = Capture::new(selector);
+            if !matches!(&capture, Err(error) if error.code() == E_ACCESSDENIED) {
+                break;
+            }
+        }
+        if capture.is_ok() {
+            log(&format!(
+                "DXGI Desktop Duplication available after {} ms",
+                waited.elapsed().as_millis()
+            ));
+        }
+    }
+    match capture {
         Ok(mut cap) => {
             log(&format!(
                 "DXGI ready: {}x{} {} — probing frame delivery",
@@ -753,10 +1066,11 @@ unsafe fn select_source(
             let context = cap.context().clone();
             let mut primed = None;
             let mut retain_error = None;
+            let mut black_probe_frames = 0u64;
             let mut dbg = (0u64, 0u64, 0u64);
             let start = Instant::now();
             while start.elapsed().as_secs_f64() < 1.5 {
-                let _ = cap.acquire_into(50, &mut dbg, |texture| {
+                let _ = cap.acquire_into(50, &mut dbg, None, |texture| {
                     match retain_texture(&device, &context, texture) {
                         Ok(texture) => primed = Some(texture),
                         Err(error) => retain_error = Some(error),
@@ -766,27 +1080,172 @@ unsafe fn select_source(
                     log(&format!("failed to retain DDA probe frame: {error:?}"));
                     break;
                 }
-                if primed.is_some() {
-                    log(&format!(
-                        "capture backend: DXGI Desktop Duplication (delivered new={} cursor={})",
-                        dbg.0, dbg.2
-                    ));
-                    return Source::Dda {
-                        capture: cap,
-                        primed,
-                    };
+                if let Some(texture) = primed.take() {
+                    match texture_has_visible_bgra_rgb(&device, &context, &texture) {
+                        Ok(true) => {
+                            log(&format!(
+                                "capture backend: DXGI Desktop Duplication (delivered new={} \
+                                 cursor={} visible_probe=true)",
+                                dbg.0, dbg.2
+                            ));
+                            return Source::Dda {
+                                capture: cap,
+                                primed: Some(texture),
+                            };
+                        }
+                        Ok(false) => {
+                            black_probe_frames += 1;
+                        }
+                        Err(error) => {
+                            log(&format!(
+                                "DDA probe visibility check unavailable ({error}); accepting \
+                                 delivered desktop image"
+                            ));
+                            return Source::Dda {
+                                capture: cap,
+                                primed: Some(texture),
+                            };
+                        }
+                    }
                 }
             }
             log(&format!(
-                "DXGI delivered 0 desktop images in 1.5s (headless vGPU/RDP?) — falling back to WGC (timeouts={} cursor_only={})",
-                dbg.1, dbg.2
+                "DXGI delivered no visible desktop images in 1.5s (headless vGPU/RDP, inactive \
+                 secondary, or zero-filled DDA?) — falling back to WGC (new={} black_probe={} \
+                 timeouts={} cursor_only={})",
+                dbg.0, black_probe_frames, dbg.1, dbg.2
             ));
             drop(cap);
             build_wgc(selector, cursor_mode, wide_capture, hdr_required)
         }
         Err(e) => {
             log(&format!("DXGI init failed ({e:?}) — falling back to WGC"));
+            // Still refused after the wait. Name the input desktop, because
+            // otherwise the Deck shows black with no reason anywhere.
+            if e.code() == E_ACCESSDENIED {
+                log(&format!(
+                    "DXGI Desktop Duplication still refused after {} s; input desktop: {}",
+                    SECURE_DESKTOP_WAIT.as_secs(),
+                    input_desktop_state()
+                ));
+            }
             build_wgc(selector, cursor_mode, wide_capture, hdr_required)
+        }
+    }
+}
+
+/// How long a refused Desktop Duplication is retried before capture settles
+/// for WGC. Kept well inside the agent's ten-second READY budget.
+/// How often a still desktop is re-sent, matching the Linux NVENC path.
+#[cfg(feature = "nvenc")]
+const IDLE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(feature = "nvenc")]
+const SECURE_DESKTOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Which desktop is receiving input, as far as this session can tell.
+///
+/// The secure desktop (lock screen, sign-in screen, UAC prompt) belongs to
+/// Winlogon and cannot be opened from a user's session, so failing to open the
+/// input desktop is itself the evidence.
+#[cfg(feature = "nvenc")]
+fn input_desktop_state() -> String {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+        DESKTOP_READOBJECTS, UOI_NAME,
+    };
+    // SAFETY: the handle is closed before returning; the name buffer outlives
+    // the call and its byte length is passed.
+    unsafe {
+        let desktop = match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
+            Ok(desktop) => desktop,
+            Err(error) => {
+                return format!(
+                    "not accessible from this session ({error}): the secure desktop is showing \
+                     ({})",
+                    secure_desktop_owner()
+                );
+            }
+        };
+        let mut name = [0u16; 64];
+        let mut needed = 0u32;
+        let read = GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            std::mem::size_of_val(&name) as u32,
+            Some(&mut needed),
+        );
+        let _ = CloseDesktop(desktop);
+        match read {
+            Ok(()) => {
+                let end = name
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(name.len());
+                String::from_utf16_lossy(&name[..end])
+            }
+            Err(error) => format!("open but unnamed ({error})"),
+        }
+    }
+}
+
+/// Which secure-desktop screen this session is showing, from the process that
+/// draws it: `consent.exe` is a UAC prompt, `LogonUI.exe` the lock or sign-in
+/// screen. Both run in the session they cover.
+#[cfg(feature = "nvenc")]
+fn secure_desktop_owner() -> String {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    // SAFETY: the snapshot handle is closed below; the entry is a correctly
+    // sized out-parameter for each call.
+    unsafe {
+        let mut own_session = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut own_session).is_err() {
+            return "lock screen, sign-in screen or a UAC prompt".to_string();
+        }
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return "lock screen, sign-in screen or a UAC prompt".to_string();
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut uac = false;
+        let mut logon_ui = false;
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            let mut session = u32::MAX;
+            if ProcessIdToSessionId(entry.th32ProcessID, &mut session).is_ok()
+                && session == own_session
+            {
+                uac |= name.eq_ignore_ascii_case("consent.exe");
+                logon_ui |= name.eq_ignore_ascii_case("LogonUI.exe");
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        match (uac, logon_ui) {
+            (true, _) => {
+                "a UAC prompt (consent.exe) is waiting for an answer in this session".into()
+            }
+            (false, true) => {
+                "the lock or sign-in screen (LogonUI.exe) is up in this session".into()
+            }
+            (false, false) => {
+                "neither a UAC prompt nor the lock screen was found in this session".into()
+            }
         }
     }
 }
@@ -871,6 +1330,7 @@ unsafe fn build_wgc(
 /// split a single large keyframe across many WebSocket messages (the decoder
 /// then saw truncated NALs and stalled on a black frame).
 #[cfg(feature = "nvenc")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_nvenc_encoder(
     cap: &Source,
     codec: &str,
@@ -878,6 +1338,8 @@ unsafe fn create_nvenc_encoder(
     intent: arcen_media::EncodeIntent,
     priority: arcen_media::video::MotionPriority,
     qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
+    max_bitrate_bps: Option<u32>,
 ) -> Result<crate::nvenc::Encoder, crate::nvenc::NvencInitError> {
     crate::nvenc::Encoder::new(
         cap.device(),
@@ -889,6 +1351,9 @@ unsafe fn create_nvenc_encoder(
         intent,
         priority,
         qp_map_policy,
+        fps,
+        max_bitrate_bps,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
         // From the pool that was actually created, so staging and conversion
         // follow the concrete source format rather than the request.
         cap.is_wide(),
@@ -1038,6 +1503,21 @@ unsafe fn run_encode(
     // change once the source is built.
     let announced_capture = cap.capture_backend();
     let announced_conversion = encoder.conversion_backend();
+    let qp_damage_source = cap.qp_damage_source();
+    let mut qp_external_damage = match qp_damage_source {
+        crate::nvenc::QpDamageSource::DxgiRects | crate::nvenc::QpDamageSource::WgcDirtyRegions => {
+            match arcen_keel::ExternalDamage::new(cap.width() as usize, cap.height() as usize) {
+                Ok(damage) => Some(damage),
+                Err(error) => {
+                    log(&format!(
+                        "QP map external damage disabled: capture size rejected by Keel ({error})"
+                    ));
+                    None
+                }
+            }
+        }
+        crate::nvenc::QpDamageSource::CpuHash | crate::nvenc::QpDamageSource::None => None,
+    };
     log(&format!(
         "capture path selected: capture={} conversion_backend={}",
         announced_capture.ready_token(),
@@ -1117,11 +1597,18 @@ unsafe fn run_encode(
     let mut restage_copied = 0u64;
     let mut restage_skipped = 0u64;
     let mut restage_unavailable = 0u64;
+    let mut raw_superseded_sum = 0u64;
     let mut bytes_sum = 0u64;
     let mut encode_submitted = 0u64;
     let mut encode_skipped_no_new = 0u64;
     let mut ready_announced = false;
     let mut stream_truth = crate::StreamTruthLog::new(codec);
+    // Keel decides when a submission is worth making, exactly as on Linux:
+    // on a new frame, on a requested keyframe, once more to flush NVENC's
+    // output queue, and otherwise once a second. Re-encoding an unchanged
+    // desktop at the full frame rate spent the whole bitrate on nothing.
+    let mut submission_gate = arcen_keel::SubmissionGate::new(IDLE_KEEPALIVE);
+    let mut last_emit = Instant::now();
 
     while !control.stop_requested() {
         // Drain toward the newest frame (short timeout keeps the pace tight and
@@ -1131,7 +1618,10 @@ unsafe fn run_encode(
         // accumulate the next frame while this one is still being converted.
         let mut copy_error = None;
         let mut copy_ms = 0.0f64;
-        let new_frame = match cap.acquire_into(2, &mut dbg, |tex| {
+        if let Some(damage) = qp_external_damage.as_mut() {
+            damage.reset();
+        }
+        let new_frame = match cap.acquire_into(2, &mut dbg, qp_external_damage.as_mut(), |tex| {
             let copy_started = Instant::now();
             let copied = encoder.copy_acquired_texture(tex);
             copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
@@ -1145,9 +1635,18 @@ unsafe fn run_encode(
                 return 3;
             }
         };
+        raw_superseded_sum = raw_superseded_sum.saturating_add(cap.take_raw_frames_superseded());
         if let Some(e) = copy_error {
             log(&format!("stage failed: {e}"));
             return 3;
+        }
+        if new_frame {
+            if let Some(damage) = qp_external_damage.as_ref() {
+                if let Err(error) = encoder.observe_external_damage(damage.damage_map()) {
+                    crate::debug_log(&error);
+                    encoder.clear_qp_observation();
+                }
+            }
         }
         // The DXGI frame is released by this point.
         if new_frame {
@@ -1170,6 +1669,7 @@ unsafe fn run_encode(
                     mirror_ms_max = mirror_ms_max.max(timing.mirror_ms);
                     have_frame = true;
                     have_latest = true;
+                    submission_gate.note_frame();
                     // The encode deadline is usually still in the future when
                     // a capture lands: the loop polls DXGI every ~2 ms while
                     // the ring only submits every ~33 ms. Without carrying
@@ -1195,11 +1695,22 @@ unsafe fn run_encode(
         if !have_frame && started.elapsed().as_millis() >= 1000 {
             have_frame = true;
             announced_black = true;
+            submission_gate.note_frame();
             log("no desktop frame after 1s — streaming blank frames until content arrives");
         }
 
         let now = Instant::now();
         if now >= next {
+            let idr_pending = control.idr_pending();
+            let Some(submission) = submission_gate.decision(idr_pending, last_emit.elapsed())
+            else {
+                encode_skipped_no_new += 1;
+                next += target_dt;
+                if next < now {
+                    next = now + target_dt;
+                }
+                continue;
+            };
             let action = choose_frame_action(new_frame || fresh_pending, have_latest, have_frame);
             match action {
                 FrameAction::NewFrameStaged | FrameAction::SubmitBlank => {}
@@ -1253,8 +1764,11 @@ unsafe fn run_encode(
                 announced_black = false;
                 log("live desktop content flowing");
             }
-            let force = first || control.take_idr();
-            if force && !first {
+            // Consume only the request observed before the cadence decision;
+            // one racing in later stays pending for the next submission.
+            let requested_idr = idr_pending && control.take_idr();
+            let force = first || requested_idr;
+            if requested_idr && !first {
                 log("consuming IDR request");
             }
             if let Some(fps) = control.take_framerate_fps() {
@@ -1302,6 +1816,8 @@ unsafe fn run_encode(
             match encoded {
                 Ok(out) => {
                     first = false; // the forced IDR rode on the submitted frame
+                    submission_gate.on_submitted(submission, out.is_some());
+                    last_emit = now;
                     if let Some(au) = out {
                         stream_truth.observe(&au);
                         if !ready_announced {
@@ -1343,6 +1859,7 @@ unsafe fn run_encode(
         }
 
         if sec.elapsed().as_secs_f64() >= 1.0 {
+            let qp_stats = encoder.take_qp_map_stats();
             let avg = if enc_count > 0 {
                 enc_ms_sum / enc_count as f64
             } else {
@@ -1386,8 +1903,9 @@ unsafe fn run_encode(
                  avg_blank_encode_ms={:.2} max_blank_encode_ms={:.2} \
                  avg_restage_ms={:.2} max_restage_ms={:.2} \
                  restage_copied={} restage_skipped={} restage_unavailable={} kbps={} \
-                 capture_new={} capture_empty={} encode_submitted={} \
-                 encode_skipped_no_new={} timeout={} cursor_only={} want_idr={}",
+                 capture_new={} capture_empty={} raw_superseded={} encode_submitted={} \
+                 encode_skipped_no_new={} timeout={} cursor_only={} pointer_updates={} \
+                 want_idr={}",
                 enc_count,
                 dbg.0,
                 stage_avg,
@@ -1419,11 +1937,19 @@ unsafe fn run_encode(
                 bytes_sum * 8 / 1000,
                 dbg.0,
                 dbg.1 + dbg.2,
+                raw_superseded_sum,
                 encode_submitted,
                 encode_skipped_no_new,
                 dbg.1,
                 dbg.2,
+                cap.take_pointer_updates(),
                 control.idr_pending()
+            ));
+            crate::debug_log(&format!(
+                "QP map stats: biased_maps={} neutral_maps={} mean_dirty_blocks={:.4}",
+                qp_stats.biased_maps,
+                qp_stats.neutral_maps,
+                qp_stats.mean_dirty_fraction()
             ));
             enc_count = 0;
             enc_ms_sum = 0.0;
@@ -1453,6 +1979,7 @@ unsafe fn run_encode(
             restage_copied = 0;
             restage_skipped = 0;
             restage_unavailable = 0;
+            raw_superseded_sum = 0;
             bytes_sum = 0;
             encode_submitted = 0;
             encode_skipped_no_new = 0;
@@ -1594,6 +2121,7 @@ unsafe fn create_headless_selftest_device(
 }
 
 #[cfg(feature = "nvenc")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_selftest(
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -1643,6 +2171,9 @@ unsafe fn run_selftest(
         arcen_media::EncodeIntent::default(),
         arcen_media::video::MotionPriority::Detail,
         qp_map_policy,
+        60,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
         wide_source,
     ) {
         Ok(e) => e,
@@ -1824,6 +2355,7 @@ unsafe fn run_admission_probe(
     codec: &str,
     color: crate::ColorSpec,
     qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
     options: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
     let mut encoder = match crate::nvenc::Encoder::new(
@@ -1837,6 +2369,9 @@ unsafe fn run_admission_probe(
         arcen_media::EncodeIntent::default(),
         arcen_media::video::MotionPriority::Detail,
         qp_map_policy,
+        fps,
+        None,
+        arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
         false,
     ) {
         Ok(encoder) => encoder,
@@ -2217,6 +2752,9 @@ fn nvenc_attempt_for_row(
             arcen_media::EncodeIntent::default(),
             arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
+            60,
+            None,
+            arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
             false,
         )
     } {
@@ -2425,6 +2963,9 @@ fn write_roundtrip_bitstream_for_row(
             arcen_media::EncodeIntent::default(),
             arcen_media::video::MotionPriority::Detail,
             crate::qp_map::QpMapPolicy::Off,
+            60,
+            None,
+            arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
             false,
         )
     }
@@ -2711,7 +3252,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         .iter()
         .find_map(|a| a.strip_prefix("bitrate="))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5000);
+        .unwrap_or(0);
 
     // argv[2] = codec ("h264" | "h265").
     #[cfg(any(feature = "nvenc", feature = "mf", feature = "software-h264"))]
@@ -2765,6 +3306,13 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         Ok(policy) => policy,
         Err(error) => {
             log(&format!("invalid qp-map: {error}"));
+            std::process::exit(2);
+        }
+    };
+    let max_bitrate_bps = match crate::requested_encoder_max_bitrate_bps(&args) {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(error) => {
+            log(&format!("invalid max-bitrate: {error}"));
             std::process::exit(2);
         }
     };
@@ -2844,7 +3392,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             fps: software_fps,
             bitrate_kbps,
             profile: crate::mf_encoder::H264Profile::Main,
-            gop_secs: 2,
+            keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
             framed,
             adapter_hint: adapter_hint.clone(),
             adapter_output_index,
@@ -2883,8 +3431,9 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                 std::process::exit(2);
             }
         };
-        let code =
-            unsafe { run_admission_probe(device, context, &codec, color, qp_map_policy, options) };
+        let code = unsafe {
+            run_admission_probe(device, context, &codec, color, qp_map_policy, fps, options)
+        };
         std::process::exit(code);
     }
 
@@ -2970,22 +3519,46 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                     )
                 };
                 match unsafe {
-                    create_nvenc_encoder(&source, &codec, color, intent, priority, qp_map_policy)
+                    create_nvenc_encoder(
+                        &source,
+                        &codec,
+                        color,
+                        intent,
+                        priority,
+                        qp_map_policy,
+                        fps,
+                        max_bitrate_bps,
+                    )
                 } {
                     Ok(mut encoder) => unsafe {
                         // Construction truthfully records whether this selected
                         // policy received a DELTA-capability trial. Engagement
                         // additionally needs the concrete capture format.
                         if qp_map_policy.submits_map() {
+                            let damage_source = if encoder.prefers_cpu_qp_damage() {
+                                crate::nvenc::QpDamageSource::CpuHash
+                            } else {
+                                source.qp_damage_source()
+                            };
                             let engaged = encoder.enable_qp_map(
                                 qp_map_policy,
                                 arcen_media::video::QpBias::default(),
                                 arcen_media::VideoCodec::from_token(&codec)
                                     .unwrap_or(arcen_media::VideoCodec::H264),
+                                damage_source,
                             );
+                            let reason = if engaged {
+                                ""
+                            } else if matches!(damage_source, crate::nvenc::QpDamageSource::None) {
+                                " reason=no_damage_source"
+                            } else {
+                                " reason=qp_map_unavailable"
+                            };
                             log(&format!(
-                                "QP map policy={} engaged={engaged}",
-                                qp_map_policy.token()
+                                "QP map policy={} engaged={engaged} damage_source={}{}",
+                                qp_map_policy.token(),
+                                damage_source.token(),
+                                reason
                             ));
                         }
                         let code =
@@ -3053,7 +3626,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                     fps: software_fps,
                     bitrate_kbps,
                     profile: crate::mf_encoder::H264Profile::Main,
-                    gop_secs: 2,
+                    keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
                     framed,
                     adapter_hint: adapter_hint.clone(),
                     adapter_output_index,
@@ -3124,7 +3697,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                 fps: software_fps,
                 bitrate_kbps,
                 profile: crate::mf_encoder::H264Profile::Main,
-                gop_secs: 2,
+                keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
                 framed,
                 adapter_hint,
                 adapter_output_index,
@@ -3425,5 +3998,21 @@ mod selector_tests {
             explicit.describe(),
             r"adapter=NVIDIA GeForce RTX 4090 adapter-output=1 device=\\.\DISPLAY2"
         );
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn dda_probe_rejects_uniform_black_samples() {
+        let pixels = vec![0u8; 4 * 4 * 4];
+        assert!(!super::bgra_sample_has_visible_rgb(&pixels, 4 * 4, 4, 4, 4).expect("valid sample"));
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn dda_probe_samples_the_full_surface_for_visible_content() {
+        let mut pixels = vec![0u8; 8 * 8 * 4];
+        let bottom_right = ((7 * 8) + 7) * 4;
+        pixels[bottom_right + 1] = 0x80;
+        assert!(super::bgra_sample_has_visible_rgb(&pixels, 8 * 4, 8, 8, 8).expect("valid sample"));
     }
 }

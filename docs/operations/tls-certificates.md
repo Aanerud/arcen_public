@@ -50,12 +50,22 @@ sudo systemctl reload arcen-pier
 ```
 
 An ordinary install or upgrade takes over a self-signed pair without an
-ownership marker (what every Arcen install before markers left) by itself: the
-key is kept, so paired Decks keep trusting the host, and the certificate is
-reissued with the marker. A CA-issued pair is served as it is and never
-reissued. Only the renewal helpers still need to be told:
+ownership marker only when it positively matches the legacy Arcen installer
+profile. The key is kept, paired Decks keep trusting the host, and the
+certificate is reissued with the marker while preserving the previous DNS/IP
+SANs and merging any new install-time names. Operator self-signed material,
+CA-issued pairs, and files with an invalid or mismatched marker are served as
+operator-managed material and never reissued implicitly. Only the renewal
+helpers still need to be told:
 `-Renew -AdoptLegacyHelperPair` on Windows or `--renew --adopt-legacy` on
 Linux, and never for enterprise/custom PEM.
+
+Residual adoption risk: a marker-less operator-made self-signed certificate
+that exactly reproduces one of Arcen's historical self-signed profiles in the
+Arcen TLS directory, including any matching companion pin files that profile
+wrote, is indistinguishable from an old Arcen install and will be adopted. To
+opt out, install a marker-less CA-issued certificate or a self-signed
+certificate with a deliberately different profile.
 
 Confirm the TLS activation event before removing the staged backup. A failed
 reload retains the last good certificate while valid. At expiry, Pier refuses
@@ -64,13 +74,17 @@ private CA chain; no TOFU prompt is expected for a trusted, name-valid chain.
 
 ## SMB bootstrap and renewal
 
-The helpers generate P-256/SHA-256, server-auth certificates with explicit
-hostname, FQDN, and non-loopback IP SANs. With no issuance flag, they generate
-only when both files are absent. A complete current/custom pair is retained;
-a partial pair fails. OpenSSL and util-linux `flock` are required only by the
-Linux helper. Both helpers serialize issuance and bind their ownership marker
-to the current certificate/key pair; explicit renewal or rekey refuses custom
-material or a stale marker.
+The helpers and installers generate P-256/SHA-256, server-auth certificates
+with explicit hostname, FQDN, and non-loopback IP SANs. With no issuance flag,
+the standalone helpers generate only when both files are absent. The Linux and
+Windows installers additionally take over an unmarked self-signed pair only
+after shared legacy-Arcen classification succeeds, by reissuing over its
+existing key and writing the shared ownership marker; operator self-signed and
+CA-issued pairs are retained. A partial pair fails. OpenSSL and util-linux
+`flock` are required by the Linux helper and matched by the Linux installer.
+Both helpers serialize issuance and bind their ownership marker to the current
+certificate/key pair; explicit renewal or rekey refuses custom material or a
+stale marker.
 
 Windows initial generation, in elevated PowerShell 7+ from the repository:
 
@@ -78,8 +92,9 @@ Windows initial generation, in elevated PowerShell 7+ from the repository:
 .\hosts\windows\scripts\new-host-cert.ps1
 ```
 
-Linux deployment installs the helper and invokes generate-if-missing for the
-current path:
+Linux deployment installs the helper. The installer itself runs the shared
+provisioning plan for the current path during install/upgrade; to invoke the
+helper manually:
 
 ```sh
 sudo /opt/arcen/bin/arcen-new-host-cert --directory /etc/arcen

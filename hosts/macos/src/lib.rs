@@ -45,6 +45,7 @@ pub mod input;
 pub mod input_session;
 #[cfg(target_os = "macos")]
 pub mod media_probe;
+pub mod microphone_input;
 #[cfg(target_os = "macos")]
 pub mod multi_capture;
 #[cfg(target_os = "macos")]
@@ -61,6 +62,8 @@ pub mod session;
 #[cfg(target_os = "macos")]
 pub mod stream;
 pub mod support_bundle;
+#[cfg(target_os = "macos")]
+pub mod timezone;
 pub mod virtual_display;
 /// Whether this host may present an input device macOS did not get from
 /// hardware, which is what Native Tablet needs.
@@ -204,6 +207,15 @@ impl MacOsPlatformConfig {
 }
 
 pub type PierFileConfig = PierConfig<MacOsPlatformConfig>;
+
+/// Whether macOS should request system timezone redirection for a session.
+///
+/// Omission follows the shared built-in default: disabled. Packaged templates
+/// opt in explicitly with `"redirection":{"timezone":true}`.
+#[must_use]
+pub const fn timezone_redirection_enabled(config: &PierFileConfig) -> bool {
+    matches!(config.redirection.timezone, Some(true))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupConfig {
@@ -374,6 +386,14 @@ pub fn parse_config(bytes: &[u8], path: &Path) -> Result<PierFileConfig, ConfigE
         path: path.to_path_buf(),
         message,
     })?;
+    if let Some(qp_map) = config.video.qp_map.as_ref() {
+        qp_map
+            .effective_token("auto")
+            .map_err(|message| ConfigError::Policy {
+                path: path.to_path_buf(),
+                message,
+            })?;
+    }
     Ok(config)
 }
 
@@ -742,6 +762,44 @@ mod tests {
             arcen_media::clipboard::ClipboardContent::Text
         );
         assert_eq!(clipboard.max_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn timezone_redirection_omission_is_disabled_and_true_opts_in() {
+        let omitted = parse_config(
+            valid_config(r#"{"level":2}"#).as_bytes(),
+            Path::new("test.json"),
+        )
+        .expect("omitted parses");
+        assert!(!timezone_redirection_enabled(&omitted));
+
+        let disabled = parse_config(
+            r#"{
+                "audio":{"enabled":false,"compressed":true},
+                "microphone_input":{"enabled":false},
+                "redirection":{"timezone":false},
+                "logging":{"level":2},
+                "platform":{}
+            }"#
+            .as_bytes(),
+            Path::new("test.json"),
+        )
+        .expect("false parses");
+        assert!(!timezone_redirection_enabled(&disabled));
+
+        let enabled = parse_config(
+            r#"{
+                "audio":{"enabled":false,"compressed":true},
+                "microphone_input":{"enabled":false},
+                "redirection":{"timezone":true},
+                "logging":{"level":2},
+                "platform":{}
+            }"#
+            .as_bytes(),
+            Path::new("test.json"),
+        )
+        .expect("true parses");
+        assert!(timezone_redirection_enabled(&enabled));
     }
 
     #[test]

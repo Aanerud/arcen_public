@@ -69,6 +69,21 @@ enters plan resolution at all.
 | VBV buffer | 2 frames | **8 frames** |
 | Lookahead / B-frames | off | **off — forced, see below** |
 
+Speed is still `Interactive`, but its served pipeline contract selects motion
+priority, so the same NVENC low-latency preset/tuning above is paired with a
+one-frame VBV. The vendored NVENC header records the preset trade-off as
+"Performance degrades and quality improves as we move from P1 to P7" and
+warns that presets P3+ for H.264 and P2+ for HEVC enable B-frames by default
+(`third_party/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h:211-213`).
+Arcen therefore keeps P4 with `ULTRA_LOW_LATENCY`, then explicitly clears
+B-frames/lookahead/zero-reorder fields, rather than dropping to P1-P3 on
+documentation alone: Speed is motion-first but still used for video editors
+and 3D artists, and no lab measurement on this branch proved a lower preset
+reduced end-to-end frame age without a visible quality cost. Its bitrate
+controller starts at the proven safe cap and probes to the true 60 fps shape
+ceiling on a clean path; the Deck mirrors that contract by setting
+VideoToolbox real-time decode for Speed sessions.
+
 ### Output ordering is never intent-dependent
 
 **This was got wrong once, in code that looked deliberate, and it produced a

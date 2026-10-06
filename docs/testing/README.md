@@ -169,6 +169,35 @@ not disable host audio and must not be used as evidence that audio passed.
    whole point of the loop: findings travel with the code that produced
    them, and the next round of work starts from what was actually measured.
 
+## 6. Windowed multi-monitor live-session test mode
+
+Single-display Deck Macs can exercise the real multi-monitor wire/session path
+against a real Pier by building the Deck with `dev-tools` and setting:
+
+```sh
+ARCEN_DECK_WINDOWED_MONITORS=2   # exact values: 2, 3, or 4
+ARCEN_DECK_WINDOWED_MONITOR_SIZE=1920x1080   # optional WxH, default 1920x1080
+```
+
+The Deck sends a synthetic requested local layout with that many monitors to the
+Pier, so host virtual-display provisioning, per-monitor streams/decoders, region
+input routing, resize/focus, and teardown all use the normal live-session path.
+Only presentation differs: each negotiated monitor opens as a decorated,
+resizable, non-fullscreen macOS window tiled on one local display. Production
+builds do not compile this mode, and an unset or invalid env var leaves normal
+`MultiWindowPlan` invariants unchanged (including rejecting two production
+fullscreen windows on the same local display).
+
+To build a Developer ID-signed local test bundle without writing to `dist/`:
+
+```sh
+ARCEN_DECK_OUTPUT_DIR=build/deck-windowed \
+ARCEN_DECK_FEATURES=dev-tools \
+ARCEN_CODESIGN_IDENTITY="Developer ID Application: Example Team (TEAMID)" \
+ARCEN_PROVISIONING_PROFILE=/path/to/profile.provisionprofile \
+  packaging/macos/build-deck-app.sh --developer-id-sign
+```
+
 ## 5. Driving a single row interactively
 
 Two independent surfaces exist. Neither requires the Pier.

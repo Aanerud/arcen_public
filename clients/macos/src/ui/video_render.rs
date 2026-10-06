@@ -438,6 +438,52 @@ pub struct VideoColorContract {
     pub transfer: arcen_media::TransferCharacteristics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalLayerCandidate<'a> {
+    is_metal: bool,
+    name: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootPresentationLayerSelection {
+    RootLayer,
+    Sublayer(usize),
+}
+
+fn is_dedicated_presentation_layer_name(name: &str) -> bool {
+    matches!(
+        name,
+        crate::ui::video_metal_layer::DEDICATED_VIDEO_LAYER_NAME
+            | crate::ui::video_metal_layer::DEDICATED_EIGHT_BIT_VIDEO_LAYER_NAME
+    )
+}
+
+fn select_root_presentation_layer(
+    root: MetalLayerCandidate<'_>,
+    sublayers: &[MetalLayerCandidate<'_>],
+) -> Result<RootPresentationLayerSelection, ColorspaceOutcome> {
+    if root.is_metal {
+        return Ok(RootPresentationLayerSelection::RootLayer);
+    }
+
+    let mut selected = None;
+    for (index, candidate) in sublayers.iter().enumerate() {
+        if !candidate.is_metal
+            || candidate
+                .name
+                .is_some_and(is_dedicated_presentation_layer_name)
+        {
+            continue;
+        }
+        if selected.replace(index).is_some() {
+            return Err(ColorspaceOutcome::AmbiguousMetalSublayers);
+        }
+    }
+    selected
+        .map(RootPresentationLayerSelection::Sublayer)
+        .ok_or(ColorspaceOutcome::NoMetalSublayer)
+}
+
 impl Default for VideoColorContract {
     /// The legacy contract: BT.709, limited range, eight-bit, 4:2:0 --
     /// `arcen_media::VideoConfiguration::legacy_h264()`'s own axes.
@@ -1623,9 +1669,13 @@ pub(crate) fn presentation_colorspace_for(
     primaries: arcen_media::ColorPrimaries,
     transfer: arcen_media::TransferCharacteristics,
 ) -> PresentationColorSpace {
-    match transfer {
+    let metadata = arcen_media::PresentationColorMetadata {
+        primaries,
+        transfer,
+    };
+    match metadata.transfer {
         arcen_media::TransferCharacteristics::Pq => PresentationColorSpace::Hdr10Pq,
-        _ => PresentationColorSpace::Sdr(reference_colorspace_for(Some(primaries))),
+        _ => PresentationColorSpace::Sdr(reference_colorspace_for(Some(metadata.primaries))),
     }
 }
 
@@ -1658,6 +1708,9 @@ enum ColorspaceOutcome {
     /// sublayers is a `CAMetalLayer` (e.g. `wgpu`'s surface has not been
     /// created yet on this frame).
     NoMetalSublayer,
+    /// More than one non-dedicated `CAMetalLayer` was present under the
+    /// content view, so applying root pacing/colour would be guesswork.
+    AmbiguousMetalSublayers,
     /// `CGColorSpaceCreateWithName` returned `nil` for a built-in system
     /// colour space. Never expected, but that constructor is fallible and
     /// silently keeping the layer's previous space would be worse than
@@ -1758,82 +1811,14 @@ pub(crate) fn find_root_window(
 /// `-[NSObject isKindOfClass:]`, `-[CAMetalLayer setColorspace:]`) is a
 /// real, stable AppKit/QuartzCore API taking/returning exactly `id`,
 /// `NSUInteger`, a `Class`, or a toll-free `CGColorSpaceRef` -- matched here
-/// by `NSObject`, `usize`, `&AnyClass`, and `*mut c_void` respectively, all
+/// by `NSObject`, `usize`, `&AnyClass`, and `&CGColorSpace` respectively, all
 /// confirmed `Encode`/`EncodeReturn` in `objc2` 0.6.4's own `encode.rs`.
 fn apply_reference_colorspace(colorspace: ReferenceColorSpace) -> ColorspaceOutcome {
     use objc2::msg_send;
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, NSObject, NSObjectProtocol};
-    use objc2_foundation::{MainThreadMarker, NSString};
 
-    let Some(mtm) = MainThreadMarker::new() else {
-        return ColorspaceOutcome::NotMainThread;
-    };
-    let Some(window) = find_root_window(mtm) else {
-        return ColorspaceOutcome::NoRootWindow;
-    };
-    let Some(view) = window.contentView() else {
-        return ColorspaceOutcome::NoContentView;
-    };
-
-    // SAFETY: `view` is the live `Retained<NSView>` just obtained above;
-    // `-[NSView layer]` takes no arguments and returns an optional `id` (the
-    // view's root `CALayer`, or nil if not yet layer-backed). `NSObject`
-    // stands in for the not-yet-typed `CALayer` return, exactly like
-    // `raw-window-metal` 1.1.0's own identical `msg_send![ns_view, layer]`
-    // (see the module doc).
-    let root_layer: Option<Retained<NSObject>> = unsafe { msg_send![&*view, layer] };
-    let Some(root_layer) = root_layer else {
-        return ColorspaceOutcome::NoRootLayer;
-    };
-
-    let Some(metal_class) = AnyClass::get(c"CAMetalLayer") else {
-        return ColorspaceOutcome::NoMetalLayerClass;
-    };
-    let metal_layer = if root_layer.isKindOfClass(metal_class) {
-        Some(root_layer)
-    } else {
-        // SAFETY: `root_layer` is the live `CALayer` just retained above;
-        // `-[CALayer sublayers]` takes no arguments and returns an optional
-        // `NSArray *` (`id`), read the same way as `layer` above.
-        let sublayers: Option<Retained<NSObject>> = unsafe { msg_send![&*root_layer, sublayers] };
-        // `w4-dedicated-metal-layer`'s own, independent `CAMetalLayer`
-        // (`video_metal_layer.rs`) can now *also* be a sublayer here; it is
-        // tagged with this name (`CALayer.name`) specifically so the loop
-        // below can skip it -- see that constant's own doc. Without this
-        // check, this search could find *that* layer first by sublayer
-        // order and misapply the wgpu/egui surface's own colour space to
-        // it instead (or vice versa), since both are plain `CAMetalLayer`s
-        // and `isKindOfClass` alone cannot tell them apart.
-        let dedicated_layer_name =
-            NSString::from_str(crate::ui::video_metal_layer::DEDICATED_VIDEO_LAYER_NAME);
-        sublayers.and_then(|sublayers| {
-            // SAFETY: `sublayers` is the live `NSArray` just retained above;
-            // `-[NSArray count]` takes no arguments and returns `NSUInteger`.
-            let count: usize = unsafe { msg_send![&*sublayers, count] };
-            (0..count).find_map(|index| {
-                // SAFETY: `sublayers` is that same live `NSArray`, and
-                // `index` is always `< count` from the range above, matching
-                // `-[NSArray objectAtIndex:]`'s own bounds contract; it
-                // takes one `NSUInteger` and returns a non-optional `id`.
-                let sublayer: Retained<NSObject> =
-                    unsafe { msg_send![&*sublayers, objectAtIndex: index] };
-                if !sublayer.isKindOfClass(metal_class) {
-                    return None;
-                }
-                // SAFETY: `sublayer` is that same live, just-retained
-                // object, now known to be a `CALayer` (checked immediately
-                // above); `-[CALayer name]` takes no arguments and returns
-                // an optional `NSString *` (`id`).
-                let name: Option<Retained<NSString>> = unsafe { msg_send![&*sublayer, name] };
-                let is_dedicated_layer =
-                    name.is_some_and(|name| name.isEqualToString(&dedicated_layer_name));
-                (!is_dedicated_layer).then_some(sublayer)
-            })
-        })
-    };
-    let Some(metal_layer) = metal_layer else {
-        return ColorspaceOutcome::NoMetalSublayer;
+    let metal_layer = match root_presentation_layer() {
+        Ok(layer) => layer,
+        Err(outcome) => return outcome,
     };
 
     let color_space = match colorspace {
@@ -1866,6 +1851,148 @@ fn apply_reference_colorspace(colorspace: ReferenceColorSpace) -> ColorspaceOutc
     // mismatch silently, which is why it survived this long.
     let _: () = unsafe { msg_send![&*metal_layer, setColorspace: &*color_space] };
     ColorspaceOutcome::Applied
+}
+
+/// The wgpu/egui presentation `CAMetalLayer` of the root window (never a
+/// dedicated video layer), or why it cannot be reached yet.
+fn root_presentation_layer(
+) -> Result<objc2::rc::Retained<objc2::runtime::NSObject>, ColorspaceOutcome> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, NSObject, NSObjectProtocol};
+    use objc2_foundation::{MainThreadMarker, NSString};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return Err(ColorspaceOutcome::NotMainThread);
+    };
+    let Some(window) = find_root_window(mtm) else {
+        return Err(ColorspaceOutcome::NoRootWindow);
+    };
+    let Some(view) = window.contentView() else {
+        return Err(ColorspaceOutcome::NoContentView);
+    };
+
+    // SAFETY: `view` is the live `Retained<NSView>` just obtained above;
+    // `-[NSView layer]` takes no arguments and returns an optional `id` (the
+    // view's root `CALayer`, or nil if not yet layer-backed). `NSObject`
+    // stands in for the not-yet-typed `CALayer` return, exactly like
+    // `raw-window-metal` 1.1.0's own identical `msg_send![ns_view, layer]`
+    // (see the module doc).
+    let root_layer: Option<Retained<NSObject>> = unsafe { msg_send![&*view, layer] };
+    let Some(root_layer) = root_layer else {
+        return Err(ColorspaceOutcome::NoRootLayer);
+    };
+
+    let Some(metal_class) = AnyClass::get(c"CAMetalLayer") else {
+        return Err(ColorspaceOutcome::NoMetalLayerClass);
+    };
+    let metal_layer = if root_layer.isKindOfClass(metal_class) {
+        root_layer
+    } else {
+        // SAFETY: `root_layer` is the live `CALayer` just retained above;
+        // `-[CALayer sublayers]` takes no arguments and returns an optional
+        // `NSArray *` (`id`), read the same way as `layer` above.
+        let sublayers: Option<Retained<NSObject>> = unsafe { msg_send![&*root_layer, sublayers] };
+        // `w4-dedicated-metal-layer`'s own, independent `CAMetalLayer`
+        // (`video_metal_layer.rs`) can now *also* be a sublayer here; it is
+        // tagged with this name (`CALayer.name`) specifically so the loop
+        // below can skip it -- see that constant's own doc. Without this
+        // check, this search could find *that* layer first by sublayer
+        // order and misapply the wgpu/egui surface's own colour space to
+        // it instead (or vice versa), since both are plain `CAMetalLayer`s
+        // and `isKindOfClass` alone cannot tell them apart.
+        let dedicated_ten_bit_layer_name =
+            NSString::from_str(crate::ui::video_metal_layer::DEDICATED_VIDEO_LAYER_NAME);
+        let dedicated_eight_bit_layer_name =
+            NSString::from_str(crate::ui::video_metal_layer::DEDICATED_EIGHT_BIT_VIDEO_LAYER_NAME);
+        let Some(sublayers) = sublayers else {
+            return Err(ColorspaceOutcome::NoMetalSublayer);
+        };
+        let (sublayer_objects, candidates) = {
+            // SAFETY: `sublayers` is the live `NSArray` just retained above;
+            // `-[NSArray count]` takes no arguments and returns `NSUInteger`.
+            let count: usize = unsafe { msg_send![&*sublayers, count] };
+            let mut objects = Vec::with_capacity(count);
+            let mut candidates = Vec::with_capacity(count);
+            for index in 0..count {
+                // SAFETY: `sublayers` is that same live `NSArray`, and
+                // `index` is always `< count` from the range above, matching
+                // `-[NSArray objectAtIndex:]`'s own bounds contract; it
+                // takes one `NSUInteger` and returns a non-optional `id`.
+                let sublayer: Retained<NSObject> =
+                    unsafe { msg_send![&*sublayers, objectAtIndex: index] };
+                let is_metal = sublayer.isKindOfClass(metal_class);
+                let mut name = None;
+                if is_metal {
+                    // SAFETY: `sublayer` is that same live, just-retained
+                    // object, now known to be a `CALayer` (checked immediately
+                    // above); `-[CALayer name]` takes no arguments and returns
+                    // an optional `NSString *` (`id`).
+                    let layer_name: Option<Retained<NSString>> =
+                        unsafe { msg_send![&*sublayer, name] };
+                    if let Some(layer_name) = layer_name {
+                        if layer_name.isEqualToString(&dedicated_ten_bit_layer_name) {
+                            name = Some(crate::ui::video_metal_layer::DEDICATED_VIDEO_LAYER_NAME);
+                        } else if layer_name.isEqualToString(&dedicated_eight_bit_layer_name) {
+                            name = Some(
+                                crate::ui::video_metal_layer::DEDICATED_EIGHT_BIT_VIDEO_LAYER_NAME,
+                            );
+                        }
+                    }
+                }
+                candidates.push(MetalLayerCandidate { is_metal, name });
+                objects.push(sublayer);
+            }
+            (objects, candidates)
+        };
+        match select_root_presentation_layer(
+            MetalLayerCandidate {
+                is_metal: false,
+                name: None,
+            },
+            &candidates,
+        )? {
+            RootPresentationLayerSelection::RootLayer => unreachable!("root is not a CAMetalLayer"),
+            RootPresentationLayerSelection::Sublayer(index) => sublayer_objects
+                .into_iter()
+                .nth(index)
+                .ok_or(ColorspaceOutcome::NoMetalSublayer)?,
+        }
+    };
+    Ok(metal_layer)
+}
+
+/// Makes the root window's presentation layer wait for display refresh
+/// (`true`) or present immediately (`false`). Returns whether the layer now
+/// has that setting.
+///
+/// The Deck configures wgpu with `AutoNoVsync` so multi-display sessions do
+/// not serialise one vblank wait per window. With one window that leaves
+/// nothing capping the UI at display rate, so the AppKit-owned root layer is
+/// paced directly here and re-applied after wgpu surface reconfiguration.
+pub(crate) fn set_root_display_sync(enabled: bool) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::Bool;
+
+    let Ok(layer) = root_presentation_layer() else {
+        return false;
+    };
+
+    // SAFETY: `layer` is the live root `CAMetalLayer` found above;
+    // `-[CAMetalLayer displaySyncEnabled]` takes no arguments and returns
+    // Objective-C `BOOL`. `objc2::runtime::Bool` encodes as `BOOL`; Rust
+    // `bool` would not be the documented Objective-C ABI type.
+    let current: Bool = unsafe { msg_send![&*layer, displaySyncEnabled] };
+    if current.as_bool() != enabled {
+        let desired = Bool::new(enabled);
+        // SAFETY: same live root `CAMetalLayer`; `setDisplaySyncEnabled:`
+        // takes exactly one Objective-C `BOOL` and returns void.
+        let _: () = unsafe { msg_send![&*layer, setDisplaySyncEnabled: desired] };
+    }
+    // SAFETY: same getter and live receiver as above; this verifies whether
+    // the property now holds the requested value after a setter call.
+    let applied: Bool = unsafe { msg_send![&*layer, displaySyncEnabled] };
+    applied.as_bool() == enabled
 }
 
 #[cfg(test)]
@@ -1901,6 +2028,66 @@ mod tests {
             primaries: arcen_media::ColorPrimaries::Bt709,
             transfer: arcen_media::TransferCharacteristics::Bt709,
         }
+    }
+
+    #[test]
+    fn root_layer_selection_skips_both_dedicated_video_layers() {
+        let egui = MetalLayerCandidate {
+            is_metal: true,
+            name: Some("wgpu"),
+        };
+        let ten_bit = MetalLayerCandidate {
+            is_metal: true,
+            name: Some(crate::ui::video_metal_layer::DEDICATED_VIDEO_LAYER_NAME),
+        };
+        let eight_bit = MetalLayerCandidate {
+            is_metal: true,
+            name: Some(crate::ui::video_metal_layer::DEDICATED_EIGHT_BIT_VIDEO_LAYER_NAME),
+        };
+
+        assert_eq!(
+            select_root_presentation_layer(
+                MetalLayerCandidate {
+                    is_metal: false,
+                    name: None,
+                },
+                &[eight_bit, egui, ten_bit],
+            ),
+            Ok(RootPresentationLayerSelection::Sublayer(1))
+        );
+        assert_eq!(
+            select_root_presentation_layer(
+                MetalLayerCandidate {
+                    is_metal: false,
+                    name: None,
+                },
+                &[ten_bit, eight_bit, egui],
+            ),
+            Ok(RootPresentationLayerSelection::Sublayer(2))
+        );
+    }
+
+    #[test]
+    fn root_layer_selection_refuses_ambiguous_non_dedicated_metal_layers() {
+        let egui_a = MetalLayerCandidate {
+            is_metal: true,
+            name: Some("wgpu-a"),
+        };
+        let egui_b = MetalLayerCandidate {
+            is_metal: true,
+            name: None,
+        };
+
+        assert_eq!(
+            select_root_presentation_layer(
+                MetalLayerCandidate {
+                    is_metal: false,
+                    name: None,
+                },
+                &[egui_a, egui_b],
+            ),
+            Err(ColorspaceOutcome::AmbiguousMetalSublayers)
+        );
     }
 
     // ---- VideoUniform::from_contract: range bounds at each depth --------

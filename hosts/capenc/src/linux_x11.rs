@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use arcen_keel::{ActivityHint, BgraFrame, EmitMode, IdleCadence};
 use arcen_media::video::{
-    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_packed_rgb10_to_bgra8, EncoderBackend,
-    I420Frame, I420FrameMut, PackedRgb10Layout, ResolvedMediaPlan, SoftwareH264Config,
-    SoftwareH264Encoder,
+    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_packed_rgb10_to_bgra8,
+    pipeline_contract, EncoderBackend, I420Frame, I420FrameMut, PackedRgb10Layout, PipelineId,
+    ResolvedMediaPlan, SoftwareH264Config, SoftwareH264Encoder,
 };
 use arcen_media::ForcedKeyframe;
 use x11rb::connection::Connection as _;
@@ -42,6 +42,18 @@ const GREEN_MASK: u32 = 0x0000_ff00;
 const BLUE_MASK: u32 = 0x0000_00ff;
 static DAMAGE_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 static SHM_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveFramerateReconfigurePolicy {
+    force_idr: bool,
+}
+
+fn live_framerate_reconfigure_policy() -> LiveFramerateReconfigurePolicy {
+    // OpenH264 applies ENCODER_OPTION_FRAME_RATE live without requiring a
+    // recovery point; forcing IDR here made Detail-priority telemetry cadence
+    // visible as once-per-second keyframe pops on the Software pipeline.
+    LiveFramerateReconfigurePolicy { force_idr: false }
+}
 
 fn warn_once(flag: &AtomicBool, message: impl FnOnce() -> String) {
     if flag
@@ -883,6 +895,21 @@ pub(crate) fn run_with_args(args: Vec<String>) -> ! {
     std::process::exit(run_inner(args))
 }
 
+fn software_bitrate_bounds(
+    width: u32,
+    height: u32,
+    fps: u32,
+    color: crate::ColorSpec,
+) -> (u32, u32) {
+    pipeline_contract(PipelineId::Software).bitrate_bounds(
+        width,
+        height,
+        fps,
+        color.chroma,
+        color.bit_depth,
+    )
+}
+
 fn run_admission_probe(
     capture: X11Capture,
     fps: u32,
@@ -913,16 +940,18 @@ fn run_admission_probe(
         .map(|count| count.get().min(64))
         .unwrap_or(1);
     let threads = u16::try_from(threads).unwrap_or(1);
+    let (start_bps, _) = software_bitrate_bounds(width, height, fps, color);
     let mut encoder = match SoftwareH264Encoder::new(SoftwareH264Config {
         width,
         height,
         fps,
-        bitrate_bps: 8_000_000,
+        bitrate_bps: start_bps,
         num_threads: threads,
         range: color.range,
         matrix: color.matrix,
         primaries: color.primaries,
         transfer: color.transfer,
+        keyframe: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
     }) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -1067,16 +1096,18 @@ fn run_inner(args: Vec<String>) -> i32 {
         .map(|count| count.get().min(64))
         .unwrap_or(1);
     let threads = u16::try_from(threads).unwrap_or(1);
+    let (start_bps, ceiling_bps) = software_bitrate_bounds(width, height, fps, color);
     let mut encoder = match SoftwareH264Encoder::new(SoftwareH264Config {
         width,
         height,
         fps,
-        bitrate_bps: 8_000_000,
+        bitrate_bps: start_bps,
         num_threads: threads,
         range: color.range,
         matrix: color.matrix,
         primaries: color.primaries,
         transfer: color.transfer,
+        keyframe: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
     }) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -1088,9 +1119,12 @@ fn run_inner(args: Vec<String>) -> i32 {
         Err(error) => return failure_code(&error, 2),
     };
     let control = crate::spawn_control_thread("OpenH264");
+    crate::log(&format!(
+        "OpenH264 software bitrate policy: start={start_bps}bps ceiling={ceiling_bps}bps"
+    ));
     let mut cadence = IdleCadence::new(KEEPALIVE);
     cadence.note_frame();
-    let interval = crate::frame_interval_from_fps(fps);
+    let mut interval = crate::frame_interval_from_fps(fps);
     let mut next_tick = Instant::now();
     let mut last_emit = Instant::now();
     let mut ready = false;
@@ -1153,6 +1187,37 @@ fn run_inner(args: Vec<String>) -> i32 {
         }
 
         let now = Instant::now();
+        if let Some(fps) = control.take_framerate_fps() {
+            let fps = fps.clamp(1, MAX_FPS);
+            if fps != encoder.config().fps {
+                match encoder.reconfigure_framerate(fps) {
+                    Ok(()) => {
+                        interval = crate::frame_interval_from_fps(fps);
+                        if live_framerate_reconfigure_policy().force_idr {
+                            encoder.force_idr();
+                        }
+                        crate::log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
+                    }
+                    Err(error) => crate::log(&format!(
+                        "OpenH264 live framerate reconfigure failed: {error}"
+                    )),
+                }
+            }
+        }
+        if let Some(bps) = control.take_bitrate_bps() {
+            let bps = bps.clamp(u64::from(start_bps / 4), u64::from(ceiling_bps));
+            let bps = u32::try_from(bps).unwrap_or(u32::MAX);
+            if bps != encoder.config().bitrate_bps {
+                match encoder.reconfigure_bitrate(bps) {
+                    Ok(()) => crate::log(&format!(
+                        "OpenH264 live bitrate reconfigured: target={bps}bps"
+                    )),
+                    Err(error) => crate::log(&format!(
+                        "OpenH264 live bitrate reconfigure failed: {error}"
+                    )),
+                }
+            }
+        }
         if now >= next_tick {
             let idr_requested = control.take_idr();
             let decision = cadence.decision(idr_requested || modeset_idr, last_emit.elapsed());
@@ -1335,6 +1400,15 @@ mod tests {
             .expect("Philips layout");
         assert_eq!(secondary.byte_len, 1800 * 1130 * 4);
         assert!(checked_layout(1920, 1080, 24, 24, 32, SOFTWARE_MAX_CAPTURE_BYTES).is_err());
+    }
+
+    #[test]
+    fn live_framerate_reconfigure_does_not_request_idr() {
+        assert_eq!(
+            live_framerate_reconfigure_policy(),
+            LiveFramerateReconfigurePolicy { force_idr: false },
+            "OpenH264 ENCODER_OPTION_FRAME_RATE is a live rate-control update, not a recovery point"
+        );
     }
 
     /// Depth 30 is accepted and lays out exactly like depth 24, because both

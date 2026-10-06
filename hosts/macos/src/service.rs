@@ -22,7 +22,11 @@ pub const AGENT_LABEL: &str = "pier.arcen.tech.agent";
 /// Where the desktop agent's definition lives.
 pub const AGENT_PLIST: &str = "/Library/LaunchAgents/pier.arcen.tech.agent.plist";
 /// Labels earlier builds installed, which an upgrade and an uninstall remove.
-pub const LEGACY_LABELS: [&str; 2] = ["pier.arcen.tech", "com.arcen.pier"];
+pub const LEGACY_LABELS: [&str; 3] = [
+    "pier.arcen.tech",
+    "com.arcen.pier",
+    "pier.arcen.tech.timezone-helper",
+];
 /// The installed network service executable.
 pub const PIER_PROGRAM: &str = "/Applications/Arcen Pier.app/Contents/MacOS/arcen-pier-macos";
 /// The installed desktop agent executable. A background helper, so it is not
@@ -91,6 +95,11 @@ pub fn daemon_plist(program: &Path, tls_directory: &Path) -> String {
     <array>
         <string>{APP_BUNDLE_ID}</string>
     </array>
+    <key>MachServices</key>
+    <dict>
+        <key>tech.arcen.microphone</key>
+        <true/>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>{program}</string>
@@ -128,14 +137,12 @@ pub fn daemon_plist(program: &Path, tls_directory: &Path) -> String {
     )
 }
 
-/// Renders the desktop agent's `LaunchAgent` definition.
-///
 /// launchd starts one copy in every graphical session, as that session's user,
 /// which is the only place capture, input injection and the pasteboard work
 /// and the only identity TCC grants them to. The agent holds no key and binds
 /// no port, so any number of sessions can each have one.
 ///
-/// Aqua and LoginWindow. At the login window launchd starts the agent as
+/// Aqua and `LoginWindow`. At the login window launchd starts the agent as
 /// root, which is how the agent knows which session it is in; it serves any
 /// account that authenticates, so that account can sign in, and types through
 /// the virtual HID keyboard, the only input that reaches the login window.
@@ -258,6 +265,15 @@ unsafe extern "C" {
 /// Returns [`ServiceError`] when not root, when the binary is missing, or when
 /// launchd refuses the definition.
 pub fn install(program: &Path, tls_directory: &Path) -> Result<(), ServiceError> {
+    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
+
+    fn step(transaction: &mut InstallTransaction, event: InstallEvent) -> Result<(), ServiceError> {
+        transaction
+            .apply(event)
+            .map(|_| ())
+            .map_err(|error| ServiceError::Transaction(error.to_string()))
+    }
+
     if !is_root() {
         return Err(ServiceError::NeedsRoot);
     }
@@ -268,13 +284,6 @@ pub fn install(program: &Path, tls_directory: &Path) -> Result<(), ServiceError>
     // the other two hosts do not follow. It also refuses to let activation be
     // reported before staging, which is the mistake that leaves a machine
     // claiming to run a service whose definition was never written.
-    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
-    fn step(transaction: &mut InstallTransaction, event: InstallEvent) -> Result<(), ServiceError> {
-        transaction
-            .apply(event)
-            .map(|_| ())
-            .map_err(|error| ServiceError::Transaction(error.to_string()))
-    }
     let mut transaction = InstallTransaction::new();
     step(&mut transaction, InstallEvent::PreflightPassed)?;
 

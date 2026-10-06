@@ -30,7 +30,7 @@ use arcen_protocol::messages::{
     MouseMoveRelativeMsg, MouseScrollMsg, MultiMonitorCarrierMsg, PenEventMsg, QualitySettings,
     RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg, RegionPointerEnterMsg,
     RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg, RequestFullFrameMsg,
-    ResumeErrorCode, ServerColorCaps, ServerHelloMsg, ServerMultiMonitorMsg,
+    ResumeErrorCode, ServedPipelineMsg, ServerColorCaps, ServerHelloMsg, ServerMultiMonitorMsg,
     TabletModeCapabilitiesMsg, TabletModeMsg, TabletModeReason, TabletModeResultMsg, TextCommitMsg,
     AUTH_METHOD_RESUME, AUTH_REQUEST, AUTH_RESPONSE, AUTH_RESULT, CLIENT_HELLO, CLIPBOARD_DATA,
     DISPLAY_UPDATE, HEALTH_PING, HEALTH_PONG, HEALTH_STATS, INPUT_PROTOCOL_VERSION,
@@ -626,6 +626,7 @@ async fn run_broker(
     host_identity: arcen_identity::HostIdentity,
     session_shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    cfg.debug_diagnostics = profile.includes(arcen_telemetry::OperationalProfile::Debug);
     log_state(peer, ServerState::Authenticating);
     let resume_supported = cfg.reconnect_window_secs > 0;
     let mut multi_monitor_gate =
@@ -1642,6 +1643,24 @@ fn cp_failure_reason_class(error: &crate::first_login::FirstLoginError) -> &'sta
     }
 }
 
+/// Unwraps a result on the way to READY, telling the broker why first.
+///
+/// Before READY the broker is waiting for this agent. An agent that leaves
+/// with a bare `?` closes the socket without a word, and the Deck reports only
+/// "Connection reset without closing handshake".
+macro_rules! or_report {
+    ($ws:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                let error: String = error;
+                send_agent_failure(&mut $ws, &error).await;
+                return Err(error);
+            }
+        }
+    };
+}
+
 pub async fn run_agent<S>(
     mut ws: WebSocketStream<S>,
     expected_session_log_id: CorrelationId,
@@ -1820,7 +1839,7 @@ where
         name: resolved_output.adapter_name.clone(),
         output_index: resolved_output.adapter_output_index,
     };
-    config.apply_software_h264_backend(display_encoder)?;
+    or_report!(ws, config.apply_software_h264_backend(display_encoder));
     run_authenticated_agent(
         ws,
         config,
@@ -1845,6 +1864,12 @@ enum ActiveDisplayLease {
     Single(DisplayLease),
     Multi(MultiDisplayLease),
 }
+
+#[cfg(windows)]
+type ActiveAdvancedColorGuard = crate::advanced_color::AdvancedColorSessionGuard;
+
+#[cfg(not(windows))]
+struct ActiveAdvancedColorGuard;
 
 impl ActiveDisplayLease {
     fn report(&self) -> &DisplayReport {
@@ -1880,10 +1905,41 @@ impl ActiveDisplayLease {
         }
     }
 
+    fn advanced_color_prepared_for(&self, desired_hdr: bool, device_names: &[String]) -> bool {
+        match self {
+            Self::Single(display) => display.advanced_color_prepared_for(desired_hdr, device_names),
+            Self::Multi(_) => false,
+        }
+    }
+
     fn restore(&mut self) -> Result<(), String> {
         match self {
             Self::Single(display) => display.restore(),
             Self::Multi(display) => display.restore(),
+        }
+    }
+
+    fn restore_with_advanced_color(
+        &mut self,
+        advanced_color: &mut Option<ActiveAdvancedColorGuard>,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        let advanced_color_restore = advanced_color
+            .as_mut()
+            .map_or(Ok(()), |guard| guard.restore());
+        #[cfg(not(windows))]
+        let advanced_color_restore: Result<(), String> = Ok(());
+        if advanced_color_restore.is_err() {
+            return advanced_color_restore;
+        }
+        *advanced_color = None;
+        let display_restore = self.restore();
+        match (display_restore, advanced_color_restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(display_error), Err(hdr_error)) => Err(format!(
+                "{display_error}; Advanced Color restore failed: {hdr_error}"
+            )),
         }
     }
 
@@ -1893,6 +1949,18 @@ impl ActiveDisplayLease {
             Self::Multi(display) => display.commit(),
         }
     }
+}
+
+fn resolved_display_hdr_intent(cfg: &HostConfig) -> bool {
+    let resolved_hdr10 = cfg.transfer == arcen_media::TransferCharacteristics::Pq;
+    arcen_media::video::session_wants_display_hdr(cfg.active_pipeline.as_ref(), resolved_hdr10)
+}
+
+fn apply_resolved_display_hdr_to_request(cfg: &HostConfig, request: &mut DisplayRequest) -> bool {
+    let desired_hdr = resolved_display_hdr_intent(cfg);
+    request.desired_hdr = desired_hdr;
+    request.hdr10 = desired_hdr;
+    desired_hdr
 }
 
 fn physical_topology_settled(
@@ -2071,16 +2139,18 @@ where
             }
         }
         if cfg.multi_monitor.nvidia_headless_effective() {
-            let adapter = cfg
-                .multi_monitor
-                .allowed_adapters
-                .first()
-                .cloned()
-                .ok_or_else(|| {
-                    "NVIDIA headless provisioning has no streaming adapter".to_string()
-                })?;
+            let adapter = or_report!(
+                ws,
+                cfg.multi_monitor
+                    .allowed_adapters
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "NVIDIA headless provisioning has no streaming adapter".to_string()
+                    })
+            );
             let requested_monitors = requested_multi_monitor.requested_topology().monitors();
-            let hdr10 = cfg.transfer == arcen_media::TransferCharacteristics::Pq;
+            let hdr10 = resolved_display_hdr_intent(&cfg);
             let contracts = requested_monitors
                 .iter()
                 .map(|requested| {
@@ -2107,15 +2177,19 @@ where
                         preferred_output_index: None,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>();
+            let contracts = or_report!(ws, contracts);
             let manager = Arc::clone(&display_manager);
             let owner = session_log_id.clone();
             let lease = tokio::task::spawn_blocking(move || {
                 manager.prepare_nvidia_headless_multi(&adapter, contracts, owner)
             })
             .await
-            .map_err(|error| format!("join NVIDIA headless provisioning: {error}"))?
-            .map_err(|error| format!("provision NVIDIA headless outputs: {error}"))?;
+            .map_err(|error| format!("join NVIDIA headless provisioning: {error}"))
+            .and_then(|result| {
+                result.map_err(|error| format!("provision NVIDIA headless outputs: {error}"))
+            });
+            let lease = or_report!(ws, lease);
             nvidia_headless_planning = Some(lease);
         }
         let inventory = match if cfg.iddcx.enabled {
@@ -2147,11 +2221,13 @@ where
         ) {
             crate::multi_monitor_gate::MultiMonitorOutcome::Planned { plan, carrier } => {
                 if cfg.iddcx.enabled {
-                    let adapter = plan
-                        .monitors
-                        .first()
-                        .map(|monitor| monitor.adapter_name.clone())
-                        .ok_or_else(|| "IddCx plan contains no monitors".to_string())?;
+                    let adapter = or_report!(
+                        ws,
+                        plan.monitors
+                            .first()
+                            .map(|monitor| monitor.adapter_name.clone())
+                            .ok_or_else(|| "IddCx plan contains no monitors".to_string())
+                    );
                     cfg.multi_monitor.allowed_adapters = vec![adapter];
                 }
                 tracing::info!(
@@ -2204,13 +2280,17 @@ where
         return Err(error);
     };
     let mut request = monitor_plan.request;
+    let desired_display_hdr = apply_resolved_display_hdr_to_request(&cfg, &mut request);
     let requested = request.size;
     if let Some((multi_plan, _)) = multi_monitor_committed.as_ref() {
-        let primary = multi_plan
-            .monitors
-            .iter()
-            .find(|monitor| monitor.primary)
-            .ok_or_else(|| "multi-monitor plan has no primary output".to_string())?;
+        let primary = or_report!(
+            ws,
+            multi_plan
+                .monitors
+                .iter()
+                .find(|monitor| monitor.primary)
+                .ok_or_else(|| "multi-monitor plan has no primary output".to_string())
+        );
         request.size = DisplaySize {
             width: primary.width,
             height: primary.height,
@@ -2243,7 +2323,7 @@ where
     // Per-encoder mirroring policy: direct NVENC recreates the client display
     // exactly (isolated primary or refuse); the software/paravirtualized path
     // keeps the negotiated ladder because it cannot promise exactness.
-    let policy = if multi_monitor_committed.is_some() {
+    let mut policy = if multi_monitor_committed.is_some() {
         crate::display::DisplayPolicy::Negotiated
     } else {
         match display_encoder {
@@ -2275,8 +2355,11 @@ where
                 return Err(error);
             }
         };
-        let scale = arcen_media::scale120_from_scale(request.scale)
-            .map_err(|error| format!("invalid headless display scale: {error}"))?;
+        let scale = or_report!(
+            ws,
+            arcen_media::scale120_from_scale(request.scale)
+                .map_err(|error| format!("invalid headless display scale: {error}"))
+        );
         let contract = crate::nvapi_headless::HeadlessDisplayContract {
             width: request.size.width,
             height: request.size.height,
@@ -2286,7 +2369,7 @@ where
             scale,
             product_id: request.product_id,
             serial: request.serial,
-            hdr10: request.hdr10,
+            hdr10: desired_display_hdr,
             color: request.color,
             primary: true,
             preferred_output_index: match &cfg.output_selector {
@@ -2297,23 +2380,49 @@ where
         let manager = Arc::clone(&display_manager);
         let owner = session_log_id.clone();
         let adapter_for_task = adapter.clone();
-        let lease = tokio::task::spawn_blocking(move || {
+        let reconciled = tokio::task::spawn_blocking(move || {
             manager.prepare_nvidia_headless_multi(&adapter_for_task, vec![contract], owner)
         })
-        .await
-        .map_err(|error| format!("join NVIDIA headless reconciliation: {error}"))?
-        .map_err(|error| format!("reconcile NVIDIA headless display: {error}"))?;
-        nvidia_headless_planning = Some(lease);
-        wait_for_previous_physical_topology_settle(cfg.multi_monitor.allowed_adapters.clone(), 1)
-            .await
-            .map_err(|error| format!("settle single-monitor headless topology: {error}"))?;
-        // Reconciliation leaves exactly one requested head on the adapter.
-        // Freeze capture to its post-reconciliation ordinal rather than the
-        // stale ordinal from the pre-session inventory.
-        cfg.output_selector = crate::display::OutputSelector::Adapter {
-            name: adapter,
-            output_index: 0,
-        };
+        .await;
+        let reconciled = or_report!(
+            ws,
+            reconciled.map_err(|error| format!("join NVIDIA headless reconciliation: {error}"))
+        );
+        match single_display_reconciliation(reconciled) {
+            SingleDisplayReconciliation::Reconciled(lease) => {
+                nvidia_headless_planning = Some(lease);
+                or_report!(
+                    ws,
+                    wait_for_previous_physical_topology_settle(
+                        cfg.multi_monitor.allowed_adapters.clone(),
+                        1
+                    )
+                    .await
+                    .map_err(|error| format!("settle single-monitor headless topology: {error}"))
+                );
+                // Reconciliation leaves exactly one requested head on the
+                // adapter. Freeze capture to its post-reconciliation ordinal
+                // rather than the stale ordinal from the pre-session inventory.
+                cfg.output_selector = crate::display::OutputSelector::Adapter {
+                    name: adapter,
+                    output_index: 0,
+                };
+            }
+            SingleDisplayReconciliation::UseExistingDisplay(reason) => {
+                tracing::warn!(
+                    target: SESSION,
+                    adapter = %adapter,
+                    %reason,
+                    "NVIDIA cannot rebuild this display (a virtual display adapter's output, \
+                     for example); serving the existing display at the nearest mode instead"
+                );
+                policy = crate::display::DisplayPolicy::Negotiated;
+            }
+            SingleDisplayReconciliation::Refuse(error) => {
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+        }
     }
     let mut deskside_protection = None;
     let mut deskside_hooks = None;
@@ -2326,7 +2435,10 @@ where
             send_agent_failure(&mut ws, &error).await;
             return Err(error);
         }
-        let capture_output = crate::display::resolve_output_selector(&cfg.output_selector)?;
+        let capture_output = or_report!(
+            ws,
+            crate::display::resolve_output_selector(&cfg.output_selector)
+        );
         let evidence = match crate::deskside::collect_evidence(
             &cfg.deskside,
             &windows_session,
@@ -2339,13 +2451,22 @@ where
             }
         };
         let decision = cfg.deskside.policy().decide(Ok(evidence.physical()));
-        let owner = LeaseOwnerId::new(session_log_id.as_str().to_string())
-            .map_err(|error| format!("deskside lease owner: {error}"))?;
+        let owner = or_report!(
+            ws,
+            LeaseOwnerId::new(session_log_id.as_str().to_string())
+                .map_err(|error| format!("deskside lease owner: {error}"))
+        );
         let mut protection = DesksideProtection::new();
-        let input_original = StateFingerprint::new(b"windows-deskside-input-released-v1")
-            .map_err(|error| error.to_string())?;
-        let display_target = StateFingerprint::new(b"windows-exact-isolated-display-v1")
-            .map_err(|error| error.to_string())?;
+        let input_original = or_report!(
+            ws,
+            StateFingerprint::new(b"windows-deskside-input-released-v1")
+                .map_err(|error| error.to_string())
+        );
+        let display_target = or_report!(
+            ws,
+            StateFingerprint::new(b"windows-exact-isolated-display-v1")
+                .map_err(|error| error.to_string())
+        );
         if protection.begin_arm(
             decision,
             owner,
@@ -2487,33 +2608,75 @@ where
             }
         }
     }
+    let mut advanced_color_guard: Option<ActiveAdvancedColorGuard> = None;
     #[cfg(windows)]
-    if request.hdr10 {
+    {
         let device_names = display.device_names();
-        let engaged = tokio::task::spawn_blocking(move || {
-            let targets = crate::advanced_color::targets_for_device_names(&device_names)?;
-            crate::advanced_color::engage_required(&targets)
-        })
-        .await;
-        match engaged {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                let restore = display.restore();
-                let error = match restore {
-                    Ok(()) => format!("enable HDR desktop before capture: {error}"),
-                    Err(restore_error) => format!(
-                        "enable HDR desktop before capture: {error}; display restore failed: \
-                         {restore_error}"
-                    ),
+        let desired_hdr = resolved_display_hdr_intent(&cfg);
+        if display.advanced_color_prepared_for(desired_hdr, &device_names) {
+            tracing::debug!(
+                target: DISPLAY,
+                desired = if desired_hdr { "hdr" } else { "sdr" },
+                devices = ?device_names,
+                "Windows Advanced Color was applied inside the exact display transaction"
+            );
+        } else {
+            let session_log_id_for_advanced_color = session_log_id.clone();
+            let advanced_color = tokio::task::spawn_blocking(move || {
+                let targets = match crate::advanced_color::targets_for_device_names(&device_names) {
+                    Ok(targets) => targets,
+                    Err(error) if !desired_hdr => {
+                        tracing::warn!(
+                            target: DISPLAY,
+                            %error,
+                            "continuing SDR session after failing to resolve Windows HDR targets"
+                        );
+                        return Ok(crate::advanced_color::AdvancedColorSessionGuard::empty());
+                    }
+                    Err(error) => return Err(error),
                 };
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
-            }
-            Err(error) => {
-                let error = format!("Advanced Color task failed: {error}");
-                let _ = display.restore();
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
+                crate::advanced_color::apply_for_session(
+                    &targets,
+                    desired_hdr,
+                    &session_log_id_for_advanced_color,
+                )
+            })
+            .await;
+            match advanced_color {
+                Ok(Ok(guard)) => {
+                    if !guard.is_empty() {
+                        advanced_color_guard = Some(guard);
+                    }
+                }
+                Ok(Err(error)) if !desired_hdr => {
+                    tracing::warn!(
+                        target: DISPLAY,
+                        %error,
+                        "continuing SDR session after failing to disable Windows HDR"
+                    );
+                }
+                Ok(Err(error)) => {
+                    let restore = display.restore_with_advanced_color(&mut advanced_color_guard);
+                    let action = if desired_hdr {
+                        "enable HDR desktop before capture"
+                    } else {
+                        "disable HDR desktop before SDR capture"
+                    };
+                    let error = match restore {
+                        Ok(()) => format!("{action}: {error}"),
+                        Err(restore_error) => {
+                            format!("{action}: {error}; display restore failed: {restore_error}")
+                        }
+                    };
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = format!("Advanced Color task failed: {error}");
+                    let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -2522,7 +2685,7 @@ where
             if let Err(error) =
                 crate::deskside::verify_protected(&cfg.deskside, &cfg.output_selector, binding)
             {
-                let _ = display.restore();
+                let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
                 if let Some(hooks) = deskside_hooks.as_mut() {
                     let _ = hooks.shutdown();
                 }
@@ -2539,7 +2702,7 @@ where
             )) != DesksideEffect::ProtectionEstablished
         {
             let error = "deskside display verification failed".to_string();
-            let _ = display.restore();
+            let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
             if let Some(hooks) = deskside_hooks.as_mut() {
                 let _ = hooks.shutdown();
             }
@@ -2550,7 +2713,7 @@ where
             &crate::recovery::default_path(),
             crate::recovery::DesksideRecoveryStage::Protected,
         ) {
-            let restore = display.restore();
+            let restore = display.restore_with_advanced_color(&mut advanced_color_guard);
             if let Some(hooks) = deskside_hooks.as_mut() {
                 let _ = hooks.shutdown();
             }
@@ -2691,6 +2854,7 @@ where
             }
         };
         let media_plan = prepared_media.video.primary_plan();
+        let aggregate_backend = prepared_media.video.aggregate_accelerator_class();
         let pen_available = prepared_media.pen.is_some();
         let region_input_available = prepared_media.region_input.is_some();
         let multi_monitor_capability = prepared_media.video.multi_capability().cloned();
@@ -2707,6 +2871,7 @@ where
             display.report(),
             &attachment_session_log_id,
             &media_plan,
+            aggregate_backend,
             pen_available,
             region_input_available,
             active_transport,
@@ -2820,10 +2985,12 @@ where
         );
     }
     let final_display_report = display.report().clone();
-    let restore = tokio::task::spawn_blocking(move || display.restore())
-        .await
-        .map_err(|error| format!("display restore task failed: {error}"))
-        .and_then(|result| result);
+    let restore = tokio::task::spawn_blocking(move || {
+        display.restore_with_advanced_color(&mut advanced_color_guard)
+    })
+    .await
+    .map_err(|error| format!("display restore task failed: {error}"))
+    .and_then(|result| result);
     if let Some(protection) = deskside_protection.as_mut() {
         let display_event = if restore.is_ok() {
             DesksideEvent::RestoreSucceeded(DesksideControl::LocalDisplays)
@@ -2930,6 +3097,7 @@ async fn run_attachment_handshake<S>(
     display_report: &DisplayReport,
     session_log_id: &CorrelationId,
     media_plan: &ResolvedMediaPlan,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
     pen_available: bool,
     region_input_available: bool,
     active_transport: &'static str,
@@ -2962,13 +3130,14 @@ where
         },
         "Windows microphone endpoint probe completed"
     );
-    let mut hello = build_server_hello(
+    let mut hello = build_server_hello_with_aggregate(
         cfg,
         display_report,
         plan,
         windows_session,
         agent_log_path,
         media_plan,
+        aggregate_backend,
         microphone_backend_available,
         pen_available,
         region_input_available,
@@ -3101,8 +3270,16 @@ where
     // ceiling to resolve against, so "no preference" is what capture started
     // with — and, until the encoder-recreation work lands, so is a stated
     // preference: this is reported below, never silently claimed.
-    let requested_encode_intent = EncodeIntent::from_token(&quality.encode_intent);
-    if requested_encode_intent.is_none() {
+    let served_contract = cfg
+        .active_pipeline
+        .as_ref()
+        .and_then(arcen_media::video::PipelineId::from_served_wire)
+        .map(arcen_media::video::pipeline_contract);
+    let requested_encode_intent = served_contract
+        .is_none()
+        .then(|| EncodeIntent::from_token(&quality.encode_intent))
+        .flatten();
+    if served_contract.is_none() && requested_encode_intent.is_none() {
         tracing::warn!(
             target: SESSION,
             sid = %session_log_id,
@@ -3110,10 +3287,15 @@ where
             "quality_settings encode_intent token not recognised — treating as no client preference"
         );
     }
-    let resolved_encode_intent = requested_encode_intent.unwrap_or_default();
-    let requested_motion_priority =
-        arcen_media::video::MotionPriority::from_token(&quality.motion_priority);
-    if requested_motion_priority.is_none() {
+    let resolved_encode_intent = served_contract.map_or_else(
+        || requested_encode_intent.unwrap_or_default(),
+        |contract| contract.intent,
+    );
+    let requested_motion_priority = served_contract
+        .is_none()
+        .then(|| arcen_media::video::MotionPriority::from_token(&quality.motion_priority))
+        .flatten();
+    if served_contract.is_none() && requested_motion_priority.is_none() {
         tracing::warn!(
             target: SESSION,
             sid = %session_log_id,
@@ -3121,7 +3303,10 @@ where
             "quality_settings motion_priority token not recognised — treating as no client preference"
         );
     }
-    let resolved_motion_priority = requested_motion_priority.unwrap_or_default();
+    let resolved_motion_priority = served_contract.map_or_else(
+        || requested_motion_priority.unwrap_or_default(),
+        |contract| contract.priority,
+    );
     // Policy precedence, then the absolute client-capability cross-check:
     // never grant more than `client_hello` claimed this client can decode,
     // regardless of what policy would otherwise serve.
@@ -3617,6 +3802,40 @@ fn resolve_session_log_id(value: Option<&str>) -> Result<(CorrelationId, bool), 
     Ok((CorrelationId::from_uuid_v4_bytes(bytes), true))
 }
 
+/// What a single-display NVENC session does after asking NVIDIA to rebuild
+/// its display.
+#[derive(Debug)]
+enum SingleDisplayReconciliation<L> {
+    /// NVIDIA rebuilt the display to the Deck's size.
+    Reconciled(L),
+    /// NVIDIA does not drive this display, and nothing was changed: serve the
+    /// display the host already has.
+    UseExistingDisplay(String),
+    /// The host's displays were being changed when it failed.
+    Refuse(String),
+}
+
+/// Rebuilding the display is how an NVIDIA host serves the Deck's exact size,
+/// but only a display NVIDIA drives can be rebuilt. A display owned by a
+/// virtual display adapter, rendered on a GeForce, is refused by NVAPI while
+/// the host is only being inspected; such a host still streams, at the
+/// nearest mode its display offers.
+fn single_display_reconciliation<L>(
+    result: Result<L, crate::display::HeadlessProvisionError>,
+) -> SingleDisplayReconciliation<L> {
+    match result {
+        Ok(lease) => SingleDisplayReconciliation::Reconciled(lease),
+        Err(crate::display::HeadlessProvisionError::NotApplicable(reason)) => {
+            SingleDisplayReconciliation::UseExistingDisplay(reason)
+        }
+        Err(crate::display::HeadlessProvisionError::Failed(error)) => {
+            SingleDisplayReconciliation::Refuse(format!(
+                "reconcile NVIDIA headless display: {error}"
+            ))
+        }
+    }
+}
+
 async fn send_agent_failure<S>(ws: &mut WebSocketStream<S>, error: &str)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -4087,13 +4306,102 @@ const fn runtime_input_capability(available: bool) -> InputCapabilityAvailabilit
     }
 }
 
-fn build_server_hello(
+fn aggregate_plan_acceleration<'a>(
+    plans: impl IntoIterator<Item = &'a ResolvedMediaPlan>,
+) -> Option<arcen_media::video::AcceleratorClass> {
+    arcen_media::video::aggregate_encoder_backend(
+        plans
+            .into_iter()
+            .map(|plan| Some(plan.backend.accelerator_class())),
+    )
+}
+
+fn served_encoder_backend_label(
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> String {
+    if aggregate == Some(primary.backend.accelerator_class()) {
+        primary.backend.ready_token().to_string()
+    } else {
+        aggregate
+            .map_or("unknown", arcen_media::video::AcceleratorClass::token)
+            .to_string()
+    }
+}
+
+fn served_stream_pipeline(
+    cfg: &HostConfig,
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> arcen_protocol::messages::ServedStreamPipeline {
+    arcen_media::video::served_pipeline(
+        cfg.requested_pipeline,
+        primary.video,
+        primary.fps,
+        cfg.requested_motion_priority(),
+        arcen_media::video::ServedPipelineContext {
+            backend: aggregate,
+            exact_or_admin_override: cfg.codec_pinned
+                || cfg.variant_pinned
+                || cfg.requested_pipeline.is_none(),
+        },
+    )
+}
+
+fn served_pipeline_message(
+    cfg: &HostConfig,
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> ServedPipelineMsg {
+    ServedPipelineMsg::new(
+        served_stream_pipeline(cfg, primary, aggregate),
+        aggregate.map_or("unknown", arcen_media::video::AcceleratorClass::token),
+        aggregate
+            .is_none()
+            .then_some("Windows encoder acceleration is unknown".to_string()),
+    )
+}
+
+fn qp_map_policy_for_capenc(
+    cfg: &HostConfig,
+    capenc: &CapencConfig,
+) -> arcen_media::video::QpMapPolicy {
+    let encoder = capenc.encoder.unwrap_or(cfg.encoder);
+    if encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+        return arcen_media::video::QpMapPolicy::Off;
+    }
+    let video = arcen_media::VideoConfiguration {
+        codec: crate::capenc::media_codec(capenc.codec),
+        chroma: crate::capenc::media_chroma(capenc.chroma),
+        bit_depth: capenc.bit_depth,
+        range: capenc.color_range,
+        matrix: capenc.color_matrix,
+        primaries: capenc.color_primaries,
+        transfer: capenc.transfer,
+    };
+    let served = arcen_media::video::served_pipeline(
+        cfg.requested_pipeline,
+        video,
+        capenc.fps,
+        capenc.motion_priority,
+        arcen_media::video::ServedPipelineContext {
+            backend: Some(arcen_media::video::AcceleratorClass::Hardware),
+            exact_or_admin_override: cfg.codec_pinned
+                || cfg.variant_pinned
+                || cfg.requested_pipeline.is_none(),
+        },
+    );
+    cfg.qp_map_policy_for_served(&served).unwrap_or(cfg.qp_map)
+}
+
+fn build_server_hello_with_aggregate(
     cfg: &HostConfig,
     display: &DisplayReport,
     plan: &SessionDisplayPlan,
     windows_session: &WindowsSessionIdentity,
     agent_log_path: &str,
     media_plan: &ResolvedMediaPlan,
+    aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
     microphone_backend_available: bool,
     pen_available: bool,
     region_input_available: bool,
@@ -4199,12 +4507,15 @@ fn build_server_hello(
         usb_hard_v1: false,
         supports_display_update: windows_display_update_supported(display),
         requires_auth: true,
-        encoder_backend: media_plan.backend.ready_token().to_string(),
+        encoder_backend: served_encoder_backend_label(media_plan, aggregate_backend),
         // Declared by the backend rather than guessed by the client from the
         // token above. Additive metadata only; encoder selection is unchanged.
-        encoder_class: media_plan.backend.accelerator_class().token().to_string(),
+        encoder_class: aggregate_backend
+            .map_or("unknown", arcen_media::video::AcceleratorClass::token)
+            .to_string(),
         available_encoders: BTreeMap::new(),
         codec: media_plan.codec_token().to_string(),
+        active_pipeline: Some(served_stream_pipeline(cfg, media_plan, aggregate_backend)),
         color_caps: ServerColorCaps {
             // Backend capability -- what this resolved backend *could*
             // serve -- not what is currently active; `active_*` below
@@ -4563,7 +4874,15 @@ impl<F: AudioCaptureFactory> AudioRuntime<F> {
 
     async fn shutdown(&mut self, writer_control: &mpsc::Sender<WriterControl>) {
         if let Err(error) = self.set_client_enabled(false, Some(writer_control)).await {
-            tracing::warn!(target: AUDIO, %error, "audio writer barrier failed during shutdown");
+            if is_expected_shutdown_barrier_error(&error) {
+                tracing::info!(
+                    target: AUDIO,
+                    %error,
+                    "audio writer barrier skipped during normal shutdown"
+                );
+            } else {
+                tracing::warn!(target: AUDIO, %error, "audio writer barrier failed during shutdown");
+            }
         }
     }
 
@@ -4638,6 +4957,13 @@ async fn writer_audio_barrier(control: &mpsc::Sender<WriterControl>) -> Result<(
         .map_err(|_| "outbound writer dropped audio barrier".to_string())
 }
 
+fn is_expected_shutdown_barrier_error(error: &str) -> bool {
+    matches!(
+        error,
+        "outbound writer closed before audio barrier" | "outbound writer dropped audio barrier"
+    )
+}
+
 async fn send_display_update_result(
     control: &mpsc::Sender<WriterControl>,
     result: DisplayUpdateResultMsg,
@@ -4651,6 +4977,24 @@ async fn send_display_update_result(
     .await
     .map_err(|_| "timed out queueing display_update_result".to_string())?
     .map_err(|_| "outbound writer closed before display_update_result".to_string())?;
+    writer_audio_barrier(control).await
+}
+
+async fn send_served_pipeline_update(
+    control: &mpsc::Sender<WriterControl>,
+    cfg: &HostConfig,
+    primary: &ResolvedMediaPlan,
+    aggregate: Option<arcen_media::video::AcceleratorClass>,
+) -> Result<(), String> {
+    let text = serde_json::to_string(&served_pipeline_message(cfg, primary, aggregate))
+        .map_err(|error| format!("serialize served_pipeline: {error}"))?;
+    tokio::time::timeout(
+        WS_WRITE_TIMEOUT,
+        control.send(WriterControl::Message(Message::Text(text.into()))),
+    )
+    .await
+    .map_err(|_| "timed out queueing served_pipeline".to_string())?
+    .map_err(|_| "outbound writer closed before served_pipeline".to_string())?;
     writer_audio_barrier(control).await
 }
 
@@ -4709,6 +5053,7 @@ struct PreparedVideoPipeline {
     frames: Arc<VideoQueue<crate::capenc::EncodedFrame>>,
     initial_frame: Option<crate::capenc::EncodedFrame>,
     plan: ResolvedMediaPlan,
+    qp_map: arcen_media::video::QpMapPolicy,
 }
 
 enum PreparedVideo {
@@ -4732,6 +5077,10 @@ impl PreparedVideo {
         }
     }
 
+    fn aggregate_accelerator_class(&self) -> Option<arcen_media::video::AcceleratorClass> {
+        aggregate_plan_acceleration(self.pipelines().iter().map(|pipeline| &pipeline.plan))
+    }
+
     fn primary_pipeline_telemetry(&self) -> crate::capenc::PipelineTelemetrySnapshot {
         match self {
             Self::Single(pipeline) => pipeline.capenc.pipeline_telemetry(),
@@ -4740,6 +5089,18 @@ impl PreparedVideo {
                 .expect("multi-monitor media has a primary pipeline")
                 .capenc
                 .pipeline_telemetry(),
+        }
+    }
+
+    fn primary_pipeline_qp_map(&self) -> arcen_media::video::QpMapPolicy {
+        match self {
+            Self::Single(pipeline) => pipeline.qp_map,
+            Self::Multi { pipelines, .. } => {
+                pipelines
+                    .first()
+                    .expect("multi-monitor media has a primary pipeline")
+                    .qp_map
+            }
         }
     }
 
@@ -4798,8 +5159,15 @@ impl PreparedVideo {
 
     fn request_keyframe_all(&self, reason: &'static str) {
         for pipeline in self.pipelines() {
-            pipeline.capenc.request_keyframe(reason);
+            let _ = pipeline.capenc.request_keyframe(reason);
         }
+    }
+
+    fn request_keyframe(&self, monitor_id: u16, reason: &'static str) -> bool {
+        self.pipelines()
+            .iter()
+            .find(|pipeline| pipeline.monitor_id == monitor_id)
+            .is_some_and(|pipeline| pipeline.capenc.request_keyframe(reason))
     }
 
     fn request_bitrate_all(&self, bps: u64) -> bool {
@@ -4999,6 +5367,8 @@ async fn prepare_attachment_media(
             attempt_cfg.encoder,
             display_encoder,
         ));
+        config.qp_map = qp_map_policy_for_capenc(cfg, &config);
+        let qp_map = config.qp_map;
         match Capenc::spawn(config).await {
             Ok((capenc, frames, plan)) => {
                 capenc.request_keyframe("display_mode_settled_capture_restart");
@@ -5013,6 +5383,7 @@ async fn prepare_attachment_media(
                             frames,
                             initial_frame: None,
                             plan,
+                            qp_map,
                         }),
                     },
                     display_encoder,
@@ -5113,6 +5484,32 @@ async fn prepare_multi_monitor_media(
     } else {
         cfg.fps
     };
+    let template_qp_map = if display_encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+        arcen_media::video::QpMapPolicy::Off
+    } else {
+        let video = arcen_media::VideoConfiguration {
+            codec: crate::capenc::media_codec(codec),
+            chroma: crate::capenc::media_chroma(chroma),
+            bit_depth: cfg.bit_depth,
+            range: cfg.color_range,
+            matrix: cfg.color_matrix,
+            primaries: cfg.color_primaries,
+            transfer: cfg.transfer,
+        };
+        let served = arcen_media::video::served_pipeline(
+            cfg.requested_pipeline,
+            video,
+            template_fps,
+            cfg.requested_motion_priority(),
+            arcen_media::video::ServedPipelineContext {
+                backend: Some(arcen_media::video::AcceleratorClass::Hardware),
+                exact_or_admin_override: cfg.codec_pinned
+                    || cfg.variant_pinned
+                    || cfg.requested_pipeline.is_none(),
+            },
+        );
+        cfg.qp_map_policy_for_served(&served).unwrap_or(cfg.qp_map)
+    };
     let template = crate::multi_monitor_capenc::MonitorPipelineTemplate {
         codec,
         chroma,
@@ -5123,7 +5520,19 @@ async fn prepare_multi_monitor_media(
         color_primaries: cfg.color_primaries,
         intent: cfg.requested_encode_intent(),
         motion_priority: cfg.requested_motion_priority(),
-        qp_map: cfg.qp_map,
+        qp_map: template_qp_map,
+        debug_diagnostics: cfg.debug_diagnostics,
+        qp_map_config: cfg.qp_map_config.clone(),
+        requested_pipeline: cfg.requested_pipeline,
+        codec_pinned: cfg.codec_pinned,
+        variant_pinned: cfg.variant_pinned,
+        encoder_max_bitrate_bps: cfg
+            .active_pipeline
+            .as_ref()
+            .and_then(arcen_media::video::PipelineId::from_served_wire)
+            .and_then(|pipeline| {
+                arcen_media::video::pipeline_contract(pipeline).encoder_ceiling_bps()
+            }),
         fps: template_fps,
         encoder: Some(display_encoder),
         video_selection: cfg.video_selection,
@@ -5229,6 +5638,7 @@ async fn prepare_multi_monitor_media(
             frames: pipeline.frames,
             initial_frame: Some(pipeline.initial_frame),
             plan: pipeline.plan,
+            qp_map: pipeline.qp_map,
         });
     }
     let capability = crate::multi_monitor_gate::build_applied_capability(
@@ -5299,6 +5709,7 @@ async fn prepare_resized_attachment_media(
         session_log_id,
     );
     config.encoder = Some(encoder);
+    let qp_map = config.qp_map;
     let (mut capenc, frames, plan) = Capenc::spawn(config)
         .await
         .map_err(|error| format!("replacement capenc READY failed: {error}"))?;
@@ -5320,6 +5731,7 @@ async fn prepare_resized_attachment_media(
             frames,
             initial_frame: None,
             plan,
+            qp_map,
         }),
     })
 }
@@ -5392,19 +5804,68 @@ fn validate_held_output(
         .device_name
         .eq_ignore_ascii_case(&display_report.device_name)
     {
+        tracing::debug!(
+            target: SESSION,
+            held_device = %display_report.device_name,
+            current_device = %resolved_output.device_name,
+            held_rect = ?display_report.desktop_rect,
+            current_rect = ?resolved_output.desktop_rect,
+            held_global_index = display_report.capture_output_index,
+            current_global_index = resolved_output.global_index,
+            current_adapter = %resolved_output.adapter_name,
+            current_adapter_output_index = resolved_output.adapter_output_index,
+            "held display validation failed: output identity changed"
+        );
         return Err("held display output identity changed".to_string());
     }
     if display_encoder == crate::capenc::EncoderSelection::Nvenc
         && (resolved_output.vendor_id == 0x1414
             || resolved_output.adapter_name.contains("Microsoft Basic"))
     {
+        tracing::debug!(
+            target: SESSION,
+            held_device = %display_report.device_name,
+            current_device = %resolved_output.device_name,
+            current_vendor = format_args!("{:#06x}", resolved_output.vendor_id),
+            current_adapter = %resolved_output.adapter_name,
+            current_adapter_output_index = resolved_output.adapter_output_index,
+            "held display validation failed: authenticated GPU changed"
+        );
         return Err("held display no longer resolves to the authenticated GPU".to_string());
     }
     if resolved_output.desktop_rect != display_report.desktop_rect
         || resolved_output.global_index != display_report.capture_output_index
     {
+        tracing::debug!(
+            target: SESSION,
+            held_device = %display_report.device_name,
+            current_device = %resolved_output.device_name,
+            held_rect = ?display_report.desktop_rect,
+            current_rect = ?resolved_output.desktop_rect,
+            rect_changed = resolved_output.desktop_rect != display_report.desktop_rect,
+            held_global_index = display_report.capture_output_index,
+            current_global_index = resolved_output.global_index,
+            global_index_changed = resolved_output.global_index != display_report.capture_output_index,
+            held_applied = %display_report.applied,
+            held_refresh_hz = display_report.applied_refresh_hz,
+            current_adapter = %resolved_output.adapter_name,
+            current_adapter_output_index = resolved_output.adapter_output_index,
+            "held display validation failed: topology changed"
+        );
         return Err("held display topology changed".to_string());
     }
+    tracing::debug!(
+        target: SESSION,
+        held_device = %display_report.device_name,
+        current_device = %resolved_output.device_name,
+        held_rect = ?display_report.desktop_rect,
+        current_rect = ?resolved_output.desktop_rect,
+        held_global_index = display_report.capture_output_index,
+        current_global_index = resolved_output.global_index,
+        current_adapter = %resolved_output.adapter_name,
+        current_adapter_output_index = resolved_output.adapter_output_index,
+        "held display validation succeeded"
+    );
     Ok(resolved_output)
 }
 
@@ -5447,9 +5908,8 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-
 /// The adaptive bitrate task of one attachment, stopped when dropped.
+#[allow(clippy::too_many_arguments)]
 struct RateTask(Option<tokio::task::JoinHandle<()>>);
 
 impl RateTask {
@@ -5502,13 +5962,32 @@ where
         video: mut video_pipelines,
     } = prepared_media;
     let mut media_plan = video_pipelines.primary_plan();
+    let mut aggregate_backend = video_pipelines.aggregate_accelerator_class();
     let mut frame_ingress = RoutedFrameIngress::start(&video_pipelines);
     let (ws_tx, mut ws_rx) = ws.split();
-    let video = match OutboundVideoMux::new(
+    let served_pipeline = served_stream_pipeline(
+        cfg,
+        &media_plan,
+        video_pipelines.aggregate_accelerator_class(),
+    );
+    tracing::info!(
+        target: SESSION,
+        pipeline = served_pipeline.token(),
+        qp_map = video_pipelines.primary_pipeline_qp_map().token(),
+        "effective QP map policy"
+    );
+    let video_queue_capacity = arcen_media::video::PipelineId::from_served_wire(&served_pipeline)
+        .map_or(VIDEO_QUEUE_CAPACITY, |pipeline| {
+            arcen_media::video::pipeline_contract(pipeline)
+                .queue
+                .host_video_frames
+        });
+    let video = match OutboundVideoMux::new_with_capacity(
         video_pipelines
             .pipelines()
             .iter()
             .map(|pipeline| pipeline.monitor_id),
+        video_queue_capacity,
     ) {
         Ok(mux) => Arc::new(mux),
         Err(error) => {
@@ -5583,7 +6062,13 @@ where
         let video_waits = Arc::clone(&video);
         let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
         let path_signal_connection = path_signal_connection.clone();
-        let motion_priority = cfg.requested_motion_priority();
+        let served_pipeline =
+            served_stream_pipeline(cfg, &plan, video_pipelines.aggregate_accelerator_class());
+        let fallback_motion_priority = cfg.requested_motion_priority();
+        let motion_priority = arcen_media::video::operational_motion_priority(
+            Some(&served_pipeline),
+            fallback_motion_priority,
+        );
         let bitrate_video = video_pipelines.pipelines().len();
         let bitrate_sender = video_pipelines
             .pipelines()
@@ -5592,27 +6077,17 @@ where
             .collect::<Vec<_>>();
         let latest_path_signal = Arc::clone(&latest_path_signal);
         RateTask(Some(tokio::spawn(async move {
-            let start_bps = u64::from(arcen_media::video::link_capped_average_bitrate_bps(
+            let policy = arcen_media::video::operational_rate_control_policy(
+                Some(&served_pipeline),
                 plan.width,
                 plan.height,
                 plan.fps,
                 plan.video.chroma,
                 plan.video.bit_depth,
-            ));
-            let ceiling_bps = u64::from(arcen_media::video::average_bitrate_bps(
-                plan.width,
-                plan.height,
-                plan.fps,
-                plan.video.chroma,
-                plan.video.bit_depth,
-            ));
-            let mut controller = arcen_media::rate_control::RateController::new(
-                arcen_media::rate_control::RateControlPolicy::for_bounds_and_priority(
-                    start_bps,
-                    ceiling_bps,
-                    motion_priority,
-                ),
+                fallback_motion_priority,
             );
+            let start_bps = policy.start_bps;
+            let mut controller = arcen_media::rate_control::RateController::new(policy);
             let mut pipeline_sync = arcen_media::rate_control::PipelineRateSync::new(
                 bitrate_sender.len(),
                 start_bps,
@@ -5623,6 +6098,7 @@ where
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let (mut last_frames, mut last_bytes) = video_stats.snapshot();
+            let mut last_monitor_stats = video_stats.monitor_snapshot();
             loop {
                 ticker.tick().await;
                 if path_signal_connection
@@ -5632,6 +6108,17 @@ where
                     break;
                 }
                 let (frames, bytes) = video_stats.snapshot();
+                let monitor_stats = video_stats.monitor_snapshot();
+                let peak_pipeline_delivered_bytes = monitor_stats
+                    .iter()
+                    .map(|(monitor_id, (_, bytes))| {
+                        let last = last_monitor_stats
+                            .get(monitor_id)
+                            .map_or(0, |(_, bytes)| *bytes);
+                        bytes.saturating_sub(last)
+                    })
+                    .max()
+                    .unwrap_or(0);
                 let wait = video_waits.take_wait_stats();
                 let write_wait =
                     Duration::from_micros(video_write_wait_micros.swap(0, Ordering::Relaxed));
@@ -5642,6 +6129,7 @@ where
                 };
                 let sample = arcen_media::rate_control::RateSample {
                     delivered_bytes: bytes.saturating_sub(last_bytes),
+                    peak_pipeline_delivered_bytes,
                     elapsed: Duration::from_secs(1),
                     mean_frame_wait: wait.mean.saturating_add(mean_write_wait),
                     frames: frames.saturating_sub(last_frames),
@@ -5663,6 +6151,7 @@ where
                 };
                 last_frames = frames;
                 last_bytes = bytes;
+                last_monitor_stats = monitor_stats;
                 if rate_control_enabled {
                     let change = controller.observe(sample);
                     let want_bps = controller.target_bps();
@@ -5707,7 +6196,8 @@ where
     let mut input_events = 0u64;
     let mut last_input_type = "";
     let mut input_sequence = InputSequenceTracker::default();
-    let mut session_health = crate::observability::SessionHealth::new(initial_qos_targets);
+    let mut session_health =
+        crate::observability::SessionHealth::new_with_fps_warmup(initial_qos_targets);
     // Cursor shape streaming: poll GetCursorInfo at ~20 Hz in a dedicated OS
     // thread; only active when cursor mode is Local.
     let mut cursor_shape_rx = if cursor_mode == CursorMode::Local {
@@ -5736,6 +6226,8 @@ where
     let mut unauthorized_microphone_frames = 0u64;
     let mut unauthorized_microphone_frames_interval = 0u64;
     let mut health = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut idr_retry_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    idr_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut microphone_tick = tokio::time::interval(std::time::Duration::from_millis(20));
     microphone_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     microphone_tick.tick().await;
@@ -5766,6 +6258,7 @@ where
         user,
         peer,
         &media_plan,
+        Some(served_stream_pipeline(cfg, &media_plan, aggregate_backend)),
         &display_report,
     );
     log_lifecycle(
@@ -5859,6 +6352,14 @@ where
                     }
                 }
             }
+            _ = idr_retry_tick.tick() => {
+                video.retry_pending_keyframes(|monitor_id| {
+                    video_pipelines.request_keyframe(
+                        monitor_id,
+                        "websocket_video_queue_recovery_retry",
+                    )
+                });
+            }
             () = audio_send_state.wait_for_codec_failure() => {
                 if let Err(error) = audio_capture.recover_after_codec_failure(&control_tx).await {
                     break Err(error);
@@ -5914,6 +6415,7 @@ where
                 match video.push(
                     monitor_id,
                     OutboundVideo {
+                        monitor_id,
                         message: Message::Binary(message.into()),
                     },
                     frame.keyframe,
@@ -5924,6 +6426,7 @@ where
                     VideoPushResult::Dropped {
                         count,
                         recovery_started,
+                        idr_request,
                     } => {
                         dropped_frames += count as u64;
                         let reason = if recovery_started {
@@ -5931,11 +6434,15 @@ where
                         } else {
                             "websocket_video_queue_awaiting_keyframe"
                         };
-                        idr.request(reason);
+                        if idr_request {
+                            let delivered = idr.request(reason);
+                            video.note_keyframe_request_handoff(monitor_id, delivered);
+                        }
                         tracing::debug!(
                             target: SESSION,
                             dropped_frames,
                             recovery_started,
+                            idr_request,
                             "outbound video AU suppressed until replacement IDR"
                         );
                     }
@@ -6190,6 +6697,18 @@ where
                                         pen = new_pen;
                                         media_plan = pipeline.plan;
                                         video_pipelines = PreparedVideo::Single(pipeline);
+                                        let next_backend =
+                                            video_pipelines.aggregate_accelerator_class();
+                                        if next_backend != aggregate_backend {
+                                            aggregate_backend = next_backend;
+                                            send_served_pipeline_update(
+                                                &control_tx,
+                                                cfg,
+                                                &media_plan,
+                                                aggregate_backend,
+                                            )
+                                            .await?;
+                                        }
                                         rate_task =
                                             spawn_rate_task(media_plan, &video_pipelines);
                                         frame_ingress =
@@ -6277,6 +6796,18 @@ where
                                             pen = new_pen;
                                             media_plan = pipeline.plan;
                                             video_pipelines = PreparedVideo::Single(pipeline);
+                                            let next_backend =
+                                                video_pipelines.aggregate_accelerator_class();
+                                            if next_backend != aggregate_backend {
+                                                aggregate_backend = next_backend;
+                                                send_served_pipeline_update(
+                                                    &control_tx,
+                                                    cfg,
+                                                    &media_plan,
+                                                    aggregate_backend,
+                                                )
+                                                .await?;
+                                            }
                                             rate_task =
                                                 spawn_rate_task(media_plan, &video_pipelines);
                                             frame_ingress =
@@ -6330,6 +6861,17 @@ where
                             pen = new_pen;
                             media_plan = pipeline.plan;
                             video_pipelines = PreparedVideo::Single(pipeline);
+                            let next_backend = video_pipelines.aggregate_accelerator_class();
+                            if next_backend != aggregate_backend {
+                                aggregate_backend = next_backend;
+                                send_served_pipeline_update(
+                                    &control_tx,
+                                    cfg,
+                                    &media_plan,
+                                    aggregate_backend,
+                                )
+                                .await?;
+                            }
                             rate_task = spawn_rate_task(media_plan, &video_pipelines);
                             frame_ingress = RoutedFrameIngress::start(&video_pipelines);
                             last_display_update_at = Some(std::time::Instant::now());
@@ -6843,7 +7385,11 @@ where
         match tokio::time::timeout(WRITER_SHUTDOWN_TIMEOUT, &mut writer).await {
             Ok(Ok(exit)) => {
                 if let Err(error) = &exit.result {
-                    tracing::warn!(target: SESSION, %error, "writer stopped with error");
+                    if is_expected_shutdown_writer_error(error) {
+                        tracing::info!(target: SESSION, %error, "writer stopped during normal shutdown");
+                    } else {
+                        tracing::warn!(target: SESSION, %error, "writer stopped with error");
+                    }
                 }
                 exit
             }
@@ -7062,6 +7608,7 @@ fn emit_session_stream_start(
     user: &str,
     peer: &str,
     media_plan: &ResolvedMediaPlan,
+    pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     display_report: &DisplayReport,
 ) {
     let mut fields = StructuredFields::default();
@@ -7080,6 +7627,9 @@ fn emit_session_stream_start(
     let _ = fields.insert("width", FieldValue::Integer(i64::from(media_plan.width)));
     let _ = fields.insert("height", FieldValue::Integer(i64::from(media_plan.height)));
     let _ = fields.insert("fps", FieldValue::Integer(i64::from(media_plan.fps)));
+    if let Some(pipeline) = pipeline {
+        let _ = fields.insert("pipeline", FieldValue::String(pipeline.token().to_string()));
+    }
     let _ = fields.insert(
         "display_backend",
         FieldValue::String(display_report.backend.to_string()),
@@ -7217,6 +7767,21 @@ fn classify_stream_interruption(error: &str) -> &'static str {
     }
 }
 
+fn is_expected_shutdown_writer_error(error: &str) -> bool {
+    // The broker closes the agent IPC WebSocket when the Deck quits; a final
+    // writer send then meets tungstenite's closed-state errors. A reset or a
+    // timeout is still unexpected.
+    const CLOSED_IPC: [&str; 3] = [
+        "Sending after closing is not allowed",
+        "Trying to work with closed connection",
+        "Connection closed normally",
+    ];
+    error == "outbound writer stopped"
+        || error.contains("outbound writer closed")
+        || (error.starts_with("WebSocket send failed:")
+            && CLOSED_IPC.iter().any(|closed| error.contains(closed)))
+}
+
 /// Emits `DISPLAY_RESTORED` (1201) after a verified in-process restore, or
 /// `DISPLAY_RESTORE_FAILED` (1203) when it fails. Only emitted when the
 /// display transaction actually mutated something (symmetric with
@@ -7321,7 +7886,7 @@ fn start_capture_after_display<I, C, F>(
     }
     let input = initialize_input(resolved_output.global_index, display.desktop_rect)
         .map_err(|error| format!("initialize selected-output input: {error}"))?;
-    let (capture, frames) = spawn_capture(CapencConfig {
+    let mut capenc_config = CapencConfig {
         binary: cfg.capenc_bin.clone(),
         output_index: resolved_output.global_index,
         adapter_name: Some(resolved_output.adapter_name.clone()),
@@ -7337,19 +7902,30 @@ fn start_capture_after_display<I, C, F>(
         intent: cfg.requested_encode_intent(),
         motion_priority: cfg.requested_motion_priority(),
         qp_map: cfg.qp_map,
+        debug_diagnostics: cfg.debug_diagnostics,
+        encoder_max_bitrate_bps: cfg
+            .active_pipeline
+            .as_ref()
+            .and_then(arcen_media::video::PipelineId::from_served_wire)
+            .and_then(|pipeline| {
+                arcen_media::video::pipeline_contract(pipeline).encoder_ceiling_bps()
+            }),
         fps: cfg.fps,
         width: display.applied.width,
         height: display.applied.height,
         encoder: Some(cfg.encoder),
         cursor_mode,
         session_log_id: session_log_id.clone(),
-    })
-    .map_err(|error| format!("spawn capenc after display settle: {error}"))?;
+    };
+    capenc_config.qp_map = qp_map_policy_for_capenc(cfg, &capenc_config);
+    let (capture, frames) = spawn_capture(capenc_config)
+        .map_err(|error| format!("spawn capenc after display settle: {error}"))?;
     request_idr(&capture);
     Ok((input, capture, frames))
 }
 
 struct OutboundVideo {
+    monitor_id: u16,
     message: Message,
 }
 
@@ -7382,10 +7958,6 @@ impl std::fmt::Debug for OutboundVideoMux {
 }
 
 impl OutboundVideoMux {
-    fn new(monitor_ids: impl IntoIterator<Item = u16>) -> Result<Self, OutboundVideoMuxError> {
-        Self::new_with_capacity(monitor_ids, VIDEO_QUEUE_CAPACITY)
-    }
-
     fn new_with_capacity(
         monitor_ids: impl IntoIterator<Item = u16>,
         capacity: usize,
@@ -7415,6 +7987,20 @@ impl OutboundVideoMux {
             self.notify.notify_one();
         }
         result
+    }
+
+    fn note_keyframe_request_handoff(&self, monitor_id: u16, success: bool) {
+        if let Some(queue) = self.roster.get(monitor_id) {
+            queue.note_keyframe_request_handoff(success);
+        }
+    }
+
+    fn retry_pending_keyframes(&self, mut request: impl FnMut(u16) -> bool) {
+        for (_index, monitor_id, queue) in self.roster.entries_in_service_order() {
+            if queue.keyframe_request_due() {
+                queue.note_keyframe_request_handoff(request(monitor_id));
+            }
+        }
     }
 
     fn take_wait_stats(&self) -> arcen_media::video::VideoQueueWaitStats {
@@ -7506,6 +8092,7 @@ impl OutboundVideoMux {
 struct WriterVideoStats {
     frames: AtomicU64,
     bytes: AtomicU64,
+    per_monitor: std::sync::Mutex<BTreeMap<u16, (u64, u64)>>,
 }
 
 impl WriterVideoStats {
@@ -7514,6 +8101,25 @@ impl WriterVideoStats {
             self.frames.load(Ordering::Relaxed),
             self.bytes.load(Ordering::Relaxed),
         )
+    }
+
+    fn monitor_snapshot(&self) -> BTreeMap<u16, (u64, u64)> {
+        self.per_monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record(&self, monitor_id: u16, bytes: u64) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        let mut per_monitor = self
+            .per_monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = per_monitor.entry(monitor_id).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(bytes);
     }
 }
 
@@ -7606,7 +8212,10 @@ where
                 None => WriterItem::Closed(WriterStream::Audio),
             },
             frame = video.pop(), if video_open => match frame {
-                Some(frame) => WriterItem::Video(frame.message),
+                Some(frame) => WriterItem::Video {
+                    monitor_id: frame.monitor_id,
+                    message: frame.message,
+                },
                 None => WriterItem::Closed(WriterStream::Video),
             },
             () = clipboard_cooldown(), if clipboard_open && !clipboard_allowed => {
@@ -7618,13 +8227,16 @@ where
                 clipboard_allowed = true;
                 (message, None, None)
             }
-            WriterItem::Video(message) => {
+            WriterItem::Video {
+                monitor_id,
+                message,
+            } => {
                 clipboard_allowed = true;
                 let bytes = match &message {
                     Message::Binary(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                     _ => 0,
                 };
-                (message, None, Some(bytes))
+                (message, None, Some((monitor_id, bytes)))
             }
             WriterItem::Clipboard(message) => {
                 clipboard_allowed = false;
@@ -7683,9 +8295,8 @@ where
             let micros = u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX);
             video_write_wait_micros.fetch_add(micros, Ordering::Relaxed);
         }
-        if let Some(bytes) = video_bytes {
-            video_stats.frames.fetch_add(1, Ordering::Relaxed);
-            video_stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some((monitor_id, bytes)) = video_bytes {
+            video_stats.record(monitor_id, bytes);
         }
         if let Some(bytes) = audio_bytes {
             if let Some(telemetry) = audio_state.telemetry() {
@@ -7698,7 +8309,7 @@ where
 
 enum WriterItem {
     Message(Message),
-    Video(Message),
+    Video { monitor_id: u16, message: Message },
     Clipboard(Message),
     ClipboardCooldown,
     AudioBarrier(oneshot::Sender<()>),
@@ -9298,6 +9909,17 @@ where
         .map_err(|error| format!("{kind} send failed: {error}"))
 }
 
+/// Messages a handshake reader passes over instead of failing on.
+///
+/// The service starts forwarding live path signals to the session agent as
+/// soon as it relays, so one can arrive before a slow Deck's `client_hello`.
+/// Only the service sends this type (the relay refuses it from a Deck), and
+/// losing one sample during the handshake is harmless.
+fn handshake_skips(message_type: &str) -> bool {
+    message_type == "path_signal"
+        && arcen_session::agent_relay::ServiceMessage::is_service_type(message_type)
+}
+
 async fn recv_typed<S, E, T>(
     ws: &mut S,
     expected_type: &str,
@@ -9318,6 +9940,9 @@ where
                         .get("type")
                         .and_then(|value| value.as_str())
                         .ok_or_else(|| "handshake message missing type".to_string())?;
+                    if handshake_skips(actual) {
+                        continue;
+                    }
                     if actual != expected_type {
                         return Err(format!(
                             "expected {expected_type} during handshake, received {actual}"
@@ -9344,7 +9969,96 @@ fn log_state(peer: &str, state: ServerState) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_path_signal_before_client_hello_does_not_fail_the_handshake() {
+        use tokio_tungstenite::tungstenite::Message;
+        let messages = vec![
+            Ok::<Message, String>(Message::Text(
+                r#"{"type":"path_signal","session":0,"signal":{}}"#.into(),
+            )),
+            Ok(Message::Text(r#"{"type":"probe","value":7}"#.into())),
+        ];
+        let mut stream = futures_util::stream::iter(messages);
+        let value: serde_json::Value = recv_typed(&mut stream, "probe", Duration::from_secs(1))
+            .await
+            .expect("skips path_signal");
+        assert_eq!(value["value"], 7);
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_message_still_fails_the_handshake() {
+        use tokio_tungstenite::tungstenite::Message;
+        let messages = vec![Ok::<Message, String>(Message::Text(
+            r#"{"type":"other"}"#.into(),
+        ))];
+        let mut stream = futures_util::stream::iter(messages);
+        let error =
+            recv_typed::<_, _, serde_json::Value>(&mut stream, "probe", Duration::from_secs(1))
+                .await
+                .expect_err("unexpected type fails");
+        assert!(error.contains("expected probe during handshake, received other"));
+    }
+
     use super::*;
+
+    fn build_server_hello(
+        cfg: &HostConfig,
+        display: &DisplayReport,
+        plan: &SessionDisplayPlan,
+        windows_session: &WindowsSessionIdentity,
+        agent_log_path: &str,
+        media_plan: &ResolvedMediaPlan,
+        microphone_backend_available: bool,
+        pen_available: bool,
+        region_input_available: bool,
+    ) -> ServerHelloMsg {
+        build_server_hello_with_aggregate(
+            cfg,
+            display,
+            plan,
+            windows_session,
+            agent_log_path,
+            media_plan,
+            Some(media_plan.backend.accelerator_class()),
+            microphone_backend_available,
+            pen_available,
+            region_input_available,
+        )
+    }
+
+    #[test]
+    fn a_display_nvidia_cannot_rebuild_is_served_as_it_is() {
+        // A GeForce rendering a virtual display adapter's output: NVAPI does
+        // not know the display, and nothing on the host has changed yet.
+        let outcome = single_display_reconciliation::<()>(Err(
+            crate::display::HeadlessProvisionError::NotApplicable(
+                "NvAPI_DISP_GetDisplayIdByDisplayName returned NVAPI status -6 \
+                 (NVAPI_NVIDIA_DEVICE_NOT_FOUND)"
+                    .to_string(),
+            ),
+        ));
+        assert!(matches!(
+            outcome,
+            SingleDisplayReconciliation::UseExistingDisplay(reason)
+                if reason.contains("NVAPI_NVIDIA_DEVICE_NOT_FOUND")
+        ));
+    }
+
+    #[test]
+    fn a_failure_while_changing_displays_still_refuses_the_session() {
+        let outcome = single_display_reconciliation::<()>(Err(
+            crate::display::HeadlessProvisionError::Failed("EDID write failed".to_string()),
+        ));
+        assert!(matches!(
+            outcome,
+            SingleDisplayReconciliation::Refuse(error)
+                if error == "reconcile NVIDIA headless display: EDID write failed"
+        ));
+        assert!(matches!(
+            single_display_reconciliation(Ok(7_u8)),
+            SingleDisplayReconciliation::Reconciled(7)
+        ));
+    }
     use crate::multi_monitor_topology::{
         AvailableOutput, OutputMode, OutputModeCapability, PhysicalOutputInventory,
     };
@@ -9366,6 +10080,7 @@ mod tests {
             adapter_name: "adapter".to_string(),
             global_index: index,
             device_name: format!(r"\\.\DISPLAY{}", index + 1),
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             mode_capability: OutputModeCapability::FixedModes(vec![OutputMode {
                 width: 1920,
                 height: 1080,
@@ -9405,6 +10120,7 @@ mod tests {
 
     fn tagged_outbound_video(tag: u8) -> OutboundVideo {
         OutboundVideo {
+            monitor_id: 0,
             message: Message::Binary(vec![tag].into()),
         }
     }
@@ -9830,10 +10546,13 @@ mod tests {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 30,
             encoder: crate::capenc::EncoderSelection::Auto,
             audio_enabled: true,
@@ -9843,6 +10562,7 @@ mod tests {
             timezone_redirection: false,
             reconnect_window_secs: 30,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -10041,6 +10761,32 @@ mod tests {
             classify_stream_interruption("some other failure"),
             "stream_failure"
         );
+    }
+
+    #[test]
+    fn normal_shutdown_writer_failures_are_expected() {
+        assert!(is_expected_shutdown_writer_error("outbound writer stopped"));
+        assert!(is_expected_shutdown_writer_error(
+            "outbound writer closed before audio barrier"
+        ));
+        assert!(is_expected_shutdown_barrier_error(
+            "outbound writer closed before audio barrier"
+        ));
+        assert!(is_expected_shutdown_writer_error(
+            "WebSocket send failed: WebSocket protocol error: Sending after closing is not allowed"
+        ));
+        assert!(is_expected_shutdown_writer_error(
+            "WebSocket send failed: Trying to work with closed connection"
+        ));
+        assert!(!is_expected_shutdown_writer_error(
+            "WebSocket send failed: connection reset"
+        ));
+        assert!(!is_expected_shutdown_writer_error(
+            "WebSocket send timed out"
+        ));
+        assert!(!is_expected_shutdown_barrier_error(
+            "audio writer barrier timed out"
+        ));
     }
 
     #[test]
@@ -10724,10 +11470,13 @@ mod tests {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::AlwaysOn,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance,
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 60,
             encoder: crate::capenc::EncoderSelection::Auto,
             audio_enabled: true,
@@ -10737,6 +11486,7 @@ mod tests {
             timezone_redirection: false,
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -10749,6 +11499,70 @@ mod tests {
         config.codec = VideoCodec::H265;
         config.video_selection = arcen_protocol::messages::VideoSelectionIntent::ColorFidelity;
         assert_eq!(next_adaptive_nvenc_codec(&config), None);
+    }
+
+    #[test]
+    fn resolved_sdr_pipeline_overrides_client_pq_for_display_hdr() {
+        let mut config = HostConfig {
+            capenc_bin: "capenc".to_string(),
+            output_selector: crate::display::OutputSelector::GlobalIndex(0),
+            output_index: 0,
+            codec: VideoCodec::H265,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: BitDepth::Ten,
+            color_range: ColorRange::Full,
+            color_matrix: ColorMatrix::Bt2020Ncl,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+            color_primaries: arcen_media::ColorPrimaries::Bt2020,
+            color_policy: ColorPolicy::AlwaysOn,
+            qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
+            video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            codec_pinned: false,
+            variant_pinned: true,
+            auth_video_request: None,
+            requested_pipeline: Some(arcen_media::video::PipelineId::Hdr),
+            active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
+            fps: 30,
+            encoder: crate::capenc::EncoderSelection::Nvenc,
+            audio_enabled: true,
+            audio_compressed: false,
+            microphone_input_enabled: false,
+            clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
+            timezone_redirection: false,
+            reconnect_window_secs: 0,
+            qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
+            deskside: crate::deskside::DesksideConfig::default(),
+            iddcx: crate::config::WindowsIddCxConfig::default(),
+            multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+        };
+
+        assert!(
+            !resolved_display_hdr_intent(&config),
+            "a pinned SDR served pipeline must not enable Windows HDR only because the Deck asked for PQ"
+        );
+        let mut request = DisplayRequest::new(1800, 1130).expect("display request");
+        request.hdr10 = true;
+        assert!(!apply_resolved_display_hdr_to_request(
+            &config,
+            &mut request
+        ));
+        assert!(!request.desired_hdr);
+        assert!(
+            !request.hdr10,
+            "resolved SDR service must also downgrade the exact-mode EDID"
+        );
+        config.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Hdr);
+        assert!(resolved_display_hdr_intent(&config));
+        config.transfer = arcen_media::TransferCharacteristics::Pq;
+        let mut request = DisplayRequest::new(1800, 1130).expect("display request");
+        assert!(apply_resolved_display_hdr_to_request(&config, &mut request));
+        assert!(request.desired_hdr);
+        assert!(
+            request.hdr10,
+            "resolved HDR service must upgrade an initially-SDR request to the HDR EDID"
+        );
     }
 
     #[test]
@@ -10766,10 +11580,13 @@ mod tests {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 30,
             encoder: crate::capenc::EncoderSelection::Auto,
             audio_enabled: true,
@@ -10779,6 +11596,7 @@ mod tests {
             timezone_redirection: false,
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -10915,6 +11733,59 @@ mod tests {
             .contains("exact display lease"));
         assert_eq!(hello.device_capabilities["input"]["available"], true);
         assert_eq!(hello.encoder_backend, "native-nvenc");
+        let auto_cfg = HostConfig {
+            codec: VideoCodec::H264,
+            chroma: ChromaSubsampling::Yuv420,
+            video_selection: arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance,
+            requested_pipeline: Some(arcen_media::video::PipelineId::Auto),
+            ..cfg.clone()
+        };
+        let auto_media = test_media_plan(
+            arcen_media::video::EncoderBackend::NativeNvenc,
+            arcen_media::VideoCodec::H264,
+            arcen_media::ChromaSubsampling::Yuv420,
+            report.applied.width,
+            report.applied.height,
+            30,
+        );
+        let all_hardware_hello = build_server_hello_with_aggregate(
+            &auto_cfg,
+            &report,
+            &plan,
+            &identity,
+            r"C:\logs\arcen-session-agent.log",
+            &auto_media,
+            Some(arcen_media::video::AcceleratorClass::Hardware),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            all_hardware_hello.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
+            "an all-hardware multi-monitor set keeps the product served truth"
+        );
+        assert_eq!(all_hardware_hello.encoder_backend, "native-nvenc");
+        assert_eq!(all_hardware_hello.encoder_class, "hardware");
+        let mixed_backend_hello = build_server_hello_with_aggregate(
+            &auto_cfg,
+            &report,
+            &plan,
+            &identity,
+            r"C:\logs\arcen-session-agent.log",
+            &auto_media,
+            Some(arcen_media::video::AcceleratorClass::Software),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            mixed_backend_hello.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Software),
+            "a hardware-primary/software-secondary set must report software"
+        );
+        assert_eq!(mixed_backend_hello.encoder_backend, "software");
+        assert_eq!(mixed_backend_hello.encoder_class, "software");
         assert!(
             hello.supports_h264,
             "capability flags describe the resolved backend roster, not only the active codec"
@@ -10922,6 +11793,31 @@ mod tests {
         assert!(hello.supports_h265);
         assert!(!hello.supports_av1);
         assert!(hello.supports_yuv444);
+        let mut grading_media = native_media;
+        grading_media.video.bit_depth = arcen_media::BitDepth::Ten;
+        grading_media.video.range = arcen_media::ColorRange::Full;
+        grading_media.video.transfer = arcen_media::TransferCharacteristics::Bt709;
+        grading_media.video.primaries = arcen_media::ColorPrimaries::Bt709;
+        grading_media.video.matrix = arcen_media::ColorMatrix::Bt709;
+        let hdr_requested_cfg = HostConfig {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Hdr),
+            ..cfg.clone()
+        };
+        let degraded_pipeline_hello = build_server_hello(
+            &hdr_requested_cfg,
+            &report,
+            &plan,
+            &identity,
+            r"C:\logs\arcen-session-agent.log",
+            &grading_media,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            degraded_pipeline_hello.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
         assert!(
             !hello.supports_display_update,
             "negotiated/fallback display leases must not advertise live resize"
@@ -11253,6 +12149,91 @@ mod tests {
     }
 
     #[test]
+    fn windows_operational_bounds_follow_served_pipeline_truth() {
+        let grading_shape = (
+            3840,
+            2160,
+            30,
+            arcen_media::ChromaSubsampling::Yuv444,
+            arcen_media::BitDepth::Ten,
+        );
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Grading),
+                grading_shape.0,
+                grading_shape.1,
+                grading_shape.2,
+                grading_shape.3,
+                grading_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .bitrate_bounds(
+                    grading_shape.0,
+                    grading_shape.1,
+                    grading_shape.2,
+                    grading_shape.3,
+                    grading_shape.4,
+                ),
+            "an HDR request served as Grading must run the Grading contract"
+        );
+
+        let exact_shape = (
+            1920,
+            1080,
+            60,
+            arcen_media::ChromaSubsampling::Yuv420,
+            arcen_media::BitDepth::Eight,
+        );
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Custom),
+                exact_shape.0,
+                exact_shape.1,
+                exact_shape.2,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            (
+                arcen_media::video::link_capped_average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+                arcen_media::video::average_bitrate_bps(
+                    exact_shape.0,
+                    exact_shape.1,
+                    exact_shape.2,
+                    exact_shape.3,
+                    exact_shape.4,
+                ),
+            ),
+            "Exact/custom Windows sessions keep the legacy bounds"
+        );
+
+        assert_eq!(
+            arcen_media::video::operational_bitrate_bounds(
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Software),
+                exact_shape.0,
+                exact_shape.1,
+                30,
+                exact_shape.3,
+                exact_shape.4,
+            ),
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Software)
+                .bitrate_bounds(
+                    exact_shape.0,
+                    exact_shape.1,
+                    30,
+                    exact_shape.3,
+                    exact_shape.4
+                ),
+            "software fallback uses the Software contract"
+        );
+    }
+
+    #[test]
     fn display_update_requires_exact_retarget_capability_not_nvenc() {
         let report = DisplayReport {
             requested: DisplaySize {
@@ -11386,10 +12367,13 @@ mod tests {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 60,
             encoder: crate::capenc::EncoderSelection::Auto,
             audio_enabled: true,
@@ -11399,6 +12383,7 @@ mod tests {
             timezone_redirection: false,
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -11547,6 +12532,8 @@ mod tests {
                 intent: arcen_media::EncodeIntent::default(),
                 motion_priority: arcen_media::video::MotionPriority::Detail,
                 qp_map: arcen_media::video::QpMapPolicy::default(),
+                debug_diagnostics: false,
+                encoder_max_bitrate_bps: None,
                 fps: 30,
                 width: report.applied.width,
                 height: report.applied.height,
@@ -11613,10 +12600,13 @@ mod tests {
             color_primaries: arcen_media::ColorPrimaries::Bt709,
             color_policy: ColorPolicy::DefaultOff,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            qp_map_config: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            requested_pipeline: None,
+            active_pipeline: None,
             fps: 30,
             encoder: crate::capenc::EncoderSelection::Auto,
             audio_enabled: false,
@@ -11626,6 +12616,7 @@ mod tests {
             timezone_redirection: false,
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
@@ -11982,6 +12973,7 @@ mod tests {
             video.push(
                 0,
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1, 2, 3].into()),
                 },
                 true,
@@ -12017,6 +13009,7 @@ mod tests {
             video.push(
                 0,
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1, 2, 3].into()),
                 },
                 true,
@@ -12061,6 +13054,7 @@ mod tests {
             video.push(
                 0,
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1].into()),
                 },
                 false,
@@ -12071,12 +13065,14 @@ mod tests {
             video.push(
                 0,
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 2].into()),
                 },
                 false,
             ),
             VideoPushResult::Dropped {
                 recovery_started: true,
+                idr_request: true,
                 ..
             }
         ));
@@ -12484,6 +13480,7 @@ mod tests {
         assert!(matches!(
             video.push(
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![7].into()),
                 },
                 false,
@@ -12520,6 +13517,7 @@ mod tests {
             video.push(
                 0,
                 OutboundVideo {
+                    monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8].into()),
                 },
                 true,

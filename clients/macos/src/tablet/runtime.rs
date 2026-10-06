@@ -34,11 +34,14 @@ impl TabletRuntime {
     /// thread; callers should treat `None` as "no typed pen capture this
     /// run", not as an error to surface to the user (Wacom mouse-emulation
     /// fallback remains fully functional either way).
+    ///
+    /// `wake` runs on the main thread after each queued sample, so the UI
+    /// drains it promptly instead of on its next idle poll.
     #[must_use]
     #[cfg(target_os = "macos")]
-    pub fn install() -> Option<Self> {
+    pub fn install(wake: impl Fn() + 'static) -> Option<Self> {
         let mtm = objc2_foundation::MainThreadMarker::new()?;
-        let (monitor, sample_handle) = super::monitor::TabletEventMonitor::start(mtm)?;
+        let (monitor, sample_handle) = super::monitor::TabletEventMonitor::start(mtm, wake)?;
         Some(Self {
             monitor,
             sample_handle,
@@ -47,7 +50,7 @@ impl TabletRuntime {
 
     #[must_use]
     #[cfg(not(target_os = "macos"))]
-    pub fn install() -> Option<Self> {
+    pub fn install(_wake: impl Fn() + 'static) -> Option<Self> {
         None
     }
 
@@ -92,6 +95,6 @@ mod tests {
         // Test harnesses run off the AppKit main thread, so `install()`
         // deterministically returns `None` here rather than installing a
         // real monitor — mirrors `monitor::tests::constructing_off_the_main_thread_is_reported_as_none`.
-        assert!(TabletRuntime::install().is_none());
+        assert!(TabletRuntime::install(|| {}).is_none());
     }
 }

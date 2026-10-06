@@ -82,7 +82,8 @@ pub use provider::{
     OutputTransactionError, OutputTransactionState, RollbackGuarantee, admits,
 };
 pub use windows_multi_monitor::{
-    AdminHeadlessMode, WindowsMultiMonitorAdapter, WindowsMultiMonitorPolicy,
-    WindowsMultiMonitorRefusal, WindowsMultiMonitorSelection, WindowsMultiMonitorSelectionReason,
-    resolve_windows_multi_monitor_adapter,
+    AdminHeadlessMode, WindowsCcdModePlan, WindowsCcdOutputKind, WindowsMultiMonitorAdapter,
+    WindowsMultiMonitorPolicy, WindowsMultiMonitorRefusal, WindowsMultiMonitorSelection,
+    WindowsMultiMonitorSelectionReason, resolve_windows_multi_monitor_adapter,
+    windows_ccd_mode_plan,
 };

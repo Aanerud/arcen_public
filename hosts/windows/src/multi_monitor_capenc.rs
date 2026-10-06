@@ -67,11 +67,52 @@ pub struct MonitorPipelineTemplate {
     /// Damage-driven QP biasing every worker in this session requests.
     /// Roster-wide for the same reason the codec is.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    pub debug_diagnostics: bool,
+    pub qp_map_config: Option<arcen_session::pier_config::QpMapConfig>,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub codec_pinned: bool,
+    pub variant_pinned: bool,
+    /// Optional native encoder ceiling from the served pipeline contract.
+    pub encoder_max_bitrate_bps: Option<u32>,
     pub fps: u32,
     pub encoder: Option<EncoderSelection>,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
     pub cursor_mode: CursorMode,
     pub session_log_id: CorrelationId,
+}
+
+impl MonitorPipelineTemplate {
+    fn qp_map_for_config(&self, config: &CapencConfig) -> arcen_media::video::QpMapPolicy {
+        if config.encoder == Some(EncoderSelection::SoftwareH264) {
+            return arcen_media::video::QpMapPolicy::Off;
+        }
+        let video = arcen_media::VideoConfiguration {
+            codec: crate::capenc::media_codec(config.codec),
+            chroma: crate::capenc::media_chroma(config.chroma),
+            bit_depth: config.bit_depth,
+            range: config.color_range,
+            matrix: config.color_matrix,
+            primaries: config.color_primaries,
+            transfer: config.transfer,
+        };
+        let served = arcen_media::video::served_pipeline(
+            self.requested_pipeline,
+            video,
+            config.fps,
+            config.motion_priority,
+            arcen_media::video::ServedPipelineContext {
+                backend: Some(arcen_media::video::AcceleratorClass::Hardware),
+                exact_or_admin_override: self.codec_pinned
+                    || self.variant_pinned
+                    || self.requested_pipeline.is_none(),
+            },
+        );
+        self.qp_map_config
+            .as_ref()
+            .and_then(|config| config.effective_token(served.token()).ok())
+            .and_then(arcen_media::video::QpMapPolicy::from_token)
+            .unwrap_or(self.qp_map)
+    }
 }
 
 /// Typed rejection building [`MonitorPipelineSpec`]s from a
@@ -259,7 +300,7 @@ pub fn resolve_pipeline_specs(
                     session_monitor_id: spec.session_monitor_id,
                     source,
                 })?;
-            let config = CapencConfig {
+            let mut config = CapencConfig {
                 binary: String::new(),
                 output_index: selector.global_index,
                 adapter_name: Some(selector.adapter_name.clone()),
@@ -284,7 +325,13 @@ pub fn resolve_pipeline_specs(
                 color_primaries: template.color_primaries,
                 intent: template.intent,
                 motion_priority: template.motion_priority,
-                qp_map: template.qp_map,
+                qp_map: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
+                    arcen_media::video::QpMapPolicy::Off
+                } else {
+                    template.qp_map
+                },
+                debug_diagnostics: template.debug_diagnostics,
+                encoder_max_bitrate_bps: template.encoder_max_bitrate_bps,
                 fps: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
                     template.fps.min(
                         arcen_media::video::EncoderBackend::OpenH264
@@ -300,6 +347,7 @@ pub fn resolve_pipeline_specs(
                 cursor_mode: template.cursor_mode,
                 session_log_id: template.session_log_id.clone(),
             };
+            config.qp_map = template.qp_map_for_config(&config);
             Ok(ResolvedMonitorPipeline {
                 session_monitor_id: spec.session_monitor_id,
                 selector,
@@ -406,6 +454,7 @@ pub struct CapencPipelineHandle {
     pub frames: std::sync::Arc<crate::latest::VideoQueue<crate::capenc::EncodedFrame>>,
     pub initial_frame: crate::capenc::EncodedFrame,
     pub plan: ResolvedMediaPlan,
+    pub qp_map: arcen_media::video::QpMapPolicy,
 }
 
 /// One atomically-started monitor pipeline transferred to the live session.
@@ -416,6 +465,7 @@ pub struct StartedMonitorPipeline {
     pub frames: std::sync::Arc<crate::latest::VideoQueue<crate::capenc::EncodedFrame>>,
     pub initial_frame: crate::capenc::EncodedFrame,
     pub plan: ResolvedMediaPlan,
+    pub qp_map: arcen_media::video::QpMapPolicy,
 }
 
 /// Supervises one `capenc` worker per applied monitor for one session.
@@ -477,6 +527,7 @@ impl MultiCapencSupervisor {
                 );
                 async move {
                     let result = async {
+                        let qp_map = pipeline.config.qp_map;
                         let (capenc, frames, plan) = Capenc::spawn(pipeline.config).await?;
                         let initial_frame =
                             tokio::time::timeout(std::time::Duration::from_secs(10), frames.pop())
@@ -506,6 +557,7 @@ impl MultiCapencSupervisor {
                                 frames,
                                 initial_frame,
                                 plan,
+                                qp_map,
                             },
                         })
                     }
@@ -607,6 +659,7 @@ impl MultiCapencSupervisor {
                 frames: pipeline.handle.frames,
                 initial_frame: pipeline.handle.initial_frame,
                 plan: pipeline.handle.plan,
+                qp_map: pipeline.handle.qp_map,
             })
             .collect()
     }
@@ -775,6 +828,7 @@ mod tests {
                             min_refresh_hz: 30,
                             max_refresh_hz: 240,
                         },
+                    ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
                     supported_rotations: vec![Rotation::Degrees0],
                     current_x: monitor.x,
                     current_y: monitor.y,
@@ -804,6 +858,12 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            qp_map_config: None,
+            requested_pipeline: None,
+            codec_pinned: false,
+            variant_pinned: false,
+            encoder_max_bitrate_bps: None,
             fps: 60,
             encoder: Some(EncoderSelection::Auto),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
@@ -815,7 +875,8 @@ mod tests {
     #[test]
     fn grading_quality_intent_reaches_every_monitor_pipeline() {
         let topology = plan(2);
-        let specs = build_pipeline_specs(&topology).expect("quality roster specs");
+        let mut specs = build_pipeline_specs(&topology).expect("quality roster specs");
+        specs[0].chroma = Some(ChromaSubsampling::Yuv420);
         let inventory = fresh_inventory(&topology);
         let mut template = template();
         template.intent = EncodeIntent::Quality;
@@ -824,6 +885,31 @@ mod tests {
         assert!(resolved
             .iter()
             .all(|spec| spec.config.intent == EncodeIntent::Quality));
+    }
+
+    #[test]
+    fn bandwidth_optimized_hardware_monitor_resolves_qp_from_final_config() {
+        let topology = plan(1);
+        let mut specs = build_pipeline_specs(&topology).expect("quality roster specs");
+        specs[0].chroma = Some(ChromaSubsampling::Yuv420);
+        let inventory = fresh_inventory(&topology);
+        let mut template = template();
+        template.chroma = ChromaSubsampling::Yuv444;
+        template.bit_depth = BitDepth::Ten;
+        template.qp_map = arcen_media::video::QpMapPolicy::On;
+        template.requested_pipeline = Some(arcen_media::video::PipelineId::Grading);
+        template.qp_map_config = Some(arcen_session::pier_config::QpMapConfig::PerPipeline(
+            std::collections::BTreeMap::from([
+                ("grading".to_string(), "on".to_string()),
+                ("custom".to_string(), "off".to_string()),
+            ]),
+        ));
+        let resolved =
+            resolve_pipeline_specs(&specs, &inventory, &template).expect("quality roster");
+        let config = &resolved[0].config;
+        assert_eq!(config.chroma, ChromaSubsampling::Yuv420);
+        assert_eq!(config.bit_depth, BitDepth::Ten);
+        assert_eq!(config.qp_map, arcen_media::video::QpMapPolicy::Off);
     }
 
     #[test]
@@ -1029,6 +1115,7 @@ mod tests {
                         min_refresh_hz: 30,
                         max_refresh_hz: 240,
                     },
+                ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
                 supported_rotations: vec![Rotation::Degrees0],
                 current_x: 0,
                 current_y: 0,
@@ -1053,6 +1140,7 @@ mod tests {
                         min_refresh_hz: 30,
                         max_refresh_hz: 240,
                     },
+                ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
                 supported_rotations: vec![Rotation::Degrees0],
                 current_x: 1_920,
                 current_y: 0,
@@ -1090,6 +1178,7 @@ mod tests {
                     min_refresh_hz: 30,
                     max_refresh_hz: 240,
                 },
+            ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             supported_rotations: vec![Rotation::Degrees0],
             current_x: 0,
             current_y: 0,
@@ -1151,6 +1240,8 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            encoder_max_bitrate_bps: None,
             fps: 60,
             width: 1_920,
             height: 1_080,
@@ -1438,6 +1529,12 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            qp_map_config: None,
+            requested_pipeline: None,
+            codec_pinned: false,
+            variant_pinned: false,
+            encoder_max_bitrate_bps: None,
             fps: 60,
             encoder: Some(EncoderSelection::Nvenc),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,

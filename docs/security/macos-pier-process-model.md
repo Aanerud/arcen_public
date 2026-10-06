@@ -11,7 +11,7 @@ the network away from everything it does not need.
 
 Version note: three details below arrive in the package after 0.13.0. The
 Agent Helper moves from `/Applications/Arcen Agent Helper.app` to
-`/Library/PrivilegedHelperTools` (installing the newer package moves it). Both
+`/Library/PrivilegedHelperTools` (installing the newer package moves it). The
 launchd definitions name the Pier app. And declining the account prompt stops
 the install with a reason. The design itself is the same in 0.13.0.
 
@@ -51,11 +51,12 @@ service that owns the network and a per-session agent that owns the desktop.
 | Process | Bundle | Started by | Runs as | Can | Cannot |
 | --- | --- | --- | --- | --- | --- |
 | Network service | `/Applications/Arcen Pier.app` (`pier.arcen.tech`) | launchd, at boot (`/Library/LaunchDaemons/pier.arcen.tech.service.plist`) | `_arcen` | Bind UDP 18444, read the host key, check passwords through PAM, relay an admitted Deck to an agent | See or control any desktop; it refuses to start as root |
-| Desktop agent | `/Library/PrivilegedHelperTools/Arcen Agent Helper.app` (`pier.arcen.tech.agent`) | launchd, in each Aqua session and at the login window (`/Library/LaunchAgents/pier.arcen.tech.agent.plist`) | The signed-in person; **root at the login window** | Capture, encode, inject input and use the pasteboard, only as far as that person's privacy approvals allow | Bind the port or read the host key; serve an account other than its own |
+| Desktop agent | `/Library/PrivilegedHelperTools/Arcen Agent Helper.app` (`pier.arcen.tech.agent`) | launchd, in each Aqua session and at the login window (`/Library/LaunchAgents/pier.arcen.tech.agent.plist`) | The signed-in person; **root at the login window** | Capture, encode, inject input, use the pasteboard, and set `TZ` in its own GUI launchd domain for newly launched apps | Bind the port, read the host key, change the system timezone, or serve an account other than its own |
 | Virtual keyboard and pointer | The Pier's own executable, run as `arcen-pier-macos hid-injector` | The agent, as its child | The same account as the agent | Present one virtual HID keyboard and one absolute pointer, fed by the agent over standard input | Anything else: it has no network, no session and no policy |
 
 Where each claim is enforced:
 
+- **Time-zone redirection stays inside the launchd agent.** The Agent Helper validates the Deck IANA name against `/var/db/timezone/zoneinfo`, then sets `ARCEN_SESSION_TZ` and `TZ` in its own GUI launchd domain. Redirection is enabled only for the launchd-managed `pier.arcen.tech.agent` Aqua job; launchd runs one such job per GUI domain, which is the single-writer guarantee. A same-uid manual process has no extra authority over that user's environment and is out of scope. Only applications launched after the setting is applied inherit the Deck zone; the menu bar clock, the system timezone, and already-running apps are not changed. If a user already has `TZ` without Arcen's sentinel, redirection is skipped. Restore unsets `TZ` only while it still equals the sentinel; if the agent is SIGKILLed before restore, the value can last until that GUI session logs out, but never beyond it.
 - **The service refuses root.** `hosts/macos/src/main.rs` (`run_daemon`) exits
   when started as root, unless a developer sets `ARCEN_DAEMON_ALLOW_ROOT`. The
   packaged definition never does. `hosts/macos/src/service.rs` renders `UserName _arcen`

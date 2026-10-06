@@ -22,8 +22,9 @@
 use std::time::{Duration, Instant};
 
 use arcen_keel::{ActivityHint, BgraFrame, DamageSummary, HashKernel};
-use arcen_media::video::ColorTransform;
-use arcen_media::video::EncoderBackend;
+use arcen_media::video::{
+    pipeline_contract, ColorTransform, EncoderBackend, KeyframePolicy, PipelineId,
+};
 
 /// Narrow a coded sample to the eight-bit plane byte these encoders consume.
 ///
@@ -69,7 +70,7 @@ pub(crate) struct MfRunOpts {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub profile: H264Profile,
-    pub gop_secs: u32,
+    pub keyframe_policy: KeyframePolicy,
     pub framed: bool,
     pub adapter_hint: Option<String>,
     pub adapter_output_index: Option<u32>,
@@ -114,7 +115,10 @@ struct CommonRunOpts {
 #[derive(Clone, Copy)]
 enum EncoderKind {
     #[cfg(feature = "mf")]
-    MediaFoundation { profile: H264Profile, gop_secs: u32 },
+    MediaFoundation {
+        profile: H264Profile,
+        keyframe_policy: KeyframePolicy,
+    },
     #[cfg(feature = "software-h264")]
     OpenH264,
 }
@@ -203,13 +207,16 @@ impl ActiveEncoder {
             .ok_or_else(|| "capture plane geometry overflow".to_string())?;
         match kind {
             #[cfg(feature = "mf")]
-            EncoderKind::MediaFoundation { profile, gop_secs } => {
+            EncoderKind::MediaFoundation {
+                profile,
+                keyframe_policy,
+            } => {
                 let encoder = MfEncoder::new(&MfConfig {
                     width,
                     height,
                     fps: opts.fps,
                     bitrate_kbps: opts.bitrate_kbps,
-                    gop_frames: opts.fps.saturating_mul(gop_secs.max(1)).max(1),
+                    gop_frames: keyframe_policy.scheduled_period_frames(opts.fps),
                     profile,
                     color: opts.color,
                 })
@@ -224,10 +231,14 @@ impl ActiveEncoder {
             }
             #[cfg(feature = "software-h264")]
             EncoderKind::OpenH264 => {
-                let bitrate_bps = opts
-                    .bitrate_kbps
-                    .checked_mul(1_000)
-                    .ok_or_else(|| "OpenH264 bitrate overflows bits per second".to_string())?;
+                let (start_bps, _) = software_bitrate_bounds(width, height, opts.fps, opts.color);
+                let bitrate_bps = if opts.bitrate_kbps == 0 {
+                    start_bps
+                } else {
+                    opts.bitrate_kbps
+                        .checked_mul(1_000)
+                        .ok_or_else(|| "OpenH264 bitrate overflows bits per second".to_string())?
+                };
                 let threads = std::thread::available_parallelism()
                     .map_or(1, |count| u16::try_from(count.get().min(4)).unwrap_or(1));
                 let encoder = SoftwareH264Encoder::new(SoftwareH264Config {
@@ -240,6 +251,7 @@ impl ActiveEncoder {
                     matrix: opts.color.matrix,
                     primaries: opts.color.primaries,
                     transfer: opts.color.transfer,
+                    keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
                 })
                 .map_err(|error| format!("OpenH264 encoder init failed: {error}"))?;
                 Ok(Self::OpenH264 {
@@ -450,6 +462,35 @@ impl ActiveEncoder {
         }
     }
 
+    fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "mf")]
+            Self::MediaFoundation { encoder, .. } => encoder
+                .reconfigure_bitrate(bps)
+                .map_err(|error| format!("MF bitrate reconfigure error: {error:?}")),
+            #[cfg(feature = "software-h264")]
+            Self::OpenH264 { encoder, .. } => {
+                let bps = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
+                encoder
+                    .reconfigure_bitrate(bps)
+                    .map_err(|error| format!("OpenH264 bitrate reconfigure error: {error}"))
+            }
+        }
+    }
+
+    fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "mf")]
+            Self::MediaFoundation { encoder, .. } => encoder
+                .reconfigure_framerate(fps)
+                .map_err(|error| format!("MF framerate reconfigure error: {error:?}")),
+            #[cfg(feature = "software-h264")]
+            Self::OpenH264 { encoder, .. } => encoder
+                .reconfigure_framerate(fps)
+                .map_err(|error| format!("OpenH264 framerate reconfigure error: {error}")),
+        }
+    }
+
     fn pool_stats(&self) -> PoolStats {
         match self {
             #[cfg(feature = "mf")]
@@ -474,7 +515,7 @@ impl ActiveEncoder {
 }
 
 const IDLE_KEEPALIVE: Duration = Duration::from_secs(1);
-const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// How long input/focus activity keeps a region responsive without new pixels.
 const REGION_INPUT_WAKE_GRACE: Duration = Duration::from_millis(100);
 const FULL_DAMAGE_ENTER_RATIO: f64 = 0.75;
@@ -687,13 +728,39 @@ fn average_u64(sum: u64, count: u64) -> f64 {
     }
 }
 
+fn software_bitrate_bounds(
+    width: u32,
+    height: u32,
+    fps: u32,
+    color: crate::ColorSpec,
+) -> (u32, u32) {
+    pipeline_contract(PipelineId::Software).bitrate_bounds(
+        width,
+        height,
+        fps,
+        color.chroma,
+        color.bit_depth,
+    )
+}
+
+fn apply_default_software_bitrate(opts: &mut CommonRunOpts, width: u32, height: u32) -> (u32, u32) {
+    let bounds = software_bitrate_bounds(width, height, opts.fps, opts.color);
+    if opts.bitrate_kbps == 0 {
+        opts.bitrate_kbps = bounds.0.div_ceil(1_000).max(1);
+    }
+    bounds
+}
+
 #[cfg(feature = "mf")]
 pub(crate) fn run(opts: MfRunOpts) -> ! {
     let profile = opts.profile;
-    let gop_secs = opts.gop_secs;
+    let keyframe_policy = opts.keyframe_policy;
     std::process::exit(run_inner(
         common_mf_options(opts),
-        EncoderKind::MediaFoundation { profile, gop_secs },
+        EncoderKind::MediaFoundation {
+            profile,
+            keyframe_policy,
+        },
     ))
 }
 
@@ -741,10 +808,13 @@ pub(crate) fn run_admission_probe(
     probe: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
     let profile = opts.profile;
-    let gop_secs = opts.gop_secs;
+    let keyframe_policy = opts.keyframe_policy;
     run_synthetic_admission(
         common_mf_options(opts),
-        EncoderKind::MediaFoundation { profile, gop_secs },
+        EncoderKind::MediaFoundation {
+            profile,
+            keyframe_policy,
+        },
         probe,
     )
 }
@@ -758,7 +828,7 @@ pub(crate) fn run_openh264_admission_probe(
 }
 
 fn run_synthetic_admission(
-    opts: CommonRunOpts,
+    mut opts: CommonRunOpts,
     encoder_kind: EncoderKind,
     probe: &crate::admission_probe::AdmissionProbeOptions,
 ) -> i32 {
@@ -787,6 +857,7 @@ fn run_synthetic_admission(
         log("software admission geometry is not 16-aligned");
         return 3;
     }
+    apply_default_software_bitrate(&mut opts, probe.width, probe.height);
     let mut encoder = match ActiveEncoder::new(encoder_kind, probe.width, probe.height, &opts) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -815,7 +886,7 @@ fn run_synthetic_admission(
     }
 }
 
-fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
+fn run_inner(mut opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
     let backend_label = encoder_kind.label();
     // Keep the (virtual) display awake so WGC keeps receiving DWM composites.
     unsafe {
@@ -877,6 +948,9 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
     }
     let (width, height) = (cap_width, cap_height);
 
+    let (software_start_bps, software_ceiling_bps) =
+        apply_default_software_bitrate(&mut opts, width, height);
+
     let mut encoder = match ActiveEncoder::new(encoder_kind, width, height, &opts) {
         Ok(e) => e,
         Err(e) => {
@@ -905,8 +979,12 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
     };
 
     let control = crate::spawn_control_thread("software encoder");
+    log(&format!(
+        "{backend_label}: software bitrate policy: start={software_start_bps}bps ceiling={software_ceiling_bps}bps"
+    ));
 
-    let target_dt = crate::frame_interval_from_fps(opts.fps);
+    let mut active_fps = opts.fps;
+    let mut target_dt = crate::frame_interval_from_fps(opts.fps);
     let mut next = Instant::now();
     let mut first = true;
     let mut have_frame = false;
@@ -953,7 +1031,7 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
         let mut stage_error: Option<String> = None;
         let mut captured_new_frame = false;
         let _ = unsafe {
-            cap.acquire_into(&mut dbg, &mut |tex: &ID3D11Texture2D| {
+            cap.acquire_into(&mut dbg, None, &mut |tex: &ID3D11Texture2D| {
                 if let Err(error) = stage_texture(
                     &device,
                     &context,
@@ -984,6 +1062,40 @@ fn run_inner(opts: CommonRunOpts, encoder_kind: EncoderKind) -> i32 {
         }
 
         let now = Instant::now();
+        if let Some(fps) = control.take_framerate_fps() {
+            let fps = fps.clamp(1, 30);
+            if fps != active_fps {
+                match encoder.reconfigure_framerate(fps) {
+                    Ok(()) => {
+                        active_fps = fps;
+                        target_dt = crate::frame_interval_from_fps(fps);
+                        log(&format!(
+                            "{backend_label}: live framerate reconfigured: fps={fps}"
+                        ));
+                    }
+                    Err(error) => log(&format!(
+                        "{backend_label}: live framerate reconfigure failed: {error}"
+                    )),
+                }
+            }
+        }
+        if let Some(bps) = control.take_bitrate_bps() {
+            let bps = bps.clamp(
+                u64::from(software_start_bps / 4),
+                u64::from(software_ceiling_bps),
+            );
+            match encoder.reconfigure_bitrate(bps) {
+                Ok(()) => {
+                    let forced_bps = bps;
+                    log(&format!(
+                        "{backend_label}: live bitrate reconfigured: target={forced_bps}bps"
+                    ));
+                }
+                Err(error) => log(&format!(
+                    "{backend_label}: live bitrate reconfigure failed: {error}"
+                )),
+            }
+        }
         let idr_pending = control.idr_pending();
         let mandatory_refresh = full_refresh_reason(
             staging.is_some(),
@@ -1121,7 +1233,7 @@ fn full_refresh_reason(
     } else if idr_pending && !idr_planes_refreshed {
         Some("forced-idr")
     } else if since_last_refresh >= FULL_REFRESH_INTERVAL {
-        Some("periodic-2s")
+        Some("periodic-safety")
     } else {
         None
     }
@@ -1395,8 +1507,9 @@ unsafe fn pick_device(
 #[cfg(test)]
 mod tests {
     use super::{
-        forced_keyframe_for, full_refresh_reason, h264_surface_is_aligned, ConversionCoverage,
-        DamageMode, FullDamageAction, FULL_DAMAGE_PROBE_INTERVAL, FULL_REFRESH_INTERVAL,
+        apply_default_software_bitrate, forced_keyframe_for, full_refresh_reason,
+        h264_surface_is_aligned, CommonRunOpts, ConversionCoverage, DamageMode, EncoderKind,
+        FullDamageAction, FULL_DAMAGE_PROBE_INTERVAL, FULL_REFRESH_INTERVAL,
     };
     use arcen_keel::scenario::{Scenario, ScenarioKind};
     use arcen_keel::{BgraFrame, DamageSummary, DamageTracker, KernelPreference};
@@ -1404,6 +1517,32 @@ mod tests {
     use arcen_media::video::{convert_bgra_to_nv12, convert_bgra_to_nv12_rows, Nv12FrameMut};
     use arcen_media::ForcedKeyframe;
     use std::time::Duration;
+
+    #[test]
+    fn mf_admission_defaults_to_nonzero_shared_software_bitrate() {
+        let mut opts = CommonRunOpts {
+            output_index: 0,
+            fps: 30,
+            bitrate_kbps: 0,
+            framed: true,
+            adapter_hint: None,
+            adapter_output_index: None,
+            device_name: None,
+            cursor_mode: crate::CursorCaptureMode::Local,
+            color: crate::ColorSpec::legacy(false),
+        };
+        let (start_bps, ceiling_bps) = apply_default_software_bitrate(&mut opts, 1920, 1080);
+        assert_eq!(start_bps, 4_000_000);
+        assert_eq!(ceiling_bps, 8_000_000);
+        assert_eq!(opts.bitrate_kbps, 4_000);
+        assert!(opts.bitrate_kbps > 0);
+        #[cfg(feature = "mf")]
+        assert!(EncoderKind::MediaFoundation {
+            profile: crate::mf_encoder::H264Profile::Main,
+            keyframe_policy: KeyframePolicy::SOFTWARE_FALLBACK,
+        }
+        .requires_macroblock_alignment());
+    }
 
     #[test]
     fn every_host_full_refresh_reason_forces_a_region_keyframe() {
@@ -1420,7 +1559,7 @@ mod tests {
             "client IDR request"
         );
         assert_eq!(
-            forced_keyframe_for("periodic-2s"),
+            forced_keyframe_for("periodic-safety"),
             ForcedKeyframe::Recovery,
             "periodic recovery refresh"
         );
@@ -1538,7 +1677,7 @@ mod tests {
         );
         assert_eq!(
             full_refresh_reason(true, true, false, false, FULL_REFRESH_INTERVAL),
-            Some("periodic-2s")
+            Some("periodic-safety")
         );
         assert_eq!(
             full_refresh_reason(false, false, true, false, FULL_REFRESH_INTERVAL),

@@ -27,28 +27,33 @@ use arcen_media::{
     VideoCodec, VideoConfiguration,
 };
 
-use crate::protocol::messages::{ServerHelloMsg, VideoSelectionIntent};
+use crate::protocol::messages::{ServedPipelineMsg, ServerHelloMsg, VideoSelectionIntent};
 
 // ============================================================================
 // w5-negotiated-truth: the negotiated colour/encode contract
 // ============================================================================
 
 /// Whether `encoder_backend` runs on dedicated silicon, preferring the class
-/// the host declares (`encoder_class`) and falling back to a name-based
-/// guess only for hosts that predate that field: a name-based guess cannot
-/// classify a vendor it has never heard of, and would show a future
-/// hardware encoder as a fallback.
+/// the host declares (`encoder_class`) and falling back to a name-based guess
+/// only for hosts that predate that field. Unknown stays unknown so a future
+/// backend is not silently displayed as either hardware or software.
 ///
 /// Pulled out so the hello-arrival status line
 /// (`ArcenApp::sync_media_state`) and the negotiated-truth panel share one
 /// answer and can never disagree about which this session is.
 #[must_use]
-pub fn encoder_is_hardware(encoder_backend: &str, encoder_class: &str) -> bool {
+pub fn encoder_acceleration(encoder_backend: &str, encoder_class: &str) -> Option<bool> {
     match AcceleratorClass::from_token(encoder_class) {
-        Some(class) => class == AcceleratorClass::Hardware,
+        Some(class) => Some(class == AcceleratorClass::Hardware),
         None => {
             let lowered = encoder_backend.to_ascii_lowercase();
-            lowered.contains("native") || lowered.contains("capenc")
+            if lowered.contains("native") || lowered.contains("capenc") {
+                Some(true)
+            } else if lowered.contains("sw") || lowered.contains("software") {
+                Some(false)
+            } else {
+                None
+            }
         }
     }
 }
@@ -189,9 +194,10 @@ pub struct NegotiatedTruth {
     pub selection: VideoSelectionIntent,
     pub active: ActiveContract,
     pub degradation: PlanDegradation,
+    pub pipeline_degradation: Option<String>,
     /// `hello.encoder_backend`, or `"unknown"` when the host sent none.
     pub encoder_backend: String,
-    pub encoder_hardware: bool,
+    pub encoder_hardware: Option<bool>,
 }
 
 impl NegotiatedTruth {
@@ -200,6 +206,7 @@ impl NegotiatedTruth {
         hello: &ServerHelloMsg,
         requested: VideoConfiguration,
         selection: VideoSelectionIntent,
+        requested_pipeline: Option<&arcen_protocol::messages::StreamPipeline>,
     ) -> Self {
         let active = ActiveContract::from_hello(hello);
         let mut degradation = negotiated_degradation(requested, &active);
@@ -214,21 +221,38 @@ impl NegotiatedTruth {
         } else {
             hello.encoder_backend.clone()
         };
-        let encoder_hardware = encoder_is_hardware(&hello.encoder_backend, &hello.encoder_class);
+        let encoder_hardware = encoder_acceleration(&hello.encoder_backend, &hello.encoder_class);
+        let pipeline_degradation =
+            pipeline_degradation_summary(requested_pipeline, hello.active_pipeline.as_ref());
         Self {
             requested,
             selection,
             active,
             degradation,
+            pipeline_degradation,
             encoder_backend,
             encoder_hardware,
         }
     }
+
+    pub fn update_served_pipeline(
+        &mut self,
+        requested: Option<&arcen_protocol::messages::StreamPipeline>,
+        served: Option<&ServedPipelineMsg>,
+    ) {
+        if let Some(served) = served {
+            self.encoder_backend = served.backend.clone();
+            self.encoder_hardware = AcceleratorClass::from_token(&served.backend)
+                .map(|class| class == AcceleratorClass::Hardware);
+        }
+        let active = served.map(|served| &served.served);
+        self.pipeline_degradation = pipeline_degradation_summary(requested, active);
+    }
 }
 
 /// `"hardware"`/`"software"`/`"unknown"` label for an `Option<bool>`
-/// acceleration flag -- shared by the encode side (always `Some`, see
-/// [`encoder_is_hardware`]) and the decode side
+/// acceleration flag -- shared by the encode side (which may become unknown
+/// when the host reports an unknown `served_pipeline.backend`) and the decode side
 /// (`NativeVideoDecoder::is_hardware_accelerated`, genuinely `None` before
 /// any decode session has been created).
 #[must_use]
@@ -296,8 +320,14 @@ pub fn degradation_summary(degradation: PlanDegradation) -> String {
 /// status. Exact sessions remain inspectable through the on-demand detail
 /// panel, while any observable downgrade stays permanently visible.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn should_show_degradation_badge(degradation: PlanDegradation) -> bool {
     !degradation.is_exact()
+}
+
+#[must_use]
+pub fn should_show_truth_badge(truth: &NegotiatedTruth) -> bool {
+    !truth.degradation.is_exact() || truth.pipeline_degradation.is_some()
 }
 
 #[must_use]
@@ -306,6 +336,39 @@ pub fn selection_summary(selection: VideoSelectionIntent, degradation: PlanDegra
         "adaptive codec selected".to_string()
     } else {
         degradation_summary(degradation)
+    }
+}
+
+#[must_use]
+pub fn negotiated_truth_summary(truth: &NegotiatedTruth) -> String {
+    truth
+        .pipeline_degradation
+        .clone()
+        .unwrap_or_else(|| selection_summary(truth.selection, truth.degradation))
+}
+
+#[must_use]
+pub fn truth_badge_text(truth: &NegotiatedTruth, decoder_hardware: Option<bool>) -> String {
+    format!(
+        "{}  ·  encode {}  ·  decode {}",
+        negotiated_truth_summary(truth),
+        hardware_label(truth.encoder_hardware),
+        hardware_label(decoder_hardware),
+    )
+}
+
+#[must_use]
+pub fn pipeline_degradation_summary(
+    requested: Option<&arcen_protocol::messages::StreamPipeline>,
+    active: Option<&arcen_protocol::messages::ServedStreamPipeline>,
+) -> Option<String> {
+    match (requested, active) {
+        (Some(requested), Some(active)) if requested.token() != active.token() => Some(format!(
+            "PIPELINE DEGRADED: requested {}, host served {}",
+            requested.token(),
+            active.token()
+        )),
+        _ => None,
     }
 }
 
@@ -427,19 +490,29 @@ mod tests {
         .expect("minimal server_hello with color_caps parses")
     }
 
-    // ---- encoder_is_hardware ----
+    // ---- encoder_acceleration ----
 
     #[test]
-    fn encoder_is_hardware_prefers_the_declared_class() {
-        assert!(encoder_is_hardware("some-unnamed-backend", "hardware"));
-        assert!(!encoder_is_hardware("native-nvenc", "software"));
+    fn encoder_acceleration_prefers_the_declared_class() {
+        assert_eq!(
+            encoder_acceleration("some-unnamed-backend", "hardware"),
+            Some(true)
+        );
+        assert_eq!(
+            encoder_acceleration("native-nvenc", "software"),
+            Some(false)
+        );
     }
 
     #[test]
-    fn encoder_is_hardware_falls_back_to_name_guess_when_class_is_unknown() {
-        assert!(encoder_is_hardware("native-nvenc", ""));
-        assert!(encoder_is_hardware("host-capenc-thing", "not-a-real-class"));
-        assert!(!encoder_is_hardware("openh264-sw-h264", ""));
+    fn encoder_acceleration_falls_back_to_name_guess_when_class_is_unknown() {
+        assert_eq!(encoder_acceleration("native-nvenc", ""), Some(true));
+        assert_eq!(
+            encoder_acceleration("host-capenc-thing", "not-a-real-class"),
+            Some(true)
+        );
+        assert_eq!(encoder_acceleration("openh264-sw-h264", ""), Some(false));
+        assert_eq!(encoder_acceleration("future-encoder", ""), None);
     }
 
     // ---- parse_chroma_from_pix_fmt ----
@@ -605,10 +678,22 @@ mod tests {
         assert!(degradation.matrix_changed);
         assert!(degradation.primaries_changed);
         assert!(degradation.transfer_changed);
-        let summary = degradation_summary(degradation);
-        assert!(summary.contains("matrix"));
-        assert!(summary.contains("primaries"));
-        assert!(summary.contains("transfer"));
+    }
+
+    #[test]
+    fn pipeline_degradation_summary_flags_requested_active_mismatch() {
+        let note = pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Hdr),
+            Some(&arcen_protocol::messages::ServedStreamPipeline::Grading),
+        )
+        .expect("mismatch is visible");
+        assert!(note.contains("requested hdr"));
+        assert!(note.contains("host served grading"));
+        assert!(pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Auto),
+            Some(&arcen_protocol::messages::ServedStreamPipeline::Auto),
+        )
+        .is_none());
     }
 
     #[test]
@@ -659,6 +744,7 @@ mod tests {
             &hello,
             requested,
             VideoSelectionIntent::AdaptivePerformance,
+            None,
         );
         assert!(adaptive.degradation.is_exact());
         assert_eq!(adaptive.active.codec, Some(VideoCodec::Av1));
@@ -667,6 +753,7 @@ mod tests {
             &hello,
             requested,
             VideoSelectionIntent::Exact,
+            None,
         );
         assert!(exact.degradation.codec_changed);
 
@@ -681,6 +768,7 @@ mod tests {
             &changed_range,
             requested,
             VideoSelectionIntent::AdaptivePerformance,
+            None,
         );
         assert!(
             adaptive.degradation.range_changed,
@@ -714,6 +802,29 @@ mod tests {
             matrix_changed: true,
             ..PlanDegradation::default()
         }));
+    }
+
+    #[test]
+    fn pipeline_mismatch_also_needs_a_permanent_badge() {
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h264",
+            "active_pipeline": "software"
+        }))
+        .expect("hello");
+        let truth = NegotiatedTruth::from_hello_with_selection(
+            &hello,
+            VideoConfiguration::legacy_h264(),
+            VideoSelectionIntent::AdaptivePerformance,
+            Some(&arcen_protocol::messages::StreamPipeline::Speed),
+        );
+        assert!(truth.degradation.is_exact());
+        assert_eq!(
+            truth.pipeline_degradation.as_deref(),
+            Some("PIPELINE DEGRADED: requested speed, host served software")
+        );
+        assert!(should_show_truth_badge(&truth));
+        assert!(negotiated_truth_summary(&truth).contains("software"));
     }
 
     #[test]

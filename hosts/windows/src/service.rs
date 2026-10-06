@@ -19,10 +19,11 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-    SC_MANAGER_CONNECT, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN,
-    SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SC_MANAGER_CONNECT, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+    SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+    SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS,
 };
 
 pub const SERVICE_NAME: &str = "ArcenPier";
@@ -93,6 +94,7 @@ pub(crate) enum ServiceControlRequest {
     TemporaryDebug,
     ReloadConfigured,
     ReloadTls,
+    SessionChange,
 }
 
 impl ServiceControlRequest {
@@ -101,6 +103,7 @@ impl ServiceControlRequest {
             Self::TemporaryDebug => 1,
             Self::ReloadConfigured => 2,
             Self::ReloadTls => 4,
+            Self::SessionChange => 8,
         }
     }
 
@@ -109,6 +112,7 @@ impl ServiceControlRequest {
             1 => Some(Self::TemporaryDebug),
             2 => Some(Self::ReloadConfigured),
             4 => Some(Self::ReloadTls),
+            8 => Some(Self::SessionChange),
             _ => None,
         }
     }
@@ -599,6 +603,7 @@ const fn decode_service_control(control: u32) -> Option<ServiceControlRequest> {
         SERVICE_CONTROL_TEMPORARY_DEBUG => Some(ServiceControlRequest::TemporaryDebug),
         SERVICE_CONTROL_RELOAD_CONFIGURED => Some(ServiceControlRequest::ReloadConfigured),
         SERVICE_CONTROL_RELOAD_TLS => Some(ServiceControlRequest::ReloadTls),
+        SERVICE_CONTROL_SESSIONCHANGE => Some(ServiceControlRequest::SessionChange),
         _ => None,
     }
 }
@@ -636,7 +641,7 @@ fn report_status(
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current_state,
         dwControlsAccepted: if current_state == SERVICE_RUNNING {
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE
         } else {
             0
         },

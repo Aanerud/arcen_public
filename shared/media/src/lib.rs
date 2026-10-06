@@ -1,6 +1,6 @@
 //! Transport-independent media and monitor capability contracts.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use arcen_protocol::messages::ClientDisplayIdError;
@@ -181,6 +181,63 @@ pub enum TransferCharacteristics {
     Pq,
     /// H.273 value 18: ARIB STD-B67 (HLG).
     Hlg,
+}
+
+/// Colour metadata axes that can change presentation without changing the
+/// encoded pixel layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoColorMetadata {
+    pub range: ColorRange,
+    pub matrix: ColorMatrix,
+    pub primaries: ColorPrimaries,
+    pub transfer: TransferCharacteristics,
+}
+
+impl VideoColorMetadata {
+    /// Builds an explicit metadata record from parsed wire fields, using the
+    /// legacy BT.709 SDR contract only for axes absent from legacy peers.
+    #[must_use]
+    pub const fn from_optional_or_legacy(
+        range: Option<ColorRange>,
+        matrix: Option<ColorMatrix>,
+        primaries: Option<ColorPrimaries>,
+        transfer: Option<TransferCharacteristics>,
+    ) -> Self {
+        Self {
+            range: match range {
+                Some(range) => range,
+                None => ColorRange::Limited,
+            },
+            matrix: match matrix {
+                Some(matrix) => matrix,
+                None => ColorMatrix::Bt709,
+            },
+            primaries: match primaries {
+                Some(primaries) => primaries,
+                None => ColorPrimaries::Bt709,
+            },
+            transfer: match transfer {
+                Some(transfer) => transfer,
+                None => TransferCharacteristics::Bt709,
+            },
+        }
+    }
+
+    /// Whether these tags can force a presenter colour-space/HDR retag.
+    #[must_use]
+    pub const fn presentation_axes(self) -> PresentationColorMetadata {
+        PresentationColorMetadata {
+            primaries: self.primaries,
+            transfer: self.transfer,
+        }
+    }
+}
+
+/// Colour metadata subset that decides presentation retags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentationColorMetadata {
+    pub primaries: ColorPrimaries,
+    pub transfer: TransferCharacteristics,
 }
 
 impl VideoCodec {
@@ -1175,6 +1232,23 @@ impl VideoConfiguration {
     pub const fn is_identity_matrix(self) -> bool {
         self.matrix.is_identity()
     }
+
+    /// The colour metadata actually signalled for this video contract.
+    #[must_use]
+    pub const fn color_metadata(self) -> VideoColorMetadata {
+        VideoColorMetadata {
+            range: self.range,
+            matrix: self.matrix,
+            primaries: self.primaries,
+            transfer: self.transfer,
+        }
+    }
+
+    /// The subset of colour metadata that may require a presentation retag.
+    #[must_use]
+    pub const fn presentation_color_metadata(self) -> PresentationColorMetadata {
+        self.color_metadata().presentation_axes()
+    }
 }
 
 /// Media contract validation failure.
@@ -1421,6 +1495,17 @@ mod tests {
         assert_eq!(VideoCodec::from_token(""), None);
         assert_eq!(VideoCodec::from_token("H264"), None);
         assert_eq!(ChromaSubsampling::from_token("yuv411"), None);
+    }
+
+    #[test]
+    fn missing_colour_metadata_normalizes_to_legacy_bt709_sdr() {
+        let explicit = VideoConfiguration::legacy_h264().color_metadata();
+        let normalized = VideoColorMetadata::from_optional_or_legacy(None, None, None, None);
+        assert_eq!(normalized, explicit);
+        assert_eq!(
+            normalized.presentation_axes(),
+            VideoConfiguration::legacy_h264().presentation_color_metadata()
+        );
     }
 
     #[test]

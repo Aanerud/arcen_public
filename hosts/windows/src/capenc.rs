@@ -43,7 +43,6 @@ use crate::{chroma_name, codec_name};
 const MAX_AU_BYTES: u32 = 16 * 1024 * 1024;
 const FRAME_QUEUE_CAPACITY: usize = 4;
 const CAPENC_READY_TIMEOUT: Duration = Duration::from_secs(10);
-const IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const CAPENC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPENC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PRE_READY_DIAGNOSTICS: usize = 32;
@@ -77,6 +76,11 @@ pub struct CapencConfig {
     /// Damage-driven QP biasing to request. Roster-wide; see
     /// `docs/architecture/qp-maps.md`.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    /// Mirrors the session agent's effective profile so capenc's debug-only
+    /// stderr diagnostics follow `pier.json` `logging.level`.
+    pub debug_diagnostics: bool,
+    /// Optional native encoder ceiling from the served pipeline contract.
+    pub encoder_max_bitrate_bps: Option<u32>,
     pub fps: u32,
     pub width: u32,
     pub height: u32,
@@ -373,7 +377,6 @@ fn format_ready_expectation(expectation: &ReadyExpectation<'_>) -> String {
 
 #[derive(Debug)]
 enum StdinCommand {
-    Idr,
     Bitrate(u64),
     Framerate(u32),
     Shutdown,
@@ -381,7 +384,7 @@ enum StdinCommand {
 
 #[derive(Clone)]
 pub struct IdrRequester {
-    tx: mpsc::Sender<StdinCommand>,
+    tx: mpsc::UnboundedSender<&'static str>,
 }
 
 #[derive(Clone)]
@@ -390,21 +393,17 @@ pub struct BitrateRequester {
 }
 
 impl IdrRequester {
-    fn new(tx: mpsc::Sender<StdinCommand>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<&'static str>) -> Self {
         Self { tx }
     }
 
     pub fn request(&self, reason: &'static str) -> bool {
-        match self.tx.try_send(StdinCommand::Idr) {
+        match self.tx.send(reason) {
             Ok(()) => {
                 tracing::info!(target: CAPENC, reason, "IDR recovery queued");
                 true
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(target: CAPENC, reason, "IDR recovery already pending");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::SendError(_)) => {
                 tracing::warn!(target: CAPENC, reason, "IDR request dropped: engine stdin closed");
                 false
             }
@@ -426,6 +425,155 @@ impl BitrateRequester {
     }
 }
 
+async fn wait_for_input_desktop_ready(session_log_id: &CorrelationId) {
+    static FULL_GATE_SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<String>>,
+    > = std::sync::OnceLock::new();
+    static IN_FLIGHT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Notify>>>,
+    > = std::sync::OnceLock::new();
+
+    let key = session_log_id.as_str().to_owned();
+    let seen =
+        FULL_GATE_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&key)
+        && matches!(input_desktop_is_default(), Ok(true))
+    {
+        return;
+    }
+
+    let in_flight =
+        IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let notify = {
+        let mut guards = in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(notify) = guards.get(&key) {
+            Some(Arc::clone(notify))
+        } else {
+            guards.insert(key.clone(), Arc::new(tokio::sync::Notify::new()));
+            None
+        }
+    };
+    if let Some(notify) = notify {
+        notify.notified().await;
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let mut gate = crate::first_login::InputDesktopGate::default();
+    loop {
+        let elapsed = started.elapsed();
+        let observation = input_desktop_is_default();
+        match &observation {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                target: CAPENC,
+                sid = %session_log_id,
+                "input desktop is not Default yet"
+            ),
+            Err(error) => tracing::debug!(
+                target: CAPENC,
+                sid = %session_log_id,
+                %error,
+                "input desktop readiness probe failed; waiting for ceiling or fresh evidence"
+            ),
+        }
+        if let Some(ready) = gate.observe(elapsed, observation) {
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.clone());
+            if let Some(notify) = in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key)
+            {
+                notify.notify_waiters();
+            }
+            tracing::info!(
+                target: CAPENC,
+                sid = %session_log_id,
+                wait_ms = ready.waited().as_millis(),
+                reason = ready.reason(),
+                evidence = ?ready.evidence_detail(),
+                "input desktop transition wait complete"
+            );
+            return;
+        }
+        tokio::time::sleep(crate::first_login::POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+const fn spawn_needs_full_desktop_gate(full_gate_seen: bool, input_default: bool) -> bool {
+    !full_gate_seen || !input_default
+}
+
+#[cfg(windows)]
+fn input_desktop_is_default() -> Result<bool, String> {
+    use windows::Win32::Foundation::{BOOL, HANDLE};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+        DESKTOP_READOBJECTS, HDESK, UOI_NAME,
+    };
+
+    struct DesktopHandle(HDESK);
+    impl Drop for DesktopHandle {
+        fn drop(&mut self) {
+            unsafe {
+                // SAFETY: The handle was returned by OpenInputDesktop and is
+                // owned by this guard, so it is closed exactly once here.
+                let _ = CloseDesktop(self.0);
+            }
+        }
+    }
+
+    let desktop = unsafe {
+        // SAFETY: OpenInputDesktop has no pointer arguments. We request only
+        // object-read access to query UOI_NAME, and the returned handle is
+        // closed by DesktopHandle.
+        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), BOOL(0), DESKTOP_READOBJECTS)
+    }
+    .map_err(|error| format!("OpenInputDesktop: {error}"))?;
+    let desktop = DesktopHandle(desktop);
+    let mut needed = 0u32;
+    let _ = unsafe {
+        // SAFETY: The desktop handle is live; a zero-sized probe with a valid
+        // length out-pointer is the documented sizing call.
+        GetUserObjectInformationW(HANDLE(desktop.0 .0), UOI_NAME, None, 0, Some(&mut needed))
+    };
+    if needed == 0 {
+        return Err("GetUserObjectInformationW(UOI_NAME) returned no size".to_string());
+    }
+    let mut buffer = vec![0u16; needed.div_ceil(2) as usize];
+    unsafe {
+        // SAFETY: buffer is writable for `needed` bytes and the desktop handle
+        // remains live for the duration of the call.
+        GetUserObjectInformationW(
+            HANDLE(desktop.0 .0),
+            UOI_NAME,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            Some(&mut needed),
+        )
+    }
+    .map_err(|error| format!("GetUserObjectInformationW(UOI_NAME): {error}"))?;
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    let name = String::from_utf16_lossy(&buffer[..end]);
+    Ok(name == "Default")
+}
+
+#[cfg(not(windows))]
+fn input_desktop_is_default() -> Result<bool, String> {
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildShutdown {
     Graceful,
@@ -438,6 +586,7 @@ impl Capenc {
     pub async fn spawn(
         cfg: CapencConfig,
     ) -> Result<(Capenc, Arc<VideoQueue<EncodedFrame>>, ResolvedMediaPlan), CapencStartError> {
+        wait_for_input_desktop_ready(&cfg.session_log_id).await;
         // Multi-call dispatch: the Pier spawns itself with the `capenc`
         // subcommand rather than a separate executable. This is what makes the
         // installed footprint one binary, and it closes SEC-101/SEC-151 by
@@ -465,13 +614,18 @@ impl Capenc {
             "spawning capture+encode engine"
         );
 
-        let mut child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .args(&args)
             .env("ARCEN_SESSION_LOG_ID", cfg.session_log_id.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if cfg.debug_diagnostics {
+            command.env("ARCEN_CAPENC_DEBUG", "1");
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| CapencStartError::StartFailed {
                 binary: binary.display().to_string(),
@@ -529,7 +683,8 @@ impl Capenc {
 
         let frames = Arc::new(VideoQueue::new(FRAME_QUEUE_CAPACITY));
         let (stdin_tx, stdin_rx) = mpsc::channel(1);
-        let idr = IdrRequester::new(stdin_tx.clone());
+        let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+        let idr = IdrRequester::new(idr_tx);
         let pipeline_telemetry = Arc::new(PipelineTelemetry::default());
 
         let codec = Self::protocol_codec(plan.video.codec);
@@ -549,7 +704,10 @@ impl Capenc {
             read_length_prefixed(stdout, codec, frames.clone(), idr.clone())
                 .instrument(helper_span.clone()),
         );
-        tokio::spawn(write_stdin(stdin, stdin_rx).instrument(helper_span.clone()));
+        tokio::spawn(
+            retry_pending_idr(frames.clone(), idr.clone()).instrument(helper_span.clone()),
+        );
+        tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
         tokio::spawn(
             forward_stderr(stderr_lines, Arc::clone(&pipeline_telemetry)).instrument(helper_span),
         );
@@ -790,6 +948,9 @@ impl Capenc {
         if variant.is_coherent() {
             args.push(format!("variant={}", variant.id()));
         }
+        if let Some(max_bitrate_bps) = cfg.encoder_max_bitrate_bps {
+            args.push(format!("max-bitrate={max_bitrate_bps}"));
+        }
         // Their own tokens: `variant=<id>` names codec, chroma, depth,
         // range and matrix and has no room for these. Emitted only when
         // they differ from BT.709, so a session that never asked for HDR
@@ -839,8 +1000,8 @@ impl Capenc {
     }
 
     /// Real IDR-on-demand: one line on the engine's stdin, no restart.
-    pub fn request_keyframe(&self, reason: &'static str) {
-        self.idr.request(reason);
+    pub fn request_keyframe(&self, reason: &'static str) -> bool {
+        self.idr.request(reason)
     }
 
     pub fn idr(&self) -> IdrRequester {
@@ -873,6 +1034,9 @@ pub(crate) fn admission_probe_command(cfg: &CapencConfig) -> Result<std::process
         .arg("capenc")
         .args(Capenc::build_args(cfg))
         .env("ARCEN_SESSION_LOG_ID", cfg.session_log_id.as_str());
+    if cfg.debug_diagnostics {
+        command.env("ARCEN_CAPENC_DEBUG", "1");
+    }
     Ok(command)
 }
 
@@ -1007,23 +1171,28 @@ fn enqueue_encoded_frame(
         VideoPushResult::Dropped {
             count,
             recovery_started,
+            idr_request,
         } => {
             let reason = if recovery_started {
                 "capenc_queue_drop"
             } else {
                 "capenc_queue_awaiting_keyframe"
             };
-            idr.request(reason);
+            if idr_request {
+                frames.note_keyframe_request_handoff(idr.request(reason));
+            }
             if recovery_started {
                 tracing::warn!(
                     target: CAPENC,
                     dropped = count,
+                    idr_request,
                     "capenc frame queue lost AU: cleared prediction chain, awaiting IDR"
                 );
             } else {
                 tracing::debug!(
                     target: CAPENC,
                     dropped = count,
+                    idr_request,
                     "capenc frame queue suppressed non-keyframe while awaiting IDR"
                 );
             }
@@ -1036,33 +1205,61 @@ fn enqueue_encoded_frame(
     }
 }
 
-async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::Receiver<StdinCommand>) {
-    while let Some(command) = commands.recv().await {
-        match command {
-            StdinCommand::Idr => {
+async fn retry_pending_idr(frames: Arc<VideoQueue<EncodedFrame>>, idr: IdrRequester) {
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    while !frames.is_closed() {
+        tick.tick().await;
+        if frames.keyframe_request_due() {
+            frames.note_keyframe_request_handoff(idr.request("capenc_queue_recovery_retry"));
+        }
+    }
+}
+
+async fn write_stdin(
+    mut stdin: ChildStdin,
+    mut idr_requests: mpsc::UnboundedReceiver<&'static str>,
+    mut commands: mpsc::Receiver<StdinCommand>,
+) {
+    loop {
+        tokio::select! {
+            reason = idr_requests.recv() => {
+                let Some(reason) = reason else {
+                    if commands.is_closed() {
+                        return;
+                    }
+                    continue;
+                };
                 let write = async {
                     stdin.write_all(b"IDR\n").await?;
                     stdin.flush().await
                 };
                 match tokio::time::timeout(CAPENC_WRITE_TIMEOUT, write).await {
-                    Ok(Ok(())) => {
-                        tokio::time::sleep(IDR_REQUEST_MIN_INTERVAL).await;
-                    }
+                    Ok(Ok(())) => {}
                     Ok(Err(_)) => {
                         tracing::warn!(
                             target: CAPENC,
+                            reason,
                             reason_class = "control_pipe_write_failed",
                             "capenc IDR write failed"
                         );
                         return;
                     }
                     Err(_) => {
-                        tracing::warn!(target: CAPENC, "capenc IDR write timed out");
+                        tracing::warn!(target: CAPENC, reason, "capenc IDR write timed out");
                         return;
                     }
                 }
             }
-            StdinCommand::Bitrate(bps) => {
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    if idr_requests.is_closed() {
+                        return;
+                    }
+                    continue;
+                };
+                match command {
+                    StdinCommand::Bitrate(bps) => {
                 let line = arcen_media::capenc_control::CapencControlCommand::Bitrate { bps }
                     .as_wire_line();
                 let write = async {
@@ -1077,7 +1274,7 @@ async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::Receiver<StdinCo
                     return;
                 }
             }
-            StdinCommand::Framerate(fps) => {
+                    StdinCommand::Framerate(fps) => {
                 let line = arcen_media::capenc_control::CapencControlCommand::Framerate { fps }
                     .as_wire_line();
                 let write = async {
@@ -1092,13 +1289,15 @@ async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::Receiver<StdinCo
                     return;
                 }
             }
-            StdinCommand::Shutdown => {
+                    StdinCommand::Shutdown => {
                 let stop = async {
                     stdin.write_all(b"STOP\n").await?;
                     stdin.flush().await
                 };
                 let _ = tokio::time::timeout(CAPENC_WRITE_TIMEOUT, stop).await;
                 return;
+            }
+                }
             }
         }
     }
@@ -1179,6 +1378,7 @@ fn forward_capenc_line_with_telemetry(line: &str, telemetry: Option<&PipelineTel
             capture_empty_polls = stats.capture_empty_polls,
             capture_timeouts = stats.capture_timeouts,
             capture_cursor_only = stats.capture_cursor_only,
+            capture_pointer_updates = stats.capture_pointer_updates,
             encode_submitted = stats.encode_submitted,
             encode_skipped_no_new = stats.encode_skipped_no_new,
             kilobits_per_second = stats.kilobits_per_second,
@@ -1265,6 +1465,7 @@ struct PipelineStats {
     capture_empty_polls: Option<u64>,
     capture_timeouts: Option<u64>,
     capture_cursor_only: Option<u64>,
+    capture_pointer_updates: Option<u64>,
     encode_submitted: Option<u64>,
     encode_skipped_no_new: Option<u64>,
     kilobits_per_second: Option<u64>,
@@ -1311,6 +1512,7 @@ fn parse_pipeline_stats(line: &str) -> PipelineStats {
             "capture_empty" => stats.capture_empty_polls = value.parse().ok(),
             "timeout" => stats.capture_timeouts = value.parse().ok(),
             "cursor_only" => stats.capture_cursor_only = value.parse().ok(),
+            "pointer_updates" => stats.capture_pointer_updates = value.parse().ok(),
             "encode_submitted" => stats.encode_submitted = value.parse().ok(),
             "encode_skipped_no_new" => stats.encode_skipped_no_new = value.parse().ok(),
             "kbps" => stats.kilobits_per_second = value.parse().ok(),
@@ -1414,6 +1616,37 @@ mod tests {
         EncoderBackend,
     };
 
+    #[test]
+    fn desktop_gate_first_spawn_always_waits_even_when_default() {
+        assert!(spawn_needs_full_desktop_gate(false, true));
+    }
+
+    #[test]
+    fn desktop_gate_later_default_spawn_can_start_immediately() {
+        assert!(!spawn_needs_full_desktop_gate(true, true));
+    }
+
+    #[test]
+    fn desktop_gate_later_winlogon_spawn_waits_again() {
+        assert!(spawn_needs_full_desktop_gate(true, false));
+    }
+
+    #[tokio::test]
+    async fn desktop_gate_batch_waiters_share_one_notification() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let first = Arc::clone(&notify);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let waiting = first.notified();
+            let _ = ready_tx.send(());
+            waiting.await;
+            true
+        });
+        ready_rx.await.expect("waiter armed");
+        notify.notify_waiters();
+        assert!(waiter.await.expect("waiter joined"));
+    }
+
     fn test_config() -> CapencConfig {
         CapencConfig {
             binary: "arcen-capenc.exe".to_string(),
@@ -1431,6 +1664,8 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            encoder_max_bitrate_bps: None,
             fps: 30,
             width: 1920,
             height: 1080,
@@ -1492,6 +1727,46 @@ mod tests {
                 .any(|arg| arg == "qp-map=neutral"),
             "the control arm must be selectable, or the benchmark has none"
         );
+    }
+
+    #[test]
+    fn args_carry_pipeline_encoder_ceiling_only_when_host_resolved_one() {
+        let mut cfg = test_config();
+        cfg.codec = VideoCodec::H265;
+        cfg.chroma = ChromaSubsampling::Yuv444;
+        cfg.bit_depth = BitDepth::Ten;
+        cfg.color_range = ColorRange::Full;
+        cfg.color_matrix = ColorMatrix::Bt709;
+        cfg.transfer = TransferCharacteristics::Bt709;
+        cfg.color_primaries = ColorPrimaries::Bt709;
+
+        assert!(
+            !Capenc::build_args(&cfg)
+                .iter()
+                .any(|arg| arg.starts_with("max-bitrate=")),
+            "a Custom colour match must not infer Grading's ceiling"
+        );
+
+        cfg.encoder_max_bitrate_bps =
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .encoder_ceiling_bps();
+        assert!(Capenc::build_args(&cfg)
+            .iter()
+            .any(|arg| arg == "max-bitrate=250000000"));
+
+        cfg.color_matrix = ColorMatrix::Bt2020Ncl;
+        cfg.encoder_max_bitrate_bps = Some(500_000_000);
+        assert!(
+            Capenc::build_args(&cfg)
+                .iter()
+                .any(|arg| arg == "max-bitrate=500000000"),
+            "any future pipeline ceiling, including HDR, must flow through the generic field"
+        );
+
+        let auto = test_config();
+        assert!(!Capenc::build_args(&auto)
+            .iter()
+            .any(|arg| arg.starts_with("max-bitrate=")));
     }
 
     #[test]
@@ -1938,7 +2213,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_encoded_au_suppresses_chain_until_idr_without_storming() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let idr = IdrRequester::new(tx);
         let queue = VideoQueue::new(1);
         let frame = |value, keyframe| EncodedFrame {
@@ -1951,7 +2226,7 @@ mod tests {
         assert!(queue.awaiting_keyframe());
         assert_eq!(queue.len(), 0);
         assert!(enqueue_encoded_frame(&queue, &idr, frame(3, false)));
-        assert!(matches!(rx.try_recv(), Ok(StdinCommand::Idr)));
+        assert!(matches!(rx.try_recv(), Ok("capenc_queue_drop")));
         assert!(
             rx.try_recv().is_err(),
             "repeated losses must coalesce behind one pending IDR"
@@ -1968,7 +2243,7 @@ mod tests {
         let (reader, writer) = tokio::io::duplex(16);
         drop(writer);
         let frames = Arc::new(VideoQueue::new(1));
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::unbounded_channel();
         read_length_prefixed(
             reader,
             VideoCodec::H264,
@@ -1987,7 +2262,7 @@ mod tests {
         ] {
             let (mut writer, reader) = tokio::io::duplex(16);
             let frames = Arc::new(VideoQueue::new(1));
-            let (tx, _rx) = mpsc::channel(1);
+            let (tx, _rx) = mpsc::unbounded_channel();
             let task = tokio::spawn(read_length_prefixed(
                 reader,
                 VideoCodec::H264,
@@ -2002,21 +2277,20 @@ mod tests {
     }
 
     #[test]
-    fn repeated_losses_coalesce_and_retry_when_throttle_reopens() {
-        let (tx, mut rx) = mpsc::channel(1);
+    fn idr_requests_use_separate_unbounded_mailbox() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let idr = IdrRequester::new(tx);
         assert!(idr.request("first_loss"));
-        assert!(!idr.request("second_loss"));
-        assert!(matches!(rx.try_recv(), Ok(StdinCommand::Idr)));
-        assert!(idr.request("retry_after_guard"));
-        assert!(matches!(rx.try_recv(), Ok(StdinCommand::Idr)));
+        assert!(idr.request("client_request_full_frame"));
+        assert!(matches!(rx.try_recv(), Ok("first_loss")));
+        assert!(matches!(rx.try_recv(), Ok("client_request_full_frame")));
     }
 
     #[tokio::test]
     async fn stdout_eof_closes_frame_queue_after_draining() {
         let (mut writer, reader) = tokio::io::duplex(64);
         let frames = Arc::new(VideoQueue::new(1));
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(read_length_prefixed(
             reader,
             VideoCodec::H264,
@@ -2045,8 +2319,10 @@ mod tests {
             .spawn()
             .expect("spawn shutdown fixture");
         let stdin = child.stdin.take().expect("fixture stdin");
+        let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+        drop(idr_tx);
         let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(write_stdin(stdin, rx));
+        tokio::spawn(write_stdin(stdin, idr_rx, rx));
         (child, tx)
     }
 
@@ -2093,7 +2369,7 @@ mod tests {
             .spawn()
             .expect("spawn shutdown fixture");
         let (control, _receiver) = mpsc::channel(1);
-        control.send(StdinCommand::Idr).await.unwrap();
+        control.send(StdinCommand::Bitrate(1)).await.unwrap();
 
         assert_eq!(
             shutdown_child(&mut child, &control, Duration::from_millis(50)).await,

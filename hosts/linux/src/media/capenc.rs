@@ -77,6 +77,8 @@ fn apply_capture_cursor_constraint(mut config: CapencConfig) -> (CapencConfig, b
 pub enum CapencStartError {
     #[error("invalid capenc configuration: {0}")]
     InvalidConfig(String),
+    #[error("{0}")]
+    PipelineRefused(&'static str),
     #[error("failed to spawn capenc: {0}")]
     Spawn(#[source] std::io::Error),
     #[error("capenc backend unavailable before READY: {0}")]
@@ -132,6 +134,11 @@ pub struct CapencConfig {
     /// Damage-driven QP biasing to request. Roster-wide; see
     /// `docs/architecture/qp-maps.md`.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    /// Mirrors the Pier's effective profile so capenc's debug-only stderr
+    /// diagnostics follow `pier.json` `logging.level`.
+    pub debug_diagnostics: bool,
+    /// Optional native encoder ceiling from the served pipeline contract.
+    pub encoder_max_bitrate_bps: Option<u32>,
     /// Exact configured capture width expected in READY.
     pub width: u32,
     /// Exact configured capture height expected in READY.
@@ -241,6 +248,9 @@ impl CapencConfig {
             let variant = VideoVariant::new(self.video_configuration(codec));
             if variant.is_coherent() {
                 v.push(format!("variant={}", variant.id()));
+            }
+            if let Some(max_bitrate_bps) = self.encoder_max_bitrate_bps {
+                v.push(format!("max-bitrate={max_bitrate_bps}"));
             }
         }
         // Transfer and primaries ride as their own tokens because
@@ -426,8 +436,6 @@ where
 
 /// Command sent to the stdin-writer task.
 pub(crate) enum StdinCmd {
-    /// Force a keyframe (`IDR\n`).
-    Idr,
     /// Apply a live bitrate target.
     Bitrate(u64),
     /// Apply a live frame-rate target.
@@ -451,7 +459,8 @@ enum ChildShutdown {
 /// including the one held by the backpressure queue — at the new child.
 #[derive(Clone)]
 pub struct IdrRequester {
-    tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
+    idr_tx: std::sync::Arc<std::sync::RwLock<mpsc::UnboundedSender<()>>>,
+    control_tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
 }
 
 #[derive(Clone)]
@@ -460,29 +469,27 @@ pub struct BitrateRequester {
 }
 
 impl IdrRequester {
-    fn new(tx: mpsc::Sender<StdinCmd>) -> Self {
+    fn new(idr_tx: mpsc::UnboundedSender<()>, control_tx: mpsc::Sender<StdinCmd>) -> Self {
         Self {
-            tx: std::sync::Arc::new(std::sync::RwLock::new(tx)),
+            idr_tx: std::sync::Arc::new(std::sync::RwLock::new(idr_tx)),
+            control_tx: std::sync::Arc::new(std::sync::RwLock::new(control_tx)),
         }
     }
 
-    /// Request one keyframe. Non-blocking; drops silently if the child is gone
-    /// or the mailbox is momentarily full (a keyframe is already in flight).
+    /// Request one keyframe. Non-blocking and independent of bitrate/framerate
+    /// control commands, so client recovery is never hidden behind a full
+    /// control mailbox.
     pub fn request(&self) -> bool {
         let tx = self
-            .tx
+            .idr_tx
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match tx.try_send(StdinCmd::Idr) {
+        match tx.send(()) {
             Ok(()) => {
                 tracing::debug!(target: target::CAPENC, "IDR requested");
                 true
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(target: target::CAPENC, "IDR request coalesced (mailbox full)");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::SendError(_)) => {
                 tracing::warn!(target: target::CAPENC, "IDR request dropped — capenc not running");
                 false
             }
@@ -493,18 +500,23 @@ impl IdrRequester {
     /// spawned capenc. Used by the mid-session stream resize after the old
     /// child was shut down.
     pub fn retarget(&self, session: &CapencSession) {
-        let mut tx = self
-            .tx
+        let mut idr_tx = self
+            .idr_tx
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *tx = session.stdin_tx.clone();
+        *idr_tx = session.idr_tx.clone();
+        let mut control_tx = self
+            .control_tx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *control_tx = session.stdin_tx.clone();
     }
 }
 
 impl BitrateRequester {
     fn new(idr: &IdrRequester) -> Self {
         Self {
-            tx: std::sync::Arc::clone(&idr.tx),
+            tx: std::sync::Arc::clone(&idr.control_tx),
         }
     }
 
@@ -536,6 +548,7 @@ pub struct CapencSession {
     frames: Option<mpsc::Receiver<AccessUnit>>,
     idr: IdrRequester,
     child: Child,
+    idr_tx: mpsc::UnboundedSender<()>,
     stdin_tx: mpsc::Sender<StdinCmd>,
 }
 
@@ -949,6 +962,20 @@ pub fn fit_to_encoder_limits(encoder: EncoderRequest, width: u32, height: u32) -
 fn software_fallback_config(
     mut config: CapencConfig,
 ) -> Result<(CapencConfig, PlanDegradation), CapencStartError> {
+    let requested_codec = config.codec_enum()?;
+    let requested_pipeline = arcen_media::video::pipeline_for_request(
+        config.video_selection,
+        config.video_configuration(requested_codec),
+        config.fps,
+        config.motion_priority,
+    );
+    let software_decision =
+        arcen_media::video::software_fallback_decision(requested_pipeline, config.video_selection);
+    if software_decision.is_refusal() {
+        return Err(CapencStartError::PipelineRefused(
+            software_decision.reason(),
+        ));
+    }
     if !software_fallback_preserves_exact_pins(&config) {
         return Err(CapencStartError::InvalidConfig(
             "OpenH264 fallback would violate an exact video.codec or video.variant pin".to_string(),
@@ -1090,6 +1117,7 @@ async fn spawn_one(
     // Small mailbox: coalesces bursts of keyframe requests (a full mailbox
     // means an IDR is already queued, so dropping extras is correct).
     let (stdin_tx, stdin_rx) = mpsc::channel::<StdinCmd>(4);
+    let (idr_tx, idr_rx) = mpsc::unbounded_channel();
 
     let helper_span = tracing::info_span!(
         target: target::CAPENC,
@@ -1109,7 +1137,7 @@ async fn spawn_one(
         }
     };
     tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
-    tokio::spawn(write_stdin(stdin, stdin_rx).instrument(helper_span.clone()));
+    tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
     tokio::spawn(read_stderr(stderr_lines).instrument(helper_span));
 
     tracing::info!(
@@ -1131,8 +1159,9 @@ async fn spawn_one(
     Ok((
         CapencSession {
             frames: Some(frames_rx),
-            idr: IdrRequester::new(stdin_tx.clone()),
+            idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone()),
             child,
+            idr_tx,
             stdin_tx,
         },
         plan,
@@ -1157,6 +1186,9 @@ fn configure_child_environment(
         command.env("XAUTHORITY", xauthority);
     }
     command.env("ARCEN_SESSION_LOG_ID", config.session_log_id.as_str());
+    if config.debug_diagnostics {
+        command.env("ARCEN_CAPENC_DEBUG", "1");
+    }
     Ok(())
 }
 
@@ -1247,15 +1279,33 @@ where
 
 /// stdin ← keyframe requests. `Stop` writes the graceful stop command and then
 /// drops stdin so older capenc children also exit on EOF.
-async fn write_stdin(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiver<StdinCmd>) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            StdinCmd::Idr => {
+async fn write_stdin(
+    mut stdin: tokio::process::ChildStdin,
+    mut idr_rx: mpsc::UnboundedReceiver<()>,
+    mut rx: mpsc::Receiver<StdinCmd>,
+) {
+    loop {
+        tokio::select! {
+            idr = idr_rx.recv() => {
+                if idr.is_none() {
+                    if rx.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
                 if let Err(e) = stdin.write_all(b"IDR\n").await.and(stdin.flush().await) {
                     tracing::warn!(target: target::CAPENC, error = %e, "capenc IDR write failed");
                     break;
                 }
             }
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else {
+                    if idr_rx.is_closed() {
+                        break;
+                    }
+                    continue;
+                };
+                match cmd {
             StdinCmd::Bitrate(bps) => {
                 let line = arcen_media::capenc_control::CapencControlCommand::Bitrate { bps }
                     .as_wire_line();
@@ -1283,6 +1333,8 @@ async fn write_stdin(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiv
             StdinCmd::Stop => {
                 let _ = stdin.write_all(b"STOP\n").await.and(stdin.flush().await);
                 break;
+            }
+                }
             }
         }
     }
@@ -1368,9 +1420,10 @@ pub(crate) mod test_support {
     /// Build an [`IdrRequester`] backed by an observable channel. The returned
     /// receiver yields one [`StdinCmd`] per `request()` / shutdown so tests can
     /// assert IDR-on-drop throttling.
-    pub(crate) fn fake_idr() -> (IdrRequester, mpsc::Receiver<StdinCmd>) {
-        let (tx, rx) = mpsc::channel::<StdinCmd>(8);
-        (IdrRequester::new(tx), rx)
+    pub(crate) fn fake_idr() -> (IdrRequester, mpsc::UnboundedReceiver<()>) {
+        let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::channel::<StdinCmd>(8);
+        (IdrRequester::new(idr_tx, control_tx), idr_rx)
     }
 
     pub(crate) fn fake_bitrate(idr: &IdrRequester) -> BitrateRequester {
@@ -1409,6 +1462,8 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            encoder_max_bitrate_bps: None,
             width: 3840,
             height: 2160,
             cursor_mode: CursorMode::Host,
@@ -1440,6 +1495,8 @@ mod tests {
             intent: EncodeIntent::default(),
             motion_priority: arcen_media::video::MotionPriority::Detail,
             qp_map: arcen_media::video::QpMapPolicy::default(),
+            debug_diagnostics: false,
+            encoder_max_bitrate_bps: None,
             width: 1920,
             height: 1080,
             cursor_mode: CursorMode::Local,
@@ -1540,6 +1597,42 @@ mod tests {
         assert!(cfg.argv().iter().any(|arg| arg == "intent=quality"));
         cfg.motion_priority = arcen_media::video::MotionPriority::Motion;
         assert!(cfg.argv().iter().any(|arg| arg == "priority=motion"));
+    }
+
+    #[test]
+    fn argv_carries_pipeline_encoder_ceiling_only_when_host_resolved_one() {
+        let mut cfg = native_config();
+        cfg.codec = "h265".to_string();
+        cfg.yuv444 = true;
+        cfg.bit_depth = BitDepth::Ten;
+        cfg.color_range = ColorRange::Full;
+        cfg.color_matrix = ColorMatrix::Bt709;
+        cfg.transfer = TransferCharacteristics::Bt709;
+        cfg.color_primaries = ColorPrimaries::Bt709;
+
+        assert!(
+            !cfg.argv().iter().any(|arg| arg.starts_with("max-bitrate=")),
+            "a Custom colour match must not infer Grading's ceiling"
+        );
+
+        cfg.encoder_max_bitrate_bps =
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Grading)
+                .encoder_ceiling_bps();
+        assert!(cfg.argv().iter().any(|arg| arg == "max-bitrate=250000000"));
+
+        cfg.color_matrix = ColorMatrix::Bt2020Ncl;
+        cfg.encoder_max_bitrate_bps = Some(500_000_000);
+        assert!(
+            cfg.argv().iter().any(|arg| arg == "max-bitrate=500000000"),
+            "any future pipeline ceiling, including HDR, must flow through the generic field"
+        );
+
+        let mut auto = native_config();
+        auto.encoder_max_bitrate_bps = None;
+        assert!(!auto
+            .argv()
+            .iter()
+            .any(|arg| arg.starts_with("max-bitrate=")));
     }
 
     #[tokio::test]
@@ -1942,7 +2035,9 @@ mod tests {
             .expect("spawn shutdown fixture");
         let stdin = child.stdin.take().expect("fixture stdin");
         let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(write_stdin(stdin, rx));
+        let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+        drop(idr_tx);
+        tokio::spawn(write_stdin(stdin, idr_rx, rx));
         (child, tx)
     }
 
@@ -1991,7 +2086,7 @@ mod tests {
             .spawn()
             .expect("spawn shutdown fixture");
         let (control, _receiver) = mpsc::channel(1);
-        control.send(StdinCmd::Idr).await.unwrap();
+        control.send(StdinCmd::Bitrate(1)).await.unwrap();
 
         assert_eq!(
             shutdown_child(&mut child, &control, Duration::from_millis(50)).await,

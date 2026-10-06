@@ -10,6 +10,8 @@ pub mod direct_reconnect;
 pub mod host_lifecycle;
 pub mod install_lifecycle;
 pub mod login_window_handover;
+pub mod network_reachability;
 pub mod pier_config;
 pub mod restore_lease;
 pub mod session_admission;
+pub mod zoneinfo;

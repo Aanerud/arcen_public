@@ -100,7 +100,7 @@ pub(crate) struct Encoder {
     gop_frames: u32,
     profile: H264Profile,
     color: ColorSpec,
-    frame_index: u64,
+    sample_clock: SampleClock,
     parameter_sets: Vec<Vec<u8>>,
     pending_idr: bool,
     /// GetOutputStreamInfo().cbSize, cached because it only changes on a
@@ -121,6 +121,38 @@ struct SampleSlot {
     sample: IMFSample,
     buffer: IMFMediaBuffer,
     capacity: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampleTiming {
+    pts_hns: i64,
+    duration_hns: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampleClock {
+    next_pts_hns: i64,
+}
+
+impl SampleClock {
+    const fn new() -> Self {
+        Self { next_pts_hns: 0 }
+    }
+
+    fn peek(self, fps: u32) -> SampleTiming {
+        SampleTiming {
+            pts_hns: self.next_pts_hns,
+            duration_hns: frame_duration_hns(fps),
+        }
+    }
+
+    fn advance(&mut self, duration_hns: i64) {
+        self.next_pts_hns = self.next_pts_hns.saturating_add(duration_hns);
+    }
+}
+
+fn frame_duration_hns(fps: u32) -> i64 {
+    10_000_000_i64 / i64::from(fps.max(1))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -231,7 +263,7 @@ impl Encoder {
             gop_frames: cfg.gop_frames,
             profile: cfg.profile,
             color: cfg.color,
-            frame_index: 0,
+            sample_clock: SampleClock::new(),
             parameter_sets,
             pending_idr: true,
             output_buffer_size: 0,
@@ -271,10 +303,12 @@ impl Encoder {
             };
         }
 
-        let sample = unsafe { self.prepare_input_sample(y_plane, y_stride, uv_plane, uv_stride) }
-            .map_err(|e| {
-            windows::core::Error::new(e.code(), format!("build_sample: {}", e.message()))
-        })?;
+        let timing = self.sample_clock.peek(self.fps);
+        let sample =
+            unsafe { self.prepare_input_sample(y_plane, y_stride, uv_plane, uv_stride, timing) }
+                .map_err(|e| {
+                    windows::core::Error::new(e.code(), format!("build_sample: {}", e.message()))
+                })?;
 
         unsafe {
             self.transform
@@ -284,7 +318,7 @@ impl Encoder {
                 })?
         };
 
-        self.frame_index += 1;
+        self.sample_clock.advance(timing.duration_hns);
 
         let mut out_bytes = std::mem::take(&mut self.out_scratch);
         out_bytes.clear();
@@ -359,6 +393,38 @@ impl Encoder {
         self.pool_stats
     }
 
+    pub(crate) fn reconfigure_bitrate(&mut self, bps: u64) -> windows::core::Result<()> {
+        let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
+        let bitrate_kbps = bitrate.div_ceil(1_000).max(1);
+        unsafe {
+            set_codec_u32(
+                &self.codec_api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                bitrate,
+                "AVEncCommonMeanBitRate",
+            )?;
+        }
+        self.bitrate_kbps = bitrate_kbps;
+        log(&format!(
+            "MF H.264 SW live bitrate reconfigured: target={bitrate}bps"
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn reconfigure_framerate(&mut self, fps: u32) -> windows::core::Result<()> {
+        if fps == 0 {
+            return Err(windows::core::Error::new(
+                E_INVALIDARG,
+                "MF H.264 fps must be non-zero",
+            ));
+        }
+        self.fps = fps;
+        log(&format!(
+            "MF H.264 SW live frame pacing reconfigured: fps={fps}"
+        ));
+        Ok(())
+    }
+
     /// Fill a retained input sample when the MFT promises not to hold input
     /// buffers. `MF_E_TRANSFORM_NEED_MORE_INPUT` ends every frame drain before
     /// this slot is reused.
@@ -368,12 +434,11 @@ impl Encoder {
         y_stride: usize,
         uv_plane: &[u8],
         uv_stride: usize,
+        timing: SampleTiming,
     ) -> windows::core::Result<IMFSample> {
         let w = self.width as usize;
         let h = self.height as usize;
         let total = w * h + w * (h / 2);
-        let hns_per_frame = 10_000_000i64 / self.fps as i64;
-        let pts = self.frame_index as i64 * hns_per_frame;
 
         if !self.input_reuse_enabled {
             self.pool_stats.input_allocations += 1;
@@ -385,8 +450,8 @@ impl Encoder {
                 uv_stride,
                 w,
                 h,
-                pts,
-                hns_per_frame,
+                timing.pts_hns,
+                timing.duration_hns,
             )?;
             return Ok(slot.sample);
         }
@@ -405,8 +470,8 @@ impl Encoder {
             uv_stride,
             w,
             h,
-            pts,
-            hns_per_frame,
+            timing.pts_hns,
+            timing.duration_hns,
         )?;
         Ok(slot.sample.clone())
     }
@@ -890,10 +955,13 @@ unsafe fn configure_codec_api(api: &ICodecAPI, cfg: &Config) -> windows::core::R
         "AVEncCommonMeanBitRate",
     )?;
     set_codec_bool(api, &CODECAPI_AVLowLatencyMode, true, "AVLowLatencyMode")?;
+    // Microsoft documents AVEncMPVGOPSize=0 as encoder-dependent rather than
+    // "infinite GOP"; callers that need deterministic no-periodic-IDR behavior
+    // must avoid MF or supply an explicit safety interval.
     set_codec_u32(
         api,
         &CODECAPI_AVEncMPVGOPSize,
-        cfg.gop_frames.max(1),
+        cfg.gop_frames,
         "AVEncMPVGOPSize",
     )?;
     set_codec_u32(
@@ -1101,7 +1169,7 @@ mod tests {
         mf_nominal_range, mf_transfer_function, mf_video_primaries, mf_yuv_matrix,
         validate_mf_color, Config, Encoder, H264Profile, MFNominalRange_0_255,
         MFNominalRange_16_235, MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransFunc_sRGB,
-        MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
+        MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, SampleClock,
     };
     use crate::ColorSpec;
 
@@ -1134,6 +1202,23 @@ mod tests {
         assert_eq!(stats.input_reuses, 3);
         assert_eq!(stats.output_allocations, 1);
         assert!(stats.output_reuses >= 3);
+    }
+
+    #[test]
+    fn sample_pts_stays_monotonic_across_framerate_changes() {
+        let mut clock = SampleClock::new();
+        let mut pts = Vec::new();
+        for fps in [30, 30, 15, 15, 30, 10, 30] {
+            let timing = clock.peek(fps);
+            pts.push(timing.pts_hns);
+            clock.advance(timing.duration_hns);
+        }
+        assert_eq!(pts[0], 0);
+        assert!(pts.windows(2).all(|pair| pair[1] > pair[0]), "{pts:?}");
+        assert_eq!(pts[2] - pts[1], 10_000_000 / 30);
+        assert_eq!(pts[3] - pts[2], 10_000_000 / 15);
+        assert_eq!(pts[5] - pts[4], 10_000_000 / 30);
+        assert_eq!(pts[6] - pts[5], 10_000_000 / 10);
     }
 
     #[test]

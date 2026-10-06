@@ -476,6 +476,7 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(WANTED),
@@ -493,6 +494,8 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -646,6 +649,7 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(1_000),
@@ -653,6 +657,8 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
                 input_bounds: arcen_pier_macos::input::DesktopBounds::new(
@@ -787,6 +793,7 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(30),
@@ -804,6 +811,8 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1035,6 +1044,7 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(40),
@@ -1052,6 +1062,8 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1229,6 +1241,7 @@ async fn a_streamed_session_records_what_it_measured() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(WANTED),
@@ -1246,6 +1259,8 @@ async fn a_streamed_session_records_what_it_measured() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1367,6 +1382,7 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(WANTED),
@@ -1384,6 +1400,8 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1514,6 +1532,7 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
         let stats = arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
                 frame_budget: Some(WANTED),
@@ -1531,6 +1550,8 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1719,6 +1740,7 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::H264,
                 frame_budget: Some(WANTED),
@@ -1736,6 +1758,8 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },
@@ -1913,6 +1937,7 @@ async fn a_still_desktop_sends_almost_nothing() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::H264,
                 frame_budget: Some(10_000),
@@ -1930,6 +1955,8 @@ async fn a_still_desktop_sends_almost_nothing() {
                 audio_channel: None,
                 audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
                 motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
             },

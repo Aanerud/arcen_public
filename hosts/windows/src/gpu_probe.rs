@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplaySettingsExW, GetMonitorInfoW, DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE,
-    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS, ENUM_DISPLAY_SETTINGS_MODE, MONITORINFO,
+    EnumDisplaySettingsExW, GetMonitorInfoW, DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE, DMDO_270,
+    DMDO_90, EDS_ROTATEDMODE, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, MONITORINFO,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -32,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 const MAX_ENUMERATED_MODES: u32 = 4096;
 const INVENTORY_VERSION: u32 = 2;
+const ARCEN_EDID_MANUFACTURE_ID: u16 = 0x064e;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HostCapabilityReport {
@@ -723,6 +724,11 @@ pub fn physical_output_inventory(
             } else {
                 OutputModeCapability::FixedModes(fixed_modes)
             };
+            let ccd_output_kind = if pier_owned_timing_output(&output) {
+                arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming
+            } else {
+                arcen_outputs::WindowsCcdOutputKind::PhysicalPanel
+            };
             outputs.push(AvailableOutput {
                 adapter_luid,
                 target_id,
@@ -731,6 +737,7 @@ pub fn physical_output_inventory(
                 global_index,
                 device_name: output.device_name,
                 mode_capability,
+                ccd_output_kind,
                 supported_rotations: vec![
                     Rotation::Degrees0,
                     Rotation::Degrees90,
@@ -853,21 +860,32 @@ fn enumerate_mode(
     };
     // SAFETY: device is null-terminated and mode is writable.
     let found = unsafe {
-        EnumDisplaySettingsExW(
-            PCWSTR(device.as_ptr()),
-            index,
-            &mut mode,
-            ENUM_DISPLAY_SETTINGS_FLAGS(0),
-        )
+        EnumDisplaySettingsExW(PCWSTR(device.as_ptr()), index, &mut mode, EDS_ROTATEDMODE)
     };
     if !found.as_bool() {
         return Err(format!("EnumDisplaySettingsExW failed for {device_name}"));
     }
-    Ok(ModeCapability {
-        width: mode.dmPelsWidth,
-        height: mode.dmPelsHeight,
+    Ok(mode_capability_from_devmode(&mode))
+}
+
+fn mode_capability_from_devmode(mode: &DEVMODEW) -> ModeCapability {
+    let (width, height) = if devmode_swaps_axes(mode) {
+        (mode.dmPelsHeight, mode.dmPelsWidth)
+    } else {
+        (mode.dmPelsWidth, mode.dmPelsHeight)
+    };
+    ModeCapability {
+        width,
+        height,
         refresh_hz: mode.dmDisplayFrequency,
-    })
+    }
+}
+
+fn devmode_swaps_axes(mode: &DEVMODEW) -> bool {
+    // SAFETY: this is the display branch of DEVMODEW's documented anonymous
+    // union as returned by EnumDisplaySettingsExW for a display device.
+    let orientation = unsafe { mode.Anonymous1.Anonymous2.dmDisplayOrientation };
+    orientation == DMDO_90 || orientation == DMDO_270
 }
 
 fn monitor_is_primary(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> bool {
@@ -881,6 +899,17 @@ fn monitor_is_primary(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> bool 
     // SAFETY: info is correctly sized and writable.
     let found = unsafe { GetMonitorInfoW(monitor, &mut info).as_bool() };
     found && info.dwFlags & MONITORINFOF_PRIMARY != 0
+}
+
+fn pier_owned_timing_output(output: &OutputCapability) -> bool {
+    output
+        .monitor_friendly_name
+        .as_deref()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("Arcen IDD"))
+        || output.edid_manufacture_id.is_some_and(|manufacturer| {
+            manufacturer == ARCEN_EDID_MANUFACTURE_ID
+                || manufacturer.swap_bytes() == ARCEN_EDID_MANUFACTURE_ID
+        })
 }
 
 pub fn nvenc_runtime_dll() -> bool {
@@ -954,6 +983,28 @@ mod tests {
         assert_eq!(
             stable_id(Some(r"\\?\PCI#VEN_10DE&DEV_1234"), 0x10de, 0x1234, 0, 1, 0),
             r"\\?\pci#ven_10de&dev_1234#0"
+        );
+    }
+
+    #[test]
+    fn rotated_devmode_modes_are_normalized_to_native_coordinates() {
+        let mut mode = DEVMODEW {
+            dmPelsWidth: 1_080,
+            dmPelsHeight: 1_920,
+            dmDisplayFrequency: 60,
+            ..DEVMODEW::default()
+        };
+        mode.Anonymous1.Anonymous2.dmDisplayOrientation = DMDO_90;
+
+        let capability = mode_capability_from_devmode(&mode);
+
+        assert_eq!(
+            capability,
+            ModeCapability {
+                width: 1_920,
+                height: 1_080,
+                refresh_hz: 60,
+            }
         );
     }
 

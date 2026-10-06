@@ -6,6 +6,313 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-06
+
+### Streaming
+
+- macOS Pier advertises host audio again for signed-in sessions. Asking for
+  helper permissions in turn (28 Sep) replaced the only call that marked audio
+  available, so every hello said `audio: false` and the Deck never requested
+  sound; it is now set on every agent and serve path before any prompt.
+- Pier debug logging now makes Keel QP-map effectiveness provable live:
+  Windows and Linux capenc inherit the Pier debug profile for helper
+  diagnostics, and Linux XShm/NVENC stats report per-second biased/neutral
+  QP-map counts plus mean dirty fraction alongside the capture damage source.
+- macOS Deck native 8-bit and 10-bit video layers now use a shared
+  refresh-sequence pacer driven by the window's `CVDisplayLink`: FIFO depth is
+  capped at three, overflow drops the oldest frame, stale frames are discarded
+  after coarse age caps, each submitted drawable uses a half-refresh minimum
+  display duration, and telemetry separates SUBMITTED cadence from
+  nonzero-`presentedTime` confirmations while reporting overflow/stale/hidden
+  drops, source-cadence underruns, queue depth, refresh gaps and ESTIMATED
+  receive-to-callback latency.
+- macOS Deck no longer discards a paced frame when every drawable slot is
+  still in flight: the refresh waits (`slot_waits` telemetry) and the frame is
+  shown on the next one. A full one-refresh minimum display duration made
+  presents miss their vsync and cost about one frame in four on a 60 Hz panel.
+- The Deck video inbox now holds ~500 ms (30 packets) for every pipeline, so a
+  Wi-Fi/VPN stall's burst is decoded instead of cleared; the old 8-packet inbox
+  turned 250-300 ms stalls into a repeating keyframe loop.
+- Windows Pier QP maps now use OS damage on the NVENC GPU path: Desktop
+  Duplication dirty/move rects and WGC dirty regions feed Keel without CPU
+  readback, and logs truthfully report `damage_source` plus disengage when no
+  damage source exists.
+- Windows Pier multi-monitor topology now programs rotated CCD outputs with
+  oriented source surfaces and native target timings, so mixed
+  landscape/portrait Deck layouts keep truthful READY geometry and no longer
+  ask Windows to apply an impossible portrait target mode.
+- Streaming pipelines now own a shared keyframe policy: hardware encoders stop
+  inserting two-second periodic IDRs and rely on Deck-requested recovery, while
+  software fallback keeps a longer bounded safety refresh.
+- macOS Pier now honours `redirection.timezone` without adding a second helper:
+  the launchd-managed Agent Helper validates the Deck IANA time zone against
+  zoneinfo and sets `TZ` in its own GUI session, so newly launched apps inherit
+  it. The state lives in that session (an owner-tagged `ARCEN_SESSION_TZ`
+  sentinel), is restored on session end and SIGTERM, and dies with logout. A
+  user-defined `TZ` is left alone. Upgrades remove the earlier root timezone
+  helper and restore any system time zone it changed.
+- Pipeline queue contracts now distinguish raw capture overflow from encoded
+  access-unit loss: raw frame pressure is latest-wins and does not request an
+  IDR, while encoded packet loss keeps the shared rate-limited keyframe
+  recovery path. Windows, Linux and macOS hosts report the relevant drop
+  counters without noisy per-frame diagnostics unless debug logging is enabled.
+- Deck keyframe requests that arrive inside a Pier's short request guard are
+  now coalesced and delivered when the guard expires instead of being dropped
+  (Linux and macOS Piers; Windows already forwarded every request), and a
+  recovery handoff that fails is retried on its own deadline.
+- The Deck now normalizes host colour metadata through shared media before
+  deciding presentation retags, so equivalent default and explicit BT.709 tags
+  no longer reconfigure the presenter.
+- Secondary Deck monitor windows now paint a neutral waiting placeholder before
+  their first frame instead of a black surface; retained frame replay remains
+  the preferred path when a frame is already available.
+- macOS Pier now installs a Core Audio HAL input driver named `Arcen Microphone` and, when `microphone_input.enabled` is true and the driver Mach service is reachable, accepts Deck microphone-v1 Opus/PCM frames into that virtual 48 kHz mono Float32 input device.
+- Windows Pier now makes the display HDR toggle follow the served pipeline:
+  HDR sessions enable HDR on the exact capture targets, SDR pipelines disable
+  it there before capture, and session/journal recovery restores the user's
+  original state.
+- Windows Pier NVIDIA headless HDR sessions now arm one recovery journal before
+  HDR and exact timing changes, record temporary NVAPI timing ownership in that
+  journal, and only record the held display after HDR is active and the exact
+  mode is re-applied.
+- Packaged Pier config templates now enable QP maps for Auto and Speed
+  (`{"auto":"on","speed":"on"}`) while the built-in default remains off and
+  existing installs keep their local config.
+- macOS Deck `dev-tools` builds now support an env-gated windowed
+  multi-monitor live-session test mode. `ARCEN_DECK_WINDOWED_MONITORS=2|3|4`
+  requests a real multi-monitor layout from the Pier but presents each
+  negotiated monitor as a decorated, resizable, non-fullscreen tiled window on
+  one local display; production builds do not compile the mode.
+- macOS Deck multi-window sessions now replay retained secondary frames when a
+  secondary window becomes ready, aspect-fit secondary video with black
+  letterboxing while routing input through the fitted image rect, and wrap
+  display mismatch notices inside narrow viewer windows.
+- macOS Deck multi-window input now ignores secondary-window clicks that start
+  in letterbox bands while still delivering releases for drags that began
+  inside the fitted image.
+- macOS Deck windowed multi-monitor test mode now keeps the root window's
+  stable title so native video layer lookup still works, and release packaging
+  refuses any binary carrying the `dev-tools` marker even on `--no-build`.
+- Pier configuration now accepts `video.qp_map` as either one
+  `off`/`neutral`/`on` policy or a per-served-pipeline object keyed by Auto,
+  Speed, Grading, HDR, Software and Custom. Linux and Windows pass the
+  effective served-pipeline policy to capenc; macOS accepts the key and logs
+  that VideoToolbox has no QP-map support.
+- Software-only Pier refusals for Grading/HDR now carry the shared user-facing reason to the Deck instead of collapsing to a generic capture/encoder setup failure, while internal init failures remain generic.
+- Linux multi-monitor sessions now aggregate the served pipeline across every started monitor encoder, so an NVENC primary with an OpenH264 fallback secondary reports and runs the Software contract instead of advertising the primary hardware preset.
+- macOS Pier multi-monitor sessions now apply served-pipeline encoder bitrate start/ceiling per region and run one adaptive session rate controller from QUIC path signals, pushing live bitrate targets up to each region's operational contract ceiling without forcing idle re-encodes.
+- The macOS Deck now latches native 8-bit and 10-bit presenter failures to the
+  RGBA fallback for the rest of the session, and keeps recovery requests armed
+  only until a non-empty RGBA fallback frame is handed to the existing texture
+  path, so occluded windows do not keep idle streams polling forever.
+- The macOS Deck now presents Grading and HDR root sessions through the same dedicated presenter-thread model as Auto/Speed instead of driving native video from egui repaint passes. Grading remains native `xf44` HEVC Main 4:4:4 10 BT.709 SDR into an RGB10A2 Metal layer with EDR off; HDR remains PQ/BT.2020 into that layer with EDR/HDR10 metadata only when the host confirms PQ.
+- HDR now keeps the conservative link-safe start but owns a 500 Mbit/s contract
+  ceiling through the same shared encoder-ceiling path as Grading, plus an
+  evidence-gated fast probe and HDR-scoped host/Deck queue budgets so other
+  pipelines keep their existing limits.
+- NVENC sessions now initialise the encoder with the resolved session frame
+  rate instead of a nominal 60 fps, so 30 fps Linux and Windows sessions deliver
+  their configured bitrate target rather than roughly half of it.
+- Speed now keeps the proven safe 1080p30 bitrate start but owns the true
+  60 fps clean-path ceiling in the shared pipeline contract. Hosts derive
+  Speed's motion priority and one-frame low-latency encoder/decoder policy
+  from the served pipeline contract: NVENC reports P4/ultra-low-latency,
+  zero reordering, no lookahead and a one-frame VBV; macOS ScreenCaptureKit
+  captures at 1/60 for Speed requests; and the Deck applies VideoToolbox
+  real-time decode for Speed sessions without treating optional decoder tuning
+  as fatal.
+- Auto, Speed, Grading and HDR are now named in the authenticated video request
+  and echoed in `server_hello` as the active pipeline. The shared media crate
+  owns one data contract per pipeline (codec ladder, colour target, bitrate
+  bounds, keel policy and degradation text), while legacy clients still resolve
+  through the previous request-field inference.
+- Grading keeps the conservative link-capped starting bitrate but now has a
+  shared 250 Mbit/s fidelity ceiling. The host adapters carry an optional
+  served-pipeline encoder ceiling into capenc generically, so future fidelity
+  pipelines can reuse the same path. Linux and Windows NVENC pass the value as
+  `maxBitRate` while sizing VBV from the active target; the macOS Pier keeps
+  `AverageBitRate` on the active target and passes the ceiling through
+  VideoToolbox `DataRateLimits`; Auto and Speed retain their previous encoder
+  bitrate numbers on this branch.
+- The Deck command line and smoke tools accept `--pipeline
+  auto|speed|grading|hdr`, deriving the same request fields as the GUI presets
+  and printing the host's active pipeline.
+- Software fallback is now a governed VM pipeline: the shared Software contract starts CPU H.264 near 4 Mbit/s for 1080p30, lets the live rate controller climb toward an 8 Mbit/s-class ceiling, and both Linux X11/OpenH264 and Windows MF/OpenH264 helpers accept runtime bitrate updates. Speed requests are visibly served as Software/Auto at 30 fps; Grading and HDR are refused on software-only hosts.
+- Windows NVENC (the H.264, HEVC and AV1 hardware path) now submits frames
+  through Keel's idle cadence, like the Linux NVENC path: a new frame, a
+  requested keyframe, one pipeline flush after a change, and otherwise a
+  keepalive once a second. It used to re-encode the last frame at the full
+  frame rate, so an idle desktop at 60 fps still cost about 4.8 Mbit/s. The
+  gate (`arcen_keel::SubmissionGate`) moved from the Linux encoder into
+  `shared/keel`, so both hosts run the same policy.
+
+### Fixed
+
+- macOS Deck sign-in hand-over now keeps the actual retained 8-bit or 10-bit
+  Metal presenter and its picture evidence alive across reconnect startup, so
+  the last login-window frame stays visible until the user's desktop sends a
+  replacement frame.
+- Linux Pier installer upgrades now use the shared certificate provisioning
+  plan: only positively classified legacy Arcen self-signed host pairs are
+  reissued over the existing key with existing SANs, shared ownership marker
+  and pin files; operator self-signed or CA-issued PEM and mismatched markers
+  are left untouched. Linux installer issuance also shares the helper's
+  certificate lock, journal, backup and rollback publication model.
+- Windows Pier no longer warns "writer stopped with error" when the Deck quits
+  normally and the broker has already closed the agent IPC WebSocket; resets
+  and timeouts still warn.
+- macOS Deck: dedicated 8-bit and 10-bit CAMetalLayer presenters now apply
+  fullscreen/resize geometry on the main thread, update backing-scale drawable
+  size, and replay the retained frame after geometry changes so native video
+  fills the resized viewport.
+- macOS Deck: session windows now keep an opaque black Core Animation backstop
+  below dedicated native video, so any transient layer gap shows black instead
+  of the desktop behind the transparent window.
+- Windows remote unlock no longer always waits the full 15 s post-login
+  stability ceiling: after an exact console bind, the broker can launch early
+  and the per-session agent waits until the target session's input desktop is
+  `Default` before starting capture. Repeated exact-bind and WTS-topology
+  diagnostics are deduplicated.
+- The macOS Deck now reports raw host-clock frame age as `wire_clock_age_ms`
+  and uses offset-free `wire_delay_ms` (raw age minus the session rolling
+  minimum) for overlays and stream-delay summaries, so inter-machine clock
+  offset no longer looks like wire latency.
+- Startup ramp no longer poisons session health with false critical FPS:
+  shared QoS assessment suppresses host and client FPS during the bounded Pier
+  warm-up window while keeping loss and latency checks active. Idle-desktop FPS
+  classification remains a known gap until per-monitor damage evidence is
+  wired into the health sample.
+- Manual or graceful session shutdowns no longer log normal Deck disconnects
+  as media-worker errors or Windows writer/audio-barrier warnings.
+- macOS Deck now declares its Local Network privacy reason and, when LAN-only advisory probes report the host or network unreachable, shows a Local Network/offline-host hint while connecting and reports that specific reason if the normal connect deadline expires.
+- Windows Pier debug logging now records incoming QUIC attempts before handshake completion plus startup network/firewall diagnostics and WTS session topology at boot/session changes.
+- macOS Deck: transient dedicated-presenter drops or occluded skips no longer
+  cover an already-established 8-bit or 10-bit native video layer with a black
+  session background; fatal fallback statuses still switch to the egui path.
+- macOS Deck: single-window sessions now re-enable display-refresh pacing on
+  the root presentation layer while preserving immediate root presents for
+  multi-window sessions, reducing input-storm pressure on WindowServer.
+- macOS Deck: session telemetry now reports per-interval dedicated-presenter
+  transient drawable drops and occluded skips as `presenter_drops` and
+  `presenter_skips`.
+- Linux Software Pier: live OpenH264 frame-rate sync no longer forces an IDR,
+  avoiding once-per-second keyframe pops during Detail-priority telemetry.
+- Linux CUDA/NVENC AV1 now repeats the AV1 sequence header on forced
+  keyframes, matching Windows NVENC so recovery IDRs are classified as
+  self-contained instead of leaving the Deck waiting.
+- macOS Deck reconnect and resume overlays now preserve the last dedicated
+  8-bit or 10-bit native video layer picture instead of flashing black while
+  the replacement session waits for a fresh keyframe.
+- macOS Deck root-layer pacing and colour tagging now positively avoid both
+  dedicated video layers, only keeps transparent backgrounds after the current
+  native layer has presented a picture, and counts every presenter drop/skip
+  even when status notifications coalesce. Session telemetry also reports
+  `ui_layout_passes_per_s` beside `ui_passes_per_s`.
+- macOS Deck native-only reconnect/resume now leaves the recovery overlay as
+  soon as the replacement session publishes its first native video frame,
+  instead of waiting for an egui fallback frame that never arrives on the
+  dedicated 8-bit and 10-bit paths.
+
+- Windows Pier: a session no longer fails with "expected client_hello during
+  handshake, received path_signal" when the Deck is slow to send its hello.
+  The service starts forwarding live path signals to the session agent as soon
+  as it relays; the agent's handshake reader now passes over that service-only
+  message instead of refusing the session (seen as "Connection reset without
+  closing handshake" on the Deck).
+
+- macOS Pier: the 8-bit low-latency VideoToolbox encoder (Auto and Speed)
+  does not report whether it is hardware-accelerated, so every macOS
+  Auto/Speed session was served as `custom` and the Deck showed a pipeline
+  degradation. The low-latency session is now created requiring a hardware
+  encoder, which proves its class; if no hardware encoder is available it is
+  created without the requirement and classified from its own read-back.
+  Found in the lab end-to-end run.
+- Deck CLI: `media-smoke` prints the host's authoritative `served_pipeline`
+  updates and reports the latest served pipeline in its summary.
+
+- macOS Pier multi-monitor sessions now send the authoritative
+  `served_pipeline` truth before the first region-video frame, aggregating every
+  region encoder's hardware/software read-back through `shared/media`; the
+  macOS Deck applies both the served pipeline and the reported backend so the
+  degradation badge no longer mixes software fallback truth with a provisional
+  hardware hello.
+- Windows Pier multi-monitor sessions now aggregate served-pipeline truth across
+  every admitted monitor encoder instead of trusting only the primary monitor,
+  so a hardware-primary/software-secondary set reports the software fallback.
+- macOS Pier exact/custom single-monitor sessions preserve the absent requested
+  pipeline through VideoToolbox encoder initialization, using Auto only for
+  bitrate sizing and keeping the authoritative served truth `custom`.
+- Linux, Windows and macOS Piers now size their operational rate controller
+  from the pipeline actually served rather than the pipeline requested: HDR
+  degraded to Grading uses Grading bounds, exact/custom streams keep legacy
+  shape-derived bounds, and software fallback uses the Software contract.
+- macOS Pier now reapplies the authoritative served contract after VideoToolbox
+  reports the real encoder acceleration, updating the initial encoder bitrate
+  and the controller before the first frame; multi-monitor region encoders apply
+  the aggregate served contract as well.
+- Windows Pier: a host whose display belongs to a virtual display adapter
+  (for example a GeForce PC with a third-party virtual display driver) streams
+  again. Every single-display NVENC session first asked NVIDIA to rebuild the
+  display to the Deck's size; NVAPI does not drive such a display, so the
+  session agent failed and the Deck saw only "Connection reset without closing
+  handshake". When NVIDIA refuses before anything on the host has changed, the
+  session now serves the existing display at its nearest mode. A failure while
+  displays are being changed still refuses the session.
+- Windows Pier: every failure before the session agent is ready now reaches
+  the Deck as a reason instead of a reset connection.
+- Windows Pier: the display recovery snapshot no longer requires NVAPI to
+  know every output an NVIDIA GPU renders. A virtual display adapter's
+  monitor is recorded as an ordinary Windows output, so the Pier may change
+  its mode instead of refusing the session.
+- Windows Pier: NVIDIA EDID provisioning is attempted only on Quadro, RTX Pro
+  and GRID GPUs. A GeForce answered `NvAPI_GPU_SetEDID` with
+  `NVAPI_NOT_SUPPORTED`, its rollback failed the same way, and every later
+  session found an unrestorable recovery journal. A GeForce host is now
+  served on its existing display without touching EDIDs.
+- Windows Pier: a session no longer ends with "display restore failed" and an
+  armed recovery journal when the display driver no longer offers the mode the
+  display started in (a virtual display's default mode, or a mode list edited
+  during the session). Windows refuses that mode every time, so the display is
+  left at its current mode. Restores that also undo NVIDIA or VMware state are
+  unchanged.
+- Windows Pier: the capture log reports how often Desktop Duplication saw the
+  pointer move, which shows whether a display draws the pointer into the
+  picture (and a Deck drawing its own pointer then shows two).
+- Windows Pier: when Desktop Duplication is refused, capture waits up to five
+  seconds for it (the secure desktop shown right after a sign-in is usually
+  brief) instead of settling at once for a WGC capture that may never deliver
+  a frame, and the log names the input desktop it found, so a black picture
+  caused by a lock screen or a pending UAC prompt says so.
+
+### Performance
+
+- The macOS Deck now has a dedicated root-window Auto/Speed presentation path:
+  VideoToolbox's 8-bit 4:2:0 IOSurface-backed `CVPixelBuffer` is wrapped as
+  Metal plane textures and drawn into a separate display-synchronised
+  `CAMetalLayer`, so ordinary 8-bit video frames no longer require a CPU
+  `CVPixelBuffer`→RGBA copy, `queue.write_texture` upload, or egui repaint.
+  The existing egui/wgpu upload path remains the visible fallback, and
+  secondary monitor windows still use the old path.
+- The macOS Deck no longer runs its UI flat out on a still desktop. A session
+  ran a full UI pass every 16 ms, and the media worker woke the UI again for
+  every media batch, about 50 times a second for audio alone. Each pass
+  repaints the whole window, so a full-screen Deck on a 3024×1964 panel showing
+  a 1 fps idle stream measured about 48% CPU plus about 53% in WindowServer.
+  With the window hidden, eframe skips the paint but not the pass, and the
+  Deck spun at about 95%. The session now polls every 250 ms when idle, and
+  every 16 ms for one second after local input or during a reconnect.
+  Decoded frames, UI-affecting host results (cursor shape and mode, tablet
+  mode, display updates), and tablet and gesture samples each wake the UI
+  themselves.
+- A healthy session no longer rebuilds its reconnect identity on every UI
+  pass. The identity enumerates every display through WindowServer (about
+  0.4 ms in the Deck plus about twice that in WindowServer per pass), and the
+  auto-reconnect controller exists for the whole session, which also kept the
+  idle poll above at 16 ms. Both now apply only while a resume is under way.
+- `session telemetry` now carries `deck_cpu_percent`, `ui_passes_per_s` and
+  the last `wire_video` header (codec included), so a Deck log shows what each
+  session costs the Mac it runs on.
+
 ## [0.14.0] — 2026-09-28
 
 ### Configuration
@@ -61,6 +368,7 @@ All notable changes to Arcen are recorded here. The format follows
 
 ### Streaming
 
+- macOS Pier now honours `redirection.timezone` without adding a second helper: the existing Agent Helper validates the Deck IANA time zone against zoneinfo, sets `TZ` in its launchd GUI session so newly launched apps inherit it, and restores the previous value from a per-user crash marker.
 - The encoder bitrate follows the QUIC path on every Pier through one shared
   controller (`arcen_media::rate_control`). A random loss floor on Wi-Fi,
   cellular and VPN paths is not counted as congestion, a congestion epoch
@@ -542,6 +850,7 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
+[0.15.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.15.0
 [0.14.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.14.0
 [0.13.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.13.0
 [0.10.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.10.0

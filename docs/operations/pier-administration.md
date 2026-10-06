@@ -214,6 +214,7 @@ Packaged services pass only `--config`, so the JSON file is the operator surface
 | `video.color_matrix` | string | `bt709` | Both | Ceiling matrix coefficients used to derive luma/chroma from RGB: `identity`, `bt709`, `bt601`, or `bt2020ncl`. | Restart |
 | `video.color_policy` | string | `default-off` | Both | `always-on`, `always-off`, `default-on`, or `default-off`. Governs how `bit_depth`/`color_range`/`color_matrix` interact with a negotiating client. See "Colour fidelity policy" below. | Restart |
 | `video.desktop_encoding` | string | `sdr` | Linux | What the Xorg desktop's code values mean, which Xorg cannot report: `sdr` or `rec2100-pq`. Set `rec2100-pq` only when a colour-managed application writes Rec.2100 PQ into the desktop (for example Flame's HDR UI with graphics monitor `Rec.2100-PQ`); a ten-bit HDR request then stays PQ / BT.2020 instead of resolving to Grading, a Grading session is converted to true BT.709 SDR, and eight-bit sessions (Auto, Speed) are refused with a message naming Grading and HDR. Windows rejects any value but `sdr` because it reads HDR state from the OS. | Restart |
+| `video.qp_map` | string or object | Built-in `off`; packaged templates `{"auto":"on","speed":"on"}` | Linux, Windows; accepted/no-op on macOS | Damage-driven NVENC QP maps: `off`, `neutral`, or `on`, either as one string for every served pipeline or an object keyed by `auto`, `speed`, `grading`, `hdr`, `software`, `custom`. Missing object keys default to `off`. Linux eight-bit CUDA and macOS VideoToolbox do not carry maps. See `docs/architecture/qp-maps.md`. | Restart |
 | `video.variant` | string or absent | absent | Both | Strongest exact administrator pin: a complete probe-matrix variant id such as `hevc-444-10-full-bt709`. It overrides the individual format keys and the Deck's automatic codec choice. | Restart |
 | `audio.enabled` | bool | Required. Built-in `false`; packaged templates `true` | Both | Enables host-to-Deck audio. | Restart |
 | `audio.compressed` | bool | Required. Built-in `false`; packaged templates `true` | Both | `false` selects PCM; `true` selects fixed Opus policy. | Restart |
@@ -225,7 +226,7 @@ Packaged services pass only `--config`, so the JSON file is the operator surface
 | `auth.disclaimer.locale` | string | `en_US` | Both | Locale file stem. | Restart |
 | `auth.disclaimer.directory` | path string | Linux `/etc/arcen/disclaimers`; Windows `disclaimers` relative to config | Both | Directory containing `<locale>.txt`. | Restart |
 | `auth.reconnect_window_secs` | u32 | `180` | Both | Direct resume window. Valid shared range is 0 through 7200. Zero disables resume. The host keeps its display authority for the whole window, so this is also how long another user waits after somebody disconnects. | Restart |
-| `redirection.timezone` | bool | Built-in `false`; packaged templates `true` | Both | Linux sets `TZ` in authenticated desktop process tree. Windows temporarily changes machine time zone under journal. | Restart |
+| `redirection.timezone` | bool | Built-in `false`; packaged templates `true` | Both | Linux sets `TZ` in authenticated desktop process tree. Windows temporarily changes machine time zone under journal. macOS sets `TZ` in the served GUI launchd session for newly launched apps only. | Restart |
 | `logging.level` | integer | `0` | Both | Operational profile: 0 Critical, 1 Error, 2 Info, 3 Debug. | Linux SIGHUP, Windows control 201, restart |
 | `logging.verbosity` | integer | unset | Both | Legacy one-release mapping: 0→Error, 1→Info, 2/3→Debug. Mutually exclusive with `logging.level`. | Linux SIGHUP, Windows control 201, restart |
 | `logging.retention_days` | u16 | `30`, normalized 7 through 100 | Both | Log archive retention. | Linux SIGHUP, Windows control 201 |
@@ -741,7 +742,7 @@ Rollback by stopping the service, restoring the previous binary set and config, 
 
 ### Windows
 
-Back up `%ProgramData%\Arcen\pier.json`, `%ProgramData%\Arcen\tls`, and any display/timezone recovery journal before replacing binaries. Stop the service first:
+Back up `%ProgramData%\Arcen\pier.json`, `%ProgramData%\Arcen\tls`, and any display/timezone recovery journal before replacing Windows binaries. Stop the service first:
 
 ```powershell
 Stop-Service ArcenPier
@@ -768,7 +769,7 @@ Preserve `%ProgramData%\Arcen\tls` and logs unless the host is being decommissio
 | Windows privilege | `ArcenPier` runs as LocalSystem for service control, `LogonUserW`, Credential Provider coordination, display mutation, recovery, and user-session process creation. |
 | Credential Provider | Additive provider for remote first login and unlock. It must be signed for production. It does not disable Microsoft's password provider. Autologon must remain disabled. |
 | Session agent | Runs in the authenticated user session. It handles clipboard APIs and per-session capture/control IPC. LocalSystem brokers TLS/auth and relays bounded frames. |
-| TLS keys | Operator-managed PEM. Windows refuses private keys without restrictive DACL. Linux requires root-owned restrictive files. Self-signed certificates issued by either installer are valid for 825 days; renew with `--force` (Windows) or `new-host-cert.sh --renew` (Linux). |
+| TLS keys | Operator-managed PEM. Windows refuses private keys without restrictive DACL. Linux requires root-owned restrictive files. Self-signed certificates issued by either installer are valid for 825 days; ordinary installer upgrades reissue only positively classified unmarked legacy-Arcen pairs over the existing key, preserving SANs, and leave operator self-signed or CA-issued material alone. Same-key renewal uses the host-cert helpers (`new-host-cert.ps1 -Renew`, `arcen-pier new-host-cert --renew`, or `arcen-new-host-cert --renew`); installer `--force` is a trust-changing key replacement. |
 | Password attempts | **Arcen applies no lockout, backoff, or attempt limit of its own.** Each connection presents one credential to PAM or `LogonUserW`, and throttling is entirely whatever the operating system already enforces. On Linux configure `pam_faillock`; on Windows configure the account-lockout policy. A Pier reachable from a network you do not control, on a host with a permissive PAM stack, is an unthrottled password oracle against a real OS account. |
 | Logs and support bundles | Sensitive operational data. Bundles pseudonymize selected identities but are not anonymous. Protect them in storage and transit. |
 | Known gaps | PERF-365 first-login delay; SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; native Linux Wayland remains deferred; ERR-366 `overall_state` unreliable. |

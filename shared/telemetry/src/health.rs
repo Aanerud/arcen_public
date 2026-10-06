@@ -15,6 +15,8 @@ pub struct QosSample {
     pub fps_actual: Option<u32>,
     /// Requested frames per second.
     pub fps_target: Option<u32>,
+    /// FPS is inside a stream start/resume/recovery grace window.
+    pub fps_warmup: bool,
     /// Estimated path bandwidth.
     pub bandwidth_mbps: Option<u32>,
     /// Frames submitted by the host.
@@ -367,6 +369,9 @@ impl SideAccumulator {
 }
 
 fn assess_fps(sample: &QosSample, targets: &QosTargets, side: &mut SideAccumulator) {
+    if sample.fps_warmup {
+        return;
+    }
     let (Some(actual), Some(target)) = (sample.fps_actual, sample.fps_target) else {
         return;
     };
@@ -620,6 +625,41 @@ mod tests {
         for (sample, expected) in cases {
             assert_eq!(assess_health(&sample, &targets).overall, Some(expected));
         }
+    }
+
+    #[test]
+    fn fps_warmup_suppresses_startup_ramp_degradation() {
+        let sample = QosSample {
+            fps_actual: Some(2),
+            fps_target: Some(30),
+            fps_warmup: true,
+            frames_sent: Some(4),
+            frames_dropped: Some(0),
+            ..QosSample::default()
+        };
+        let assessment = assess_health(&sample, &QosTargets::default());
+        assert_eq!(assessment.host_delivery.state, Some(HealthState::Ok));
+        assert_eq!(
+            assessment.host_delivery.dominant_cause,
+            Some(HealthCause::Loss)
+        );
+    }
+
+    #[test]
+    fn real_fps_drop_after_warmup_still_goes_critical() {
+        let sample = QosSample {
+            fps_actual: Some(2),
+            fps_target: Some(30),
+            frames_sent: Some(4),
+            frames_dropped: Some(0),
+            ..QosSample::default()
+        };
+        let assessment = assess_health(&sample, &QosTargets::default());
+        assert_eq!(
+            assessment.host_delivery.dominant_cause,
+            Some(HealthCause::Fps)
+        );
+        assert_eq!(assessment.host_delivery.state, Some(HealthState::Critical));
     }
 
     #[test]

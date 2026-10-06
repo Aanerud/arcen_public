@@ -330,6 +330,7 @@ const SESSION_STREAM_START_FIELDS: &[LifecycleFieldSpec] = &[
     required("width", LifecycleFieldType::Integer),
     required("height", LifecycleFieldType::Integer),
     optional("fps", LifecycleFieldType::Integer),
+    optional("pipeline", LifecycleFieldType::String),
     optional("display_backend", LifecycleFieldType::String),
     // Colour identity. Optional in the schema so an older emitter's events are
     // still accepted rather than rejected wholesale, but both Piers always
@@ -478,6 +479,8 @@ const CLIENT_CONNECT_OK_FIELDS: &[LifecycleFieldSpec] = &[
 const CLIENT_CONNECT_FAIL_FIELDS: &[LifecycleFieldSpec] = &[
     required("reason_class", LifecycleFieldType::String),
     optional("stage", LifecycleFieldType::String),
+    optional("errno", LifecycleFieldType::Integer),
+    optional("network_scope", LifecycleFieldType::String),
 ];
 const CLIENT_SESSION_END_FIELDS: &[LifecycleFieldSpec] = &[
     required("duration_ms", LifecycleFieldType::Integer),

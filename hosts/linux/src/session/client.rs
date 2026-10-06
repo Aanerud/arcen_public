@@ -49,7 +49,10 @@ impl FrameQueue {
         Self {
             inner: Mutex::new(SharedVideoQueue::new(
                 CAPACITY,
-                KEYFRAME_REQUEST_MIN_INTERVAL,
+                arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Auto)
+                    .queue
+                    .encoded_overflow
+                    .keyframe_request_min_interval,
             )),
             notify: Notify::new(),
             room: Notify::new(),
@@ -102,12 +105,21 @@ impl FrameQueue {
                     tracing::warn!(
                         target: target::MEDIA,
                         drops = self.drops_since_keyframe(),
+                        idr_request,
                         "send queue lost AU — cleared prediction chain, awaiting IDR"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: target::MEDIA,
+                        idr_request,
+                        "send queue suppressed AU while awaiting keyframe"
                     );
                 }
                 if idr_request {
-                    self.idr.request();
+                    let delivered = self.idr.request();
+                    self.note_keyframe_request_handoff(delivered, now);
                 }
+                self.notify.notify_one();
                 false
             }
             VideoQueuePush::Closed(_) => false,
@@ -130,14 +142,25 @@ impl FrameQueue {
             return false;
         }
         if outcome.idr_request && !self.idr.request() {
-            if let Some(requested_at) = outcome.requested_at {
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .clear_keyframe_request_if_at(requested_at);
-            }
+            self.note_keyframe_request_handoff(false, requested_at);
+        } else if outcome.idr_request {
+            self.note_keyframe_request_handoff(true, requested_at);
         }
+        self.notify.notify_one();
         true
+    }
+
+    fn note_keyframe_request_handoff(&self, delivered: bool, now: Instant) {
+        let mut inner = self.inner.lock().unwrap();
+        if delivered {
+            inner.note_keyframe_request_handoff(true, now);
+        } else {
+            tracing::warn!(
+                target: target::MEDIA,
+                "send queue recovery IDR could not be handed to capenc; stopping retries"
+            );
+            inner.abandon_keyframe_request();
+        }
     }
 
     /// Await the next frame to send. Returns `None` once the queue is closed and
@@ -145,7 +168,7 @@ impl FrameQueue {
     pub async fn dequeue(&self) -> Option<Vec<u8>> {
         loop {
             let notified = self.notify.notified();
-            {
+            let retry_at = {
                 let mut g = self.inner.lock().unwrap();
                 if !g.is_paused() {
                     if let Some(item) = g.pop_front_with_bytes(Vec::len) {
@@ -156,8 +179,25 @@ impl FrameQueue {
                 if g.is_closed() {
                     return None;
                 }
+                let retry = g.keyframe_request_retry(Instant::now());
+                if retry.due {
+                    drop(g);
+                    let delivered = self.idr.request();
+                    self.note_keyframe_request_handoff(delivered, Instant::now());
+                    continue;
+                } else {
+                    retry.retry_at
+                }
+            };
+            match retry_at {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = notified => {}
+                        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                    }
+                }
+                None => notified.await,
             }
-            notified.await;
         }
     }
 
@@ -332,6 +372,66 @@ mod tests {
         q.close();
         assert_eq!(q.dequeue().await.unwrap(), vec![7], "buffered frame drains");
         assert!(q.dequeue().await.is_none(), "then closed → None");
+    }
+
+    #[tokio::test]
+    async fn throttled_recovery_retries_without_later_enqueue() {
+        let (idr, mut rx) = fake_idr();
+        let q = std::sync::Arc::new(FrameQueue::new(idr));
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        assert!(!q.enqueue(vec![0xAA], false));
+        assert!(rx.try_recv().is_ok());
+        assert!(!q.enqueue(vec![0xBB], false));
+
+        let writer = {
+            let q = std::sync::Arc::clone(&q);
+            tokio::spawn(async move { q.dequeue().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("pending recovery should retry at its deadline")
+            .expect("IDR request should be delivered");
+        q.close_and_clear();
+        assert!(writer.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_stops_pending_recovery_retry() {
+        let (idr, mut rx) = fake_idr();
+        let q = FrameQueue::new(idr);
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        assert!(!q.enqueue(vec![0xAA], false));
+        assert!(rx.try_recv().is_ok());
+        assert!(!q.enqueue(vec![0xBB], false));
+        q.close_and_clear();
+        assert!(q.dequeue().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_idr_path_does_not_spin_and_close_still_finishes() {
+        let (idr, rx) = fake_idr();
+        drop(rx);
+        let q = std::sync::Arc::new(FrameQueue::new(idr));
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        assert!(!q.enqueue(vec![0xAA], false));
+
+        let dequeue = {
+            let q = std::sync::Arc::clone(&q);
+            tokio::spawn(async move { q.dequeue().await })
+        };
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !dequeue.is_finished(),
+            "closed IDR path must not busy-spin the dequeue future to completion"
+        );
+        q.close_and_clear();
+        assert!(dequeue.await.unwrap().is_none());
     }
 
     #[tokio::test]

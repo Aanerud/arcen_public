@@ -19,7 +19,7 @@ use crate::transport::tls::{CertInfo, TlsTrustConfig};
 use crate::transport::websocket::{
     spawn_resume_session, spawn_session, spawn_session_opt_in, AuthSubmission, AuthenticationKind,
     ConnectOptions, DisconnectReason, SessionAuthentication, SessionCommand, SessionCommandSender,
-    SessionEnd, StreamProfile, TerminalDisconnect,
+    SessionEnd, SessionEvent, StreamProfile, TerminalDisconnect,
 };
 use crate::ui::display_fit::DisplayFitTracker;
 use crate::ui::home::{
@@ -28,7 +28,9 @@ use crate::ui::home::{
 };
 use crate::ui::keyboard::{KeyboardAction, KeyboardInput, NativeKeyMetadata};
 use crate::ui::macos_menu;
-use crate::ui::media_worker::{spawn_media_worker, MonitorPresentationTarget, SharedMediaState};
+use crate::ui::media_worker::{
+    spawn_media_worker, MonitorPresentationTarget, NativePresentationMetadata, SharedMediaState,
+};
 use crate::ui::multi_window_activation::{
     self, MultiWindowSessionState, MULTI_WINDOW_ENTER_TIMEOUT,
 };
@@ -39,28 +41,319 @@ use crate::ui::multi_window_runtime::{
 };
 use crate::ui::multi_window_session::ValidatedAppliedTopology;
 use crate::ui::region_runtime::{DeckRegionRuntime, LegacyRegionWireMessage, RegionViewport};
-use crate::ui::session_truth::{self, ExactnessReadout, NegotiatedTruth};
+use crate::ui::session_truth::{self, ActiveContract, ExactnessReadout, NegotiatedTruth};
 use crate::ui::theme;
 use crate::ui::video_metal_layer::{
-    DedicatedLayerFrame, DedicatedPresentationStatus, DedicatedVideoPresenter,
+    DedicatedEightBitPresentationStatus, DedicatedEightBitVideoPresenter, DedicatedLayerFrame,
+    DedicatedPresentationStatus, DedicatedVideoPresenter,
 };
 use crate::ui::video_render::RemoteVideoFrame;
 use arcen_input::{FractionalMotionAccumulator, PenEvent, PenTool, RegionInputWireMessage};
 use arcen_telemetry::{rate_per_second, rounded_percentiles_ms};
 use arcen_transport::tls::TlsPin;
+#[cfg(target_os = "macos")]
+use objc2_core_graphics::CGColor;
+#[cfg(target_os = "macos")]
+use objc2_quartz_core::CATransaction;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(test)]
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
 const UI_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+/// How often an idle session's UI still runs a pass. Every pass repaints the
+/// whole window, so polling a still desktop at 60 Hz kept a full-screen Deck
+/// and WindowServer busy for nothing. Decoded frames, session events, and
+/// local input each wake the UI themselves; this poll only bounds what is
+/// drained per pass without a wake (telemetry, inbound clipboard).
+const UI_IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+const CONNECTING_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// How long after local input the session keeps the 16 ms poll.
+const UI_ACTIVE_WINDOW: Duration = Duration::from_secs(1);
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(2);
 const TELEMETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const MULTI_WINDOW_TIMING_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the root layer's display sync is re-applied; wgpu resets it when
+/// it reconfigures the surface (resize/fullscreen changes).
+const ROOT_DISPLAY_SYNC_REFRESH: Duration = Duration::from_millis(250);
+
+/// The Deck's own CPU use and UI pass rate between two telemetry records,
+/// so a support log shows what a session costs the machine it runs on.
+struct UiLoadMeter {
+    passes: u64,
+    since: Instant,
+    cpu_at_start: Duration,
+}
+
+impl UiLoadMeter {
+    fn new(now: Instant) -> Self {
+        Self {
+            passes: 0,
+            since: now,
+            cpu_at_start: process_cpu_time(),
+        }
+    }
+
+    fn note_pass(&mut self) {
+        self.passes = self.passes.saturating_add(1);
+    }
+
+    fn sample(&self, now: Instant) -> (u64, f64, f64) {
+        let wall = now.duration_since(self.since).as_secs_f64();
+        if wall <= 0.0 {
+            return (self.passes, 0.0, 0.0);
+        }
+        let used = process_cpu_time()
+            .saturating_sub(self.cpu_at_start)
+            .as_secs_f64();
+        #[allow(clippy::cast_precision_loss)]
+        let rate = self.passes as f64 / wall;
+        (self.passes, rate, used / wall * 100.0)
+    }
+
+    /// Passes per second and CPU percent (100 = one core) since the last call.
+    fn take(&mut self, now: Instant) -> (f64, f64) {
+        let cpu = process_cpu_time();
+        let (_, rate, cpu_percent) = self.sample(now);
+        *self = Self {
+            passes: 0,
+            since: now,
+            cpu_at_start: cpu,
+        };
+        (rate, cpu_percent)
+    }
+}
+
+/// User plus system CPU time this process has used.
+fn process_cpu_time() -> Duration {
+    // SAFETY: `getrusage` only writes the zeroed `rusage` it is given.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return Duration::ZERO;
+        }
+        usage
+    };
+    let time = |value: libc::timeval| {
+        Duration::new(
+            u64::try_from(value.tv_sec).unwrap_or(0),
+            u32::try_from(value.tv_usec)
+                .unwrap_or(0)
+                .saturating_mul(1_000),
+        )
+    };
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// The session background must not cover a dedicated video layer that is still
+/// displaying its last picture. Fallback statuses deliberately return black so
+/// the egui fallback can be seen instead of a stale native layer.
+fn session_background_transparent(
+    screen: &AppScreen,
+    dedicated_video_frame: Option<&DedicatedLayerFrame>,
+    eight_bit_status: DedicatedEightBitPresentationStatus,
+    eight_bit_has_picture: bool,
+    ten_bit_status: DedicatedPresentationStatus,
+    ten_bit_has_picture: bool,
+) -> bool {
+    if !matches!(
+        screen,
+        AppScreen::InSession
+            | AppScreen::Reconnecting(_)
+            | AppScreen::Resuming(_)
+            | AppScreen::SigningIn
+    ) {
+        return false;
+    }
+    (eight_bit_status.is_dedicated_eight_bit() && eight_bit_has_picture)
+        || (ten_bit_status.is_dedicated_ten_bit() && ten_bit_has_picture)
+        || (dedicated_video_frame.is_some()
+            && ten_bit_has_picture
+            && !ten_bit_status.is_eight_bit_fallback())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionBackstopState {
+    enabled: bool,
+}
+
+fn session_backstop_enabled(screen: &AppScreen) -> bool {
+    matches!(
+        screen,
+        AppScreen::InSession
+            | AppScreen::Reconnecting(_)
+            | AppScreen::Resuming(_)
+            | AppScreen::SigningIn
+    )
+}
+
+fn session_backstop_decision(
+    screen: &AppScreen,
+    current: SessionBackstopState,
+) -> (SessionBackstopState, bool) {
+    let next = SessionBackstopState {
+        enabled: session_backstop_enabled(screen),
+    };
+    (next, next != current)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_session_backstop(enabled: bool) -> bool {
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(window) = crate::ui::video_render::find_root_window(mtm) else {
+        return false;
+    };
+    let Some(view) = window.contentView() else {
+        return false;
+    };
+    view.setWantsLayer(true);
+    let Some(layer) = view.layer() else {
+        return false;
+    };
+
+    let black = CGColor::new_generic_rgb(0.0, 0.0, 0.0, 1.0);
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    if enabled {
+        window.setOpaque(true);
+        layer.setOpaque(true);
+        layer.setBackgroundColor(Some(&black));
+    } else {
+        window.setOpaque(false);
+        layer.setOpaque(false);
+        layer.setBackgroundColor(None);
+    }
+    CATransaction::commit();
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootDisplaySyncDecision {
+    enabled: bool,
+    should_apply: bool,
+    log_transition: bool,
+}
+
+/// Single-window sessions pace the root CAMetalLayer at display refresh.
+/// Multi-window sessions keep immediate root presents because eframe renders
+/// all immediate viewports synchronously inside the root pass.
+fn root_display_sync_decision(
+    multi_window_active: bool,
+    last_applied: Option<(Instant, bool)>,
+    now: Instant,
+) -> RootDisplaySyncDecision {
+    let enabled = !multi_window_active;
+    let previous = last_applied.map(|(_, applied)| applied);
+    let should_apply = last_applied.is_none_or(|(at, applied)| {
+        applied != enabled || now.duration_since(at) >= ROOT_DISPLAY_SYNC_REFRESH
+    });
+    RootDisplaySyncDecision {
+        enabled,
+        should_apply,
+        log_transition: should_apply && previous != Some(enabled),
+    }
+}
+
+#[derive(Debug, Default)]
+struct PresenterTelemetryWindow {
+    drops: u64,
+    skips: u64,
+}
+
+impl PresenterTelemetryWindow {
+    fn take(&mut self, drops: u64, skips: u64) -> (u64, u64) {
+        let interval_drops = drops.saturating_sub(self.drops);
+        let interval_skips = skips.saturating_sub(self.skips);
+        self.drops = drops;
+        self.skips = skips;
+        (interval_drops, interval_skips)
+    }
+}
+
+#[derive(Debug)]
+struct RateMeter {
+    count: u64,
+    since: Instant,
+}
+
+impl RateMeter {
+    fn new(now: Instant) -> Self {
+        Self {
+            count: 0,
+            since: now,
+        }
+    }
+
+    fn note(&mut self) {
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn take(&mut self, now: Instant) -> f64 {
+        let elapsed = now.duration_since(self.since);
+        let rate = rate_per_second(self.count, elapsed);
+        *self = Self::new(now);
+        rate
+    }
+}
+
+/// How soon a session's UI must run again without a wake: fast while a
+/// reconnect or sign-in hand-over is being driven or someone is using the
+/// Deck, slow when the session is just showing a desktop.
+fn ui_poll_interval(transitioning: bool, since_local_input: Option<Duration>) -> Duration {
+    if transitioning || since_local_input.is_some_and(|elapsed| elapsed < UI_ACTIVE_WINDOW) {
+        UI_REPAINT_INTERVAL
+    } else {
+        UI_IDLE_REPAINT_INTERVAL
+    }
+}
+
+fn should_schedule_session_poll(
+    screen: &AppScreen,
+    has_session_commands: bool,
+    transitioning: bool,
+) -> bool {
+    transitioning || (has_session_commands && matches!(screen, AppScreen::InSession))
+}
+
+/// Start angle of the connecting arc, quantised to the repaint cadence so the
+/// animation never asks for more passes than `CONNECTING_PROGRESS_REPAINT_INTERVAL`.
+fn connecting_progress_angle(time_seconds: f64) -> f64 {
+    let step = CONNECTING_PROGRESS_REPAINT_INTERVAL.as_secs_f64();
+    (time_seconds / step).floor() * step * std::f64::consts::TAU
+}
+
+/// Paints the same arc as `egui::Spinner` without its per-frame
+/// `request_repaint`, which otherwise drives the UI at display refresh while
+/// a session is only connecting.
+fn paint_connecting_progress(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx()
+        .request_repaint_after(CONNECTING_PROGRESS_REPAINT_INTERVAL);
+    let radius = rect.height().min(rect.width()) / 2.0 - 2.0;
+    let start = connecting_progress_angle(ui.input(|input| input.time));
+    let end = start + 240f64.to_radians();
+    let points = (0..32)
+        .map(|i| {
+            let angle = start + (end - start) * f64::from(i) / 32.0;
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(
+        points,
+        egui::Stroke::new(3.0, egui::Color32::from_rgb(0x66, 0x66, 0x66)),
+    ));
+}
 
 /// The one authoritative egui pointer button -> wire mouse button mapping,
 /// shared verbatim by the root viewport's pointer dispatch and every
@@ -112,6 +405,10 @@ struct ViewportTimingSample {
 struct DeferredSecondaryViewportState {
     pending_frame: Option<DecodedVideoFrame>,
     texture: Option<egui::TextureHandle>,
+    frame_size: Option<[usize; 2]>,
+    accepted_pointer_buttons: [bool; 3],
+    ignored_pointer_buttons: [bool; 3],
+    logged_first_paint: bool,
     output: Option<DeferredSecondaryOutput>,
     presented_fresh_frames: u64,
     viewport_paint_ms: Vec<f64>,
@@ -136,6 +433,52 @@ struct DeferredSecondaryOutput {
     /// sample per paint and must be dispatched exactly once, or root would
     /// replay a stale pointer position every pass.
     input_fresh: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryReadyFrameAction {
+    None,
+    ReplayedRetainedFrame,
+    RequestFullFrame,
+}
+
+fn stage_secondary_frame_for_ready_viewport(
+    state: &mut DeferredSecondaryViewportState,
+    retained: Option<&DecodedVideoFrame>,
+) -> SecondaryReadyFrameAction {
+    if state.pending_frame.is_some() || state.texture.is_some() {
+        return SecondaryReadyFrameAction::None;
+    }
+    if let Some(retained) = retained {
+        state.pending_frame = Some(retained.clone());
+        SecondaryReadyFrameAction::ReplayedRetainedFrame
+    } else {
+        SecondaryReadyFrameAction::RequestFullFrame
+    }
+}
+
+const fn secondary_waiting_placeholder_color() -> egui::Color32 {
+    egui::Color32::from_gray(18)
+}
+
+fn paint_secondary_waiting_placeholder(ui: &egui::Ui, rect: egui::Rect, committed: bool) {
+    ui.painter()
+        .rect_filled(rect, 0.0, secondary_waiting_placeholder_color());
+    let _ = committed;
+}
+
+fn secondary_color_image_from_frame(frame: &DecodedVideoFrame) -> Option<egui::ColorImage> {
+    if frame.rgba.is_empty() {
+        return None;
+    }
+    let mut rgba = frame.rgba.clone();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 0xff;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [frame.width, frame.height],
+        &rgba,
+    ))
 }
 
 impl DeferredSecondaryViewportState {
@@ -246,7 +589,7 @@ impl MultiWindowTimingTelemetry {
         let root_present = rounded_percentiles_ms(self.root_present_ms.iter().copied());
         let passes_per_s = rate_per_second(self.pass_count, elapsed);
         if self.viewports.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 target: crate::logging::target::SESSION,
                 monitor_id = 0,
                 passes_per_s,
@@ -1021,6 +1364,16 @@ impl StreamingPreset {
             Self::Custom => None,
         }
     }
+
+    const fn wire_pipeline(self) -> Option<arcen_protocol::messages::StreamPipeline> {
+        match self {
+            Self::Auto => Some(arcen_protocol::messages::StreamPipeline::Auto),
+            Self::Speed => Some(arcen_protocol::messages::StreamPipeline::Speed),
+            Self::Grading => Some(arcen_protocol::messages::StreamPipeline::Grading),
+            Self::Hdr => Some(arcen_protocol::messages::StreamPipeline::Hdr),
+            Self::Custom => None,
+        }
+    }
 }
 
 /// The exact contract a connection will request on the wire: `settings`'s own
@@ -1775,6 +2128,67 @@ fn video_stream_stalled(last_presented_at: Option<Instant>, now: Instant) -> boo
         .is_some_and(|last| now.saturating_duration_since(last) >= VIDEO_STALL_OVERLAY_AFTER)
 }
 
+fn root_viewport_visible_for_presenter(viewport: &egui::ViewportInfo) -> bool {
+    viewport.visible().unwrap_or(true)
+}
+
+#[must_use]
+fn aspect_fit_rect(container: egui::Rect, frame_size: Option<[usize; 2]>, ppp: f32) -> egui::Rect {
+    let Some([w, h]) = frame_size else {
+        return container;
+    };
+    if w == 0 || h == 0 || container.width() <= 0.0 || container.height() <= 0.0 {
+        return container;
+    }
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let aspect = w as f32 / h as f32;
+    let fit_h = (container.width() / aspect).min(container.height());
+    let fit_w = fit_h * aspect;
+    let cx = container.center().x;
+    let cy = container.center().y;
+    egui::Rect::from_min_max(
+        egui::pos2(snap(cx - fit_w / 2.0), snap(cy - fit_h / 2.0)),
+        egui::pos2(snap(cx + fit_w / 2.0), snap(cy + fit_h / 2.0)),
+    )
+}
+
+fn paint_letterbox_bands(painter: &egui::Painter, container: egui::Rect, image: egui::Rect) {
+    for band in [
+        egui::Rect::from_min_max(container.min, egui::pos2(container.max.x, image.min.y)),
+        egui::Rect::from_min_max(egui::pos2(container.min.x, image.max.y), container.max),
+        egui::Rect::from_min_max(
+            egui::pos2(container.min.x, image.min.y),
+            egui::pos2(image.min.x, image.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(image.max.x, image.min.y),
+            egui::pos2(container.max.x, image.max.y),
+        ),
+    ] {
+        if band.is_positive() {
+            painter.rect_filled(band, 0.0, egui::Color32::BLACK);
+        }
+    }
+}
+
+#[must_use]
+fn display_note_text_rect(viewer_rect: egui::Rect, band_height: f32) -> egui::Rect {
+    const H_MARGIN: f32 = 24.0;
+    const MIN_WIDTH: f32 = 160.0;
+    let width = if viewer_rect.width() >= MIN_WIDTH + H_MARGIN * 2.0 {
+        viewer_rect.width() - H_MARGIN * 2.0
+    } else {
+        (viewer_rect.width() - 12.0).max(1.0)
+    };
+    egui::Rect::from_center_size(
+        egui::pos2(
+            viewer_rect.center().x,
+            viewer_rect.top() + band_height / 2.0,
+        ),
+        egui::vec2(width, band_height.max(1.0)),
+    )
+}
+
 /// How long to keep re-pinning a notch-covering window to the screen frame.
 /// winit reasserts its own geometry for a frame or two after decorations are
 /// dropped, so a single placement can be undone.
@@ -2368,13 +2782,19 @@ pub struct ArcenApp {
     saved_connections_unknown: serde_json::Map<String, serde_json::Value>,
     saved_connections_fingerprint: Option<[u8; 32]>,
     session_commands: Option<SessionCommandSender>,
+    media_events: Option<mpsc::UnboundedSender<SessionEvent>>,
     deferred_auth: Option<AuthSubmission>,
     media: Option<Arc<Mutex<SharedMediaState>>>,
     session_telemetry: Option<Arc<ClientTelemetry>>,
     session_hello_handled: bool,
     remote_texture: Option<RemoteVideoFrame>,
     dedicated_video_frame: Option<DedicatedLayerFrame>,
-    dedicated_video_presenter: DedicatedVideoPresenter,
+    dedicated_video_presenter: Arc<Mutex<DedicatedVideoPresenter>>,
+    dedicated_video_presentation: DedicatedPresentationStatus,
+    dedicated_video_layer_has_picture: bool,
+    dedicated_eight_bit_video_presenter: Arc<Mutex<DedicatedEightBitVideoPresenter>>,
+    dedicated_eight_bit_presentation: DedicatedEightBitPresentationStatus,
+    dedicated_eight_bit_layer_has_picture: bool,
     remote_frame_size: Option<[usize; 2]>,
     /// The host injects point-unit, phased scrolling (`precise_scroll_v1`).
     host_precise_scroll: bool,
@@ -2392,6 +2812,7 @@ pub struct ArcenApp {
     /// says whether the codec itself was exact or adaptive.
     requested_video_variant: Option<arcen_media::video::VideoVariant>,
     requested_video_selection: arcen_protocol::messages::VideoSelectionIntent,
+    requested_pipeline: Option<arcen_protocol::messages::StreamPipeline>,
     /// Requested frame-rate ceiling for the active session, shown beside
     /// measured delivery so it is not mistaken for a promise.
     active_stream_max_fps: u32,
@@ -2436,6 +2857,10 @@ pub struct ArcenApp {
     /// (see `crate::transport::multi_monitor::MultiMonitorAuthError::UnsupportedHost`),
     /// never a silent legacy session with this field left `Inactive`.
     multi_window: MultiWindowSessionState,
+    /// Developer-only, env-gated live-session test mode that presents a real
+    /// multi-monitor negotiation as decorated tiled windows on one display.
+    #[cfg(feature = "dev-tools")]
+    windowed_monitor_test: Option<crate::ui::windowed_monitor_test::WindowedMonitorTestMode>,
     /// Negotiated monitor presented by the root viewport. Multi-window
     /// sessions choose the highest-refresh local display for root so root's
     /// surface acquire/present does not pace every immediate secondary
@@ -2523,6 +2948,11 @@ pub struct ArcenApp {
     /// reason `pending_viewport_closes` is: `close_multi_window_session`
     /// has no `egui::Context` of its own.
     pending_root_restore: Option<RootPreEntrySnapshot>,
+    /// Developer-only windowed test mode may retitle root to "monitor 1 of N";
+    /// teardown queues one ordinary title restore because this method has no
+    /// `egui::Context`, just like viewport closes and root fullscreen restore.
+    #[cfg(feature = "dev-tools")]
+    pending_root_title_restore: bool,
     video_frames_seen: u64,
     video_frames_decoded: u64,
     presentation_superseded_frames: u64,
@@ -2549,6 +2979,16 @@ pub struct ArcenApp {
     /// so a stale monitor id from a prior committed roster never lingers
     /// into a later one.
     secondary_scroll_accum: BTreeMap<arcen_media::SessionMonitorId, egui::Vec2>,
+    /// Newest decoded frame retained per secondary monitor so a viewport
+    /// that binds/resizes after decode can replay the current desktop even
+    /// when Keel sends no new damage.
+    secondary_retained_frames: BTreeMap<arcen_media::SessionMonitorId, DecodedVideoFrame>,
+    /// Monitors that need a full-frame request because their secondary
+    /// viewport became ready with no retained frame to replay.
+    secondary_full_frame_refresh_needed: BTreeSet<arcen_media::SessionMonitorId>,
+    /// Monitors whose ready-without-retained-frame refresh has already been
+    /// requested; prevents retry spam while waiting for the host's keyframe.
+    secondary_full_frame_refresh_sent: BTreeSet<arcen_media::SessionMonitorId>,
     last_pointer_norm: Option<(f64, f64, i32, i32)>,
     last_pointer_view_pos: Option<egui::Pos2>,
     pointer_lock: bool,
@@ -2641,9 +3081,11 @@ pub struct ArcenApp {
     viewport_context: Option<egui::Context>,
     last_decode_at: Option<Instant>,
     last_presented_at: Option<Instant>,
-    last_wire_frame_age_ms: Option<i32>,
+    last_wire_clock_age_ms: Option<i32>,
+    last_wire_delay_ms: Option<i32>,
     video_packet_times: VecDeque<Instant>,
     presented_frame_times: VecDeque<Instant>,
+    presented_frame_times_estimated: VecDeque<Instant>,
     /// Presentation samples keyed by the monitor whose surface actually
     /// refreshed. `presented_frame_times` above only ever samples the root
     /// window, so on a multi-monitor session it reports the primary's rate
@@ -2663,6 +3105,12 @@ pub struct ArcenApp {
     host_build_identity: Option<arcen_protocol::messages::BuildIdentityMsg>,
     last_health_pong: Option<HealthPongMsg>,
     last_telemetry_log_at: Instant,
+    ui_load: UiLoadMeter,
+    ui_layout_load: RateMeter,
+    /// Last successful root-layer display sync application.
+    root_display_sync: Option<(Instant, bool)>,
+    session_backstop: SessionBackstopState,
+    presenter_telemetry: PresenterTelemetryWindow,
     show_health_overlay: bool,
     fullscreen: bool,
     session_fullscreen_restore: Option<bool>,
@@ -2683,6 +3131,7 @@ pub struct ArcenApp {
     audio_concealed_frames: u64,
     audio_queue_phase: String,
     status: String,
+    connection_status_hint: Option<String>,
     native_menu_refreshed: bool,
     add_connection_host: String,
     add_connection_name: String,
@@ -2774,6 +3223,9 @@ pub struct ArcenApp {
     /// When a Cmd+Q began to be held in a session, until it is let go (and
     /// sent to the host) or held for [`QUIT_HOLD`] (and the Deck quits).
     quit_hold: Option<Instant>,
+    /// When this Deck last received local input, which keeps the session's
+    /// UI poll fast while someone is using it.
+    last_local_input: Option<Instant>,
     /// Whether any local screen can show HDR, and when that was last read.
     /// HDR streaming is offered only when one can.
     hdr_screen: Option<(Instant, bool)>,
@@ -2936,6 +3388,42 @@ pub struct ArcenApp {
     force_multi_window_begin_outcome: std::cell::Cell<Option<MultiWindowBeginOutcome>>,
 }
 
+#[must_use]
+fn wants_dedicated_ten_bit_layer_state(
+    _multi_window_active: bool,
+    has_dedicated_frame: bool,
+    active: Option<&ActiveContract>,
+    remote_frame_size: Option<[usize; 2]>,
+) -> bool {
+    if !has_dedicated_frame || remote_frame_size.is_none() {
+        return false;
+    }
+    let Some(active) = active else {
+        return false;
+    };
+    active
+        .bit_depth
+        .is_some_and(|depth| depth >= arcen_media::BitDepth::Ten)
+        && active.chroma == Some(arcen_media::ChromaSubsampling::Yuv444)
+}
+
+#[must_use]
+fn wants_dedicated_eight_bit_layer_state(
+    multi_window_active: bool,
+    has_dedicated_frame: bool,
+    active: Option<&ActiveContract>,
+    remote_frame_size: Option<[usize; 2]>,
+) -> bool {
+    if multi_window_active || has_dedicated_frame || remote_frame_size.is_none() {
+        return false;
+    }
+    let Some(active) = active else {
+        return false;
+    };
+    active.bit_depth == Some(arcen_media::BitDepth::Eight)
+        && active.chroma == Some(arcen_media::ChromaSubsampling::Yuv420)
+}
+
 impl ArcenApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -2983,6 +3471,12 @@ impl ArcenApp {
         // A saved connection's own Displays choice wins; otherwise the
         // launch arguments' mode governs this session.
         let display_mode = app.active_displays_mode.unwrap_or(display_mode);
+        #[cfg(feature = "dev-tools")]
+        let display_mode = if app.windowed_monitor_test.is_some() {
+            DisplaysMode::MatchLayout
+        } else {
+            display_mode
+        };
         if options.multi_monitor_topology.is_none() {
             match app.approve_match_layout_topology(display_mode) {
                 Ok(Some(selection)) => {
@@ -3016,6 +3510,12 @@ impl ArcenApp {
             presentation,
             options.multi_monitor_topology.is_some(),
         );
+        #[cfg(feature = "dev-tools")]
+        let stream_sizing_policy = if app.windowed_monitor_test.is_some() {
+            StreamSizingPolicy::FollowWindow
+        } else {
+            stream_sizing_policy
+        };
         app.stream_sizing_policy = stream_sizing_policy;
         if options.multi_monitor_topology.is_none() {
             options.monitors = monitors_for_policy(stream_sizing_policy, &options.monitors);
@@ -3113,19 +3613,28 @@ impl ArcenApp {
             saved_connections_unknown: saved_store.unknown,
             saved_connections_fingerprint: saved_store.fingerprint,
             session_commands: None,
+            media_events: None,
             deferred_auth: None,
             media: None,
             session_telemetry: None,
             session_hello_handled: false,
             remote_texture: None,
             dedicated_video_frame: None,
-            dedicated_video_presenter: DedicatedVideoPresenter::new(),
+            dedicated_video_presenter: Arc::new(Mutex::new(DedicatedVideoPresenter::new())),
+            dedicated_video_presentation: DedicatedPresentationStatus::Inactive,
+            dedicated_video_layer_has_picture: false,
+            dedicated_eight_bit_video_presenter: Arc::new(Mutex::new(
+                DedicatedEightBitVideoPresenter::new(),
+            )),
+            dedicated_eight_bit_presentation: DedicatedEightBitPresentationStatus::Inactive,
+            dedicated_eight_bit_layer_has_picture: false,
             remote_frame_size: None,
             host_precise_scroll: false,
             host_gestures_v1: false,
             negotiated_truth: None,
             requested_video_variant: None,
             requested_video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            requested_pipeline: None,
             active_stream_max_fps: 0,
             negotiated_truth_panel_open: false,
             decoder_backend_name: "",
@@ -3142,6 +3651,29 @@ impl ArcenApp {
             },
             pattern_accuracy: None,
             multi_window: MultiWindowSessionState::Inactive,
+            #[cfg(feature = "dev-tools")]
+            windowed_monitor_test: match crate::ui::windowed_monitor_test::mode_from_process_env() {
+                crate::ui::windowed_monitor_test::WindowedMonitorTestEnv::Off => None,
+                crate::ui::windowed_monitor_test::WindowedMonitorTestEnv::Active(mode) => {
+                    tracing::warn!(
+                        target: "arcen::display",
+                        monitors = mode.monitor_count,
+                        width_px = mode.monitor_size_px[0],
+                        height_px = mode.monitor_size_px[1],
+                        env = crate::ui::windowed_monitor_test::MONITORS_ENV_VAR,
+                        "windowed multi-monitor live-session test mode is active",
+                    );
+                    Some(mode)
+                }
+                crate::ui::windowed_monitor_test::WindowedMonitorTestEnv::Invalid(reason) => {
+                    tracing::warn!(
+                        target: "arcen::display",
+                        %reason,
+                        "windowed multi-monitor test mode disabled",
+                    );
+                    None
+                }
+            },
             multi_window_root_monitor_id: None,
             region_runtime: None,
             multi_window_started_at: None,
@@ -3156,6 +3688,8 @@ impl ArcenApp {
             pending_viewport_closes: Vec::new(),
             root_pre_entry_snapshot: None,
             pending_root_restore: None,
+            #[cfg(feature = "dev-tools")]
+            pending_root_title_restore: false,
             video_frames_seen: 0,
             video_frames_decoded: 0,
             presentation_superseded_frames: 0,
@@ -3169,6 +3703,9 @@ impl ArcenApp {
             last_input_sent_at: None,
             root_scroll_accum: egui::Vec2::ZERO,
             secondary_scroll_accum: BTreeMap::new(),
+            secondary_retained_frames: BTreeMap::new(),
+            secondary_full_frame_refresh_needed: BTreeSet::new(),
+            secondary_full_frame_refresh_sent: BTreeSet::new(),
             last_pointer_norm: None,
             last_pointer_view_pos: None,
             pointer_lock: false,
@@ -3189,9 +3726,11 @@ impl ArcenApp {
             viewport_context: None,
             last_decode_at: None,
             last_presented_at: None,
-            last_wire_frame_age_ms: None,
+            last_wire_clock_age_ms: None,
+            last_wire_delay_ms: None,
             video_packet_times: VecDeque::new(),
             presented_frame_times: VecDeque::new(),
+            presented_frame_times_estimated: VecDeque::new(),
             monitor_presented_frame_times: BTreeMap::new(),
             multi_window_timing: MultiWindowTimingTelemetry::default(),
             last_ui_wake_media_ready: 0,
@@ -3203,6 +3742,11 @@ impl ArcenApp {
             host_build_identity: None,
             last_health_pong: None,
             last_telemetry_log_at: now,
+            ui_load: UiLoadMeter::new(now),
+            ui_layout_load: RateMeter::new(now),
+            root_display_sync: None,
+            session_backstop: SessionBackstopState::default(),
+            presenter_telemetry: PresenterTelemetryWindow::default(),
             show_health_overlay: false,
             fullscreen: false,
             session_fullscreen_restore: None,
@@ -3229,6 +3773,7 @@ impl ArcenApp {
                         .map(|error| format!("Settings unavailable; microphone disabled: {error}"))
                 })
                 .unwrap_or_else(|| "Ready".to_string()),
+            connection_status_hint: None,
             native_menu_refreshed: false,
             add_connection_host: String::new(),
             add_connection_name: String::new(),
@@ -3261,6 +3806,7 @@ impl ArcenApp {
             login_window_handover: None,
             app_shortcuts_forwarded: false,
             quit_hold: None,
+            last_local_input: None,
             hdr_screen: None,
             cursor_preference: settings.cursor_preference,
             clipboard_enabled: settings.clipboard_enabled,
@@ -3341,6 +3887,9 @@ impl eframe::App for ArcenApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.viewport_context = Some(ctx.clone());
+        if !raw_input.events.is_empty() {
+            self.last_local_input = Some(Instant::now());
+        }
         self.native_key_metadata = crate::ui::keyboard::drain_native_key_metadata().into();
         // Root's own raw OS focus flag is *not*, by itself, authoritative
         // for "pointer/pen ownership must be torn down": macOS has exactly
@@ -3435,6 +3984,9 @@ impl eframe::App for ArcenApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.viewport_context = Some(ctx.clone());
+        self.ui_load.note_pass();
+        self.keep_root_display_sync();
+        self.keep_session_backstop();
         if !self.native_menu_refreshed {
             macos_menu::install();
             crate::ui::keyboard::install_native_keypad_monitor();
@@ -3444,18 +3996,34 @@ impl eframe::App for ArcenApp {
             // dropping `ArcenApp` (process exit) uninstalls it. Only the
             // *pen-authority/dispatcher* state resets per session/setting
             // change, never this monitor itself.
-            self.tablet_runtime = crate::tablet::TabletRuntime::install();
+            let wake = ctx.clone();
+            self.tablet_runtime =
+                crate::tablet::TabletRuntime::install(move || wake.request_repaint());
             #[cfg(target_os = "macos")]
             {
-                self.gesture_runtime = crate::gestures::GestureRuntime::install();
+                let wake = ctx.clone();
+                self.gesture_runtime =
+                    crate::gestures::GestureRuntime::install(move || wake.request_repaint());
             }
             self.native_menu_refreshed = true;
         }
-        if self.session_commands.is_some()
-            || self.reconnect.is_some()
-            || self.login_window_handover.is_some()
-        {
-            ctx.request_repaint_after(UI_REPAINT_INTERVAL);
+        // A healthy session keeps its controller in `Connected`; only a live
+        // resume needs the fast poll.
+        let transitioning = self.reconnect.as_ref().is_some_and(|controller| {
+            matches!(
+                controller.phase(),
+                ReconnectPhase::Reconnecting { .. } | ReconnectPhase::Resuming { .. }
+            )
+        }) || self.login_window_handover.is_some();
+        if should_schedule_session_poll(
+            &self.screen,
+            self.session_commands.is_some(),
+            transitioning,
+        ) {
+            ctx.request_repaint_after(ui_poll_interval(
+                transitioning,
+                self.last_local_input.map(|at| at.elapsed()),
+            ));
             if self.multi_window.is_active() {
                 self.multi_window_timing.note_ui_interval_wake();
             }
@@ -3487,10 +4055,12 @@ impl eframe::App for ArcenApp {
         self.drain_pending_viewport_closes(ctx);
         self.drain_pending_root_restore(ctx);
         self.drive_multi_window(ctx);
+        self.publish_root_viewport_visibility(ctx);
         self.maybe_log_telemetry();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_layout_load.note();
         let available = ui.available_size();
         egui::Frame::new()
             .fill(
@@ -3501,9 +4071,14 @@ impl eframe::App for ArcenApp {
                         | AppScreen::Resuming(_)
                         | AppScreen::SigningIn
                 ) {
-                    if matches!(self.screen, AppScreen::InSession)
-                        && self.dedicated_video_frame.is_some()
-                    {
+                    if session_background_transparent(
+                        &self.screen,
+                        self.dedicated_video_frame.as_ref(),
+                        self.dedicated_eight_bit_presentation,
+                        self.dedicated_eight_bit_layer_has_picture,
+                        self.dedicated_video_presentation,
+                        self.dedicated_video_layer_has_picture,
+                    ) {
                         egui::Color32::TRANSPARENT
                     } else {
                         egui::Color32::BLACK
@@ -3936,9 +4511,20 @@ impl ArcenApp {
         let Some(media) = self.media.clone() else {
             return;
         };
+        let ten_bit_presenter_has_picture = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .has_presented_picture();
+        let eight_bit_presenter_has_picture = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .has_presented_picture();
 
         let (
             frame,
+            native_metadata,
             closed,
             end,
             hello,
@@ -3950,6 +4536,8 @@ impl ArcenApp {
             display_update_result,
             certificate_untrusted,
             pending_cursor_shape,
+            served_pipeline,
+            connection_status_hint,
             generation,
         ) = {
             let mut state = media.lock().expect("media state poisoned");
@@ -3972,12 +4560,37 @@ impl ArcenApp {
             self.last_decode_ms = state.last_decode_ms;
             self.decode_ms_samples = state.decode_ms_samples.clone();
             self.video_packet_times = state.video_packet_times.clone();
-            self.last_wire_frame_age_ms = state.last_wire_frame_age_ms;
+            self.last_wire_clock_age_ms = state.last_wire_clock_age_ms;
+            self.last_wire_delay_ms = state.last_wire_delay_ms;
             self.host_health = state.host_health.clone();
             self.last_health_pong = state.last_health_pong.clone();
             self.decoder_backend_name = state.decoder_backend_name;
             self.decoder_hardware_accelerated = state.decoder_hardware_accelerated;
             self.media_inbox = state.inbox;
+            self.dedicated_eight_bit_presentation = state.eight_bit_presentation_status;
+            self.dedicated_eight_bit_layer_has_picture =
+                state.eight_bit_presentation_status.is_dedicated_eight_bit()
+                    && !state.eight_bit_layer_disabled
+                    && eight_bit_presenter_has_picture;
+            state.eight_bit_layer_has_picture = self.dedicated_eight_bit_layer_has_picture;
+            self.dedicated_video_presentation = state.ten_bit_presentation_status;
+            self.dedicated_video_layer_has_picture =
+                state.ten_bit_presentation_status.is_dedicated_ten_bit()
+                    && !state.ten_bit_layer_disabled
+                    && ten_bit_presenter_has_picture;
+            state.ten_bit_layer_has_picture = self.dedicated_video_layer_has_picture;
+            let native_layer_owns_surface =
+                (state.eight_bit_presentation_status.is_dedicated_eight_bit()
+                    && state.eight_bit_layer_has_picture)
+                    || (state.ten_bit_presentation_status.is_dedicated_ten_bit()
+                        && state.ten_bit_layer_has_picture);
+            if native_layer_owns_surface {
+                self.last_presented_at = self
+                    .presented_frame_times
+                    .back()
+                    .copied()
+                    .or_else(|| self.presented_frame_times_estimated.back().copied());
+            }
             self.microphone_active = state.microphone_active
                 || self
                     .session_commands
@@ -4004,6 +4617,7 @@ impl ArcenApp {
                 .note_media_ready_wakes(media_ready_wakes);
             (
                 state.latest_frame.take(),
+                state.latest_native_frame_metadata.take(),
                 state.closed,
                 state.end.clone(),
                 if self.session_hello_handled {
@@ -4019,12 +4633,20 @@ impl ArcenApp {
                 state.display_update_result.take(),
                 state.certificate_untrusted.take(),
                 state.pending_cursor_shape.take(),
+                state.served_pipeline.take(),
+                state.connection_status_hint.clone(),
                 state.generation,
             )
         };
 
         if generation != self.connection_generation {
             return;
+        }
+        self.connection_status_hint = connection_status_hint;
+
+        let native_replacement_presented = native_metadata.is_some();
+        if let Some(metadata) = native_metadata {
+            self.apply_native_presentation_metadata(metadata);
         }
 
         if let Some(info) = certificate_untrusted {
@@ -4173,6 +4795,7 @@ impl ArcenApp {
                 &hello,
                 requested_video_variant.video,
                 self.requested_video_selection,
+                self.requested_pipeline.as_ref(),
             );
             tracing::info!(
                 target: crate::logging::target::VIDEO,
@@ -4181,6 +4804,8 @@ impl ArcenApp {
                 requested_depth = requested_video_variant.video.bit_depth.token(),
                 requested_range = requested_video_variant.video.range.token(),
                 requested_matrix = requested_video_variant.video.matrix.token(),
+                requested_pipeline = self.requested_pipeline.as_ref().map(|pipeline| pipeline.token()),
+                active_pipeline = hello.active_pipeline.as_ref().map(|pipeline| pipeline.token()),
                 active_codec = ?negotiated_truth.active.codec,
                 active_chroma = ?negotiated_truth.active.chroma,
                 active_depth = ?negotiated_truth.active.bit_depth,
@@ -4189,7 +4814,7 @@ impl ArcenApp {
                 degradation = ?negotiated_truth.degradation,
                 "resolved session colour truth",
             );
-            let path_note = if negotiated_truth.encoder_hardware {
+            let path_note = if negotiated_truth.encoder_hardware == Some(true) {
                 format!(
                     "Native optimized media path: {}",
                     negotiated_truth.encoder_backend
@@ -4197,11 +4822,15 @@ impl ArcenApp {
             } else {
                 format!("Fallback media path: {}", negotiated_truth.encoder_backend)
             };
-            self.negotiated_truth = Some(negotiated_truth);
+            self.negotiated_truth = Some(negotiated_truth.clone());
             self.status = format!(
                 "{} · {} · {}x{} · {}",
                 hello.server_name, hello.codec, hello.screen_width, hello.screen_height, path_note
             );
+            if let Some(note) = negotiated_truth.pipeline_degradation.as_ref() {
+                self.status.push_str(" · ");
+                self.status.push_str(note);
+            }
             if let Some(identity) = &self.host_build_identity {
                 self.status.push_str(" · build ");
                 self.status.push_str(&identity.build_id);
@@ -4330,6 +4959,11 @@ impl ArcenApp {
                 self.screen = AppScreen::LaunchingSession(draft);
             }
         }
+        if let Some(served) = served_pipeline {
+            if let Some(truth) = self.negotiated_truth.as_mut() {
+                truth.update_served_pipeline(self.requested_pipeline.as_ref(), Some(&served));
+            }
+        }
         // Apply the authoritative host result after ServerHello. The media
         // worker may deliver both in one UI poll; applying this first would let
         // the ServerHello initialization overwrite the result.
@@ -4435,17 +5069,22 @@ impl ArcenApp {
             self.last_decode_at = Some(now);
             self.video_frames_decoded += 1;
             self.last_decode_error = None;
-            self.pending_connection = None;
-            if let Some(draft) = self.active_connection.as_mut() {
-                draft.password.zeroize();
-            }
-            self.status = if let Some(note) = self.stream_sizing_policy.status_note() {
-                format!("Receiving video stream · {note}")
-            } else {
-                "Receiving video stream".to_string()
-            };
+            self.note_session_presentation_started();
             if !matches!(self.screen, AppScreen::InSession) {
-                self.screen = AppScreen::InSession;
+                self.enter_in_session(Instant::now());
+            }
+        }
+
+        if native_replacement_presented && !multi_window_pending {
+            self.note_session_presentation_started();
+            if matches!(
+                self.screen,
+                AppScreen::Connecting(_)
+                    | AppScreen::LaunchingSession(_)
+                    | AppScreen::Reconnecting(_)
+                    | AppScreen::Resuming(_)
+            ) {
+                self.enter_in_session(Instant::now());
             }
         }
 
@@ -4462,12 +5101,43 @@ impl ArcenApp {
             )
         {
             self.pending_connection = None;
-            self.screen = AppScreen::InSession;
+            self.enter_in_session(Instant::now());
         }
 
         if closed {
             self.handle_connection_closed(end, generation, ctx);
         }
+    }
+
+    fn note_session_presentation_started(&mut self) {
+        self.pending_connection = None;
+        if let Some(draft) = self.active_connection.as_mut() {
+            draft.password.zeroize();
+        }
+        self.status = if let Some(note) = self.stream_sizing_policy.status_note() {
+            format!("Receiving video stream · {note}")
+        } else {
+            "Receiving video stream".to_string()
+        };
+    }
+
+    fn enter_in_session(&mut self, now: Instant) {
+        let (passes, ui_passes_per_s, deck_cpu_percent) = self.ui_load.sample(now);
+        tracing::info!(
+            target: crate::logging::target::SESSION,
+            passes,
+            deck_cpu_percent = format!("{deck_cpu_percent:.1}"),
+            ui_passes_per_s = format!("{ui_passes_per_s:.1}"),
+            "pre-session UI load"
+        );
+        self.screen = AppScreen::InSession;
+        self.last_telemetry_log_at = now;
+        self.reset_ui_load_baseline(now);
+    }
+
+    fn reset_ui_load_baseline(&mut self, now: Instant) {
+        self.ui_load = UiLoadMeter::new(now);
+        self.ui_layout_load = RateMeter::new(now);
     }
 
     /// Spawn a session + its media worker and reset the presentation state.
@@ -4476,6 +5146,7 @@ impl ArcenApp {
     fn launch_session(&mut self, options: ConnectOptions, ctx: &egui::Context) {
         self.requested_video_variant = stream_profile_video_variant(&options.profile);
         self.requested_video_selection = options.profile.video_selection;
+        self.requested_pipeline = options.profile.pipeline.clone();
         self.active_stream_max_fps = options.profile.max_fps;
         if self.requested_video_variant.is_none() {
             tracing::warn!(
@@ -4529,6 +5200,7 @@ impl ArcenApp {
     ) {
         self.requested_video_variant = stream_profile_video_variant(&options.profile);
         self.requested_video_selection = options.profile.video_selection;
+        self.requested_pipeline = options.profile.pipeline.clone();
         self.session_telemetry = Some(Arc::clone(&options.telemetry));
         let handle = spawn_resume_session(options, attempt, deadline);
         self.install_session_handle(handle, true, ctx);
@@ -4650,6 +5322,39 @@ impl ArcenApp {
             self.connection_generation,
             resuming,
         )));
+        let preserve_native_hold = self.screen_preserves_dedicated_native_hold();
+        let (ten_bit_picture, eight_bit_picture) = self.dedicated_native_picture_evidence();
+        let preserve_eight_bit_hold = preserve_native_hold
+            && self
+                .dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit()
+            && eight_bit_picture;
+        let preserve_ten_bit_hold = preserve_native_hold
+            && self.dedicated_video_presentation.is_dedicated_ten_bit()
+            && ten_bit_picture;
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.eight_bit_video_presenter =
+                Some(self.dedicated_eight_bit_video_presenter.clone());
+            state.eight_bit_layer_ready = preserve_eight_bit_hold;
+            state.eight_bit_layer_has_picture = preserve_eight_bit_hold;
+            state.eight_bit_layer_disabled = false;
+            state.eight_bit_presentation_status = if preserve_eight_bit_hold {
+                DedicatedEightBitPresentationStatus::DedicatedEightBit
+            } else {
+                DedicatedEightBitPresentationStatus::Inactive
+            };
+            state.ten_bit_video_presenter = Some(self.dedicated_video_presenter.clone());
+            state.ten_bit_layer_ready = preserve_ten_bit_hold;
+            state.ten_bit_layer_has_picture = preserve_ten_bit_hold;
+            state.ten_bit_layer_disabled = false;
+            state.ten_bit_presentation_status = if preserve_ten_bit_hold {
+                DedicatedPresentationStatus::DedicatedTenBit
+            } else {
+                DedicatedPresentationStatus::Inactive
+            };
+            state.layer_present_ms_samples.clear();
+        }
         spawn_media_worker(
             handle.events,
             handle.media,
@@ -4660,6 +5365,7 @@ impl ArcenApp {
                 .clone()
                 .unwrap_or_else(|| Arc::new(ClientTelemetry::default())),
         );
+        self.media_events = Some(handle.event_sender);
         self.session_commands = Some(handle.commands);
         self.clipboard_controller
             .attach(self.connection_generation, clipboard.clone());
@@ -4696,19 +5402,38 @@ impl ArcenApp {
         self.multi_window_timing = MultiWindowTimingTelemetry::default();
         self.last_ui_wake_media_ready = 0;
         self.multi_window_root_monitor_id = None;
-        self.presented_frame_times.clear();
+        self.reset_presentation_cadence_history();
         self.monitor_presented_frame_times.clear();
         self.video_packet_times.clear();
         self.upload_ms_samples.clear();
         self.decode_ms_samples.clear();
         self.last_decode_at = None;
         self.last_presented_at = None;
-        self.last_wire_frame_age_ms = None;
+        self.last_wire_clock_age_ms = None;
+        self.last_wire_delay_ms = None;
         self.last_decode_error = None;
         self.media_inbox = IncomingMediaTelemetry::default();
+        self.presenter_telemetry = PresenterTelemetryWindow::default();
         self.ingress_idr_requests = 0;
         self.malformed_media_packets = 0;
         self.waiting_for_keyframe = resuming;
+        if !preserve_ten_bit_hold {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .teardown();
+            self.dedicated_video_presentation = DedicatedPresentationStatus::Inactive;
+            self.dedicated_video_layer_has_picture = false;
+            self.dedicated_video_frame = None;
+        }
+        if !preserve_eight_bit_hold {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .teardown();
+            self.dedicated_eight_bit_presentation = DedicatedEightBitPresentationStatus::Inactive;
+            self.dedicated_eight_bit_layer_has_picture = false;
+        }
     }
 
     /// Resets `self.multi_window` back to `Inactive` and queues an explicit
@@ -4731,6 +5456,10 @@ impl ArcenApp {
         if let MultiWindowSessionState::Active { attempt, .. } = &self.multi_window {
             self.pending_viewport_closes
                 .extend(attempt.plan().viewport_ids());
+            #[cfg(feature = "dev-tools")]
+            if self.windowed_monitor_test.is_some() {
+                self.pending_root_title_restore = true;
+            }
         }
         self.multi_window = MultiWindowSessionState::Inactive;
         self.multi_window_root_monitor_id = None;
@@ -4765,6 +5494,9 @@ impl ArcenApp {
         self.secondary_refresh_superseded_pending.clear();
         self.secondary_tablet_targets.clear();
         self.secondary_scroll_accum.clear();
+        self.secondary_retained_frames.clear();
+        self.secondary_full_frame_refresh_needed.clear();
+        self.secondary_full_frame_refresh_sent.clear();
         self.secondary_pointer_lock = None;
         // A drag capture belongs to the committed topology it started under;
         // a fresh commit can reuse the same negotiated `SessionMonitorId`
@@ -4814,6 +5546,13 @@ impl ArcenApp {
     /// exact outer window position regardless (see `RootPreEntrySnapshot`'s
     /// own doc).
     fn drain_pending_root_restore(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "dev-tools")]
+        if self.pending_root_title_restore {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE.to_string(),
+            ));
+            self.pending_root_title_restore = false;
+        }
         let Some(snapshot) = self.pending_root_restore.take() else {
             return;
         };
@@ -4956,6 +5695,36 @@ impl ArcenApp {
                     root_display_id = plan.primary_cg_display_id(),
                     "beginning production multi-window entry",
                 );
+                #[cfg(feature = "dev-tools")]
+                if let Some(mode) = self.windowed_monitor_test {
+                    if let Some(tile_display) =
+                        crate::ui::windowed_monitor_test::primary_display_bounds()
+                    {
+                        if let Ok(tiles) = crate::ui::windowed_monitor_test::tile_placements(
+                            mode,
+                            tile_display,
+                            crate::ui::windowed_monitor_test::TilingInsets::default(),
+                        ) {
+                            tracing::warn!(
+                                target: "arcen::display",
+                                monitors = mode.monitor_count,
+                                monitor_width_px = mode.monitor_size_px[0],
+                                monitor_height_px = mode.monitor_size_px[1],
+                                backing_display_id = tile_display.cg_display_id,
+                                tiles = ?tiles.iter().map(|tile| {
+                                    (
+                                        tile.session_monitor_id.get(),
+                                        tile.outer_x.round() as i32,
+                                        tile.outer_y.round() as i32,
+                                        tile.inner_width.round() as u32,
+                                        tile.inner_height.round() as u32,
+                                    )
+                                }).collect::<Vec<_>>(),
+                                "windowed multi-monitor test mode presenting negotiated monitors as tiled windows",
+                            );
+                        }
+                    }
+                }
                 self.region_runtime = Some(region_runtime);
                 self.multi_window_root_monitor_id = root_monitor_id;
                 self.arm_multi_window_decode_isolation(&validated);
@@ -5363,6 +6132,9 @@ impl ArcenApp {
             .unwrap_or_default();
         #[cfg(not(target_os = "macos"))]
         let samples: Vec<()> = Vec::new();
+        if !samples.is_empty() {
+            self.last_local_input = Some(Instant::now());
+        }
         if !focused || !self.host_gestures_v1 {
             return;
         }
@@ -5775,11 +6547,48 @@ impl ArcenApp {
             return;
         }
 
+        #[cfg(feature = "dev-tools")]
+        let mut active_displays: Vec<ActiveDisplayInfo> = live_active_displays();
+        #[cfg(not(feature = "dev-tools"))]
         let active_displays: Vec<ActiveDisplayInfo> = live_active_displays();
+        #[cfg(feature = "dev-tools")]
+        let mut active_display_ids: Vec<u32> = active_displays
+            .iter()
+            .map(|display| display.cg_display_id)
+            .collect();
+        #[cfg(not(feature = "dev-tools"))]
         let active_display_ids: Vec<u32> = active_displays
             .iter()
             .map(|display| display.cg_display_id)
             .collect();
+        #[cfg(feature = "dev-tools")]
+        let windowed_test_context = if let Some(mode) = self.windowed_monitor_test {
+            let Some(display) = crate::ui::windowed_monitor_test::primary_display_bounds() else {
+                tracing::error!(
+                    target: "arcen::display",
+                    "windowed multi-monitor test mode could not find a local display; requiring reconnect",
+                );
+                self.multi_window_failure(
+                    ctx,
+                    "windowed multi-monitor test mode could not find a local display",
+                );
+                return;
+            };
+            active_displays = (0..mode.monitor_count)
+                .map(|index| ActiveDisplayInfo {
+                    cg_display_id: crate::ui::windowed_monitor_test::synthetic_display_id(index),
+                    width_pts: display.width,
+                    height_pts: display.height,
+                })
+                .collect();
+            active_display_ids = active_displays
+                .iter()
+                .map(|display| display.cg_display_id)
+                .collect();
+            Some((mode, display))
+        } else {
+            None
+        };
 
         let root_move_command_needed = match &self.multi_window {
             MultiWindowSessionState::Active { attempt, .. } => {
@@ -5788,9 +6597,61 @@ impl ArcenApp {
             MultiWindowSessionState::Inactive => false,
         };
         let snapshot_needed = self.root_pre_entry_snapshot.is_none();
+        let root_window_title = self.current_root_window_title();
+        #[cfg(feature = "dev-tools")]
+        let root_monitor_id = validated
+            .monitors
+            .first()
+            .map(|monitor| monitor.session_monitor_id);
+        #[cfg(feature = "dev-tools")]
+        let (root_observation, root_move_command_sent, root_pre_entry_snapshot) = if let (
+            Some((mode, display)),
+            Some(root_monitor_id),
+        ) =
+            (windowed_test_context, root_monitor_id)
+        {
+            match crate::ui::windowed_monitor_test::placement_for_monitor(
+                mode,
+                display,
+                root_monitor_id,
+            ) {
+                Ok(tile) => drive_root_windowed_monitor_test_target(
+                    ctx,
+                    &root_window_title,
+                    tile,
+                    display,
+                    primary_cg_display_id,
+                    root_move_command_needed,
+                    snapshot_needed,
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        target: "arcen::display",
+                        %error,
+                        "windowed multi-monitor test mode could not tile root; requiring reconnect",
+                    );
+                    self.multi_window_failure(
+                        ctx,
+                        &format!("windowed multi-monitor test mode could not tile root: {error}"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            drive_root_multi_window_target(
+                ctx,
+                &root_window_title,
+                primary_cg_display_id,
+                &active_display_ids,
+                root_move_command_needed,
+                snapshot_needed,
+            )
+        };
+        #[cfg(not(feature = "dev-tools"))]
         let (root_observation, root_move_command_sent, root_pre_entry_snapshot) =
             drive_root_multi_window_target(
                 ctx,
+                &root_window_title,
                 primary_cg_display_id,
                 &active_display_ids,
                 root_move_command_needed,
@@ -5862,36 +6723,118 @@ impl ArcenApp {
                     .secondary_frames
                     .remove(&monitor_id)
             });
+            if let Some(frame) = &frame {
+                self.secondary_retained_frames
+                    .insert(monitor_id, frame.clone());
+                self.secondary_full_frame_refresh_sent.remove(&monitor_id);
+            }
 
-            let builder = match viewport_builder_for(assignment, &active_displays) {
-                Ok(builder) => builder,
-                Err(_) => {
-                    // The assigned display is not currently resolvable at
-                    // all: never open a window with no target monitor (it
-                    // could land on the wrong/primary display). Feed a
-                    // default (definitely-not-confirmed) observation so
-                    // `record_observation`'s own `target_still_active` check
-                    // below latches the correct `DisplayDisappeared` hard
-                    // failure through the normal path.
-                    results.push(SecondaryResult {
-                        viewport_id,
+            #[cfg(feature = "dev-tools")]
+            let windowed_tile = if let Some((mode, display)) = windowed_test_context {
+                match crate::ui::windowed_monitor_test::placement_for_monitor(
+                    mode, display, monitor_id,
+                ) {
+                    Ok(tile) => Some((mode, display, tile)),
+                    Err(error) => {
+                        tracing::error!(
+                            target: "arcen::display",
+                            %error,
+                            monitor_id = monitor_id.get(),
+                            "windowed multi-monitor test mode could not tile secondary; requiring reconnect",
+                        );
+                        self.multi_window_failure(
+                            ctx,
+                            &format!(
+                                "windowed multi-monitor test mode could not tile secondary: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let title = {
+                #[cfg(feature = "dev-tools")]
+                if let Some((mode, _, _)) = windowed_tile {
+                    crate::ui::windowed_monitor_test::window_title_for(
                         monitor_id,
-                        observation: ViewportBindObservation::default(),
-                        texture: self.secondary_textures.get(&monitor_id).cloned(),
-                        local_fraction: None,
-                        buttons: POINTER_BUTTON_WIRE_MAPPING
-                            .map(|(_, wire_button)| (wire_button, false)),
-                        focused: false,
-                        keyboard_events: Vec::new(),
-                        tablet_target: None,
-                        scroll: egui::Vec2::ZERO,
-                        motion: egui::Vec2::ZERO,
-                        input_fresh: false,
-                    });
-                    continue;
+                        mode.monitor_count,
+                    )
+                } else {
+                    window_title_for(monitor_id)
+                }
+                #[cfg(not(feature = "dev-tools"))]
+                {
+                    window_title_for(monitor_id)
                 }
             };
-            let title = window_title_for(monitor_id);
+            let builder = {
+                #[cfg(feature = "dev-tools")]
+                if let Some((_, _, tile)) = windowed_tile {
+                    egui::ViewportBuilder::default()
+                        .with_title(title.clone())
+                        .with_decorations(true)
+                        .with_resizable(true)
+                        .with_fullscreen(false)
+                        .with_position(egui::pos2(tile.outer_x, tile.outer_y))
+                        .with_inner_size(egui::vec2(tile.inner_width, tile.inner_height))
+                        .with_min_inner_size(egui::vec2(320.0, 200.0))
+                } else {
+                    match viewport_builder_for(assignment, &active_displays) {
+                        Ok(builder) => builder,
+                        Err(_) => {
+                            // The assigned display is not currently resolvable at
+                            // all: never open a window with no target monitor (it
+                            // could land on the wrong/primary display). Feed a
+                            // default (definitely-not-confirmed) observation so
+                            // `record_observation`'s own `target_still_active` check
+                            // below latches the correct `DisplayDisappeared` hard
+                            // failure through the normal path.
+                            results.push(SecondaryResult {
+                                viewport_id,
+                                monitor_id,
+                                observation: ViewportBindObservation::default(),
+                                texture: self.secondary_textures.get(&monitor_id).cloned(),
+                                local_fraction: None,
+                                buttons: POINTER_BUTTON_WIRE_MAPPING
+                                    .map(|(_, wire_button)| (wire_button, false)),
+                                focused: false,
+                                keyboard_events: Vec::new(),
+                                tablet_target: None,
+                                scroll: egui::Vec2::ZERO,
+                                motion: egui::Vec2::ZERO,
+                                input_fresh: false,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "dev-tools"))]
+                {
+                    match viewport_builder_for(assignment, &active_displays) {
+                        Ok(builder) => builder,
+                        Err(_) => {
+                            results.push(SecondaryResult {
+                                viewport_id,
+                                monitor_id,
+                                observation: ViewportBindObservation::default(),
+                                texture: self.secondary_textures.get(&monitor_id).cloned(),
+                                local_fraction: None,
+                                buttons: POINTER_BUTTON_WIRE_MAPPING
+                                    .map(|(_, wire_button)| (wire_button, false)),
+                                focused: false,
+                                keyboard_events: Vec::new(),
+                                tablet_target: None,
+                                scroll: egui::Vec2::ZERO,
+                                motion: egui::Vec2::ZERO,
+                                input_fresh: false,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            };
             let deferred_state = self
                 .secondary_deferred_viewports
                 .entry(monitor_id)
@@ -5930,61 +6873,136 @@ impl ArcenApp {
                     }
                 }
             }
+            {
+                let mut state = deferred_state
+                    .lock()
+                    .expect("secondary viewport state poisoned");
+                match stage_secondary_frame_for_ready_viewport(
+                    &mut state,
+                    self.secondary_retained_frames.get(&monitor_id),
+                ) {
+                    SecondaryReadyFrameAction::ReplayedRetainedFrame => {
+                        self.multi_window_timing.note_secondary_frame_wake();
+                        request_viewport_repaint = true;
+                    }
+                    SecondaryReadyFrameAction::RequestFullFrame => {
+                        if !self.secondary_full_frame_refresh_sent.contains(&monitor_id) {
+                            self.secondary_full_frame_refresh_needed.insert(monitor_id);
+                        }
+                    }
+                    SecondaryReadyFrameAction::None => {}
+                }
+            }
             if request_viewport_repaint {
                 ctx.request_repaint_of(viewport_id);
             }
 
             let callback_state = Arc::clone(&deferred_state);
             let callback_media = self.media.clone();
+            #[cfg(feature = "dev-tools")]
+            let expected_virtual_display_id = assignment.cg_display_id;
             ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
                 let show_started_at = Instant::now();
                 let viewport_paint_started_at = Instant::now();
                 let rect = ui.max_rect();
+                #[cfg(feature = "dev-tools")]
+                if !already_committed {
+                    if let Some((_, _, tile)) = windowed_tile {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                                tile.outer_x,
+                                tile.outer_y,
+                            )));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                                tile.inner_width,
+                                tile.inner_height,
+                            )));
+                    }
+                }
                 let mut state = callback_state
                     .lock()
                     .expect("secondary viewport state poisoned");
                 let frame = state.pending_frame.take();
                 let had_fresh_frame = frame.is_some();
+                if let Some(frame) = frame.as_ref() {
+                    state.frame_size = Some([frame.width, frame.height]);
+                }
+                let image_rect =
+                    aspect_fit_rect(rect, state.frame_size, ui.ctx().pixels_per_point());
+                if !state.logged_first_paint && (frame.is_some() || state.texture.is_some()) {
+                    state.logged_first_paint = true;
+                    let rgba_len = frame.as_ref().map_or(0, |frame| frame.rgba.len());
+                    let first_alpha = frame
+                        .as_ref()
+                        .and_then(|frame| frame.rgba.get(3).copied())
+                        .unwrap_or_default();
+                    let nonzero_rgb_samples = frame.as_ref().map_or(0usize, |frame| {
+                        frame
+                            .rgba
+                            .chunks_exact(4)
+                            .take(4096)
+                            .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+                            .count()
+                    });
+                    tracing::info!(
+                        target: "arcen::display",
+                        monitor_id = monitor_id.get(),
+                        rgba_len,
+                        first_alpha,
+                        nonzero_rgb_samples,
+                        frame_size = ?state.frame_size,
+                        rect = ?(rect.left(), rect.top(), rect.width(), rect.height()),
+                        image_rect = ?(image_rect.left(), image_rect.top(), image_rect.width(), image_rect.height()),
+                        has_texture = state.texture.is_some(),
+                        already_committed,
+                        "secondary viewport first paint diagnostics",
+                    );
+                }
                 let mut texture_upload_ms = 0.0;
                 let texture_upload_started_at = Instant::now();
                 let texture = match (&frame, state.texture.clone()) {
-                    (Some(frame), Some(mut handle)) => {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width, frame.height],
-                            &frame.rgba,
-                        );
-                        handle.set(image, egui::TextureOptions::LINEAR);
+                    (Some(frame), Some(mut handle)) if !frame.rgba.is_empty() => {
+                        if let Some(image) = secondary_color_image_from_frame(frame) {
+                            handle.set(image, egui::TextureOptions::LINEAR);
+                        }
                         Some(handle)
                     }
-                    (Some(frame), None) => {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width, frame.height],
-                            &frame.rgba,
-                        );
-                        Some(ui.ctx().load_texture(
-                            format!("secondary-video-{}", monitor_id.get()),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ))
+                    (Some(frame), None) if !frame.rgba.is_empty() => {
+                        secondary_color_image_from_frame(frame).map(|image| {
+                            ui.ctx().load_texture(
+                                format!("secondary-video-{}", monitor_id.get()),
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            )
+                        })
                     }
                     (None, existing) => existing,
+                    (Some(_), existing) => existing,
                 };
                 if had_fresh_frame {
                     texture_upload_ms = ms(texture_upload_started_at.elapsed());
                 }
                 if already_committed {
                     if let Some(texture) = &texture {
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
                         ui.painter().image(
                             texture.id(),
-                            rect,
+                            image_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
                     } else {
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                        paint_secondary_waiting_placeholder(ui, rect, true);
                     }
                 } else {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    paint_secondary_waiting_placeholder(ui, rect, false);
                 }
                 let observed_display_id = window_display_id(&title);
                 let info = ui.ctx().input(|input| input.viewport().clone());
@@ -5999,28 +7017,47 @@ impl ArcenApp {
                     inner_rect_size_pts: info.inner_rect.map(|rect| (rect.width(), rect.height())),
                     observed_display_id,
                 };
+                #[cfg(feature = "dev-tools")]
+                let observation = if let Some((_, display, _)) = windowed_tile {
+                    crate::ui::windowed_monitor_test::confirmation_observation(
+                        observation,
+                        expected_virtual_display_id,
+                        display.cg_display_id,
+                    )
+                } else {
+                    observation
+                };
                 let focused = ui.input(|input| input.focused);
-                let buttons = POINTER_BUTTON_WIRE_MAPPING.map(|(button, wire_button)| {
+                let raw_buttons = POINTER_BUTTON_WIRE_MAPPING.map(|(button, wire_button)| {
                     (
                         wire_button,
                         ui.input(|input| input.pointer.button_down(button)),
                     )
                 });
+                let keyboard_events = ui.input(|input| input.events.clone());
                 // A release is still part of the press it ends: when it
                 // happens outside this viewport the button already reads up,
                 // yet the release must go out at the press's position or the
                 // host keeps the button held.
-                let button_in_use = buttons.iter().any(|&(_, down)| down)
-                    || ui.input(|input| input.pointer.any_released());
+                let capture = secondary_pointer_capture_for_frame(
+                    image_rect,
+                    &keyboard_events,
+                    state.accepted_pointer_buttons,
+                    state.ignored_pointer_buttons,
+                    raw_buttons,
+                );
+                state.accepted_pointer_buttons = capture.accepted_buttons;
+                state.ignored_pointer_buttons = capture.ignored_buttons;
                 let pointer_pos = ui.input(|input| {
                     secondary_pointer_position(
                         input.pointer.interact_pos(),
                         input.pointer.hover_pos(),
-                        button_in_use,
+                        capture.pointer_in_use,
                     )
                 });
-                let local_fraction = secondary_local_fraction(rect, pointer_pos, button_in_use);
-                let keyboard_events = ui.input(|input| input.events.clone());
+                let local_fraction =
+                    secondary_local_fraction(image_rect, pointer_pos, capture.pointer_in_use);
+                let buttons = capture.buttons;
                 let scroll = ui.input(|input| input.smooth_scroll_delta());
                 let motion = ui
                     .input(|input| input.pointer.motion())
@@ -6031,10 +7068,10 @@ impl ArcenApp {
                         window_number,
                         ViewSize::within_window(
                             window_height,
-                            f64::from(rect.left()),
-                            f64::from(rect.top()),
-                            f64::from(rect.width()),
-                            f64::from(rect.height()),
+                            f64::from(image_rect.left()),
+                            f64::from(image_rect.top()),
+                            f64::from(image_rect.width()),
+                            f64::from(image_rect.height()),
                         ),
                     )
                 });
@@ -6121,6 +7158,31 @@ impl ArcenApp {
                 motion: output.motion,
                 input_fresh: output.input_fresh,
             });
+        }
+
+        if !self.secondary_full_frame_refresh_needed.is_empty() {
+            let monitors: Vec<u16> = self
+                .secondary_full_frame_refresh_needed
+                .iter()
+                .map(|monitor| monitor.get())
+                .collect();
+            if let Some(commands) = &self.session_commands {
+                if commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "request_full_frame"
+                    })))
+                    .is_ok()
+                {
+                    self.secondary_full_frame_refresh_sent
+                        .extend(self.secondary_full_frame_refresh_needed.iter().copied());
+                    tracing::warn!(
+                        target: crate::logging::target::VIDEO,
+                        monitors = ?monitors,
+                        "secondary viewport ready without a retained frame; requested full-frame refresh",
+                    );
+                    self.secondary_full_frame_refresh_needed.clear();
+                }
+            }
         }
 
         self.secondary_tablet_targets = results
@@ -6495,10 +7557,52 @@ impl ArcenApp {
     /// into the persisted app default (`save_client_settings` deliberately
     /// still writes `displays_mode`).
     fn effective_displays_mode(&self) -> DisplaysMode {
+        #[cfg(feature = "dev-tools")]
+        if self.windowed_monitor_test.is_some() {
+            return DisplaysMode::MatchLayout;
+        }
         self.active_displays_mode.unwrap_or(self.displays_mode)
     }
 
+    fn current_root_window_title(&self) -> String {
+        crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE.to_string()
+    }
+
+    fn dedicated_native_hold_active(&self) -> bool {
+        let (ten_bit_picture, eight_bit_picture) = self.dedicated_native_picture_evidence();
+        eight_bit_picture || ten_bit_picture
+    }
+
+    fn dedicated_native_picture_evidence(&self) -> (bool, bool) {
+        let ten_bit_picture = self.dedicated_video_presentation.is_dedicated_ten_bit()
+            && self
+                .dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .has_presented_picture();
+        let eight_bit_picture = self
+            .dedicated_eight_bit_presentation
+            .is_dedicated_eight_bit()
+            && self
+                .dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture();
+        (ten_bit_picture, eight_bit_picture)
+    }
+
+    fn screen_preserves_dedicated_native_hold(&self) -> bool {
+        matches!(
+            self.screen,
+            AppScreen::SigningIn | AppScreen::Reconnecting(_) | AppScreen::Resuming(_)
+        ) && self.dedicated_native_hold_active()
+    }
+
     fn drop_session_handles(&mut self) {
+        self.drop_session_handles_preserving_native_hold(false);
+    }
+
+    fn drop_session_handles_preserving_native_hold(&mut self, preserve_native_hold: bool) {
         self.release_pointer_lock("disconnect");
         self.release_remote_keys("disconnect");
         self.release_pen_authority("disconnect");
@@ -6509,6 +7613,7 @@ impl ArcenApp {
             microphone_lifecycle = commands.microphone_lifecycle_active();
         }
         self.session_commands = None;
+        self.media_events = None;
         self.session_telemetry = None;
         if let Some(media) = self.media.take() {
             let active = media
@@ -6532,8 +7637,32 @@ impl ArcenApp {
         }
         self.clipboard_session = None;
         self.clipboard_controller.detach();
-        self.dedicated_video_frame = None;
-        self.dedicated_video_presenter.teardown();
+        let (ten_bit_picture, eight_bit_picture) = self.dedicated_native_picture_evidence();
+        let preserve_ten_bit_hold = preserve_native_hold
+            && self.dedicated_video_presentation.is_dedicated_ten_bit()
+            && ten_bit_picture;
+        if !preserve_ten_bit_hold {
+            self.dedicated_video_frame = None;
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .teardown();
+            self.dedicated_video_presentation = DedicatedPresentationStatus::Inactive;
+            self.dedicated_video_layer_has_picture = false;
+        }
+        let preserve_eight_bit_hold = preserve_native_hold
+            && self
+                .dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit()
+            && eight_bit_picture;
+        if !preserve_eight_bit_hold {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .teardown();
+            self.dedicated_eight_bit_presentation = DedicatedEightBitPresentationStatus::Inactive;
+            self.dedicated_eight_bit_layer_has_picture = false;
+        }
         self.session_hello_handled = false;
         self.pending_connection = None;
         self.deferred_auth = None;
@@ -6572,6 +7701,7 @@ impl ArcenApp {
             let _ = commands.send(SessionCommand::DeclineDisclaimer);
         }
         self.session_commands = None;
+        self.media_events = None;
         self.media = None;
         self.clipboard_session = None;
         self.clipboard_controller.detach();
@@ -7103,6 +8233,7 @@ impl ArcenApp {
         preloaded_auth: Option<crate::transport::websocket::AuthSubmission>,
         ctx: &egui::Context,
     ) {
+        self.reset_ui_load_baseline(Instant::now());
         // Re-bind the per-connection Displays choice to *this* connection.
         //
         // `active_displays_mode` is the mode for the attempt about to start,
@@ -7209,6 +8340,43 @@ impl ArcenApp {
         displays_mode: DisplaysMode,
     ) -> Result<Option<crate::transport::multi_monitor::RequestedMultiMonitorSelection>, String>
     {
+        #[cfg(feature = "dev-tools")]
+        if let Some(mode) = self.windowed_monitor_test {
+            if displays_mode != DisplaysMode::MatchLayout {
+                return Ok(None);
+            }
+            let topology = crate::ui::windowed_monitor_test::synthetic_requested_topology(mode)
+                .map_err(|error| format!("Windowed monitor test mode cannot start: {error}"))?;
+            tracing::warn!(
+                target: "arcen::display",
+                monitors = mode.monitor_count,
+                width_px = mode.monitor_size_px[0],
+                height_px = mode.monitor_size_px[1],
+                "requesting synthetic local display layout for windowed multi-monitor test mode",
+            );
+            let require_full_color_roster = effective_color_fidelity_variant(self.color_fidelity)
+                .video
+                .chroma
+                == arcen_media::ChromaSubsampling::Yuv444;
+            let full_color_display_ids = topology
+                .monitors()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    require_full_color_roster
+                        || (*index < 4 && self.full_color_display_mask & (1u8 << index) != 0)
+                })
+                .map(|(_, monitor)| monitor.monitor().identity.id.clone())
+                .collect();
+            return Ok(Some(
+                crate::transport::multi_monitor::RequestedMultiMonitorSelection {
+                    topology,
+                    safe_area_policy:
+                        crate::protocol::messages::SafeAreaPolicyMsg::StandardFullscreen,
+                    full_color_display_ids,
+                },
+            ));
+        }
         let local_display_count = crate::display::topology::local_display_count();
         let separate_spaces = crate::display::topology::screens_have_separate_spaces();
         let safe_area_policy = if self.fullscreen_uses_notch_area {
@@ -7276,7 +8444,20 @@ impl ArcenApp {
         // `launch_session` is ever reached) simply drops `preloaded_auth`
         // without installing it: the attempt never launched, so there is no
         // session left for it to auto-submit into.
-        self.disconnect();
+        let preserve_native_hold =
+            matches!(self.screen, AppScreen::SigningIn) && self.dedicated_native_hold_active();
+        if preserve_native_hold {
+            self.login_window_handover = None;
+            if let Some(controller) = &mut self.reconnect {
+                controller.manual_cancel();
+            }
+            self.reconnect = None;
+            self.reconnect_options = None;
+            self.active_connection = None;
+            self.drop_session_handles_preserving_native_hold(true);
+        } else {
+            self.disconnect();
+        }
         #[cfg(not(feature = "wss-compat"))]
         {
             draft.use_quic = true;
@@ -7375,6 +8556,7 @@ impl ArcenApp {
                 "stream sizing pinned to primary display",
             );
         }
+        self.connection_status_hint = None;
         self.status = if policy.match_layout_fallback() {
             format!(
                 "Connecting to {}... {}",
@@ -7501,6 +8683,37 @@ impl ArcenApp {
         true
     }
 
+    fn keep_root_display_sync(&mut self) {
+        let now = Instant::now();
+        let decision =
+            root_display_sync_decision(self.multi_window.is_active(), self.root_display_sync, now);
+        if !decision.should_apply {
+            return;
+        }
+        if crate::ui::video_render::set_root_display_sync(decision.enabled) {
+            if decision.log_transition {
+                tracing::info!(
+                    target: crate::logging::target::VIDEO,
+                    display_sync = decision.enabled,
+                    "root presentation layer pacing set",
+                );
+            }
+            self.root_display_sync = Some((now, decision.enabled));
+        }
+    }
+
+    fn keep_session_backstop(&mut self) {
+        let (next, should_apply) = session_backstop_decision(&self.screen, self.session_backstop);
+        if !should_apply {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if !apply_session_backstop(next.enabled) {
+            return;
+        }
+        self.session_backstop = next;
+    }
+
     fn drive_reconnect(&mut self, ctx: &egui::Context) {
         let now = self.reconnect_clock.now();
         if self.reconnect.is_none() {
@@ -7513,6 +8726,17 @@ impl ArcenApp {
         {
             self.status = "Session resume window expired".to_string();
             self.return_to_credentials();
+            return;
+        }
+        // Only a reconnecting controller can issue an attempt, and only that
+        // needs the live identity. Building it enumerates every display
+        // through WindowServer, which on every pass of a healthy session
+        // kept a core and WindowServer busy for the whole session.
+        let reconnecting = self.reconnect.as_ref().is_some_and(|controller| {
+            matches!(controller.phase(), ReconnectPhase::Reconnecting { .. })
+        });
+        if !reconnecting && self.active_connection.is_some() && self.reconnect_options.is_some() {
+            self.refresh_reconnect_screen();
             return;
         }
         let Some(identity) = self
@@ -7797,7 +9021,16 @@ impl ArcenApp {
         // like the same connection attempt. Anything that is not a recovery
         // path drops it here, unchanged from before.
         let recovery_auth = self.deferred_auth.take();
-        self.drop_session_handles();
+        let native_hold_close_can_continue = !matches!(
+            end.reason,
+            DisconnectReason::Terminal(
+                TerminalDisconnect::Manual | TerminalDisconnect::TlsIdentity
+            )
+        ) && self.active_connection.is_some();
+        let preserve_native_hold = native_hold_close_can_continue
+            && self.dedicated_native_hold_active()
+            && (self.login_window_handover.is_some() || end.transient());
+        self.drop_session_handles_preserving_native_hold(preserve_native_hold);
 
         if self.follow_login_window(&end, ctx) {
             return;
@@ -8965,7 +10198,7 @@ impl ArcenApp {
     fn launching_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
         ui.vertical_centered(|ui| {
             ui.add_space(180.0);
-            ui.spinner();
+            paint_connecting_progress(ui, 24.0);
             ui.add_space(28.0);
             ui.heading(
                 egui::RichText::new("Connecting")
@@ -8992,6 +10225,14 @@ impl ArcenApp {
                     .color(egui::Color32::from_rgb(0x66, 0x66, 0x66))
                     .size(15.0),
             );
+            if let Some(hint) = &self.connection_status_hint {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(hint)
+                        .color(egui::Color32::from_rgb(0xA0, 0x62, 0x36))
+                        .size(13.0),
+                );
+            }
             ui.add_space(36.0);
             if ui
                 .add_sized([112.0, 40.0], egui::Button::new("Cancel"))
@@ -10540,6 +11781,9 @@ impl ArcenApp {
         options.profile.video_selection = self.color_fidelity.video_selection();
         let preset_contract =
             StreamingPreset::from_settings(self.performance_mode, self.color_fidelity).contract();
+        options.profile.pipeline =
+            StreamingPreset::from_settings(self.performance_mode, self.color_fidelity)
+                .wire_pipeline();
         options.profile.max_fps = preset_contract.map_or_else(
             || self.performance_mode.max_fps(),
             |contract| contract.max_fps,
@@ -10610,6 +11854,12 @@ impl ArcenApp {
             presentation,
             options.multi_monitor_topology.is_some(),
         );
+        #[cfg(feature = "dev-tools")]
+        let policy = if self.windowed_monitor_test.is_some() {
+            StreamSizingPolicy::FollowWindow
+        } else {
+            policy
+        };
         options.monitors = legacy_roster_for_connect_options(
             options.multi_monitor_topology.as_ref(),
             policy,
@@ -10772,18 +12022,16 @@ impl ArcenApp {
         right_x -= 10.0;
 
         // FPS
-        let fps = if self.presented_frame_times.len() >= 2 {
-            let oldest = *self.presented_frame_times.front().unwrap();
-            let newest = *self.presented_frame_times.back().unwrap();
-            let elapsed = newest.duration_since(oldest).as_secs_f32();
-            if elapsed > 0.05 {
-                (self.presented_frame_times.len() as f32 / elapsed).round() as u32
-            } else {
-                0
-            }
+        let now = Instant::now();
+        self.expire_presentation_histories(now);
+        let fps_is_estimated = !self.has_recent_confirmed_presentation(now)
+            && self.has_recent_estimated_presentation(now);
+        let fps_rate = if fps_is_estimated {
+            Self::instant_rate(&self.presented_frame_times_estimated)
         } else {
-            0
+            Self::instant_rate(&self.presented_frame_times)
         };
+        let fps = fps_rate.round() as u32;
         let fps_color = if fps >= 50 {
             theme::ACCENT
         } else if fps >= 30 {
@@ -10791,10 +12039,11 @@ impl ArcenApp {
         } else {
             theme::DANGER
         };
+        let fps_label = if fps_is_estimated { "fps est" } else { "fps" };
         let fps_text = if self.active_stream_max_fps > 0 {
-            format!("{fps} fps (up to {})", self.active_stream_max_fps)
+            format!("{fps} {fps_label} (up to {})", self.active_stream_max_fps)
         } else {
-            format!("{fps} fps")
+            format!("{fps} {fps_label}")
         };
         ui.painter().text(
             egui::pos2(right_x, toolbar_rect.center().y),
@@ -10844,9 +12093,14 @@ impl ArcenApp {
     fn signing_in_screen(&mut self, ui: &mut egui::Ui) {
         let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
         let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        if let Some(texture) = &self.remote_texture {
+        if self.dedicated_native_hold_active() {
+            // The last native frame is still held by the dedicated layer under
+            // this translucent overlay.
+        } else if let Some(texture) = &self.remote_texture {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             texture.paint(ui.painter(), rect);
+        } else {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
         }
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
@@ -10963,6 +12217,10 @@ impl ArcenApp {
         let auth = handover.auth.clone();
         let Some(draft) = self.active_connection.clone() else {
             self.login_window_handover = None;
+            self.status = "Sign-in hand-over could not continue: connection destination was lost."
+                .to_string();
+            self.return_to_credentials();
+            ctx.request_repaint();
             return;
         };
         // Starting a connection disconnects the previous one, which drops the
@@ -10985,9 +12243,14 @@ impl ArcenApp {
     fn reconnect_screen(&mut self, ui: &mut egui::Ui, overlay: &ReconnectOverlay, resuming: bool) {
         let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
         let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        if let Some(texture) = &self.remote_texture {
+        if self.dedicated_native_hold_active() {
+            // The last native frame is still held by the dedicated layer under
+            // this translucent reconnect/resume overlay.
+        } else if let Some(texture) = &self.remote_texture {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             texture.paint(ui.painter(), rect);
+        } else {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
         }
 
         // 60% gray overlay
@@ -11084,47 +12347,24 @@ impl ArcenApp {
                         egui::vec2(stream_pts[0], stream_pts[1]),
                     );
                 }
-                let aspect = w as f32 / h.max(1) as f32;
-                // Fit inside `rect`, preserving aspect ratio.
-                let fit_h = (rect.width() / aspect).min(rect.height());
-                let fit_w = fit_h * aspect;
-                // Centre and snap to the physical pixel grid to avoid
-                // sub-pixel blurring on Retina panels.
-                let cx = rect.center().x;
-                let cy = rect.center().y;
-                let x0 = snap(cx - fit_w / 2.0);
-                let y0 = snap(cy - fit_h / 2.0);
-                let x1 = snap(cx + fit_w / 2.0);
-                let y1 = snap(cy + fit_h / 2.0);
-                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+                aspect_fit_rect(rect, Some([w, h]), ppp)
             })
             .unwrap_or(rect);
 
-        let dedicated_presentation = if let Some(frame) = &self.dedicated_video_frame {
-            self.dedicated_video_presenter
-                .try_paint_egui(image_rect, frame)
-        } else {
-            DedicatedPresentationStatus::Inactive
-        };
+        let viewport_visible = ui
+            .ctx()
+            .input(|input| root_viewport_visible_for_presenter(input.viewport()));
+        let eight_bit_presentation =
+            self.sync_dedicated_eight_bit_layer(image_rect, viewport_visible);
+        let dedicated_eight_bit_presented = eight_bit_presentation.is_dedicated_eight_bit();
+
+        let dedicated_presentation =
+            self.sync_dedicated_ten_bit_layer(image_rect, viewport_visible);
         let dedicated_presented = dedicated_presentation.is_dedicated_ten_bit();
 
-        if dedicated_presented {
-            for band in [
-                egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, image_rect.min.y)),
-                egui::Rect::from_min_max(egui::pos2(rect.min.x, image_rect.max.y), rect.max),
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, image_rect.min.y),
-                    egui::pos2(image_rect.min.x, image_rect.max.y),
-                ),
-                egui::Rect::from_min_max(
-                    egui::pos2(image_rect.max.x, image_rect.min.y),
-                    egui::pos2(rect.max.x, image_rect.max.y),
-                ),
-            ] {
-                if band.is_positive() {
-                    ui.painter().rect_filled(band, 0.0, egui::Color32::BLACK);
-                }
-            }
+        let dedicated_layer_presented = dedicated_presented || dedicated_eight_bit_presented;
+        if dedicated_layer_presented {
+            paint_letterbox_bands(ui.painter(), rect, image_rect);
         } else if self.remote_texture.is_some() {
             // Black letterbox fill so no BG colour bleeds around the image.
             ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
@@ -11139,7 +12379,7 @@ impl ArcenApp {
             );
         }
 
-        if !dedicated_presented {
+        if !dedicated_layer_presented {
             if let Some(texture) = &self.remote_texture {
                 texture.paint(ui.painter(), image_rect);
             } else {
@@ -11165,11 +12405,20 @@ impl ArcenApp {
             let band_height = image_rect.top() - rect.top();
             // Only use a band that is clearly spare space, never the notch strip.
             if band_height >= 60.0 && self.remote_texture.is_some() {
-                ui.painter().text(
-                    egui::pos2(rect.center().x, rect.top() + band_height / 2.0),
-                    egui::Align2::CENTER_CENTER,
+                let text_rect = display_note_text_rect(rect, band_height);
+                let galley = ui.painter().layout(
                     note,
                     egui::FontId::proportional(14.0),
+                    egui::Color32::from_gray(190),
+                    text_rect.width(),
+                );
+                let pos = egui::pos2(
+                    text_rect.center().x - galley.size().x / 2.0,
+                    text_rect.center().y - galley.size().y / 2.0,
+                );
+                ui.painter().galley(
+                    egui::pos2(pos.x.max(text_rect.left()), pos.y.max(text_rect.top())),
+                    galley,
                     egui::Color32::from_gray(190),
                 );
             }
@@ -11183,6 +12432,7 @@ impl ArcenApp {
         // panel, but exact sessions do not need a permanent on-video badge.
         self.paint_negotiated_truth_badge(ui, rect);
         self.paint_wide_presentation_warning(ui, rect, dedicated_presentation);
+        self.paint_eight_bit_presentation_warning(ui, rect, eight_bit_presentation);
         if self.negotiated_truth_panel_open {
             self.paint_negotiated_truth_panel(ui, rect);
         }
@@ -11372,8 +12622,8 @@ impl ArcenApp {
         self.process_gesture_samples(response.hovered() || self.pointer_lock);
     }
 
-    fn paint_health_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let overlay_width = (rect.width() - 36.0).max(320.0).min(1040.0);
+    fn paint_health_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let overlay_width = (rect.width() - 36.0).clamp(320.0, 1040.0);
         let overlay = egui::Rect::from_min_size(
             rect.left_top() + egui::vec2(18.0, 18.0),
             egui::vec2(overlay_width, 360.0),
@@ -11458,29 +12708,48 @@ impl ArcenApp {
         );
         let (client_wire, client_decoder) =
             client_video_health_rows(&self.last_wire_video_summary, &self.last_decoder_summary);
+        let now = Instant::now();
+        self.expire_presentation_histories(now);
         let presented_fps = Self::instant_rate(&self.presented_frame_times);
+        let presented_fps_estimated = Self::instant_rate(&self.presented_frame_times_estimated);
+        let displayed_presented_fps = if presented_fps > 0.0 {
+            presented_fps
+        } else {
+            presented_fps_estimated
+        };
+        let presented_label = if presented_fps > 0.0 {
+            "presented"
+        } else {
+            "presented estimated"
+        };
         let presented_fps_text = if self.active_stream_max_fps > 0 {
             format!(
-                "{presented_fps:.1} fps (up to {})",
+                "{displayed_presented_fps:.1} fps (up to {})",
                 self.active_stream_max_fps
             )
         } else {
-            format!("{presented_fps:.1} fps")
+            format!("{displayed_presented_fps:.1} fps")
         };
         let monitor_fps_text = self.multi_monitor_fps_overlay_text();
         let client_delivery = if monitor_fps_text.is_empty() {
             format!(
-                "Client delivery: rx {:.1} fps · presented {presented_fps_text} · wire age {} ms",
+                "Client delivery: rx {:.1} fps · {presented_label} {presented_fps_text} · wire delay {} ms · clock age {} ms",
                 Self::instant_rate(&self.video_packet_times),
-                self.last_wire_frame_age_ms
+                self.last_wire_delay_ms
+                    .map(|delay| delay.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                self.last_wire_clock_age_ms
                     .map(|age| age.to_string())
                     .unwrap_or_else(|| "-".to_string())
             )
         } else {
             format!(
-                "Client delivery: rx {:.1} fps · presented {presented_fps_text} · wire age {} ms\nDisplay fps: {monitor_fps_text}",
+                "Client delivery: rx {:.1} fps · presented {presented_fps_text} · wire delay {} ms · clock age {} ms\nDisplay fps: {monitor_fps_text}",
                 Self::instant_rate(&self.video_packet_times),
-                self.last_wire_frame_age_ms
+                self.last_wire_delay_ms
+                    .map(|delay| delay.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                self.last_wire_clock_age_ms
                     .map(|age| age.to_string())
                     .unwrap_or_else(|| "-".to_string())
             )
@@ -11680,7 +12949,7 @@ impl ArcenApp {
         let Some(truth) = &self.negotiated_truth else {
             return;
         };
-        if !session_truth::should_show_degradation_badge(truth.degradation) {
+        if !session_truth::should_show_truth_badge(truth) {
             return;
         }
         let color = if truth.degradation.colour_degraded() {
@@ -11688,12 +12957,7 @@ impl ArcenApp {
         } else {
             theme::WARNING
         };
-        let text = format!(
-            "{}  ·  encode {}  ·  decode {}",
-            session_truth::selection_summary(truth.selection, truth.degradation),
-            session_truth::hardware_label(Some(truth.encoder_hardware)),
-            session_truth::hardware_label(self.decoder_hardware_accelerated),
-        );
+        let text = session_truth::truth_badge_text(truth, self.decoder_hardware_accelerated);
         let badge = egui::Rect::from_min_size(
             egui::pos2(rect.center().x - 280.0, rect.top() + 8.0),
             egui::vec2(560.0, 24.0),
@@ -11707,6 +12971,526 @@ impl ArcenApp {
             egui::FontId::proportional(13.0),
             color,
         );
+    }
+
+    fn wants_dedicated_ten_bit_layer(&self) -> bool {
+        wants_dedicated_ten_bit_layer_state(
+            self.multi_window.is_active(),
+            self.dedicated_video_frame.is_some(),
+            self.negotiated_truth.as_ref().map(|truth| &truth.active),
+            self.remote_frame_size,
+        )
+    }
+
+    fn sync_dedicated_ten_bit_layer(
+        &mut self,
+        image_rect: egui::Rect,
+        viewport_visible: bool,
+    ) -> DedicatedPresentationStatus {
+        let disabled = self.media.as_ref().is_some_and(|media| {
+            media
+                .lock()
+                .expect("media state poisoned")
+                .ten_bit_layer_disabled
+        });
+        if disabled || !self.wants_dedicated_ten_bit_layer() {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .teardown();
+            self.dedicated_video_layer_has_picture = false;
+            if disabled && self.dedicated_video_presentation.is_eight_bit_fallback() {
+                return self.dedicated_video_presentation;
+            }
+            if let Some(media) = &self.media {
+                let mut state = media.lock().expect("media state poisoned");
+                state.ten_bit_layer_ready = false;
+                state.ten_bit_layer_has_picture = false;
+                if !state.ten_bit_presentation_status.is_eight_bit_fallback() {
+                    state.ten_bit_presentation_status = DedicatedPresentationStatus::Inactive;
+                }
+            }
+            if !self.dedicated_video_presentation.is_eight_bit_fallback() {
+                self.dedicated_video_presentation = DedicatedPresentationStatus::Inactive;
+            }
+            return DedicatedPresentationStatus::Inactive;
+        }
+
+        let async_status = {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .take_async_status()
+        };
+        if let Some(async_status) = async_status {
+            return self.apply_async_ten_bit_status(async_status);
+        }
+
+        let status = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .attach_or_resize_egui(image_rect, viewport_visible);
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            if state.ten_bit_presentation_status.is_eight_bit_fallback() {
+                self.dedicated_video_presentation = state.ten_bit_presentation_status;
+                return state.ten_bit_presentation_status;
+            }
+            state.ten_bit_layer_ready = status.is_dedicated_ten_bit();
+            if status.is_eight_bit_fallback() {
+                state.ten_bit_layer_disabled = true;
+                state.ten_bit_layer_has_picture = false;
+                state.ten_bit_presentation_status = status;
+                self.dedicated_video_presentation = status;
+                self.dedicated_video_layer_has_picture = false;
+                return status;
+            }
+            if status.is_dedicated_ten_bit()
+                && state
+                    .ten_bit_presentation_status
+                    .is_transient_drop_or_skip()
+            {
+                state.ten_bit_presentation_status = DedicatedPresentationStatus::DedicatedTenBit;
+                self.dedicated_video_presentation = DedicatedPresentationStatus::DedicatedTenBit;
+            }
+        }
+        // A successful attach only means the worker may submit future native
+        // frames. Do not hide the egui fallback until the worker reports a
+        // dedicated 10-bit frame was actually accepted.
+        self.dedicated_video_presentation
+    }
+
+    fn wants_dedicated_eight_bit_layer(&self) -> bool {
+        wants_dedicated_eight_bit_layer_state(
+            self.multi_window.is_active(),
+            self.dedicated_video_frame.is_some(),
+            self.negotiated_truth.as_ref().map(|truth| &truth.active),
+            self.remote_frame_size,
+        )
+    }
+
+    fn sync_dedicated_eight_bit_layer(
+        &mut self,
+        image_rect: egui::Rect,
+        viewport_visible: bool,
+    ) -> DedicatedEightBitPresentationStatus {
+        let disabled = self.media.as_ref().is_some_and(|media| {
+            media
+                .lock()
+                .expect("media state poisoned")
+                .eight_bit_layer_disabled
+        });
+        if disabled || !self.wants_dedicated_eight_bit_layer() {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .teardown();
+            self.dedicated_eight_bit_layer_has_picture = false;
+            if disabled && self.dedicated_eight_bit_presentation.is_fallback() {
+                return self.dedicated_eight_bit_presentation;
+            }
+            if let Some(media) = &self.media {
+                let mut state = media.lock().expect("media state poisoned");
+                state.eight_bit_layer_ready = false;
+                state.eight_bit_layer_has_picture = false;
+                if !state.eight_bit_presentation_status.is_fallback() {
+                    state.eight_bit_presentation_status =
+                        DedicatedEightBitPresentationStatus::Inactive;
+                }
+            }
+            if !self.dedicated_eight_bit_presentation.is_fallback() {
+                self.dedicated_eight_bit_presentation =
+                    DedicatedEightBitPresentationStatus::Inactive;
+            }
+            return DedicatedEightBitPresentationStatus::Inactive;
+        }
+
+        let async_status = {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .take_async_status()
+        };
+        if let Some(async_status) = async_status {
+            return self.apply_async_eight_bit_status(async_status);
+        }
+
+        let status = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .attach_or_resize_egui(image_rect, viewport_visible);
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            if state.eight_bit_presentation_status.is_fallback() {
+                self.dedicated_eight_bit_presentation = state.eight_bit_presentation_status;
+                return state.eight_bit_presentation_status;
+            }
+            let state_status = state
+                .eight_bit_presentation_status
+                .preserve_established_on_transient(status, state.eight_bit_layer_has_picture);
+            state.eight_bit_layer_ready = state_status.is_dedicated_eight_bit();
+            if state_status.is_fallback() {
+                state.eight_bit_layer_disabled = true;
+                state.eight_bit_layer_has_picture = false;
+            }
+            state.eight_bit_presentation_status = state_status;
+        }
+        self.dedicated_eight_bit_presentation = self
+            .dedicated_eight_bit_presentation
+            .preserve_established_on_transient(status, self.dedicated_eight_bit_layer_has_picture);
+        self.dedicated_eight_bit_presentation
+    }
+
+    fn publish_root_viewport_visibility(&mut self, ctx: &egui::Context) {
+        self.refresh_dedicated_presenter_picture_state();
+        let visible = ctx.input(|input| root_viewport_visible_for_presenter(input.viewport()));
+        self.dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .set_surface_visible(visible);
+        self.dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .set_wake_context(ctx.clone());
+        let ten_bit_async_status = {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .take_async_status()
+        };
+        if let Some(async_status) = ten_bit_async_status {
+            self.apply_async_ten_bit_status(async_status);
+        }
+        self.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .set_surface_visible(visible);
+        self.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .set_wake_context(ctx.clone());
+        let async_status = {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .take_async_status()
+        };
+        if let Some(async_status) = async_status {
+            self.apply_async_eight_bit_status(async_status);
+        }
+    }
+
+    fn refresh_dedicated_presenter_picture_state(&mut self) {
+        let ten_bit_has_picture = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .has_presented_picture();
+        let eight_bit_has_picture = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .has_presented_picture();
+        self.dedicated_video_layer_has_picture =
+            self.dedicated_video_presentation.is_dedicated_ten_bit() && ten_bit_has_picture;
+        self.dedicated_eight_bit_layer_has_picture = self
+            .dedicated_eight_bit_presentation
+            .is_dedicated_eight_bit()
+            && eight_bit_has_picture;
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            state.ten_bit_layer_has_picture =
+                state.ten_bit_presentation_status.is_dedicated_ten_bit()
+                    && !state.ten_bit_layer_disabled
+                    && ten_bit_has_picture;
+            state.eight_bit_layer_has_picture =
+                state.eight_bit_presentation_status.is_dedicated_eight_bit()
+                    && !state.eight_bit_layer_disabled
+                    && eight_bit_has_picture;
+            self.dedicated_video_layer_has_picture = state.ten_bit_layer_has_picture;
+            self.dedicated_eight_bit_layer_has_picture = state.eight_bit_layer_has_picture;
+        }
+    }
+
+    fn drain_dedicated_presenter_telemetry(&mut self) {
+        let ten_bit = {
+            let presenter = self
+                .dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned");
+            (
+                presenter.take_telemetry(),
+                presenter.has_presented_picture(),
+            )
+        };
+        let eight_bit = {
+            let presenter = self
+                .dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned");
+            (
+                presenter.take_telemetry(),
+                presenter.has_presented_picture(),
+            )
+        };
+        self.dedicated_video_layer_has_picture =
+            self.dedicated_video_presentation.is_dedicated_ten_bit() && ten_bit.1;
+        self.dedicated_eight_bit_layer_has_picture = self
+            .dedicated_eight_bit_presentation
+            .is_dedicated_eight_bit()
+            && eight_bit.1;
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            state.dedicated_presenter_drops = state
+                .dedicated_presenter_drops
+                .saturating_add(ten_bit.0.drops.saturating_add(eight_bit.0.drops));
+            state.dedicated_presenter_skips = state
+                .dedicated_presenter_skips
+                .saturating_add(ten_bit.0.skips.saturating_add(eight_bit.0.skips));
+            state.ten_bit_layer_has_picture =
+                state.ten_bit_presentation_status.is_dedicated_ten_bit()
+                    && !state.ten_bit_layer_disabled
+                    && ten_bit.1;
+            state.eight_bit_layer_has_picture =
+                state.eight_bit_presentation_status.is_dedicated_eight_bit()
+                    && !state.eight_bit_layer_disabled
+                    && eight_bit.1;
+            self.dedicated_video_layer_has_picture = state.ten_bit_layer_has_picture;
+            self.dedicated_eight_bit_layer_has_picture = state.eight_bit_layer_has_picture;
+        }
+        let received = ten_bit
+            .0
+            .frames_received
+            .saturating_add(eight_bit.0.frames_received);
+        let submitted = ten_bit
+            .0
+            .frames_submitted
+            .saturating_add(eight_bit.0.frames_submitted);
+        let confirmed = ten_bit
+            .0
+            .frames_confirmed
+            .saturating_add(eight_bit.0.frames_confirmed);
+        if submitted > 0 {
+            for submitted_at in ten_bit
+                .0
+                .submitted_presented_at
+                .iter()
+                .chain(eight_bit.0.submitted_presented_at.iter())
+                .copied()
+            {
+                Self::push_instant_sample(&mut self.presented_frame_times_estimated, submitted_at);
+            }
+        }
+        if confirmed > 0 {
+            for confirmed_at in ten_bit
+                .0
+                .confirmed_presented_at
+                .iter()
+                .chain(eight_bit.0.confirmed_presented_at.iter())
+                .copied()
+            {
+                Self::push_instant_sample(&mut self.presented_frame_times, confirmed_at);
+                if let Some(root_monitor_id) = self.committed_root_monitor_id() {
+                    self.record_monitor_presentation(root_monitor_id, confirmed_at);
+                }
+            }
+        }
+        if let Some(telemetry) = &self.session_telemetry {
+            for _ in 0..confirmed {
+                telemetry.record_presented(Duration::ZERO);
+            }
+        }
+        let metal_dropped = ten_bit
+            .0
+            .metal_dropped
+            .saturating_add(eight_bit.0.metal_dropped);
+        let presented_time_unconfirmed = ten_bit
+            .0
+            .presented_time_unconfirmed
+            .saturating_add(eight_bit.0.presented_time_unconfirmed);
+        let overflow = ten_bit
+            .0
+            .dropped_overflow
+            .saturating_add(eight_bit.0.dropped_overflow);
+        let stale = ten_bit
+            .0
+            .dropped_stale
+            .saturating_add(eight_bit.0.dropped_stale);
+        let hidden = ten_bit
+            .0
+            .dropped_hidden
+            .saturating_add(eight_bit.0.dropped_hidden);
+        let underruns = ten_bit.0.underruns.saturating_add(eight_bit.0.underruns);
+        let slot_waits = ten_bit.0.slot_waits.saturating_add(eight_bit.0.slot_waits);
+        let depth_samples = ten_bit
+            .0
+            .queue_depth_samples
+            .saturating_add(eight_bit.0.queue_depth_samples);
+        if received > 0
+            || submitted > 0
+            || confirmed > 0
+            || metal_dropped > 0
+            || presented_time_unconfirmed > 0
+            || overflow > 0
+            || stale > 0
+            || hidden > 0
+            || underruns > 0
+            || slot_waits > 0
+        {
+            let depth_total = ten_bit
+                .0
+                .queue_depth_total
+                .saturating_add(eight_bit.0.queue_depth_total);
+            let queue_depth_avg = if depth_samples == 0 {
+                0.0
+            } else {
+                depth_total as f64 / depth_samples as f64
+            };
+            let queue_depth_max = ten_bit.0.queue_depth_max.max(eight_bit.0.queue_depth_max);
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                frames_received = received,
+                frames_submitted = submitted,
+                frames_confirmed = confirmed,
+                metal_dropped,
+                presented_time_unconfirmed,
+                dropped_overflow = overflow,
+                dropped_stale = stale,
+                dropped_hidden = hidden,
+                underruns,
+                slot_waits,
+                interval_1x = ten_bit.0.interval_1x.saturating_add(eight_bit.0.interval_1x),
+                interval_2x = ten_bit.0.interval_2x.saturating_add(eight_bit.0.interval_2x),
+                interval_3x_plus = ten_bit
+                    .0
+                    .interval_3x_plus
+                    .saturating_add(eight_bit.0.interval_3x_plus),
+                estimated_latency_p50_us = ?ten_bit.0.latency_p50_us.or(eight_bit.0.latency_p50_us),
+                estimated_latency_p99_us = ?ten_bit.0.latency_p99_us.or(eight_bit.0.latency_p99_us),
+                queue_depth_avg = format!("{queue_depth_avg:.2}"),
+                queue_depth_max,
+                refresh_period_us = ?ten_bit.0.refresh_period_us.or(eight_bit.0.refresh_period_us),
+                "dedicated presenter telemetry",
+            );
+        }
+    }
+
+    fn request_full_frame_after_presentation_failure(&mut self) {
+        if let Some(media) = &self.media {
+            media
+                .lock()
+                .expect("media state poisoned")
+                .waiting_for_keyframe = true;
+        }
+        if let Some(events) = &self.media_events {
+            let _ = events.send(SessionEvent::PresentationRecoveryRequested);
+        }
+    }
+
+    fn apply_async_ten_bit_status(
+        &mut self,
+        async_status: DedicatedPresentationStatus,
+    ) -> DedicatedPresentationStatus {
+        if async_status.is_eight_bit_fallback() {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .teardown();
+        }
+        let presenter_has_picture = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .has_presented_picture();
+        let current_has_picture =
+            self.dedicated_video_presentation.is_dedicated_ten_bit() && presenter_has_picture;
+        let mut presentation_status = self
+            .dedicated_video_presentation
+            .preserve_established_on_transient(async_status, current_has_picture);
+        let mut needs_recovery = false;
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            let state_has_picture = state.ten_bit_presentation_status.is_dedicated_ten_bit()
+                && !state.ten_bit_layer_disabled
+                && presenter_has_picture;
+            presentation_status = state
+                .ten_bit_presentation_status
+                .preserve_established_on_transient(async_status, state_has_picture);
+            state.ten_bit_presentation_status = presentation_status;
+            if presentation_status.is_eight_bit_fallback() {
+                state.ten_bit_layer_disabled = true;
+                state.ten_bit_layer_has_picture = false;
+                needs_recovery = true;
+            } else {
+                state.ten_bit_layer_has_picture = presentation_status.is_dedicated_ten_bit()
+                    && !state.ten_bit_layer_disabled
+                    && presenter_has_picture;
+            }
+            self.dedicated_video_layer_has_picture = state.ten_bit_layer_has_picture;
+        }
+        self.dedicated_video_presentation = presentation_status;
+        if presentation_status.is_eight_bit_fallback() {
+            self.dedicated_video_layer_has_picture = false;
+        }
+        if needs_recovery {
+            self.request_full_frame_after_presentation_failure();
+        }
+        presentation_status
+    }
+
+    fn apply_async_eight_bit_status(
+        &mut self,
+        async_status: DedicatedEightBitPresentationStatus,
+    ) -> DedicatedEightBitPresentationStatus {
+        if async_status.is_fallback() {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .teardown();
+        }
+        let presenter_has_picture = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .has_presented_picture();
+        let current_has_picture = self
+            .dedicated_eight_bit_presentation
+            .is_dedicated_eight_bit()
+            && presenter_has_picture;
+        let mut presentation_status = self
+            .dedicated_eight_bit_presentation
+            .preserve_established_on_transient(async_status, current_has_picture);
+        let mut needs_recovery = false;
+        if let Some(media) = &self.media {
+            let mut state = media.lock().expect("media state poisoned");
+            let state_has_picture = state.eight_bit_presentation_status.is_dedicated_eight_bit()
+                && !state.eight_bit_layer_disabled
+                && presenter_has_picture;
+            presentation_status = state
+                .eight_bit_presentation_status
+                .preserve_established_on_transient(async_status, state_has_picture);
+            state.eight_bit_presentation_status = presentation_status;
+            if presentation_status.is_fallback() {
+                state.eight_bit_layer_disabled = true;
+                state.eight_bit_layer_has_picture = false;
+                needs_recovery = true;
+            } else {
+                state.eight_bit_layer_has_picture = presentation_status.is_dedicated_eight_bit()
+                    && !state.eight_bit_layer_disabled
+                    && presenter_has_picture;
+            }
+            self.dedicated_eight_bit_layer_has_picture = state.eight_bit_layer_has_picture;
+        }
+        self.dedicated_eight_bit_presentation = presentation_status;
+        if presentation_status.is_fallback() {
+            self.dedicated_eight_bit_layer_has_picture = false;
+        }
+        if needs_recovery {
+            self.request_full_frame_after_presentation_failure();
+        }
+        presentation_status
     }
 
     /// Keeps any wide-presentation fallback visible for the whole frame in
@@ -11739,6 +13523,39 @@ impl ArcenApp {
             egui::Align2::CENTER_CENTER,
             format!(
                 "Wide-colour warning: RGB10A2Unorm unavailable; rendering 8-bit fallback \
+                 ({reason:?})"
+            ),
+            egui::FontId::proportional(13.0),
+            theme::DANGER,
+        );
+    }
+
+    fn paint_eight_bit_presentation_warning(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        presentation: DedicatedEightBitPresentationStatus,
+    ) {
+        if !presentation.is_fallback() {
+            return;
+        }
+        let Some(reason) = presentation.fallback_reason() else {
+            return;
+        };
+        let warning = egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - 330.0, rect.top() + 70.0),
+            egui::vec2(660.0, 26.0),
+        );
+        ui.painter().rect_filled(
+            warning,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(90, 20, 0, 220),
+        );
+        ui.painter().text(
+            warning.center(),
+            egui::Align2::CENTER_CENTER,
+            format!(
+                "8-bit video layer unavailable; rendering through egui upload fallback \
                  ({reason:?})"
             ),
             egui::FontId::proportional(13.0),
@@ -11829,7 +13646,7 @@ impl ArcenApp {
                 truth.active.matrix.map(arcen_media::ColorMatrix::token),
             ),
             self.color_fidelity.preset.encode_intent().token(),
-            session_truth::hardware_label(Some(truth.encoder_hardware)),
+            session_truth::hardware_label(truth.encoder_hardware),
             truth.encoder_backend,
             session_truth::hardware_label(self.decoder_hardware_accelerated),
             if self.decoder_backend_name.is_empty() {
@@ -11938,6 +13755,8 @@ impl ArcenApp {
             return;
         }
         self.last_telemetry_log_at = now;
+        let (ui_passes_per_s, deck_cpu_percent) = self.ui_load.take(now);
+        let ui_layout_passes_per_s = self.ui_layout_load.take(now);
         let (host_fps, host_bitrate, host_drops, host_input_events, host_input_sequence) = self
             .host_health
             .as_ref()
@@ -11951,13 +13770,28 @@ impl ArcenApp {
                 )
             })
             .unwrap_or_default();
+        self.drain_dedicated_presenter_telemetry();
+        self.expire_presentation_histories(now);
+        let (total_presenter_drops, total_presenter_skips) =
+            self.dedicated_presenter_telemetry_totals();
+        let (presenter_drops, presenter_skips) = self
+            .presenter_telemetry
+            .take(total_presenter_drops, total_presenter_skips);
         tracing::info!(
             target: crate::logging::target::SESSION,
+            deck_cpu_percent = format!("{deck_cpu_percent:.1}"),
+            ui_passes_per_s = format!("{ui_passes_per_s:.1}"),
+            ui_layout_passes_per_s = format!("{ui_layout_passes_per_s:.1}"),
+            wire_video = %self.last_wire_video_summary,
             rx_fps = Self::instant_rate(&self.video_packet_times),
-            presented_fps = Self::instant_rate(&self.presented_frame_times),
+            presented_fps_confirmed = Self::instant_rate(&self.presented_frame_times),
+            presented_fps_estimated = Self::instant_rate(&self.presented_frame_times_estimated),
             decode_ms = Self::avg_ms(&self.decode_ms_samples),
             upload_ms = Self::avg_ms(&self.upload_ms_samples),
-            wire_age_ms = ?self.last_wire_frame_age_ms,
+            presenter_drops,
+            presenter_skips,
+            wire_clock_age_ms = ?self.last_wire_clock_age_ms,
+            wire_delay_ms = ?self.last_wire_delay_ms,
             host_fps,
             host_mbps = host_bitrate,
             host_drops,
@@ -12012,6 +13846,16 @@ impl ArcenApp {
         self.log_monitor_presentation_telemetry();
     }
 
+    fn dedicated_presenter_telemetry_totals(&self) -> (u64, u64) {
+        self.media.as_ref().map_or((0, 0), |media| {
+            let state = media.lock().expect("media state poisoned");
+            (
+                state.dedicated_presenter_drops,
+                state.dedicated_presenter_skips,
+            )
+        })
+    }
+
     /// One bounded record per monitor that has presented at least one frame,
     /// pairing UI-thread presentation with the worker's decode counters.
     /// A monitor that decodes at 60 and presents at 30 is starved in
@@ -12050,6 +13894,32 @@ impl ArcenApp {
     /// Samples one presented frame for `monitor_id`. Called from the two
     /// places a remote surface actually refreshes: the root window's upload
     /// and each secondary viewport's committed paint.
+
+    fn reset_presentation_cadence_history(&mut self) {
+        self.presented_frame_times.clear();
+        self.presented_frame_times_estimated.clear();
+    }
+
+    fn expire_presentation_histories(&mut self, now: Instant) {
+        Self::expire_instant_samples(&mut self.presented_frame_times, now);
+        Self::expire_instant_samples(&mut self.presented_frame_times_estimated, now);
+    }
+
+    fn has_recent_confirmed_presentation(&self, now: Instant) -> bool {
+        Self::has_recent_samples(&self.presented_frame_times, now)
+    }
+
+    fn has_recent_estimated_presentation(&self, now: Instant) -> bool {
+        Self::has_recent_samples(&self.presented_frame_times_estimated, now)
+    }
+
+    fn has_recent_samples(samples: &VecDeque<Instant>, now: Instant) -> bool {
+        samples
+            .back()
+            .is_some_and(|latest| now.duration_since(*latest) <= TELEMETRY_WINDOW)
+            && samples.len() >= 2
+    }
+
     fn record_monitor_presentation(
         &mut self,
         monitor_id: arcen_media::SessionMonitorId,
@@ -12072,6 +13942,10 @@ impl ArcenApp {
 
     fn push_instant_sample(samples: &mut VecDeque<Instant>, now: Instant) {
         samples.push_back(now);
+        Self::expire_instant_samples(samples, now);
+    }
+
+    fn expire_instant_samples(samples: &mut VecDeque<Instant>, now: Instant) {
         while samples
             .front()
             .is_some_and(|front| now.duration_since(*front) > TELEMETRY_WINDOW)
@@ -12487,11 +14361,10 @@ impl ArcenApp {
             .front()
             .copied()
             .filter(|metadata| metadata.matches(event))
-            .map(|metadata| {
+            .and_then(|metadata| {
                 self.native_key_metadata.pop_front();
                 metadata.keypad.then_some(metadata.qt_key)
-            })
-            .flatten();
+            });
         let action = self.keyboard.handle_event_with_native_key(
             event,
             self.active_swap_cmd_ctrl,
@@ -13276,6 +15149,7 @@ impl ArcenApp {
         if raw_samples.is_empty() {
             return;
         }
+        self.last_local_input = Some(Instant::now());
         tracing::debug!(
             target: crate::logging::target::INPUT,
             raw_samples = raw_samples.len(),
@@ -13312,7 +15186,7 @@ impl ArcenApp {
         // of being correctly dropped as ambiguous.
         let multi_window_attempt_active = self.multi_window.is_active();
         let root_window_number = if multi_window_attempt_active {
-            window_number_for_title(crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE)
+            window_number_for_title(&self.current_root_window_title())
         } else {
             None
         };
@@ -13573,17 +15447,17 @@ impl ArcenApp {
         had_authority
     }
 
-    fn update_remote_texture(&mut self, mut frame: DecodedVideoFrame) {
-        let size = [frame.width, frame.height];
+    fn apply_frame_geometry(&mut self, width: usize, height: usize) {
+        let size = [width, height];
         if self.remote_frame_size != Some(size) {
             // Stream dimensions changed (display_update or initial frame). Clear
             // stale pointer mapping doesn't survive a changed image rectangle.
             self.last_pointer_view_pos = None;
             self.last_pointer_norm = None;
             if !self.multi_window.is_active() {
-                self.region_runtime = u32::try_from(frame.width)
+                self.region_runtime = u32::try_from(width)
                     .ok()
-                    .zip(u32::try_from(frame.height).ok())
+                    .zip(u32::try_from(height).ok())
                     .and_then(|(width, height)| {
                         DeckRegionRuntime::legacy_primary(width, height)
                             .map_err(|error| {
@@ -13597,6 +15471,27 @@ impl ArcenApp {
                     });
             }
         }
+        self.remote_frame_size = Some(size);
+    }
+
+    fn apply_native_presentation_metadata(&mut self, metadata: NativePresentationMetadata) {
+        self.apply_frame_geometry(metadata.width, metadata.height);
+        self.last_decoder_summary = format!(
+            "{} {}x{} {} {:?}/{:?} ts={}",
+            metadata.backend,
+            metadata.width,
+            metadata.height,
+            metadata.pixel_format,
+            metadata.video.chroma,
+            metadata.video.bit_depth,
+            metadata.timestamp_ms
+        );
+        self.last_decode_at = Some(Instant::now());
+    }
+
+    fn update_remote_texture(&mut self, frame: DecodedVideoFrame) {
+        let size = [frame.width, frame.height];
+        self.apply_frame_geometry(frame.width, frame.height);
         self.last_decoder_summary = format!(
             "{} {}x{} {} ts={}",
             frame.backend, frame.width, frame.height, frame.pixel_format, frame.timestamp_ms
@@ -13641,21 +15536,32 @@ impl ArcenApp {
         }
         self.dedicated_video_frame = frame
             .native
-            .take()
+            .as_ref()
             .filter(|native| native.video.bit_depth >= arcen_media::BitDepth::Ten)
             .map(|native| DedicatedLayerFrame {
-                pixel_buffer: native.pixel_buffer,
+                pixel_buffer: native.pixel_buffer.clone(),
                 contract: native.video.into(),
+                arrival_host_time: crate::ui::video_metal_layer::current_host_time(),
+                source_fps: (self.active_stream_max_fps > 0).then_some(self.active_stream_max_fps),
             });
         if self.dedicated_video_frame.is_none() {
-            self.dedicated_video_presenter.teardown();
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .teardown();
+            self.dedicated_video_presentation = DedicatedPresentationStatus::Inactive;
+            self.dedicated_video_layer_has_picture = false;
         }
 
         // GPU upload/conversion is deferred to `RemoteVideoFrame::paint`'s own
         // `wgpu` callback (see `video_render.rs`); constructing one here
         // touches no `wgpu::Device` at all, so this stays a plain, cheap
         // buffer swap exactly like the `egui::TextureHandle` it replaces.
-        self.remote_texture = Some(RemoteVideoFrame::from_decoded(frame));
+        self.remote_texture = if frame.rgba.is_empty() {
+            None
+        } else {
+            Some(RemoteVideoFrame::from_decoded(frame))
+        };
         self.remote_frame_size = Some(size);
     }
 }
@@ -13919,6 +15825,85 @@ fn secondary_pointer_position(
     }
 }
 
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SecondaryPointerCapture {
+    accepted_buttons: [bool; 3],
+    ignored_buttons: [bool; 3],
+    buttons: [(u8, bool); 3],
+    pointer_in_use: bool,
+}
+
+fn secondary_pointer_capture_for_frame(
+    image_rect: egui::Rect,
+    events: &[egui::Event],
+    accepted_active: [bool; 3],
+    ignored_active: [bool; 3],
+    raw_buttons: [(u8, bool); 3],
+) -> SecondaryPointerCapture {
+    let mut accepted_buttons = accepted_active;
+    let mut ignored_buttons = ignored_active;
+    let mut accepted_release_seen = [false; 3];
+
+    for event in events {
+        let egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(index) = POINTER_BUTTON_WIRE_MAPPING
+            .iter()
+            .position(|(mapped, _)| mapped == button)
+        else {
+            continue;
+        };
+        if *pressed {
+            if image_rect.contains(*pos) {
+                if !ignored_buttons[index] {
+                    accepted_buttons[index] = true;
+                }
+            } else if !accepted_buttons[index] {
+                ignored_buttons[index] = true;
+            }
+        } else {
+            accepted_release_seen[index] = accepted_buttons[index];
+            accepted_buttons[index] = false;
+            ignored_buttons[index] = false;
+        }
+    }
+
+    for (index, (_, down)) in raw_buttons.iter().copied().enumerate() {
+        if !down {
+            if accepted_buttons[index] {
+                accepted_release_seen[index] = true;
+            }
+            accepted_buttons[index] = false;
+            ignored_buttons[index] = false;
+        }
+    }
+
+    let buttons = raw_buttons.map(|(wire_button, down)| {
+        let accepted = wire_button
+            .checked_sub(1)
+            .and_then(|index| accepted_buttons.get(usize::from(index)))
+            .copied()
+            .unwrap_or(false);
+        (wire_button, accepted && down)
+    });
+    let pointer_in_use =
+        accepted_buttons.iter().any(|accepted| *accepted) || accepted_release_seen.contains(&true);
+    SecondaryPointerCapture {
+        accepted_buttons,
+        ignored_buttons,
+        buttons,
+        pointer_in_use,
+    }
+}
+
 /// Whether root's own raw OS focus flag reading `false` this frame is a
 /// genuine loss of keyboard focus for the *session as a whole*, rather than
 /// a plain internal switch onto one of our own committed secondary
@@ -14115,13 +16100,14 @@ impl RootPreEntrySnapshot {
 /// `true` and `snapshot_needed` was `true`.
 fn drive_root_multi_window_target(
     ctx: &egui::Context,
+    root_window_title: &str,
     expected_cg_display_id: u32,
     active_display_ids: &[u32],
     move_command_needed: bool,
     snapshot_needed: bool,
 ) -> (ViewportBindObservation, bool, Option<RootPreEntrySnapshot>) {
     let info = ctx.input(|input| input.viewport().clone());
-    let observed_display_id = window_display_id(crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE);
+    let observed_display_id = window_display_id(root_window_title);
     let observation = ViewportBindObservation {
         inner_rect_known: info.inner_rect.is_some(),
         fullscreen: info.fullscreen,
@@ -14152,6 +16138,65 @@ fn drive_root_multi_window_target(
         }
     }
     (observation, command_sent, snapshot)
+}
+
+#[cfg(feature = "dev-tools")]
+fn drive_root_windowed_monitor_test_target(
+    ctx: &egui::Context,
+    root_window_title: &str,
+    tile: crate::ui::windowed_monitor_test::TilePlacement,
+    display: crate::ui::windowed_monitor_test::DisplayBoundsPts,
+    expected_virtual_display_id: u32,
+    move_command_needed: bool,
+    snapshot_needed: bool,
+) -> (ViewportBindObservation, bool, Option<RootPreEntrySnapshot>) {
+    let info = ctx.input(|input| input.viewport().clone());
+    let observed_display_id = window_display_id(root_window_title)
+        .or_else(|| window_display_id(crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE));
+    let observation = ViewportBindObservation {
+        inner_rect_known: info.inner_rect.is_some(),
+        fullscreen: info.fullscreen,
+        close_requested: info
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::ViewportEvent::Close)),
+        monitor_size_pts: info.monitor_size.map(|size| (size.x, size.y)),
+        inner_rect_size_pts: info.inner_rect.map(|rect| (rect.width(), rect.height())),
+        observed_display_id,
+    };
+    let mut command_sent = false;
+    let mut snapshot = None;
+    if move_command_needed {
+        if snapshot_needed {
+            snapshot = Some(RootPreEntrySnapshot {
+                display_id: observed_display_id,
+                fullscreen: observation.fullscreen,
+                inner_rect_size_pts: observation.inner_rect_size_pts,
+            });
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(root_window_title.to_string()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            tile.outer_x,
+            tile.outer_y,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            tile.inner_width,
+            tile.inner_height,
+        )));
+        command_sent = true;
+    }
+    (
+        crate::ui::windowed_monitor_test::confirmation_observation(
+            observation,
+            expected_virtual_display_id,
+            display.cg_display_id,
+        ),
+        command_sent,
+        snapshot,
+    )
 }
 
 fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
@@ -14241,6 +16286,7 @@ fn initial_stream_profile() -> crate::transport::websocket::StreamProfile {
                 .token()
                 .to_string()
         }),
+        pipeline: None,
     }
 }
 
@@ -14631,7 +16677,7 @@ fn parse_saved_connection_settings(value: Option<serde_json::Value>) -> SavedCon
         .remove("displays_mode")
         .and_then(|value| value.as_str().map(str::to_string))
         .as_deref()
-        .and_then(|value| DisplaysMode::from_wire(&value));
+        .and_then(DisplaysMode::from_wire);
     SavedConnectionSettings {
         version,
         remembered_username,
@@ -15372,7 +17418,6 @@ fn approved_multi_monitor_selection(
 /// this gate on their own -- multi-monitor Match My Layout requires
 /// `StandardFullscreen` on every display; see this function's own inline doc
 /// at that check for why.
-
 /// Exact guidance shown when Match My Layout needs multiple displays but the
 /// notch-covering presentation policy (Settings > Displays > Notch area's
 /// "Extend fullscreen under the notch") is enabled or already active on
@@ -16017,6 +18062,184 @@ fn configure_native_menu(_options: &mut eframe::NativeOptions) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ui_load_meter_reports_passes_and_cpu_per_window_then_resets() {
+        let start = Instant::now();
+        let mut meter = UiLoadMeter::new(start);
+        for _ in 0..30 {
+            meter.note_pass();
+        }
+        let mut spin = 0_u64;
+        while process_cpu_time() == meter.cpu_at_start {
+            spin = spin.wrapping_add(1);
+        }
+        let (passes, rate, cpu) = meter.sample(start + Duration::from_secs(2));
+        assert_eq!(passes, 30);
+        assert!((rate - 15.0).abs() < f64::EPSILON, "{rate}");
+        assert!(cpu > 0.0, "{cpu} after {spin} spins");
+        let (rate, cpu) = meter.take(start + Duration::from_secs(2));
+        assert!((rate - 15.0).abs() < f64::EPSILON, "{rate}");
+        assert!(cpu > 0.0, "{cpu} after {spin} spins");
+        let (rate, _) = meter.take(start + Duration::from_secs(3));
+        assert!(rate.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn connection_and_session_entry_reset_ui_load_baselines() {
+        let start = Instant::now();
+        let mut app = ArcenApp::default();
+        app.ui_load = UiLoadMeter::new(start);
+        for _ in 0..10_000 {
+            app.ui_load.note_pass();
+        }
+
+        app.reset_ui_load_baseline(start + Duration::from_secs(2));
+        let (rate, _) = app.ui_load.take(start + Duration::from_secs(3));
+        assert!(
+            rate.abs() < f64::EPSILON,
+            "pre-connect app repaint work must not be billed to the connect window"
+        );
+        for _ in 0..10_000 {
+            app.ui_load.note_pass();
+        }
+        app.enter_in_session(start + Duration::from_secs(2));
+        let (rate, _) = app.ui_load.take(start + Duration::from_secs(3));
+
+        assert!(
+            rate.abs() < f64::EPSILON,
+            "pre-session launch/connect repaint work must not be billed to the first session sample"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_polls_slowly_and_input_or_recovery_polls_fast() {
+        assert_eq!(ui_poll_interval(false, None), UI_IDLE_REPAINT_INTERVAL);
+        assert_eq!(
+            ui_poll_interval(false, Some(UI_ACTIVE_WINDOW)),
+            UI_IDLE_REPAINT_INTERVAL
+        );
+        assert_eq!(
+            ui_poll_interval(false, Some(Duration::from_millis(200))),
+            UI_REPAINT_INTERVAL
+        );
+        assert_eq!(ui_poll_interval(true, None), UI_REPAINT_INTERVAL);
+    }
+
+    #[test]
+    fn root_display_sync_decision_paces_single_window_only() {
+        let now = Instant::now();
+        assert_eq!(
+            root_display_sync_decision(false, None, now),
+            RootDisplaySyncDecision {
+                enabled: true,
+                should_apply: true,
+                log_transition: true,
+            }
+        );
+        assert_eq!(
+            root_display_sync_decision(true, None, now),
+            RootDisplaySyncDecision {
+                enabled: false,
+                should_apply: true,
+                log_transition: true,
+            }
+        );
+    }
+
+    #[test]
+    fn session_backstop_turns_on_only_for_session_screens() {
+        let disabled = SessionBackstopState { enabled: false };
+        let enabled = SessionBackstopState { enabled: true };
+
+        assert_eq!(
+            session_backstop_decision(&AppScreen::Home, disabled),
+            (disabled, false),
+            "home/connect chrome keeps its ordinary transparent white UI setup"
+        );
+        assert_eq!(
+            session_backstop_decision(&AppScreen::InSession, disabled),
+            (enabled, true),
+            "live sessions get an opaque black layer behind native video"
+        );
+        assert_eq!(
+            session_backstop_decision(&AppScreen::SigningIn, enabled),
+            (enabled, false),
+            "sign-in handover keeps the same native-video backstop without churn"
+        );
+        assert_eq!(
+            session_backstop_decision(&AppScreen::Settings, enabled),
+            (disabled, true),
+            "leaving a session restores the non-session background behavior"
+        );
+    }
+
+    #[test]
+    fn root_display_sync_decision_reapplies_on_cadence() {
+        let now = Instant::now();
+
+        assert_eq!(
+            root_display_sync_decision(false, Some((now, true)), now + Duration::from_millis(249)),
+            RootDisplaySyncDecision {
+                enabled: true,
+                should_apply: false,
+                log_transition: false,
+            }
+        );
+        assert_eq!(
+            root_display_sync_decision(false, Some((now, true)), now + ROOT_DISPLAY_SYNC_REFRESH),
+            RootDisplaySyncDecision {
+                enabled: true,
+                should_apply: true,
+                log_transition: false,
+            }
+        );
+        assert_eq!(
+            root_display_sync_decision(true, Some((now, true)), now + Duration::from_millis(1)),
+            RootDisplaySyncDecision {
+                enabled: false,
+                should_apply: true,
+                log_transition: true,
+            }
+        );
+    }
+
+    #[test]
+    fn presenter_telemetry_window_reports_interval_and_resets() {
+        let mut window = PresenterTelemetryWindow::default();
+
+        assert_eq!(window.take(3, 2), (3, 2));
+        assert_eq!(window.take(3, 2), (0, 0));
+        assert_eq!(window.take(5, 9), (2, 7));
+    }
+
+    #[test]
+    fn active_session_channel_does_not_self_poll_before_in_session() {
+        let connecting = AppScreen::Connecting(ConnectionDraft::new(ConnectionKind::DirectMachine));
+        let launching =
+            AppScreen::LaunchingSession(ConnectionDraft::new(ConnectionKind::DirectMachine));
+
+        assert!(!should_schedule_session_poll(&connecting, true, false));
+        assert!(!should_schedule_session_poll(&launching, true, false));
+        assert!(should_schedule_session_poll(
+            &AppScreen::InSession,
+            true,
+            false
+        ));
+        assert!(should_schedule_session_poll(&connecting, false, true));
+    }
+
+    #[test]
+    fn connecting_progress_animation_is_capped_at_ten_hz() {
+        assert!(CONNECTING_PROGRESS_REPAINT_INTERVAL >= Duration::from_millis(100));
+        let step = CONNECTING_PROGRESS_REPAINT_INTERVAL.as_secs_f64();
+        assert_eq!(
+            connecting_progress_angle(0.0),
+            connecting_progress_angle(step * 0.99)
+        );
+        assert!(connecting_progress_angle(step) > connecting_progress_angle(0.0));
+    }
+
     use crate::protocol::messages::ResumeErrorCode;
 
     /// Serializes the remaining test that overrides the process-global log path.
@@ -16226,6 +18449,21 @@ mod tests {
         let note = display_negotiation_note(&capabilities).expect("reason must be reported");
         assert!(note.contains("Windowed resize is unavailable"), "{note}");
         assert!(note.contains("NVAPI custom timings"), "{note}");
+    }
+
+    #[test]
+    fn display_note_text_rect_keeps_a_readable_margin_at_small_widths() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(864.0, 500.0));
+        let note = display_note_text_rect(rect, 100.0);
+        assert!(note.left() >= 24.0);
+        assert!(note.right() <= 840.0);
+        assert_eq!(note.width(), 816.0);
+
+        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(140.0, 500.0));
+        let note = display_note_text_rect(narrow, 80.0);
+        assert!(note.left() >= 0.0);
+        assert!(note.right() <= 140.0);
+        assert!(note.width() >= 120.0);
     }
 
     #[test]
@@ -17100,10 +19338,27 @@ mod tests {
         let mut app = ArcenApp::default();
         let (commands, receiver) = mpsc::unbounded_channel();
         app.session_commands = Some(SessionCommandSender::for_test(commands));
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        app.media_events = Some(events);
         app.region_input_confirmed = true;
         app.active_swap_cmd_ctrl = false;
         app.update_viewer_keyboard_focus(true);
         (app, receiver)
+    }
+
+    fn test_session_handle() -> crate::transport::websocket::SessionHandle {
+        let (_media_tx, media) = crate::pipeline::frame_queue::incoming_media_inbox();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let event_sender = events_tx.clone();
+        drop(events_tx);
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        crate::transport::websocket::SessionHandle {
+            events,
+            event_sender,
+            media,
+            commands: SessionCommandSender::for_test(commands_tx),
+            clipboard: crate::clipboard::ClipboardSession::new(),
+        }
     }
 
     #[test]
@@ -17274,6 +19529,215 @@ mod tests {
     }
 
     #[test]
+    fn served_pipeline_update_same_poll_overrides_hello_and_survives_first_frame_status() {
+        let generation = 19;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            requested_pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
+            requested_video_variant: Some(arcen_media::video::VideoVariant::new(
+                arcen_media::VideoConfiguration::grading_reference(),
+            )),
+            requested_video_selection:
+                arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+            ..ArcenApp::default()
+        };
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h265",
+            "active_pipeline": "grading",
+            "color_caps": {
+                "active_bit_depth": "10",
+                "active_range": "full",
+                "active_matrix": "bt709",
+                "active_primaries": "bt709",
+                "active_transfer": "bt709",
+                "advertised_pix_fmt": "yuv444p10le"
+            }
+        }))
+        .unwrap();
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            server_hello: Some(hello),
+            served_pipeline: Some(arcen_protocol::messages::ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Custom,
+                "unknown",
+                Some("session encoder acceleration unknown".to_string()),
+            )),
+            latest_frame: Some(DecodedVideoFrame {
+                width: 2,
+                height: 2,
+                rgba: vec![255; 2 * 2 * 4],
+                timestamp_ms: 0,
+                pixel_format: "bgra".to_string(),
+                backend: "test",
+                native: None,
+            }),
+            generation,
+            ..SharedMediaState::default()
+        }));
+        app.media = Some(shared);
+
+        app.sync_media_state(&egui::Context::default());
+
+        let truth = app.negotiated_truth.as_ref().expect("truth");
+        assert_eq!(
+            truth.pipeline_degradation.as_deref(),
+            Some("PIPELINE DEGRADED: requested grading, host served custom")
+        );
+        assert!(session_truth::should_show_truth_badge(truth));
+        assert!(
+            app.status.starts_with("Receiving video stream"),
+            "first frame still owns transient status"
+        );
+    }
+
+    #[test]
+    fn served_pipeline_update_can_clear_a_provisional_hello_mismatch() {
+        let generation = 20;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            requested_pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
+            requested_video_variant: Some(arcen_media::video::VideoVariant::new(
+                arcen_media::VideoConfiguration::grading_reference(),
+            )),
+            requested_video_selection:
+                arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+            ..ArcenApp::default()
+        };
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h265",
+            "active_pipeline": "custom",
+            "color_caps": {
+                "active_bit_depth": "10",
+                "active_range": "full",
+                "active_matrix": "bt709",
+                "active_primaries": "bt709",
+                "active_transfer": "bt709",
+                "advertised_pix_fmt": "yuv444p10le"
+            }
+        }))
+        .unwrap();
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            server_hello: Some(hello),
+            served_pipeline: Some(arcen_protocol::messages::ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Grading,
+                "hardware",
+                None,
+            )),
+            generation,
+            ..SharedMediaState::default()
+        }));
+        app.media = Some(shared);
+
+        app.sync_media_state(&egui::Context::default());
+
+        let truth = app.negotiated_truth.as_ref().expect("truth");
+        assert!(truth.pipeline_degradation.is_none());
+        assert_eq!(truth.encoder_hardware, Some(true));
+        assert!(!session_truth::should_show_truth_badge(truth));
+    }
+
+    #[test]
+    fn served_pipeline_update_replaces_hardware_hello_with_software_backend_in_badge() {
+        let generation = 21;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            requested_pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
+            requested_video_variant: Some(arcen_media::video::VideoVariant::new(
+                arcen_media::VideoConfiguration::grading_reference(),
+            )),
+            requested_video_selection:
+                arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+            ..ArcenApp::default()
+        };
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h265",
+            "encoder_backend": "native-videotoolbox",
+            "encoder_class": "hardware",
+            "active_pipeline": "grading",
+            "color_caps": {
+                "active_bit_depth": "10",
+                "active_range": "full",
+                "active_matrix": "bt709",
+                "active_primaries": "bt709",
+                "active_transfer": "bt709",
+                "advertised_pix_fmt": "yuv444p10le"
+            }
+        }))
+        .unwrap();
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            server_hello: Some(hello),
+            served_pipeline: Some(arcen_protocol::messages::ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Software,
+                "software",
+                None,
+            )),
+            generation,
+            ..SharedMediaState::default()
+        }));
+        app.media = Some(shared);
+
+        app.sync_media_state(&egui::Context::default());
+
+        let truth = app.negotiated_truth.as_ref().expect("truth");
+        assert_eq!(truth.encoder_hardware, Some(false));
+        let badge = session_truth::truth_badge_text(truth, None);
+        assert!(badge.contains("host served software"));
+        assert!(badge.contains("encode software"));
+    }
+
+    #[test]
+    fn served_pipeline_update_replaces_hardware_hello_with_unknown_backend_in_badge() {
+        let generation = 22;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            requested_pipeline: Some(arcen_protocol::messages::StreamPipeline::Grading),
+            requested_video_variant: Some(arcen_media::video::VideoVariant::new(
+                arcen_media::VideoConfiguration::grading_reference(),
+            )),
+            requested_video_selection:
+                arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+            ..ArcenApp::default()
+        };
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h265",
+            "encoder_backend": "native-videotoolbox",
+            "encoder_class": "hardware",
+            "active_pipeline": "grading",
+            "color_caps": {
+                "active_bit_depth": "10",
+                "active_range": "full",
+                "active_matrix": "bt709",
+                "active_primaries": "bt709",
+                "active_transfer": "bt709",
+                "advertised_pix_fmt": "yuv444p10le"
+            }
+        }))
+        .unwrap();
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            server_hello: Some(hello),
+            served_pipeline: Some(arcen_protocol::messages::ServedPipelineMsg::new(
+                arcen_protocol::messages::ServedStreamPipeline::Custom,
+                "unknown",
+                Some("VideoToolbox did not report encoder acceleration".to_string()),
+            )),
+            generation,
+            ..SharedMediaState::default()
+        }));
+        app.media = Some(shared);
+
+        app.sync_media_state(&egui::Context::default());
+
+        let truth = app.negotiated_truth.as_ref().expect("truth");
+        assert_eq!(truth.encoder_hardware, None);
+        let badge = session_truth::truth_badge_text(truth, None);
+        assert!(badge.contains("host served custom"));
+        assert!(badge.contains("encode unknown"));
+    }
+
+    #[test]
     fn saved_connection_editor_uses_that_connections_tablet_mode() {
         let mut local = saved_connection("local", "Local", "local", 18443, None);
         local.settings.tablet_mode_requested = TabletModeMsg::LocalTermination;
@@ -17427,14 +19891,41 @@ mod tests {
     }
 
     fn receive_json(receiver: &mut mpsc::UnboundedReceiver<SessionCommand>) -> serde_json::Value {
-        match receiver.try_recv().expect("queued session command") {
-            SessionCommand::Json(value) => value,
-            SessionCommand::SubmitAuth(_)
-            | SessionCommand::AcceptAuthentication
-            | SessionCommand::DeclineDisclaimer
-            | SessionCommand::Binary(_)
-            | SessionCommand::HardUsbPen(_)
-            | SessionCommand::Close => panic!("expected JSON command"),
+        loop {
+            match receiver.try_recv().expect("queued session command") {
+                SessionCommand::Json(value)
+                    if value["type"] == arcen_protocol::messages::REQUEST_FULL_FRAME =>
+                {
+                    continue;
+                }
+                SessionCommand::Json(value) => return value,
+                SessionCommand::SubmitAuth(_)
+                | SessionCommand::AcceptAuthentication
+                | SessionCommand::DeclineDisclaimer
+                | SessionCommand::Binary(_)
+                | SessionCommand::HardUsbPen(_)
+                | SessionCommand::Close => panic!("expected JSON command"),
+            }
+        }
+    }
+
+    fn assert_no_input_commands(receiver: &mut mpsc::UnboundedReceiver<SessionCommand>) {
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                SessionCommand::Json(value)
+                    if value["type"] == arcen_protocol::messages::REQUEST_FULL_FRAME => {}
+                SessionCommand::Json(value) => {
+                    panic!("unexpected JSON command before confirmation: {value:?}")
+                }
+                SessionCommand::SubmitAuth(_)
+                | SessionCommand::AcceptAuthentication
+                | SessionCommand::DeclineDisclaimer
+                | SessionCommand::Binary(_)
+                | SessionCommand::HardUsbPen(_)
+                | SessionCommand::Close => {
+                    panic!("unexpected non-JSON command before confirmation")
+                }
+            }
         }
     }
 
@@ -20969,7 +23460,9 @@ mod tests {
         );
 
         let mut app = ArcenApp::default();
-        app.active_connection = Some(ConnectionDraft::new(ConnectionKind::DirectMachine));
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        app.active_connection = Some(draft);
         app.connection_generation = 3;
         let ctx = egui::Context::default();
         app.handle_connection_closed(
@@ -21053,6 +23546,11 @@ mod tests {
             &ctx,
         );
         assert!(matches!(app.screen, AppScreen::SigningIn));
+        assert_eq!(
+            app.dedicated_eight_bit_presentation,
+            DedicatedEightBitPresentationStatus::Inactive,
+            "no native frame was armed in this legacy hand-over case"
+        );
         let handover = app.login_window_handover.as_ref().expect("still following");
         assert!(
             handover.schedule.pending().is_some(),
@@ -21088,6 +23586,1166 @@ mod tests {
         );
         assert!(!matches!(app.screen, AppScreen::SigningIn));
         assert!(app.login_window_handover.is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_in_handover_keeps_native_layer_frame_when_that_was_the_last_picture() {
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        draft.use_quic = false;
+        let mut app = ArcenApp {
+            active_connection: Some(draft),
+            displays_mode: DisplaysMode::SinglePrimary,
+            connection_generation: 9,
+            dedicated_eight_bit_presentation:
+                DedicatedEightBitPresentationStatus::DedicatedEightBit,
+            login_window_handover: Some(LoginWindowHandover {
+                schedule: arcen_session::login_window_handover::HandoverSchedule::new(),
+                auth: AuthSubmission {
+                    username: "someone".to_string(),
+                    password: "secret".to_string(),
+                },
+            }),
+            ..ArcenApp::default()
+        };
+        let held_presenter = Arc::clone(&app.dedicated_eight_bit_video_presenter);
+        held_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .mark_presented_for_test();
+        assert!(
+            held_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture(),
+            "the test setup must install real presenter evidence, not just a UI flag"
+        );
+        assert!(
+            !app.dedicated_eight_bit_layer_has_picture,
+            "the hold must be proven from the presenter rather than a copied flag"
+        );
+        app.handle_connection_closed(
+            Some(SessionEnd {
+                reason: DisconnectReason::Terminal(TerminalDisconnect::Protocol),
+                message: "WebSocket protocol error: Connection reset without closing handshake"
+                    .to_string(),
+                observed_at: Instant::now(),
+            }),
+            9,
+            &egui::Context::default(),
+        );
+
+        assert!(matches!(app.screen, AppScreen::SigningIn));
+        assert!(
+            Arc::ptr_eq(&held_presenter, &app.dedicated_eight_bit_video_presenter),
+            "closing the sign-in session must retain the same 8-bit Metal presenter"
+        );
+        assert!(
+            held_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture(),
+            "the retained presenter must still prove it owns a real picture"
+        );
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "the native layer remains the held last frame under the Signing in overlay"
+        );
+        assert!(
+            app.remote_texture.is_none(),
+            "no stale egui bootstrap frame should cover the native hold"
+        );
+
+        tokio::time::sleep(arcen_session::login_window_handover::FIRST_RECONNECT_DELAY).await;
+        app.drive_login_window_handover(&egui::Context::default());
+        assert!(
+            matches!(
+                app.screen,
+                AppScreen::SigningIn | AppScreen::CertificateWarning(..)
+            ),
+            "a valid hand-over destination should either launch under the overlay or stop for a real prompt"
+        );
+        assert!(
+            Arc::ptr_eq(&held_presenter, &app.dedicated_eight_bit_video_presenter),
+            "begin_connection_flow must not swap out the held 8-bit Metal presenter"
+        );
+        assert!(
+            held_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture(),
+            "begin_connection_flow must not tear down the picture held by the presenter"
+        );
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "the first retry startup must preserve the native hold until a replacement frame"
+        );
+        {
+            let media = app.media.as_ref().expect("retry installs media state");
+            let state = media.lock().expect("media state poisoned");
+            assert!(
+                state
+                    .eight_bit_video_presenter
+                    .as_ref()
+                    .is_some_and(|presenter| Arc::ptr_eq(presenter, &held_presenter)),
+                "the replacement worker must share the retained presenter object"
+            );
+            assert!(
+                state.eight_bit_layer_has_picture,
+                "the replacement worker must inherit picture evidence from the presenter"
+            );
+        }
+        app.sync_media_state(&egui::Context::default());
+        assert!(
+            Arc::ptr_eq(&held_presenter, &app.dedicated_eight_bit_video_presenter),
+            "syncing the replacement worker must keep the same 8-bit Metal presenter"
+        );
+        assert!(
+            held_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture(),
+            "syncing the replacement worker must not clear presenter evidence"
+        );
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "replacement worker initialization must not blank the native hold before a frame"
+        );
+
+        app.login_window_handover = Some(LoginWindowHandover {
+            schedule: arcen_session::login_window_handover::HandoverSchedule::new(),
+            auth: AuthSubmission {
+                username: "someone".to_string(),
+                password: "secret".to_string(),
+            },
+        });
+        app.handle_connection_closed(
+            Some(SessionEnd {
+                reason: DisconnectReason::Terminal(TerminalDisconnect::Protocol),
+                message: "WebSocket protocol error: Connection reset without closing handshake"
+                    .to_string(),
+                observed_at: Instant::now(),
+            }),
+            app.connection_generation,
+            &egui::Context::default(),
+        );
+        tokio::time::sleep(arcen_session::login_window_handover::FIRST_RECONNECT_DELAY).await;
+        app.drive_login_window_handover(&egui::Context::default());
+        assert!(
+            Arc::ptr_eq(&held_presenter, &app.dedicated_eight_bit_video_presenter),
+            "a second retry must keep using the same retained presenter"
+        );
+        assert!(
+            held_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .has_presented_picture(),
+            "a second retry must preserve real presenter evidence"
+        );
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "a second retry still preserves the native hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_handover_without_destination_does_not_wait_in_signing_in() {
+        let mut schedule = arcen_session::login_window_handover::HandoverSchedule::new();
+        schedule.session_ended(Duration::ZERO).expect("attempt due");
+        let mut app = ArcenApp {
+            screen: AppScreen::SigningIn,
+            login_window_handover: Some(LoginWindowHandover {
+                schedule,
+                auth: AuthSubmission {
+                    username: "someone".to_string(),
+                    password: "secret".to_string(),
+                },
+            }),
+            ..ArcenApp::default()
+        };
+
+        tokio::time::sleep(arcen_session::login_window_handover::FIRST_RECONNECT_DELAY).await;
+        app.drive_login_window_handover(&egui::Context::default());
+
+        assert!(
+            !matches!(app.screen, AppScreen::SigningIn),
+            "without an active destination the Deck must not wait behind the Signing in overlay"
+        );
+        assert!(app.login_window_handover.is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_in_handover_keeps_ten_bit_native_layer_status_across_retries() {
+        let mut app = ArcenApp {
+            active_connection: Some(ConnectionDraft::new(ConnectionKind::DirectMachine)),
+            connection_generation: 13,
+            dedicated_video_presentation: DedicatedPresentationStatus::DedicatedTenBit,
+            dedicated_video_layer_has_picture: true,
+            login_window_handover: Some(LoginWindowHandover {
+                schedule: arcen_session::login_window_handover::HandoverSchedule::new(),
+                auth: AuthSubmission {
+                    username: "someone".to_string(),
+                    password: "secret".to_string(),
+                },
+            }),
+            ..ArcenApp::default()
+        };
+        app.dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .mark_presented_for_test();
+
+        app.handle_connection_closed(
+            Some(SessionEnd {
+                reason: DisconnectReason::Terminal(TerminalDisconnect::Protocol),
+                message: "WebSocket protocol error: Connection reset without closing handshake"
+                    .to_string(),
+                observed_at: Instant::now(),
+            }),
+            13,
+            &egui::Context::default(),
+        );
+
+        assert!(matches!(app.screen, AppScreen::SigningIn));
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "the 10-bit native layer remains the held last frame under Signing in"
+        );
+
+        tokio::time::sleep(arcen_session::login_window_handover::FIRST_RECONNECT_DELAY).await;
+        app.drive_login_window_handover(&egui::Context::default());
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "retry startup must preserve the 10-bit hold until replacement presentation succeeds"
+        );
+        let shared = Arc::new(Mutex::new(SharedMediaState::fresh(
+            app.connection_generation,
+            false,
+        )));
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.ten_bit_presentation_status = DedicatedPresentationStatus::DedicatedTenBit;
+            state.ten_bit_layer_has_picture = true;
+        }
+        app.media = Some(shared);
+        app.sync_media_state(&egui::Context::default());
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "replacement worker initialization must not blank the 10-bit native hold"
+        );
+    }
+
+    fn reconnect_capable_app_with_native_hold(
+        generation: u64,
+        hold: DedicatedNativeHold,
+    ) -> ArcenApp {
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        let options = connect_options_from_draft(&draft);
+        let identity = connection_identity(&draft, &options, SecurityMode::Medium, false, 0, 0);
+        let mut controller = ReconnectController::new(generation, identity, "nonce".to_string());
+        controller
+            .accept_initial(
+                Some("grant".to_string()),
+                Some(Duration::from_secs(30)),
+                false,
+                "sid".to_string(),
+            )
+            .expect("initial reconnect grant");
+
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            active_connection: Some(draft),
+            reconnect_options: Some(options),
+            reconnect: Some(controller),
+            screen: AppScreen::InSession,
+            ..ArcenApp::default()
+        };
+        match hold {
+            DedicatedNativeHold::EightBit => {
+                app.dedicated_eight_bit_presentation =
+                    DedicatedEightBitPresentationStatus::DedicatedEightBit;
+                app.dedicated_eight_bit_layer_has_picture = true;
+                app.dedicated_eight_bit_video_presenter
+                    .lock()
+                    .expect("8-bit presenter poisoned")
+                    .mark_presented_for_test();
+            }
+            DedicatedNativeHold::TenBit => {
+                app.dedicated_video_presentation = DedicatedPresentationStatus::DedicatedTenBit;
+                app.dedicated_video_layer_has_picture = true;
+                app.dedicated_video_presenter
+                    .lock()
+                    .expect("10-bit presenter poisoned")
+                    .mark_presented_for_test();
+            }
+        }
+        app
+    }
+
+    enum DedicatedNativeHold {
+        EightBit,
+        TenBit,
+    }
+
+    fn transient_end() -> SessionEnd {
+        SessionEnd {
+            reason: DisconnectReason::Transient(
+                crate::transport::websocket::TransientTransportError::ConnectionReset,
+            ),
+            message: "Connection reset without closing handshake".to_string(),
+            observed_at: Instant::now(),
+        }
+    }
+
+    fn reconnect_overlay() -> ReconnectOverlay {
+        ReconnectOverlay {
+            attempt: 1,
+            next_retry: None,
+            deadline: Duration::from_secs(30),
+            last_error: "connection reset".to_string(),
+        }
+    }
+
+    fn native_replacement_metadata(timestamp_ms: u32) -> NativePresentationMetadata {
+        NativePresentationMetadata {
+            width: 1920,
+            height: 1080,
+            timestamp_ms,
+            pixel_format: "420v-video-iosurface".to_string(),
+            backend: "test-native",
+            video: arcen_media::VideoConfiguration::legacy_h264(),
+        }
+    }
+
+    #[test]
+    fn reconnect_preserves_eight_bit_native_hold_until_replacement_frame() {
+        let mut app = reconnect_capable_app_with_native_hold(41, DedicatedNativeHold::EightBit);
+
+        app.handle_connection_closed(Some(transient_end()), 41, &egui::Context::default());
+
+        assert!(matches!(app.screen, AppScreen::Reconnecting(_)));
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "transient reconnect must keep the 8-bit native last picture visible"
+        );
+        assert!(session_background_transparent(
+            &app.screen,
+            app.dedicated_video_frame.as_ref(),
+            app.dedicated_eight_bit_presentation,
+            app.dedicated_eight_bit_layer_has_picture,
+            app.dedicated_video_presentation,
+            app.dedicated_video_layer_has_picture,
+        ));
+        assert!(app.media.is_none());
+        assert!(
+            app.remote_texture.is_none(),
+            "native hold must not require an egui fallback texture"
+        );
+
+        let shared = Arc::new(Mutex::new(SharedMediaState::fresh(41, true)));
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+            state.eight_bit_layer_has_picture = true;
+        }
+        app.media = Some(shared);
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "replacement resume worker setup must not blank the 8-bit hold before a frame"
+        );
+    }
+
+    #[test]
+    fn reconnect_preserves_ten_bit_native_hold_until_replacement_frame() {
+        let mut app = reconnect_capable_app_with_native_hold(42, DedicatedNativeHold::TenBit);
+
+        app.handle_connection_closed(Some(transient_end()), 42, &egui::Context::default());
+
+        assert!(matches!(app.screen, AppScreen::Reconnecting(_)));
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "transient reconnect must keep the 10-bit native last picture visible"
+        );
+        assert!(session_background_transparent(
+            &app.screen,
+            app.dedicated_video_frame.as_ref(),
+            app.dedicated_eight_bit_presentation,
+            app.dedicated_eight_bit_layer_has_picture,
+            app.dedicated_video_presentation,
+            app.dedicated_video_layer_has_picture,
+        ));
+
+        let shared = Arc::new(Mutex::new(SharedMediaState::fresh(42, true)));
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.ten_bit_presentation_status = DedicatedPresentationStatus::DedicatedTenBit;
+            state.ten_bit_layer_has_picture = true;
+        }
+        app.media = Some(shared);
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "replacement resume worker setup must not blank the 10-bit hold before a frame"
+        );
+    }
+
+    #[test]
+    fn resuming_preserves_eight_bit_native_hold() {
+        let mut app = reconnect_capable_app_with_native_hold(43, DedicatedNativeHold::EightBit);
+        app.handle_connection_closed(Some(transient_end()), 43, &egui::Context::default());
+        app.screen = AppScreen::Resuming(ReconnectOverlay {
+            attempt: 1,
+            next_retry: None,
+            deadline: Duration::from_secs(30),
+            last_error: "connection reset".to_string(),
+        });
+
+        let shared = Arc::new(Mutex::new(SharedMediaState::fresh(43, true)));
+        app.media = Some(shared);
+        app.install_session_handle(test_session_handle(), true, &egui::Context::default());
+
+        assert!(
+            app.dedicated_eight_bit_presentation
+                .is_dedicated_eight_bit(),
+            "resume attach must preserve the 8-bit hold until replacement presentation succeeds"
+        );
+    }
+
+    #[test]
+    fn resuming_preserves_ten_bit_native_hold() {
+        let mut app = reconnect_capable_app_with_native_hold(44, DedicatedNativeHold::TenBit);
+        app.handle_connection_closed(Some(transient_end()), 44, &egui::Context::default());
+        app.screen = AppScreen::Resuming(ReconnectOverlay {
+            attempt: 1,
+            next_retry: None,
+            deadline: Duration::from_secs(30),
+            last_error: "connection reset".to_string(),
+        });
+
+        app.install_session_handle(test_session_handle(), true, &egui::Context::default());
+
+        assert!(
+            app.dedicated_video_presentation.is_dedicated_ten_bit(),
+            "resume attach must preserve the 10-bit hold until replacement presentation succeeds"
+        );
+    }
+
+    #[test]
+    fn resume_native_eight_bit_replacement_frame_enters_session() {
+        let generation = 51;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            screen: AppScreen::Resuming(reconnect_overlay()),
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(
+                generation, true,
+            )))),
+            ..ArcenApp::default()
+        };
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+            state.latest_native_frame_metadata = Some(native_replacement_metadata(51));
+        }
+
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(matches!(app.screen, AppScreen::InSession));
+        assert_eq!(app.remote_frame_size, Some([1920, 1080]));
+    }
+
+    #[test]
+    fn resume_native_ten_bit_replacement_frame_enters_session() {
+        let generation = 52;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            screen: AppScreen::Resuming(reconnect_overlay()),
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(
+                generation, true,
+            )))),
+            ..ArcenApp::default()
+        };
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.ten_bit_presentation_status = DedicatedPresentationStatus::DedicatedTenBit;
+            state.latest_native_frame_metadata = Some(native_replacement_metadata(52));
+        }
+
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(matches!(app.screen, AppScreen::InSession));
+        assert_eq!(app.remote_frame_size, Some([1920, 1080]));
+    }
+
+    #[test]
+    fn reconnect_native_replacement_frame_enters_session() {
+        let generation = 53;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            screen: AppScreen::Reconnecting(reconnect_overlay()),
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(
+                generation, true,
+            )))),
+            ..ArcenApp::default()
+        };
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+            state.latest_native_frame_metadata = Some(native_replacement_metadata(53));
+        }
+
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(matches!(app.screen, AppScreen::InSession));
+    }
+
+    #[test]
+    fn inherited_native_picture_without_replacement_frame_does_not_enter_session() {
+        let generation = 54;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            screen: AppScreen::Resuming(reconnect_overlay()),
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(
+                generation, true,
+            )))),
+            ..ArcenApp::default()
+        };
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+            state.eight_bit_layer_has_picture = true;
+        }
+
+        app.sync_media_state(&egui::Context::default());
+
+        assert!(
+            matches!(app.screen, AppScreen::Resuming(_)),
+            "preserved native hold alone is not a replacement-session frame"
+        );
+    }
+
+    #[test]
+    fn native_presentation_metadata_updates_geometry_without_rgba_upload() {
+        let mut app = ArcenApp::default();
+        app.last_pointer_view_pos = Some(egui::pos2(10.0, 10.0));
+        app.last_pointer_norm = Some((0.5, 0.5, 1234, 720));
+        app.apply_native_presentation_metadata(NativePresentationMetadata {
+            width: 1234,
+            height: 720,
+            timestamp_ms: 42,
+            pixel_format: "420v-video-iosurface".to_string(),
+            backend: "videotoolbox-iosurface",
+            video: arcen_media::VideoConfiguration::legacy_h264(),
+        });
+
+        assert_eq!(app.remote_frame_size, Some([1234, 720]));
+        assert!(app.remote_texture.is_none());
+        assert!(app.last_pointer_view_pos.is_none());
+        assert!(app.last_pointer_norm.is_none());
+        assert!(app.last_decoder_summary.contains("1234x720"));
+    }
+
+    #[test]
+    fn dedicated_layer_selection_keeps_grading_hdr_off_the_eight_bit_path() {
+        let ten_bit_active = ActiveContract {
+            codec: Some(arcen_media::VideoCodec::H265),
+            chroma: Some(arcen_media::ChromaSubsampling::Yuv444),
+            bit_depth: Some(arcen_media::BitDepth::Ten),
+            range: Some(arcen_media::ColorRange::Full),
+            matrix: Some(arcen_media::ColorMatrix::Bt709),
+            primaries: Some(arcen_media::ColorPrimaries::Bt709),
+            transfer: Some(arcen_media::TransferCharacteristics::Bt709),
+        };
+        assert!(wants_dedicated_ten_bit_layer_state(
+            false,
+            true,
+            Some(&ten_bit_active),
+            Some([3840, 2160])
+        ));
+        assert!(wants_dedicated_ten_bit_layer_state(
+            true,
+            true,
+            Some(&ten_bit_active),
+            Some([3840, 2160])
+        ));
+        assert!(!wants_dedicated_eight_bit_layer_state(
+            false,
+            true,
+            Some(&ten_bit_active),
+            Some([3840, 2160])
+        ));
+    }
+
+    #[test]
+    fn dedicated_layer_selection_uses_eight_bit_only_for_auto_speed_shape() {
+        let eight_bit_active = ActiveContract {
+            codec: Some(arcen_media::VideoCodec::H265),
+            chroma: Some(arcen_media::ChromaSubsampling::Yuv420),
+            bit_depth: Some(arcen_media::BitDepth::Eight),
+            range: Some(arcen_media::ColorRange::Limited),
+            matrix: Some(arcen_media::ColorMatrix::Bt709),
+            primaries: Some(arcen_media::ColorPrimaries::Bt709),
+            transfer: Some(arcen_media::TransferCharacteristics::Bt709),
+        };
+        assert!(wants_dedicated_eight_bit_layer_state(
+            false,
+            false,
+            Some(&eight_bit_active),
+            Some([1920, 1080])
+        ));
+        assert!(!wants_dedicated_ten_bit_layer_state(
+            false,
+            false,
+            Some(&eight_bit_active),
+            Some([1920, 1080])
+        ));
+    }
+
+    #[test]
+    fn disabled_eight_bit_layer_preserves_fallback_warning_reason() {
+        let mut app = ArcenApp::default();
+        let shared = Arc::new(Mutex::new(SharedMediaState::fresh(0, false)));
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.eight_bit_layer_disabled = true;
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::FallbackToEgui(
+                    crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+                );
+        }
+
+        app.media = Some(shared);
+        app.dedicated_eight_bit_presentation = DedicatedEightBitPresentationStatus::FallbackToEgui(
+            crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+        );
+
+        let status = app.sync_dedicated_eight_bit_layer(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
+            true,
+        );
+
+        assert_eq!(
+            status.fallback_reason(),
+            Some(crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed)
+        );
+        assert_eq!(
+            app.dedicated_eight_bit_presentation.fallback_reason(),
+            status.fallback_reason()
+        );
+    }
+
+    fn rgba_test_frame(timestamp_ms: u32) -> DecodedVideoFrame {
+        DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![255; 2 * 2 * 4],
+            timestamp_ms,
+            pixel_format: "rgba".to_string(),
+            backend: "test",
+            native: None,
+        }
+    }
+
+    #[test]
+    fn stale_confirmed_history_uses_fresh_estimated_cadence() {
+        let mut app = ArcenApp::default();
+        let now = Instant::now();
+        app.presented_frame_times
+            .push_back(now - TELEMETRY_WINDOW - Duration::from_millis(200));
+        app.presented_frame_times
+            .push_back(now - TELEMETRY_WINDOW - Duration::from_millis(100));
+        app.presented_frame_times_estimated
+            .push_back(now - Duration::from_millis(20));
+        app.presented_frame_times_estimated.push_back(now);
+
+        app.expire_presentation_histories(now);
+
+        assert!(!app.has_recent_confirmed_presentation(now));
+        assert!(app.has_recent_estimated_presentation(now));
+        assert!(app.presented_frame_times.is_empty());
+        assert_eq!(app.presented_frame_times_estimated.len(), 2);
+    }
+
+    #[test]
+    fn simultaneous_submitted_and_confirmed_drains_keep_independent_rates() {
+        let mut app = ArcenApp::default();
+        let start = Instant::now();
+        for drain in 0..2u64 {
+            for frame in 0..60u64 {
+                let sample = start + Duration::from_millis(drain * 1_000 + frame * 16);
+                ArcenApp::push_instant_sample(&mut app.presented_frame_times_estimated, sample);
+                ArcenApp::push_instant_sample(&mut app.presented_frame_times, sample);
+            }
+            let now = start + Duration::from_millis(drain * 1_000 + 59 * 16);
+            app.expire_presentation_histories(now);
+            assert!(app.has_recent_confirmed_presentation(now));
+            assert!(app.has_recent_estimated_presentation(now));
+            assert!(ArcenApp::instant_rate(&app.presented_frame_times) > 50.0);
+            assert!(ArcenApp::instant_rate(&app.presented_frame_times_estimated) > 50.0);
+        }
+    }
+
+    #[test]
+    fn repeated_estimated_only_drains_keep_estimated_rate_without_confirmed() {
+        let mut app = ArcenApp::default();
+        let start = Instant::now();
+        for drain in 0..2u64 {
+            for frame in 0..60u64 {
+                let sample = start + Duration::from_millis(drain * 1_000 + frame * 16);
+                ArcenApp::push_instant_sample(&mut app.presented_frame_times_estimated, sample);
+            }
+            let now = start + Duration::from_millis(drain * 1_000 + 59 * 16);
+            app.expire_presentation_histories(now);
+            assert!(!app.has_recent_confirmed_presentation(now));
+            assert!(app.has_recent_estimated_presentation(now));
+            assert!(ArcenApp::instant_rate(&app.presented_frame_times_estimated) > 50.0);
+        }
+    }
+
+    #[test]
+    fn reset_presentation_cadence_history_clears_both_histories() {
+        let mut app = ArcenApp::default();
+        let now = Instant::now();
+        ArcenApp::push_instant_sample(&mut app.presented_frame_times_estimated, now);
+        ArcenApp::push_instant_sample(&mut app.presented_frame_times, now);
+
+        app.reset_presentation_cadence_history();
+
+        assert!(app.presented_frame_times_estimated.is_empty());
+        assert!(app.presented_frame_times.is_empty());
+    }
+
+    fn assert_fallback_poll_keeps_newer_timestamp(
+        app: &mut ArcenApp,
+        shared: &Arc<Mutex<SharedMediaState>>,
+    ) {
+        let fallback_presented_at = Instant::now();
+        {
+            let mut state = shared.lock().expect("media state poisoned");
+            state.layer_present_ms_samples.push_back(1.0);
+            state.latest_frame = Some(rgba_test_frame(99));
+        }
+        app.last_presented_at = None;
+        app.media = Some(Arc::clone(shared));
+        app.screen =
+            AppScreen::LaunchingSession(ConnectionDraft::new(ConnectionKind::DirectMachine));
+        app.sync_media_state(&egui::Context::default());
+        app.last_presented_at = Some(fallback_presented_at);
+        app.presented_frame_times.clear();
+        app.presented_frame_times.push_back(fallback_presented_at);
+
+        app.sync_media_state(&egui::Context::default());
+
+        assert_eq!(app.last_presented_at, Some(fallback_presented_at));
+        assert_eq!(
+            app.presented_frame_times.back().copied(),
+            Some(fallback_presented_at)
+        );
+        assert!(
+            !video_stream_stalled(
+                app.last_presented_at,
+                fallback_presented_at + Duration::from_secs(1)
+            ),
+            "fresh RGBA fallback presentation must not be dimmed by stale native history",
+        );
+    }
+
+    #[test]
+    fn eight_bit_fallback_does_not_import_stale_native_presentation_history() {
+        let generation = 31;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            ..ArcenApp::default()
+        };
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            generation,
+            eight_bit_layer_disabled: true,
+            eight_bit_presentation_status: DedicatedEightBitPresentationStatus::FallbackToEgui(
+                crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+            ),
+            ..SharedMediaState::default()
+        }));
+
+        assert_fallback_poll_keeps_newer_timestamp(&mut app, &shared);
+    }
+
+    #[test]
+    fn ten_bit_fallback_does_not_import_stale_native_presentation_history() {
+        let generation = 32;
+        let mut app = ArcenApp {
+            connection_generation: generation,
+            ..ArcenApp::default()
+        };
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            generation,
+            ten_bit_layer_disabled: true,
+            ten_bit_presentation_status: DedicatedPresentationStatus::FallbackToEightBit(
+                crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+            ),
+            ..SharedMediaState::default()
+        }));
+
+        assert_fallback_poll_keeps_newer_timestamp(&mut app, &shared);
+    }
+
+    #[test]
+    fn async_ten_bit_fatal_status_disables_dedicated_fallback() {
+        let (mut app, mut received) = app_with_command_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        app.media_events = Some(events_tx);
+        app.media = Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false))));
+        app.dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .inject_async_status_for_test(DedicatedPresentationStatus::FallbackToEightBit(
+                crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+            ));
+
+        app.publish_root_viewport_visibility(&egui::Context::default());
+
+        assert_eq!(
+            app.dedicated_video_presentation.fallback_reason(),
+            Some(crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed)
+        );
+        assert!(
+            app.media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned")
+                .ten_bit_layer_disabled
+        );
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(SessionEvent::PresentationRecoveryRequested)
+        ));
+    }
+
+    #[test]
+    fn async_fatal_status_consumed_without_reentrant_presenter_lock() {
+        let (mut app, mut received) = app_with_command_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        app.media_events = Some(events_tx);
+        app.media = Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false))));
+        app.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .inject_async_status_for_test(DedicatedEightBitPresentationStatus::FallbackToEgui(
+                crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+            ));
+
+        app.publish_root_viewport_visibility(&egui::Context::default());
+
+        assert_eq!(
+            app.dedicated_eight_bit_presentation.fallback_reason(),
+            Some(crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed)
+        );
+        assert!(
+            app.media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned")
+                .eight_bit_layer_disabled
+        );
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(SessionEvent::PresentationRecoveryRequested)
+        ));
+    }
+
+    #[test]
+    fn async_ui_presentation_failure_notifies_worker_without_ui_json_request() {
+        let (mut app, mut received) = app_with_command_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        app.media_events = Some(events_tx);
+        app.media = Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false))));
+
+        app.request_full_frame_after_presentation_failure();
+
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(SessionEvent::PresentationRecoveryRequested)
+        ));
+        assert!(
+            app.media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned")
+                .waiting_for_keyframe
+        );
+    }
+
+    #[test]
+    fn sync_consumes_async_fatal_status_before_replacement_attach() {
+        let mut app = ArcenApp::default();
+        app.remote_frame_size = Some([1800, 1168]);
+        app.negotiated_truth = Some(NegotiatedTruth {
+            requested: arcen_media::VideoConfiguration::legacy_h264(),
+            selection: arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance,
+            active: crate::ui::session_truth::ActiveContract {
+                codec: Some(arcen_media::VideoCodec::H265),
+                chroma: Some(arcen_media::ChromaSubsampling::Yuv420),
+                bit_depth: Some(arcen_media::BitDepth::Eight),
+                range: Some(arcen_media::ColorRange::Limited),
+                matrix: Some(arcen_media::ColorMatrix::Bt709),
+                primaries: Some(arcen_media::ColorPrimaries::Bt709),
+                transfer: Some(arcen_media::TransferCharacteristics::Bt709),
+            },
+            degradation: arcen_media::video::PlanDegradation::default(),
+            pipeline_degradation: None,
+            encoder_backend: "test".to_string(),
+            encoder_hardware: Some(true),
+        });
+        app.media = Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false))));
+        app.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .inject_async_status_for_test(DedicatedEightBitPresentationStatus::FallbackToEgui(
+                crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+            ));
+
+        let status = app.sync_dedicated_eight_bit_layer(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
+            true,
+        );
+
+        assert_eq!(
+            status.fallback_reason(),
+            Some(crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed)
+        );
+    }
+
+    #[test]
+    fn async_eight_bit_transient_keeps_established_surface_transparent() {
+        let mut app = ArcenApp {
+            screen: AppScreen::InSession,
+            dedicated_eight_bit_presentation:
+                DedicatedEightBitPresentationStatus::DedicatedEightBit,
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false)))),
+            ..ArcenApp::default()
+        };
+        app.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .mark_presented_for_test();
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+            state.eight_bit_layer_has_picture = true;
+        }
+
+        let status =
+            app.apply_async_eight_bit_status(DedicatedEightBitPresentationStatus::DroppedFrame);
+
+        assert_eq!(
+            status,
+            DedicatedEightBitPresentationStatus::DedicatedEightBit
+        );
+        assert_eq!(
+            app.media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned")
+                .eight_bit_presentation_status,
+            DedicatedEightBitPresentationStatus::DedicatedEightBit
+        );
+        assert!(session_background_transparent(
+            &app.screen,
+            app.dedicated_video_frame.as_ref(),
+            app.dedicated_eight_bit_presentation,
+            app.dedicated_eight_bit_layer_has_picture,
+            app.dedicated_video_presentation,
+            app.dedicated_video_layer_has_picture,
+        ));
+    }
+
+    #[test]
+    fn async_ten_bit_transient_keeps_established_surface_transparent() {
+        let mut app = ArcenApp {
+            screen: AppScreen::InSession,
+            dedicated_video_presentation: DedicatedPresentationStatus::DedicatedTenBit,
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false)))),
+            ..ArcenApp::default()
+        };
+        app.dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .mark_presented_for_test();
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.ten_bit_presentation_status = DedicatedPresentationStatus::DedicatedTenBit;
+            state.ten_bit_layer_has_picture = true;
+        }
+
+        let status = app.apply_async_ten_bit_status(DedicatedPresentationStatus::DroppedFrame);
+
+        assert_eq!(status, DedicatedPresentationStatus::DedicatedTenBit);
+        assert_eq!(
+            app.media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned")
+                .ten_bit_presentation_status,
+            DedicatedPresentationStatus::DedicatedTenBit
+        );
+        assert!(session_background_transparent(
+            &app.screen,
+            app.dedicated_video_frame.as_ref(),
+            app.dedicated_eight_bit_presentation,
+            app.dedicated_eight_bit_layer_has_picture,
+            app.dedicated_video_presentation,
+            app.dedicated_video_layer_has_picture,
+        ));
+    }
+
+    #[test]
+    fn async_transient_before_first_present_does_not_preserve_or_turn_transparent() {
+        let mut app = ArcenApp {
+            screen: AppScreen::InSession,
+            dedicated_eight_bit_presentation:
+                DedicatedEightBitPresentationStatus::DedicatedEightBit,
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false)))),
+            ..ArcenApp::default()
+        };
+        {
+            let mut state = app
+                .media
+                .as_ref()
+                .expect("media")
+                .lock()
+                .expect("media state poisoned");
+            state.eight_bit_presentation_status =
+                DedicatedEightBitPresentationStatus::DedicatedEightBit;
+        }
+
+        let status =
+            app.apply_async_eight_bit_status(DedicatedEightBitPresentationStatus::DroppedFrame);
+
+        assert_eq!(status, DedicatedEightBitPresentationStatus::DroppedFrame);
+        assert!(!session_background_transparent(
+            &app.screen,
+            app.dedicated_video_frame.as_ref(),
+            app.dedicated_eight_bit_presentation,
+            app.dedicated_eight_bit_layer_has_picture,
+            app.dedicated_video_presentation,
+            app.dedicated_video_layer_has_picture,
+        ));
+    }
+
+    #[test]
+    fn fallback_status_keeps_session_background_opaque_for_egui() {
+        let status = DedicatedEightBitPresentationStatus::FallbackToEgui(
+            crate::ui::video_metal_layer::DedicatedLayerOutcome::PlaneTextureCreationFailed,
+        );
+
+        assert!(!session_background_transparent(
+            &AppScreen::InSession,
+            None,
+            status,
+            false,
+            DedicatedPresentationStatus::Inactive,
+            false,
+        ));
+    }
+
+    #[test]
+    fn transient_status_before_establishment_does_not_make_background_transparent() {
+        assert!(!session_background_transparent(
+            &AppScreen::InSession,
+            None,
+            DedicatedEightBitPresentationStatus::DroppedFrame,
+            false,
+            DedicatedPresentationStatus::Inactive,
+            false,
+        ));
+        assert!(!session_background_transparent(
+            &AppScreen::InSession,
+            None,
+            DedicatedEightBitPresentationStatus::Inactive,
+            false,
+            DedicatedPresentationStatus::SkippedOccluded,
+            false,
+        ));
+    }
+
+    #[test]
+    fn presenter_telemetry_counts_multiple_failures_between_polls() {
+        let mut app = ArcenApp {
+            media: Some(Arc::new(Mutex::new(SharedMediaState::fresh(0, false)))),
+            ..ArcenApp::default()
+        };
+
+        app.dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .add_telemetry_for_test(2, 3);
+        app.drain_dedicated_presenter_telemetry();
+
+        assert_eq!(app.dedicated_presenter_telemetry_totals(), (2, 3));
+    }
+
+    #[test]
+    fn root_viewport_visibility_policy_uses_occlusion_and_minimize_flags() {
+        let mut viewport = egui::ViewportInfo::default();
+        assert!(root_viewport_visible_for_presenter(&viewport));
+        viewport.occluded = Some(true);
+        assert!(!root_viewport_visible_for_presenter(&viewport));
+        viewport.occluded = Some(false);
+        viewport.minimized = Some(true);
+        assert!(!root_viewport_visible_for_presenter(&viewport));
+        viewport.minimized = Some(false);
+        assert!(root_viewport_visible_for_presenter(&viewport));
     }
 
     #[test]
@@ -23764,6 +27422,7 @@ mod tests {
             color_primaries: "bt709".to_string(),
             encode_intent: "interactive".to_string(),
             motion_priority: "detail".to_string(),
+            pipeline: None,
         };
         let variant =
             stream_profile_video_variant(&profile).expect("AV1 profile uses known tokens");
@@ -23784,6 +27443,7 @@ mod tests {
             color_primaries: "bt2020".to_string(),
             encode_intent: "quality".to_string(),
             motion_priority: "detail".to_string(),
+            pipeline: Some(arcen_protocol::messages::StreamPipeline::Hdr),
         };
         let requested =
             stream_profile_video_variant(&profile).expect("HDR profile uses known tokens");
@@ -26662,21 +30322,7 @@ mod tests {
         // survive into the freshly (re)installed session.
         let mut app = ArcenApp::default();
         app.root_scroll_accum = egui::vec2(0.0, 42.0);
-        let (_media_tx, media) = crate::pipeline::frame_queue::incoming_media_inbox();
-        let (events_tx, events) = mpsc::unbounded_channel();
-        // Dropped immediately: the worker thread's very first receive then
-        // observes a closed channel and exits right away, with no live
-        // sender left for it to ever block on.
-        drop(events_tx);
-        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
-        let commands = SessionCommandSender::for_test(commands_tx);
-        let clipboard = crate::clipboard::ClipboardSession::new();
-        let handle = crate::transport::websocket::SessionHandle {
-            events,
-            media,
-            commands,
-            clipboard,
-        };
+        let handle = test_session_handle();
         let ctx = egui::Context::default();
 
         app.install_session_handle(handle, false, &ctx);
@@ -26685,6 +30331,20 @@ mod tests {
             app.root_scroll_accum,
             egui::Vec2::ZERO,
             "a fresh session attach must reset root's own scroll accumulator",
+        );
+    }
+
+    #[test]
+    fn install_session_handle_resets_presenter_telemetry_window() {
+        let mut app = ArcenApp::default();
+        assert_eq!(app.presenter_telemetry.take(5, 4), (5, 4));
+
+        app.install_session_handle(test_session_handle(), false, &egui::Context::default());
+
+        assert_eq!(
+            app.presenter_telemetry.take(2, 1),
+            (2, 1),
+            "fresh media counters start at zero, so the telemetry window must not keep the old baseline"
         );
     }
 
@@ -27532,15 +31192,27 @@ mod tests {
         // display id is always `None`, which never equals `Some(42)`,
         // exactly mirroring root's real pre-move state (on some other, or
         // no yet resolvable, display).
-        let (_, sent_first, _) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, true, true);
+        let (_, sent_first, _) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            true,
+            true,
+        );
         assert!(
             sent_first,
             "a caller-confirmed-needed command must actually be sent the first time",
         );
 
-        let (_, sent_while_not_needed, _) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, false, false);
+        let (_, sent_while_not_needed, _) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            false,
+            false,
+        );
         assert!(
             !sent_while_not_needed,
             "must not resend SetMonitor every frame once the caller says it is not needed, \
@@ -27549,8 +31221,14 @@ mod tests {
 
         // Once the caller decides a (re)send is needed again (e.g. a
         // renegotiated primary), it must be sent again.
-        let (_, sent_again, _) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, true, false);
+        let (_, sent_again, _) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            true,
+            false,
+        );
         assert!(
             sent_again,
             "a fresh caller-confirmed-needed request must send the command again",
@@ -27568,8 +31246,14 @@ mod tests {
         let ctx = egui::Context::default();
         let active_display_ids = [100_u32];
 
-        let (_, sent, snapshot) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, true, true);
+        let (_, sent, snapshot) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            true,
+            true,
+        );
         assert!(
             !sent,
             "an unresolvable target display must never be sent to SetMonitor",
@@ -27599,8 +31283,14 @@ mod tests {
         // exactly what this test is proving actually exists: without it,
         // this scenario would rely purely on the (here, artificially
         // untestable) display mismatch to trigger the first send.
-        let (observation, sent, snapshot) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, true, true);
+        let (observation, sent, snapshot) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            true,
+            true,
+        );
         assert!(
             observation.fullscreen != Some(true),
             "sanity: the bare test context never reports genuine fullscreen",
@@ -27620,14 +31310,349 @@ mod tests {
         // prevent a resend every frame while fullscreen confirmation is
         // still pending -- exactly the "avoid repeated commands" half of
         // this fix.
-        let (_, resent, resnapshot) =
-            drive_root_multi_window_target(&ctx, 42, &active_display_ids, false, false);
+        let (_, resent, resnapshot) = drive_root_multi_window_target(
+            &ctx,
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE,
+            42,
+            &active_display_ids,
+            false,
+            false,
+        );
         assert!(
             !resent,
             "must not resend while the caller says no fresh command is needed, \
              even though fullscreen still is not confirmed",
         );
         assert!(resnapshot.is_none());
+    }
+
+    #[test]
+    fn aspect_fit_rect_preserves_frame_aspect_and_centres_letterbox() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        let image = aspect_fit_rect(rect, Some([1920, 1080]), 1.0);
+        assert_eq!(image.width(), 1000.0);
+        assert!((image.height() - 562.0).abs() <= 1.0);
+        assert!((image.top() - 219.0).abs() <= 1.0);
+        assert!((image.bottom() - 781.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn secondary_local_fraction_uses_the_fitted_image_rect_not_the_whole_window() {
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        let image = aspect_fit_rect(window, Some([1920, 1080]), 1.0);
+        assert_eq!(
+            secondary_local_fraction(image, Some(egui::pos2(500.0, 100.0)), false),
+            None,
+            "top letterbox must not route pointer input"
+        );
+        let fraction = secondary_local_fraction(image, Some(image.center()), false).unwrap();
+        assert!((fraction.0 - 0.5).abs() < 0.001);
+        assert!((fraction.1 - 0.5).abs() < 0.001);
+    }
+
+    fn pointer_button_event_for(
+        button: egui::PointerButton,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn pointer_button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        pointer_button_event_for(egui::PointerButton::Primary, pos, pressed)
+    }
+
+    fn pointer_buttons(primary: bool, middle: bool, secondary: bool) -> [(u8, bool); 3] {
+        [(1, primary), (2, middle), (3, secondary)]
+    }
+
+    #[test]
+    fn secondary_pointer_capture_ignores_letterbox_origin_clicks() {
+        let image = egui::Rect::from_min_size(egui::pos2(0.0, 200.0), egui::vec2(1000.0, 500.0));
+        let capture = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event(egui::pos2(500.0, 100.0), true)],
+            [false; 3],
+            [false; 3],
+            pointer_buttons(true, false, false),
+        );
+        assert_eq!(capture.accepted_buttons, [false; 3]);
+        assert_eq!(capture.ignored_buttons, [true, false, false]);
+        assert!(!capture.pointer_in_use);
+        assert_eq!(capture.buttons, pointer_buttons(false, false, false));
+        assert_eq!(
+            secondary_local_fraction(
+                image,
+                Some(egui::pos2(500.0, 100.0)),
+                capture.pointer_in_use
+            ),
+            None,
+            "a press that starts in the letterbox must not clamp into a remote edge click",
+        );
+    }
+
+    #[test]
+    fn secondary_pointer_capture_keeps_image_origin_drag_release_outside() {
+        let image = egui::Rect::from_min_size(egui::pos2(0.0, 200.0), egui::vec2(1000.0, 500.0));
+        let capture = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event(egui::pos2(500.0, 450.0), true)],
+            [false; 3],
+            [false; 3],
+            pointer_buttons(true, false, false),
+        );
+        assert_eq!(capture.accepted_buttons, [true, false, false]);
+        assert_eq!(capture.ignored_buttons, [false; 3]);
+        assert!(capture.pointer_in_use);
+        assert_eq!(capture.buttons, pointer_buttons(true, false, false));
+
+        let release = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event(egui::pos2(500.0, 100.0), false)],
+            capture.accepted_buttons,
+            capture.ignored_buttons,
+            pointer_buttons(false, false, false),
+        );
+        assert_eq!(release.accepted_buttons, [false; 3]);
+        assert_eq!(release.ignored_buttons, [false; 3]);
+        assert_eq!(release.buttons, pointer_buttons(false, false, false));
+        assert!(
+            release.pointer_in_use,
+            "release frame must still dispatch for an image-origin drag"
+        );
+        let fraction = secondary_local_fraction(
+            image,
+            Some(egui::pos2(500.0, 100.0)),
+            release.pointer_in_use,
+        )
+        .expect("captured release outside the image clamps to the image edge");
+        assert!((fraction.0 - 0.5).abs() < 0.001);
+        assert_eq!(fraction.1, 0.0);
+    }
+
+    #[test]
+    fn secondary_pointer_capture_suppresses_entire_letterbox_origin_gesture() {
+        let image = egui::Rect::from_min_size(egui::pos2(0.0, 200.0), egui::vec2(1000.0, 500.0));
+        let capture = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event(egui::pos2(500.0, 100.0), true)],
+            [false; 3],
+            [false; 3],
+            pointer_buttons(true, false, false),
+        );
+        assert_eq!(capture.accepted_buttons, [false; 3]);
+        assert_eq!(capture.ignored_buttons, [true, false, false]);
+        assert!(!capture.pointer_in_use);
+        assert_eq!(capture.buttons, pointer_buttons(false, false, false));
+
+        let dragged = secondary_pointer_capture_for_frame(
+            image,
+            &[],
+            capture.accepted_buttons,
+            capture.ignored_buttons,
+            pointer_buttons(true, false, false),
+        );
+        assert_eq!(dragged.accepted_buttons, [false; 3]);
+        assert_eq!(dragged.ignored_buttons, [true, false, false]);
+        assert!(
+            !dragged.pointer_in_use,
+            "dragging into the image after a letterbox-origin press stays ignored"
+        );
+        assert_eq!(dragged.buttons, pointer_buttons(false, false, false));
+
+        let release = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event(egui::pos2(500.0, 100.0), false)],
+            dragged.accepted_buttons,
+            dragged.ignored_buttons,
+            pointer_buttons(false, false, false),
+        );
+        assert_eq!(release.accepted_buttons, [false; 3]);
+        assert_eq!(release.ignored_buttons, [false; 3]);
+        assert!(
+            !release.pointer_in_use,
+            "letterbox-origin release must not synthesize a remote release"
+        );
+        assert_eq!(release.buttons, pointer_buttons(false, false, false));
+    }
+
+    #[test]
+    fn secondary_pointer_capture_preserves_an_image_origin_drag_when_another_button_presses_letterbox(
+    ) {
+        let image = egui::Rect::from_min_size(egui::pos2(0.0, 200.0), egui::vec2(1000.0, 500.0));
+        let left_press = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event_for(
+                egui::PointerButton::Primary,
+                egui::pos2(500.0, 450.0),
+                true,
+            )],
+            [false; 3],
+            [false; 3],
+            pointer_buttons(true, false, false),
+        );
+        assert_eq!(left_press.accepted_buttons, [true, false, false]);
+        assert_eq!(left_press.buttons, pointer_buttons(true, false, false));
+        assert!(left_press.pointer_in_use);
+
+        let right_letterbox_press = secondary_pointer_capture_for_frame(
+            image,
+            &[pointer_button_event_for(
+                egui::PointerButton::Secondary,
+                egui::pos2(500.0, 100.0),
+                true,
+            )],
+            left_press.accepted_buttons,
+            left_press.ignored_buttons,
+            pointer_buttons(true, false, true),
+        );
+        assert_eq!(right_letterbox_press.accepted_buttons, [true, false, false]);
+        assert_eq!(right_letterbox_press.ignored_buttons, [false, false, true]);
+        assert_eq!(
+            right_letterbox_press.buttons,
+            pointer_buttons(true, false, false),
+            "the ignored letterbox-origin right button must not cancel the forwarded left drag",
+        );
+        assert!(right_letterbox_press.pointer_in_use);
+
+        let release_both = secondary_pointer_capture_for_frame(
+            image,
+            &[
+                pointer_button_event_for(
+                    egui::PointerButton::Primary,
+                    egui::pos2(500.0, 100.0),
+                    false,
+                ),
+                pointer_button_event_for(
+                    egui::PointerButton::Secondary,
+                    egui::pos2(500.0, 100.0),
+                    false,
+                ),
+            ],
+            right_letterbox_press.accepted_buttons,
+            right_letterbox_press.ignored_buttons,
+            pointer_buttons(false, false, false),
+        );
+        assert_eq!(release_both.accepted_buttons, [false; 3]);
+        assert_eq!(release_both.ignored_buttons, [false; 3]);
+        assert_eq!(release_both.buttons, pointer_buttons(false, false, false));
+        assert!(
+            release_both.pointer_in_use,
+            "the accepted left button release must keep capture alive even though the ignored \
+             right button also released outside",
+        );
+        let fraction = secondary_local_fraction(
+            image,
+            Some(egui::pos2(500.0, 100.0)),
+            release_both.pointer_in_use,
+        )
+        .expect("accepted drag release outside the image clamps to the image edge");
+        assert!((fraction.0 - 0.5).abs() < 0.001);
+        assert_eq!(fraction.1, 0.0);
+    }
+
+    #[test]
+    fn ready_secondary_viewport_replays_retained_frame_or_requests_refresh() {
+        let retained = rgba_test_frame(77);
+        let mut state = DeferredSecondaryViewportState::default();
+        assert_eq!(
+            stage_secondary_frame_for_ready_viewport(&mut state, Some(&retained)),
+            SecondaryReadyFrameAction::ReplayedRetainedFrame
+        );
+        assert_eq!(
+            state.pending_frame.as_ref().map(|frame| frame.timestamp_ms),
+            Some(77)
+        );
+        assert_eq!(
+            stage_secondary_frame_for_ready_viewport(&mut state, Some(&retained)),
+            SecondaryReadyFrameAction::None
+        );
+
+        let mut empty = DeferredSecondaryViewportState::default();
+        assert_eq!(
+            stage_secondary_frame_for_ready_viewport(&mut empty, None),
+            SecondaryReadyFrameAction::RequestFullFrame
+        );
+    }
+
+    #[test]
+    fn ready_secondary_viewport_treats_callback_texture_as_presentable_state() {
+        let ctx = egui::Context::default();
+        let mut state = DeferredSecondaryViewportState {
+            texture: Some(ctx.load_texture(
+                "ready-secondary-texture",
+                egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+                egui::TextureOptions::LINEAR,
+            )),
+            ..DeferredSecondaryViewportState::default()
+        };
+        assert_eq!(
+            stage_secondary_frame_for_ready_viewport(&mut state, None),
+            SecondaryReadyFrameAction::None,
+            "a retained egui texture is a visible secondary frame and must not spam full-frame \
+             refreshes"
+        );
+    }
+
+    #[test]
+    fn secondary_waiting_placeholder_is_neutral_not_black() {
+        assert_ne!(secondary_waiting_placeholder_color(), egui::Color32::BLACK);
+        assert_eq!(
+            secondary_waiting_placeholder_color(),
+            egui::Color32::from_gray(18)
+        );
+    }
+
+    #[test]
+    fn secondary_color_image_forces_opaque_alpha() {
+        let mut frame = rgba_test_frame(1);
+        frame.width = 2;
+        frame.height = 1;
+        frame.rgba = vec![10, 20, 30, 0, 40, 50, 60, 12];
+        let image = secondary_color_image_from_frame(&frame).expect("non-empty frame");
+        assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
+        assert_eq!(
+            image.pixels[1],
+            egui::Color32::from_rgba_unmultiplied(40, 50, 60, 255)
+        );
+    }
+
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn windowed_monitor_test_keeps_root_window_title_stable_for_native_layer_lookup() {
+        let app = ArcenApp {
+            windowed_monitor_test: Some(
+                crate::ui::windowed_monitor_test::WindowedMonitorTestMode::default_size(2),
+            ),
+            multi_window: MultiWindowSessionState::Active {
+                validated: two_monitor_validated_topology(),
+                attempt: MultiWindowEnterAttempt::new(
+                    MultiWindowPlan::build(
+                        &[
+                            arcen_media::SessionMonitorId::new(1).unwrap(),
+                            arcen_media::SessionMonitorId::new(2).unwrap(),
+                        ],
+                        &[1, 2],
+                    )
+                    .expect("plan"),
+                    Duration::ZERO,
+                ),
+                committed: true,
+            },
+            ..ArcenApp::default()
+        };
+        assert_eq!(
+            app.current_root_window_title(),
+            crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE
+        );
     }
 
     // ---------------------------------------------------------------
@@ -28514,10 +32539,7 @@ mod tests {
             "root and the secondary are both resolvable but unconfirmed; this must stay \
              pending, not commit or disconnect",
         );
-        assert!(
-            receiver.try_recv().is_err(),
-            "no secondary input may ever be forwarded before the entry has committed",
-        );
+        assert_no_input_commands(&mut receiver);
     }
 
     #[test]
@@ -28631,10 +32653,7 @@ mod tests {
         }
         assert!(matches!(app.screen, AppScreen::InSession));
         assert!(app.reconnect.is_some());
-        assert!(
-            receiver.try_recv().is_err(),
-            "nothing should have been sent from a merely-observed pending frame",
-        );
+        assert_no_input_commands(&mut receiver);
     }
 
     #[test]

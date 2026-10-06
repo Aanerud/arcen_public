@@ -125,6 +125,7 @@ pub struct Encoder {
     reconfig_config: NV_ENC_CONFIG,
     frame_rate: u32,
     vbv_buffer_frames: f64,
+    max_bitrate_bps: Option<u32>,
     width: u32,
     height: u32,
     frame_bytes: usize,
@@ -184,6 +185,7 @@ struct QpMapState {
     /// without a fresh observation carries no new damage, and biasing it from
     /// a stale map would describe a frame that is no longer on screen.
     observed: bool,
+    stats: arcen_media::video::QpMapStats,
 }
 
 struct EncoderInitGuard<'a> {
@@ -404,6 +406,49 @@ impl NvencCodec {
             Self::Hevc => arcen_media::VideoCodec::H265,
             Self::Av1 => arcen_media::VideoCodec::Av1,
         }
+    }
+}
+
+fn apply_keyframe_policy(
+    config: &mut NV_ENC_CONFIG,
+    codec: NvencCodec,
+    policy: arcen_media::video::KeyframePolicy,
+    fps: u32,
+) {
+    let scheduled = policy.scheduled_period_frames(fps);
+    config.gopLength = if scheduled == 0 {
+        NVENC_INFINITE_GOPLENGTH
+    } else {
+        scheduled
+    };
+    let idr_period = config.gopLength;
+    match codec {
+        NvencCodec::H264 => config.encodeCodecConfig.h264Config.idrPeriod = idr_period,
+        NvencCodec::Hevc => config.encodeCodecConfig.hevcConfig.idrPeriod = idr_period,
+        NvencCodec::Av1 => config.encodeCodecConfig.av1Config.idrPeriod = idr_period,
+    }
+}
+
+fn configure_codec_headers(config: &mut NV_ENC_CONFIG, codec: NvencCodec) {
+    // SAFETY: `encodeCodecConfig` is NVENC's codec-config union. Each arm
+    // writes only the member that matches `codec`, which is the member the
+    // driver reads for that codec GUID; the bitfield setters only touch that
+    // member's plain-integer storage.
+    match codec {
+        NvencCodec::Hevc => unsafe {
+            config.encodeCodecConfig.hevcConfig.set_outputAUD(1);
+        },
+        NvencCodec::H264 => unsafe {
+            config.encodeCodecConfig.h264Config.set_outputAUD(1);
+        },
+        // Keep low-overhead OBU framing (`outputAnnexBFormat = 0`) for
+        // VideoToolbox samples, and repeat the Sequence Header on every
+        // forced keyframe so Linux's AV1 recovery classifier can recognise a
+        // self-contained point exactly like the Windows NVENC path.
+        NvencCodec::Av1 => unsafe {
+            config.encodeCodecConfig.av1Config.set_outputAnnexBFormat(0);
+            config.encodeCodecConfig.av1Config.set_repeatSeqHdr(1);
+        },
     }
 }
 
@@ -847,6 +892,7 @@ impl Encoder {
     /// can't drift between what was resolved and what NVENC was actually
     /// configured for — see the module doc for exactly which part of the
     /// colour pipeline this file does and doesn't control for each format.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         cuctx: *mut c_void,
         width: u32,
@@ -856,6 +902,9 @@ impl Encoder {
         intent: EncodeIntent,
         priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
+        fps: u32,
+        max_bitrate_bps: Option<u32>,
+        keyframe_policy: arcen_media::video::KeyframePolicy,
     ) -> Result<Self, NativeStartupError> {
         Self::new_for_source(
             cuctx,
@@ -866,6 +915,9 @@ impl Encoder {
             intent,
             priority,
             qp_map_policy,
+            fps,
+            max_bitrate_bps,
+            keyframe_policy,
             WideSource::XorgDepth30,
         )
     }
@@ -881,6 +933,9 @@ impl Encoder {
         intent: EncodeIntent,
         priority: MotionPriority,
         qp_map_policy: crate::qp_map::QpMapPolicy,
+        fps: u32,
+        max_bitrate_bps: Option<u32>,
+        keyframe_policy: arcen_media::video::KeyframePolicy,
         wide_source: WideSource,
     ) -> Result<Self, NativeStartupError> {
         let nvenc_codec = NvencCodec::parse(codec).ok_or_else(|| NativeStartupError::Unavailable {
@@ -975,9 +1030,7 @@ impl Encoder {
             get_preset(resources.enc, codec_guid, preset_guid, tuning, &mut preset),
             "GetEncodePresetConfigEx"
         );
-        if intent == EncodeIntent::Interactive {
-            preset.presetCfg.gopLength = 120;
-        }
+        apply_keyframe_policy(&mut preset.presetCfg, nvenc_codec, keyframe_policy, fps);
         // Undo the driver's reordering defaults, for BOTH intents. This block
         // used to be inside the `Interactive` branch above, which meant
         // `Quality` silently kept the B-frames and lookahead that P6 +
@@ -1010,24 +1063,7 @@ impl Encoder {
         preset.presetCfg.rcParams.lookaheadDepth = 0;
         preset.presetCfg.rcParams.set_zeroReorderDelay(1);
 
-        if matches!(nvenc_codec, NvencCodec::Hevc) {
-            preset
-                .presetCfg
-                .encodeCodecConfig
-                .hevcConfig
-                .set_outputAUD(1);
-        } else if matches!(nvenc_codec, NvencCodec::H264) {
-            preset
-                .presetCfg
-                .encodeCodecConfig
-                .h264Config
-                .set_outputAUD(1);
-        }
-        // AV1 has no AUD/NAL-delimiter concept (OBU-structured, not
-        // NAL-structured); its own framing knobs are left at the preset
-        // default -- see nvenc.rs's identical reasoning and the final
-        // report for what a real Ada+ GPU run still needs to confirm about
-        // AV1 bitstream framing.
+        configure_codec_headers(&mut preset.presetCfg, nvenc_codec);
         // Chroma + bit depth + profile, all driven off the one resolved
         // `format` rather than a bare `yuv444` bool (see `Encoder::new`'s
         // doc). `Bgra8` is untouched: the existing, hardware-validated
@@ -1214,30 +1250,29 @@ impl Encoder {
         let sizing = crate::nvenc_policy::rate_control_sizing(
             width,
             height,
-            60,
+            fps,
             color.chroma,
             color.bit_depth,
             priority,
             intent,
+            max_bitrate_bps,
         );
+        let latency = crate::nvenc_policy::latency_tuning(priority, intent);
         preset.presetCfg.rcParams.averageBitRate = sizing.average_bitrate_bps;
         preset.presetCfg.rcParams.maxBitRate = sizing.max_bitrate_bps;
         preset.presetCfg.rcParams.vbvBufferSize = sizing.vbv_buffer_size_bits;
         preset.presetCfg.rcParams.vbvInitialDelay = sizing.vbv_buffer_size_bits;
         crate::log(&format!(
-            "NVENC CUDA rate control: codec={} intent={} preset={} tuning={} average={} max={} vbv_bits={}",
+            "NVENC CUDA rate control: codec={} intent={} priority={} preset={} tuning={} frame_interval_p={} lookahead_depth={} zero_reorder_delay={} vbv_frames={} average={} max={} vbv_bits={}",
             codec,
             intent.token(),
-            if intent == EncodeIntent::Quality {
-                "p6"
-            } else {
-                "p4"
-            },
-            if intent == EncodeIntent::Quality {
-                "high-quality"
-            } else {
-                "ultra-low-latency"
-            },
+            priority.token(),
+            latency.preset,
+            latency.tuning,
+            latency.frame_interval_p,
+            latency.lookahead_depth,
+            latency.zero_reorder_delay,
+            latency.vbv_buffer_frames,
             sizing.average_bitrate_bps,
             sizing.max_bitrate_bps,
             sizing.vbv_buffer_size_bits,
@@ -1251,7 +1286,7 @@ impl Encoder {
         init.encodeHeight = height;
         init.darWidth = width;
         init.darHeight = height;
-        init.frameRateNum = 60;
+        init.frameRateNum = fps.max(1);
         init.frameRateDen = 1;
         init.enablePTD = 1;
         init.tuningInfo = tuning;
@@ -1377,8 +1412,9 @@ impl Encoder {
             preset_guid,
             tuning,
             reconfig_config: preset.presetCfg,
-            frame_rate: 60,
+            frame_rate: fps.max(1),
             vbv_buffer_frames: crate::nvenc_policy::vbv_buffer_frames(priority, intent),
+            max_bitrate_bps,
             width,
             height,
             frame_bytes,
@@ -1466,13 +1502,15 @@ impl Encoder {
     /// Reconfigures NVENC's average/max bitrate and VBV without forcing an IDR.
     pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
         let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
-        let vbv = ((f64::from(bitrate) / f64::from(self.frame_rate.max(1)))
-            * self.vbv_buffer_frames)
-            .round()
-            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let vbv = crate::nvenc_policy::vbv_bits_for_frames(
+            bitrate,
+            self.frame_rate,
+            self.vbv_buffer_frames,
+        );
         let mut config = self.reconfig_config;
         config.rcParams.averageBitRate = bitrate;
-        config.rcParams.maxBitRate = bitrate;
+        config.rcParams.maxBitRate =
+            crate::nvenc_policy::max_bitrate_for_target(bitrate, self.max_bitrate_bps);
         config.rcParams.vbvBufferSize = vbv;
         config.rcParams.vbvInitialDelay = vbv;
         let mut init: NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
@@ -1505,7 +1543,8 @@ impl Encoder {
         }
         self.reconfig_config = config;
         crate::log(&format!(
-            "NVENC CUDA live bitrate reconfigured: average={bitrate} max={bitrate} vbv_bits={vbv}"
+            "NVENC CUDA live bitrate reconfigured: average={bitrate} max={} vbv_bits={vbv}",
+            config.rcParams.maxBitRate,
         ));
         Ok(())
     }
@@ -1773,8 +1812,17 @@ impl Encoder {
             bias,
             policy,
             observed: false,
+            stats: arcen_media::video::QpMapStats::default(),
         });
         true
+    }
+
+    pub fn take_qp_map_stats(&mut self) -> arcen_media::video::QpMapStats {
+        self.qp_state
+            .as_mut()
+            .map_or_else(arcen_media::video::QpMapStats::default, |state| {
+                std::mem::take(&mut state.stats)
+            })
     }
 
     fn next_writable_slot(&self) -> usize {
@@ -1854,19 +1902,22 @@ impl Encoder {
             // Neutral on an IDR (every block is intra, so damage describes
             // nothing) and on any frame staged without a fresh observation.
             let built = if force_idr || !fresh {
+                state.stats.record_neutral();
                 Some(state.builder.build_neutral())
             } else {
+                let damage = state.tracker.damage_map();
+                let dirty_blocks = damage.dirty_blocks().count();
+                let total_blocks = damage.grid().block_count().max(1);
+                let dirty_fraction = dirty_blocks as f64 / total_blocks as f64;
                 let bias = match state.policy {
                     arcen_media::video::QpMapPolicy::Neutral => arcen_media::video::QpBias::NEUTRAL,
                     _ => state.bias,
                 };
-                match crate::qp_map::fill_qp_delta_map(
-                    &mut state.builder,
-                    state.tracker.damage_map(),
-                    bias,
-                    false,
-                ) {
-                    Ok(entries) => Some(entries),
+                match crate::qp_map::fill_qp_delta_map(&mut state.builder, damage, bias, false) {
+                    Ok(entries) => {
+                        state.stats.record_built_map(entries, dirty_fraction);
+                        Some(entries)
+                    }
                     Err(error) => {
                         crate::log(&format!("QP map: build failed, encoding unbiased: {error}"));
                         None
@@ -2473,6 +2524,28 @@ mod pixel_format_tests {
         assert_eq!(NvencCodec::H264.codec_guid(), NV_ENC_CODEC_H264_GUID);
         assert_eq!(NvencCodec::Hevc.codec_guid(), NV_ENC_CODEC_HEVC_GUID);
         assert_eq!(NvencCodec::Av1.codec_guid(), NV_ENC_CODEC_AV1_GUID);
+    }
+
+    #[test]
+    fn codec_header_policy_repeats_av1_sequence_header_for_recovery() {
+        // SAFETY (all reads below): each config was just written through the
+        // union member matching its codec, and is read back through that
+        // same member.
+        let mut av1 = NV_ENC_CONFIG::default();
+        configure_codec_headers(&mut av1, NvencCodec::Av1);
+        assert_eq!(
+            unsafe { av1.encodeCodecConfig.av1Config.outputAnnexBFormat() },
+            0
+        );
+        assert_eq!(unsafe { av1.encodeCodecConfig.av1Config.repeatSeqHdr() }, 1);
+
+        let mut h264 = NV_ENC_CONFIG::default();
+        configure_codec_headers(&mut h264, NvencCodec::H264);
+        assert_eq!(unsafe { h264.encodeCodecConfig.h264Config.outputAUD() }, 1);
+
+        let mut hevc = NV_ENC_CONFIG::default();
+        configure_codec_headers(&mut hevc, NvencCodec::Hevc);
+        assert_eq!(unsafe { hevc.encodeCodecConfig.hevcConfig.outputAUD() }, 1);
     }
 
     #[test]

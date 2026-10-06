@@ -21,7 +21,7 @@ Read this before you invest time.
 | **Windows Pier** (host) | Works. Multi-display is automatic: the service picks an eligible NVIDIA adapter at start, and an administrator can reserve a GPU for other work. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
 | **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. AV1 decode needs Apple silicon M3 or later. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
-| **macOS Pier** | Preview. A signed, notarised package ships with each release, and a logged-in user can serve a real Deck: PAM sign-in, ScreenCaptureKit → VideoToolbox video in Auto, Speed and Grading, HDR when the display being captured has HDR headroom, one virtual display per Deck display, pointer/keyboard/pen input and trackpad gestures, clipboard both ways, and host audio. It installs as a network service under a hidden `_arcen` account plus a helper in each signed-in session ([why two parts](docs/security/macos-pier-process-model.md)). Not yet: microphone input, time-zone redirection, deskside privacy, native tablet, and qualification of cold-boot login-window operation and of multi-display on physical hardware. FileVault's pre-boot unlock screen cannot be served. |
+| **macOS Pier** | Preview. A signed, notarised package ships with each release, and a logged-in user can serve a real Deck: PAM sign-in, ScreenCaptureKit → VideoToolbox video in Auto, Speed and Grading, HDR when the display being captured has HDR headroom, one virtual display per Deck display, pointer/keyboard/pen input and trackpad gestures, clipboard both ways, host audio, and session-scoped time-zone redirection for newly launched apps. It installs as a network service under a hidden `_arcen` account plus a helper in each signed-in session ([why two parts](docs/security/macos-pier-process-model.md)). A virtual microphone (an AudioServerPlugIn) ships in the package and negotiates with the Deck, but end-to-end microphone capture has not been qualified. Not yet: deskside privacy, native tablet, and qualification of cold-boot login-window operation and of multi-display on physical hardware. FileVault's pre-boot unlock screen cannot be served. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
 
 Every claim above was tested on real hardware, running real work, not merely
@@ -68,11 +68,11 @@ account.
 | **Video** | Four complete presets: Auto, Speed, Grading, and HDR. They select separate capture/conversion pipelines rather than adding switches to one path. Source-built OpenH264 is the software floor where no supported hardware encoder exists. See [Streaming presets and independent pipelines](#streaming-presets-and-independent-pipelines). |
 | **Multiple monitors** | One to four, negotiated as one topology, and **on by default on every host**. The Deck can match its own display layout. The Linux Pier discovers the GPU's NVIDIA heads when the service starts; the Windows Pier picks an eligible NVIDIA adapter at start (list any GPU you want kept for other work in `excluded_adapters`); the macOS Pier creates one virtual display per Deck display. **Each monitor is its own NVENC session** on Linux and Windows, and that is the real ceiling there: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. `advertise_enabled: false` turns multi-display off. |
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. By default the host's own speakers go silent for the session (`audio.local_playback`), so nobody beside the machine hears the remote user. On macOS that silence needs **System Audio Recording**, a separate approval from Screen Recording: the helper asks for it when it starts, and until it is given the host refuses a session and tells the Deck why rather than serving it audibly. |
-| **Microphone in** | **Linux hosts only.** Client microphone into the host session, Opus or fixed-rate PCM. Enabled in the host's default configuration, and still opt-in on the Deck every launch — consent is deliberately never restored from settings. Windows needs a signed driver Arcen does not yet ship (see [Where help is wanted](#where-help-is-wanted)); the macOS Pier refuses a microphone request rather than ignoring it. |
+| **Microphone in** | **Linux hosts; macOS Pier preview.** Client microphone into the host session, Opus or fixed-rate PCM. Enabled in the host's default configuration, and still opt-in on the Deck every launch — consent is deliberately never restored from settings. Windows needs a signed driver Arcen does not yet ship (see [Where help is wanted](#where-help-is-wanted)). The macOS Pier publishes a virtual microphone and offers it only when that device is present; end-to-end capture is built but not yet qualified. |
 | **Keyboard and pointer** | Absolute and relative motion, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. Trackpad scrolling stays precise end to end (phased deltas on macOS, high-resolution wheel on Linux, fractional and horizontal wheel on Windows). Trackpad gestures — magnify, smart zoom, swipe — are negotiated separately and injected where the host OS allows it (the macOS Pier today). |
 | **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
-| **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. Linux and Windows hosts; the macOS Pier does not yet. |
+| **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. Linux sets `TZ` in the remote process tree; Windows temporarily changes the system timezone; the macOS Pier sets `TZ` in the served GUI session, so apps launched during the session see the Deck zone while the menu bar clock and already-running apps stay on the Mac's zone. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
 | **Reconnection** | A dropped connection resumes the same session for up to two hours. The Deck reattaches with a signed grant instead of asking for the password again. |
 | **Bitrate** | Follows the network path through one shared controller on every host, and QUIC uses BBR congestion control, so the random loss of Wi-Fi, cellular and VPN links is not mistaken for congestion. When an encoder cannot sustain a preset's frame rate the session is admitted at the best proven rate and says so, instead of being refused. |
@@ -330,6 +330,68 @@ range. The code is blunt about why: claiming a capability the Deck has not
 demonstrated is worse than admitting it, because the host believes the claim and
 sends a stream the Deck then cannot decode.
 
+### Keel: send what changed, and nothing else
+
+Keel ([`shared/keel`](shared/keel)) is the part of every Pier that decides
+whether a frame is worth sending. It works at two levels, and they are easy to
+confuse.
+
+**Frame level — on for every hardware pipeline.** An encoder submits a frame
+when the desktop changed, when the Deck asked for a keyframe, once more to
+flush NVENC's one-deep output queue, and otherwise once a second as a
+keepalive. A still desktop therefore costs a fraction of a megabit, not a full
+stream: a Windows RTX session measured 150–400 kbit/s while idle and 5–9 Mbit/s
+while a video played. Each Pier gets the change signal from its own operating
+system:
+
+| Pier | Change signal |
+|---|---|
+| Linux, Auto/Speed (NvFBC) | NvFBC's new-frame flag. The CUDA capture interface has no per-block damage, so this path has frame-level gating only. |
+| Linux, Grading/HDR (XShm) | X Damage events |
+| Windows, every preset | Desktop Duplication and WGC deliver a frame only when the desktop changed; their dirty/move rectangles and dirty regions feed the QP map |
+| macOS | ScreenCaptureKit dirty rectangles |
+| Software fallback | Keel's own 16×16 block hash, which also skips unchanged rows during colour conversion |
+
+**Block level — an encoder hint, off by default.** With `video.qp_map` set
+(one value, or per preset: `{"auto": "on", "speed": "on"}`), Keel turns the
+same damage into an NVENC QP map so changed blocks get the bits. It engages
+only where damage is free: OS rectangles on Windows, X Damage on Linux
+Grading/HDR. The Linux NvFBC fast path refuses it rather than add a full-frame
+GPU readback. Every encoder logs
+`QP map policy=… engaged=… damage_source=…`, so whether it ran is never a
+guess. See [`docs/architecture/qp-maps.md`](docs/architecture/qp-maps.md).
+
+Modern codecs already code an unchanged block almost for free, so Keel's gain
+is mostly the frames it never encodes. What it does not do yet is *refine*: a
+static region that arrived during motion stays at its first quality until it
+changes. Spending spare bits to sharpen blocks once they stop changing — the
+"build to lossless" behaviour other remote-desktop products use — is open work.
+
+### How frames reach the glass on the Deck
+
+Both the 8-bit and the 10-bit streams normally present decoded `IOSurface`s
+through a dedicated `CAMetalLayer`, with no CPU copy; the ordinary window
+surface remains only as a fallback that the Deck reports when it is used. A shared display-refresh pacer
+([`shared/media/src/presentation.rs`](shared/media/src/presentation.rs)),
+driven by the window's `CVDisplayLink`, shows at most one new picture per
+refresh from a queue of at most three, dropping the oldest on overflow and
+anything stale after a stall. Two lessons from real sessions are built in:
+
+- **Never take a frame you cannot show.** When every drawable is still in
+  flight, the refresh waits and the frame stays queued for the next one.
+  Taking it and then finding no drawable silently threw away about one frame
+  in four on a 60 Hz panel.
+- **A network stall arrives as a burst.** A 250–300 ms Wi-Fi or VPN stall
+  releases every frame produced meanwhile at once. The Deck's inbox holds about
+  half a second, so the burst is decoded and the newest frame shown; a smaller
+  inbox discarded the chain, asked for a keyframe, and the large keyframe made
+  the next burst bigger.
+
+The Deck logs `dedicated presenter telemetry` every second — received,
+submitted, confirmed, drops by cause, slot waits, and refresh intervals — and
+the host's health check compares decoded against presented frames, so a
+presentation problem shows up even when nobody notices it on screen.
+
 ### Three ways to run a Pier
 
 Hardware encoding is the fast path, but it is not the only intended one.
@@ -582,10 +644,11 @@ attestation.
 on the same shared contracts as the others, with display creation, capture,
 input, clipboard, audio and packaging kept as thin macOS adapters. The
 logged-in path is used from a Deck every day. What is missing is listed in
-the table at the top: microphone input, time-zone redirection and deskside
-privacy each need only a macOS adapter; their wire messages, configuration and
-policy already live in `shared/`. Multi-display creates a virtual display per Deck display, but has
-not been qualified with physical monitors attached to the Mac. Serving
+the table at the top: deskside privacy needs only a macOS adapter, since its
+wire messages, configuration and policy already live in `shared/`, and the
+virtual microphone that now ships needs end-to-end qualification.
+Multi-display creates a virtual display per Deck display, but has not been
+qualified with physical monitors attached to the Mac. Serving
 the macOS login screen needs a `LoginWindow` launch agent and virtual-HID input,
 because `CGEvent` posting does not reach that screen. Apple has now granted the
 virtual-HID entitlement, and both pieces are built. Apple still publishes no
@@ -623,6 +686,9 @@ is the first one.
   [`docs/architecture/macos-peripheral-access.md`](docs/architecture/macos-peripheral-access.md),
   along with the measurement that decides it.
 - Wayland capture on Linux, alongside the current Xorg path.
+- Keel refinement: sharpen blocks once they stop changing, and a damage
+  source for the Linux NvFBC fast path (the GL interface reports a change map
+  that the CUDA interface does not).
 - AMD and Intel hardware encoding. Only NVENC exists today.
 - Better software encoding for hosts with no GPU.
 
@@ -633,11 +699,6 @@ discard prediction chains rather than block, NVENC runs with no B-frames and no
 lookahead, the media worker is off the UI thread — so what is left is copies and
 serialisation, ranked here by what a measurement would actually show at 4K60.
 
-- **Zero-copy presentation on the Deck.** A decoded frame is transferred to a
-  BGRA `CVPixelBuffer`, swizzled into an RGBA `Vec`, then copied again for the
-  WGPU upload. At 4K that is roughly 33 MiB per frame of avoidable traffic, and
-  10-bit frames pay it even though the native `CVPixelBuffer` is already kept
-  for the dedicated Metal layer. A `CVMetalTextureCache` path would remove it.
 - **A bounded async decode window.** VideoToolbox is currently made synchronous
   — `wait_for_async_frames` immediately after every submit — which serialises the
   worker behind the decoder and turns any hiccup into a stall. Two frames in

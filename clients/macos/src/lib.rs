@@ -21,6 +21,15 @@ pub const SOURCE_OFFER: &str =
      You may redistribute it under the terms of that licence. If you run a modified version \
      that others connect to over a network, you must offer them its corresponding source.";
 
+/// Release packaging scans the final binary for this marker and refuses to
+/// ship it. It must stay compiled into every `dev-tools` binary, including
+/// `--no-build` package assemblies, so stale local artefacts cannot become a
+/// release.
+#[cfg(feature = "dev-tools")]
+#[used]
+pub static ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER: &[u8] =
+    b"ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP";
+
 pub mod build_identity;
 pub mod clipboard;
 pub mod credentials;

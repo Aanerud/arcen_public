@@ -392,7 +392,7 @@ Do not edit this section by hand; regenerate it.
 
 Every package below is reachable from a release artefact through a `normal` or `build` dependency edge on that artefact's target triple. Dev-dependencies are excluded because they are not redistributed. The *Artefacts* column records which builds carry the package.
 
-374 third-party packages across 31 distinct licence expressions.
+375 third-party packages across 31 distinct licence expressions.
 
 ### (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
 
@@ -916,6 +916,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `objc2-avf-audio` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-core-foundation` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-core-graphics` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
+| `objc2-core-video` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-io-surface` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-metal` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-quartz-core` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
@@ -12308,6 +12309,7 @@ These declare a licence in metadata but ship no licence file. The declared SPDX 
 - `objc2-core-foundation 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-core-graphics 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-core-image 0.2.2` — MIT
+- `objc2-core-video 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-encode 4.1.0` — MIT
 - `objc2-foundation 0.2.2` — MIT
 - `objc2-foundation 0.3.2` — MIT

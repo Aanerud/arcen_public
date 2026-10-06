@@ -42,8 +42,14 @@ pub enum ProvisioningRequest {
 pub enum MaterialOwnership {
     /// Created and marked by this host.
     Owned,
-    /// Present but not marked as ours.
+    /// Present and carrying no ownership marker.
     Foreign,
+    /// Present with a marker this host cannot accept.
+    ///
+    /// This is not legacy material. It may be tampered Arcen material or an
+    /// operator's file set with an unrelated marker, so installers preserve it
+    /// rather than adopting it.
+    Ambiguous,
 }
 
 /// What a host found in its certificate directory.
@@ -63,9 +69,10 @@ pub struct MaterialState {
     pub expiring_or_expired: bool,
     /// Whether an interrupted publication left staged files behind.
     pub stale_staging_present: bool,
-    /// Whether the certificate is self-signed, as everything Arcen generates
-    /// is. An operator's CA-issued certificate is not.
-    pub self_signed: bool,
+    /// Whether unmarked material positively matches the legacy Arcen
+    /// self-signed profile that old installers generated before marker files
+    /// existed.
+    pub legacy_arcen_self_signed: bool,
 }
 
 impl MaterialState {
@@ -79,7 +86,7 @@ impl MaterialState {
             certificate_valid: false,
             expiring_or_expired: false,
             stale_staging_present: false,
-            self_signed: false,
+            legacy_arcen_self_signed: false,
         }
     }
 
@@ -93,7 +100,7 @@ impl MaterialState {
             certificate_valid: true,
             expiring_or_expired: false,
             stale_staging_present: false,
-            self_signed: true,
+            legacy_arcen_self_signed: true,
         }
     }
 
@@ -257,10 +264,14 @@ pub fn plan(
     }
 
     let foreign = matches!(state.ownership, Some(MaterialOwnership::Foreign));
+    let ambiguous = matches!(state.ownership, Some(MaterialOwnership::Ambiguous));
     let action = match request {
         ProvisioningRequest::AdoptLegacy => {
             if !state.is_complete() {
                 return Err(ProvisioningRefusal::NothingToAdopt);
+            }
+            if ambiguous {
+                return Err(ProvisioningRefusal::ForeignMaterial);
             }
             if !foreign {
                 return Err(ProvisioningRefusal::AlreadyOwned);
@@ -270,13 +281,13 @@ pub fn plan(
         ProvisioningRequest::Ensure => {
             if !state.is_complete() {
                 ProvisioningAction::CreateNew
-            } else if foreign && state.self_signed {
+            } else if foreign && state.legacy_arcen_self_signed {
                 // A self-signed pair without our marker is what every Arcen
                 // install before ownership markers left behind. Taking it over
                 // keeps the key, so every Deck that trusts this host still
                 // does; demanding a flag for it only stopped upgrades.
                 ProvisioningAction::AdoptAndRenew
-            } else if foreign {
+            } else if foreign || ambiguous {
                 // An operator's CA-issued certificate: serve it as it is and
                 // never reissue it, which would replace their chain with a
                 // self-signed one.
@@ -284,6 +295,8 @@ pub fn plan(
                     return Err(ProvisioningRefusal::InvalidCertificate);
                 }
                 ProvisioningAction::KeepExisting
+            } else if !state.certificate_valid && state.expiring_or_expired {
+                ProvisioningAction::RenewPreservingKey
             } else if !state.certificate_valid {
                 return Err(ProvisioningRefusal::InvalidCertificate);
             } else if state.expiring_or_expired {
@@ -297,7 +310,7 @@ pub fn plan(
             if !state.is_complete() {
                 return Err(ProvisioningRefusal::NothingToRenew);
             }
-            if foreign {
+            if foreign || ambiguous {
                 return Err(ProvisioningRefusal::ForeignMaterial);
             }
             ProvisioningAction::RenewPreservingKey
@@ -309,7 +322,7 @@ pub fn plan(
             if !state.is_complete() {
                 return Err(ProvisioningRefusal::NothingToRekey);
             }
-            if foreign {
+            if foreign || ambiguous {
                 return Err(ProvisioningRefusal::ForeignMaterial);
             }
             ProvisioningAction::ReplaceKeyAndCertificate
@@ -404,7 +417,7 @@ mod tests {
     fn an_operators_ca_issued_certificate_is_served_and_never_reissued() {
         let enterprise = MaterialState {
             ownership: Some(MaterialOwnership::Foreign),
-            self_signed: false,
+            legacy_arcen_self_signed: false,
             ..MaterialState::owned_valid()
         };
         assert_eq!(
@@ -420,6 +433,26 @@ mod tests {
                 }
             ),
             Err(ProvisioningRefusal::InvalidCertificate)
+        );
+    }
+
+    #[test]
+    fn ambiguous_marker_material_is_preserved_but_not_adopted() {
+        let ambiguous = MaterialState {
+            ownership: Some(MaterialOwnership::Ambiguous),
+            ..MaterialState::owned_valid()
+        };
+        assert_eq!(
+            plan(ProvisioningRequest::Ensure, ambiguous).map(|plan| plan.action),
+            Ok(ProvisioningAction::KeepExisting)
+        );
+        assert_eq!(
+            plan(ProvisioningRequest::AdoptLegacy, ambiguous),
+            Err(ProvisioningRefusal::ForeignMaterial)
+        );
+        assert_eq!(
+            plan(ProvisioningRequest::Rekey, ambiguous),
+            Err(ProvisioningRefusal::ForeignMaterial)
         );
     }
 
@@ -492,6 +525,18 @@ mod tests {
             ..MaterialState::owned_valid()
         };
         let plan = plan(ProvisioningRequest::Ensure, expiring).expect("renewable");
+        assert_eq!(plan.action, ProvisioningAction::RenewPreservingKey);
+        assert!(!plan.invalidates_pins);
+    }
+
+    #[test]
+    fn expired_owned_material_renews_rather_than_being_refused() {
+        let expired = MaterialState {
+            certificate_valid: false,
+            expiring_or_expired: true,
+            ..MaterialState::owned_valid()
+        };
+        let plan = plan(ProvisioningRequest::Ensure, expired).expect("expired owned cert renews");
         assert_eq!(plan.action, ProvisioningAction::RenewPreservingKey);
         assert!(!plan.invalidates_pins);
     }

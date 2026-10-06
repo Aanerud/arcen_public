@@ -316,9 +316,9 @@ async fn main() {
                 "arcen-client protocol_version={}\n\
                 usage:\n\
                   arcen-client\n\
-                  arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
-                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
+                  arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
+                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
                   arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--full-color-display ID]\n\
                   arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
@@ -395,7 +395,7 @@ async fn main() {
             if let Some(hello) = result.server_hello {
                 println!(
                     "connected uri={} server={} version={} codec={} bit_depth={} range={} \
-                     matrix={} pixel_format={} encoder={} encoder_class={} state={}",
+                     matrix={} pixel_format={} encoder={} encoder_class={} active_pipeline={} state={}",
                     result.uri,
                     hello.server_name,
                     hello.version,
@@ -406,6 +406,9 @@ async fn main() {
                     hello.color_caps.advertised_pix_fmt,
                     hello.encoder_backend,
                     hello.encoder_class,
+                    hello.active_pipeline
+                        .as_ref()
+                        .map_or("absent", arcen_protocol::messages::ServedStreamPipeline::token),
                     result.fsm_state
                 );
             } else if let Some(hello) = result.broker_hello {
@@ -634,6 +637,52 @@ fn parse_video_selection(
     }
 }
 
+fn parse_pipeline(value: &str) -> Result<arcen_media::video::PipelineId, String> {
+    match value {
+        "auto" => Ok(arcen_media::video::PipelineId::Auto),
+        "speed" => Ok(arcen_media::video::PipelineId::Speed),
+        "grading" => Ok(arcen_media::video::PipelineId::Grading),
+        "hdr" => Ok(arcen_media::video::PipelineId::Hdr),
+        _ => Err("--pipeline must be auto, speed, grading, or hdr".to_string()),
+    }
+}
+
+fn stream_profile_for_pipeline(pipeline: arcen_media::video::PipelineId) -> StreamProfile {
+    let contract = arcen_media::video::pipeline_contract(pipeline);
+    StreamProfile {
+        codec: contract.colour.codec.token().to_string(),
+        chroma: contract.colour.chroma.token().to_string(),
+        video_selection: contract.selection,
+        max_fps: contract.max_fps,
+        bit_depth: contract.colour.bit_depth.token().to_string(),
+        color_range: contract.colour.range.token().to_string(),
+        color_matrix: contract.colour.matrix.token().to_string(),
+        transfer: contract.colour.transfer.token().to_string(),
+        color_primaries: contract.colour.primaries.token().to_string(),
+        encode_intent: contract.intent.token().to_string(),
+        motion_priority: contract.priority.token().to_string(),
+        pipeline: contract.id.request_wire(),
+    }
+}
+
+fn has_profile_override_flags(args: &[String]) -> bool {
+    [
+        "--codec",
+        "--chroma",
+        "--video-selection",
+        "--max-fps",
+        "--bit-depth",
+        "--color-range",
+        "--color-matrix",
+        "--transfer",
+        "--color-primaries",
+        "--encode-intent",
+        "--motion-priority",
+    ]
+    .iter()
+    .any(|flag| flag_value(args, flag).is_some())
+}
+
 fn active_chroma_from_pixel_format(
     pixel_format: &str,
 ) -> Option<arcen_deck::protocol::ChromaSubsampling> {
@@ -794,26 +843,48 @@ fn connect_options_from_parts_with_monitors(
     };
 
     let default_profile = StreamProfile::default();
-    let profile = StreamProfile {
-        codec: flag_value(args, "--codec").unwrap_or(default_profile.codec),
-        chroma: flag_value(args, "--chroma").unwrap_or(default_profile.chroma),
-        video_selection: flag_value(args, "--video-selection")
-            .map(|value| parse_video_selection(&value))
-            .transpose()?
-            .unwrap_or(arcen_protocol::messages::VideoSelectionIntent::Exact),
-        max_fps: flag_value(args, "--max-fps")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(default_profile.max_fps),
-        bit_depth: flag_value(args, "--bit-depth").unwrap_or(default_profile.bit_depth),
-        color_range: flag_value(args, "--color-range").unwrap_or(default_profile.color_range),
-        color_matrix: flag_value(args, "--color-matrix").unwrap_or(default_profile.color_matrix),
-        transfer: flag_value(args, "--transfer").unwrap_or(default_profile.transfer),
-        color_primaries: flag_value(args, "--color-primaries")
-            .unwrap_or(default_profile.color_primaries),
-        encode_intent: flag_value(args, "--encode-intent").unwrap_or(default_profile.encode_intent),
-        motion_priority: flag_value(args, "--motion-priority")
-            .unwrap_or(default_profile.motion_priority),
-    };
+    let requested_pipeline = flag_value(args, "--pipeline")
+        .map(|value| parse_pipeline(&value))
+        .transpose()?;
+    let mut profile =
+        requested_pipeline.map_or_else(|| default_profile.clone(), stream_profile_for_pipeline);
+    if has_profile_override_flags(args) {
+        profile.pipeline = None;
+        profile.video_selection = arcen_protocol::messages::VideoSelectionIntent::Exact;
+    }
+    if let Some(value) = flag_value(args, "--codec") {
+        profile.codec = value;
+    }
+    if let Some(value) = flag_value(args, "--chroma") {
+        profile.chroma = value;
+    }
+    if let Some(value) = flag_value(args, "--video-selection") {
+        profile.video_selection = parse_video_selection(&value)?;
+    }
+    if let Some(value) = flag_value(args, "--max-fps").and_then(|value| value.parse::<u32>().ok()) {
+        profile.max_fps = value;
+    }
+    if let Some(value) = flag_value(args, "--bit-depth") {
+        profile.bit_depth = value;
+    }
+    if let Some(value) = flag_value(args, "--color-range") {
+        profile.color_range = value;
+    }
+    if let Some(value) = flag_value(args, "--color-matrix") {
+        profile.color_matrix = value;
+    }
+    if let Some(value) = flag_value(args, "--transfer") {
+        profile.transfer = value;
+    }
+    if let Some(value) = flag_value(args, "--color-primaries") {
+        profile.color_primaries = value;
+    }
+    if let Some(value) = flag_value(args, "--encode-intent") {
+        profile.encode_intent = value;
+    }
+    if let Some(value) = flag_value(args, "--motion-priority") {
+        profile.motion_priority = value;
+    }
     let fixture_displays = smoke_monitor_fixture(args)?;
     let monitors = fixture_displays.as_ref().map_or(live_monitors, |displays| {
         displays
@@ -1003,7 +1074,10 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
                     hard_mode_ready = true;
                 }
             }
-            SessionEvent::BrokerHello(_) | SessionEvent::MicrophoneActive(_) => {}
+            SessionEvent::BrokerHello(_)
+            | SessionEvent::MicrophoneActive(_)
+            | SessionEvent::ConnectionStatusHint(_)
+            | SessionEvent::PresentationRecoveryRequested => {}
         }
     }
 
@@ -1137,6 +1211,7 @@ async fn media_smoke(
     let mut server_supports_yuv444 = false;
     let mut server_active_codec = None;
     let mut server_active_chroma = None;
+    let mut host_active_pipeline = "absent".to_string();
     let mut decoded_summary: Option<String> = None;
     let mut decoded_resolution: Option<(usize, usize)> = None;
     let mut full_frame_requests = FullFrameRequestGate::default();
@@ -1233,7 +1308,7 @@ async fn media_smoke(
             SessionEvent::ServerHello(hello) => {
                 println!(
                     "server={} codec={} bit_depth={} range={} matrix={} primaries={} transfer={} \
-                     pixel_format={} encoder={} encoder_class={} size={}x{} supports_audio={} \
+                     pixel_format={} encoder={} encoder_class={} active_pipeline={} size={}x{} supports_audio={} \
                      yuv444={} av1={}",
                     hello.server_name,
                     hello.codec,
@@ -1245,6 +1320,9 @@ async fn media_smoke(
                     hello.color_caps.advertised_pix_fmt,
                     hello.encoder_backend,
                     hello.encoder_class,
+                    hello.active_pipeline
+                        .as_ref()
+                        .map_or("absent", arcen_protocol::messages::ServedStreamPipeline::token),
                     hello.screen_width,
                     hello.screen_height,
                     hello.supports_audio,
@@ -1270,6 +1348,14 @@ async fn media_smoke(
                 server_supports_h265 = hello.supports_h265;
                 server_supports_av1 = hello.supports_av1;
                 server_supports_yuv444 = hello.supports_yuv444;
+                host_active_pipeline = hello
+                    .active_pipeline
+                    .as_ref()
+                    .map_or(
+                        "absent",
+                        arcen_protocol::messages::ServedStreamPipeline::token,
+                    )
+                    .to_string();
                 server_active_codec = match hello.codec.as_str() {
                     "h264" => Some(arcen_deck::protocol::VideoCodec::H264),
                     "h265" => Some(arcen_deck::protocol::VideoCodec::H265),
@@ -1610,8 +1696,9 @@ async fn media_smoke(
                             println!("health-stats {health}");
                         }
                         println!(
-                            "media-smoke complete displays_mode={} monitors_decoded={} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2}",
+                            "media-smoke complete displays_mode={} active_pipeline={} monitors_decoded={} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2}",
                             requested_displays_mode,
+                            host_active_pipeline,
                             decoded_monitor_ids.len().max(1),
                             decoded_resolution.map_or(0, |resolution| resolution.0),
                             decoded_resolution.map_or(0, |resolution| resolution.1),
@@ -1645,6 +1732,21 @@ async fn media_smoke(
                         }
                     }
                     last_health = Some(value);
+                } else if msg_type(&value) == Some(arcen_protocol::messages::SERVED_PIPELINE) {
+                    // The host's authoritative served identity once its real
+                    // encoder is known; it supersedes the hello's value.
+                    if let Ok(served) = serde_json::from_value::<
+                        arcen_protocol::messages::ServedPipelineMsg,
+                    >(value.clone())
+                    {
+                        println!(
+                            "served-pipeline-update served={} backend={} reason={}",
+                            served.served.token(),
+                            served.backend,
+                            served.reason.as_deref().unwrap_or("-")
+                        );
+                        host_active_pipeline = served.served.token().to_string();
+                    }
                 } else if msg_type(&value) == Some(AUDIO_STREAM_RESULT) {
                     let result = serde_json::from_value::<AudioStreamResultMsg>(value)
                         .map_err(|error| format!("invalid audio result: {error}"))?;
@@ -1664,6 +1766,8 @@ async fn media_smoke(
                         ));
                     }
                 }
+            }
+            SessionEvent::PresentationRecoveryRequested | SessionEvent::ConnectionStatusHint(_) => {
             }
             SessionEvent::MicrophoneActive(active) => {
                 if microphone_requested {
@@ -2082,6 +2186,81 @@ mod tests {
         );
         *args.last_mut().unwrap() = "fastest".to_string();
         assert!(connect_options_from_cli_args(&args).is_err());
+    }
+
+    #[test]
+    fn pipeline_cli_uses_the_shared_contract() {
+        for (token, expected_pipeline) in [
+            ("auto", arcen_protocol::messages::StreamPipeline::Auto),
+            ("speed", arcen_protocol::messages::StreamPipeline::Speed),
+            ("grading", arcen_protocol::messages::StreamPipeline::Grading),
+            ("hdr", arcen_protocol::messages::StreamPipeline::Hdr),
+        ] {
+            let mut args = base_smoke_args();
+            args.extend(["--pipeline".to_string(), token.to_string()]);
+            let options = connect_options_from_cli_args(&args).expect("pipeline parses");
+            let id = parse_pipeline(token).expect("known pipeline");
+            let contract = arcen_media::video::pipeline_contract(id);
+            assert_eq!(options.profile.pipeline, Some(expected_pipeline));
+            assert_eq!(options.profile.codec, contract.colour.codec.token());
+            assert_eq!(options.profile.chroma, contract.colour.chroma.token());
+            assert_eq!(options.profile.video_selection, contract.selection);
+            assert_eq!(options.profile.max_fps, contract.max_fps);
+            assert_eq!(options.profile.bit_depth, contract.colour.bit_depth.token());
+            assert_eq!(options.profile.color_range, contract.colour.range.token());
+            assert_eq!(options.profile.color_matrix, contract.colour.matrix.token());
+            assert_eq!(options.profile.transfer, contract.colour.transfer.token());
+            assert_eq!(
+                options.profile.color_primaries,
+                contract.colour.primaries.token()
+            );
+            assert_eq!(options.profile.encode_intent, contract.intent.token());
+            assert_eq!(options.profile.motion_priority, contract.priority.token());
+        }
+    }
+
+    #[test]
+    fn explicit_video_axis_overrides_pipeline_and_makes_custom_exact() {
+        let mut args = base_smoke_args();
+        args.extend([
+            "--pipeline".to_string(),
+            "speed".to_string(),
+            "--codec".to_string(),
+            "h265".to_string(),
+        ]);
+        let options = connect_options_from_cli_args(&args).expect("custom pipeline override");
+        assert_eq!(options.profile.codec, "h265");
+        assert_eq!(
+            options.profile.max_fps, 60,
+            "other Speed fields remain the base"
+        );
+        assert_eq!(
+            options.profile.video_selection,
+            arcen_protocol::messages::VideoSelectionIntent::Exact
+        );
+        assert_eq!(options.profile.pipeline, None);
+
+        *args.last_mut().unwrap() = "av1".to_string();
+        args.extend([
+            "--video-selection".to_string(),
+            "adaptive-performance".to_string(),
+        ]);
+        let options = connect_options_from_cli_args(&args).expect("explicit selection");
+        assert_eq!(
+            options.profile.video_selection,
+            arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
+        );
+        assert_eq!(options.profile.pipeline, None);
+    }
+
+    #[test]
+    fn pipeline_cli_rejects_unknown_tokens() {
+        let mut args = base_smoke_args();
+        args.extend(["--pipeline".to_string(), "cinema".to_string()]);
+        assert_eq!(
+            connect_options_from_cli_args(&args).unwrap_err(),
+            "--pipeline must be auto, speed, grading, or hdr"
+        );
     }
 
     #[test]

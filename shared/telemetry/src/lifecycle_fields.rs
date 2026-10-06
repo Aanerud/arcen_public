@@ -104,6 +104,8 @@ pub struct StreamStart<'a> {
     pub height: u32,
     /// Frames per second, when a target exists.
     pub fps: Option<u32>,
+    /// Named product pipeline, when known.
+    pub pipeline: Option<&'a str>,
     /// The colour identity of the stream being started.
     ///
     /// Optional only so an emitter that genuinely cannot describe its colour
@@ -151,6 +153,11 @@ pub fn session_stream_start(start: StreamStart<'_>) -> Option<StructuredFields> 
     if let Some(fps) = start.fps {
         fields
             .insert("fps", FieldValue::Integer(i64::from(fps)))
+            .ok()?;
+    }
+    if let Some(pipeline) = start.pipeline {
+        fields
+            .insert("pipeline", FieldValue::String(pipeline.to_owned()))
             .ok()?;
     }
     if let Some(color) = start.color {
@@ -294,6 +301,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 fps: Some(60),
+                pipeline: Some("speed"),
                 color: None,
             })
         ));
@@ -311,6 +319,7 @@ mod tests {
             width: 1920,
             height: 1080,
             fps: Some(60),
+            pipeline: Some("grading"),
             color: Some(ColorIdentity {
                 bit_depth: "10",
                 color_range: "limited",
@@ -331,6 +340,7 @@ mod tests {
             "color_matrix",
             "color_primaries",
             "transfer",
+            "pipeline",
         ] {
             assert!(rendered.contains(key), "{key} must reach the record");
         }

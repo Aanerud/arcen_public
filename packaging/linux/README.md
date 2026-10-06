@@ -59,7 +59,13 @@ operator-managed PEM from
 `/etc/arcen/host.crt` and `host.key`; the private key must be exactly mode
 `0600`, and the certificate must be `0644` or stricter. Enterprise
 installations should place their complete CA-issued pair there before
-deployment. Upgrades never overwrite a complete pair.
+deployment. Upgrades never overwrite operator CA-issued material. A complete
+self-signed pair without `host.generated-by-arcen` is taken over only when it
+matches the legacy Arcen Linux installer profile; the installer reissues the
+certificate over the existing key, preserves the old DNS/IP SANs while merging
+newly discovered or supplied names, writes the shared ownership marker and pin
+files, and keeps Deck SPKI pins stable. Ambiguous self-signed material or a
+mismatched marker is preserved as operator-managed.
 
 `arcen-new-host-cert` is the reviewed SMB helper. OpenSSL and util-linux
 `flock` are required by this helper only, not by the running service. `flock`
@@ -83,8 +89,8 @@ sudo /opt/arcen/bin/arcen-new-host-cert --renew --directory /etc/arcen
 sudo systemctl reload arcen-pier
 ```
 
-For a SAN-less pair created by the previous inline Arcen helper, explicitly
-adopt it once while preserving its key:
+For a SAN-less pair created by the previous inline Arcen helper outside the
+installer path, explicitly adopt it once while preserving its key:
 
 ```sh
 sudo /opt/arcen/bin/arcen-new-host-cert --renew --adopt-legacy --directory /etc/arcen
@@ -103,8 +109,10 @@ sudo systemctl reload arcen-pier
 
 The helper stages, fsyncs, journals, backs up, and atomically renames files in
 the TLS directory; the next invocation recovers an interrupted transaction.
-It rejects symlinks in destinations and transaction artifacts. The running
-Pier never issues or rotates certificates. `SIGHUP` independently reloads
+It rejects symlinks in destinations and transaction artifacts. The installer
+takes the same `.arcen-cert.lock` and uses the same journaled publication set
+when it creates, adopts, renews, or rekeys material. The running Pier never
+issues or rotates certificates. `SIGHUP` independently reloads
 logging and validates/reloads PEM; either reload can succeed while the other
 fails, and invalid material leaves the last good certificate active.
 

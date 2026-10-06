@@ -28,8 +28,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BIN="$REPO/target/release/arcen-pier-macos"
-OUT="$REPO/dist/macos"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+BIN="$TARGET_DIR/release/arcen-pier-macos"
+OUT="${ARCEN_MACOS_OUT:-$REPO/dist/macos}"
+SCRATCH="${ARCEN_BUILD_SCRATCH:-$REPO/.arcen-build}/macos-app.$$"
+mkdir -p "$SCRATCH"
 APP="$OUT/Arcen Pier.app"
 IDENTITY=""
 NOTARY_PROFILE=""
@@ -261,7 +264,9 @@ if (( WITH_PROFILE )); then
   fi
   [[ -f "$ENT" ]] || { echo "error: $ENT is missing" >&2; exit 1; }
 
-  SIGN_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/arcen-pier-sign.XXXXXX")"
+  SIGN_TEMP="$SCRATCH/sign"
+  rm -rf "$SIGN_TEMP"
+  mkdir -p "$SIGN_TEMP"
   trap 'rm -rf "$SIGN_TEMP"' EXIT
   PROFILE_SNAPSHOT="$SIGN_TEMP/profile.provisionprofile"
   PROFILE_METADATA="$SIGN_TEMP/profile.plist"
@@ -326,7 +331,7 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
     echo "error: notarization requires --identity; Apple will not notarize unsigned code" >&2
     exit 2
   }
-  ZIP="$(mktemp -d)/ArcenPier.zip"
+  ZIP="$SCRATCH/ArcenPier.zip"
   # ditto, not zip: it preserves the bundle structure and extended attributes
   # notarization inspects.
   ditto -c -k --keepParent "$APP" "$ZIP"

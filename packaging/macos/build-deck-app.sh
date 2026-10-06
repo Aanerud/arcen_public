@@ -2,16 +2,22 @@
 # Build "Arcen Deck.app" — the macOS client bundle.
 #
 # Compiles arcen-deck-macos in release and assembles a minimal .app around it.
-# Output: <repo>/dist/macos/Arcen Deck.app (git-ignored; regenerate any time with
-# this script). --release also writes dist/macos/Arcen-Deck-<version>-macOS.zip.
+# Output: ${ARCEN_DECK_OUTPUT_DIR:-<repo>/dist/macos}/Arcen Deck.app
+# (git-ignored; regenerate any time with this script). --release also writes
+# Arcen-Deck-<version>-macOS.zip in that output directory.
 #
-# Usage: packaging/macos/build-deck-app.sh [--no-build] [--release | --dev-sign]
+# Usage: packaging/macos/build-deck-app.sh [--no-build] [--release | --dev-sign | --developer-id-sign]
 #
-# Three distinct, mutually exclusive assembly modes:
+# Four distinct, mutually exclusive assembly modes:
 #   (default)    unsigned ordinary assembly; rejects any protected input.
 #   --dev-sign   explicit local development signing: external Apple Development
 #                identity/profile, verified team/bundle/entitlements, no
 #                notarization. Never auto-discovers a keychain identity.
+#   --developer-id-sign
+#                explicit local Developer ID signing with the release
+#                profile/identity, verified like --release but not notarized
+#                and with no distribution zip. Intended for same-machine live
+#                testing of Developer ID-only OS permissions.
 #   --release    explicit Developer ID release signing: external Developer ID
 #                identity/profile, verified team/bundle/entitlements, CMS trust,
 #                notarization, staple, and Gatekeeper assessment.
@@ -19,10 +25,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-OUT="$REPO/dist/macos"
+OUT="${ARCEN_DECK_OUTPUT_DIR:-$REPO/dist/macos}"
 APP="$OUT/Arcen Deck.app"
 mkdir -p "$OUT"
-BIN="$REPO/target/release/arcen-deck"
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+BIN="$BUILD_TARGET_DIR/release/arcen-deck"
 PLIST="$HERE/Deck-Info.plist"
 # Hard USB is a product feature, so the helper is embedded unless someone
 # deliberately opts out with ARCEN_EMBED_USB_HELPER=0. It defaulted to off,
@@ -43,16 +50,52 @@ CMS_VERIFIER_SOURCE="$HERE/verify-provisioning-cms.c"
 NO_BUILD=0
 RELEASE=0
 DEV_SIGN=0
+DEVELOPER_ID_SIGN=0
 for argument in "$@"; do
   case "$argument" in
     --no-build) NO_BUILD=1 ;;
     --release) RELEASE=1 ;;
     --dev-sign) DEV_SIGN=1 ;;
+    --developer-id-sign) DEVELOPER_ID_SIGN=1 ;;
     *) echo "error: unknown argument: $argument" >&2; exit 2 ;;
   esac
 done
-if [ "$RELEASE" -eq 1 ] && [ "$DEV_SIGN" -eq 1 ]; then
-  echo "error: --release and --dev-sign are mutually exclusive" >&2
+if [ $((RELEASE + DEV_SIGN + DEVELOPER_ID_SIGN)) -gt 1 ]; then
+  echo "error: --release, --dev-sign, and --developer-id-sign are mutually exclusive" >&2
+  exit 2
+fi
+
+normalize_deck_features() {
+  local RAW="${1:-}"
+  local NORMALIZED=""
+  local OLD_IFS="$IFS"
+  local TOKEN
+  local FEATURE
+  IFS=' ,'
+  for TOKEN in $RAW; do
+    [ -n "$TOKEN" ] || continue
+    FEATURE="${TOKEN##*/}"
+    if [ -z "$NORMALIZED" ]; then
+      NORMALIZED="$FEATURE"
+    elif [[ ",$NORMALIZED," != *",$FEATURE,"* ]]; then
+      NORMALIZED="$NORMALIZED,$FEATURE"
+    fi
+  done
+  IFS="$OLD_IFS"
+  printf '%s' "$NORMALIZED"
+}
+
+feature_list_contains() {
+  local FEATURES="$1"
+  local NEEDLE="$2"
+  [[ ",$FEATURES," == *",$NEEDLE,"* ]]
+}
+
+DECK_FEATURES="$(normalize_deck_features "${ARCEN_DECK_FEATURES:-}")"
+DEV_TOOLS_MARKER="ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP"
+
+if [ "$RELEASE" -eq 1 ] && feature_list_contains "$DECK_FEATURES" "dev-tools"; then
+  echo "error: --release must not be built with dev-tools (ARCEN_DECK_FEATURES)" >&2
   exit 2
 fi
 
@@ -92,20 +135,34 @@ if [ "$NO_BUILD" -eq 0 ]; then
   # are one decision, not two. Keeping them separate already shipped a bundle
   # whose UI reported "(not available in this build)" while the helper sat
   # right next to it.
-  DECK_FEATURES=""
+  append_deck_feature() {
+    local FEATURE="$1"
+    if [ -z "$DECK_FEATURES" ]; then
+      DECK_FEATURES="$FEATURE"
+    elif [[ ",$DECK_FEATURES," != *",$FEATURE,"* ]]; then
+      DECK_FEATURES="$DECK_FEATURES,$FEATURE"
+    fi
+  }
   if [ "$EMBED_USB_HELPER" = "1" ]; then
-    DECK_FEATURES="--features usb-hard-lab"
+    append_deck_feature "usb-hard-lab"
     echo "==> cargo build --locked --release -p arcen-usb-helper"
     ( cd "$REPO" && "${CARGO[@]}" build --locked --release -p arcen-usb-helper )
   fi
-  echo "==> cargo build --locked --release -p arcen-deck-macos $DECK_FEATURES"
-  # shellcheck disable=SC2086
-  ( cd "$REPO" && bash scripts/verify-opusic-source.sh && "${CARGO[@]}" build --locked --release -p arcen-deck-macos $DECK_FEATURES )
+  CARGO_DECK_ARGS=(build --locked --release -p arcen-deck-macos)
+  if [ -n "$DECK_FEATURES" ]; then
+    CARGO_DECK_ARGS=("${CARGO_DECK_ARGS[@]}" --features "$DECK_FEATURES")
+  fi
+  echo "==> cargo ${CARGO_DECK_ARGS[*]}"
+  ( cd "$REPO" && bash scripts/verify-opusic-source.sh && "${CARGO[@]}" "${CARGO_DECK_ARGS[@]}" )
 fi
 
 [ -x "$BIN" ] || { echo "error: $BIN not found; build first"; exit 1; }
 [ -f "$ENTITLEMENTS" ] || { echo "error: entitlements file not found: $ENTITLEMENTS"; exit 1; }
 python3 "$REPO/scripts/verify_quic_product_binary.py" "$BIN"
+if [ "$RELEASE" -eq 1 ] && strings "$BIN" | grep -F "$DEV_TOOLS_MARKER" >/dev/null; then
+    echo "error: release binary contains dev-tools marker; rebuild without dev-tools in a clean target dir" >&2
+    exit 1
+fi
 
 echo "==> assembling $APP"
 rm -rf "$APP"
@@ -124,7 +181,7 @@ chmod +x "$APP/Contents/MacOS/arcen-deck"
 # all. SMAppService requires the plist under Contents/Library/LaunchDaemons and
 # honours BundleProgram relative to the bundle root.
 # See docs/adr/0011-macos-privileged-usb-helper.md.
-HELPER_BIN="$REPO/target/release/arcen-usb-helper"
+HELPER_BIN="$BUILD_TARGET_DIR/release/arcen-usb-helper"
 HELPER_PLIST="$REPO/packaging/macos/tech.arcen.deck.usbhelper.plist"
 EMBED_HELPER=0
 if [ "$EMBED_USB_HELPER" = "1" ]; then
@@ -191,7 +248,9 @@ run_signed_assembly() {
         exit 1
     }
 
-    SIGN_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/arcen-deck-$MODE.XXXXXX")"
+    SIGN_TEMP="$OUT/signing-$MODE-$$"
+    rm -rf "$SIGN_TEMP"
+    mkdir -p "$SIGN_TEMP"
     PROFILE_SNAPSHOT="$SIGN_TEMP/profile.provisionprofile"
     PROFILE_METADATA="$SIGN_TEMP/profile.plist"
     SIGNATURE_METADATA="$SIGN_TEMP/signature.txt"
@@ -267,18 +326,20 @@ run_signed_assembly() {
         rm -f "$RELEASE_ZIP"
         ditto -c -k --keepParent "$APP" "$RELEASE_ZIP"
         echo "==> wrote $RELEASE_ZIP"
-    else
+    elif [ "$MODE" = "dev" ]; then
         echo "==> signed with a local Apple Development identity — development mode only, not notarized"
+    else
+        echo "==> signed with a Developer ID identity for local testing — not notarized or zipped"
     fi
 
     cleanup_signing_metadata
     trap - EXIT
 }
 
-if [ "$RELEASE" -eq 0 ] && [ "$DEV_SIGN" -eq 0 ]; then
+if [ "$RELEASE" -eq 0 ] && [ "$DEV_SIGN" -eq 0 ] && [ "$DEVELOPER_ID_SIGN" -eq 0 ]; then
     if [ -n "$PROFILE" ] || [ -n "$SIGN_ID" ] || [ -n "$NOTARY_PROFILE" ] || \
        [ -n "$DEV_PROFILE" ] || [ -n "$DEV_SIGN_ID" ]; then
-        echo "error: protected signing inputs require explicit --dev-sign or --release mode" >&2
+        echo "error: protected signing inputs require explicit --dev-sign, --developer-id-sign, or --release mode" >&2
         exit 1
     fi
     echo "    UNSIGNED. Fine on this machine; Gatekeeper will reject it anywhere else."
@@ -303,6 +364,20 @@ elif [ "$DEV_SIGN" -eq 1 ]; then
         exit 1
     fi
     run_signed_assembly "dev" "$DEV_PROFILE" "$DEV_SIGN_ID" "apple-development" "development"
+elif [ "$DEVELOPER_ID_SIGN" -eq 1 ]; then
+    [ -n "$PROFILE" ] && [ -f "$PROFILE" ] || {
+        echo "error: --developer-id-sign requires an external ARCEN_PROVISIONING_PROFILE file" >&2
+        exit 1
+    }
+    [ -n "$SIGN_ID" ] || {
+        echo "error: --developer-id-sign requires ARCEN_CODESIGN_IDENTITY" >&2
+        exit 1
+    }
+    if [ -n "$NOTARY_PROFILE" ] || [ -n "$DEV_PROFILE" ] || [ -n "$DEV_SIGN_ID" ]; then
+        echo "error: --developer-id-sign must not be combined with ARCEN_NOTARY_KEYCHAIN_PROFILE, ARCEN_DEV_PROVISIONING_PROFILE, or ARCEN_DEV_CODESIGN_IDENTITY" >&2
+        exit 1
+    fi
+    run_signed_assembly "developer-id" "$PROFILE" "$SIGN_ID" "developer-id" "release"
 else
     [ -n "$PROFILE" ] && [ -f "$PROFILE" ] || {
         echo "error: release requires an external ARCEN_PROVISIONING_PROFILE file" >&2

@@ -101,6 +101,7 @@ mod config;
 mod cp_pipe;
 mod cursor_watcher;
 mod deskside;
+mod diagnostics;
 mod display;
 mod edid;
 mod encoder_admission;
@@ -177,6 +178,7 @@ mod service {
         TemporaryDebug,
         ReloadConfigured,
         ReloadTls,
+        SessionChange,
     }
     pub(crate) async fn next_control_request() -> ServiceControlRequest {
         std::future::pending::<ServiceControlRequest>().await
@@ -378,12 +380,15 @@ pub struct HostConfig {
     /// without changing the format a client decodes, so there is nothing to
     /// negotiate. See `docs/architecture/qp-maps.md`.
     pub qp_map: arcen_media::video::QpMapPolicy,
+    pub qp_map_config: Option<arcen_session::pier_config::QpMapConfig>,
     pub video_selection: VideoSelectionIntent,
     /// Explicit administrator codec pin. The internal default codec remains
     /// only a legacy-client fallback when no auth-time request is available.
     pub codec_pinned: bool,
     pub variant_pinned: bool,
     pub auth_video_request: Option<InitialVideoRequestMsg>,
+    pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
     pub encoder: crate::capenc::EncoderSelection,
     pub audio_enabled: bool,
@@ -393,12 +398,22 @@ pub struct HostConfig {
     pub timezone_redirection: bool,
     pub reconnect_window_secs: u32,
     pub qos_targets: arcen_telemetry::QosTargets,
+    pub debug_diagnostics: bool,
     pub deskside: deskside::DesksideConfig,
     pub iddcx: config::WindowsIddCxConfig,
     pub multi_monitor: config::WindowsMultiMonitorConfig,
 }
 
 impl HostConfig {
+    pub(crate) fn qp_map_policy_for_served(
+        &self,
+        served: &arcen_protocol::messages::ServedStreamPipeline,
+    ) -> Option<arcen_media::video::QpMapPolicy> {
+        let config = self.qp_map_config.as_ref()?;
+        let token = config.effective_token(served.token()).ok()?;
+        arcen_media::video::QpMapPolicy::from_token(token)
+    }
+
     pub fn codec_name(&self) -> &'static str {
         codec_name(self.codec)
     }
@@ -408,6 +423,13 @@ impl HostConfig {
     }
 
     pub(crate) fn requested_encode_intent(&self) -> arcen_media::EncodeIntent {
+        if let Some(active) = self.active_pipeline.as_ref() {
+            if let Some(pipeline) = arcen_media::video::PipelineId::from_served_wire(active) {
+                return arcen_media::video::pipeline_contract(pipeline).intent;
+            }
+        } else if let Some(pipeline) = self.requested_pipeline {
+            return arcen_media::video::pipeline_contract(pipeline).intent;
+        }
         self.auth_video_request
             .as_ref()
             .and_then(|request| {
@@ -417,6 +439,13 @@ impl HostConfig {
     }
 
     pub(crate) fn requested_motion_priority(&self) -> arcen_media::video::MotionPriority {
+        if let Some(active) = self.active_pipeline.as_ref() {
+            if let Some(pipeline) = arcen_media::video::PipelineId::from_served_wire(active) {
+                return arcen_media::video::pipeline_contract(pipeline).priority;
+            }
+        } else if let Some(pipeline) = self.requested_pipeline {
+            return arcen_media::video::pipeline_contract(pipeline).priority;
+        }
         self.auth_video_request
             .as_ref()
             .and_then(|request| {
@@ -431,6 +460,13 @@ impl HostConfig {
     ) -> Result<(), String> {
         if active != crate::capenc::EncoderSelection::SoftwareH264 {
             return Ok(());
+        }
+        let software_decision = arcen_media::video::software_fallback_decision(
+            self.requested_pipeline,
+            self.video_selection,
+        );
+        if software_decision.is_refusal() {
+            return Err(software_decision.reason().to_string());
         }
         if self.variant_pinned && !self.exact_pins_allow_software_h264() {
             return Err(
@@ -515,6 +551,25 @@ impl HostConfig {
         )
         .map_err(|error| format!("initial video request: {error}"))?;
         self.auth_video_request = Some(request.clone());
+        self.requested_pipeline = resolved.pipeline;
+        self.active_pipeline = Some(arcen_media::video::served_pipeline(
+            self.requested_pipeline,
+            resolved.video,
+            resolved.max_fps,
+            client.motion_priority,
+            arcen_media::video::ServedPipelineContext {
+                backend: Some(
+                    if self.encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+                        arcen_media::video::AcceleratorClass::Software
+                    } else {
+                        arcen_media::video::AcceleratorClass::Hardware
+                    },
+                ),
+                exact_or_admin_override: self.codec_pinned
+                    || self.variant_pinned
+                    || self.requested_pipeline.is_none(),
+            },
+        ));
         self.fps = resolved.max_fps;
         self.codec = crate::capenc::protocol_codec(resolved.video.codec);
         self.chroma = crate::capenc::protocol_chroma(resolved.video.chroma);
@@ -1368,6 +1423,7 @@ where
     let mut profile = arcen_telemetry::OperationalProfile::Critical;
     let mut profile_override = None;
     let mut profile_source = arcen_session::pier_config::LoggingProfileSource::ProductionDefault;
+    let mut debug_diagnostics = false;
     let mut qos_targets = arcen_telemetry::QosTargets::default();
     let mut rotate_mb = arcen_telemetry::DEFAULT_ROTATE_BYTES / (1024 * 1024);
     let mut retention_days = arcen_telemetry::DEFAULT_RETENTION_DAYS;
@@ -1380,6 +1436,7 @@ where
     let mut color_matrix = ColorMatrix::Bt709;
     let mut color_policy = ColorPolicy::DefaultOff;
     let mut qp_map = arcen_media::video::QpMapPolicy::default();
+    let mut qp_map_config = None;
     let mut video_selection = VideoSelectionIntent::Exact;
     let mut codec_pinned = false;
     let mut variant_pinned = false;
@@ -1409,6 +1466,7 @@ where
             .resolved_profile()
             .map_err(|error| format!("Pier config logging profile: {error}"))?;
         profile = resolved.profile;
+        debug_diagnostics = profile.includes(arcen_telemetry::OperationalProfile::Debug);
         profile_source = resolved.source;
         qos_targets = file.logging.qos_targets;
         if let Some(value) = file.platform.logging.rotate_mb {
@@ -1510,15 +1568,9 @@ where
                 .map_err(|error| format!("Pier config video.color_policy: {error}"))?;
         }
         if let Some(value) = file.video.qp_map {
-            qp_map = arcen_media::video::QpMapPolicy::from_token(&value.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    let known = arcen_media::video::QpMapPolicy::ALL
-                        .iter()
-                        .map(|policy| policy.token())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("Pier config video.qp_map {value:?}: expected one of {known}")
-                })?;
+            let effective = value.effective_token("auto")?;
+            qp_map = arcen_media::video::QpMapPolicy::from_token(effective).unwrap_or_default();
+            qp_map_config = Some(value);
         }
         if let Some(value) = file.video.variant {
             apply_variant(
@@ -1705,6 +1757,7 @@ where
                 let selected = arcen_telemetry::OperationalProfile::try_from(value)
                     .map_err(|error| error.to_string())?;
                 profile = selected;
+                debug_diagnostics = profile.includes(arcen_telemetry::OperationalProfile::Debug);
                 profile_override = Some(selected);
                 profile_source = arcen_session::pier_config::LoggingProfileSource::Level;
             }
@@ -1720,16 +1773,19 @@ where
                 .map_err(|error| error.to_string())?
                 .profile;
                 profile = selected;
+                debug_diagnostics = profile.includes(arcen_telemetry::OperationalProfile::Debug);
                 profile_override = Some(selected);
                 profile_source = arcen_session::pier_config::LoggingProfileSource::LegacyVerbosity;
             }
             "-v" | "--verbose" => {
                 profile = arcen_telemetry::OperationalProfile::Debug;
+                debug_diagnostics = true;
                 profile_override = Some(profile);
                 profile_source = arcen_session::pier_config::LoggingProfileSource::Level;
             }
             "--quiet" => {
                 profile = arcen_telemetry::OperationalProfile::Critical;
+                debug_diagnostics = false;
                 profile_override = Some(profile);
                 profile_source = arcen_session::pier_config::LoggingProfileSource::Level;
             }
@@ -1885,10 +1941,13 @@ where
         color_primaries: arcen_media::ColorPrimaries::Bt709,
         color_policy,
         qp_map,
+        qp_map_config,
         video_selection,
         codec_pinned,
         variant_pinned,
         auth_video_request: None,
+        requested_pipeline: None,
+        active_pipeline: None,
         fps,
         encoder,
         audio_enabled,
@@ -1898,6 +1957,7 @@ where
         timezone_redirection,
         reconnect_window_secs,
         qos_targets,
+        debug_diagnostics,
         deskside,
         iddcx,
         multi_monitor,
@@ -2881,6 +2941,80 @@ fn spawn_compatibility_session(
     });
 }
 
+#[derive(Default)]
+struct WtsTopologyDebugWorker {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
+}
+
+impl WtsTopologyDebugWorker {
+    fn request(&self, stage: &'static str) {
+        if !tracing::enabled!(target: NET, tracing::Level::DEBUG) {
+            return;
+        }
+        let sender = {
+            let mut slot = self
+                .sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = spawn_wts_topology_debug_thread();
+            }
+            slot.clone()
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(stage);
+        }
+    }
+}
+
+fn spawn_wts_topology_debug_thread() -> Option<std::sync::mpsc::Sender<&'static str>> {
+    let (sender, receiver) = std::sync::mpsc::channel::<&'static str>();
+    match std::thread::Builder::new()
+        .name("arcen-wts-topology-debug".to_string())
+        .spawn(move || {
+            let mut dedupe = WtsTopologyLogDeduper::default();
+            while let Ok(mut stage) = receiver.recv() {
+                for queued in receiver.try_iter() {
+                    stage = queued;
+                }
+                let topology = windows_session::topology_summary();
+                if dedupe.should_log(&topology) {
+                    tracing::debug!(
+                        target: NET,
+                        stage,
+                        topology = %topology,
+                        "Windows WTS session topology"
+                    );
+                }
+            }
+        }) {
+        Ok(_detached) => Some(sender),
+        Err(error) => {
+            tracing::debug!(
+                target: NET,
+                %error,
+                "could not start Windows WTS topology debug thread"
+            );
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WtsTopologyLogDeduper {
+    last: Option<String>,
+}
+
+impl WtsTopologyLogDeduper {
+    fn should_log(&mut self, topology: &str) -> bool {
+        if self.last.as_deref() == Some(topology) {
+            false
+        } else {
+            self.last = Some(topology.to_owned());
+            true
+        }
+    }
+}
 pub(crate) async fn run_host<F, S>(
     args: Args,
     log_controller: logging::LogController,
@@ -2987,7 +3121,10 @@ where
     log_maintenance_interval.tick().await;
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
     tls_health_interval.tick().await;
+    let topology_debug = WtsTopologyDebugWorker::default();
     on_started();
+    diagnostics::spawn_startup_debug_diagnostics(quic_bind);
+    topology_debug.request("startup");
     emit_effective_profile(
         &emitter,
         args.profile,
@@ -3081,6 +3218,9 @@ where
                             ),
                         }
                     }
+                    service::ServiceControlRequest::SessionChange => {
+                        topology_debug.request("session_change");
+                    }
                 }
                 continue;
             }
@@ -3104,6 +3244,15 @@ where
             incoming = quic_endpoint.accept() => {
                 if let Some(incoming) = incoming {
                     let peer = incoming.remote_address();
+                    let local_ip = incoming.local_ip();
+                    let remote_validated = incoming.remote_address_validated();
+                    tracing::debug!(
+                        target: NET,
+                        %peer,
+                        local_ip = local_ip.map(|ip| ip.to_string()).as_deref().unwrap_or("unknown"),
+                        remote_validated,
+                        "QUIC incoming connection attempt"
+                    );
                     let preauth_permit = match preauth_slots.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -3123,6 +3272,10 @@ where
                     let resume_registry = Arc::clone(&resume_registry);
                     let session_shutdown = session_shutdown.subscribe();
                     sessions.spawn(async move {
+                        let handshake_started = std::time::Instant::now();
+                        let local_addr = local_ip
+                            .map(|ip| std::net::SocketAddr::new(ip, quic_bind.port()).to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let selected_host_identity = match connection_tls.host_identity() {
                             Ok(identity) => identity,
                             Err(error) => {
@@ -3141,13 +3294,35 @@ where
                         )
                         .await
                         {
-                            Ok(Ok(connection)) => connection,
+                            Ok(Ok(connection)) => {
+                                tracing::debug!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    handshake_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "QUIC TLS handshake completed"
+                                );
+                                connection
+                            }
                             Ok(Err(error)) => {
-                                tracing::debug!(target: NET, %peer, %error, "QUIC TLS handshake failed");
+                                tracing::debug!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    %error,
+                                    handshake_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "QUIC TLS handshake failed"
+                                );
                                 return;
                             }
                             Err(_) => {
-                                tracing::debug!(target: NET, %peer, "QUIC TLS handshake timed out");
+                                tracing::debug!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    handshake_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "QUIC TLS handshake timed out"
+                                );
                                 return;
                             }
                         };
@@ -3188,11 +3363,24 @@ where
                         {
                             Ok(Ok(stream)) => stream,
                             Ok(Err(error)) => {
-                                tracing::debug!(target: NET, %peer, %error, "QUIC direct stream failed");
+                                tracing::debug!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    %error,
+                                    elapsed_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "QUIC direct stream failed"
+                                );
                                 return;
                             }
                             Err(_) => {
-                                tracing::debug!(target: NET, %peer, "QUIC direct stream timed out");
+                                tracing::debug!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    elapsed_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "QUIC direct stream timed out"
+                                );
                                 return;
                             }
                         };
@@ -3454,6 +3642,15 @@ async fn run_session_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wts_topology_deduper_logs_startup_and_changes_only() {
+        let mut deduper = WtsTopologyLogDeduper::default();
+        assert!(deduper.should_log("console=4 active"));
+        assert!(!deduper.should_log("console=4 active"));
+        assert!(deduper.should_log("console=5 active"));
+        assert!(!deduper.should_log("console=5 active"));
+    }
 
     fn expect_args_error(result: Result<Args, String>) -> String {
         match result {
@@ -4153,6 +4350,7 @@ mod tests {
                 full_range: true,
                 ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
             },
+            pipeline: None,
         }
     }
 
@@ -4200,6 +4398,38 @@ mod tests {
         assert_eq!(pinned.codec, VideoCodec::H265);
         assert_eq!(pinned.chroma, ChromaSubsampling::Yuv444);
         assert!(pinned.auth_video_request.is_some());
+    }
+
+    #[test]
+    fn speed_pipeline_contract_drives_motion_priority() {
+        let mut config = parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .config;
+        let mut request = initial_video_request(VideoSelectionIntent::AdaptivePerformance);
+        request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Speed);
+        request.quality.max_fps = 60;
+        request.quality.motion_priority = "detail".to_string();
+        config.apply_initial_video_request(&request).unwrap();
+        config.active_pipeline = Some(arcen_protocol::messages::ServedStreamPipeline::Speed);
+        assert_eq!(
+            config.requested_motion_priority(),
+            arcen_media::video::MotionPriority::Motion,
+            "served Speed uses the shared contract's motion priority"
+        );
+        assert_eq!(
+            config.requested_encode_intent(),
+            arcen_media::EncodeIntent::Interactive
+        );
     }
 
     #[test]
@@ -4292,6 +4522,41 @@ mod tests {
         assert!(pinned
             .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
             .is_err());
+    }
+
+    #[test]
+    fn software_host_refuses_grading_with_shared_user_reason() {
+        let mut software = parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+                "--encoder",
+                "software-h264",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .config;
+        let mut request = initial_video_request(VideoSelectionIntent::ColorFidelity);
+        request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Grading);
+        let error = software
+            .apply_initial_video_request_for_encoder(
+                &request,
+                crate::capenc::EncoderSelection::SoftwareH264,
+            )
+            .expect_err("Grading requires hardware");
+        assert_eq!(
+            error,
+            arcen_media::video::software_fallback_decision(
+                Some(arcen_media::video::PipelineId::Grading),
+                VideoSelectionIntent::ColorFidelity,
+            )
+            .reason()
+        );
     }
 
     #[test]

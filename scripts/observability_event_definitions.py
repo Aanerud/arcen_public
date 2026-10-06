@@ -111,6 +111,7 @@ EVENT_DEFINITIONS = {
         ),
         (
             ("fps", INTEGER),
+            ("pipeline", STRING),
             ("display_backend", STRING),
             ("bit_depth", STRING),
             ("color_range", STRING),
@@ -383,7 +384,7 @@ EVENT_DEFINITIONS = {
         "connection",
         "failed",
         (("reason_class", STRING),),
-        (("stage", STRING),),
+        (("stage", STRING), ("errno", INTEGER), ("network_scope", STRING)),
     ),
     1505: _event(
         "CLIENT_SESSION_END",

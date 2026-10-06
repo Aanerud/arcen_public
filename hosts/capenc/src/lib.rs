@@ -396,6 +396,17 @@ pub fn log(msg: &str) {
     );
 }
 
+#[cfg(windows)]
+pub(crate) fn debug_log(msg: &str) {
+    if std::env::var_os("ARCEN_CAPENC_DEBUG").is_some()
+        || std::env::var_os("ARCEN_DEBUG").is_some()
+        || std::env::var_os("RUST_LOG")
+            .is_some_and(|value| value.to_string_lossy().contains("debug"))
+    {
+        log(msg);
+    }
+}
+
 /// Logs what an HEVC stream's SPS says it carries, whenever that changes.
 ///
 /// The plan says what was asked for; the SPS is what the Deck's decoder
@@ -685,6 +696,32 @@ pub(crate) fn requested_motion_priority(args: &[String]) -> Result<MotionPriorit
         );
     }
     Ok(selected.unwrap_or_default())
+}
+
+/// Optional encoder-side bitrate ceiling, in bits per second.
+///
+/// The parent Pier derives this from the served shared pipeline contract. An
+/// absent token preserves the shipped encoder setup; a repeated or invalid
+/// token is refused so a fidelity run cannot silently benchmark the wrong
+/// ceiling.
+#[cfg(any(test, windows, target_os = "linux"))]
+pub(crate) fn requested_encoder_max_bitrate_bps(args: &[String]) -> Result<Option<u32>, String> {
+    let mut selected = None;
+    for value in args
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("max-bitrate="))
+    {
+        if selected.is_some() {
+            return Err("max-bitrate may be specified only once".to_string());
+        }
+        let bps = value
+            .parse::<u32>()
+            .ok()
+            .filter(|bps| *bps > 0)
+            .ok_or_else(|| format!("invalid max-bitrate {value:?}: expected a positive u32"))?;
+        selected = Some(bps);
+    }
+    Ok(selected)
 }
 
 /// Linux's portable OpenH264 path has neither the quality NVENC preset nor
@@ -1276,6 +1313,25 @@ mod tests {
         );
         assert!(requested_qp_map(&args_vec(&["qp-map=maybe"])).is_err());
         assert!(requested_qp_map(&args_vec(&["qp-map=on", "qp-map=off"])).is_err());
+    }
+
+    #[test]
+    fn max_bitrate_parses_as_an_optional_positive_u32() {
+        assert_eq!(
+            requested_encoder_max_bitrate_bps(&args_vec(&["0", "h265", "60"])).unwrap(),
+            None
+        );
+        assert_eq!(
+            requested_encoder_max_bitrate_bps(&args_vec(&["max-bitrate=250000000"])).unwrap(),
+            Some(250_000_000)
+        );
+        assert!(requested_encoder_max_bitrate_bps(&args_vec(&["max-bitrate=0"])).is_err());
+        assert!(requested_encoder_max_bitrate_bps(&args_vec(&["max-bitrate=nope"])).is_err());
+        assert!(requested_encoder_max_bitrate_bps(&args_vec(&[
+            "max-bitrate=250000000",
+            "max-bitrate=1"
+        ]))
+        .is_err());
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub struct DisplayRequest {
     /// carries information only where DWM composited wide. Without this the
     /// whole HDR path runs correctly over an 8-bit desktop.
     pub hdr10: bool,
+    /// Whether Windows Advanced Color should be active for the served session.
+    /// This follows the resolved served pipeline, not merely the Deck request
+    /// that may have asked for a PQ-capable EDID.
+    pub desired_hdr: bool,
     /// What the Deck display this stands for can show. Its gamut and HDR
     /// luminance go into the EDID, through the shared rule, instead of a
     /// fixed grade. `None` from a Deck that does not report it.
@@ -85,6 +89,7 @@ impl DisplayRequest {
             // Color for nothing, and change how every ordinary desktop is
             // composited.
             hdr10: false,
+            desired_hdr: false,
             color: None,
         })
     }
@@ -327,6 +332,23 @@ trait DisplayBackend {
         Ok(())
     }
     fn test_mode(&mut self, target: &DisplayTarget, size: DisplaySize) -> Result<(), String>;
+    fn needs_bound_mode_preparation(&self, _target: &DisplayTarget, _size: DisplaySize) -> bool {
+        false
+    }
+    fn prepare_bound_mode(
+        &mut self,
+        _target: &DisplayTarget,
+        _size: DisplaySize,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn before_mode_apply(
+        &mut self,
+        _target: &DisplayTarget,
+        _size: DisplaySize,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn apply_mode(
         &mut self,
         target: &DisplayTarget,
@@ -340,6 +362,11 @@ trait DisplayBackend {
         target: &DisplayTarget,
         snapshot: &Self::Snapshot,
     ) -> Result<ModeState, String>;
+    /// Whether restoring also has to undo driver state of Arcen's own (NVIDIA
+    /// timings or EDIDs, a VMware resolution), which must never be skipped.
+    fn restore_owns_driver_state(&self, _snapshot: &Self::Snapshot) -> bool {
+        false
+    }
 
     fn arm_recovery(
         &mut self,
@@ -470,19 +497,72 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 policy.accepts_size(original.size) && original.is_settled_at(requested)
             }
         };
+        let mut bound_mode_prepared = false;
         if already_satisfied && !contract_refresh_required {
-            transaction.snapshot = None;
-            transaction.report = report(
-                requested,
-                original,
-                original,
-                true,
-                false,
-                "unchanged",
-                "none",
-                &target,
-            );
-            return Ok(transaction);
+            if policy == DisplayPolicy::ExactIsolated
+                && transaction
+                    .backend
+                    .needs_bound_mode_preparation(&target, requested)
+            {
+                match transaction.prepare_bound_mode_armed(requested) {
+                    Ok(true) => {
+                        bound_mode_prepared = true;
+                        let current = transaction.backend.current(&target)?;
+                        if current.is_isolated_primary_at(requested) {
+                            transaction.report = report(
+                                requested,
+                                original,
+                                current,
+                                true,
+                                true,
+                                "advanced-color-unchanged-display",
+                                transaction.backend.restore_backend(),
+                                &target,
+                            );
+                            transaction.record_restore_active();
+                            return Ok(transaction);
+                        }
+                    }
+                    Ok(false) => {
+                        transaction.snapshot = None;
+                        transaction.report = report(
+                            requested,
+                            original,
+                            original,
+                            true,
+                            false,
+                            "unchanged",
+                            "none",
+                            &target,
+                        );
+                        return Ok(transaction);
+                    }
+                    Err(ArmedApplyError::MutationFailed(error)) => {
+                        return transaction.refuse_strict(requested, error, true);
+                    }
+                    Err(ArmedApplyError::RecoveryNotReady(error)) => {
+                        transaction.snapshot = None;
+                        transaction.record_restore_success();
+                        return Err(format!(
+                            "display recovery watchdog was not ready; no display mutation was \
+                             attempted: {error}"
+                        ));
+                    }
+                }
+            } else {
+                transaction.snapshot = None;
+                transaction.report = report(
+                    requested,
+                    original,
+                    original,
+                    true,
+                    false,
+                    "unchanged",
+                    "none",
+                    &target,
+                );
+                return Ok(transaction);
+            }
         }
 
         // ExactIsolated with a matching mode but an un-isolated topology:
@@ -490,6 +570,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         if policy == DisplayPolicy::ExactIsolated
             && original.is_settled_at(requested)
             && !contract_refresh_required
+            && !bound_mode_prepared
         {
             let (failure, attempted) = match transaction.isolate_armed() {
                 Ok(isolated) if isolated.is_isolated_primary_at(requested) => {
@@ -843,7 +924,17 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
     fn apply_mode_armed(&mut self, size: DisplaySize) -> Result<ModeState, ArmedApplyError> {
         self.arm_for_mutation()?;
         self.backend
+            .before_mode_apply(&self.target, size)
+            .map_err(ArmedApplyError::MutationFailed)?;
+        self.backend
             .apply_mode(&self.target, size)
+            .map_err(ArmedApplyError::MutationFailed)
+    }
+
+    fn prepare_bound_mode_armed(&mut self, size: DisplaySize) -> Result<bool, ArmedApplyError> {
+        self.arm_for_mutation()?;
+        self.backend
+            .prepare_bound_mode(&self.target, size)
             .map_err(ArmedApplyError::MutationFailed)
     }
 
@@ -1020,6 +1111,19 @@ fn restore_with_retry<B: DisplayBackend>(
                 }
             }
             Err(error) => {
+                if let Some(current) = original_mode_withdrawn(backend, target, snapshot, original)
+                {
+                    tracing::warn!(
+                        target: DISPLAY,
+                        device = %target.device_name,
+                        original = %original.size,
+                        current = %current.size,
+                        %error,
+                        "the display driver no longer offers the original mode; leaving the \
+                         display at its current mode"
+                    );
+                    return Ok(current);
+                }
                 last_error = format!("attempt {attempt}/{RESTORE_ATTEMPTS}: {error}");
                 if attempt < RESTORE_ATTEMPTS {
                     std::thread::sleep(RESTORE_RETRY_DELAY);
@@ -1028,6 +1132,31 @@ fn restore_with_retry<B: DisplayBackend>(
         }
     }
     Err(last_error)
+}
+
+/// The display's current state when restoring cannot succeed because the
+/// driver has withdrawn the original mode.
+///
+/// A virtual display driver can start at a default mode that it does not list,
+/// or have its mode list edited during a session. Windows then refuses the
+/// original mode outright, and retrying, or leaving the recovery journal armed
+/// for the next session, only repeats the refusal. Restoring a mode the
+/// display cannot show is not a safety property, so the display is left as it
+/// is. A mode that is still offered keeps every existing retry and failure.
+fn original_mode_withdrawn<B: DisplayBackend>(
+    backend: &mut B,
+    target: &DisplayTarget,
+    snapshot: &B::Snapshot,
+    original: ModeState,
+) -> Option<ModeState> {
+    if backend.restore_owns_driver_state(snapshot) {
+        return None;
+    }
+    let offered = backend.supported_sizes(target).ok()?;
+    if offered.is_empty() || offered.contains(&original.size) {
+        return None;
+    }
+    backend.current(target).ok()
 }
 
 fn report(
@@ -1405,19 +1534,18 @@ impl DisplayManager {
         adapter_name: &str,
         contracts: Vec<crate::nvapi_headless::HeadlessDisplayContract>,
         session_log_id: arcen_telemetry::CorrelationId,
-    ) -> Result<HeadlessPlanningLease, String> {
+    ) -> Result<HeadlessPlanningLease, HeadlessProvisionError> {
         let dpi_awareness = crate::input::initialize_process_dpi_awareness();
         tracing::debug!(
             target: DISPLAY,
             dpi_awareness,
             "NVIDIA headless planning initialized process DPI awareness"
         );
-        recover_pending_journal(&crate::recovery::default_path())?;
-        let permit = self
-            .session_slot
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "shared Windows display is already in use".to_string())?;
+        recover_pending_journal(&crate::recovery::default_path())
+            .map_err(HeadlessProvisionError::Failed)?;
+        let permit = self.session_slot.clone().try_acquire_owned().map_err(|_| {
+            HeadlessProvisionError::Failed("shared Windows display is already in use".into())
+        })?;
         #[cfg(windows)]
         let preparation = windows_backend::provision_nvidia_headless_outputs(
             adapter_name,
@@ -1427,7 +1555,9 @@ impl DisplayManager {
         #[cfg(not(windows))]
         let preparation = {
             let _ = (adapter_name, contracts, session_log_id);
-            return Err("NVIDIA headless provisioning is only available on Windows".to_string());
+            return Err(HeadlessProvisionError::NotApplicable(
+                "NVIDIA headless provisioning is only available on Windows".to_string(),
+            ));
         };
         Ok(HeadlessPlanningLease {
             preparation,
@@ -1472,6 +1602,18 @@ fn ensure_recovery_journal_clear(pending: bool, path: &std::path::Path) -> Resul
 #[cfg(windows)]
 pub(crate) fn recover_pending_display_journal() -> Result<(), String> {
     recover_pending_journal(&crate::recovery::default_path())
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_display_recovery_watchdog(
+    path: &std::path::Path,
+    session_log_id: &arcen_telemetry::CorrelationId,
+) -> Result<(), String> {
+    windows_backend::spawn_recovery_watchdog(
+        path,
+        session_log_id,
+        crate::recovery::WatchdogResource::Display,
+    )
 }
 
 #[cfg(windows)]
@@ -1586,6 +1728,31 @@ pub struct DisplayLease {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Why NVIDIA headless provisioning did not produce a lease.
+///
+/// The distinction decides what a single-display session may do next. A
+/// display that NVAPI cannot drive (one owned by a third-party virtual display
+/// adapter, for example) is refused while the host is only being inspected, so
+/// the session can carry on with the display it has. A failure after the
+/// recovery journal was armed is not that: the host was being changed, and
+/// the session must stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessProvisionError {
+    /// Refused before the recovery journal was written; nothing on the host
+    /// changed.
+    NotApplicable(String),
+    /// Failed while, or after, changing the host's displays.
+    Failed(String),
+}
+
+impl std::fmt::Display for HeadlessProvisionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplicable(reason) | Self::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 pub struct HeadlessPlanningLease {
     #[cfg(windows)]
     preparation: Option<windows_backend::HeadlessOutputPreparation>,
@@ -1620,6 +1787,8 @@ impl HeadlessPlanningLease {
             selector
         };
         #[cfg(windows)]
+        let adopting_headless_recovery = self.preparation.is_some();
+        #[cfg(windows)]
         if let Some(preparation) = self.preparation.take() {
             // NVAPI assigns exactly the requested heads, but GRID can leave an
             // emptied connector as an active CCD path. Isolate the requested
@@ -1652,8 +1821,19 @@ impl HeadlessPlanningLease {
             let _ = (&selector, request, policy, &session_log_id, &deskside);
             return Err("NVIDIA headless provisioning is only available on Windows".to_string());
         }
+        #[cfg(windows)]
+        let backend = if adopting_headless_recovery {
+            NativeBackend::adopting_headless_recovery(request, session_log_id, deskside)
+        } else {
+            NativeBackend::new(request, session_log_id, deskside)
+        };
+        #[cfg(not(windows))]
+        let backend = {
+            let _ = (&selector, request, policy, &session_log_id, &deskside);
+            return Err("NVIDIA headless provisioning is only available on Windows".to_string());
+        };
         let inner = DisplayTransaction::acquire_observed(
-            NativeBackend::new(request, session_log_id, deskside),
+            backend,
             &selector,
             request.size,
             policy,
@@ -1807,6 +1987,20 @@ impl DisplayLease {
         self.inner.report()
     }
 
+    pub fn advanced_color_prepared_for(&self, desired_hdr: bool, device_names: &[String]) -> bool {
+        #[cfg(windows)]
+        {
+            self.inner
+                .backend
+                .advanced_color_prepared_for(desired_hdr, device_names)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (desired_hdr, device_names);
+            false
+        }
+    }
+
     pub fn restore(&mut self) -> Result<(), String> {
         let display_restore = self.inner.restore();
         #[cfg(windows)]
@@ -1889,9 +2083,14 @@ struct NativeBackend {
     nvapi_failed: bool,
     pending_nvapi: bool,
     pending_vmware: bool,
+    advanced_color_prepared: bool,
+    advanced_color_desired_hdr: Option<bool>,
+    advanced_color_target_names: Vec<String>,
+    advanced_color_guard: Option<crate::advanced_color::AdvancedColorSessionGuard>,
     vmware_active: bool,
     vmware_failed: bool,
     recovery_armed: bool,
+    adopted_headless_recovery: bool,
     deskside: Option<crate::recovery::DesksideRecoveryEntry>,
     journal_path: std::path::PathBuf,
     session_log_id: arcen_telemetry::CorrelationId,
@@ -1913,13 +2112,29 @@ impl NativeBackend {
             nvapi_failed: false,
             pending_nvapi: false,
             pending_vmware: false,
+            advanced_color_prepared: false,
+            advanced_color_desired_hdr: None,
+            advanced_color_target_names: Vec::new(),
+            advanced_color_guard: None,
             vmware_active: false,
             vmware_failed: false,
             recovery_armed: false,
+            adopted_headless_recovery: false,
             deskside,
             journal_path: crate::recovery::default_path(),
             session_log_id,
         }
+    }
+
+    fn adopting_headless_recovery(
+        request: DisplayRequest,
+        session_log_id: arcen_telemetry::CorrelationId,
+        deskside: Option<crate::recovery::DesksideRecoveryEntry>,
+    ) -> Self {
+        let mut backend = Self::new(request, session_log_id, deskside);
+        backend.recovery_armed = true;
+        backend.adopted_headless_recovery = true;
+        backend
     }
 
     fn desired_edid(&self, size: DisplaySize) -> Result<Vec<u8>, String> {
@@ -1939,6 +2154,84 @@ impl NativeBackend {
         } else {
             Ok(crate::edid::generate(request)?.to_vec())
         }
+    }
+
+    fn prepare_advanced_color_before_exact_mode(
+        &mut self,
+        target: &DisplayTarget,
+    ) -> Result<(), String> {
+        if self.advanced_color_prepared {
+            return Ok(());
+        }
+        let desired_hdr = self.request.desired_hdr;
+        let target_names = vec![target.device_name.clone()];
+        let targets = match crate::advanced_color::targets_for_device_names(&target_names) {
+            Ok(targets) => targets,
+            Err(error) if !desired_hdr => {
+                tracing::warn!(
+                    target: DISPLAY,
+                    device = %target.device_name,
+                    %error,
+                    "continuing SDR display transaction after failing to resolve Windows HDR target"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let guard = match crate::advanced_color::apply_for_session(
+            &targets,
+            desired_hdr,
+            &self.session_log_id,
+        ) {
+            Ok(guard) => guard,
+            Err(error) if !desired_hdr => {
+                tracing::warn!(
+                    target: DISPLAY,
+                    device = %target.device_name,
+                    %error,
+                    "continuing SDR display transaction after failing to disable Windows HDR"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.advanced_color_prepared = true;
+        self.advanced_color_desired_hdr = Some(desired_hdr);
+        self.advanced_color_target_names = target_names;
+        if guard.is_empty() {
+            tracing::debug!(
+                target: DISPLAY,
+                device = %target.device_name,
+                desired = if desired_hdr { "hdr" } else { "sdr" },
+                "Windows Advanced Color already matched exact-mode display transaction"
+            );
+        } else {
+            tracing::info!(
+                target: DISPLAY,
+                device = %target.device_name,
+                desired = if desired_hdr { "hdr" } else { "sdr" },
+                "Windows Advanced Color engaged before exact custom timing apply"
+            );
+            self.advanced_color_guard = Some(guard);
+        }
+        Ok(())
+    }
+
+    fn advanced_color_prepared_for(&self, desired_hdr: bool, device_names: &[String]) -> bool {
+        self.advanced_color_prepared
+            && self.advanced_color_desired_hdr == Some(desired_hdr)
+            && self.advanced_color_target_names.len() == device_names.len()
+            && self
+                .advanced_color_target_names
+                .iter()
+                .zip(device_names)
+                .all(|(prepared, current)| prepared.eq_ignore_ascii_case(current))
+    }
+
+    fn clear_advanced_color_evidence(&mut self) {
+        self.advanced_color_prepared = false;
+        self.advanced_color_desired_hdr = None;
+        self.advanced_color_target_names.clear();
     }
 }
 
@@ -2390,22 +2683,32 @@ mod windows_backend {
         adapter_name: &str,
         contracts: &[crate::nvapi_headless::HeadlessDisplayContract],
         session_log_id: &arcen_telemetry::CorrelationId,
-    ) -> Result<Option<HeadlessOutputPreparation>, String> {
-        let prepared = crate::nvapi_headless::prepare_provisioning(adapter_name, contracts)?;
+    ) -> Result<Option<HeadlessOutputPreparation>, super::HeadlessProvisionError> {
+        use super::HeadlessProvisionError::{Failed, NotApplicable};
+        // Inventory and mapping only read the host. A display NVAPI does not
+        // drive is refused here, before anything changes.
+        let prepared = crate::nvapi_headless::prepare_provisioning(adapter_name, contracts)
+            .map_err(NotApplicable)?;
         if prepared.is_empty() {
             return Ok(None);
         }
+        // The recovery snapshot needs a stable identity for every active
+        // output. A virtual display adapter's target can lack one, and this is
+        // still before the journal is written.
+        query_active_topology()
+            .and_then(|topology| capture_stable_topology(&topology))
+            .map_err(NotApplicable)?;
         let entries = prepared.recovery_entries();
         let (original, original_stable, journal_path) =
-            arm_physical_recovery(session_log_id, entries.clone())?;
+            arm_physical_recovery(session_log_id, entries.clone()).map_err(Failed)?;
         if let Err(error) = crate::nvapi_headless::apply_provisioning(&prepared) {
             let rollback = restore_from_path(&journal_path);
-            return Err(match rollback {
+            return Err(Failed(match rollback {
                 Ok(_) => format!("provision NVIDIA headless outputs: {error}"),
                 Err(rollback_error) => format!(
                     "provision NVIDIA headless outputs: {error}; rollback failed: {rollback_error}"
                 ),
-            });
+            }));
         }
         tracing::info!(
             target: DISPLAY,
@@ -3206,7 +3509,7 @@ mod windows_backend {
                 let error = if rc == 0 {
                     match verify_restored_topology(&self.original, &self.original_stable) {
                         Ok(()) => {
-                            crate::recovery::remove(&self.journal_path)?;
+                            crate::recovery::remove_preserving_advanced_color(&self.journal_path)?;
                             self.recovery_armed = false;
                             self.headless_entries.clear();
                             tracing::info!(
@@ -4183,24 +4486,57 @@ mod windows_backend {
 
             let active =
                 take_nvapi_active_after_stage(&mut self.nvapi_active, self.recovery_armed, || {
-                    crate::recovery::nvapi_cleanup_stage(&self.journal_path)
+                    if self.adopted_headless_recovery {
+                        crate::recovery::nvapi_timing_cleanup_stage(
+                            &self.journal_path,
+                            snapshot.mapping.adapter_luid,
+                            snapshot.mapping.display_id,
+                        )
+                    } else {
+                        crate::recovery::nvapi_cleanup_stage(&self.journal_path)
+                    }
                 })?;
             if let Some((active, cleanup_stage)) = active {
                 let recovery_armed = self.recovery_armed;
                 let journal_path = self.journal_path.clone();
-                if let Err(error) = nvapi::restore_exact_staged(
-                    driver,
-                    &snapshot,
-                    Some(&active),
-                    cleanup_stage,
-                    |stage| {
+                let restore = if self.adopted_headless_recovery {
+                    let mut timing = nvapi::timing_recovery_data(
+                        target.device_name.clone(),
+                        &snapshot,
+                        self.request.size.width,
+                        self.request.size.height,
+                        self.request.refresh_hz.max(1),
+                    );
+                    nvapi::update_timing_recovery_from_active(&mut timing, &active);
+                    timing.cleanup_stage = cleanup_stage;
+                    nvapi::restore_timing_recovery_staged(driver, &timing, |stage| {
                         if recovery_armed {
-                            crate::recovery::mark_nvapi_cleanup_stage(&journal_path, stage)
+                            crate::recovery::mark_nvapi_timing_cleanup_stage(
+                                &journal_path,
+                                snapshot.mapping.adapter_luid,
+                                snapshot.mapping.display_id,
+                                stage,
+                            )
                         } else {
                             Ok(())
                         }
-                    },
-                ) {
+                    })
+                } else {
+                    nvapi::restore_exact_staged(
+                        driver,
+                        &snapshot,
+                        Some(&active),
+                        cleanup_stage,
+                        |stage| {
+                            if recovery_armed {
+                                crate::recovery::mark_nvapi_cleanup_stage(&journal_path, stage)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                };
+                if let Err(error) = restore {
                     self.nvapi_active = Some(active);
                     return Err(format!(
                         "clean previous NVAPI exact timing before media retarget: {error}"
@@ -4218,16 +4554,29 @@ mod windows_backend {
                 self.request.refresh_hz.max(1),
             )?;
             if self.recovery_armed {
-                crate::recovery::rearm_nvapi(
-                    &self.journal_path,
-                    nvapi::recovery_data(
-                        target.device_name.clone(),
-                        &retarget,
-                        size.width,
-                        size.height,
-                        self.request.refresh_hz.max(1),
-                    ),
-                )?;
+                if self.adopted_headless_recovery {
+                    crate::recovery::rearm_nvapi_timing(
+                        &self.journal_path,
+                        nvapi::timing_recovery_data(
+                            target.device_name.clone(),
+                            &retarget,
+                            size.width,
+                            size.height,
+                            self.request.refresh_hz.max(1),
+                        ),
+                    )?;
+                } else {
+                    crate::recovery::rearm_nvapi(
+                        &self.journal_path,
+                        nvapi::recovery_data(
+                            target.device_name.clone(),
+                            &retarget,
+                            size.width,
+                            size.height,
+                            self.request.refresh_hz.max(1),
+                        ),
+                    )?;
+                }
             }
             self.nvapi_snapshot = Some(retarget);
             Ok(())
@@ -4256,6 +4605,41 @@ mod windows_backend {
             }
             self.pending_nvapi = false;
             change_mode(&target.device_name, size, CDS_TEST)
+        }
+
+        fn needs_bound_mode_preparation(&self, target: &DisplayTarget, _size: DisplaySize) -> bool {
+            nvapi_exact_available(
+                target.vendor_id,
+                self.nvapi_failed,
+                self.nvapi.is_some(),
+                self.nvapi_snapshot.is_some(),
+            )
+        }
+
+        fn prepare_bound_mode(
+            &mut self,
+            target: &DisplayTarget,
+            _size: DisplaySize,
+        ) -> Result<bool, String> {
+            if nvapi_exact_available(
+                target.vendor_id,
+                self.nvapi_failed,
+                self.nvapi.is_some(),
+                self.nvapi_snapshot.is_some(),
+            ) {
+                self.prepare_advanced_color_before_exact_mode(target)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+
+        fn before_mode_apply(
+            &mut self,
+            target: &DisplayTarget,
+            _size: DisplaySize,
+        ) -> Result<(), String> {
+            self.prepare_advanced_color_before_exact_mode(target)?;
+            Ok(())
         }
 
         fn apply_mode(
@@ -4306,6 +4690,25 @@ mod windows_backend {
                     .nvapi
                     .as_mut()
                     .ok_or_else(|| "NVAPI exact apply lost its driver".to_string())?;
+                if self.recovery_armed && self.adopted_headless_recovery {
+                    crate::recovery::rearm_nvapi_timing(
+                        &journal_path,
+                        nvapi::timing_recovery_data(
+                            target.device_name.clone(),
+                            snapshot,
+                            size.width,
+                            size.height,
+                            self.request.refresh_hz.max(1),
+                        ),
+                    )
+                    .map_err(|message| {
+                        format!("checkpoint adopted NVAPI timing recovery: {message}")
+                    })?;
+                }
+                let checkpoint_standard_journal =
+                    self.recovery_armed && !self.adopted_headless_recovery;
+                let checkpoint_timing_journal =
+                    self.recovery_armed && self.adopted_headless_recovery;
                 match nvapi::apply_exact(
                     driver,
                     snapshot,
@@ -4313,7 +4716,20 @@ mod windows_backend {
                     size.width,
                     size.height,
                     self.request.refresh_hz.max(1),
-                    |active| crate::recovery::mark_nvapi_ownership(&journal_path, active),
+                    |active| {
+                        if checkpoint_standard_journal {
+                            crate::recovery::mark_nvapi_ownership(&journal_path, active)
+                        } else if checkpoint_timing_journal {
+                            crate::recovery::mark_nvapi_timing_ownership(
+                                &journal_path,
+                                snapshot.mapping.adapter_luid,
+                                snapshot.mapping.display_id,
+                                active,
+                            )
+                        } else {
+                            Ok(())
+                        }
+                    },
                 ) {
                     Ok(active) => {
                         let save_error = active.save_error.clone();
@@ -4381,9 +4797,72 @@ mod windows_backend {
         ) -> Result<ModeState, String> {
             let mut errors = Vec::new();
             let mut nvapi_errors = Vec::new();
+            if let Some(guard) = self.advanced_color_guard.as_mut() {
+                match guard.restore() {
+                    Ok(()) => {
+                        self.advanced_color_guard = None;
+                    }
+                    Err(error) => {
+                        errors.push(format!("Advanced Color restore failed: {error}"));
+                    }
+                }
+            }
+            self.clear_advanced_color_evidence();
             // Nothing to revert unless an NVAPI mutation actually happened:
             // isolate-only sessions snapshot NVAPI state but never touch it.
-            if self.nvapi_active.is_some() {
+            if self.adopted_headless_recovery && self.nvapi_active.is_some() {
+                if let (Some(driver), Some(nvapi_snapshot), Some(active)) = (
+                    self.nvapi.as_mut(),
+                    snapshot.nvapi.as_ref(),
+                    self.nvapi_active.as_ref(),
+                ) {
+                    let cleanup_stage = if self.recovery_armed {
+                        crate::recovery::nvapi_timing_cleanup_stage(
+                            &self.journal_path,
+                            nvapi_snapshot.mapping.adapter_luid,
+                            nvapi_snapshot.mapping.display_id,
+                        )
+                    } else {
+                        Ok(nvapi::CleanupStage::Pending)
+                    };
+                    match cleanup_stage {
+                        Ok(cleanup_stage) => {
+                            let mut timing = nvapi::timing_recovery_data(
+                                target.device_name.clone(),
+                                nvapi_snapshot,
+                                self.request.size.width,
+                                self.request.size.height,
+                                self.request.refresh_hz.max(1),
+                            );
+                            nvapi::update_timing_recovery_from_active(&mut timing, active);
+                            timing.cleanup_stage = cleanup_stage;
+                            let recovery_armed = self.recovery_armed;
+                            let journal_path = self.journal_path.clone();
+                            if let Err(error) =
+                                nvapi::restore_timing_recovery_staged(driver, &timing, |stage| {
+                                    if recovery_armed {
+                                        crate::recovery::mark_nvapi_timing_cleanup_stage(
+                                            &journal_path,
+                                            nvapi_snapshot.mapping.adapter_luid,
+                                            nvapi_snapshot.mapping.display_id,
+                                            stage,
+                                        )
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                            {
+                                nvapi_errors.push(error);
+                            } else {
+                                self.nvapi_active = None;
+                            }
+                        }
+                        Err(error) => nvapi_errors.push(format!(
+                            "read adopted NVAPI timing cleanup stage from recovery journal: {error}"
+                        )),
+                    }
+                }
+            } else if self.nvapi_active.is_some() {
                 if let (Some(driver), Some(nvapi_snapshot)) =
                     (self.nvapi.as_mut(), snapshot.nvapi.as_ref())
                 {
@@ -4527,6 +5006,10 @@ mod windows_backend {
             }
         }
 
+        fn restore_owns_driver_state(&self, snapshot: &Self::Snapshot) -> bool {
+            snapshot.nvapi.is_some() || self.nvapi_active.is_some() || self.vmware_active
+        }
+
         fn arm_recovery(
             &mut self,
             target: &DisplayTarget,
@@ -4615,7 +5098,16 @@ mod windows_backend {
         }
 
         fn disarm_recovery(&mut self) -> Result<(), String> {
-            crate::recovery::remove(&self.journal_path)?;
+            if self.adopted_headless_recovery {
+                self.recovery_armed = false;
+                tracing::debug!(
+                    target: DISPLAY,
+                    journal = %self.journal_path.display(),
+                    "exact display recovery released; NVIDIA headless rollback journal remains armed"
+                );
+                return Ok(());
+            }
+            crate::recovery::remove_preserving_advanced_color(&self.journal_path)?;
             self.recovery_armed = false;
             tracing::info!(
                 target: DISPLAY,
@@ -5683,14 +6175,20 @@ mod windows_backend {
                     })?);
                 }
                 let driver = nvapi_driver.as_mut().expect("NVAPI initialized above");
-                let mapping = driver.map_display(
+                match driver.map_display(
                     &device_name,
                     AdapterLuid {
                         low_part: path.sourceInfo.adapterId.LowPart,
                         high_part: path.sourceInfo.adapterId.HighPart,
                     },
-                )?;
-                Some(mapping)
+                ) {
+                    Ok(mapping) => Some(mapping),
+                    // Rendered on the NVIDIA GPU but driven by someone else,
+                    // such as a virtual display adapter's monitor: Windows
+                    // owns its identity and its restore.
+                    Err(error) if nvapi::display_not_driven_by_nvidia(&error) => None,
+                    Err(error) => return Err(error),
+                }
             } else {
                 None
             };
@@ -6810,13 +7308,117 @@ mod windows_backend {
         )
     }
 
+    fn restore_nvapi_timing_recovery_entries(
+        path: &std::path::Path,
+        timings: &[nvapi::TimingRecoveryData],
+    ) -> Result<(), String> {
+        let mut driver = nvapi::Nvapi::load()
+            .map_err(|error| format!("load NVAPI for timing recovery: {error}"))?;
+        let mut errors = Vec::new();
+        for timing in timings {
+            if let Err(error) =
+                nvapi::restore_timing_recovery_staged(&mut driver, timing, |stage| {
+                    crate::recovery::mark_nvapi_timing_cleanup_stage(
+                        path,
+                        timing.adapter_luid,
+                        timing.display_id,
+                        stage,
+                    )
+                })
+            {
+                errors.push(format!(
+                    "restore NVAPI timing for display id 0x{:08x}: {error}",
+                    timing.display_id
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    pub(super) fn restore_timing_then_headless_recovery<T, H>(
+        path: &std::path::Path,
+        journal: &crate::recovery::DisplayRecoveryJournal,
+        prior_errors: &[String],
+        mut restore_timings: T,
+        mut restore_headless: H,
+    ) -> Result<(), String>
+    where
+        T: FnMut(&std::path::Path, &[nvapi::TimingRecoveryData]) -> Result<(), String>,
+        H: FnMut(&[crate::nvapi_headless::HeadlessEdidRecovery]) -> Result<(), String>,
+    {
+        let mut errors = prior_errors.to_vec();
+        if !journal.nvapi_timings.is_empty() {
+            if let Err(error) = restore_timings(path, &journal.nvapi_timings) {
+                errors.push(error);
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        if !journal.headless_nvapi_edids.is_empty() {
+            restore_headless(&journal.headless_nvapi_edids)
+                .map_err(|error| format!("restore NVIDIA headless EDIDs: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_adopted_headless_prefix_if_needed<T, H>(
+        path: &std::path::Path,
+        journal: &crate::recovery::DisplayRecoveryJournal,
+        prior_errors: &[String],
+        restore_timings: T,
+        restore_headless: H,
+    ) -> Result<(), String>
+    where
+        T: FnMut(&std::path::Path, &[nvapi::TimingRecoveryData]) -> Result<(), String>,
+        H: FnMut(&[crate::nvapi_headless::HeadlessEdidRecovery]) -> Result<(), String>,
+    {
+        if journal.headless_nvapi_edids.is_empty() {
+            return Ok(());
+        }
+        restore_timing_then_headless_recovery(
+            path,
+            journal,
+            prior_errors,
+            restore_timings,
+            restore_headless,
+        )
+    }
+
     pub(super) fn restore_from_path(path: &std::path::Path) -> Result<RestoreOutcome, String> {
         let journal = crate::recovery::read(path)?;
+        if journal.is_advanced_color_only() {
+            crate::advanced_color::restore_entries(&journal.advanced_color, "recovery")?;
+            crate::recovery::clear_advanced_color_entries(path)?;
+            tracing::info!(
+                target: DISPLAY,
+                journal = %path.display(),
+                "Advanced Color-only display recovery journal restored"
+            );
+            return Ok(RestoreOutcome::Restored {
+                restore_backend: "advanced-color-state",
+                width: 0,
+                height: 0,
+            });
+        }
         super::require_stable_recovery_schema(journal.version, journal.stable_topology.is_some())?;
         let mut errors = Vec::new();
         let mut nvapi_errors = Vec::new();
         let mut nvapi_restored = false;
         let mut recovery_device_name = journal.device_name.clone();
+        if !journal.advanced_color.is_empty() {
+            if let Err(error) =
+                crate::advanced_color::restore_entries(&journal.advanced_color, "recovery")
+            {
+                errors.push(format!("restore Advanced Color state: {error}"));
+            } else if let Err(error) = crate::recovery::clear_advanced_color_entries(path) {
+                errors.push(format!("clear Advanced Color recovery state: {error}"));
+            }
+        }
 
         let paths: Vec<DISPLAYCONFIG_PATH_INFO> =
             decode_values(&journal.topology_paths()?, 128, "DISPLAYCONFIG_PATH_INFO")?;
@@ -6845,7 +7447,7 @@ mod windows_backend {
             ));
         }
         if !journal.mutation_started {
-            crate::recovery::remove(path)?;
+            crate::recovery::remove_preserving_advanced_color(path)?;
             tracing::info!(
                 target: DISPLAY,
                 journal = %path.display(),
@@ -6853,10 +7455,13 @@ mod windows_backend {
             );
             return Ok(RestoreOutcome::AlreadyClean);
         }
-        if !journal.headless_nvapi_edids.is_empty() {
-            crate::nvapi_headless::restore_recovery_entries(&journal.headless_nvapi_edids)
-                .map_err(|error| format!("restore NVIDIA headless EDIDs: {error}"))?;
-        }
+        restore_adopted_headless_prefix_if_needed(
+            path,
+            &journal,
+            &errors,
+            restore_nvapi_timing_recovery_entries,
+            crate::nvapi_headless::restore_recovery_entries,
+        )?;
         let mut reconstructed = if journal.nvapi.is_none() {
             let (paths, modes, selected_device) = if journal.headless_nvapi_edids.is_empty() {
                 reconstruct_current_topology_with_settle(
@@ -7254,7 +7859,7 @@ mod windows_backend {
             );
             let width = journal.original_width;
             let height = journal.original_height;
-            crate::recovery::remove(path)?;
+            crate::recovery::remove_preserving_advanced_color(path)?;
             tracing::info!(
                 target: DISPLAY,
                 journal = %path.display(),
@@ -7956,6 +8561,263 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires elevated interactive console and pier-windows.example.internal V100D vGPU"]
+    fn native_nvidia_headless_orientation_capability_probe() {
+        use arcen_media::{
+            Monitor, MonitorIdentity, RequestedMonitor, RequestedMonitorTopology, Rotation,
+            TopologyGeneration,
+        };
+
+        #[derive(Clone, Copy)]
+        struct ProbeMonitor {
+            id: &'static str,
+            x: i32,
+            y: i32,
+            width: u32,
+            height: u32,
+            rotation: Rotation,
+            primary: bool,
+            output_kind: arcen_outputs::WindowsCcdOutputKind,
+        }
+
+        fn topology(monitors: &[ProbeMonitor]) -> RequestedMonitorTopology {
+            RequestedMonitorTopology::new(
+                monitors
+                    .iter()
+                    .map(|monitor| {
+                        RequestedMonitor::new(
+                            Monitor {
+                                identity: MonitorIdentity {
+                                    id: monitor.id.to_owned(),
+                                    name: monitor.id.to_owned(),
+                                    ..MonitorIdentity::default()
+                                },
+                                x: monitor.x,
+                                y: monitor.y,
+                                width_px: monitor.width,
+                                height_px: monitor.height,
+                                scale: 1.0,
+                                refresh_hz: 60,
+                                rotation: monitor.rotation,
+                                primary: monitor.primary,
+                                width_mm: 0.0,
+                                height_mm: 0.0,
+                                color: None,
+                            },
+                            monitor.width,
+                            monitor.height,
+                        )
+                        .expect("probe monitor")
+                    })
+                    .collect(),
+            )
+            .expect("probe topology")
+        }
+
+        fn contracts(
+            monitors: &[ProbeMonitor],
+        ) -> Vec<crate::nvapi_headless::HeadlessDisplayContract> {
+            monitors
+                .iter()
+                .enumerate()
+                .map(|(index, monitor)| {
+                    let ccd = arcen_outputs::windows_ccd_mode_plan(
+                        monitor.width,
+                        monitor.height,
+                        monitor.rotation,
+                        monitor.output_kind,
+                    );
+                    crate::nvapi_headless::HeadlessDisplayContract {
+                        width: ccd.target_width,
+                        height: ccd.target_height,
+                        refresh_hz: 60,
+                        width_mm: 0.0,
+                        height_mm: 0.0,
+                        scale: arcen_media::scale120_from_scale(1.0).expect("scale"),
+                        product_id: 0x6100 + u16::try_from(index).expect("index"),
+                        serial: 0x6100 + u32::try_from(index).expect("index"),
+                        hdr10: false,
+                        color: None,
+                        primary: monitor.primary,
+                        preferred_output_index: None,
+                    }
+                })
+                .collect()
+        }
+
+        fn run_case(name: &str, monitors: &[ProbeMonitor]) {
+            const ADAPTER: &str = "NVIDIA GRID V100D-16Q";
+            println!("=== CASE {name} ===");
+            let baseline = crate::gpu_probe::physical_output_inventory(&[ADAPTER.to_string()])
+                .expect("baseline");
+            println!("baseline_outputs={}", baseline.len());
+            let manager = DisplayManager::default();
+            let owner = crate::eventlog::random_correlation_id();
+            let planning = manager
+                .prepare_nvidia_headless_multi(ADAPTER, contracts(monitors), owner.clone())
+                .expect("provision probe outputs");
+            let mut outputs = crate::gpu_probe::physical_output_inventory(&[ADAPTER.to_string()])
+                .expect("expanded")
+                .outputs()
+                .to_vec();
+            for (output, monitor) in outputs.iter_mut().zip(monitors) {
+                output.ccd_output_kind = monitor.output_kind;
+            }
+            let inventory = crate::multi_monitor_topology::PhysicalOutputInventory::new(outputs)
+                .expect("probe inventory");
+            let plan = crate::multi_monitor_topology::plan_topology(
+                &topology(monitors),
+                TopologyGeneration::new(1).expect("generation"),
+                &inventory,
+            )
+            .expect("probe plan");
+            for monitor in &plan.monitors {
+                println!(
+                    "planned {} source={}x{}@{},{} target={}x{} rotation={:?}",
+                    monitor.client_display_id,
+                    monitor.width,
+                    monitor.height,
+                    monitor.x,
+                    monitor.y,
+                    monitor.mode_width,
+                    monitor.mode_height,
+                    monitor.rotation
+                );
+            }
+            match planning.acquire(&plan, owner) {
+                Ok(mut lease) => {
+                    println!("SetDisplayConfig=0");
+                    let active = windows_backend::query_active_topology().expect("active topology");
+                    println!(
+                        "active_paths={} active_modes={}",
+                        active.paths.len(),
+                        active.modes.len()
+                    );
+                    lease.restore().expect("restore probe lease");
+                }
+                Err(error) => println!("SetDisplayConfig=ERR {error}"),
+            }
+            assert!(!crate::recovery::default_path().exists());
+            let restored = crate::gpu_probe::physical_output_inventory(&[ADAPTER.to_string()])
+                .expect("restored");
+            println!("restored_outputs={}", restored.len());
+            assert_eq!(
+                restored.len(),
+                baseline.len(),
+                "probe must restore output count"
+            );
+        }
+
+        require_nvapi_headless_probe_context().expect("elevated local console");
+        crate::logging::init(
+            arcen_telemetry::OperationalProfile::Debug,
+            crate::logging::COMPONENT_DIAGNOSTIC,
+            None,
+            false,
+        )
+        .expect("probe logging");
+
+        let physical = arcen_outputs::WindowsCcdOutputKind::PhysicalPanel;
+        let pier = arcen_outputs::WindowsCcdOutputKind::PierOwnedTiming;
+        let case = std::env::var("ARCEN_CCD_PROBE_CASE").unwrap_or_else(|_| "all".to_string());
+        let mut maybe_run = |name: &str, monitors: &[ProbeMonitor]| {
+            if case == "all" || case == name {
+                run_case(name, monitors);
+            }
+        };
+        maybe_run(
+            "a-single-rotated-90",
+            &[ProbeMonitor {
+                id: "rot90",
+                x: 0,
+                y: 0,
+                width: 1_440,
+                height: 2_560,
+                rotation: Rotation::Degrees90,
+                primary: true,
+                output_kind: physical,
+            }],
+        );
+        maybe_run(
+            "a-single-rotated-270",
+            &[ProbeMonitor {
+                id: "rot270",
+                x: 0,
+                y: 0,
+                width: 1_440,
+                height: 2_560,
+                rotation: Rotation::Degrees270,
+                primary: true,
+                output_kind: physical,
+            }],
+        );
+        maybe_run(
+            "b-single-native-portrait",
+            &[ProbeMonitor {
+                id: "native",
+                x: 0,
+                y: 0,
+                width: 1_440,
+                height: 2_560,
+                rotation: Rotation::Degrees0,
+                primary: true,
+                output_kind: pier,
+            }],
+        );
+        maybe_run(
+            "c-landscape-plus-native-portrait-negative-origin",
+            &[
+                ProbeMonitor {
+                    id: "landscape",
+                    x: 0,
+                    y: 0,
+                    width: 2_560,
+                    height: 1_440,
+                    rotation: Rotation::Degrees0,
+                    primary: true,
+                    output_kind: pier,
+                },
+                ProbeMonitor {
+                    id: "native-portrait",
+                    x: -1_440,
+                    y: -1_120,
+                    width: 1_440,
+                    height: 2_560,
+                    rotation: Rotation::Degrees0,
+                    primary: false,
+                    output_kind: pier,
+                },
+            ],
+        );
+        maybe_run(
+            "d-landscape-plus-rotated-negative-origin",
+            &[
+                ProbeMonitor {
+                    id: "owner-landscape",
+                    x: 0,
+                    y: 0,
+                    width: 2_560,
+                    height: 1_440,
+                    rotation: Rotation::Degrees0,
+                    primary: true,
+                    output_kind: physical,
+                },
+                ProbeMonitor {
+                    id: "owner-portrait",
+                    x: -1_440,
+                    y: -1_120,
+                    width: 1_440,
+                    height: 2_560,
+                    rotation: Rotation::Degrees270,
+                    primary: false,
+                    output_kind: physical,
+                },
+            ],
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires elevated interactive console and pier-windows.example.internal V100D vGPU"]
     fn native_nvidia_headless_three_output_transaction_restores_exact_baseline() {
         use arcen_media::{
             Monitor, MonitorIdentity, RequestedMonitor, RequestedMonitorTopology, Rotation,
@@ -8632,6 +9494,414 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn adopted_timing_failure_blocks_headless_edid_restore_until_replay() {
+        let directory = std::env::temp_dir().join(format!(
+            "arcen-journal-timing-barrier-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let path = directory.join("display-recovery.json");
+        let adapter_luid = crate::nvapi::AdapterLuid {
+            low_part: 47_171,
+            high_part: 0,
+        };
+        let mut timing = crate::nvapi::TimingRecoveryData {
+            device_name: r"\\.\DISPLAY6".to_string(),
+            adapter_luid,
+            display_id: 0x8206_1081,
+            width: 1800,
+            height: 1130,
+            refresh_hz: 60,
+            ownership: crate::nvapi::TimingOwnership::SavedByUs,
+            custom: Some(crate::nvapi::CustomDisplay::test_value(1800, 1130, 60)),
+            custom_snapshot_complete: true,
+            pre_existing_custom: Vec::new(),
+            cleanup_stage: crate::nvapi::CleanupStage::Pending,
+        };
+        let headless = crate::nvapi_headless::HeadlessEdidRecovery {
+            display_id: 0x8206_1081,
+            output_id: 1,
+            adapter_luid,
+            original_edid: Some(vec![0xaa; 128]),
+            intended_edid_sha256: "0".repeat(64),
+        };
+        let mut journal = crate::recovery::DisplayRecoveryJournal::new(
+            r"\\.\DISPLAY6".to_string(),
+            2560,
+            1600,
+            60,
+            &[1],
+            &[2],
+            &[3],
+            None,
+        )
+        .with_stable_topology(crate::recovery::StableTopologySnapshot {
+            paths: vec![crate::recovery::StableOutputIdentity {
+                adapter_stable_id: "pci:test-nvidia".to_string(),
+                monitor_device_path: r"\\?\DISPLAY#SESSION".to_string(),
+                adapter_output_index: 0,
+                output_technology: 4,
+                connector_instance: 1,
+                edid_manufacture_id: 1,
+                edid_product_code_id: 2,
+                edid_sha256: Some("f".repeat(64)),
+                binding: crate::recovery::StableOutputBackend::Nvidia {
+                    nvapi_display_id: timing.display_id,
+                    nvapi_output_id: 1,
+                    nvapi_head: 0,
+                },
+            }],
+        })
+        .with_headless_nvapi_edids(vec![headless]);
+        journal.mutation_started = true;
+        journal.nvapi_timings = vec![timing.clone()];
+        crate::recovery::write_atomic(&path, &journal).expect("write journal");
+
+        let fail_delete_once = std::cell::Cell::new(true);
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut restore_timings =
+            |path: &std::path::Path, timings: &[crate::nvapi::TimingRecoveryData]| {
+                let [entry] = timings else {
+                    return Err("expected one timing entry".to_string());
+                };
+                if fail_delete_once.replace(false) {
+                    crate::recovery::mark_nvapi_timing_cleanup_stage(
+                        path,
+                        entry.adapter_luid,
+                        entry.display_id,
+                        crate::nvapi::CleanupStage::TopologyRestored,
+                    )?;
+                    crate::recovery::mark_nvapi_timing_cleanup_stage(
+                        path,
+                        entry.adapter_luid,
+                        entry.display_id,
+                        crate::nvapi::CleanupStage::TrialReverted,
+                    )?;
+                    events.borrow_mut().push("delete-failed");
+                    return Err("delete saved custom timing: injected failure".to_string());
+                }
+                timing.cleanup_stage = crate::recovery::nvapi_timing_cleanup_stage(
+                    path,
+                    entry.adapter_luid,
+                    entry.display_id,
+                )?;
+                for stage in [
+                    crate::nvapi::CleanupStage::SavedTimingDeleted,
+                    crate::nvapi::CleanupStage::EdidRestored,
+                    crate::nvapi::CleanupStage::Complete,
+                ] {
+                    crate::recovery::mark_nvapi_timing_cleanup_stage(
+                        path,
+                        entry.adapter_luid,
+                        entry.display_id,
+                        stage,
+                    )?;
+                }
+                events.borrow_mut().push("timing-deleted");
+                Ok(())
+            };
+        let restore_headless = |path: &std::path::Path| -> Result<(), String> {
+            events.borrow_mut().push("edid-restored");
+            crate::recovery::remove(path)
+        };
+
+        let loaded = crate::recovery::read(&path).expect("read journal");
+        let first = windows_backend::restore_timing_then_headless_recovery(
+            &path,
+            &loaded,
+            &[],
+            &mut restore_timings,
+            |entries| {
+                assert_eq!(entries.len(), 1);
+                restore_headless(&path)
+            },
+        );
+        assert!(first.unwrap_err().contains("delete saved custom timing"));
+        assert_eq!(*events.borrow(), vec!["delete-failed"]);
+        assert!(
+            path.exists(),
+            "journal must remain for timing cleanup retry"
+        );
+        let replay = crate::recovery::read(&path).expect("reload checkpointed journal");
+        assert_eq!(
+            replay.nvapi_timings[0].cleanup_stage,
+            crate::nvapi::CleanupStage::TrialReverted
+        );
+
+        windows_backend::restore_timing_then_headless_recovery(
+            &path,
+            &replay,
+            &[],
+            &mut restore_timings,
+            |entries| {
+                assert_eq!(entries.len(), 1);
+                restore_headless(&path)
+            },
+        )
+        .expect("replay completes timing cleanup before EDID restore");
+        assert_eq!(
+            *events.borrow(),
+            vec!["delete-failed", "timing-deleted", "edid-restored"]
+        );
+        assert!(
+            !path.exists(),
+            "journal should be removed only after timing cleanup and EDID restore succeed"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn advanced_color_failure_blocks_headless_edid_restore_after_timing_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "arcen-journal-colour-barrier-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let path = directory.join("display-recovery.json");
+        let adapter_luid = crate::nvapi::AdapterLuid {
+            low_part: 47_171,
+            high_part: 0,
+        };
+        let timing = crate::nvapi::TimingRecoveryData {
+            device_name: r"\\.\DISPLAY6".to_string(),
+            adapter_luid,
+            display_id: 0x8206_1081,
+            width: 1800,
+            height: 1130,
+            refresh_hz: 60,
+            ownership: crate::nvapi::TimingOwnership::SavedByUs,
+            custom: Some(crate::nvapi::CustomDisplay::test_value(1800, 1130, 60)),
+            custom_snapshot_complete: true,
+            pre_existing_custom: Vec::new(),
+            cleanup_stage: crate::nvapi::CleanupStage::Pending,
+        };
+        let headless = crate::nvapi_headless::HeadlessEdidRecovery {
+            display_id: timing.display_id,
+            output_id: 1,
+            adapter_luid,
+            original_edid: Some(vec![0xaa; 128]),
+            intended_edid_sha256: "0".repeat(64),
+        };
+        let mut journal = crate::recovery::DisplayRecoveryJournal::new(
+            r"\\.\DISPLAY6".to_string(),
+            2560,
+            1600,
+            60,
+            &[1],
+            &[2],
+            &[3],
+            None,
+        )
+        .with_stable_topology(crate::recovery::StableTopologySnapshot {
+            paths: vec![crate::recovery::StableOutputIdentity {
+                adapter_stable_id: "pci:test-nvidia".to_string(),
+                monitor_device_path: r"\\?\DISPLAY#SESSION".to_string(),
+                adapter_output_index: 0,
+                output_technology: 4,
+                connector_instance: 1,
+                edid_manufacture_id: 1,
+                edid_product_code_id: 2,
+                edid_sha256: Some("f".repeat(64)),
+                binding: crate::recovery::StableOutputBackend::Nvidia {
+                    nvapi_display_id: timing.display_id,
+                    nvapi_output_id: 1,
+                    nvapi_head: 0,
+                },
+            }],
+        })
+        .with_headless_nvapi_edids(vec![headless]);
+        journal.mutation_started = true;
+        journal.nvapi_timings = vec![timing];
+        crate::recovery::write_atomic(&path, &journal).expect("write journal");
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut restore_timings =
+            |path: &std::path::Path, timings: &[crate::nvapi::TimingRecoveryData]| {
+                let [entry] = timings else {
+                    return Err("expected one timing entry".to_string());
+                };
+                match crate::recovery::nvapi_timing_cleanup_stage(
+                    path,
+                    entry.adapter_luid,
+                    entry.display_id,
+                )? {
+                    crate::nvapi::CleanupStage::Complete => {
+                        events.borrow_mut().push("timing-already-clean");
+                    }
+                    _ => {
+                        for stage in [
+                            crate::nvapi::CleanupStage::TopologyRestored,
+                            crate::nvapi::CleanupStage::TrialReverted,
+                            crate::nvapi::CleanupStage::SavedTimingDeleted,
+                            crate::nvapi::CleanupStage::EdidRestored,
+                            crate::nvapi::CleanupStage::Complete,
+                        ] {
+                            crate::recovery::mark_nvapi_timing_cleanup_stage(
+                                path,
+                                entry.adapter_luid,
+                                entry.display_id,
+                                stage,
+                            )?;
+                        }
+                        events.borrow_mut().push("timing-cleaned");
+                    }
+                }
+                Ok(())
+            };
+        let restore_headless = |path: &std::path::Path| -> Result<(), String> {
+            events.borrow_mut().push("edid-restored");
+            crate::recovery::remove(path)
+        };
+
+        let loaded = crate::recovery::read(&path).expect("read journal");
+        let colour_error = vec!["restore Advanced Color state: injected".to_string()];
+        let first = windows_backend::restore_timing_then_headless_recovery(
+            &path,
+            &loaded,
+            &colour_error,
+            &mut restore_timings,
+            |entries| {
+                assert_eq!(entries.len(), 1);
+                restore_headless(&path)
+            },
+        );
+        assert!(first.unwrap_err().contains("restore Advanced Color state"));
+        assert_eq!(*events.borrow(), vec!["timing-cleaned"]);
+        assert!(
+            path.exists(),
+            "journal must remain after colour restore failure"
+        );
+        let replay = crate::recovery::read(&path).expect("reload checkpointed journal");
+        assert_eq!(
+            replay.nvapi_timings[0].cleanup_stage,
+            crate::nvapi::CleanupStage::Complete
+        );
+
+        windows_backend::restore_timing_then_headless_recovery(
+            &path,
+            &replay,
+            &[],
+            &mut restore_timings,
+            |entries| {
+                assert_eq!(entries.len(), 1);
+                restore_headless(&path)
+            },
+        )
+        .expect("replay completes EDID restore after colour recovery succeeds");
+        assert_eq!(
+            *events.borrow(),
+            vec!["timing-cleaned", "timing-already-clean", "edid-restored"]
+        );
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn standard_nvapi_recovery_keeps_base_edid_before_hdr_retry_order() {
+        let directory = std::env::temp_dir().join(format!(
+            "arcen-journal-standard-nvapi-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let path = directory.join("display-recovery.json");
+        let mut journal = crate::recovery::DisplayRecoveryJournal::new(
+            r"\\.\DISPLAY6".to_string(),
+            2560,
+            1600,
+            60,
+            &[1],
+            &[2],
+            &[3],
+            Some(crate::nvapi::test_recovery_data(
+                r"\\.\DISPLAY6".to_string(),
+            )),
+        )
+        .with_stable_topology(crate::recovery::StableTopologySnapshot {
+            paths: vec![crate::recovery::StableOutputIdentity {
+                adapter_stable_id: "pci:test-nvidia".to_string(),
+                monitor_device_path: r"\\?\DISPLAY#ORIGINAL-HDR".to_string(),
+                adapter_output_index: 0,
+                output_technology: 4,
+                connector_instance: 1,
+                edid_manufacture_id: 1,
+                edid_product_code_id: 2,
+                edid_sha256: Some("a".repeat(64)),
+                binding: crate::recovery::StableOutputBackend::Nvidia {
+                    nvapi_display_id: 1,
+                    nvapi_output_id: 1,
+                    nvapi_head: 0,
+                },
+            }],
+        });
+        journal.mutation_started = true;
+        journal.advanced_color = vec![crate::recovery::AdvancedColorRecoveryEntry {
+            adapter_device_path: r"\\?\PCI#TEST".to_string(),
+            monitor_device_path: r"\\?\DISPLAY#ORIGINAL-HDR".to_string(),
+            adapter_low: 7,
+            adapter_high: 9,
+            target_id: 3,
+            original_hdr_enabled: true,
+            arcen_changed: true,
+        }];
+        crate::recovery::write_atomic(&path, &journal).expect("write journal");
+
+        let mut events = Vec::new();
+        let first = {
+            let loaded = crate::recovery::read(&path).expect("read journal");
+            let colour_error = vec![
+                "restore Advanced Color state: HDR unsupported on current SDR EDID".to_string(),
+            ];
+            windows_backend::restore_adopted_headless_prefix_if_needed(
+                &path,
+                &loaded,
+                &colour_error,
+                |_path, _timings| panic!("standard NVAPI journal must not run adopted timings"),
+                |_entries| panic!("standard NVAPI journal must not restore headless EDIDs"),
+            )
+        };
+        assert!(
+            first.is_ok(),
+            "standard recovery must keep base ordering and continue to NVAPI EDID restore"
+        );
+        events.push("original-edid-restored");
+        assert!(
+            path.exists(),
+            "standard path keeps the journal after the first-pass HDR restore failure"
+        );
+
+        let replay = {
+            let loaded = crate::recovery::read(&path).expect("reload journal");
+            windows_backend::restore_adopted_headless_prefix_if_needed(
+                &path,
+                &loaded,
+                &[],
+                |_path, _timings| panic!("standard NVAPI journal must not run adopted timings"),
+                |_entries| panic!("standard NVAPI journal must not restore headless EDIDs"),
+            )
+        };
+        replay.expect("standard replay is not blocked before Advanced Color restore");
+        events.push("advanced-color-restored");
+        crate::recovery::remove(&path).expect("journal removed after standard recovery succeeds");
+        events.push("journal-removed");
+        assert_eq!(
+            events,
+            vec![
+                "original-edid-restored",
+                "advanced-color-restored",
+                "journal-removed"
+            ]
+        );
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn standalone_restore_lifecycle_emitters_never_panic_on_a_disabled_emitter() {
         let emitter = crate::LifecycleEmitter::disabled();
         let correlation_id = crate::eventlog::random_correlation_id();
@@ -8658,6 +9928,7 @@ mod tests {
         Supported,
         Test(DisplaySize),
         PrepareRetarget(DisplaySize),
+        BeforeModeApply(DisplaySize),
         Arm,
         Apply(DisplaySize),
         Isolate,
@@ -8674,9 +9945,13 @@ mod tests {
         applies: VecDeque<Result<ModeState, String>>,
         isolates: VecDeque<Result<ModeState, String>>,
         restores: VecDeque<Result<ModeState, String>>,
+        bound_mode_currents: VecDeque<ModeState>,
         recovery_armed: bool,
         arm_error: Option<String>,
         contract_refresh_required: bool,
+        record_before_mode_apply: bool,
+        bound_mode_preparation_needed: bool,
+        bound_mode_preparations: VecDeque<Result<bool, String>>,
     }
 
     impl FakeBackend {
@@ -8693,9 +9968,13 @@ mod tests {
                 applies: VecDeque::new(),
                 isolates: VecDeque::new(),
                 restores: VecDeque::from([Ok(state)]),
+                bound_mode_currents: VecDeque::new(),
                 recovery_armed: false,
                 arm_error: None,
                 contract_refresh_required: false,
+                record_before_mode_apply: false,
+                bound_mode_preparation_needed: false,
+                bound_mode_preparations: VecDeque::new(),
             }
         }
 
@@ -8756,6 +10035,40 @@ mod tests {
         fn test_mode(&mut self, _target: &DisplayTarget, size: DisplaySize) -> Result<(), String> {
             self.record(Call::Test(size));
             self.tests.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn needs_bound_mode_preparation(
+            &self,
+            _target: &DisplayTarget,
+            _size: DisplaySize,
+        ) -> bool {
+            self.bound_mode_preparation_needed
+        }
+
+        fn prepare_bound_mode(
+            &mut self,
+            _target: &DisplayTarget,
+            size: DisplaySize,
+        ) -> Result<bool, String> {
+            self.record(Call::BeforeModeApply(size));
+            let result = self.bound_mode_preparations.pop_front().unwrap_or(Ok(true));
+            if result == Ok(true) {
+                if let Some(current) = self.bound_mode_currents.pop_front() {
+                    self.current = current;
+                }
+            }
+            result
+        }
+
+        fn before_mode_apply(
+            &mut self,
+            _target: &DisplayTarget,
+            size: DisplaySize,
+        ) -> Result<(), String> {
+            if self.record_before_mode_apply {
+                self.record(Call::BeforeModeApply(size));
+            }
+            Ok(())
         }
 
         fn apply_mode(
@@ -9071,6 +10384,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_apply_runs_display_colour_engagement_inside_the_armed_transaction() {
+        let mut backend = FakeBackend::new(size(1680, 1050));
+        backend.record_before_mode_apply = true;
+        backend.applies.push_back(Ok(mode(size(1920, 1080), 2)));
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction =
+            DisplayTransaction::acquire_isolated(backend, 1, size(1920, 1080)).unwrap();
+        assert!(transaction.report.exact);
+        transaction.restore().unwrap();
+        drop(transaction);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Select(1),
+                Call::Snapshot,
+                Call::Current,
+                Call::Test(size(1920, 1080)),
+                Call::Arm,
+                Call::BeforeModeApply(size(1920, 1080)),
+                Call::Apply(size(1920, 1080)),
+                Call::Isolate,
+                Call::Restore,
+                Call::Disarm,
+            ]
+        );
+    }
+
+    #[test]
     fn isolated_policy_with_matching_size_still_isolates_a_multi_output_desktop() {
         let backend = FakeBackend::new(size(1920, 1080));
         let calls = Arc::clone(&backend.calls);
@@ -9138,6 +10479,84 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec![Call::Select(3), Call::Snapshot, Call::Current]
+        );
+    }
+
+    #[test]
+    fn isolated_policy_can_prepare_colour_before_accepting_an_already_bound_mode() {
+        let mut backend = FakeBackend::new(size(1920, 1080));
+        backend.current = isolated(size(1920, 1080));
+        backend.restores = VecDeque::from([Ok(backend.current)]);
+        backend.bound_mode_preparation_needed = true;
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction =
+            DisplayTransaction::acquire_isolated(backend, 3, size(1920, 1080)).unwrap();
+        assert!(transaction.report.changed);
+        assert_eq!(
+            transaction.report.backend,
+            "advanced-color-unchanged-display"
+        );
+        transaction.restore().unwrap();
+        drop(transaction);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Select(3),
+                Call::Snapshot,
+                Call::Current,
+                Call::Arm,
+                Call::BeforeModeApply(size(1920, 1080)),
+                Call::Current,
+                Call::Restore,
+                Call::Disarm,
+            ],
+            "HDR engagement for an already-bound exact head must remain inside the armed lease"
+        );
+    }
+
+    #[test]
+    fn headless_hdr_reset_reapplies_exact_mode_before_hold_is_recorded() {
+        let requested = size(1512, 950);
+        let native = size(2560, 1600);
+        let mut backend = FakeBackend::new(requested);
+        backend.current = isolated(requested);
+        backend.restores = VecDeque::from([Ok(backend.current)]);
+        backend.recovery_armed = true;
+        backend.bound_mode_preparation_needed = true;
+        backend.bound_mode_currents.push_back(isolated(native));
+        backend.applies.push_back(Ok(isolated(requested)));
+        let calls = Arc::clone(&backend.calls);
+
+        let mut transaction = DisplayTransaction::acquire_isolated(backend, 0, requested).unwrap();
+
+        assert_eq!(transaction.report.applied, requested);
+        assert_eq!(
+            transaction.report.desktop_rect.width,
+            requested.width as i32
+        );
+        assert_eq!(
+            transaction.report.desktop_rect.height,
+            requested.height as i32
+        );
+        assert!(transaction.report.changed);
+        transaction.restore().unwrap();
+        drop(transaction);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Select(0),
+                Call::Snapshot,
+                Call::Current,
+                Call::BeforeModeApply(requested),
+                Call::Current,
+                Call::Test(requested),
+                Call::Apply(requested),
+                Call::Isolate,
+                Call::Restore,
+                Call::Disarm,
+            ],
+            "HDR can reset Windows to the EDID native mode, but the held report must be recorded \
+             only after the requested exact mode is re-applied"
         );
     }
 
@@ -9553,6 +10972,47 @@ mod tests {
     }
 
     #[test]
+    fn fallback_reestablishes_colour_after_exact_apply_rollback() {
+        let requested = size(1920, 1080);
+        let fallback = size(1280, 720);
+        let mut backend = FakeBackend::new(size(1680, 1050));
+        backend.supported = vec![fallback];
+        backend.record_before_mode_apply = true;
+        backend.tests.push_back(Ok(()));
+        backend.tests.push_back(Ok(()));
+        backend
+            .applies
+            .push_back(Err("exact apply failed after HDR".to_string()));
+        backend.applies.push_back(Ok(mode(fallback, 0)));
+        backend.restores = VecDeque::from([Ok(mode(size(1680, 1050), 0))]);
+        let calls = Arc::clone(&backend.calls);
+
+        let transaction = DisplayTransaction::acquire(backend, 0, requested).unwrap();
+
+        assert_eq!(transaction.report.applied, fallback);
+        let calls = calls.lock().unwrap();
+        let exact_colour = calls
+            .iter()
+            .position(|call| *call == Call::BeforeModeApply(requested))
+            .expect("colour prepared before exact mode");
+        let rollback = calls
+            .iter()
+            .position(|call| *call == Call::Restore)
+            .expect("exact failure rollback");
+        let fallback_colour = calls
+            .iter()
+            .rposition(|call| *call == Call::BeforeModeApply(fallback))
+            .expect("colour prepared again before fallback mode");
+        let fallback_apply = calls
+            .iter()
+            .position(|call| *call == Call::Apply(fallback))
+            .expect("fallback applied");
+        assert!(exact_colour < rollback);
+        assert!(rollback < fallback_colour);
+        assert!(fallback_colour < fallback_apply);
+    }
+
+    #[test]
     fn macroblock_policy_refuses_an_unaligned_current_mode_without_safe_candidates() {
         let requested = size(1792, 1168);
         let mut backend = FakeBackend::new(size(1680, 1050));
@@ -9640,6 +11100,45 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn a_mode_the_driver_withdrew_is_not_restored_forever() {
+        // A virtual display started at 800x600, a mode it does not list. The
+        // session set 1920x1080; restoring 800x600 is refused every time.
+        let mut backend = FakeBackend::new(size(800, 600));
+        backend.supported = vec![size(1920, 1080)];
+        backend.restores = VecDeque::from([Err("DISP_CHANGE_BADMODE(-2)".to_string())]);
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction = DisplayTransaction::acquire(backend, 0, size(1920, 1080)).unwrap();
+
+        transaction
+            .restore()
+            .expect("a withdrawn mode leaves the display as it is");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|call| **call == Call::Restore).count(),
+            1
+        );
+        assert!(
+            calls.contains(&Call::Disarm),
+            "the recovery journal must be disarmed"
+        );
+    }
+
+    #[test]
+    fn a_mode_still_offered_keeps_retrying_and_fails() {
+        let mut backend = FakeBackend::new(size(800, 600));
+        backend.supported = vec![size(800, 600), size(1920, 1080)];
+        backend.restores = VecDeque::from([
+            Err("transient".to_string()),
+            Err("transient".to_string()),
+            Err("transient".to_string()),
+        ]);
+        let mut transaction = DisplayTransaction::acquire(backend, 0, size(1920, 1080)).unwrap();
+
+        assert!(transaction.restore().is_err());
     }
 
     #[test]
