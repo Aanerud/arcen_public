@@ -27,6 +27,16 @@ const SOURCE_OFFER: &str = "Arcen is free software under the GNU AGPL-3.0. It co
 #[path = "../../../quic_config_migration.rs"]
 mod quic_config_migration;
 
+/// The Pier's sysfs PCI reader, compiled here too so the installer and the
+/// Pier reach the same answer about which GPU Xorg must use. It depends only
+/// on `std` and `arcen-outputs`, which owns the decision itself.
+#[path = "../../../../hosts/linux/src/display/gpu_pci.rs"]
+mod gpu_pci;
+/// The launcher's rule for trusting the Xorg template, so the installer never
+/// repairs (and so launders) a file the Pier itself would refuse.
+#[path = "../../../../hosts/linux/src/display/xorg_template_trust.rs"]
+mod xorg_template_trust;
+
 const PIER: &[u8] = include_bytes!(env!("ARCEN_PIER_BINARY_ABS"));
 
 /// Where the Pier binary lives.
@@ -70,6 +80,7 @@ const LOCK_FILE: &str = ".arcen-cert.lock";
 const SERVICE_TEMPLATE: &str = include_str!("../../arcen-pier.service");
 const CONFIG_TEMPLATE: &str = include_str!("../../arcen-pier.json");
 const XORG_TEMPLATE: &str = include_str!("../../arcen-xorg.conf");
+const XORG_CONFIG_PATH: &str = "/etc/arcen/xorg.conf";
 const LOGROTATE_CONF: &str = include_str!("../../arcen-pier.logrotate");
 /// Third-party notices, shipped with the binary rather than kept only in the
 /// repository. The Pier statically links the Cisco OpenH264 source through
@@ -444,13 +455,15 @@ fn install(options: &Options) -> Result<(), String> {
     if !options.force {
         migrate_existing_config(options)?;
     }
+    let xorg_written = options.force || !map_path(&options.prefix, XORG_CONFIG_PATH).exists();
     write_atomic(
         options,
-        "/etc/arcen/xorg.conf",
+        XORG_CONFIG_PATH,
         XORG_TEMPLATE.as_bytes(),
         0o644,
         options.force,
     )?;
+    configure_xorg_gpu(options, xorg_written);
     ensure_cert(options)?;
     if options.dry_run {
         println!("dry-run: would run systemctl daemon-reload when installing to /");
@@ -471,6 +484,236 @@ fn install(options: &Options) -> Result<(), String> {
     }
     finish_install(transaction, &outcome)
 }
+
+/// Name this machine's NVIDIA GPU in `/etc/arcen/xorg.conf`.
+///
+/// The `BusID` is a fact about one machine, so the packaged template carries
+/// none, and a file from an earlier package may name another machine's GPU.
+/// Either way the NVIDIA driver then finds no device and no session can start.
+/// The shared `arcen_outputs::decide_xorg_gpu` decides from sysfs; this applies
+/// it. Only on the real root: a staging prefix describes another machine's
+/// files, not this one's GPU. Never fails the install: the Pier re-checks the
+/// `BusID` before every X server it starts.
+fn configure_xorg_gpu(options: &Options, freshly_written: bool) {
+    if !is_root_prefix(&options.prefix) {
+        println!("staging prefix: skipped choosing the GPU for {XORG_CONFIG_PATH}");
+        return;
+    }
+    let step = XorgGpuStep {
+        config: Path::new(XORG_CONFIG_PATH),
+        sysfs_root: Path::new(gpu_pci::SYSFS_ROOT),
+        dry_run: options.dry_run,
+        freshly_written,
+        backup_suffix: env!("CARGO_PKG_VERSION"),
+        owner: 0,
+    };
+    match step.run() {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(warning) => println!("warning: xorg: {warning}; {XORG_CONFIG_PATH} was not changed"),
+    }
+}
+
+/// One run of the `BusID` step against an explicit file and sysfs root.
+struct XorgGpuStep<'a> {
+    config: &'a Path,
+    sysfs_root: &'a Path,
+    dry_run: bool,
+    /// The installer has just written the stock template there (or would
+    /// have, in a dry run), so there is no operator file to back up.
+    freshly_written: bool,
+    /// Names the backup of an operator file: `xorg.conf.before-<suffix>`.
+    backup_suffix: &'a str,
+    /// The uid the file must belong to: root, except in tests.
+    owner: u32,
+}
+
+impl XorgGpuStep<'_> {
+    /// What was decided and done, one terminal line each, or why nothing was.
+    fn run(&self) -> Result<Vec<String>, String> {
+        let label = self.config.display().to_string();
+        let text = if self.dry_run && self.freshly_written {
+            XORG_TEMPLATE.to_owned()
+        } else {
+            self.read_trusted(&label)?
+        };
+        let candidates = gpu_pci::pci_candidates(self.sysfs_root).map_err(|error| {
+            format!(
+                "cannot list PCI devices under {}: {error}",
+                self.sysfs_root.display()
+            )
+        })?;
+        let decision = arcen_outputs::decide_xorg_gpu(&text, &candidates)
+            .map_err(|error| gpu_pci::describe_template_error(&label, &error))?;
+        let mut lines = Vec::new();
+        match &decision {
+            arcen_outputs::XorgGpuDecision::Keep { .. } => {
+                lines.push(format!(
+                    "xorg: {}",
+                    gpu_pci::describe_decision(&label, &decision, "keeping")
+                ));
+            }
+            arcen_outputs::XorgGpuDecision::NoNvidiaGpu { .. } => {
+                lines.push(format!(
+                    "warning: xorg: {}. NVIDIA display devices found: {}. Nothing was changed; \
+                     install the NVIDIA driver, then rerun this installer",
+                    gpu_pci::describe_decision(&label, &decision, "keeping"),
+                    gpu_pci::describe_nvidia_gpus(&candidates)
+                ));
+            }
+            arcen_outputs::XorgGpuDecision::Set { address, .. } => {
+                let verb = if self.dry_run { "would set" } else { "setting" };
+                let prefix = if self.dry_run {
+                    "dry-run: xorg"
+                } else {
+                    "xorg"
+                };
+                lines.push(format!(
+                    "{prefix}: {} so headless sessions can start",
+                    gpu_pci::describe_decision(&label, &decision, verb)
+                ));
+                if let Some(others) = gpu_pci::describe_other_gpus(&label, &decision) {
+                    lines.push(format!("{prefix}: {others}"));
+                }
+                let updated = arcen_outputs::apply_bus_id(&text, *address)
+                    .map_err(|error| gpu_pci::describe_template_error(&label, &error))?;
+                if !self.freshly_written {
+                    if self.dry_run {
+                        let backup = self
+                            .backup_candidates()
+                            .find(|candidate| fs::symlink_metadata(candidate).is_err())
+                            .unwrap_or_else(|| self.backup_name(None));
+                        lines.push(format!(
+                            "dry-run: would keep the previous file as {}",
+                            backup.display()
+                        ));
+                    } else {
+                        let backup = self.keep_backup(text.as_bytes())?;
+                        lines.push(format!("xorg: previous file kept as {}", backup.display()));
+                    }
+                }
+                if !self.dry_run {
+                    write_atomic_path(self.config, updated.as_bytes(), 0o644)?;
+                }
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Reads the existing file the way the launcher does: without following a
+    /// symlink, and only when it is a regular root-owned file that group and
+    /// other users cannot write. Anything else was not written by an
+    /// administrator through the usual route, and rewriting it root-owned
+    /// `0644` would hand an untrusted edit to a root X server.
+    fn read_trusted(&self, label: &str) -> Result<String, String> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let refuse = |reason: String| {
+            format!(
+                "{label} is not safe to repair: {reason}. The Pier refuses it too; make it a \
+                 regular file owned by root with mode 0644, then rerun this installer"
+            )
+        };
+        let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow)
+            .open(self.config)
+        {
+            Ok(file) => file,
+            Err(_)
+                if fs::symlink_metadata(self.config)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+            {
+                return Err(refuse("it is a symbolic link".to_owned()));
+            }
+            Err(error) => return Err(format!("read {label}: {error}")),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("read {label}: {error}"))?;
+        let trust = xorg_template_trust::template_trust(
+            metadata.file_type().is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            self.owner,
+        );
+        if trust != xorg_template_trust::TemplateTrust::Trusted {
+            return Err(refuse(trust.describe()));
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        Ok(text)
+    }
+
+    /// `xorg.conf.before-<suffix>`, then `.1`, `.2`, ... for later repairs.
+    fn backup_name(&self, attempt: Option<u32>) -> PathBuf {
+        let name = self.config.file_name().map_or_else(
+            || "xorg.conf".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let base = format!("{name}.before-{}", self.backup_suffix);
+        self.config.with_file_name(match attempt {
+            None => base,
+            Some(attempt) => format!("{base}.{attempt}"),
+        })
+    }
+
+    fn backup_candidates(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        std::iter::once(None)
+            .chain((1..=MAX_BACKUP_ATTEMPTS).map(Some))
+            .map(|attempt| self.backup_name(attempt))
+    }
+
+    /// Writes `content` to a staged file, then links it into the first free
+    /// backup name. `link` never replaces an existing name, so an earlier
+    /// backup — including one made a moment ago by another run — is never
+    /// overwritten, and the backup appears whole or not at all.
+    fn keep_backup(&self, content: &[u8]) -> Result<PathBuf, String> {
+        let staged = self
+            .config
+            .with_file_name(format!(".xorg.conf.backup.{}", std::process::id()));
+        match fs::remove_file(&staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove {}: {error}", staged.display())),
+        }
+        write_file_path(&staged, content, 0o644)?;
+        let mut linked = None;
+        for candidate in self.backup_candidates() {
+            match fs::hard_link(&staged, &candidate) {
+                Ok(()) => {
+                    linked = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&staged);
+                    return Err(format!("keep backup {}: {error}", candidate.display()));
+                }
+            }
+        }
+        let _ = fs::remove_file(&staged);
+        let backup = linked.ok_or_else(|| {
+            format!(
+                "every backup name up to {} is taken",
+                self.backup_name(Some(MAX_BACKUP_ATTEMPTS)).display()
+            )
+        })?;
+        if let Some(parent) = backup.parent() {
+            fsync_directory(parent)?;
+        }
+        Ok(backup)
+    }
+}
+
+/// How many numbered backups of `xorg.conf` one version may leave.
+const MAX_BACKUP_ATTEMPTS: u32 = 999;
 
 /// Register the unit and bring it up.
 fn enable_and_start(options: &Options) -> Result<ServiceOutcome, String> {
@@ -2367,5 +2610,387 @@ mod tests {
         let rendered = subject_alt_name(&["localhost".to_string(), "127.0.0.1".to_string()]);
         assert_eq!(rendered.matches("DNS:localhost").count(), 1, "{rendered}");
         assert_eq!(rendered.matches("IP:127.0.0.1").count(), 1, "{rendered}");
+    }
+
+    const LAB_BUS_ID_LINE: &str = "    BusID          \"PCI:6:16:0\"\n";
+    const DRIVER_LINE: &str = "    Driver         \"nvidia\"\n";
+
+    /// The 0.16.1 template: the stock file with the development lab's GPU.
+    fn lab_template() -> String {
+        XORG_TEMPLATE.replacen(DRIVER_LINE, &format!("{DRIVER_LINE}{LAB_BUS_ID_LINE}"), 1)
+    }
+
+    struct XorgFixture {
+        root: PathBuf,
+        sysfs: gpu_pci::test_support::FakeSysfs,
+        config: PathBuf,
+        /// The test user stands in for root as the trusted owner.
+        owner: u32,
+    }
+
+    impl XorgFixture {
+        fn new(
+            name: &str,
+            existing: Option<&str>,
+            gpus: &[(&str, &str, &str, Option<&str>)],
+        ) -> Self {
+            let root = test_prefix(name);
+            let config = root.join("etc/arcen/xorg.conf");
+            fs::create_dir_all(config.parent().expect("parent")).expect("create etc");
+            if let Some(existing) = existing {
+                fs::write(&config, existing).expect("write xorg.conf");
+                chmod(&config, 0o644).expect("chmod");
+            }
+            let sysfs = gpu_pci::test_support::fake_sysfs(name, gpus);
+            let owner = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&root).expect("root"));
+            Self {
+                root,
+                sysfs,
+                config,
+                owner,
+            }
+        }
+
+        fn run(&self, dry_run: bool, freshly_written: bool) -> Result<Vec<String>, String> {
+            XorgGpuStep {
+                config: &self.config,
+                sysfs_root: self.sysfs.path(),
+                dry_run,
+                freshly_written,
+                backup_suffix: "0.16.1",
+                owner: self.owner,
+            }
+            .run()
+        }
+
+        fn backup(&self) -> PathBuf {
+            self.config.with_file_name("xorg.conf.before-0.16.1")
+        }
+
+        fn read(&self) -> String {
+            fs::read_to_string(&self.config).expect("read xorg.conf")
+        }
+    }
+
+    impl Drop for XorgFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const NVIDIA_VGPU: (&str, &str, &str, Option<&str>) =
+        ("0000:00:10.0", "0x10de", "0x030000", Some("nvidia"));
+    const VIRTIO_VGA: (&str, &str, &str, Option<&str>) =
+        ("0000:00:01.0", "0x1af4", "0x030000", Some("virtio-pci"));
+
+    #[test]
+    fn the_stock_template_names_no_machines_gpu() {
+        assert!(!XORG_TEMPLATE.contains("PCI:6:16:0"));
+        assert_eq!(
+            arcen_outputs::decide_xorg_gpu(XORG_TEMPLATE, &[]),
+            Ok(arcen_outputs::XorgGpuDecision::NoNvidiaGpu { previous: None })
+        );
+    }
+
+    #[test]
+    fn a_stale_lab_bus_id_is_corrected_with_a_backup() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-stale", Some(&original), &[VIRTIO_VGA, NVIDIA_VGPU]);
+        let lines = fixture.run(false, false).expect("step");
+        assert_eq!(
+            lines[0],
+            format!(
+                "xorg: {} named BusID \"PCI:6:16:0\", but the NVIDIA GPU is at 0000:00:10.0; \
+                 setting BusID \"PCI:0:16:0\" so headless sessions can start",
+                fixture.config.display()
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!("xorg: previous file kept as {}", fixture.backup().display())
+        );
+        assert_eq!(
+            fixture.read(),
+            original.replace("\"PCI:6:16:0\"", "\"PCI:0:16:0\"")
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.backup()).expect("backup"),
+            original
+        );
+        for path in [&fixture.config, &fixture.backup()] {
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "{}", path.display());
+        }
+
+        // A second correction must not overwrite the operator's original.
+        let second = original.replace("PCI:6:16:0", "PCI:7:0:0");
+        fs::write(&fixture.config, &second).expect("restale");
+        let lines = fixture.run(false, false).expect("step again");
+        assert_eq!(
+            fs::read_to_string(fixture.backup()).expect("backup"),
+            original
+        );
+        let numbered = fixture.config.with_file_name("xorg.conf.before-0.16.1.1");
+        assert_eq!(fs::read_to_string(&numbered).expect("numbered"), second);
+        assert_eq!(
+            lines[1],
+            format!("xorg: previous file kept as {}", numbered.display())
+        );
+        let backups = fs::read_dir(fixture.config.parent().expect("parent"))
+            .expect("list")
+            .filter(|entry| {
+                entry.as_ref().is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("xorg.conf.before-")
+                })
+            })
+            .count();
+        assert_eq!(backups, 2);
+    }
+
+    #[test]
+    fn a_freshly_written_template_gets_the_bus_id_without_a_backup() {
+        let fixture = XorgFixture::new("xorg-fresh", Some(XORG_TEMPLATE), &[NVIDIA_VGPU]);
+        let lines = fixture.run(false, true).expect("step");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("had no BusID"), "{}", lines[0]);
+        assert_eq!(
+            fixture.read(),
+            XORG_TEMPLATE.replacen(
+                DRIVER_LINE,
+                &format!("{DRIVER_LINE}    BusID          \"PCI:0:16:0\"\n"),
+                1
+            )
+        );
+        assert!(!fixture.backup().exists());
+    }
+
+    #[test]
+    fn a_correct_bus_id_is_kept_untouched() {
+        let original = lab_template().replace("PCI:6:16:0", "PCI:0:16:0");
+        let fixture = XorgFixture::new("xorg-keep", Some(&original), &[NVIDIA_VGPU]);
+        let lines = fixture.run(false, false).expect("step");
+        assert_eq!(
+            lines,
+            [format!(
+                "xorg: {} uses the NVIDIA GPU at PCI 0000:00:10.0 (BusID PCI:0:16:0)",
+                fixture.config.display()
+            )]
+        );
+        assert_eq!(fixture.read(), original);
+        assert!(!fixture.backup().exists());
+    }
+
+    #[test]
+    fn no_nvidia_gpu_warns_and_changes_nothing() {
+        let original = lab_template();
+        let fixture = XorgFixture::new(
+            "xorg-none",
+            Some(&original),
+            &[
+                VIRTIO_VGA,
+                ("0000:3b:00.0", "0x10de", "0x030200", Some("vfio-pci")),
+            ],
+        );
+        let lines = fixture.run(false, false).expect("step");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("warning: xorg: "), "{}", lines[0]);
+        assert!(lines[0].contains("no usable NVIDIA GPU"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("0000:3b:00.0 (bound to vfio-pci, not usable)"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("Nothing was changed"), "{}", lines[0]);
+        assert_eq!(fixture.read(), original);
+        assert!(!fixture.backup().exists());
+    }
+
+    #[test]
+    fn a_dry_run_reports_without_writing() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-dry", Some(&original), &[NVIDIA_VGPU]);
+        let lines = fixture.run(true, false).expect("step");
+        assert!(lines[0].starts_with("dry-run: xorg: "), "{}", lines[0]);
+        assert!(
+            lines[0].contains("would set BusID \"PCI:0:16:0\""),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("dry-run: would keep the previous file as"));
+        assert_eq!(fixture.read(), original);
+        assert!(!fixture.backup().exists());
+
+        // A dry run of a fresh install judges the template it would write.
+        let fresh = XorgFixture::new("xorg-dry-fresh", None, &[NVIDIA_VGPU]);
+        let lines = fresh.run(true, true).expect("step");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("had no BusID"), "{}", lines[0]);
+        assert!(!fresh.config.exists());
+    }
+
+    #[test]
+    fn several_gpus_name_the_choice_and_the_alternatives() {
+        let fixture = XorgFixture::new(
+            "xorg-several",
+            Some(XORG_TEMPLATE),
+            &[
+                ("0000:af:00.0", "0x10de", "0x030200", Some("nvidia")),
+                ("0000:3b:00.0", "0x10de", "0x030200", Some("nvidia")),
+            ],
+        );
+        let lines = fixture.run(false, true).expect("step");
+        assert!(
+            lines[0].contains("0000:3b:00.0; setting BusID \"PCI:59:0:0\""),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("the others are 0000:af:00.0 (BusID \"PCI:175:0:0\")"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains("set its BusID in"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn an_unreadable_sysfs_is_a_warning_not_a_failure() {
+        let fixture = XorgFixture::new("xorg-nosysfs", Some(XORG_TEMPLATE), &[]);
+        fs::remove_dir_all(fixture.sysfs.path().join("bus")).expect("remove fake pci");
+        let error = fixture.run(false, true).expect_err("no sysfs");
+        assert!(
+            error.starts_with("cannot list PCI devices under"),
+            "{error}"
+        );
+        assert_eq!(fixture.read(), XORG_TEMPLATE);
+    }
+
+    #[test]
+    fn backups_never_replace_an_existing_name() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-collide", Some(&original), &[NVIDIA_VGPU]);
+        let first = fixture.backup();
+        let second = fixture.config.with_file_name("xorg.conf.before-0.16.1.1");
+        fs::write(&first, "first").expect("first");
+        fs::write(&second, "second").expect("second");
+        // A dangling symlink is a taken name too.
+        let third = fixture.config.with_file_name("xorg.conf.before-0.16.1.2");
+        std::os::unix::fs::symlink(fixture.root.join("nowhere"), &third).expect("symlink");
+        let lines = fixture.run(false, false).expect("step");
+        let fourth = fixture.config.with_file_name("xorg.conf.before-0.16.1.3");
+        assert_eq!(
+            lines[1],
+            format!("xorg: previous file kept as {}", fourth.display())
+        );
+        assert_eq!(fs::read_to_string(&first).expect("first"), "first");
+        assert_eq!(fs::read_to_string(&second).expect("second"), "second");
+        assert!(
+            fs::symlink_metadata(&third)
+                .expect("third")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&fourth).expect("fourth"), original);
+        let mode = fs::metadata(&fourth)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+        let leftovers: Vec<_> = fs::read_dir(fixture.config.parent().expect("parent"))
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staged files left behind: {leftovers:?}"
+        );
+
+        // A dry run names the first free slot without taking it.
+        fs::write(&fixture.config, &original).expect("restale");
+        let lines = fixture.run(true, false).expect("dry run");
+        let fifth = fixture.config.with_file_name("xorg.conf.before-0.16.1.4");
+        assert_eq!(
+            lines[1],
+            format!(
+                "dry-run: would keep the previous file as {}",
+                fifth.display()
+            )
+        );
+        assert!(!fifth.exists());
+    }
+
+    fn assert_refused(fixture: &XorgFixture, owner: u32, reason: &str) {
+        let before = fs::symlink_metadata(&fixture.config).expect("metadata");
+        let result = XorgGpuStep {
+            config: &fixture.config,
+            sysfs_root: fixture.sysfs.path(),
+            dry_run: false,
+            freshly_written: false,
+            backup_suffix: "0.16.1",
+            owner,
+        }
+        .run();
+        let error = result.expect_err("an untrusted template must be refused");
+        assert!(error.contains("is not safe to repair"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        let after = fs::symlink_metadata(&fixture.config).expect("metadata");
+        assert_eq!(before.modified().ok(), after.modified().ok());
+        assert_eq!(before.permissions(), after.permissions());
+        assert!(!fixture.backup().exists());
+    }
+
+    #[test]
+    fn a_template_others_can_write_is_not_repaired() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-writable", Some(&original), &[NVIDIA_VGPU]);
+        chmod(&fixture.config, 0o664).expect("chmod");
+        assert_refused(&fixture, fixture.owner, "mode 0664");
+        assert_eq!(fixture.read(), original);
+        chmod(&fixture.config, 0o646).expect("chmod");
+        assert_refused(&fixture, fixture.owner, "mode 0646");
+        assert_eq!(fixture.read(), original);
+    }
+
+    #[test]
+    fn a_template_owned_by_someone_else_is_not_repaired() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-owner", Some(&original), &[NVIDIA_VGPU]);
+        let stranger = fixture.owner.wrapping_add(1);
+        assert_refused(
+            &fixture,
+            stranger,
+            &format!("owned by uid {}", fixture.owner),
+        );
+        assert_eq!(fixture.read(), original);
+    }
+
+    #[test]
+    fn a_symlinked_template_is_not_followed() {
+        let original = lab_template();
+        let fixture = XorgFixture::new("xorg-symlink", None, &[NVIDIA_VGPU]);
+        let real = fixture.root.join("attacker.conf");
+        fs::write(&real, &original).expect("target");
+        chmod(&real, 0o644).expect("chmod");
+        std::os::unix::fs::symlink(&real, &fixture.config).expect("symlink");
+        assert_refused(&fixture, fixture.owner, "symbolic link");
+        assert_eq!(fs::read_to_string(&real).expect("target"), original);
+        assert!(
+            fs::symlink_metadata(&fixture.config)
+                .expect("link")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_template_that_is_not_a_file_is_not_repaired() {
+        let fixture = XorgFixture::new("xorg-dir", None, &[NVIDIA_VGPU]);
+        fs::create_dir(&fixture.config).expect("directory");
+        chmod(&fixture.config, 0o755).expect("chmod");
+        assert_refused(&fixture, fixture.owner, "not a regular file");
     }
 }

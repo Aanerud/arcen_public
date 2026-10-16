@@ -28,8 +28,19 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
   - **Identity drop is ordered:** `setgroups → setgid → setuid`, then PDEATHSIG re-armed.
     Credentials travel over a private stdin pipe as `Zeroizing` bytes; PAM owned by the root
     session-launcher (`pam-client2`), validated via loginctl + `/proc/self/cgroup`.
-  - **Resilient headless Xorg:** BusID-detected config in `/run`, never touches
-    `/etc/X11/xorg.conf`.
+  - **Resilient headless Xorg:** per-session config rendered into `/run`, never
+    touches `/etc/X11/xorg.conf`. The template's NVIDIA `BusID` is a machine
+    fact, so the packaged `/etc/arcen/xorg.conf` ships without one; the
+    installer writes it from sysfs, and the Pier re-checks it in memory before
+    every dedicated or probe X server (`display/gpu_pci.rs` →
+    `arcen_outputs::xorg_gpu`). A stale `BusID` otherwise fails every session
+    with `(EE) No devices detected`. The launcher reports the chosen GPU
+    (`capture_gpu_pci` in its ready response); the Pier passes it to capenc as
+    `ARCEN_CAPTURE_GPU_PCI`, and capenc opens CUDA with `cuDeviceGetByPCIBusId`
+    so NvFBC, CUDA and NVENC share the X screen's GPU. The template trust rule
+    (`display/xorg_template_trust.rs`: regular, root-owned, not group/other
+    writable, opened `O_NOFOLLOW`) is shared by the launcher, the head probe,
+    and the installer.
   - Reasoned WebSocket close frames (UTF-8-safe 120-byte truncation) for
     `persistent_session_busy` / `graphical_session_setup` instead of bare `Close(None)`.
 
@@ -114,7 +125,11 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
   pen/tablet input" below.
 - `clipboard.rs` / `clipboard/native.rs` — trusted parent relay/supervision and
   the user-context x11rb XFixes/ICCCM selection agent.
-- `display/` — `nvctrl.rs`, `topology.rs`, and `wayland.rs` (host-local
+- `display/` — `xorg_template_trust.rs` (std-only template trust rule, also
+  compiled into the installer), `gpu_pci.rs` (std-only sysfs PCI reader feeding the shared
+  `arcen_outputs::xorg_gpu` `BusID` decision; the Linux installer compiles the
+  same file), `nvidia_discovery.rs` (head probe and the in-memory `BusID`
+  backstop, `resolve_xorg_template_gpu`), `nvctrl.rs`, `topology.rs`, and `wayland.rs` (host-local
   `wl_output`/`xdg-output`/fractional-scale model and fail-closed provider
   detection; not selected by the launcher). `topology.rs` owns the Xorg/RandR
   head inventory, mode matching, and framebuffer ceiling; the rotation-aware

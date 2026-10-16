@@ -55,7 +55,7 @@ pub struct InterfaceReportDescriptor {
 pub enum HardUsbTabletDenial {
     /// The device-level class is neither per-interface (`0x00`) nor HID.
     DeviceClass(u8),
-    /// The Deck supplied no report descriptors (a Deck older than 0.16.0, or
+    /// The Deck supplied no report descriptors (a Deck older than 0.16.1, or
     /// a device it could not read).
     NoDescriptors,
     /// More descriptors than the bridge accepts interfaces.
@@ -90,7 +90,7 @@ impl Display for HardUsbTabletDenial {
                 "device class {class:#04x} is not a HID or per-interface device"
             ),
             Self::NoDescriptors => formatter.write_str(
-                "the Deck supplied no HID report descriptors; Deck 0.16.0 or newer is required",
+                "the Deck supplied no HID report descriptors; Deck 0.16.1 or newer is required",
             ),
             Self::TooManyDescriptors => {
                 formatter.write_str("more HID report descriptors than the bridge accepts")

@@ -99,6 +99,45 @@ pub(crate) const fn linux_capture_backend(bit_depth: BitDepth) -> LinuxCaptureBa
     }
 }
 
+/// Which CUDA device capture opens.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CudaDeviceRequest {
+    /// The GPU at this PCI address, in the `0000:00:10.0` form that
+    /// `cuDeviceGetByPCIBusId` accepts. Set when the Pier knows which GPU
+    /// drives the X screen, so NvFBC, CUDA and NVENC share it.
+    PciBusId(String),
+    /// A CUDA ordinal: the operator's `ARCEN_CUDA_DEVICE`, otherwise 0.
+    Ordinal(i32),
+}
+
+/// Resolves the capture GPU from `ARCEN_CAPTURE_GPU_PCI` and
+/// `ARCEN_CUDA_DEVICE` as read from the environment (`None` when unset).
+///
+/// A PCI address wins: it is the X server's own GPU, which an ordinal cannot
+/// name reliably on a host whose GPUs differ. Malformed values are refused
+/// rather than silently replaced by device 0.
+pub(crate) fn cuda_device_request(
+    capture_gpu_pci: Option<&str>,
+    ordinal: Option<&str>,
+) -> Result<CudaDeviceRequest, String> {
+    if let Some(pci) = capture_gpu_pci {
+        let address = arcen_outputs::PciAddress::parse_sysfs(pci.trim()).map_err(|error| {
+            format!(
+                "{} must be a PCI address like 0000:00:10.0: {error}",
+                crate::CAPTURE_GPU_PCI_ENV
+            )
+        })?;
+        return Ok(CudaDeviceRequest::PciBusId(address.to_string()));
+    }
+    match ordinal {
+        Some(value) => value
+            .parse::<i32>()
+            .map(CudaDeviceRequest::Ordinal)
+            .map_err(|_| "ARCEN_CUDA_DEVICE must be a signed integer".to_string()),
+        None => Ok(CudaDeviceRequest::Ordinal(0)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +197,35 @@ mod tests {
                 LinuxCaptureBackend::XShm,
                 "{depth:?} cannot be served by NvFBC"
             );
+        }
+    }
+
+    #[test]
+    fn capture_gpu_defaults_to_cuda_ordinal_zero() {
+        assert_eq!(
+            cuda_device_request(None, None),
+            Ok(CudaDeviceRequest::Ordinal(0))
+        );
+        assert_eq!(
+            cuda_device_request(None, Some("1")),
+            Ok(CudaDeviceRequest::Ordinal(1))
+        );
+        assert!(cuda_device_request(None, Some("first")).is_err());
+    }
+
+    #[test]
+    fn the_x_servers_pci_gpu_wins_over_an_ordinal() {
+        assert_eq!(
+            cuda_device_request(Some("0000:00:10.0"), Some("1")),
+            Ok(CudaDeviceRequest::PciBusId("0000:00:10.0".to_string()))
+        );
+        assert_eq!(
+            cuda_device_request(Some("3b:00.0\n"), None),
+            Ok(CudaDeviceRequest::PciBusId("0000:3b:00.0".to_string()))
+        );
+        for bad in ["", "PCI:0:16:0", "0000:00:10", "0000:00:10.0;rm"] {
+            let error = cuda_device_request(Some(bad), None).expect_err(bad);
+            assert!(error.starts_with("ARCEN_CAPTURE_GPU_PCI"), "{error}");
         }
     }
 }

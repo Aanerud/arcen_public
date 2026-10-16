@@ -26,6 +26,9 @@
 //!   the applied origin translation, and the "publish the negotiated bitrate
 //!   budget verbatim" rule that both hosts hand-wrote when assembling their
 //!   applied multi-region capability.
+//! - [`xorg_gpu`]: which PCI GPU a dedicated NVIDIA Xorg `Device` section
+//!   names (`BusID`), decided from host-reported PCI facts, so a template
+//!   never carries one machine's GPU address to another.
 //!
 //! # Dependency and runtime boundary
 //!
@@ -54,6 +57,7 @@ pub mod fairness;
 pub mod nvidia_heads;
 pub mod provider;
 pub mod windows_multi_monitor;
+pub mod xorg_gpu;
 
 #[cfg(test)]
 mod block_on;
@@ -86,4 +90,8 @@ pub use windows_multi_monitor::{
     WindowsMultiMonitorPolicy, WindowsMultiMonitorRefusal, WindowsMultiMonitorSelection,
     WindowsMultiMonitorSelectionReason, resolve_windows_multi_monitor_adapter,
     windows_ccd_mode_plan,
+};
+pub use xorg_gpu::{
+    BoundDriver, GpuCandidate, NVIDIA_PCI_VENDOR, PciAddress, PciAddressError, XorgGpuDecision,
+    XorgTemplateError, apply_bus_id, decide_xorg_gpu, resolve_xorg_gpu,
 };

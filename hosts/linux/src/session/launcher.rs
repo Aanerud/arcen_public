@@ -408,6 +408,43 @@ struct LauncherResponse {
     xauthority: String,
     #[serde(default)]
     agent_pid: u32,
+    /// `lspci -D` form of the GPU the dedicated X server drives, or empty.
+    #[serde(default)]
+    capture_gpu_pci: String,
+}
+
+/// The helper environment that pins capture to the dedicated X server's GPU.
+///
+/// The launcher reports the GPU its Xorg drives; capenc reads
+/// [`arcen_capenc::CAPTURE_GPU_PCI_ENV`] and opens CUDA on that PCI device
+/// instead of CUDA ordinal 0, so NvFBC, CUDA and NVENC stay on the GPU that
+/// owns the screen. Anything but a valid address is dropped with a warning:
+/// capture then keeps its previous single-GPU behaviour.
+fn capture_gpu_environment(reported: &str) -> Option<(String, String)> {
+    if reported.is_empty() {
+        return None;
+    }
+    match arcen_outputs::PciAddress::parse_sysfs(reported) {
+        Ok(address) => {
+            tracing::info!(
+                target: target::SESSION,
+                capture_gpu_pci = %address,
+                "dedicated X server GPU; capture will use the same GPU"
+            );
+            Some((
+                arcen_capenc::CAPTURE_GPU_PCI_ENV.to_owned(),
+                address.to_string(),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: target::SESSION,
+                %error,
+                "launcher reported an unusable capture GPU; capture keeps CUDA's default device"
+            );
+            None
+        }
+    }
 }
 
 impl LauncherResponse {
@@ -426,6 +463,7 @@ impl LauncherResponse {
             display: String::new(),
             xauthority: String::new(),
             agent_pid: 0,
+            capture_gpu_pci: String::new(),
         }
     }
 
@@ -446,6 +484,7 @@ impl LauncherResponse {
         identity: &UserIdentity,
         environment: &SessionEnvironment,
         agent: &AgentReady,
+        capture_gpu_pci: Option<arcen_outputs::PciAddress>,
     ) -> Self {
         Self {
             status: "ready".into(),
@@ -464,6 +503,9 @@ impl LauncherResponse {
                 .unwrap_or_default()
                 .to_string(),
             agent_pid: agent.pid,
+            capture_gpu_pci: capture_gpu_pci
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -654,22 +696,24 @@ impl AuthenticatedLauncher {
         {
             return Err(open_response_error(response.status.as_str()));
         }
+        let mut extra_environment = vec![
+            ("XDG_SESSION_ID".into(), response.session_id.clone()),
+            (
+                "ARCEN_SESSION_LOG_ID".into(),
+                self.session_log_id
+                    .lock()
+                    .expect("session log id lock")
+                    .to_string(),
+            ),
+        ];
+        extra_environment.extend(capture_gpu_environment(&response.capture_gpu_pci));
         let environment = SessionEnvironment::build(
             &self.identity,
             &response.display,
             (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
             &response.desktop,
             self.timezone.as_ref(),
-            [
-                ("XDG_SESSION_ID".into(), response.session_id.clone()),
-                (
-                    "ARCEN_SESSION_LOG_ID".into(),
-                    self.session_log_id
-                        .lock()
-                        .expect("session log id lock")
-                        .to_string(),
-                ),
-            ],
+            extra_environment,
         );
         if self.child.is_none()
             || self.stdin.is_none()
@@ -1205,6 +1249,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         &identity,
         &environment,
         &agent.ready,
+        xorg.gpu_pci(),
     )) {
         agent.shutdown().await;
         if let Some(deskside) = deskside.as_mut() {
@@ -1272,6 +1317,8 @@ async fn wait_for_deskside_failure(deskside: &mut Option<crate::deskside::LinuxD
 struct PreparedDedicatedXorg {
     display_number: u16,
     config_text: String,
+    /// The NVIDIA GPU `config_text` names, when the host has it.
+    gpu_pci: Option<arcen_outputs::PciAddress>,
     /// The EDID the configuration's `CustomEDID` names, written beside it.
     edid: Option<Vec<u8>>,
     /// The topology this attempt applies, cloned out of the caller's plan so
@@ -1386,6 +1433,10 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
         }
 
         let template_text = read_secure_xorg_template(self.template)?;
+        let (template_text, gpu_pci) = crate::display::nvidia_discovery::resolve_xorg_template_gpu(
+            self.template,
+            &template_text,
+        );
         let config_text = match plan.as_ref() {
             Some(plan) => {
                 super::xorg_multihead::render_multi_head_xorg_config(&template_text, plan)
@@ -1409,6 +1460,7 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
         Ok(PreparedDedicatedXorg {
             display_number,
             config_text,
+            gpu_pci,
             edid,
             plan: plan.clone(),
             session_log_id: context.session_log_id().clone(),
@@ -1573,6 +1625,7 @@ struct DedicatedXorg {
     display_number: u16,
     session_dir: PathBuf,
     xauthority: PathBuf,
+    gpu_pci: Option<arcen_outputs::PciAddress>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1641,7 +1694,13 @@ impl DedicatedXorg {
             display_number: prepared.display_number,
             session_dir,
             xauthority,
+            gpu_pci: prepared.gpu_pci,
         })
+    }
+
+    /// The NVIDIA GPU this server drives, for capture to open CUDA on.
+    fn gpu_pci(&self) -> Option<arcen_outputs::PciAddress> {
+        self.gpu_pci
     }
 
     fn xauthority(&self) -> &str {
@@ -1856,7 +1915,19 @@ fn read_secure_xorg_template(path: &Path) -> Result<String, LauncherError> {
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+    let trust = crate::display::xorg_template_trust::template_trust(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        0,
+    );
+    if trust != crate::display::xorg_template_trust::TemplateTrust::Trusted {
+        tracing::warn!(
+            target: target::SESSION,
+            template = %path.display(),
+            "refusing the Xorg template: {}",
+            trust.describe()
+        );
         return Err(LauncherError::XorgConfig);
     }
     let mut template = String::new();
@@ -2507,6 +2578,39 @@ mod tests {
             "reading an enormous unterminated line must complete promptly, not hang"
         );
         writer_task.await.unwrap();
+    }
+
+    #[test]
+    fn the_dedicated_servers_gpu_reaches_capture_as_a_canonical_address() {
+        assert_eq!(
+            capture_gpu_environment("0000:00:10.0"),
+            Some((
+                "ARCEN_CAPTURE_GPU_PCI".to_string(),
+                "0000:00:10.0".to_string()
+            ))
+        );
+        assert_eq!(
+            capture_gpu_environment("0000:3B:00.0"),
+            Some((
+                "ARCEN_CAPTURE_GPU_PCI".to_string(),
+                "0000:3b:00.0".to_string()
+            ))
+        );
+        assert_eq!(capture_gpu_environment(""), None);
+        assert_eq!(capture_gpu_environment("PCI:0:16:0"), None);
+        assert_eq!(capture_gpu_environment("0000:00:10.0\nLD_PRELOAD=x"), None);
+    }
+
+    #[test]
+    fn launcher_responses_carry_the_capture_gpu_and_accept_older_launchers() {
+        let error = serde_json::to_value(LauncherResponse::error("pam_error")).unwrap();
+        assert_eq!(error["capture_gpu_pci"], "");
+        let older: LauncherResponse =
+            serde_json::from_str(r#"{"status":"ready","username":"u","uid":1000}"#).unwrap();
+        assert!(older.capture_gpu_pci.is_empty());
+        let newer: LauncherResponse =
+            serde_json::from_str(r#"{"status":"ready","capture_gpu_pci":"0000:00:10.0"}"#).unwrap();
+        assert_eq!(newer.capture_gpu_pci, "0000:00:10.0");
     }
 
     #[test]

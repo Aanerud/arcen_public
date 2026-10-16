@@ -1,6 +1,6 @@
 [package]
 name = "arcen-capenc"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -22,6 +22,7 @@ harness = false
 [dependencies]
 arcen-keel = { workspace = true }
 arcen-media.workspace = true
+arcen-outputs.workspace = true
 arcen-protocol.workspace = true
 arcen-telemetry.workspace = true
 # Linux NvFBC/CUDA/NVENC entry points remain dlopen'd with hand-written FFI

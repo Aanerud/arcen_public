@@ -42,6 +42,8 @@ pub enum DiscoveryError {
     MissingXorg(PathBuf),
     #[error("Xorg template is not readable: {0}")]
     MissingTemplate(PathBuf),
+    #[error("Xorg template {0} is not trusted: {1}")]
+    UntrustedTemplate(PathBuf, String),
     #[error("create discovery directory {0}: {1}")]
     CreateDirectory(PathBuf, io::Error),
     #[error("write probe Xorg template {0}: {1}")]
@@ -135,8 +137,8 @@ fn run_xorg_probe(
     config: &Config,
     discovery_dir: &Path,
 ) -> Result<NvidiaHeadDiscovery, DiscoveryError> {
-    let template = fs::read_to_string(&config.xorg_config_template)
-        .map_err(|error| DiscoveryError::ReadLog(config.xorg_config_template.clone(), error))?;
+    let template = read_trusted_template(&config.xorg_config_template)?;
+    let (template, _gpu) = resolve_xorg_template_gpu(&config.xorg_config_template, &template);
     let probe_config_path = discovery_dir.join("nvidia-head-probe-xorg.conf");
     fs::write(&probe_config_path, probe_template(&template))
         .map_err(|error| DiscoveryError::WriteTemplate(probe_config_path.clone(), error))?;
@@ -186,6 +188,119 @@ fn run_xorg_probe(
         source: DiscoverySource::Probe,
         log_path,
     })
+}
+
+/// Reads the template the probe's root Xorg will load, under the launcher's
+/// rule: not through a symlink, a regular root-owned file, not group- or
+/// other-writable.
+fn read_trusted_template(path: &Path) -> Result<String, DiscoveryError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let read_error = |error| DiscoveryError::ReadLog(path.to_path_buf(), error);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    let trust = super::xorg_template_trust::template_trust(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        0,
+    );
+    if trust != super::xorg_template_trust::TemplateTrust::Trusted {
+        return Err(DiscoveryError::UntrustedTemplate(
+            path.to_path_buf(),
+            trust.describe(),
+        ));
+    }
+    let mut template = String::new();
+    file.read_to_string(&mut template).map_err(read_error)?;
+    Ok(template)
+}
+
+/// Points the template's NVIDIA `Device` section at a GPU this host has.
+///
+/// The runtime backstop for a stale `BusID`: the installer writes the right
+/// one, but a file from an older package, a cloned VM, or a GPU that moved to
+/// another slot names a device that is not there, and then the NVIDIA driver
+/// reports `No devices detected` and no session can start. The decision is the
+/// shared [`arcen_outputs::decide_xorg_gpu`]; this only gathers sysfs facts and
+/// logs the outcome. It changes the text in memory and never writes the file.
+/// Anything it cannot decide leaves the template exactly as read.
+///
+/// Also returns the PCI address of the GPU the text now names, when it names
+/// one this host has, so capture can open CUDA on that same GPU.
+pub fn resolve_xorg_template_gpu(
+    template_path: &Path,
+    template: &str,
+) -> (String, Option<arcen_outputs::PciAddress>) {
+    use super::gpu_pci;
+
+    let name = template_path.display().to_string();
+    let candidates = match gpu_pci::pci_candidates(Path::new(gpu_pci::SYSFS_ROOT)) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                template = %name,
+                %error,
+                "cannot list PCI devices; using the Xorg template's BusID unchecked"
+            );
+            return (template.to_owned(), None);
+        }
+    };
+    match arcen_outputs::resolve_xorg_gpu(template, &candidates) {
+        Ok((resolved, decision)) => {
+            let mut text = gpu_pci::describe_decision(&name, &decision, "using");
+            if let Some(others) = gpu_pci::describe_other_gpus(&name, &decision) {
+                text.push_str("; ");
+                text.push_str(&others);
+            }
+            let gpu = match &decision {
+                arcen_outputs::XorgGpuDecision::Keep { address, .. }
+                | arcen_outputs::XorgGpuDecision::Set { address, .. } => Some(*address),
+                arcen_outputs::XorgGpuDecision::NoNvidiaGpu { .. } => None,
+            };
+            match decision {
+                arcen_outputs::XorgGpuDecision::Keep { .. } => tracing::info!(
+                    target: crate::logging::target::SESSION,
+                    template = %name,
+                    outcome = "kept",
+                    "Xorg GPU: {text}"
+                ),
+                arcen_outputs::XorgGpuDecision::Set { .. } => tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    template = %name,
+                    outcome = "corrected",
+                    "Xorg GPU: {text}. Applied in memory only; the file is unchanged, rerun the installer to correct it"
+                ),
+                arcen_outputs::XorgGpuDecision::NoNvidiaGpu { .. } => tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    template = %name,
+                    outcome = "no_nvidia_gpu",
+                    nvidia_devices = %gpu_pci::describe_nvidia_gpus(&candidates),
+                    "Xorg GPU: {text}"
+                ),
+            }
+            (resolved, gpu)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                template = %name,
+                outcome = "unresolved",
+                "Xorg GPU: {}; using it unchanged",
+                gpu_pci::describe_template_error(&name, &error)
+            );
+            (template.to_owned(), None)
+        }
+    }
 }
 
 /// Outputs the probe asks the driver for. A vGPU reports only the heads its

@@ -1186,6 +1186,12 @@ fn configure_child_environment(
         command.env("XAUTHORITY", xauthority);
     }
     command.env("ARCEN_SESSION_LOG_ID", config.session_log_id.as_str());
+    // Defence in depth for anything that still opens CUDA by ordinal: count
+    // GPUs in PCI order, not CUDA's default fastest-first, so ordinals mean
+    // the same thing to capenc as to `lspci`. The dedicated session's own GPU
+    // arrives by PCI address in the session environment
+    // (`ARCEN_CAPTURE_GPU_PCI`), which `configure` applied above.
+    command.env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
     if config.debug_diagnostics {
         command.env("ARCEN_CAPENC_DEBUG", "1");
     }
@@ -1472,6 +1478,18 @@ mod tests {
             execution: None,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
         }
+    }
+
+    #[test]
+    fn capture_children_count_cuda_devices_in_pci_order() {
+        let mut command = tokio::process::Command::new("true");
+        configure_child_environment(&mut command, &native_config()).expect("configure");
+        let order = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CUDA_DEVICE_ORDER"))
+            .and_then(|(_, value)| value);
+        assert_eq!(order, Some(std::ffi::OsStr::new("PCI_BUS_ID")));
     }
 
     #[test]

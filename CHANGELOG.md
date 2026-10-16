@@ -6,6 +6,31 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-10-17
+
+### Fixed
+
+- Linux Pier: sessions on a freshly installed host no longer fail with
+  `dedicated Xorg failed to start`. The packaged `/etc/arcen/xorg.conf` named
+  the development lab's GPU (`BusID "PCI:6:16:0"`), so on any other machine the
+  NVIDIA driver reported `No devices detected`. The template now ships without
+  a `BusID`; the installer finds the NVIDIA GPU in sysfs and sets it (keeping
+  a correct one, backing up an operator file to
+  `xorg.conf.before-<version>`, warning when there is no NVIDIA GPU), and the
+  Pier re-checks it in memory before every X server, so an existing stale file
+  keeps working until the installer is rerun. The decision is the shared
+  `arcen_outputs::xorg_gpu`.
+- Linux Pier: capture opens CUDA on the dedicated X server's GPU, by PCI
+  address (`ARCEN_CAPTURE_GPU_PCI`, logged as `capture_gpu_pci=`), instead of
+  CUDA device 0, so a host with different GPUs cannot capture or encode on one
+  the screen does not live on. Capture children use
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+- Linux installer: an existing `/etc/arcen/xorg.conf` is repaired only when
+  it is a regular root-owned file that group and other users cannot write, the
+  rule the Pier itself enforces, and backups never overwrite an earlier one.
+  The Pier's head-discovery probe now applies the same rule before starting its
+  root X server.
+
 ## [0.16.0] — 2026-10-16
 
 ### macOS Deck
@@ -948,6 +973,7 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
+[0.16.1]: https://github.com/Aanerud/arcen_public/releases/tag/v0.16.1
 [0.16.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.16.0
 [0.15.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.15.0
 [0.14.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.14.0
