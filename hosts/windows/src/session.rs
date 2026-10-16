@@ -3197,7 +3197,7 @@ where
         } else {
             InputCapabilityAvailability::Unavailable
         },
-        wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+        usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
         disabled_mouse_compat: InputCapabilityAvailability::Available,
     };
     let tablet_mode_result = resolve_windows_tablet_mode_result(
@@ -4235,8 +4235,8 @@ fn resolve_windows_tablet_mode_result(
             capability_to_input(host_capabilities.local_termination),
         ),
         mutual_capability(
-            capability_to_input(client_capabilities.wacom_usb_bridge),
-            capability_to_input(host_capabilities.wacom_usb_bridge),
+            capability_to_input(client_capabilities.usb_tablet_bridge),
+            capability_to_input(host_capabilities.usb_tablet_bridge),
         ),
     );
     let reason = if negotiation.accepted {
@@ -4252,7 +4252,7 @@ fn resolve_windows_tablet_mode_result(
             TabletModeMsg::LocalTermination => {
                 "local termination unavailable: Windows Ink synthetic pen backend did not initialize"
             }
-            TabletModeMsg::WacomUsbBridge => {
+            TabletModeMsg::UsbTabletBridge => {
                 // Reaches the operator verbatim: the Deck shows this reason
                 // rather than inventing its own, so it has to say what is
                 // missing and what to do instead.
@@ -4269,7 +4269,7 @@ fn resolve_windows_tablet_mode_result(
         active: tablet_mode_from_input(negotiation.active),
         accepted: negotiation.accepted,
         reason,
-        reconnect_required: requested == TabletModeMsg::WacomUsbBridge && !negotiation.accepted,
+        reconnect_required: requested == TabletModeMsg::UsbTabletBridge && !negotiation.accepted,
         ..TabletModeResultMsg::default()
     }
 }
@@ -4277,7 +4277,7 @@ fn resolve_windows_tablet_mode_result(
 const fn tablet_mode_to_input(mode: TabletModeMsg) -> InputTabletMode {
     match mode {
         TabletModeMsg::LocalTermination => InputTabletMode::LocalTermination,
-        TabletModeMsg::WacomUsbBridge => InputTabletMode::WacomUsbBridge,
+        TabletModeMsg::UsbTabletBridge => InputTabletMode::UsbTabletBridge,
         TabletModeMsg::DisabledMouseCompat => InputTabletMode::DisabledMouseCompat,
     }
 }
@@ -4285,7 +4285,7 @@ const fn tablet_mode_to_input(mode: TabletModeMsg) -> InputTabletMode {
 const fn tablet_mode_from_input(mode: InputTabletMode) -> TabletModeMsg {
     match mode {
         InputTabletMode::LocalTermination => TabletModeMsg::LocalTermination,
-        InputTabletMode::WacomUsbBridge => TabletModeMsg::WacomUsbBridge,
+        InputTabletMode::UsbTabletBridge => TabletModeMsg::UsbTabletBridge,
         InputTabletMode::DisabledMouseCompat => TabletModeMsg::DisabledMouseCompat,
     }
 }
@@ -4558,7 +4558,7 @@ fn build_server_hello_with_aggregate(
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_capability,
-            wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+            usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         },
         clipboard: Some(crate::clipboard::policy_message(cfg.clipboard_policy)),
@@ -10282,12 +10282,12 @@ mod tests {
     fn windows_tablet_mode_resolution_keeps_native_bridge_explicit() {
         let client = TabletModeCapabilitiesMsg {
             local_termination: InputCapabilityAvailability::Available,
-            wacom_usb_bridge: InputCapabilityAvailability::Available,
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         };
         let host = TabletModeCapabilitiesMsg {
             local_termination: InputCapabilityAvailability::Available,
-            wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+            usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         };
         let local =
@@ -10296,7 +10296,7 @@ mod tests {
         assert_eq!(local.active, TabletModeMsg::LocalTermination);
 
         let bridge =
-            resolve_windows_tablet_mode_result(TabletModeMsg::WacomUsbBridge, client, host);
+            resolve_windows_tablet_mode_result(TabletModeMsg::UsbTabletBridge, client, host);
         assert!(!bridge.accepted);
         assert_eq!(bridge.active, TabletModeMsg::DisabledMouseCompat);
         assert_reason_reaches_the_operator(bridge.reason.as_str());

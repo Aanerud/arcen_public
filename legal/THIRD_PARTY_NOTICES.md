@@ -54,6 +54,17 @@ inventory/SBOM artifact or obtain an explicit Release/Security release
 decision. Windows packages, the macOS app resources, and Linux installations
 include this notice file.
 
+## macOS 12 Deck local patches
+
+| Component and version | Copyright holder | License | Source URL | Required notice or source offer |
+| --- | --- | --- | --- | --- |
+| `apple-cf` 0.9.3 (`arcen1` local patch) | Copyright (c) 2026 Per Johansson | MIT OR Apache-2.0 | https://github.com/doom-fish/apple-cf-rs/tree/ea8a6c96c10647f46215ac7076295e998f05677d | Locally path-patched so its Swift bridge builds with Swift 5.7 and runs on macOS 12. Preserve its complete source, licenses, source manifest, and Arcen patch. |
+| `videotoolbox` 0.18.1 (`arcen1` local patch) | Copyright (c) 2026 Per Johansson | MIT OR Apache-2.0 | https://github.com/doom-fish/videotoolbox-rs/tree/59e024ffcbfa73ab54996901faacdb5a31261ae9 | Locally path-patched so decoding does not strongly link a VideoToolbox entry point newer than macOS 12. Preserve its complete source, licenses, source manifest, and Arcen patch. |
+
+Both packages keep their upstream licences and appear in the generated
+inventory below. Each directory's `ARCEN_NOTICE.md` records the exact archive
+checksum and every change.
+
 ## Portable software H.264 release inventory additions
 
 These components are present only when `arcen-media/software-h264-source` (or
@@ -447,7 +458,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 
 | Package | Version | Artefacts | Source |
 | --- | --- | --- | --- |
-| `rustls` | 0.23.41 | macOS, Windows, Linux | https://github.com/rustls/rustls |
+| `rustls` | 0.23.45 | macOS, Windows, Linux | https://github.com/rustls/rustls |
 | `rustls-native-certs` | 0.8.4 | macOS | https://github.com/rustls/rustls-native-certs |
 | `rustls-pemfile` | 2.2.0 | macOS, Windows, Linux | https://github.com/rustls/pemfile |
 
@@ -549,7 +560,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | Package | Version | Artefacts | Source |
 | --- | --- | --- | --- |
 | `libloading` | 0.8.9 | macOS, Linux | https://github.com/nagisa/rust_libloading/ |
-| `rustls-webpki` | 0.103.13 | macOS, Windows, Linux | https://github.com/rustls/webpki |
+| `rustls-webpki` | 0.103.15 | macOS, Windows, Linux | https://github.com/rustls/webpki |
 | `untrusted` | 0.9.0 | macOS, Windows, Linux | https://github.com/briansmith/untrusted |
 
 ### MIT
@@ -930,7 +941,7 @@ The tables above are an inventory. MIT, BSD and Apache-2.0 all require the copyr
 
 #### Notice 1 — applies to 99 package(s)
 
-`ahash 0.8.12`, `arrayvec 0.7.8`, `asn1-rs 0.7.2`, `asn1-rs-derive 0.6.0`, `atomic-waker 1.1.2`, `autocfg 1.5.1`, `base64 0.22.1`, `bitflags 1.3.2`, `bitflags 2.13.1`, `cc 1.4.0`, `cexpr 0.6.0`, `cfg-if 1.0.4`, `cgl 0.3.2`, `cmake 0.1.58`, `core-foundation 0.10.1`, `core-foundation 0.9.4`, `core-foundation-sys 0.8.7`, `core-graphics 0.23.2`, `core-graphics 0.25.0`, `core-graphics-types 0.1.3`, `core-graphics-types 0.2.0`, `coreaudio-rs 0.11.3`, `crossbeam-channel 0.5.16`, `crossbeam-queue 0.3.13`, `crossbeam-utils 0.8.22`, `der-parser 10.0.0`, `displaydoc 0.2.7`, `either 1.17.0`, `equivalent 1.0.2`, `errno 0.3.14`, `euclid 0.22.14`, `find-msvc-tools 0.1.9`, `flate2 1.1.9`, `form_urlencoded 1.2.2`, `gethostname 1.1.0`, `glob 0.3.4`, `glow 0.17.0`, `hashbrown 0.15.5`, `hashbrown 0.16.1`, `hashbrown 0.17.1`, `idna 1.1.0`, `idna_adapter 1.2.1`, `indexmap 2.14.0`, `itertools 0.13.0`, `itertools 0.14.0`, `jobserver 0.1.35`, `khronos-egl 6.0.0`, `lazy_static 1.5.0`, `libpulse-binding 2.30.1`, `libpulse-simple-binding 2.29.0`, `libpulse-simple-sys 1.22.0`, `libpulse-sys 1.23.0`, `linux-raw-sys 0.12.1`, `lock_api 0.4.14`, `log 0.4.33`, `nasm-rs 0.3.2`, `num-bigint 0.4.8`, `num-derive 0.4.2`, `num-integer 0.1.46`, `num-traits 0.2.19`, `nusb 0.1.14`, `oid-registry 0.8.1`, `once_cell 1.21.4`, `parking_lot 0.12.5`, `parking_lot_core 0.9.12`, `percent-encoding 2.3.2`, `pkg-config 0.3.33`, `png 0.18.1`, `pollster 0.4.0`, `regex 1.13.1`, `regex-automata 0.4.16`, `regex-syntax 0.8.11`, `renderdoc-sys 1.1.0`, `rustc-hash 1.1.0`, `rustc_version 0.4.1`, `rusticata-macros 4.1.0`, `rustix 1.1.4`, `rustls 0.23.41`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`, `scopeguard 1.2.0`, `security-framework 3.7.0`, `security-framework-sys 2.17.0`, `signal-hook-registry 1.4.8`, `smallvec 1.15.2`, `smol_str 0.2.2`, `socket2 0.6.5`, `stable_deref_trait 1.2.1`, `symlink 0.1.0`, `thread_local 1.1.10`, `tungstenite 0.24.0`, `unicode-segmentation 1.13.3`, `unicode-width 0.2.2`, `url 2.5.8`, `uuid 1.24.0`, `version_check 0.9.5`, `weezl 0.1.12`, `x509-parser 0.18.1`, `yasna 0.6.0`
+`ahash 0.8.12`, `arrayvec 0.7.8`, `asn1-rs 0.7.2`, `asn1-rs-derive 0.6.0`, `atomic-waker 1.1.2`, `autocfg 1.5.1`, `base64 0.22.1`, `bitflags 1.3.2`, `bitflags 2.13.1`, `cc 1.4.0`, `cexpr 0.6.0`, `cfg-if 1.0.4`, `cgl 0.3.2`, `cmake 0.1.58`, `core-foundation 0.10.1`, `core-foundation 0.9.4`, `core-foundation-sys 0.8.7`, `core-graphics 0.23.2`, `core-graphics 0.25.0`, `core-graphics-types 0.1.3`, `core-graphics-types 0.2.0`, `coreaudio-rs 0.11.3`, `crossbeam-channel 0.5.16`, `crossbeam-queue 0.3.13`, `crossbeam-utils 0.8.22`, `der-parser 10.0.0`, `displaydoc 0.2.7`, `either 1.17.0`, `equivalent 1.0.2`, `errno 0.3.14`, `euclid 0.22.14`, `find-msvc-tools 0.1.9`, `flate2 1.1.9`, `form_urlencoded 1.2.2`, `gethostname 1.1.0`, `glob 0.3.4`, `glow 0.17.0`, `hashbrown 0.15.5`, `hashbrown 0.16.1`, `hashbrown 0.17.1`, `idna 1.1.0`, `idna_adapter 1.2.1`, `indexmap 2.14.0`, `itertools 0.13.0`, `itertools 0.14.0`, `jobserver 0.1.35`, `khronos-egl 6.0.0`, `lazy_static 1.5.0`, `libpulse-binding 2.30.1`, `libpulse-simple-binding 2.29.0`, `libpulse-simple-sys 1.22.0`, `libpulse-sys 1.23.0`, `linux-raw-sys 0.12.1`, `lock_api 0.4.14`, `log 0.4.33`, `nasm-rs 0.3.2`, `num-bigint 0.4.8`, `num-derive 0.4.2`, `num-integer 0.1.46`, `num-traits 0.2.19`, `nusb 0.1.14`, `oid-registry 0.8.1`, `once_cell 1.21.4`, `parking_lot 0.12.5`, `parking_lot_core 0.9.12`, `percent-encoding 2.3.2`, `pkg-config 0.3.33`, `png 0.18.1`, `pollster 0.4.0`, `regex 1.13.1`, `regex-automata 0.4.16`, `regex-syntax 0.8.11`, `renderdoc-sys 1.1.0`, `rustc-hash 1.1.0`, `rustc_version 0.4.1`, `rusticata-macros 4.1.0`, `rustix 1.1.4`, `rustls 0.23.45`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`, `scopeguard 1.2.0`, `security-framework 3.7.0`, `security-framework-sys 2.17.0`, `signal-hook-registry 1.4.8`, `smallvec 1.15.2`, `smol_str 0.2.2`, `socket2 0.6.5`, `stable_deref_trait 1.2.1`, `symlink 0.1.0`, `thread_local 1.1.10`, `tungstenite 0.24.0`, `unicode-segmentation 1.13.3`, `unicode-width 0.2.2`, `url 2.5.8`, `uuid 1.24.0`, `version_check 0.9.5`, `weezl 0.1.12`, `x509-parser 0.18.1`, `yasna 0.6.0`
 
 ```text
 Apache License
@@ -3773,7 +3784,7 @@ APPENDIX: How to apply the Apache License to your work.
 
 #### Notice 37 — applies to 3 package(s)
 
-`rustls 0.23.41`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`
+`rustls 0.23.45`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`
 
 ```text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -10244,7 +10255,7 @@ limitations under the License.
 
 #### Notice 152 — applies to 1 package(s)
 
-`rustls-webpki 0.103.13`
+`rustls-webpki 0.103.15`
 
 ```text
 Except as otherwise noted, this project is licensed under the following

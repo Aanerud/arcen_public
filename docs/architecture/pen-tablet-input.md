@@ -1,5 +1,17 @@
 # Typed pen/tablet input (local termination)
 
+**Vendor neutrality (0.16.0).** Pen and tablet support is not tied to any
+tablet maker. Every decision about *whether* a device is a pen tablet is made
+from its HID report descriptor by shared code
+(`arcen_usb_bridge::classify_pen_tablet`, see
+[Pen-tablet classification](#pen-tablet-classification-vendor-neutral)), and
+every pressure, tilt and rotation conversion goes through one shared,
+vendor-neutral contract (`arcen_input::pen_axes`, see
+[Axis normalisation](#axis-normalisation-vendor-neutral)). Vendor ids are
+logged for readability and never used as a gate. The validation history
+below names the tablet that was physically tested; that is a record of what
+was measured, not a list of what is supported.
+
 **Status (2026-08-03):** Wire contract, macOS capture, Linux and Windows
 injection backends, and the raw-HID quarantine described below are
 implemented and unit/portable-tested — see
@@ -15,8 +27,9 @@ redirect.**
 
 ### macOS AppKit event gate — root cause and fix (2026-08-03)
 
-During validation a critical capture bug was found and fixed: Wacom on macOS
-delivers pen motion as **mouse/drag events with a `TabletPoint` subtype**,
+During validation a critical capture bug was found and fixed: tablet drivers
+on macOS (measured with a Wacom) deliver pen motion as **mouse/drag events
+with a `TabletPoint` subtype**,
 not as standalone `NSTabletPoint` events. For these events `vendorID()` and
 `pointingDeviceType()` both return **0**. The original gate in
 `clients/macos/src/tablet/monitor.rs` dropped every event where `vendor_id =
@@ -28,7 +41,8 @@ Fix (`clients/macos` commit `1d6af87`): the gate now blocks only
 tablet-shaped events from trackpads) and promotes everything else that passed
 the `effective_kind` gate to `Pen`. The old vendor-allowlist approach was
 inverted: rather than requiring a known vendor, it now requires only the
-absence of the known-bad vendor.
+absence of the known-bad vendor. Since 0.16.0 the test-only vendor list that
+remained in `monitor.rs` is gone too.
 
 ## Problem and scope
 
@@ -43,12 +57,12 @@ parser boundary. That path is now quarantined (see
 below) and is not part of default builds.
 
 **Local termination** is the shipped feature this document describes: the
-Wacom driver already installed on the macOS client decodes the physical
-tablet, AppKit delivers typed pressure/tilt/rotation/tool/proximity events to
+tablet driver already installed on the macOS client (any make) decodes the
+physical tablet, AppKit delivers typed pressure/tilt/rotation/tool/proximity events to
 Deck, Deck maps and forwards one small typed sample over the negotiated input
 protocol, and each active Pier injects a native virtual pen device that any
 ordinary Linux or Windows creative application already understands. Neither
-host runs, needs, or requires a Wacom driver.
+host runs, needs, or requires a tablet vendor's driver.
 
 **True USB bridging** — a future feature where a host owns the physical
 device and full bidirectional USB semantics traverse the network — is a
@@ -60,7 +74,7 @@ below (["Future true USB bridge (not implemented)"](#future-true-usb-bridge-not-
 ## Data path
 
 ```text
-Wacom hardware + macOS Wacom driver
+Any pen tablet + its macOS driver
   -> AppKit NSEvent tabletPoint / tabletProximity
   -> clients/macos/src/tablet/monitor.rs   (main-thread AppKit local event monitor, RAII)
   -> clients/macos/src/tablet/mapper.rs    (pure native-sample -> arcen_input::PenEvent mapper)
@@ -71,11 +85,146 @@ Wacom hardware + macOS Wacom driver
   -> remote creative application (Krita, GIMP, Photoshop, ...)
 ```
 
-No Wacom SDK, vendor report parsing, or proprietary dependency is used
+No vendor SDK, vendor report parsing, or proprietary dependency is used
 anywhere in this path. AppKit — not raw HID report decoding — is the capture
-boundary; Wacom's own driver remains responsible for device-specific decoding
-and pressure curves, while Arcen owns a small, stable, vendor-neutral pen
-contract (`arcen_input::PenEvent`, `arcen_protocol::messages::PenEventMsg`).
+boundary; the tablet's own driver remains responsible for device-specific
+decoding and pressure curves (AppKit hands Arcen pressure already scaled to
+`0..1`, whatever the pen's native resolution), while Arcen owns a small,
+stable, vendor-neutral pen contract (`arcen_input::PenEvent`,
+`arcen_protocol::messages::PenEventMsg`).
+
+## Pen-tablet classification (vendor-neutral)
+
+Module: `shared/usb-bridge/src/hid_digitizer.rs` (pure, bounded, no OS calls;
+tests with hand-written descriptors in `hid_digitizer_tests.rs`).
+
+`parse_report_descriptor` walks a HID report descriptor (short and long
+items, global Push/Pop, usage ranges, 32-bit extended usages, signed/unsigned
+extents) into one summary per Application collection — top-level ones and
+any nested inside them, each a device function of its own, with inputs
+attributed to the innermost Application collection as a host does — refusing
+descriptors over 4096 bytes, deeper than 32 collections, with more than 64
+Application collections or 256 usages on one item, or that are truncated or
+unbalanced. An opaque `0xFF0D` Digitizer/Pen application that wraps a
+nested non-digitizer Application collection (say, a keyboard) is a wrapper,
+not a pen, and does not classify as one.
+
+`classify_pen_tablet` decides from all of a device's HID interfaces:
+
+- **Pen tablet** when a standard Digitizers-page (`0x0D`) collection whose
+  usage is Pen (`0x02`) or Digitizer (`0x01`), or that nests a Stylus
+  (`0x20`), reports X and Y plus at least one of Tip Switch (`0x42`), Tip
+  Pressure (`0x30`) or In Range (`0x32`). Touch-shaped collections (Finger,
+  Contact Identifier, Touch Screen/Pad without a stylus) are not pens.
+- **Vendor-defined Digitizers page** (`0xFF0D`, whose usage ids mirror the
+  Digitizers page — the Linux HID stack treats it the same way). A top-level
+  application collection there whose usage is Digitizer (`0x01`) or Pen
+  (`0x02`) is a pen tablet even when its reports are opaque vendor bytes
+  (`PenTabletEvidence::VendorDigitizerPen`), provided the device publishes no
+  Generic Desktop Joystick, Gamepad or Multi-axis Controller collection
+  (`NotPenTablet::DisqualifyingCollection`). Keyboard and keypad collections
+  (express keys) are allowed, exactly as beside a standard pen. Its
+  capabilities are only what it declares: an opaque collection reports none,
+  and no pressure range is invented. This is how an Intuos5-style tablet
+  (`0xFF0D` pen, `0xFF00` vendor control, Generic Desktop mouse) qualifies.
+  Any other `0xFF0D` collection counts only beside a standard Digitizers
+  collection; other vendor pages (a lone `0xFF00`) never qualify.
+- **Refused** (fail closed): keyboards, mice (relative or absolute), gamepads,
+  vendor-only devices, touch-only digitizers (including a keyboard beside a
+  touch pad), digitizers without position or contact, and any device with a
+  malformed descriptor. A keyboard or mouse is accepted only as part of a
+  device that has a pen digitizer.
+
+It also reports the declared surface (`PenCapabilities`): pressure range and
+level count, X/Y tilt ranges with physical units, twist, eraser/invert, and the
+number of barrel switches (Barrel `0x44`, Secondary Barrel `0x5A`).
+
+Where it is used:
+
+| Where | What it decides |
+| --- | --- |
+| Deck `tablet::presence` | whether a pen tablet is present, from every HID device's `ReportDescriptor` in the I/O Registry (no open, no permission), plus "AppKit already delivered a pen sample this run". Informational only (Tablet Monitor, diagnostics): typed pen is offered whenever capture is possible (`tablet::typed_pen_capability`), because the hello cannot be renegotiated when a tablet appears later. |
+| Deck raw-HID capture (`hid/session.rs`) | match by digitizer usage page; offer an interface only if its descriptor declares a digitizer; forward reports only from pen-declaring interfaces. |
+| `arcen-usb-helper` (root, macOS) | Hard USB candidate: every interface HID, and the same shared `authorize_hard_usb_tablet` the host applies (pen tablet, no game-controller collection, aggregate size). Descriptors come from the I/O Registry (`IOHIDDevice` `ReportDescriptor`, matched by vendor/product id, a known and equal `LocationID` when two identical devices are attached, and the interface's `bInterfaceNumber`; conflicting entries refuse the device), so no device is opened to be examined. The handshake size is checked before the device is seized. `GET_DESCRIPTOR(Report)` is sent only for an interface the registry left undescribed, on a device the registry already shows to be a digitizer and that has no boot-keyboard interface. |
+| Linux Pier `usb_bridge::authorize_device` | before creating the `usb-vhci` device: `authorize_hard_usb_tablet` over the Deck's claimed descriptors; afterwards `BridgedDeviceGuard` checks every device, configuration and report descriptor the device returns before giveback. |
+| Linux Pier raw HID (`net/server.rs`) | `RawHidAdmission`: a `/dev/uhid` device only for a pen-bearing interface of a device that classifies as a pen tablet, and never for a descriptor that also carries a joystick, gamepad or multi-axis controller collection. Express-key keyboard collections in the pen's descriptor are admitted with it. |
+
+### Security: what bridging forwards, and why
+
+Hard USB forwards every collection of every interface of the device, and raw
+HID every collection of an admitted descriptor. That is the point: a whole
+tablet — pen, touch strip, mouse mode and express keys — reaches the host's
+own driver.
+
+**Express keys are forwarded.** Many tablets (Huion, XP-Pen, Gaomon and some
+Wacom models) present their express keys and buttons as a Generic Desktop
+Keyboard or Keypad collection, often as a boot-keyboard interface. A device
+that classifies as a pen tablet may carry those, and they are bridged with it.
+This grants nothing new: the authenticated Deck can already send any
+keystroke to the host session through the ordinary input channel, so
+forwarding a composite tablet's keyboard is not an escalation. What does
+matter, and stays enforced:
+
+- **It must be a pen tablet.** The device must classify as one
+  (`classify_pen_tablet`): a plain keyboard, or a keyboard beside a
+  touch-pad-only digitizer, is never forwarded.
+- **No non-tablet functions.** `authorize_hard_usb_tablet` refuses a device
+  if any interface's descriptor carries a Generic Desktop Joystick, Gamepad
+  or Multi-axis Controller collection at any depth — top-level, nested as an
+  Application collection, or named by a physical/logical collection
+  (`ForwardsNonPenInput`); raw HID refuses such a descriptor
+  (`RawHidRefusal::NonPenCollection`).
+- **Bounded claims.** The descriptors together may not exceed
+  `MAX_CLAIMED_REPORT_DESCRIPTOR_BYTES` (12 KiB, which always fits the helper
+  handshake frame).
+- **HID only, bound to the claims.** `BridgedDeviceGuard` (`shared/usb-bridge/src/bridged_device_guard.rs`)
+  binds the device's own answers to the authorization: device and
+  device-qualifier descriptors must keep class `0x00`/`0x03`, the authorized
+  vendor/product/revision and one configuration; configuration and
+  other-speed configuration descriptors must parse within bounds with
+  interrupt endpoints only, every interface and alternate setting HID (a
+  mass-storage or any other non-HID interface ends it), and exactly the
+  authorized interface numbers (only the 9-byte header may be read
+  partially), and each interface's HID class descriptor must be well formed
+  (`bLength` exactly `6 + 3 × bNumDescriptors`, at most 16 entries) with
+  exactly one Report entry — hosts disagree on which of several wins, Linux
+  taking the last — advertising exactly the authorized report-descriptor
+  length, so the host never reads a
+  shorter prefix that hides the pen; a report-descriptor completion must be
+  exactly `min(wLength, authorized length)` bytes of the classified
+  descriptor, so a prefix is accepted only when the host asked for fewer
+  bytes. A violation ends the attachment
+  (`usb_hard_device_refused` with the reason) before the host kernel sees
+  the descriptor.
+
+## Axis normalisation (vendor-neutral)
+
+Module: `shared/input/src/pen_axes.rs`. The wire contract is pressure
+`0.0..=1.0`, tilt `-90.0..=90.0` degrees, rotation `0.0..360.0` degrees. Every
+conversion into or out of it is shared:
+
+- Deck (`tablet/mapper.rs`): `clamp_pressure`, `tilt_unit_to_degrees` (AppKit
+  normalized tilt × 90), `wrap_rotation_degrees`. Non-finite input still
+  reaches `PenEvent::validate` and is rejected, never invented.
+- Device ranges: `normalize_logical`/`scale_unit` over a `LogicalRange`
+  (tested with 1023/2047/4095/8191/16383 maxima: the same physical force lands
+  on the same host value within one host step), `tilt_logical_to_degrees`
+  (physical degree extent when declared, else logical extremes are full
+  deflection), `twist_logical_to_degrees`.
+- Linux (`hosts/linux/src/input/pen.rs`): `ABS_PRESSURE` is
+  `TYPED_PEN_PRESSURE_RANGE` (`0..=65535`, 16 bits — finer than any shipping
+  pen, and no vendor's maximum); tilt via `whole_tilt_degrees`.
+- Windows (`hosts/windows/src/input.rs`): pressure via
+  `WINDOWS_INK_PRESSURE_RANGE` (`0..=1024`, the Windows Ink API ceiling),
+  tilt/rotation via `whole_tilt_degrees`/`whole_rotation_degrees`.
+- macOS Pier (`hosts/macos/src/input/pen.rs`): `clamp_pressure`,
+  `tilt_degrees_to_unit`, `wrap_rotation_degrees`. Its proximity events report
+  vendor id `0xFFFF` (reserved, never assigned; Arcen's id for synthetic
+  devices), not a tablet maker's.
+
+In Native tablet (USB bridged) mode no conversion happens at all: the host
+kernel reads the device's own report descriptor, so the pen's native pressure
+resolution and every axis it declares reach the host driver unchanged.
 
 ## Wire negotiation (protocol v3, input v3)
 
@@ -133,11 +282,16 @@ Deck now carries an explicit per-connection tablet mode request in
 client can show the effective mode and reason.
 
 - **Tablet support** (`local_termination`) remains the default and the only
-  WAN-recommended mode. It becomes active only when Deck detects a tablet and
-  the input-v3 pen path is available.
-- **Native tablet mode** (`wacom_usb_bridge`) is an explicit LAN/KVM choice and
-  must not be conflated with generic HID/PT_PEN injection; bridge parity
-  requires complete USB semantics plus the host driver stack. If unavailable,
+  WAN-recommended mode. It becomes active when the input-v3 pen path is
+  available and the user left typed pen enabled; the Deck offers it whether
+  or not a tablet is attached at connect time, because AppKit tablet events
+  are the source and the hello is not renegotiated when a tablet appears.
+- **Native tablet mode** (`TabletModeMsg::UsbTabletBridge`, wire token
+  `wacom_usb_bridge` kept for 0.15 compatibility — a legacy name, the mode is
+  vendor-neutral) is an explicit LAN/KVM choice and must not be conflated with
+  generic HID/PT_PEN injection; bridge parity requires complete USB semantics
+  plus the host's own driver for that tablet. It is offered for any device
+  that classifies as a pen tablet. If unavailable,
   the host rejects it and activates `disabled_mouse_compat`, never
   `local_termination`.
 - **Mouse compatibility only** (`disabled_mouse_compat`) is the fail-safe and
@@ -151,7 +305,7 @@ Module: `clients/macos/src/tablet/` (`mod.rs`, `sample.rs`, `probe.rs`,
 pen-capability parts of `clients/macos/src/transport/websocket.rs`.
 
 - `monitor.rs` is a main-thread-owned AppKit local `NSEvent` monitor RAII
-  guard (`objc2`/`objc2-app-kit`/`block2`; no Wacom SDK) that delivers
+  guard (`objc2`/`objc2-app-kit`/`block2`; no vendor SDK) that delivers
   `tabletPoint`/`tabletProximity` samples into a bounded producer queue.
   `runtime::TabletRuntime::install()` only ever succeeds on macOS, on the
   main thread; it degrades to an inert `None` everywhere else (off-macOS
@@ -174,16 +328,24 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   samples may coalesce. `release_event()`/`last_position()` emit one final
   synthetic out-of-proximity release so a remote tool can never be left
   logically stuck down.
-- `probe.rs` combines two independently deterministic signals, neither of
-  which claims or requires a human touched the pen: **USB presence**
-  (`wacom_usb_presence()`, Wacom vendor ID `0x056A`, via the existing
-  cross-platform USB inventory) and **empirically observed axis capability**
+- `presence.rs`/`hid_inventory.rs` answer **tablet presence** without a
+  vendor id: `tablet_presence()` is `Available` when any HID device in the
+  I/O Registry publishes a report descriptor that declares a pen or a
+  vendor-mirrored digitizer (USB or Bluetooth; read-only, no Input
+  Monitoring), or when AppKit already delivered a pen/eraser sample this run;
+  `Unavailable` when none does; `Unknown` if the registry cannot be read.
+  Presence is informational. The hello's `pen`/`local_termination` follow
+  `typed_pen_capability(tablet_input_enabled)` instead: `Available` on the
+  macOS Deck whenever the setting is on, so a tablet connected late or not
+  described by the registry still gets pressure without a reconnect. A 0.15
+  host resolves this exactly as it did for a Deck with a tablet attached.
+- `probe.rs` adds **empirically observed axis capability**
   (`TabletCapabilityProbe`: pressure/tilt/rotation/eraser/barrel-buttons each
   start `Unknown` and move to `Available` only once a delivered sample
   actually demonstrates that axis in use — never synthesized, never inferred
   from silence).
-- `tablet_input_enabled` (default `true`, "Enable typed pen/tablet input
-  (Wacom)" under Advanced settings) gates client pen-capability
+- `tablet_input_enabled` (default `true`, the Tablet support mode in
+  Settings) gates client pen-capability
   advertisement; see [`clients/macos/SETTINGS.md`](../../clients/macos/SETTINGS.md).
   A settings file predating this key defaults it to `true` on load.
   Disabling it, losing window focus, leaving proximity, or session
@@ -195,7 +357,7 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   enabled); otherwise Deck preserves ordinary mouse behavior and shows an
   honest pressure-unavailable downgrade — it never fabricates pressure.
 - **View > Tablet Monitor** (`ui/app.rs::paint_tablet_monitor_panel`) is the
-  local-only diagnostic panel (never logged or persisted): Wacom USB
+  local-only diagnostic panel (never logged or persisted): pen-tablet
   presence, whether the runtime installed, negotiated state, current
   tool/proximity/touching, live pressure/tilt/rotation, lifetime
   events-sent/overflow-reset counters, producer-drop and dispatcher
@@ -203,8 +365,8 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   last error string. It reports device/capability/liveness facts only —
   never coordinates, pressure samples, raw report bytes, or other input
   content.
-- **ExpressKeys and the touch ring/strip are configured in Wacom Center on
-  the client**, not by Arcen, to emit ordinary keyboard or wheel input,
+- **Express keys and touch rings/strips are configured in the tablet
+  vendor's control panel on the client**, not by Arcen, to emit ordinary keyboard or wheel input,
   which Deck already transports through its existing keyboard/mouse-wheel
   path. Arcen ships no ExpressKeys/ring-specific protocol or mapping UI.
 - **Tablet multi-touch is not transported.** Only stylus/eraser samples
@@ -225,11 +387,11 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   `ABS_PRESSURE`/`BTN_TOOL_PEN` onto the plain pointer device would make the
   ordinary mouse device misclassify as a tablet everywhere.
 - Advertises `ABS_X`/`ABS_Y` (same fixed device raster as the mouse device),
-  `ABS_PRESSURE` (inclusive `0..=8191` — the documented 13-bit
-  `PRESSURE_MAX_13BIT` range, matching the magnitude Wacom's own Linux
-  driver reports for modern pens such as Pro Pen 2, so the virtual device
-  does not overclaim vendor-specific resolution while still preserving full
-  source precision), `ABS_TILT_X`/`ABS_TILT_Y` (whole-degree `-90..=90`,
+  `ABS_PRESSURE` (inclusive `0..=65535`, `pen::PRESSURE_MAX`, the shared
+  vendor-neutral `arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE`: the wire
+  carries normalized pressure, so the virtual device adopts no tablet maker's
+  range, and 16 bits is finer than any shipping pen; libinput normalizes by
+  the declared extent), `ABS_TILT_X`/`ABS_TILT_Y` (whole-degree `-90..=90`,
   passed straight through from the wire's degree convention), tool/proximity
   via `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER`, tip contact via `BTN_TOUCH`, and two
   barrel buttons via `BTN_STYLUS`/`BTN_STYLUS2`.
@@ -254,7 +416,7 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   aspirational default. If pen-device creation alone fails, mouse and
   keyboard remain available (see `hosts/linux/ARCHITECTURE.md` for the full
   fail-open-for-mouse contract).
-- **No Wacom driver runs on the Linux host.** `libinput`/Xorg see an
+- **No tablet vendor driver runs on the Linux host.** `libinput`/Xorg see an
   ordinary kernel tablet-tool device; the Linux target is the dedicated
   Arcen Xorg session described in `hosts/linux/ARCHITECTURE.md`.
 - Parse/validate every `PenEventMsg` through the existing globally sequenced
@@ -274,7 +436,8 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
   legacy Wintab-only creative applications are out of scope for this
   backend.
 - Pressure maps to the **documented `0..=1024`** Windows Ink pointer-pressure
-  range (`pen_pressure_to_windows`: `round(pressure.clamp(0,1) * 1024)`) even
+  range (`pen_pressure_to_windows`: the shared `scale_unit` over
+  `WINDOWS_INK_PRESSURE_RANGE`) even
   when the source tablet reports more levels — this is a public Win32 API
   ceiling, not an Arcen-imposed limit, and this document does not claim 8192
   levels through that API.
@@ -306,14 +469,16 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
 
 ## Capability coverage and improvement boundaries
 
-Confirmed by physical Wacom Intuos5 touch L validation (2026-08-03).
+Confirmed by physical validation with one tablet (a Wacom Intuos5 touch L,
+2026-08-03). The Linux pressure range has since moved from 8191 to the
+vendor-neutral 65535; no tablet of another make has been physically tested.
 
 ### Supported (end-to-end confirmed)
 
 | Capability | Linux | Windows | Notes |
 |---|---|---|---|
 | Position X/Y | ✅ Full | ✅ Full | Normalised → screen pixels |
-| Pressure | ✅ 8191 levels (13-bit) | ✅ 1024 levels (10-bit) | See ceiling note |
+| Pressure | ✅ 65536 steps (16-bit) | ✅ 1024 levels (10-bit) | See ceiling note |
 | Tilt X/Y | ✅ ±90° whole-degree | ✅ ±90° whole-degree | |
 | Hover/proximity | ✅ `BTN_TOOL_PEN` | ✅ `POINTER_FLAG_INRANGE` | Enter/leave tracked |
 | Tip contact | ✅ `BTN_TOUCH` | ✅ `POINTER_FLAG_INCONTACT` | |
@@ -326,7 +491,7 @@ Confirmed by physical Wacom Intuos5 touch L validation (2026-08-03).
 
 **Windows pressure: 1024 levels.**
 `InjectSyntheticPointerInput` documents `0..=1024` as the pressure range for
-`PT_PEN` pointer data. The Wacom hardware reports 8192 levels; AppKit and the
+`PT_PEN` pointer data. A pen may report far more levels (8192 or 16384 are common); AppKit and the
 protocol carry the full float normalised value; `pen_pressure_to_windows`
 maps it faithfully to the 1024-step range. Closing this gap requires either
 a kernel-mode Wintab driver (out of scope — USB redirect territory) or a
@@ -358,16 +523,16 @@ require the future true USB bridge (see
 - **Full 8192 pressure levels on Windows** — requires a kernel-mode Wintab
   driver owning the physical device.
 - **Wintab API support on Windows** — same requirement.
-- **Tangential pressure / fingerwheel** (airbrush side-wheel) — Wacom device
+- **Tangential pressure / fingerwheel** (airbrush side-wheel) — a device
   feature not exposed by AppKit `NSEvent`; only accessible via raw HID.
-- **Wacom-driver pressure curves and device-specific calibration** — the
-  Wacom host driver must own the physical device; local termination
+- **Vendor-driver pressure curves and device-specific calibration** — the
+  vendor's host driver must own the physical device; local termination
   intentionally lets the macOS driver run those curves before Arcen sees the
   event.
 - **ExpressKey / touch-ring software mapping on the remote host** — buttons
   and touch-ring shortcuts already work as keyboard/scroll events through
-  Deck's existing keyboard/wheel path (the macOS Wacom driver handles the
-  remapping); only Wacom Center host-side configuration requires the driver
+  Deck's existing keyboard/wheel path (the macOS tablet driver handles the
+  remapping); only host-side vendor control-panel configuration requires the driver
   present on the host.
 - **4D Mouse / cursor tool** — `Cursor` tool type is explicitly rejected; USB
   redirect is the correct path.
@@ -403,13 +568,14 @@ the future USB bridge described below.
   negotiation state, so a hostile or buggy peer can never hand an oversize
   payload to the host's kernel-facing `/dev/uhid` parser.
   `hosts/linux/src/net/server.rs` additionally bounds the admitted device
-  count (`MAX_EXPERIMENTAL_RAW_HID_DEVICES = 8`) and restricts admission to
-  an explicit vendor allowlist (`is_experimental_raw_hid_vendor`: Wacom
-  `0x056A`, Huion `0x256c`, XP-Pen `0x28bd`, UC-Logic `0x5543`, Gaomon
-  `0x0b57`).
+  count (`MAX_EXPERIMENTAL_RAW_HID_DEVICES = 8`) and admits a device only
+  through `arcen_usb_bridge::RawHidAdmission`: a `/dev/uhid` device is created
+  only for an interface whose descriptor declares a pen, of a device whose
+  interfaces classify as a pen tablet. No vendor id is consulted (the 0.15
+  five-vendor allowlist is gone).
 - **This is not USB bridging.** It carries only raw IOHID *input* reports
   one direction (client to host); it has no control, feature, output, or USB
-  transfer channel, and it cannot satisfy a Wacom host driver's bidirectional
+  transfer channel, and it cannot satisfy a vendor host driver's bidirectional
   protocol. Extending this quarantined path is explicitly out of scope; the
   true future bridge (below) is a different design, not a graduation of this
   feature flag.
@@ -431,7 +597,7 @@ requiring all of:
   reports, interrupt/output reports, and full USB lifecycle/error signaling
   in both directions — not the one-directional input-only quarantined path
   above.
-- **The Wacom driver installed on the host**, not consumed locally by the
+- **The tablet's driver installed on the host**, not consumed locally by the
   client while bridged — the opposite placement from local termination.
 - **A reviewed Linux USB virtualization backend** (e.g. USB/IP-class
   kernel or userspace virtualization) — not `/dev/uhid`, which cannot carry

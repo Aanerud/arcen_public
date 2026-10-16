@@ -133,7 +133,7 @@ pub struct NativeTabletProximity {
     pub entering: bool,
     /// `-[NSEvent pointingDeviceType]`.
     pub tool: NativeTabletTool,
-    /// `-[NSEvent vendorID]`. Wacom reports `0x056a` (`WACOM_USB_VENDOR_ID`).
+    /// `-[NSEvent vendorID]`: the tablet's vendor id, informational only.
     pub vendor_id: u64,
     pub tablet_id: u64,
     pub pointing_device_id: u64,

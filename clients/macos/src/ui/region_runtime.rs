@@ -644,7 +644,7 @@ impl DeckRegionRuntime {
         })
     }
 
-    /// Emits one Wacom pen sample through its authoritative region.
+    /// Emits one pen sample through its authoritative region.
     ///
     /// The tablet pipeline already allocated this sample's sequence from the
     /// session-global input counter, so the emitter adopts it rather than
@@ -1251,7 +1251,7 @@ mod tests {
 
     /// Parity gate: everything a live Match My Layout session emits -- root
     /// and secondary motion, the cross-viewport leave/enter transition,
-    /// buttons, scroll, Wacom pen, and the held-button release -- is
+    /// buttons, scroll, pen, and the held-button release -- is
     /// produced by one shared emitter, is accepted in order by the shared
     /// host pipeline, and lands on exactly the applied point the one shared
     /// transformer computes. There is no second client mapping path left to
@@ -1624,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn wacom_pen_sample_routes_through_its_secondary_region() {
+    fn pen_sample_routes_through_its_secondary_region() {
         let mut runtime = mixed_runtime();
         let viewport = runtime
             .viewport_for_monitor(SessionMonitorId::new(2).unwrap())

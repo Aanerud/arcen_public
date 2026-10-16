@@ -30,6 +30,46 @@ const DEV_TOOLS_USAGE: &str = "";
 #[cfg(feature = "dev-tools")]
 const DEV_TOOLS_USAGE: &str = "arcen-client virtual-monitor-lab [2|4] [--timeout-secs N]   (developer-only; requires ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1)\narcen-client probe-matrix [--parameter-sets <dir>] [--output <path>]   (developer-only; see docs/testing/color-matrix-results.json)\n";
 
+/// `platform-report`: the Deck platform profile and the real decode
+/// capability probe, one `key=value` per line, without a window or a Pier.
+fn print_platform_report() {
+    let platform = arcen_deck::platform::current();
+    let capabilities = arcen_deck::pipeline::video_decoder::probe_decode_capabilities();
+    println!("deck_platform={}", platform.label());
+    println!("arch={}", platform.architecture().token());
+    println!("macos={}", platform.macos());
+    println!("rosetta={}", platform.translated());
+    println!("av1_decode_possible={}", platform.av1_decode_possible());
+    println!(
+        "software_decode_expected={}",
+        platform.software_decode_expected()
+    );
+    println!(
+        "native_usb_helper_supported={}",
+        platform.native_usb_helper_supported()
+    );
+    println!(
+        "decode h264={} h265={} av1={} yuv444={} main10={} main12={} full_range={} \
+         bt601={} bt2020ncl={}",
+        capabilities.h264,
+        capabilities.h265,
+        capabilities.av1,
+        capabilities.yuv444,
+        capabilities.main10,
+        capabilities.main12,
+        capabilities.full_range,
+        capabilities.bt601_matrix,
+        capabilities.bt2020_ncl_matrix,
+    );
+    println!("decoder_backend={}", capabilities.decoder_backend_label());
+    println!(
+        "decode_path={}",
+        platform
+            .assess_decode_path(capabilities.hardware_accelerated)
+            .token()
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // Logging is infrastructure: bring it up before anything else so every
@@ -40,6 +80,11 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str);
+    if subcommand == Some("platform-report") {
+        print_platform_report();
+        arcen_deck::logging::shutdown();
+        return;
+    }
     if subcommand == Some("multi-monitor-harness") {
         run_multi_monitor_harness_subcommand(&args);
         arcen_deck::logging::shutdown();
@@ -54,6 +99,7 @@ async fn main() {
             HelperInstallState::RequiresApproval => "requires_approval",
             HelperInstallState::NotRegistered => "not_registered",
             HelperInstallState::NotFound => "not_found",
+            HelperInstallState::UnsupportedOs => "unsupported_os",
             HelperInstallState::Unknown(_) => "unknown",
         };
         println!("usb-helper-status state={label}");
@@ -152,15 +198,20 @@ async fn main() {
         return;
     }
 
+    /// Identities of attached HID devices whose report descriptors classify
+    /// as a pen tablet (`arcen_usb_bridge::classify_pen_tablet`). The lab
+    /// probes below pick their device from this list, never by vendor id.
     #[cfg(feature = "usb-hard-lab")]
-    const WACOM_VENDOR_ID: u16 = 0x056a;
+    fn is_attached_pen_tablet(vendor_id: u16, product_id: u16) -> bool {
+        arcen_deck::tablet::attached_pen_tablets().contains(&(vendor_id, product_id))
+    }
 
     #[cfg(feature = "usb-hard-lab")]
     fn usb_claim_probe() -> Result<(), String> {
         let device = nusb::list_devices()
             .map_err(|error| error.to_string())?
-            .find(|device| device.vendor_id() == WACOM_VENDOR_ID)
-            .ok_or_else(|| "no Wacom tablet is attached".to_owned())?;
+            .find(|device| is_attached_pen_tablet(device.vendor_id(), device.product_id()))
+            .ok_or_else(|| "no pen tablet is attached".to_owned())?;
         let probe_identity = format!("{:04x}:{:04x}", device.vendor_id(), device.product_id());
         let interfaces: Vec<_> = device
             .interfaces()
@@ -197,7 +248,7 @@ async fn main() {
             }
         }
         if claimed == 0 {
-            return Err("no Wacom USB interface could be claimed".to_owned());
+            return Err("no pen tablet USB interface could be claimed".to_owned());
         }
         println!("usb-claim-probe claimed_interfaces={claimed}");
         Ok(())
@@ -225,11 +276,11 @@ async fn main() {
         let device = devices
             .iter()
             .find(|device| {
-                device
-                    .device_descriptor()
-                    .is_ok_and(|descriptor| descriptor.vendor_id() == WACOM_VENDOR_ID)
+                device.device_descriptor().is_ok_and(|descriptor| {
+                    is_attached_pen_tablet(descriptor.vendor_id(), descriptor.product_id())
+                })
             })
-            .ok_or_else(|| "no Wacom tablet is attached".to_owned())?;
+            .ok_or_else(|| "no pen tablet is attached".to_owned())?;
         let descriptor = device
             .device_descriptor()
             .map_err(|error| format!("read device descriptor: {error}"))?;
@@ -323,6 +374,7 @@ async fn main() {
                   arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
+                  arcen-client platform-report\n\
                 {}transport: QUIC/TLS 1.3 over UDP; default port 18444\n\
                 \n\
                 {}\n\
@@ -955,7 +1007,7 @@ fn connect_options_from_parts_with_monitors(
         Some("light") | None if !args.iter().any(|arg| arg == "--no-tablet-input") => {
             TabletModeMsg::LocalTermination
         }
-        Some("hard") => TabletModeMsg::WacomUsbBridge,
+        Some("hard") => TabletModeMsg::UsbTabletBridge,
         Some("off") | None => TabletModeMsg::DisabledMouseCompat,
         Some(other) => {
             return Err(format!(
@@ -1012,7 +1064,7 @@ fn cursor_mode_from_args(args: &[String]) -> Result<CursorMode, String> {
 }
 
 async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
-    let hard_mode = options.tablet_mode_requested == TabletModeMsg::WacomUsbBridge;
+    let hard_mode = options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge;
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
         password: std::mem::take(&mut options.password),
@@ -1065,7 +1117,7 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
                 if hard_mode && msg_type(&value) == Some(TABLET_MODE_RESULT) {
                     let result = serde_json::from_value::<TabletModeResultMsg>(value)
                         .map_err(|error| error.to_string())?;
-                    if !result.accepted || result.active != TabletModeMsg::WacomUsbBridge {
+                    if !result.accepted || result.active != TabletModeMsg::UsbTabletBridge {
                         return Err(format!(
                             "Hard USB mode rejected: {}",
                             result.reason.as_str()

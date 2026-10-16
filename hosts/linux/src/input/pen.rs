@@ -17,13 +17,17 @@
 use arcen_input::{PenTool, RegionPenSample};
 use arcen_protocol::messages::{PenEventMsg, PenToolMsg};
 
-/// Inclusive maximum of the documented 13-bit Linux `ABS_PRESSURE` range
-/// (`2^13 - 1`). This mirrors the magnitude Wacom's own Linux driver reports
-/// for `ABS_PRESSURE` on modern pens (e.g. Pro Pen 2), so a generic virtual
-/// tablet built on this range does not overclaim vendor-specific resolution
-/// while still preserving the full source pressure precision Arcen's typed
-/// pen contract can carry.
-pub const PRESSURE_MAX_13BIT: i32 = 8_191;
+/// Inclusive maximum of the virtual pen's `ABS_PRESSURE` axis: the shared
+/// vendor-neutral typed-pen resolution
+/// ([`arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE`], 16 bits). The wire
+/// carries normalized pressure, so the device does not adopt any one tablet
+/// maker's range; libinput normalizes `ABS_PRESSURE` by its declared extent.
+pub const PRESSURE_MAX: i32 = 65_535;
+
+const _: () = assert!(
+    arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE.max() == 65_535
+        && arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE.min() == 0
+);
 
 /// Whole-degree tilt bounds. `uinput.rs` declares the `ABS_TILT_X`/
 /// `ABS_TILT_Y` `AbsInfo` with this exact range, so the wire's `-90.0..=90.0`
@@ -64,23 +68,23 @@ pub fn normalized_axis(value: f64, extent: u32) -> i32 {
     mapped
 }
 
-/// Maps validated `0.0..=1.0` wire pressure onto the documented inclusive
-/// 13-bit Linux `ABS_PRESSURE` range, clamping defensively at the boundary.
+/// Maps validated `0.0..=1.0` wire pressure onto the virtual pen's
+/// `0..=PRESSURE_MAX` axis through the shared normalisation.
 #[must_use]
-pub fn pressure_to_13bit(pressure: f32) -> i32 {
-    let clamped = pressure.clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation)]
-    let mapped = (clamped * PRESSURE_MAX_13BIT as f32).round() as i32;
-    mapped.clamp(0, PRESSURE_MAX_13BIT)
+pub fn pressure_to_device(pressure: f32) -> i32 {
+    let scaled = arcen_input::pen_axes::scale_unit(
+        pressure,
+        arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE,
+    );
+    i32::try_from(scaled).map_or(PRESSURE_MAX, |value| value.clamp(0, PRESSURE_MAX))
 }
 
 /// Maps validated `-90.0..=90.0` degree tilt directly onto the whole-degree
 /// `ABS_TILT_X`/`ABS_TILT_Y` axis declared with a matching `AbsInfo` range.
 #[must_use]
 pub fn tilt_to_evdev_degrees(tilt_degrees: f32) -> i32 {
-    #[allow(clippy::cast_possible_truncation)]
-    let mapped = tilt_degrees.clamp(-90.0, 90.0).round() as i32;
-    mapped.clamp(TILT_MIN_DEGREES, TILT_MAX_DEGREES)
+    arcen_input::pen_axes::whole_tilt_degrees(tilt_degrees)
+        .clamp(TILT_MIN_DEGREES, TILT_MAX_DEGREES)
 }
 
 /// Mapped tablet-tool absolute axis values ready for `EV_ABS` emission.
@@ -101,7 +105,7 @@ impl PenAxes {
         Self {
             x: normalized_axis(event.x, width),
             y: normalized_axis(event.y, height),
-            pressure: pressure_to_13bit(event.pressure),
+            pressure: pressure_to_device(event.pressure),
             tilt_x: tilt_to_evdev_degrees(event.tilt_x_degrees),
             tilt_y: tilt_to_evdev_degrees(event.tilt_y_degrees),
         }
@@ -114,7 +118,7 @@ impl PenAxes {
         Self {
             x,
             y,
-            pressure: pressure_to_13bit(sample.pressure),
+            pressure: pressure_to_device(sample.pressure),
             tilt_x: tilt_to_evdev_degrees(sample.tilt_x_degrees),
             tilt_y: tilt_to_evdev_degrees(sample.tilt_y_degrees),
         }
@@ -291,12 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn pressure_maps_full_13bit_range_and_clamps_out_of_bounds() {
-        assert_eq!(pressure_to_13bit(0.0), 0);
-        assert_eq!(pressure_to_13bit(1.0), PRESSURE_MAX_13BIT);
-        assert_eq!(pressure_to_13bit(0.5), 4_096); // round(0.5 * 8191) = 4096
-        assert_eq!(pressure_to_13bit(-1.0), 0);
-        assert_eq!(pressure_to_13bit(2.0), PRESSURE_MAX_13BIT);
+    fn pressure_maps_the_full_neutral_range_and_clamps_out_of_bounds() {
+        assert_eq!(pressure_to_device(0.0), 0);
+        assert_eq!(pressure_to_device(1.0), PRESSURE_MAX);
+        assert_eq!(pressure_to_device(0.5), 32_768); // round(0.5 * 65535)
+        assert_eq!(pressure_to_device(-1.0), 0);
+        assert_eq!(pressure_to_device(2.0), PRESSURE_MAX);
+        assert_eq!(pressure_to_device(f32::NAN), 0);
     }
 
     #[test]
@@ -330,7 +335,7 @@ mod tests {
         let axes = PenAxes::from_event(&event, 1920, 1080);
         assert_eq!(axes.x, 960);
         assert_eq!(axes.y, 270);
-        assert_eq!(axes.pressure, PRESSURE_MAX_13BIT);
+        assert_eq!(axes.pressure, PRESSURE_MAX);
         assert_eq!(axes.tilt_x, -45);
         assert_eq!(axes.tilt_y, 45);
     }

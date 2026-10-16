@@ -1158,7 +1158,7 @@ fn write_plugin_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.15.0", data_size, out_size, out_data)
+            write_cf_string("0.16.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST => {
             write_array::<u8>(&[], data_size, out_size, out_data)
@@ -1252,7 +1252,7 @@ fn write_device_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.15.0", data_size, out_size, out_data)
+            write_cf_string("0.16.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST
         | K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST => {
@@ -1397,7 +1397,7 @@ fn write_stream_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.15.0", data_size, out_size, out_data)
+            write_cf_string("0.16.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST => {
             write_array::<u8>(&[], data_size, out_size, out_data)

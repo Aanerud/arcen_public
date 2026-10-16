@@ -223,9 +223,10 @@ Operator validation: [`../../docs/operations/pen-tablet-input.md`](../../docs/op
 `"Arcen Virtual Tablet Pen"` device (not merged into the existing
 absolute/relative mouse `uinput` device, so `libinput`/Xorg classify each by
 its own complete capability set), advertising `ABS_X`/`ABS_Y` on the shared
-fixed device raster, `ABS_PRESSURE` on the documented inclusive 13-bit
-`0..=8191` Linux range (`input/pen.rs::PRESSURE_MAX_13BIT`, matching modern
-Wacom Linux-driver magnitude without overclaiming vendor resolution),
+fixed device raster, `ABS_PRESSURE` on the inclusive 16-bit `0..=65535`
+range (`input/pen.rs::PRESSURE_MAX`, the shared vendor-neutral
+`arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE`; the wire carries
+normalized pressure, so no tablet maker's range is assumed),
 whole-degree `ABS_TILT_X`/`ABS_TILT_Y` (`-90..=90`), tool/proximity via
 `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER`, tip contact via `BTN_TOUCH`, and two
 barrel buttons via `BTN_STYLUS`/`BTN_STYLUS2`. **No rotation axis is
@@ -242,7 +243,7 @@ released on reset/drop. The tablet-tool device is probed/created before
 `ServerHello` is built (`InputController::pen_available`), so this host
 advertises pen/pressure/tilt/eraser/proximity as `Available` only once the
 runtime backend actually established the device; a pen-creation failure
-alone still leaves mouse/keyboard available. No Wacom driver is installed or
+alone still leaves mouse/keyboard available. No tablet vendor driver is installed or
 required on this Linux host — `libinput`/Xorg see an ordinary kernel
 tablet-tool device on the dedicated per-session Xorg target described above.
 Tablet touch is not transported; only one active tool is supported.

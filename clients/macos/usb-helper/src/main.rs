@@ -17,6 +17,7 @@
 
 mod capture;
 mod frame;
+mod registry;
 
 use capture::{speed_code, PhysicalDevice};
 use frame::{
@@ -247,18 +248,22 @@ fn handle_client(stream: &UnixStream) -> Result<(), String> {
             .map_err(|error| format!("clone socket: {error}"))?,
     );
 
-    write_frame(
-        &mut writer,
-        TAG_HELLO,
-        &encode_hello(
-            identity.vendor_id,
-            identity.product_id,
-            identity.bcd_device,
-            identity.device_class,
-            speed_code(identity.speed),
-        ),
-    )
-    .map_err(|error| error.to_string())?;
+    let descriptors: Vec<(u8, &[u8])> = identity
+        .report_descriptors
+        .iter()
+        .map(|entry| (entry.interface, entry.descriptor.as_slice()))
+        .collect();
+    let hello = encode_hello(
+        identity.vendor_id,
+        identity.product_id,
+        identity.bcd_device,
+        identity.device_class,
+        speed_code(identity.speed),
+        &descriptors,
+    )?;
+    write_frame(&mut writer, TAG_HELLO, &hello).map_err(|error| {
+        format!("send handshake with the tablet's HID report descriptors: {error}")
+    })?;
 
     // Every outbound completion funnels through one channel and one writer, so
     // worker completions and synchronous cancellation acknowledgements cannot

@@ -191,7 +191,7 @@ impl TabletMapper {
         self.in_proximity = true;
         self.tool = tool;
 
-        let pressure = sample.pressure.clamp(0.0, 1.0);
+        let pressure = normalize_pressure(sample.pressure);
         let tilt_x_degrees = tilt_to_degrees(sample.tilt_x);
         let tilt_y_degrees = tilt_to_degrees(sample.tilt_y);
         let rotation_degrees = normalize_rotation(sample.rotation_degrees);
@@ -260,19 +260,39 @@ fn normalize(window_x: f64, window_y: f64, view: ViewSize) -> Option<(f64, f64)>
     Some((x, y))
 }
 
+/// Clamp AppKit's `0.0..=1.0` pressure through the shared vendor-neutral
+/// normalisation. AppKit already scales every tablet's own pressure range
+/// (1024, 2048, 8192, 16384 levels...) to this unit range, so no device
+/// maximum is assumed here. Non-finite input is passed through unchanged so
+/// `PenEvent::validate` rejects it instead of this function inventing `0.0`.
+fn normalize_pressure(raw: f32) -> f32 {
+    if raw.is_finite() {
+        arcen_input::pen_axes::clamp_pressure(f64::from(raw))
+    } else {
+        raw
+    }
+}
+
 /// Convert AppKit's normalized `-1.0..=1.0` tilt axis into the `-90.0..=90.0`
-/// degree range `arcen_input::PenEvent` validates.
+/// degree range `arcen_input::PenEvent` validates, via the shared
+/// `arcen_input::pen_axes::tilt_unit_to_degrees`.
 ///
 /// AppKit's `tilt` property is explicitly documented as a normalized `-1..1`
 /// value, not degrees. The `* 90` scaling matches the W3C Pointer Events
 /// `tiltX`/`tiltY` convention (`-90..=90`, 0 = perpendicular), which several
 /// browser engines apply for exactly this native-to-web conversion — it is
-/// an established convention, not an invented one.
+/// an established convention, not an invented one. Non-finite input is
+/// passed through so validation rejects it.
 fn tilt_to_degrees(raw: f32) -> f32 {
-    (raw.clamp(-1.0, 1.0) * 90.0).clamp(-90.0, 90.0)
+    if raw.is_finite() {
+        arcen_input::pen_axes::tilt_unit_to_degrees(f64::from(raw))
+    } else {
+        raw
+    }
 }
 
-/// Normalize `-[NSEvent rotation]` into `0.0..360.0`.
+/// Normalize `-[NSEvent rotation]` into `0.0..360.0` via the shared
+/// `arcen_input::pen_axes::wrap_rotation_degrees`.
 ///
 /// Apple's documentation for the degrees this reports does not commit to a
 /// `0..360` vs. `-180..180` sign convention across tablet drivers. Rather
@@ -282,14 +302,10 @@ fn tilt_to_degrees(raw: f32) -> f32 {
 /// `PenEvent::validate` rejects it explicitly instead of this function
 /// silently inventing `0.0`.
 fn normalize_rotation(raw: f32) -> f32 {
-    if !raw.is_finite() {
-        return raw;
-    }
-    let wrapped = raw % 360.0;
-    if wrapped < 0.0 {
-        wrapped + 360.0
+    if raw.is_finite() {
+        arcen_input::pen_axes::wrap_rotation_degrees(f64::from(raw))
     } else {
-        wrapped
+        raw
     }
 }
 
@@ -331,7 +347,7 @@ mod tests {
             window_y: 250.0,
             entering,
             tool,
-            vendor_id: 0x056a,
+            vendor_id: 0x1234,
             tablet_id: 1,
             pointing_device_id: 1,
             system_tablet_id: 1,

@@ -1,0 +1,139 @@
+diff -ruN a/src/decompression/mod.rs b/src/decompression/mod.rs
+--- a/src/decompression/mod.rs	2026-10-10 16:10:22.000000000 +0200
++++ b/src/decompression/mod.rs	2026-10-10 16:10:22.000000000 +0200
+@@ -85,6 +85,50 @@
+     release = ffi::CFRelease,
+ );
+ 
++/// `unimpErr`: the running OS does not provide the requested routine.
++const UNIMPLEMENTED_STATUS: ffi::OSStatus = -4;
++
++type DecodeFrameWithOptionsFn = unsafe extern "C" fn(
++    ffi::VTDecompressionSessionRef,
++    ffi::CMSampleBufferRef,
++    ffi::VTDecodeFrameFlags,
++    *const std::ffi::c_void,
++    *mut std::ffi::c_void,
++    *mut ffi::VTDecodeInfoFlags,
++) -> ffi::OSStatus;
++
++/// Look up `VTDecompressionSessionDecodeFrameWithOptions` in the loaded
++/// VideoToolbox image, once per process.
++fn decode_frame_with_options_fn() -> Option<DecodeFrameWithOptionsFn> {
++    use std::sync::OnceLock;
++
++    extern "C" {
++        fn dlsym(
++            handle: *mut std::ffi::c_void,
++            symbol: *const std::ffi::c_char,
++        ) -> *mut std::ffi::c_void;
++    }
++    // `RTLD_DEFAULT` on Apple platforms.
++    const RTLD_DEFAULT: *mut std::ffi::c_void = -2_isize as *mut std::ffi::c_void;
++
++    static RESOLVED: OnceLock<usize> = OnceLock::new();
++    let address = *RESOLVED.get_or_init(|| {
++        // SAFETY: the name is a NUL-terminated C string literal and
++        // RTLD_DEFAULT searches the images already loaded by this process.
++        let symbol = unsafe {
++            dlsym(RTLD_DEFAULT, c"VTDecompressionSessionDecodeFrameWithOptions".as_ptr())
++        };
++        symbol as usize
++    });
++    if address == 0 {
++        None
++    } else {
++        // SAFETY: the resolved symbol has exactly the C signature declared
++        // by VideoToolbox's `VTDecompressionSessionDecodeFrameWithOptions`.
++        Some(unsafe { std::mem::transmute::<usize, DecodeFrameWithOptionsFn>(address) })
++    }
++}
++
+ impl DecompressionSession {
+     /// CoreFoundation type identifier for `VTDecompressionSession`.
+     #[must_use]
+@@ -207,7 +251,9 @@
+     /// # Errors
+     ///
+     /// Returns [`VTError::EncoderCallback`] wrapping the raw `OSStatus`
+-    /// if `VTDecompressionSessionDecodeFrameWithOptions` rejects the sample buffer.
++    /// if VideoToolbox rejects the sample buffer, or `-4` (`unimpErr`) when
++    /// `frame_options` are given on a system without
++    /// `VTDecompressionSessionDecodeFrameWithOptions`.
+     pub fn decode_with_options(
+         &self,
+         sample_buffer: &apple_cf::cm::CMSampleBuffer,
+@@ -215,15 +261,33 @@
+         frame_options: Option<&CFDictionary>,
+     ) -> Result<ffi::VTDecodeInfoFlags, VTError> {
+         let mut info_flags: ffi::VTDecodeInfoFlags = 0;
+-        let status = unsafe {
+-            ffi::VTDecompressionSessionDecodeFrameWithOptions(
+-                self.session,
+-                sample_buffer.as_ptr().cast(),
+-                decode_flags,
+-                frame_options.map_or(ptr::null(), |dict| dict.as_ptr().cast_const().cast()),
+-                ptr::null_mut(),
+-                &mut info_flags,
+-            )
++        // Arcen patch: without per-frame options this is exactly
++        // `VTDecompressionSessionDecodeFrame` (macOS 10.8+). The options
++        // variant is resolved at runtime so the crate still loads on systems
++        // that predate it; there it reports `UNIMPLEMENTED_STATUS`.
++        let status = match frame_options {
++            None => unsafe {
++                ffi::VTDecompressionSessionDecodeFrame(
++                    self.session,
++                    sample_buffer.as_ptr().cast(),
++                    decode_flags,
++                    ptr::null_mut(),
++                    &mut info_flags,
++                )
++            },
++            Some(dict) => match decode_frame_with_options_fn() {
++                Some(decode_frame_with_options) => unsafe {
++                    decode_frame_with_options(
++                        self.session,
++                        sample_buffer.as_ptr().cast(),
++                        decode_flags,
++                        dict.as_ptr().cast_const().cast(),
++                        ptr::null_mut(),
++                        &mut info_flags,
++                    )
++                },
++                None => UNIMPLEMENTED_STATUS,
++            },
+         };
+         if status == 0 {
+             Ok(info_flags)
+diff -ruN a/src/ffi/mod.rs b/src/ffi/mod.rs
+--- a/src/ffi/mod.rs	2026-10-10 16:10:22.000000000 +0200
++++ b/src/ffi/mod.rs	2026-10-10 16:10:22.000000000 +0200
+@@ -554,22 +554,11 @@
+         info_flags_out: *mut VTDecodeInfoFlags,
+         multi_image_capable_output_handler: *const c_void,
+     ) -> OSStatus;
+-    pub fn VTDecompressionSessionDecodeFrameWithOptions(
+-        session: VTDecompressionSessionRef,
+-        sample_buffer: CMSampleBufferRef,
+-        decode_flags: VTDecodeFrameFlags,
+-        frame_options: CFDictionaryRef,
+-        source_frame_ref_con: *mut c_void,
+-        info_flags_out: *mut VTDecodeInfoFlags,
+-    ) -> OSStatus;
+-    pub fn VTDecompressionSessionDecodeFrameWithOptionsAndOutputHandler(
+-        session: VTDecompressionSessionRef,
+-        sample_buffer: CMSampleBufferRef,
+-        decode_flags: VTDecodeFrameFlags,
+-        frame_options: CFDictionaryRef,
+-        info_flags_out: *mut VTDecodeInfoFlags,
+-        output_handler: *const c_void,
+-    ) -> OSStatus;
++    // Arcen patch: `VTDecompressionSessionDecodeFrameWithOptions` and
++    // `...WithOptionsAndOutputHandler` are deliberately not linked. They are
++    // newer than macOS 12, so a strong reference stops the binary loading
++    // there. `DecompressionSession::decode_with_options` resolves the options
++    // variant at runtime instead; see `decompression/mod.rs`.
+ 
+     pub fn VTDecompressionSessionWaitForAsynchronousFrames(
+         session: VTDecompressionSessionRef,

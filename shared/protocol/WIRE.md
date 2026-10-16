@@ -102,7 +102,8 @@ newer accepted sequence.
 ### Hard USB bridge v1 frames — little-endian, reliable stream only
 
 These frames are legal only when both peers advertise `usb_hard_v1` and the
-connection requested/accepted `TabletModeMsg::WacomUsbBridge`. They are
+connection requested/accepted `TabletModeMsg::UsbTabletBridge` (wire token
+`wacom_usb_bridge`, see "Tablet mode split" below). They are
 normalized URBs, not USB/IP packets, and remain on Arcen's authenticated QUIC
 session.
 
@@ -433,6 +434,17 @@ host describes the same display the same way.
 - `ClientHelloMsg` adds:
   - `tablet_mode_requested: local_termination | wacom_usb_bridge | disabled_mouse_compat`
   - `tablet_mode_capabilities` (`local_termination`, `wacom_usb_bridge`, `disabled_mouse_compat`)
+- **`wacom_usb_bridge` is a legacy name for a vendor-neutral mode.** It means
+  "Native tablet (USB bridged)": the client's physical pen tablet, of any
+  make, is bridged so the host's own driver owns it. Rust names the variant
+  `TabletModeMsg::UsbTabletBridge` and the capability field
+  `TabletModeCapabilitiesMsg::usb_tablet_bridge`, but both keep the 0.15 wire
+  spelling through `#[serde(rename = "wacom_usb_bridge")]`, so 0.15 and 0.16
+  peers read each other unchanged in both directions. The neutral spelling
+  `usb_tablet_bridge` is accepted on input (`#[serde(alias)]`) and never
+  emitted; a capabilities object must carry only one of the two keys.
+  `arcen_input::TabletMode` uses the same token. Round-trip tests in
+  `messages.rs` pin the 0.15 JSON byte-for-byte.
 - `ServerHelloMsg` adds `tablet_mode_capabilities` with the same shape.
 - Host sends `tablet_mode_result` (`TabletModeResultMsg`) after setup with:
   `requested`, `active`, `accepted`, bounded `reason`, and `reconnect_required`.
@@ -446,6 +458,61 @@ host describes the same display the same way.
   reason and `active=disabled_mouse_compat`. A host never substitutes
   `local_termination`; the user must explicitly select Tablet support.
 
+
+### Hard USB device facts and pen-tablet classification (additive)
+
+`ClientHelloMsg.usb_hard_device` (`UsbHardDeviceMsg`) describes the device the
+client's privileged helper captured: `vendor_id`, `product_id`, `bcd_device`,
+`device_class`, `speed`, and, since 0.16.0, `hid_report_descriptors` — one
+`{interface, descriptor}` entry per HID interface, `descriptor` being the
+verbatim HID report descriptor as lowercase hexadecimal. The field is
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]`: a 0.15 client omits
+it and a 0.15 host ignores it.
+
+- Vendor and product ids are informational only. A host authorizes Hard USB
+  with `arcen_usb_bridge::authorize_hard_usb_tablet(device_class,
+  descriptors)`: the device class must be `0x00` or `0x03`, at most
+  `MAX_INTERFACES` (16) descriptors of at most
+  `MAX_HID_REPORT_DESCRIPTOR_BYTES` (4096) bytes each with unique interface
+  numbers, at most `MAX_CLAIMED_REPORT_DESCRIPTOR_BYTES` (12 KiB) in total,
+  the descriptors must classify as a pen tablet
+  (`arcen_usb_bridge::classify_pen_tablet`), and no descriptor may carry a
+  Generic Desktop joystick, gamepad or multi-axis controller collection at
+  any collection depth, because every interface is forwarded. Keyboard and keypad collections
+  (express keys) are forwarded with a pen tablet: the Deck can already send
+  any keystroke through the input channel, so they grant nothing new.
+- `UsbHardDeviceMsg::report_descriptors()` decodes the set and refuses it
+  whole on any non-hex, odd-length, oversized or excess entry.
+- A host that receives no descriptors (a 0.15 Deck) refuses Hard USB with an
+  explicit reason rather than admitting the device by vendor id; Tablet
+  support is unaffected.
+- After attaching, the host checks every standard `GET_DESCRIPTOR`
+  completion against the authorization before giveback
+  (`arcen_usb_bridge::BridgedDeviceGuard`): device and device-qualifier
+  descriptors (class `0x00`/`0x03`, the hello's vendor/product/`bcd_device`,
+  one configuration), configuration and other-speed configuration
+  descriptors (bounded, interrupt endpoints only, every interface HID,
+  exactly the interface numbers of `hid_report_descriptors`, and each HID
+  class descriptor well formed with exactly one Report entry advertising
+  exactly the length of that interface's claimed descriptor), and report descriptors (exactly `min(wLength, claimed
+  length)` bytes of the claimed descriptor). A violation ends the session as a protocol error before the host
+  kernel parses the descriptor. The hello's identity fields are therefore
+  binding for the attached device, though they still never authorize it.
+
+Pen-tablet classification (`shared/usb-bridge/src/hid_digitizer.rs`) reads
+only the report descriptor: a standard Digitizers-page (`0x0D`) collection
+whose usage is Pen or Digitizer (or that nests a Stylus) and reports X/Y plus
+Tip Switch, Tip Pressure or In Range is a pen. On the vendor-defined
+Digitizers page (`0xFF0D`, usage ids mirroring the Digitizers page) an
+application collection whose usage is Digitizer or Pen is a pen even with
+opaque reports, unless the device also publishes a Generic Desktop joystick,
+gamepad or multi-axis controller collection; its
+capabilities are then unknown. Any other `0xFF0D` collection counts only
+together with a standard digitizer collection on the same device, and other
+vendor pages never qualify. Keyboards, mice, gamepads, vendor-only and touch-only
+devices, and malformed descriptors are refused. The classifier also reports
+the declared pen surface (pressure range, tilt, twist, eraser, barrel
+switches) for diagnostics.
 
 ### Tier-B Stage-1 types now modeled in Rust
 
@@ -573,6 +640,14 @@ new field/message defaults safely on an old peer.
   keyboard, absolute motion, relative motion, button, and wheel events;
   sequence zero remains legacy/unsequenced and a rejected/out-of-order
   sequence must not advance product state.
+- The pressure/tilt/rotation ranges are vendor-neutral: no tablet's own
+  resolution travels on the wire. Conversion into and out of them is shared
+  code, `arcen_input::pen_axes` (`normalize_logical`, `scale_unit`,
+  `tilt_unit_to_degrees`, `tilt_logical_to_degrees`,
+  `twist_logical_to_degrees`, `wrap_rotation_degrees`, `whole_tilt_degrees`,
+  `whole_rotation_degrees`). Hosts map the normalized pressure to their own
+  device range (`TYPED_PEN_PRESSURE_RANGE` `0..=65535` for the Linux virtual
+  pen, `WINDOWS_INK_PRESSURE_RANGE` `0..=1024` for Windows Ink).
 
 Compatibility remains additive:
 
@@ -606,10 +681,10 @@ so `PROTOCOL_VERSION` remains 3.
 
 The binary `HidDeviceAdded`/`HidDeviceRemoved`/`HidReport` frames (see the
 `HID passthrough (HoIP)` layout comment in `wire.rs`) carry raw IOHID input
-reports for a small allow-listed set of drawing-tablet vendors (Wacom, Huion,
-XP-Pen, UC-Logic, Gaomon) from Arcen Deck to a host's `/dev/uhid`. This path
-is **quarantined** and is not part of default builds or the default wire
-contract:
+reports from pen-tablet HID interfaces of any make — chosen by what their
+report descriptors declare, never by vendor id — from Arcen Deck to a host's
+`/dev/uhid`. This path is **quarantined** and is not part of default builds or
+the default wire contract:
 
 - Both `ClientHelloMsg` and `ServerHelloMsg` carry an additive,
   `#[serde(default)] experimental_raw_hid: bool` field (default `false`).
@@ -626,6 +701,12 @@ contract:
   `/dev/uhid` parser.
 - Default builds and any peer that predates this field (`experimental_raw_hid`
   absent → `false` via `#[serde(default)]`) never send or accept raw HID.
+- The client offers only interfaces whose descriptor declares a digitizer and
+  forwards reports only from interfaces that declare a pen; the host admits a
+  device through `arcen_usb_bridge::RawHidAdmission`, which creates a
+  `/dev/uhid` device only for a pen-bearing interface whose device (grouped by
+  vendor/product id) classifies as a pen tablet, bounded to 8 offered devices
+  per session.
 
 ### In legacy Python, not yet in Rust (Tier B — ported on host demand)
 `monitor_list` (+ `MonitorInfo`), `select_monitor`,

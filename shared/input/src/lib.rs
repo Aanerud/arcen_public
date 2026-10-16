@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 mod gestures;
 pub mod hid_reports;
 mod negotiation;
+pub mod pen_axes;
 mod pen_edges;
 mod region;
 mod region_emitter;
@@ -115,8 +116,13 @@ pub enum TabletMode {
     /// Local AppKit/local-injection termination over input-v3.
     #[default]
     LocalTermination,
-    /// Full USB bridge for native host-driver/device semantics.
-    WacomUsbBridge,
+    /// Native tablet: the client's physical pen tablet, of any make, bridged
+    /// over USB so the host's own driver stack owns it.
+    ///
+    /// Serialized as the legacy token `wacom_usb_bridge` so it matches the
+    /// protocol's `TabletModeMsg`; `usb_tablet_bridge` is accepted on input.
+    #[serde(rename = "wacom_usb_bridge", alias = "usb_tablet_bridge")]
+    UsbTabletBridge,
     /// Disable tablet redirection and keep normal mouse compatibility.
     DisabledMouseCompat,
 }
@@ -192,7 +198,7 @@ pub const fn negotiate_cursor_mode(
 pub const fn negotiate_tablet_mode(
     requested: TabletMode,
     local_termination: CapabilityAvailability,
-    wacom_usb_bridge: CapabilityAvailability,
+    usb_tablet_bridge: CapabilityAvailability,
 ) -> TabletModeNegotiation {
     match requested {
         TabletMode::LocalTermination => {
@@ -210,11 +216,11 @@ pub const fn negotiate_tablet_mode(
                 }
             }
         }
-        TabletMode::WacomUsbBridge => {
-            if matches!(wacom_usb_bridge, CapabilityAvailability::Available) {
+        TabletMode::UsbTabletBridge => {
+            if matches!(usb_tablet_bridge, CapabilityAvailability::Available) {
                 TabletModeNegotiation {
                     requested,
-                    active: TabletMode::WacomUsbBridge,
+                    active: TabletMode::UsbTabletBridge,
                     accepted: true,
                 }
             } else {
@@ -233,6 +239,28 @@ pub const fn negotiate_tablet_mode(
             active: TabletMode::DisabledMouseCompat,
             accepted: true,
         },
+    }
+}
+
+impl From<arcen_protocol::messages::TabletModeMsg> for TabletMode {
+    fn from(mode: arcen_protocol::messages::TabletModeMsg) -> Self {
+        match mode {
+            arcen_protocol::messages::TabletModeMsg::LocalTermination => Self::LocalTermination,
+            arcen_protocol::messages::TabletModeMsg::UsbTabletBridge => Self::UsbTabletBridge,
+            arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat => {
+                Self::DisabledMouseCompat
+            }
+        }
+    }
+}
+
+impl From<TabletMode> for arcen_protocol::messages::TabletModeMsg {
+    fn from(mode: TabletMode) -> Self {
+        match mode {
+            TabletMode::LocalTermination => Self::LocalTermination,
+            TabletMode::UsbTabletBridge => Self::UsbTabletBridge,
+            TabletMode::DisabledMouseCompat => Self::DisabledMouseCompat,
+        }
     }
 }
 
@@ -730,15 +758,41 @@ mod tests {
     }
 
     #[test]
+    fn native_tablet_mode_keeps_the_0_15_token_and_maps_to_the_wire_enum() {
+        assert_eq!(
+            serde_json::to_string(&TabletMode::UsbTabletBridge).expect("serializes"),
+            r#""wacom_usb_bridge""#
+        );
+        for token in [r#""wacom_usb_bridge""#, r#""usb_tablet_bridge""#] {
+            assert_eq!(
+                serde_json::from_str::<TabletMode>(token).expect("parses"),
+                TabletMode::UsbTabletBridge
+            );
+        }
+        for mode in [
+            TabletMode::LocalTermination,
+            TabletMode::UsbTabletBridge,
+            TabletMode::DisabledMouseCompat,
+        ] {
+            let wire = arcen_protocol::messages::TabletModeMsg::from(mode);
+            assert_eq!(TabletMode::from(wire), mode);
+            assert_eq!(
+                serde_json::to_string(&wire).expect("serializes"),
+                serde_json::to_string(&mode).expect("serializes")
+            );
+        }
+    }
+
+    #[test]
     fn tablet_bridge_never_silently_falls_back_to_local_termination() {
         assert_eq!(
             negotiate_tablet_mode(
-                TabletMode::WacomUsbBridge,
+                TabletMode::UsbTabletBridge,
                 CapabilityAvailability::Available,
                 CapabilityAvailability::Unavailable,
             ),
             TabletModeNegotiation {
-                requested: TabletMode::WacomUsbBridge,
+                requested: TabletMode::UsbTabletBridge,
                 active: TabletMode::DisabledMouseCompat,
                 accepted: false,
             }

@@ -324,9 +324,9 @@ const MAX_INBOUND_WS_MESSAGE: usize =
 /// Bounds the number of `/dev/uhid` virtual devices one experimental-raw-hid
 /// session may create, independent of the wire-level descriptor/report size
 /// bounds already enforced in `arcen_protocol::decode_hid_device_added` /
-/// `decode_hid_report`. Five supported vendors × a couple of interfaces each
-/// leaves comfortable headroom without letting a hostile/buggy peer flood the
-/// kernel with virtual devices.
+/// `decode_hid_report`. A tablet's pen, touch and vendor interfaces fit with
+/// room to spare, without letting a hostile/buggy peer flood the kernel with
+/// virtual devices.
 #[cfg(all(target_os = "linux", feature = "experimental-raw-hid"))]
 const MAX_EXPERIMENTAL_RAW_HID_DEVICES: usize = 8;
 
@@ -5231,18 +5231,25 @@ async fn run_attachment(
         return AttachmentEnd::terminal(SessionEndReason::WriterEnded);
     }
     let client_tablet_capabilities = client_hello.effective_tablet_mode_capabilities();
-    let usb_hard_speed =
-        crate::usb_bridge::authorized_device_speed(client_hello.usb_hard_device.as_ref());
+    // Vendor-neutral and independent of the Deck's own decision: the claimed
+    // HID report descriptors are classified here before any virtual device
+    // exists, and checked again against the device once it is attached.
+    let usb_hard_authorization =
+        crate::usb_bridge::authorize_device(client_hello.usb_hard_device.as_ref());
     let usb_hard_available = client_hello.usb_hard_v1
-        && usb_hard_speed.is_some()
+        && usb_hard_authorization.is_ok()
         && crate::usb_bridge::runtime_available();
     info!(
         target: NET,
         requested = ?client_hello.tablet_mode_requested,
         client_usb_hard_v1 = client_hello.usb_hard_v1,
-        client_usb_hard_device = ?client_hello.usb_hard_device,
+        client_usb_hard_vendor_id = client_hello.usb_hard_device.as_ref().map(|device| device.vendor_id),
+        client_usb_hard_product_id = client_hello.usb_hard_device.as_ref().map(|device| device.product_id),
+        client_usb_hard_descriptors = client_hello.usb_hard_device.as_ref().map_or(0, |device| device.hid_report_descriptors.len()),
         runtime_available = crate::usb_bridge::runtime_available(),
-        client_bridge_capability = ?client_tablet_capabilities.wacom_usb_bridge,
+        client_bridge_capability = ?client_tablet_capabilities.usb_tablet_bridge,
+        tablet_pressure_levels = usb_hard_authorization.as_ref().ok().and_then(|tablet| tablet.profile.capabilities.pressure_levels()),
+        tablet_refusal = usb_hard_authorization.as_ref().err().map(String::as_str),
         usb_hard_available,
         "Hard USB negotiation inputs"
     );
@@ -5252,7 +5259,7 @@ async fn run_attachment(
         } else {
             InputCapabilityAvailability::Unavailable
         },
-        wacom_usb_bridge: if usb_hard_available {
+        usb_tablet_bridge: if usb_hard_available {
             InputCapabilityAvailability::Available
         } else {
             InputCapabilityAvailability::Unavailable
@@ -5265,19 +5272,37 @@ async fn run_attachment(
         client_tablet_capabilities,
         host_tablet_capabilities,
     );
+    // When the backend exists but the device itself was refused, say why
+    // rather than blaming a missing backend.
+    if let Err(refusal) = &usb_hard_authorization {
+        if client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
+            && !tablet_mode_result.accepted
+            && client_hello.usb_hard_v1
+            && crate::usb_bridge::runtime_available()
+        {
+            tablet_mode_result.reason = TabletModeReason::try_from(format!(
+                "Native tablet (USB bridged) refused: {refusal}. Use Tablet support instead."
+            ))
+            .unwrap_or_default();
+        }
+    }
     #[cfg(feature = "usb-hard-lab")]
     let mut usb_bridge = if tablet_mode_result.accepted
-        && tablet_mode_result.active == TabletModeMsg::WacomUsbBridge
+        && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge
     {
         match (
             crate::current_pier_exe(),
             crate::usb_bridge::fresh_attachment_generation(),
         ) {
             (Some(binary), Ok(generation)) => {
+                let tablet = usb_hard_authorization
+                    .as_ref()
+                    .expect("accepted Hard USB mode has an authorized tablet");
                 match crate::usb_bridge::BridgeProcess::spawn(
                     &binary,
                     generation,
-                    usb_hard_speed.expect("accepted Hard USB mode has authorized speed"),
+                    tablet.speed,
+                    tablet.guard(),
                 )
                 .await
                 {
@@ -5330,7 +5355,7 @@ async fn run_attachment(
     // built long before the requested tablet mode is known, and mutability is
     // wanted only for this one decision.
     let mut input_controller = input_controller;
-    if tablet_mode_result.accepted && tablet_mode_result.active == TabletModeMsg::WacomUsbBridge {
+    if tablet_mode_result.accepted && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge {
         if let Some(controller) = input_controller.as_mut() {
             if controller.release_tablet_device() {
                 info!(
@@ -5969,6 +5994,11 @@ async fn run_attachment(
             #[cfg(all(target_os = "linux", feature = "experimental-raw-hid"))]
             let mut hid_devices: std::collections::HashMap<u8, crate::input::UhidDevice> =
                 std::collections::HashMap::new();
+            // Vendor-neutral admission: only interfaces whose report
+            // descriptor classifies as a pen tablet become uhid devices.
+            #[cfg(all(target_os = "linux", feature = "experimental-raw-hid"))]
+            let mut hid_admission =
+                arcen_usb_bridge::RawHidAdmission::new(MAX_EXPERIMENTAL_RAW_HID_DEVICES);
             let mut usb_bridge = disp_usb_bridge;
             let mut cursor_shape_rx = disp_cursor_shape_rx;
             let reason = loop {
@@ -6365,35 +6395,44 @@ async fn run_attachment(
                                         "experimental raw-HID frame rejected: capability not negotiated"
                                     );
                                 } else if let Ok((hdr, descriptor)) = decode_hid_device_added(&bytes) {
-                                    if !crate::input::is_experimental_raw_hid_vendor(hdr.vendor_id) {
-                                        warn!(
+                                    match hid_admission.offer(
+                                        hdr.device_id,
+                                        hdr.vendor_id,
+                                        hdr.product_id,
+                                        descriptor,
+                                    ) {
+                                        Err(refusal) => warn!(
                                             target: NET,
                                             event = "raw_hid_rejected",
-                                            reason = "vendor_not_allowed",
+                                            reason = %refusal,
                                             vid = hdr.vendor_id,
-                                            "experimental raw-HID device rejected: vendor not on the allow-list"
-                                        );
-                                    } else if hid_devices.len() >= MAX_EXPERIMENTAL_RAW_HID_DEVICES {
-                                        warn!(
+                                            "experimental raw-HID device rejected: not a pen tablet interface"
+                                        ),
+                                        Ok(admitted) if admitted.is_empty() => debug!(
                                             target: NET,
-                                            event = "raw_hid_rejected",
-                                            reason = "device_limit",
-                                            "experimental raw-HID device rejected: per-session device limit reached"
-                                        );
-                                    } else {
-                                        let name = format!("Arcen HID {:04x}:{:04x}", hdr.vendor_id, hdr.product_id);
-                                        match crate::input::UhidDevice::create(
-                                            &name,
-                                            hdr.vendor_id,
-                                            hdr.product_id,
-                                            descriptor,
-                                            hdr.device_id,
-                                        ) {
-                                            Ok(dev) => {
-                                                debug!(target: NET, device_id = hdr.device_id, vid = hdr.vendor_id, pid = hdr.product_id, "uhid device created");
-                                                hid_devices.insert(hdr.device_id, dev);
+                                            device_id = hdr.device_id,
+                                            "raw-HID interface held until its device classifies as a pen tablet"
+                                        ),
+                                        Ok(admitted) => {
+                                            for device in admitted {
+                                                let name = format!(
+                                                    "Arcen HID {:04x}:{:04x}",
+                                                    device.vendor_id, device.product_id
+                                                );
+                                                match crate::input::UhidDevice::create(
+                                                    &name,
+                                                    device.vendor_id,
+                                                    device.product_id,
+                                                    &device.descriptor,
+                                                    device.device_id,
+                                                ) {
+                                                    Ok(dev) => {
+                                                        debug!(target: NET, device_id = device.device_id, vid = device.vendor_id, pid = device.product_id, "uhid device created");
+                                                        hid_devices.insert(device.device_id, dev);
+                                                    }
+                                                    Err(e) => warn!(target: NET, %e, "uhid device creation failed"),
+                                                }
                                             }
-                                            Err(e) => warn!(target: NET, %e, "uhid device creation failed"),
                                         }
                                     }
                                 }
@@ -6415,6 +6454,7 @@ async fn run_attachment(
                             Some(FrameType::HidDeviceRemoved) => {
                                 use arcen_protocol::decode_hid_device_removed;
                                 if let Ok(device_id) = decode_hid_device_removed(&bytes) {
+                                    hid_admission.remove(device_id);
                                     hid_devices.remove(&device_id);
                                     debug!(target: NET, device_id, "uhid device removed");
                                 }
@@ -6424,6 +6464,15 @@ async fn run_attachment(
                                     break SessionEndReason::ProtocolError;
                                 };
                                 if let Err(error) = bridge.send_frame(&bytes).await {
+                                    if error.kind() == std::io::ErrorKind::InvalidData {
+                                        warn!(
+                                            target: NET,
+                                            event = "usb_hard_device_refused",
+                                            reason = %error,
+                                            "Hard USB device refused: a descriptor it served contradicts its authorization; detaching"
+                                        );
+                                        break SessionEndReason::ProtocolError;
+                                    }
                                     warn!(target: NET, %error, "Hard USB completion IPC failed");
                                     break SessionEndReason::TransportError;
                                 }
@@ -7357,8 +7406,8 @@ fn resolve_linux_tablet_mode_result(
             capability_to_input(host_capabilities.local_termination),
         ),
         mutual_capability(
-            capability_to_input(client_capabilities.wacom_usb_bridge),
-            capability_to_input(host_capabilities.wacom_usb_bridge),
+            capability_to_input(client_capabilities.usb_tablet_bridge),
+            capability_to_input(host_capabilities.usb_tablet_bridge),
         ),
     );
     let reason = if negotiation.accepted {
@@ -7374,8 +7423,8 @@ fn resolve_linux_tablet_mode_result(
             TabletModeMsg::LocalTermination => {
                 "local termination unavailable: host pen backend did not initialize"
             }
-            TabletModeMsg::WacomUsbBridge => {
-                "Native tablet (USB bridged) is unavailable on this Linux host: it needs the USB virtualization backend and a host Wacom driver. Use Tablet support instead: it needs no host driver and works over any network."
+            TabletModeMsg::UsbTabletBridge => {
+                "Native tablet (USB bridged) is unavailable on this Linux host: it needs the USB virtualization backend and a host driver for the tablet. Use Tablet support instead: it needs no host driver and works over any network."
             }
             TabletModeMsg::DisabledMouseCompat => {
                 "mouse compatibility mode negotiation failed unexpectedly"
@@ -7388,7 +7437,7 @@ fn resolve_linux_tablet_mode_result(
         active: tablet_mode_from_input(negotiation.active),
         accepted: negotiation.accepted,
         reason,
-        reconnect_required: requested == TabletModeMsg::WacomUsbBridge && !negotiation.accepted,
+        reconnect_required: requested == TabletModeMsg::UsbTabletBridge && !negotiation.accepted,
         ..TabletModeResultMsg::default()
     }
 }
@@ -7396,7 +7445,7 @@ fn resolve_linux_tablet_mode_result(
 const fn tablet_mode_to_input(mode: TabletModeMsg) -> InputTabletMode {
     match mode {
         TabletModeMsg::LocalTermination => InputTabletMode::LocalTermination,
-        TabletModeMsg::WacomUsbBridge => InputTabletMode::WacomUsbBridge,
+        TabletModeMsg::UsbTabletBridge => InputTabletMode::UsbTabletBridge,
         TabletModeMsg::DisabledMouseCompat => InputTabletMode::DisabledMouseCompat,
     }
 }
@@ -7404,7 +7453,7 @@ const fn tablet_mode_to_input(mode: TabletModeMsg) -> InputTabletMode {
 const fn tablet_mode_from_input(mode: InputTabletMode) -> TabletModeMsg {
     match mode {
         InputTabletMode::LocalTermination => TabletModeMsg::LocalTermination,
-        InputTabletMode::WacomUsbBridge => TabletModeMsg::WacomUsbBridge,
+        InputTabletMode::UsbTabletBridge => TabletModeMsg::UsbTabletBridge,
         InputTabletMode::DisabledMouseCompat => TabletModeMsg::DisabledMouseCompat,
     }
 }
@@ -9119,19 +9168,19 @@ mod tests {
     fn linux_tablet_mode_resolution_keeps_native_bridge_explicit() {
         let client = TabletModeCapabilitiesMsg {
             local_termination: InputCapabilityAvailability::Available,
-            wacom_usb_bridge: InputCapabilityAvailability::Available,
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         };
         let host = TabletModeCapabilitiesMsg {
             local_termination: InputCapabilityAvailability::Available,
-            wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+            usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         };
         let local = resolve_linux_tablet_mode_result(TabletModeMsg::LocalTermination, client, host);
         assert!(local.accepted);
         assert_eq!(local.active, TabletModeMsg::LocalTermination);
 
-        let bridge = resolve_linux_tablet_mode_result(TabletModeMsg::WacomUsbBridge, client, host);
+        let bridge = resolve_linux_tablet_mode_result(TabletModeMsg::UsbTabletBridge, client, host);
         assert!(!bridge.accepted);
         assert_eq!(bridge.active, TabletModeMsg::DisabledMouseCompat);
         assert_reason_reaches_the_operator(bridge.reason.as_str());

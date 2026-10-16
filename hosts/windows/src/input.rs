@@ -223,25 +223,26 @@ const fn prepends_absolute_position(mode: PointerMotionMode) -> bool {
 // documented flag combination.
 
 /// Maps normalized `0.0..=1.0` pressure to the Windows Ink documented
-/// `0..=1024` pointer pressure range.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// `0..=1024` pointer pressure range, through the shared vendor-neutral
+/// normalisation.
 fn pen_pressure_to_windows(pressure: f32) -> u32 {
-    (pressure.clamp(0.0, 1.0) * 1024.0).round() as u32
+    let scaled = arcen_input::pen_axes::scale_unit(
+        pressure,
+        arcen_input::pen_axes::WINDOWS_INK_PRESSURE_RANGE,
+    );
+    u32::try_from(scaled).unwrap_or(0)
 }
 
 /// Maps `PenEventMsg`'s inclusive `0.0..=360.0` rotation (`0` and `360` both
 /// denoting the same angle) to Windows Ink's documented `0..=359` range.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn pen_rotation_to_windows(rotation_degrees: f32) -> u32 {
-    let clamped = rotation_degrees.clamp(0.0, 360.0);
-    (clamped.round() as u32) % 360
+    arcen_input::pen_axes::whole_rotation_degrees(rotation_degrees)
 }
 
 /// Maps `-90.0..=90.0` tilt degrees to Windows Ink's documented
 /// `-90..=90` integer range.
-#[allow(clippy::cast_possible_truncation)]
 fn pen_tilt_to_windows(tilt_degrees: f32) -> i32 {
-    tilt_degrees.clamp(-90.0, 90.0).round() as i32
+    arcen_input::pen_axes::whole_tilt_degrees(tilt_degrees)
 }
 
 /// Maps a legacy normalized position to a pixel coordinate inside the selected

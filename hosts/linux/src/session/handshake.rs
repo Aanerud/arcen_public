@@ -183,7 +183,7 @@ pub fn build_server_hello(
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_availability,
-            wacom_usb_bridge: if crate::usb_bridge::runtime_available() {
+            usb_tablet_bridge: if crate::usb_bridge::runtime_available() {
                 InputCapabilityAvailability::Available
             } else {
                 InputCapabilityAvailability::Unavailable

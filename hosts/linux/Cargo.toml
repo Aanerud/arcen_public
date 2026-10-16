@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-linux"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
@@ -20,9 +20,10 @@ default = []
 # Never enable this in a release artifact: it disables the product's only trust
 # boundary. There is no runtime flag or config key that can turn it on.
 insecure-lab-no-auth = []
-# SEC-raw-hid. Compiles in the quarantined experimental raw-HID vendor
-# passthrough (Wacom/Huion/XP-Pen/UC-Logic/Gaomon) that creates `/dev/uhid`
-# virtual devices from client-supplied descriptors/reports. Off by default.
+# SEC-raw-hid. Compiles in the quarantined experimental raw-HID pen-tablet
+# passthrough (devices whose report descriptor classifies as a pen tablet) that
+# creates `/dev/uhid` virtual devices from client-supplied descriptors/reports.
+# Off by default.
 # Even when enabled, nothing runs unless an operator ALSO sets
 # `ARCEN_EXPERIMENTAL_RAW_HID=1` at runtime and the connecting client
 # negotiates the matching `experimental_raw_hid` ClientHello capability. This

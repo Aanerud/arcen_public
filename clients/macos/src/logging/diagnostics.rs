@@ -28,9 +28,11 @@ pub fn log_startup_banner() {
         protocol = %format!("{:?}", crate::protocol::PROTOCOL_VERSION),
         os = %os_description(),
         arch = std::env::consts::ARCH,
+        deck_platform = crate::platform::current().label(),
         host = %host_name(),
         "Arcen client starting"
     );
+    crate::platform::log_platform();
 }
 
 /// Everything the client knows about an outgoing connection attempt. Owned
@@ -101,7 +103,11 @@ pub struct UsbDeviceInfo {
     pub firmware: String,
     /// True if any interface advertises the HID class (0x03).
     pub is_hid: bool,
-    /// Known graphics-tablet brand, if the vendor id is recognised.
+    /// True if its HID report descriptors classify as a pen tablet
+    /// (`arcen_usb_bridge::classify_pen_tablet`), whoever made it.
+    pub is_pen_tablet: bool,
+    /// Brand name for a few well-known tablet vendor ids. Informational only:
+    /// it labels log lines and never decides whether a device is a tablet.
     pub tablet_brand: Option<&'static str>,
 }
 
@@ -110,6 +116,7 @@ pub struct UsbDeviceInfo {
 /// devices attached" from "USB subsystem/permission failure".
 pub fn usb_inventory() -> Result<Vec<UsbDeviceInfo>, String> {
     let devices = nusb::list_devices().map_err(|error| error.to_string())?;
+    let pen_tablets = crate::tablet::attached_pen_tablets();
     Ok(devices
         .map(|device| {
             let is_hid = device.interfaces().any(|iface| iface.class() == 0x03);
@@ -121,6 +128,7 @@ pub fn usb_inventory() -> Result<Vec<UsbDeviceInfo>, String> {
                 serial: device.serial_number().map(str::to_string),
                 firmware: bcd_version(device.device_version()),
                 is_hid,
+                is_pen_tablet: pen_tablets.contains(&(device.vendor_id(), device.product_id())),
                 tablet_brand: tablet_brand(device.vendor_id()),
             }
         })
@@ -143,7 +151,7 @@ pub fn log_usb_inventory() {
             return;
         }
     };
-    let tablets = devices.iter().filter(|d| d.tablet_brand.is_some()).count();
+    let tablets = devices.iter().filter(|d| d.is_pen_tablet).count();
     info!(
         target: USB,
         total = devices.len(),
@@ -154,10 +162,10 @@ pub fn log_usb_inventory() {
         let id = format!("{:04x}:{:04x}", device.vendor_id, device.product_id);
         let product = device.product.as_deref().unwrap_or("?");
         let vendor = device.vendor_name.as_deref().unwrap_or("?");
-        if let Some(brand) = device.tablet_brand {
+        if device.is_pen_tablet {
             info!(
                 target: USB,
-                brand,
+                brand = device.tablet_brand.unwrap_or("unbranded"),
                 id = %id,
                 product,
                 firmware = %device.firmware,
@@ -184,7 +192,8 @@ fn bcd_version(raw: u16) -> String {
     format!("{:x}.{:02x}", (raw >> 8) & 0xff, raw & 0xff)
 }
 
-/// Recognise common graphics-tablet vendor ids so pens/tablets stand out.
+/// Brand label for a few common tablet vendor ids, for readable logs only.
+/// Whether a device is a tablet is decided by its report descriptors.
 fn tablet_brand(vendor_id: u16) -> Option<&'static str> {
     match vendor_id {
         0x056a => Some("Wacom"),

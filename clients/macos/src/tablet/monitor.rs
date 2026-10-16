@@ -5,7 +5,7 @@
 //! pure types in [`super::sample`] so the rest of the module (mapper, probe)
 //! never needs `unsafe` or a live `NSApplication` to be tested.
 //!
-//! Design constraints from the Wacom local-termination plan:
+//! Design constraints from the local-termination plan:
 //! - **Main-thread/AppKit lifecycle**: constructing and dropping the monitor
 //!   requires proof of the main thread via `MainThreadMarker`
 //!   (`objc2_foundation`). AppKit event monitors must be installed/removed
@@ -176,11 +176,11 @@ impl TabletEventMonitor {
         // null, which it does (the unmodified input event pointer).
         //
         // The mask includes both standalone tablet events (NSEventTypeTabletPoint,
-        // NSEventTypeTabletProximity) AND every mouse/drag event type.  Wacom and
-        // other tablet vendors on macOS normally deliver pen data as mouse events
-        // with a TabletPoint or TabletProximity *subtype*, not as standalone tablet
+        // NSEventTypeTabletProximity) AND every mouse/drag event type. Tablet
+        // drivers on macOS normally deliver pen data as mouse events with a
+        // TabletPoint or TabletProximity *subtype*, not as standalone tablet
         // event types. Listening only to the standalone types misses essentially
-        // all real-world pen motion and proximity events from an attached Wacom.
+        // all real-world pen motion and proximity events from an attached tablet.
         let tablet_mouse_mask = NSEventMask::LeftMouseDown
             | NSEventMask::LeftMouseUp
             | NSEventMask::RightMouseDown
@@ -230,7 +230,7 @@ impl Drop for TabletEventMonitor {
 /// `NSEventTypeTabletProximity`) and mouse/drag events with a tablet subtype
 /// (`NSEventSubtype::TabletPoint`, `NSEventSubtype::TabletProximity`).
 ///
-/// Wacom and most other tablet drivers on macOS deliver pen input primarily
+/// Tablet drivers on macOS deliver pen input primarily
 /// as mouse events with a tablet subtype, not as standalone tablet event
 /// types. The standalone types may still appear in some driver configurations,
 /// so both paths are handled. Every getter call here is a safe Objective-C
@@ -263,7 +263,7 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
     // contract). `subtype()` is an unsafe getter because AppKit's docs only
     // guarantee it is meaningful on certain event types; we only call it
     // here after confirming the event type is one of the mouse/drag types
-    // that the Wacom driver uses to carry tablet data, matching the AppKit
+    // that tablet drivers use to carry tablet data, matching the AppKit
     // documentation for `NSEvent.subtype`.
     #[allow(unused_unsafe)]
     let effective_tablet_kind = if kind == NSEventType::TabletPoint {
@@ -277,7 +277,7 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
         } else if subtype == NSEventSubtype::TabletProximity {
             Some(NSEventType::TabletProximity)
         } else {
-            // Some Wacom driver/runtime combinations deliver pen motion as
+            // Some tablet driver/runtime combinations deliver pen motion as
             // ordinary mouse/drag events with Pen/Eraser device type but
             // without a TabletPoint subtype. Accept those as tablet-point
             // samples so motion/pressure reaches the host. Trackpad-origin
@@ -302,7 +302,7 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
 
     // Resolve the effective tool type from NSEvent.pointingDeviceType.
     //
-    // Wacom on macOS delivers pen motion as mouse/drag events whose
+    // Tablet drivers on macOS deliver pen motion as mouse/drag events whose
     // pointingDeviceType and vendorID are BOTH 0 — AppKit does not populate
     // those fields reliably for tablet-subtype events on all driver versions.
     // The only thing that reliably identifies Apple trackpads (the false-
@@ -313,8 +313,9 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
     // Gate logic:
     //   1. If pointingDeviceType is Pen/Eraser — always accept.
     //   2. If vendor_id is Apple (0x05AC) — always reject (trackpad).
-    //   3. Otherwise (vendor_id = 0 or known tablet vendor, type = Unknown)
+    //   3. Otherwise (vendor_id = 0 or any non-Apple vendor, type = Unknown)
     //      — promote to Pen; the event already passed the effective_kind gate.
+    //      No list of tablet vendors is consulted: any maker's pen is a pen.
     const APPLE_VENDOR_ID: u64 = 0x05AC;
     let vendor_id = event.vendorID() as u64;
     let pointing_device_type = event.pointingDeviceType().0 as u64;
@@ -332,8 +333,8 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
         );
         return None;
     } else {
-        // Unknown tool type, non-Apple vendor (or vendor_id=0 which is normal
-        // for Wacom driver on macOS). Promote to Pen — the effective_kind gate
+        // Unknown tool type, non-Apple vendor (or vendor_id=0, which is normal
+        // for tablet-subtype events on macOS). Promote to Pen — the effective_kind gate
         // already confirmed this is a tablet-subtype or standalone event.
         tracing::debug!(
             target: crate::logging::target::INPUT,
@@ -344,6 +345,8 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
         );
         NativeTabletTool::Pen
     };
+    // A pen or eraser sample is the strongest presence evidence there is.
+    super::presence::note_pen_observed();
     if effective_kind == NSEventType::TabletPoint {
         tracing::debug!(
             target: crate::logging::target::INPUT,
@@ -400,41 +403,6 @@ fn truncate_bits(raw: usize) -> u16 {
     (raw & 0xFFFF) as u16
 }
 
-/// USB vendor IDs of known tablet manufacturers.
-///
-/// A `NSTabletProximity` event with `NSPointingDeviceTypeUnknown` (0) is
-/// promoted to `Pen` when its vendor ID appears in this list.  This admits
-/// proximity events that arrive before the Wacom driver finishes registering
-/// the tool type with AppKit on hot-plug — the vendor ID is set by the OS HID
-/// layer (not the driver) and is reliable from the very first event.  Mac
-/// trackpads, which also emit Unknown-typed tablet events, carry Apple's vendor
-/// ID (`0x05AC`) and therefore remain blocked.
-///
-/// Mirrors `crate::hid::session::TABLET_VENDOR_IDS`; kept local so this
-/// module has no compile-time dependency on the experimental raw-HID path.
-///
-/// Test-only: the typed-pen path identifies tablets from the AppKit event
-/// subtype rather than the vendor ID, so nothing in the shipped build reads
-/// this. It is retained because the mapping is the documented reference for
-/// which vendors the raw-HID path recognises.
-#[cfg(test)]
-const TYPED_TABLET_VENDOR_IDS: &[u16] = &[
-    0x056A, // Wacom
-    0x256c, // Huion
-    0x28bd, // XP-Pen
-    0x5543, // UC-Logic
-    0x0b57, // Gaomon
-];
-
-/// Returns `true` when `vendor_id` identifies a known tablet manufacturer.
-///
-/// `NSEvent.vendorID` is an `NSUInteger` (64-bit) but only the low 16 bits
-/// carry the USB vendor ID; the upper bits are always zero in practice.
-#[cfg(test)]
-fn is_known_tablet_vendor(vendor_id: u64) -> bool {
-    TYPED_TABLET_VENDOR_IDS.contains(&(vendor_id as u16))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,31 +430,5 @@ mod tests {
         assert!(!NativeTabletTool::Cursor.is_pen_or_eraser());
         assert!(NativeTabletTool::Pen.is_pen_or_eraser());
         assert!(NativeTabletTool::Eraser.is_pen_or_eraser());
-    }
-
-    // --- vendor-gated Unknown bypass ---
-
-    #[test]
-    fn known_tablet_vendor_accepts_wacom_huion_xppen_and_rejects_apple_and_unknown() {
-        // Known tablet vendors — must be accepted.
-        assert!(is_known_tablet_vendor(0x056A)); // Wacom
-        assert!(is_known_tablet_vendor(0x256c)); // Huion
-        assert!(is_known_tablet_vendor(0x28bd)); // XP-Pen
-        assert!(is_known_tablet_vendor(0x5543)); // UC-Logic
-        assert!(is_known_tablet_vendor(0x0b57)); // Gaomon
-
-        // Apple trackpad vendor must stay blocked regardless of event shape.
-        assert!(!is_known_tablet_vendor(0x05AC));
-        // Zero / all-ones must not accidentally match.
-        assert!(!is_known_tablet_vendor(0x0000));
-        assert!(!is_known_tablet_vendor(0xFFFF));
-    }
-
-    #[test]
-    fn vendor_id_check_uses_only_low_16_bits() {
-        // NSEvent.vendorID is NSUInteger; upper 48 bits must not affect the match.
-        assert!(is_known_tablet_vendor(0x0000_0000_0000_056A)); // Wacom, clean
-        assert!(is_known_tablet_vendor(0xDEAD_BEEF_CAFE_056A)); // Wacom, dirty high bits
-        assert!(!is_known_tablet_vendor(0xDEAD_BEEF_CAFE_05AC)); // Apple, dirty high bits
     }
 }

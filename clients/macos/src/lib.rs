@@ -43,6 +43,7 @@ pub mod microphone;
 pub mod netinfo;
 pub mod observability;
 pub mod pipeline;
+pub mod platform;
 #[cfg(feature = "dev-tools")]
 pub mod probe_matrix;
 pub mod protocol;

@@ -2251,7 +2251,7 @@ fn pinned_image_offset(surface: [f32; 2], stream: [f32; 2]) -> Option<[f32; 2]> 
 /// speaks input protocol v3+, and the host's `InputCapabilitiesMsg.pen` is
 /// `Available`. Fails closed (`false`) on any missing piece — an older host,
 /// a host with no pen capability, or the local setting off all fall back to
-/// the Wacom mouse-emulation duplicates the driver already produces, with
+/// the mouse-emulation duplicates the tablet driver already produces, with
 /// pressure honestly reported unavailable rather than guessed at.
 fn pen_negotiation_result(
     requested_mode: TabletModeMsg,
@@ -2282,7 +2282,7 @@ fn provisional_tablet_mode_active(
             TabletModeMsg::LocalTermination
         }
         TabletModeMsg::DisabledMouseCompat => TabletModeMsg::DisabledMouseCompat,
-        TabletModeMsg::LocalTermination | TabletModeMsg::WacomUsbBridge => {
+        TabletModeMsg::LocalTermination | TabletModeMsg::UsbTabletBridge => {
             TabletModeMsg::DisabledMouseCompat
         }
     }
@@ -2316,10 +2316,10 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
         (TabletModeMsg::LocalTermination, TabletModeMsg::DisabledMouseCompat, false) => {
             !result.reason.as_str().is_empty() && !result.reconnect_required
         }
-        (TabletModeMsg::WacomUsbBridge, TabletModeMsg::DisabledMouseCompat, false) => {
+        (TabletModeMsg::UsbTabletBridge, TabletModeMsg::DisabledMouseCompat, false) => {
             !result.reason.as_str().is_empty() && result.reconnect_required
         }
-        (TabletModeMsg::WacomUsbBridge, TabletModeMsg::WacomUsbBridge, true) => {
+        (TabletModeMsg::UsbTabletBridge, TabletModeMsg::UsbTabletBridge, true) => {
             cfg!(feature = "usb-hard-lab") && !result.reconnect_required
         }
         (TabletModeMsg::DisabledMouseCompat, TabletModeMsg::DisabledMouseCompat, true) => {
@@ -2339,7 +2339,7 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
 #[cfg(feature = "usb-hard-lab")]
 const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
     TabletModeMsg::LocalTermination,
-    TabletModeMsg::WacomUsbBridge,
+    TabletModeMsg::UsbTabletBridge,
     TabletModeMsg::DisabledMouseCompat,
 ];
 
@@ -2353,7 +2353,7 @@ const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
 const fn tablet_mode_label(mode: TabletModeMsg) -> &'static str {
     match mode {
         TabletModeMsg::LocalTermination => "Tablet support",
-        TabletModeMsg::WacomUsbBridge => "Native tablet (USB bridged)",
+        TabletModeMsg::UsbTabletBridge => "Native tablet (USB bridged)",
         TabletModeMsg::DisabledMouseCompat => "Mouse compatibility only",
     }
 }
@@ -2366,23 +2366,24 @@ const fn tablet_mode_description(mode: TabletModeMsg) -> &'static str {
         // interpreted is decided by how far away the host is.
         TabletModeMsg::LocalTermination => {
             "For Wi-Fi, 5G, and working away from the office — good enough for most remote \
-             work. This Mac's Wacom driver reads the pen and Arcen sends finished pen events \
-             to the host, so no Wacom driver is needed there and no pen sample has to wait for \
+             work. This Mac's tablet driver reads the pen and Arcen sends finished pen events \
+             to the host, so no tablet driver is needed there and no pen sample has to wait for \
              a reply. Distance costs you responsiveness, not correctness.\n\n\
              Pressure, tilt, rotation, eraser, proximity, and barrel buttons all work; finger \
              touch and the tablet's own buttons stay on this Mac. The tablet also stays usable \
              in Mac applications while you are connected."
         }
-        TabletModeMsg::WacomUsbBridge => {
+        TabletModeMsg::UsbTabletBridge => {
             "For a LAN — the office nearby, not the other side of the country. As close to \
              plugging the tablet straight into the host as a network allows: a privileged \
              Arcen helper takes the device away from macOS and forwards its raw USB traffic, \
-             and the host's own Wacom driver claims it exactly as if it were plugged in there. \
+             and the host's own driver for that tablet claims it exactly as if it were plugged \
+             in there. Any pen tablet works, whoever made it. \
              Arcen never interprets the pen, so the whole device works — pressure, tilt, \
              rotation, eraser, the tablet's own buttons, and finger touch.\n\n\
              In exchange: every pen sample makes a full round trip to the host, so latency is \
              felt directly and this is not a WAN mode. Mac applications cannot use the tablet \
-             until you disconnect, and the host needs its own Wacom driver and USB \
+             until you disconnect, and the host needs its own driver for the tablet and USB \
              virtualization. The host draws the pointer, so pair this with host cursor \
              rendering. The helper is what runs privileged; Arcen Deck itself never does."
         }
@@ -2396,9 +2397,9 @@ const fn tablet_mode_description(mode: TabletModeMsg) -> &'static str {
 /// Client preferences. Microphone consent is intentionally runtime-only; all
 /// other fields are persisted to `<config>/settings.json`.
 ///
-/// USB policy is deliberate: HID devices (keyboard, mouse, pen/Wacom stylus)
+/// USB policy is deliberate: HID devices (keyboard, mouse, pen tablet stylus)
 /// always ride the low-latency input channel natively — the lesson learned
-/// from Sunshine. Only NON-HID devices (Wacom tablet control surfaces, USB
+/// from Sunshine. Only NON-HID devices (tablet control surfaces, USB
 /// flash drives) use bridged auto-forwarding, which adds WAN latency, so it
 /// stays OFF unless the user explicitly opts in.
 #[derive(Debug, Clone, Copy)]
@@ -2443,10 +2444,10 @@ struct ClientSettings {
     /// default -- keeps every monitor point-sized, exactly as before.
     hidpi_display_mask: u8,
     /// Local opt-in for typed AppKit tablet/pen input (`tablet` module local
-    /// termination). Defaults to `true`: users with no Wacom hardware are
+    /// termination). Defaults to `true`: users with no pen tablet are
     /// unaffected (capability probing still reports `Unavailable`), while
-    /// Wacom owners get typed pen support without an extra opt-in step. A
-    /// user who wants to force the legacy Wacom mouse-emulation fallback can
+    /// pen tablet owners get typed pen support without an extra opt-in step. A
+    /// user who wants to force the tablet driver's mouse-emulation fallback can
     /// still turn this off explicitly in Advanced settings.
     tablet_input_enabled: bool,
     tablet_mode_requested: TabletModeMsg,
@@ -2916,7 +2917,7 @@ pub struct ArcenApp {
     /// authoritative routing identity consumed by the shared Region* path.
     tablet_region_viewports: HashMap<u64, RegionViewport>,
     /// Region identity of the last real pen sample, retained so a synthetic
-    /// proximity-out release stays on the same Wacom-targeted region.
+    /// proximity-out release stays on the same pen-targeted region.
     last_pen_region_viewport: Option<RegionViewport>,
     /// Additional native viewports queued to receive an explicit
     /// `egui::ViewportCommand::Close` on the next `logic()` frame.
@@ -3086,6 +3087,10 @@ pub struct ArcenApp {
     video_packet_times: VecDeque<Instant>,
     presented_frame_times: VecDeque<Instant>,
     presented_frame_times_estimated: VecDeque<Instant>,
+    /// Whether any dedicated presenter drawable has reported a non-zero
+    /// `presentedTime`. See
+    /// [`arcen_media::presentation::presented_frames_for_health`].
+    dedicated_presented_time_reported: bool,
     /// Presentation samples keyed by the monitor whose surface actually
     /// refreshed. `presented_frame_times` above only ever samples the root
     /// window, so on a multi-monitor session it reports the primary's rate
@@ -3306,8 +3311,8 @@ pub struct ArcenApp {
     tablet_mode_reason: String,
     /// Main-thread RAII AppKit tablet monitor, installed once at startup and
     /// held for the app's lifetime (see `logic()`). `None` off macOS, off
-    /// the main thread, or if AppKit refused to install it — Wacom
-    /// mouse-emulation fallback remains fully usable regardless.
+    /// the main thread, or if AppKit refused to install it — the tablet
+    /// driver's mouse-emulation fallback remains fully usable regardless.
     tablet_runtime: Option<crate::tablet::TabletRuntime>,
     #[cfg(target_os = "macos")]
     gesture_runtime: Option<crate::gestures::GestureRuntime>,
@@ -3325,7 +3330,7 @@ pub struct ArcenApp {
     /// Whether the current session has negotiated typed pen input.
     /// Set provisionally in `apply_server_hello` and recomputed authoritatively
     /// in `apply_tablet_mode_result` once the host sends its confirmed result.
-    /// `false` (including with no active session) means the Wacom mouse-emulation
+    /// `false` (including with no active session) means the mouse-emulation
     /// fallback path is the only pen input the host will ever see, and pressure
     /// is honestly reported unavailable rather than guessed at.
     pen_negotiated: bool,
@@ -3335,9 +3340,9 @@ pub struct ArcenApp {
     hello_input_protocol_version: u32,
     /// The host's advertised pen capability from the most recent `ServerHello`.
     hello_pen_capability: InputCapabilityAvailability,
-    /// The local Wacom USB capability as observed at `ServerHello` time. Saved
-    /// for display in the Tablet Monitor panel ("USB at connect") so the user
-    /// can see whether the provisioning race affected their session.
+    /// The local typed-pen capability offered at `ServerHello` time
+    /// (`crate::tablet::typed_pen_capability`; not tablet presence). Saved for
+    /// display in the Tablet Monitor panel ("Typed pen offered").
     hello_local_pen_capability: InputCapabilityAvailability,
     /// Most recent event the tablet pipeline actually dispatched, kept only
     /// for the in-session Tablet Monitor diagnostic panel's live read-out
@@ -3731,6 +3736,7 @@ impl ArcenApp {
             video_packet_times: VecDeque::new(),
             presented_frame_times: VecDeque::new(),
             presented_frame_times_estimated: VecDeque::new(),
+            dedicated_presented_time_reported: false,
             monitor_presented_frame_times: BTreeMap::new(),
             multi_window_timing: MultiWindowTimingTelemetry::default(),
             last_ui_wake_media_ready: 0,
@@ -4712,10 +4718,15 @@ impl ArcenApp {
                 hello.input_protocol_version,
                 hello.input_capabilities,
             );
-            let local_pen_capability = protocol_capability(crate::tablet::wacom_usb_presence());
+            // Typed pen follows the capture capability, not tablet presence:
+            // the hello cannot be renegotiated when a tablet appears later.
+            let local_pen_capability = protocol_capability(crate::tablet::typed_pen_capability(
+                tablet_mode_allows_typed_pen(self.tablet_mode_requested),
+            ));
             // Save the hello-time values so apply_tablet_mode_result can
-            // recompute pen_negotiated authoritatively without re-racing USB
-            // enumeration (the nusb scan may not have finished at this point).
+            // recompute pen_negotiated authoritatively without re-racing
+            // device enumeration (a just-plugged tablet may not be in the HID
+            // registry yet at this point).
             self.hello_input_protocol_version = hello.input_protocol_version;
             self.hello_pen_capability = hello.input_capabilities.pen;
             self.hello_local_pen_capability = local_pen_capability;
@@ -4758,20 +4769,21 @@ impl ArcenApp {
             // Monitor shows empirical data for this session only — capabilities
             // observed in a previous session do not carry over.
             self.tablet_probe = crate::tablet::TabletCapabilityProbe::default();
-            // USB hint: if Wacom is already
+            // Presence hint: if a pen tablet is already
             // plugged in when the session connects, surface a one-time log so
             // the user knows to move the pen near the tablet surface.  On
-            // plug-in the Wacom driver races USB enumeration and the first
+            // plug-in the tablet driver races device enumeration and the first
             // proximity event may arrive before the driver finishes classifying
             // the device type; moving the pen near the tablet re-triggers that
-            // event and lets the vendor-gated bypass (in tablet/monitor.rs)
+            // event and lets the Unknown-tool promotion (in tablet/monitor.rs)
             // admit it.
             if tablet_mode_allows_typed_pen(self.tablet_mode_requested)
-                && local_pen_capability == InputCapabilityAvailability::Available
+                && crate::tablet::tablet_presence()
+                    == arcen_input::CapabilityAvailability::Available
             {
                 tracing::info!(
                     target: crate::logging::target::INPUT,
-                    "Wacom USB present at session connect; awaiting first pen \
+                    "pen tablet present at session connect; awaiting first pen \
                      proximity event to establish tablet authority \
                      (if pen does not respond, move it near the tablet surface)",
                 );
@@ -4779,13 +4791,13 @@ impl ArcenApp {
             if tablet_mode_allows_typed_pen(self.tablet_mode_requested) && !self.pen_negotiated {
                 // Honest fallback messaging: either this host predates typed
                 // pen negotiation, or it has no pen capability. Either way,
-                // Wacom's mouse-emulation duplicates remain the only pen
+                // the tablet driver's mouse-emulation duplicates remain the only pen
                 // input the host will see, and pressure is genuinely
                 // unavailable over that path — never guessed at.
                 tracing::info!(
                     target: crate::logging::target::INPUT,
                     input_protocol_version = hello.input_protocol_version,
-                    "typed pen not negotiated with this host; falling back to Wacom mouse-emulation (pressure unavailable)"
+                    "typed pen not negotiated with this host; falling back to the tablet driver's mouse emulation (pressure unavailable)"
                 );
             }
             let requested_video_variant = self
@@ -7922,8 +7934,8 @@ impl ArcenApp {
         if self.tablet_input_enabled && result.accepted {
             // Recompute pen_negotiated authoritatively from the saved ServerHello
             // values. The provisional value set in apply_server_hello may be false
-            // due to a USB enumeration race at connect time (nusb::list_devices()
-            // may not have seen the Wacom yet). The host's TabletModeResult is
+            // due to an enumeration race at connect time (the HID registry
+            // may not have published a just-plugged tablet yet). The host's TabletModeResult is
             // the authoritative confirmation: if the host accepted LocalTermination,
             // pen input MUST be enabled here regardless of the provisional result.
             self.pen_negotiated = self.hello_input_protocol_version
@@ -10892,10 +10904,10 @@ impl ArcenApp {
                         settings_radio_with_trailing(
                             ui,
                             &mut tablet_mode_requested,
-                            TabletModeMsg::WacomUsbBridge,
+                            TabletModeMsg::UsbTabletBridge,
                             None,
-                            tablet_mode_label(TabletModeMsg::WacomUsbBridge),
-                            tablet_mode_description(TabletModeMsg::WacomUsbBridge),
+                            tablet_mode_label(TabletModeMsg::UsbTabletBridge),
+                            tablet_mode_description(TabletModeMsg::UsbTabletBridge),
                             |ui| {
                                 use crate::usb_helper_install::HelperInstallState;
                                 let tint = match helper_state {
@@ -10919,10 +10931,10 @@ impl ArcenApp {
                         settings_radio(
                             ui,
                             &mut tablet_mode_requested,
-                            TabletModeMsg::WacomUsbBridge,
+                            TabletModeMsg::UsbTabletBridge,
                             Some("(not available in this build)"),
-                            tablet_mode_label(TabletModeMsg::WacomUsbBridge),
-                            tablet_mode_description(TabletModeMsg::WacomUsbBridge),
+                            tablet_mode_label(TabletModeMsg::UsbTabletBridge),
+                            tablet_mode_description(TabletModeMsg::UsbTabletBridge),
                         );
                         #[cfg(feature = "usb-hard-lab")]
                         if let Some(action) = helper_click {
@@ -10990,7 +11002,7 @@ impl ArcenApp {
                         // one, so the pen would have no visible pointer at
                         // all. Offered as a correction next to the choice that
                         // causes it rather than buried in Displays.
-                        if tablet_mode_requested == TabletModeMsg::WacomUsbBridge
+                        if tablet_mode_requested == TabletModeMsg::UsbTabletBridge
                             && cursor_preference == CursorMode::Local
                         {
                             ui.horizontal(|ui| {
@@ -12500,6 +12512,14 @@ impl ArcenApp {
             }
         }
 
+        if root_viewer_should_take_keyboard_focus(
+            matches!(self.screen, AppScreen::InSession),
+            ui.input(|input| input.focused),
+            ui.memory(|memory| memory.focused().is_some()),
+            self.active_secondary_keyboard_focus,
+        ) {
+            response.request_focus();
+        }
         let viewer_focused = response.has_focus() && ui.input(|input| input.focused);
         // Root's own focus flag is never, by itself, "is the session as a
         // whole still keyboard-focused": if root just lost OS focus to one
@@ -12837,7 +12857,7 @@ impl ArcenApp {
     /// pipeline: device presence, negotiated fields, tool/proximity, event
     /// rate/drop/overflow counters, and live pressure/tilt/rotation. Reads
     /// only in-memory state already held for the current frame/session —
-    /// never logs or persists a sample, matching the Wacom local-termination
+    /// never logs or persists a sample, matching the local-termination
     /// plan's privacy requirement for this panel.
     fn paint_tablet_monitor_panel(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let overlay = egui::Rect::from_min_size(
@@ -12849,14 +12869,14 @@ impl ArcenApp {
             10.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 175),
         );
-        let presence = match crate::tablet::wacom_usb_presence() {
+        let presence = match crate::tablet::tablet_presence() {
             arcen_input::CapabilityAvailability::Available => "present",
             arcen_input::CapabilityAvailability::Unavailable => "not detected",
             arcen_input::CapabilityAvailability::Unknown => "unknown",
         };
         let presence_at_connect = match self.hello_local_pen_capability {
-            InputCapabilityAvailability::Available => "present",
-            InputCapabilityAvailability::Unavailable => "not detected",
+            InputCapabilityAvailability::Available => "yes",
+            InputCapabilityAvailability::Unavailable => "no (setting off)",
             InputCapabilityAvailability::Unknown => "unknown (no active session)",
         };
         let host_pen_cap = match self.hello_pen_capability {
@@ -12893,8 +12913,8 @@ impl ArcenApp {
             .unwrap_or(("-", false, false, 0.0, 0.0, 0.0, 0.0));
         let text = format!(
             "Tablet Monitor (local-only; never logged/persisted)\n\
-             Wacom USB presence: {presence}\n\
-             USB at connect: {presence_at_connect}  ·  Host pen cap: {host_pen_cap}\n\
+             Pen tablet: {presence}\n\
+             Typed pen offered: {presence_at_connect}  ·  Host pen cap: {host_pen_cap}\n\
              Runtime installed: {}\n\
              Mode requested: {:?}\n\
              Mode active: {:?}\n\
@@ -13297,11 +13317,6 @@ impl ArcenApp {
                 }
             }
         }
-        if let Some(telemetry) = &self.session_telemetry {
-            for _ in 0..confirmed {
-                telemetry.record_presented(Duration::ZERO);
-            }
-        }
         let metal_dropped = ten_bit
             .0
             .metal_dropped
@@ -13310,6 +13325,17 @@ impl ArcenApp {
             .0
             .presented_time_unconfirmed
             .saturating_add(eight_bit.0.presented_time_unconfirmed);
+        self.dedicated_presented_time_reported |= confirmed > 0;
+        if let Some(telemetry) = &self.session_telemetry {
+            let presented = arcen_media::presentation::presented_frames_for_health(
+                confirmed,
+                presented_time_unconfirmed,
+                self.dedicated_presented_time_reported,
+            );
+            for _ in 0..presented {
+                telemetry.record_presented(Duration::ZERO);
+            }
+        }
         let overflow = ten_bit
             .0
             .dropped_overflow
@@ -13609,7 +13635,7 @@ impl ArcenApp {
              {}\n{}\n{}\n{}\n{}\n\
              Intent: {} (requested; no host reports it back)\n\
              Encode: {} ({})\n\
-             Decode: {} ({})\n\
+             Decode: {} ({}) on {}, {}\n\
              {}",
             axis(
                 "Codec",
@@ -13654,6 +13680,10 @@ impl ArcenApp {
             } else {
                 self.decoder_backend_name
             },
+            crate::platform::current().label(),
+            crate::platform::current()
+                .assess_decode_path(self.decoder_hardware_accelerated)
+                .token(),
             session_truth::selection_summary(truth.selection, truth.degradation),
         );
         ui.painter().text(
@@ -15315,7 +15345,7 @@ impl ArcenApp {
                         .remove(&event.metadata.sequence);
                     self.last_pen_region_viewport = region_viewport;
                     self.tablet_last_event = Some(event);
-                    if self.tablet_mode_active == TabletModeMsg::WacomUsbBridge {
+                    if self.tablet_mode_active == TabletModeMsg::UsbTabletBridge {
                         if !self.send_hard_usb_pen(event) {
                             self.tablet_last_error =
                                 Some("Hard USB pen state failed to reach transport".to_string());
@@ -15933,6 +15963,26 @@ const fn root_focus_out_is_total_focus_loss(
     active_secondary_keyboard_focus: Option<arcen_media::SessionMonitorId>,
 ) -> bool {
     !root_focused && active_secondary_keyboard_focus.is_none()
+}
+
+/// Whether root's viewer should claim egui keyboard focus by itself.
+///
+/// Without this, the viewer took focus only on a mouse press inside the
+/// stream, so every key typed after connecting or after switching back to
+/// the Deck was silently dropped until the user clicked. It never takes
+/// focus from another egui widget (a text field keeps its keys) or from a
+/// secondary viewport that owns the keyboard.
+#[must_use]
+const fn root_viewer_should_take_keyboard_focus(
+    in_session: bool,
+    root_window_focused: bool,
+    other_widget_focused: bool,
+    active_secondary_keyboard_focus: Option<arcen_media::SessionMonitorId>,
+) -> bool {
+    in_session
+        && root_window_focused
+        && !other_widget_focused
+        && active_secondary_keyboard_focus.is_none()
 }
 
 /// One secondary viewport's own absolute pointer fraction for this frame,
@@ -16666,7 +16716,9 @@ fn parse_saved_connection_settings(value: Option<serde_json::Value>) -> SavedCon
         .and_then(|value| value.as_str().map(str::to_string))
         .as_deref()
     {
-        Some("wacom_usb_bridge") => TabletModeMsg::WacomUsbBridge,
+        // `wacom_usb_bridge` is the 0.15 spelling, still written so an older
+        // Deck reads this file; the neutral spelling is accepted too.
+        Some("wacom_usb_bridge" | "usb_tablet_bridge") => TabletModeMsg::UsbTabletBridge,
         Some("disabled_mouse_compat") => TabletModeMsg::DisabledMouseCompat,
         _ => TabletModeMsg::LocalTermination,
     };
@@ -16710,7 +16762,7 @@ fn serialize_saved_connections(
                 "tablet_mode_requested".to_string(),
                 match c.settings.tablet_mode_requested {
                     TabletModeMsg::LocalTermination => "local_termination",
-                    TabletModeMsg::WacomUsbBridge => "wacom_usb_bridge",
+                    TabletModeMsg::UsbTabletBridge => "wacom_usb_bridge",
                     TabletModeMsg::DisabledMouseCompat => "disabled_mouse_compat",
                 }
                 .into(),
@@ -17015,7 +17067,8 @@ fn load_client_settings(
         .and_then(serde_json::Value::as_str)
     {
         settings.tablet_mode_requested = match mode {
-            "wacom_usb_bridge" => TabletModeMsg::WacomUsbBridge,
+            // Legacy 0.15 token (still written) or the neutral spelling.
+            "wacom_usb_bridge" | "usb_tablet_bridge" => TabletModeMsg::UsbTabletBridge,
             "disabled_mouse_compat" => TabletModeMsg::DisabledMouseCompat,
             _ => TabletModeMsg::LocalTermination,
         };
@@ -17147,7 +17200,7 @@ fn save_client_settings(
         "tablet_mode_requested".to_string(),
         match settings.tablet_mode_requested {
             TabletModeMsg::LocalTermination => "local_termination",
-            TabletModeMsg::WacomUsbBridge => "wacom_usb_bridge",
+            TabletModeMsg::UsbTabletBridge => "wacom_usb_bridge",
             TabletModeMsg::DisabledMouseCompat => "disabled_mouse_compat",
         }
         .into(),
@@ -19377,7 +19430,7 @@ mod tests {
             "opting out of tablet redirection must always be offered"
         );
         assert_eq!(
-            TABLET_MODE_CHOICES.contains(&TabletModeMsg::WacomUsbBridge),
+            TABLET_MODE_CHOICES.contains(&TabletModeMsg::UsbTabletBridge),
             cfg!(feature = "usb-hard-lab"),
             "the USB-bridged mode must be offered exactly when it is compiled in"
         );
@@ -19410,7 +19463,7 @@ mod tests {
         );
         assert_eq!(
             provisional_tablet_mode_active(
-                TabletModeMsg::WacomUsbBridge,
+                TabletModeMsg::UsbTabletBridge,
                 crate::protocol::messages::INPUT_PROTOCOL_VERSION,
                 InputCapabilityAvailability::Available,
                 InputCapabilityAvailability::Available,
@@ -19431,7 +19484,7 @@ mod tests {
     #[test]
     fn tablet_mode_result_contract_rejects_implicit_mode_substitution() {
         assert!(tablet_mode_result_is_consistent(&TabletModeResultMsg {
-            requested: TabletModeMsg::WacomUsbBridge,
+            requested: TabletModeMsg::UsbTabletBridge,
             active: TabletModeMsg::DisabledMouseCompat,
             accepted: false,
             reason: TabletModeReason::try_from("bridge unavailable".to_string()).unwrap(),
@@ -19439,7 +19492,7 @@ mod tests {
             ..TabletModeResultMsg::default()
         }));
         assert!(!tablet_mode_result_is_consistent(&TabletModeResultMsg {
-            requested: TabletModeMsg::WacomUsbBridge,
+            requested: TabletModeMsg::UsbTabletBridge,
             active: TabletModeMsg::LocalTermination,
             accepted: false,
             reason: TabletModeReason::try_from("bridge unavailable".to_string()).unwrap(),
@@ -19447,7 +19500,7 @@ mod tests {
             ..TabletModeResultMsg::default()
         }));
         assert!(!tablet_mode_result_is_consistent(&TabletModeResultMsg {
-            requested: TabletModeMsg::WacomUsbBridge,
+            requested: TabletModeMsg::UsbTabletBridge,
             active: TabletModeMsg::DisabledMouseCompat,
             accepted: false,
             reconnect_required: true,
@@ -19455,8 +19508,8 @@ mod tests {
         }));
         assert_eq!(
             tablet_mode_result_is_consistent(&TabletModeResultMsg {
-                requested: TabletModeMsg::WacomUsbBridge,
-                active: TabletModeMsg::WacomUsbBridge,
+                requested: TabletModeMsg::UsbTabletBridge,
+                active: TabletModeMsg::UsbTabletBridge,
                 accepted: true,
                 ..TabletModeResultMsg::default()
             }),
@@ -19478,7 +19531,7 @@ mod tests {
         ));
         assert!(!tablet_mode_change_requires_reconnect(
             TabletModeMsg::LocalTermination,
-            TabletModeMsg::WacomUsbBridge,
+            TabletModeMsg::UsbTabletBridge,
             false,
         ));
     }
@@ -19488,8 +19541,8 @@ mod tests {
         let generation = 17;
         let mut app = ArcenApp {
             connection_generation: generation,
-            tablet_mode_requested: TabletModeMsg::WacomUsbBridge,
-            tablet_mode_active: TabletModeMsg::WacomUsbBridge,
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
+            tablet_mode_active: TabletModeMsg::UsbTabletBridge,
             tablet_input_enabled: false,
             ..ArcenApp::default()
         };
@@ -19508,7 +19561,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedMediaState {
             server_hello: Some(hello),
             tablet_mode_result: Some(TabletModeResultMsg {
-                requested: TabletModeMsg::WacomUsbBridge,
+                requested: TabletModeMsg::UsbTabletBridge,
                 active: TabletModeMsg::DisabledMouseCompat,
                 accepted: false,
                 reason: TabletModeReason::try_from(reason.to_string()).unwrap(),
@@ -19742,10 +19795,10 @@ mod tests {
         let mut local = saved_connection("local", "Local", "local", 18443, None);
         local.settings.tablet_mode_requested = TabletModeMsg::LocalTermination;
         let mut native = saved_connection("native", "Native", "native", 18443, None);
-        native.settings.tablet_mode_requested = TabletModeMsg::WacomUsbBridge;
+        native.settings.tablet_mode_requested = TabletModeMsg::UsbTabletBridge;
         let mut app = ArcenApp {
             saved_connections: vec![local, native],
-            tablet_mode_requested: TabletModeMsg::WacomUsbBridge,
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
             ..ArcenApp::default()
         };
 
@@ -19771,7 +19824,7 @@ mod tests {
             .unknown
             .insert("future_connection".to_string(), serde_json::json!(7));
         let mut second = saved_connection("two", "Two", "two", 18443, None);
-        second.settings.tablet_mode_requested = TabletModeMsg::WacomUsbBridge;
+        second.settings.tablet_mode_requested = TabletModeMsg::UsbTabletBridge;
         let mut store = SavedConnectionsStore::with_connections(vec![first, second]);
         store.last_selected_connection_id = Some("one".to_string());
         save_saved_connections(&repository, &store);
@@ -19787,7 +19840,7 @@ mod tests {
         );
         assert_eq!(
             saved.connections[1].settings.tablet_mode_requested,
-            TabletModeMsg::WacomUsbBridge
+            TabletModeMsg::UsbTabletBridge
         );
         assert_eq!(
             saved.connections[0].settings.unknown["future_setting"]["keep"],
@@ -19812,7 +19865,7 @@ mod tests {
         let mut app = ArcenApp::from_config_repository(repository.clone());
         app.active_connection = Some(unsaved);
 
-        app.persist_tablet_mode_for_selected_connection(TabletModeMsg::WacomUsbBridge)
+        app.persist_tablet_mode_for_selected_connection(TabletModeMsg::UsbTabletBridge)
             .unwrap();
 
         let reloaded = load_saved_connections(&repository).unwrap().unwrap();
@@ -20613,6 +20666,29 @@ mod tests {
         assert!(!root_focus_out_is_total_focus_loss(false, Some(monitor_id)));
         assert!(!root_focus_out_is_total_focus_loss(true, None));
         assert!(!root_focus_out_is_total_focus_loss(true, Some(monitor_id)));
+    }
+
+    #[test]
+    fn root_viewer_takes_keyboard_focus_only_when_nothing_else_owns_it() {
+        let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
+        assert!(root_viewer_should_take_keyboard_focus(
+            true, true, false, None
+        ));
+        assert!(!root_viewer_should_take_keyboard_focus(
+            false, true, false, None
+        ));
+        assert!(!root_viewer_should_take_keyboard_focus(
+            true, false, false, None
+        ));
+        assert!(!root_viewer_should_take_keyboard_focus(
+            true, true, true, None
+        ));
+        assert!(!root_viewer_should_take_keyboard_focus(
+            true,
+            true,
+            false,
+            Some(monitor_id)
+        ));
     }
 
     /// Drains every currently queued session command and asserts none of
@@ -21789,7 +21865,7 @@ mod tests {
             Cap::Available
         ));
         assert!(!pen_negotiation_result(
-            TabletModeMsg::WacomUsbBridge,
+            TabletModeMsg::UsbTabletBridge,
             V3,
             Cap::Available
         ));
@@ -28306,7 +28382,7 @@ mod tests {
         assert!(!matches!(app.screen, AppScreen::InSession));
     }
 
-    /// Regression test for the USB enumeration race: if `wacom_usb_presence()`
+    /// Regression test for the enumeration race: if `tablet_presence()`
     /// returned Unknown/Unavailable at `apply_server_hello` time (provisional
     /// `pen_negotiated = false`), `apply_tablet_mode_result` must still honour
     /// the host's authoritative `LocalTermination` result and set

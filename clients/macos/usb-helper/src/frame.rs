@@ -93,40 +93,111 @@ pub fn read_frame(reader: &mut impl Read) -> Result<(u8, Vec<u8>), FrameError> {
 }
 
 /// Encodes the captured device identity for [`TAG_HELLO`].
-#[must_use]
+///
+/// Layout: vendor `u16`, product `u16`, bcdDevice `u16`, device class `u8`,
+/// speed `u8` (all little-endian), then the HID report descriptors that made
+/// the device admissible: count `u8`, and per descriptor interface `u8`,
+/// length `u16`, bytes. A Deck that predates the descriptors reads only the
+/// first eight bytes and ignores the rest.
+///
+/// # Errors
+///
+/// Returns a message when there are more than 255 descriptors or one is
+/// longer than `u16::MAX`; the caller bounds both far below that.
 pub fn encode_hello(
     vendor_id: u16,
     product_id: u16,
     bcd_device: u16,
     device_class: u8,
     speed: u8,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
+    descriptors: &[(u8, &[u8])],
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(9);
     out.extend_from_slice(&vendor_id.to_le_bytes());
     out.extend_from_slice(&product_id.to_le_bytes());
     out.extend_from_slice(&bcd_device.to_le_bytes());
     out.push(device_class);
     out.push(speed);
-    out
+    out.push(
+        u8::try_from(descriptors.len())
+            .map_err(|_| "too many HID report descriptors for the helper handshake".to_owned())?,
+    );
+    for (interface, descriptor) in descriptors {
+        let length = u16::try_from(descriptor.len())
+            .map_err(|_| "HID report descriptor too long for the helper handshake".to_owned())?;
+        out.push(*interface);
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(descriptor);
+    }
+    Ok(out)
 }
 
-/// Decodes a [`TAG_HELLO`] payload into `(vendor, product, bcd, class, speed)`.
+/// Bytes of a [`TAG_HELLO`] payload carrying `descriptor_lengths`: the
+/// eight-byte identity, the count byte, and three bytes of framing per
+/// descriptor.
+#[must_use]
+pub fn hello_len(descriptor_lengths: impl IntoIterator<Item = usize>) -> usize {
+    descriptor_lengths
+        .into_iter()
+        .fold(9_usize, |total, length| {
+            total.saturating_add(3).saturating_add(length)
+        })
+}
+
+/// Whether a hello carrying these descriptors fits one frame (payload plus
+/// its tag byte).
+#[must_use]
+pub fn hello_fits(descriptor_lengths: impl IntoIterator<Item = usize>) -> bool {
+    hello_len(descriptor_lengths).saturating_add(1) <= MAX_FRAME_BYTES
+}
+
+// The shared aggregate bound a host and the helper enforce must always fit
+// the unchanged frame, with every interface present. Older Decks read frames
+// up to `MAX_FRAME_BYTES`, so the frame itself is never raised.
+// (`<` because the frame also carries the one tag byte.)
+const _: () = assert!(
+    9 + 3 * arcen_usb_bridge::MAX_INTERFACES
+        + arcen_usb_bridge::MAX_CLAIMED_REPORT_DESCRIPTOR_BYTES
+        < MAX_FRAME_BYTES
+);
+
+/// Decoded [`TAG_HELLO`] payload: `(vendor, product, bcd, class, speed)` and
+/// the `(interface, descriptor)` list.
+pub type DecodedHello = ((u16, u16, u16, u8, u8), Vec<(u8, Vec<u8>)>);
+
+/// Decodes a [`TAG_HELLO`] payload.
 ///
 /// Used by the Deck-side client of this boundary; kept here so both halves of
-/// the handshake are defined and tested in one place.
+/// the handshake are defined and tested in one place. A payload of exactly
+/// eight bytes (an older helper) decodes with no descriptors; a malformed
+/// descriptor trailer is refused.
 #[allow(dead_code)]
 #[must_use]
-pub fn decode_hello(payload: &[u8]) -> Option<(u16, u16, u16, u8, u8)> {
+pub fn decode_hello(payload: &[u8]) -> Option<DecodedHello> {
     if payload.len() < 8 {
         return None;
     }
-    Some((
+    let identity = (
         u16::from_le_bytes([payload[0], payload[1]]),
         u16::from_le_bytes([payload[2], payload[3]]),
         u16::from_le_bytes([payload[4], payload[5]]),
         payload[6],
         payload[7],
-    ))
+    );
+    let mut descriptors = Vec::new();
+    if let Some((&count, mut rest)) = payload[8..].split_first() {
+        for _ in 0..count {
+            let (&interface, after) = rest.split_first()?;
+            let length = usize::from(u16::from_le_bytes([*after.first()?, *after.get(1)?]));
+            let bytes = after.get(2..2 + length)?;
+            descriptors.push((interface, bytes.to_vec()));
+            rest = &after[2 + length..];
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+    }
+    Some((identity, descriptors))
 }
 
 #[cfg(test)]
@@ -162,13 +233,65 @@ mod tests {
     }
 
     #[test]
-    fn hello_round_trips() {
-        let encoded = encode_hello(0x056a, 0x0317, 0x0100, 0, 1);
-        assert_eq!(decode_hello(&encoded), Some((0x056a, 0x0317, 0x0100, 0, 1)));
+    fn hello_round_trips_with_report_descriptors() {
+        let pen: &[u8] = &[0x05, 0x0d, 0x09, 0x02, 0xa1, 0x01, 0xc0];
+        let encoded = encode_hello(
+            0x1234,
+            0x0317,
+            0x0100,
+            0,
+            1,
+            &[(0, pen), (2, &[0x05, 0x01])],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_hello(&encoded),
+            Some((
+                (0x1234, 0x0317, 0x0100, 0, 1),
+                vec![(0, pen.to_vec()), (2, vec![0x05, 0x01])]
+            ))
+        );
+    }
+
+    /// The reviewed failure: five individually valid 4 KiB descriptors
+    /// produced a 20,505-byte hello that the frame refused only after the
+    /// device had been seized.
+    #[test]
+    fn hello_size_is_known_before_any_device_is_seized() {
+        assert!(!hello_fits([4000; 5]));
+        assert_eq!(hello_len([4000; 5]), 9 + 5 * 4003);
+        assert!(hello_fits([4000; 3]));
+        let at_bound = vec![
+            arcen_usb_bridge::MAX_CLAIMED_REPORT_DESCRIPTOR_BYTES
+                / arcen_usb_bridge::MAX_INTERFACES;
+            arcen_usb_bridge::MAX_INTERFACES
+        ];
+        assert!(hello_fits(at_bound));
+        let descriptor = vec![0_u8; 4000];
+        let three: Vec<(u8, &[u8])> = (0..3).map(|i| (i, descriptor.as_slice())).collect();
+        let encoded = encode_hello(1, 2, 3, 0, 1, &three).unwrap();
+        assert_eq!(encoded.len(), hello_len([4000; 3]));
+        let mut framed = Vec::new();
+        write_frame(&mut framed, TAG_HELLO, &encoded).expect("fits one frame");
     }
 
     #[test]
-    fn short_hello_is_rejected() {
+    fn an_older_eight_byte_hello_decodes_without_descriptors() {
+        let legacy = [0x6a, 0x05, 0x17, 0x03, 0x00, 0x01, 0x00, 0x01];
+        assert_eq!(
+            decode_hello(&legacy),
+            Some(((0x056a, 0x0317, 0x0100, 0, 1), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn short_or_malformed_hello_is_rejected() {
         assert_eq!(decode_hello(&[1, 2, 3]), None);
+        let mut truncated = encode_hello(1, 2, 3, 0, 1, &[(0, &[1, 2, 3, 4])]).unwrap();
+        truncated.pop();
+        assert_eq!(decode_hello(&truncated), None);
+        let mut trailing = encode_hello(1, 2, 3, 0, 1, &[(0, &[1])]).unwrap();
+        trailing.push(9);
+        assert_eq!(decode_hello(&trailing), None);
     }
 }

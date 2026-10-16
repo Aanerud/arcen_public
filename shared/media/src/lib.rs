@@ -17,6 +17,7 @@ mod applied_topology;
 pub mod audio;
 pub mod capenc_control;
 pub mod clipboard;
+pub mod deck_platform;
 pub mod display_color;
 mod encoder_admission;
 pub mod hevc_sps;

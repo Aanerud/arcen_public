@@ -6,6 +6,104 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-10-16
+
+### macOS Deck
+
+- Two Deck apps from one source, both for macOS 12 or later: **Arcen Deck**
+  for Apple silicon (`Arcen-Deck-<version>-macOS.zip`) and **Arcen Deck
+  Intel** for Intel Macs (`Arcen-Deck-Intel-<version>-macOS.zip`). They share
+  the bundle ID `deck.arcen.tech`. `build-deck-app.sh --arch arm64|x86_64`
+  builds either on either kind of Mac, so one release machine signs and
+  notarizes both; every binary is checked for exactly one architecture and a
+  `minos` equal to `LSMinimumSystemVersion`.
+- `apple-cf` 0.9.3 and `videotoolbox` 0.18.1 are vendored with macOS 12
+  patches (`third_party/*-arcen1`, each with `ARCEN_NOTICE.md` and a source
+  manifest), so the Deck loads on macOS 12 and builds with Swift 5.7.
+- A Deck platform profile (`arcen_media::deck_platform`) decides what differs
+  between Apple silicon and Intel: the `deck_platform` label, AV1 only on
+  Apple silicon with macOS 14 and only when the decode probe proves it,
+  software decode expected on Intel, and native tablet only on macOS 13+.
+  `arcen-deck platform-report` prints it without opening a window.
+- The viewer takes keyboard focus when nothing else owns it, so keys work
+  before the first click.
+- Paced frames age against the display link's current time rather than the
+  future scan-out target; on Intel/AMD with macOS 12 a ~49 ms lead had marked
+  every frame stale.
+- Presented-handler callbacks count as presented until a drawable reports a
+  `presentedTime`, so graphics stacks that never timestamp are not reported as
+  unpresented.
+- The Deck adds the system Swift rpath to its own binaries, so native builds
+  with the macOS 12 SDK load the Swift runtime.
+
+### Security and supply chain
+
+- `rustls` 0.23.45 and `rustls-webpki` 0.103.15.
+- `scripts/verify-vendored-source.sh` checks every vendored tree before each
+  Deck build and in CI, and refuses symlinks or any entry that is not a regular
+  file or directory; the `apple-cf` Swift bridge never follows symlinks.
+
+### Input
+
+- Pen and tablet support is no longer tied to Wacom or to any list of tablet
+  makers. Whether a device is a pen tablet is decided from its HID report
+  descriptor by a new shared, bounded classifier
+  (`arcen_usb_bridge::classify_pen_tablet`): a standard Digitizers-page pen
+  with position and contact, pressure or proximity qualifies; so does a
+  Digitizer or Pen collection on the vendor-defined Digitizers page `0xFF0D`
+  (as Intuos5-style tablets publish it, with opaque reports and unknown axes)
+  unless the device also has a game-controller collection; keyboards, mice,
+  gamepads, devices on other vendor pages and touch-only devices are refused
+  on their own. Express keys presented as a keyboard or keypad are part of a
+  pen tablet and are accepted with it.
+  Vendor ids are now informational only.
+- macOS Deck: Tablet support is offered for any pen tablet, USB or Bluetooth,
+  whether or not one is attached when connecting, replacing the
+  Wacom-USB-vendor-id check that left other tablets without typed pen input.
+  Tablet presence (report descriptors in the I/O Registry, or a pen sample
+  AppKit already delivered) is shown in the Tablet Monitor. Settings, help, Tablet Monitor, logs and errors
+  say "tablet" instead of "Wacom".
+- Pressure, tilt and rotation conversions are shared
+  (`arcen_input::pen_axes`). The Linux virtual pen's `ABS_PRESSURE` range is
+  now `0..=65535` instead of Wacom's `0..=8191`; Windows keeps the Windows Ink
+  `0..=1024` API range through the same shared scaling.
+- macOS Pier: the virtual pen's tablet-proximity vendor id is `0xFFFF`
+  (reserved, Arcen's id for synthetic devices) instead of Wacom's.
+- Native tablet (USB bridged), lab builds: the privileged USB helper captures
+  any attached device whose report descriptors classify as a pen tablet. It
+  reads them from the I/O Registry rather than opening every HID device, and
+  sends a USB request only for an undescribed interface of a registry-proven
+  digitizer without a boot keyboard. It sends those descriptors with the
+  device facts
+  (`UsbHardDeviceMsg.hid_report_descriptors`, additive). The Linux Pier
+  classifies them again before creating the `usb-vhci` device (replacing its
+  single Intuos5 identity allowlist) and checks every descriptor the device
+  later returns against the authorization: device, configuration and report
+  descriptors must keep the authorized class, identity, HID-only interfaces
+  and report bytes, or the attachment ends. The whole tablet is bridged,
+  express keys (keyboard/keypad interfaces) included: the authenticated Deck
+  can already send any keystroke, so this grants nothing new. A device with a
+  joystick, gamepad or multi-axis controller collection at any nesting depth,
+  or with no pen digitizer, is never bridged; a configuration must advertise
+  each interface's full claimed report-descriptor length and the device must
+  serve it whole, and claimed descriptors are bounded to 12 KiB so the helper
+  never seizes a device it cannot describe. **Compatibility:** a 0.15 Deck
+  sends no descriptors, so a 0.16 Linux Pier refuses its Native tablet
+  request with an explicit reason; Tablet support is unaffected.
+- Experimental raw-HID passthrough (quarantined, default off): the Deck
+  matches digitizer collections by usage page and descriptor instead of five
+  vendor ids, and the Linux Pier admits devices through
+  `arcen_usb_bridge::RawHidAdmission` instead of a vendor allowlist.
+
+### Protocol
+
+- Rust names are vendor-neutral (`TabletModeMsg::UsbTabletBridge`,
+  `TabletModeCapabilitiesMsg::usb_tablet_bridge`, `arcen_input::TabletMode::
+  UsbTabletBridge`), but the wire keeps the 0.15 token and key
+  `wacom_usb_bridge` (serde rename), so 0.15 and 0.16 peers interoperate
+  unchanged. The neutral `usb_tablet_bridge` is accepted on input only. See
+  `shared/protocol/WIRE.md`, "Tablet mode split".
+
 ## [0.15.0] — 2026-10-06
 
 ### Streaming
@@ -850,6 +948,7 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
+[0.16.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.16.0
 [0.15.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.15.0
 [0.14.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.14.0
 [0.13.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.13.0

@@ -3,10 +3,9 @@
 //! Two independent, deterministic signals are combined here, and neither one
 //! requires — or claims — that a human moved a physical pen:
 //!
-//! 1. **USB presence**: whether a Wacom-vendor USB device is enumerated at
-//!    all (via the existing cross-platform [`crate::logging::diagnostics`]
-//!    inventory). This is available the instant a tablet is plugged in, with
-//!    zero pen interaction.
+//! 1. **Tablet presence**: whether any attached HID device declares a pen in
+//!    its report descriptor, whoever made it ([`super::presence`]). This is
+//!    available the instant a tablet is plugged in, with zero pen interaction.
 //! 2. **Empirical axis capability**: which axes (pressure, tilt, rotation,
 //!    eraser, barrel buttons) have actually been *observed* varying across
 //!    delivered [`super::sample::RawTabletSample`]s. This never claims a
@@ -23,36 +22,6 @@
 use arcen_input::CapabilityAvailability;
 
 use super::sample::{NativeTabletProximity, NativeTabletTool, RawTabletSample};
-
-/// Wacom's USB vendor id (`WACOM_USB_VENDOR_ID`), also used by
-/// `crate::hid::session::TABLET_VENDOR_IDS` and
-/// `crate::logging::diagnostics::tablet_brand`.
-pub const WACOM_USB_VENDOR_ID: u16 = 0x056A;
-
-/// Query the existing cross-platform USB inventory for a Wacom-vendor
-/// device. This is a presence check only — it says nothing about whether
-/// AppKit has delivered any tablet event, and nothing about a human touching
-/// the pen. `Unavailable` here is a fully deterministic negative ("no such
-/// device is enumerated"), not a guess.
-#[must_use]
-pub fn wacom_usb_presence() -> CapabilityAvailability {
-    match crate::logging::diagnostics::usb_inventory() {
-        Ok(devices) => {
-            if devices
-                .iter()
-                .any(|device| device.vendor_id == WACOM_USB_VENDOR_ID)
-            {
-                CapabilityAvailability::Available
-            } else {
-                CapabilityAvailability::Unavailable
-            }
-        }
-        // Enumeration failure (subsystem/permission issue) is genuinely
-        // unknown, not "no device": conflating the two would misreport a
-        // permissions problem as "no tablet attached".
-        Err(_) => CapabilityAvailability::Unknown,
-    }
-}
 
 /// Empirically observed axis/tool capability, accumulated from a stream of
 /// [`RawTabletSample`]s. Every field starts `Unknown` and only ever moves to
@@ -154,7 +123,7 @@ mod tests {
             window_y: 0.0,
             entering: true,
             tool,
-            vendor_id: WACOM_USB_VENDOR_ID as u64,
+            vendor_id: 0x1234,
             tablet_id: 1,
             pointing_device_id: 1,
             system_tablet_id: 1,

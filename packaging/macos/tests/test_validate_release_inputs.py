@@ -245,7 +245,8 @@ class ReleaseInputValidationTests(unittest.TestCase):
         self.assertIn("ARCEN_DEV_PROVISIONING_PROFILE", script)
         self.assertIn("ARCEN_DEV_CODESIGN_IDENTITY", script)
         self.assertIn(
-            "--release and --dev-sign are mutually exclusive", script
+            "--release, --dev-sign, and --developer-id-sign are mutually exclusive",
+            script,
         )
         self.assertNotIn("find-identity", script)
         self.assertIn(
@@ -303,6 +304,38 @@ class ReleaseInputValidationTests(unittest.TestCase):
                 4,
                 "fixture must be a cryptographically valid CMS rejected at signer trust",
             )
+
+    def test_intel_deck_is_a_separate_app_with_the_same_bundle_id(self):
+        script = (ROOT / "build-deck-app.sh").read_text(encoding="utf-8")
+        # One app per architecture, each built for an explicit cargo target so
+        # an Apple-silicon release Mac can cross-compile the Intel Deck.
+        self.assertIn('TARGET_ARCH="${ARCEN_DECK_ARCH:-}"', script)
+        self.assertIn('RUST_TARGET="aarch64-apple-darwin"', script)
+        self.assertIn('RUST_TARGET="x86_64-apple-darwin"', script)
+        self.assertIn('APP_NAME="Arcen Deck Intel"', script)
+        self.assertIn('ZIP_STEM="Arcen-Deck-Intel"', script)
+        self.assertIn('RELEASE_ZIP="$OUT/$ZIP_STEM-$DECK_VERSION-macOS.zip"', script)
+        self.assertIn('--release --target "$RUST_TARGET" -p arcen-usb-helper', script)
+        self.assertIn('--release --target "$RUST_TARGET" -p arcen-deck-macos', script)
+        self.assertNotIn("macOS-Intel.zip", script)
+        # The built binary must be the requested architecture.
+        self.assertIn('[ "$DECK_ARCH" = "$TARGET_ARCH" ]', script)
+        # Only the visible name changes; the bundle ID stays the one App ID
+        # with a Developer ID provisioning profile.
+        self.assertIn(
+            'plutil -replace CFBundleDisplayName -string "$APP_NAME"', script
+        )
+        self.assertIn('[ "$BUNDLE_ID" = "deck.arcen.tech" ]', script)
+        # Deck-Info.plist carries an XML comment Python's strict parser
+        # rejects (plutil accepts it), so read the two keys textually.
+        plist = (ROOT / "Deck-Info.plist").read_text(encoding="utf-8")
+        self.assertRegex(
+            plist,
+            r"<key>CFBundleIdentifier</key>\s*<string>deck\.arcen\.tech</string>",
+        )
+        self.assertRegex(
+            plist, r"<key>CFBundleName</key>\s*<string>Arcen Deck</string>"
+        )
 
 
 if __name__ == "__main__":

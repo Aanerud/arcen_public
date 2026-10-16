@@ -1,6 +1,6 @@
 //! Pen injection: Basic Tablet termination on macOS.
 //!
-//! In Basic Tablet the Deck's own Wacom driver reads the pen and sends
+//! In Basic Tablet the Deck's own tablet driver reads the pen and sends
 //! finished samples. This host's job is to put them on the local desktop with
 //! their professional surface intact — pressure, tilt, rotation, eraser,
 //! proximity and barrel buttons — so an application here sees a tablet rather
@@ -23,7 +23,7 @@
 //! shared policy in [`arcen_input::plan_pen_edges`], because it is identical
 //! on Linux and would otherwise be written twice and drift.
 
-use arcen_input::{PenEdge, PenTool, PenToolState, plan_pen_edges};
+use arcen_input::{PenEdge, PenTool, PenToolState, pen_axes, plan_pen_edges};
 use arcen_protocol::messages::{PenEventMsg, PenToolMsg};
 
 /// `kCGMouseEventSubtype`. Read from `CGEventTypes.h`; it is 7, which is not
@@ -63,15 +63,22 @@ pub const NX_TABLET_POINTER_PEN: i64 = 1;
 /// `NX_TABLET_POINTER_ERASER`, from `IOLLEvent.h`.
 pub const NX_TABLET_POINTER_ERASER: i64 = 3;
 
-/// The device identity reported to applications.
+/// The vendor id this host's virtual pen reports in tablet proximity events.
 ///
-/// A tablet that reports as vendor 0 with no device id is treated by some
-/// applications as an unidentified pointer and demoted to a mouse. Reporting a
-/// stable non-zero identity keeps one Arcen session looking like one tablet.
-/// The vendor is Wacom's USB id, because the Deck's pen samples originate from
-/// a Wacom digitizer and claiming a different vendor would be a lie an
-/// application can read.
-pub const ARCEN_TABLET_VENDOR_ID: i64 = 0x056a;
+/// It is `0xFFFF`, the USB-IF reserved id that is never assigned to any
+/// company, and the same id Arcen uses for every synthetic device
+/// (`arcen_usb_bridge::ARCEN_LAB_VENDOR_ID`). It used to be Wacom's id, on
+/// the reasoning that the pen samples came from a Wacom digitizer; with any
+/// tablet now supported that would be a false claim for most pens, and for a
+/// Wacom it is still not the device the application is talking to.
+///
+/// Nothing on macOS requires a particular vendor here. `AppKit` and
+/// `CoreGraphics` deliver tablet pressure, tilt, rotation and proximity from the
+/// event fields regardless of vendor, and real tablets' point events already
+/// arrive with vendor `0` (measured on the Deck: `-[NSEvent vendorID]` reads
+/// 0 for `TabletPoint`-subtype mouse events). The id stays non-zero so one
+/// Arcen session reads as one identified tablet in proximity events.
+pub const ARCEN_TABLET_VENDOR_ID: i64 = 0xFFFF;
 /// Device id for the single pen this host presents.
 pub const ARCEN_TABLET_DEVICE_ID: i64 = 1;
 
@@ -96,9 +103,6 @@ pub struct TabletPoint {
     pub pointer_type: i64,
 }
 
-/// Maximum tilt the wire expresses, in degrees.
-const TILT_DEGREES_FULL_SCALE: f32 = 90.0;
-
 /// Converts a wire sample into CoreGraphics tablet annotations.
 ///
 /// Degrees become the normalized -1..=1 CoreGraphics tilt. Values are clamped
@@ -109,14 +113,12 @@ const TILT_DEGREES_FULL_SCALE: f32 = 90.0;
 #[must_use]
 pub fn tablet_point(event: &PenEventMsg) -> TabletPoint {
     TabletPoint {
-        pressure: clamp_unit(f64::from(event.pressure), 0.0),
-        tilt_x: clamp_tilt(event.tilt_x_degrees),
-        tilt_y: clamp_tilt(event.tilt_y_degrees),
-        rotation_degrees: if event.rotation_degrees.is_finite() {
-            f64::from(event.rotation_degrees.rem_euclid(360.0))
-        } else {
-            0.0
-        },
+        pressure: f64::from(pen_axes::clamp_pressure(f64::from(event.pressure))),
+        tilt_x: pen_axes::tilt_degrees_to_unit(event.tilt_x_degrees),
+        tilt_y: pen_axes::tilt_degrees_to_unit(event.tilt_y_degrees),
+        rotation_degrees: f64::from(pen_axes::wrap_rotation_degrees(f64::from(
+            event.rotation_degrees,
+        ))),
         buttons: i64::from(event.buttons),
         pointer_type: pointer_type(event.tool),
     }
@@ -155,22 +157,6 @@ pub const fn shared_tool(tool: PenToolMsg) -> PenTool {
     match tool {
         PenToolMsg::Tip => PenTool::Tip,
         PenToolMsg::Eraser => PenTool::Eraser,
-    }
-}
-
-fn clamp_unit(value: f64, fallback: f64) -> f64 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        fallback
-    }
-}
-
-fn clamp_tilt(degrees: f32) -> f64 {
-    if degrees.is_finite() {
-        f64::from((degrees / TILT_DEGREES_FULL_SCALE).clamp(-1.0, 1.0))
-    } else {
-        0.0
     }
 }
 
@@ -251,6 +237,22 @@ mod tests {
         event.tool = PenToolMsg::Eraser;
         assert_eq!(tablet_point(&event).pointer_type, NX_TABLET_POINTER_ERASER);
         assert_eq!(tablet_point(&sample()).pointer_type, NX_TABLET_POINTER_PEN);
+    }
+
+    #[test]
+    fn the_virtual_pen_claims_no_tablet_makers_vendor_id() {
+        // Reserved, never-assigned, and Arcen's id for every synthetic device.
+        assert_eq!(ARCEN_TABLET_VENDOR_ID, 0xFFFF);
+        assert_ne!(ARCEN_TABLET_VENDOR_ID, 0);
+    }
+
+    #[test]
+    fn pressure_passes_through_the_shared_normalisation_unchanged() {
+        for pressure in [0.0_f32, 0.25, 0.5, 1.0] {
+            let mut event = sample();
+            event.pressure = pressure;
+            assert!((tablet_point(&event).pressure - f64::from(pressure)).abs() < 1e-6);
+        }
     }
 
     #[test]

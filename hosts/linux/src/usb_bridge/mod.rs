@@ -43,43 +43,86 @@ use vhci::{FetchedWork, PortState, VhciController, VhciUrb};
 const SELF_TEST_RUNTIME: Duration = Duration::from_secs(8);
 #[cfg(feature = "usb-hard-lab")]
 const MAX_HELPER_FRAME_BYTES: usize = arcen_usb_bridge::MAX_TRANSFER_BYTES + 64;
-#[cfg(feature = "usb-hard-lab")]
-const WACOM_VENDOR_ID: u16 = 0x056a;
-#[cfg(feature = "usb-hard-lab")]
-const WACOM_INTUOS5_TOUCH_L_PRODUCT_ID: u16 = 0x0317;
-#[cfg(feature = "usb-hard-lab")]
-const WACOM_INTUOS5_TOUCH_L_BCD_DEVICE: u16 = 0x0100;
+/// A Hard USB device this host agreed to bridge.
+#[derive(Debug, Clone)]
+pub struct AuthorizedTablet {
+    /// Bus speed the virtual port is connected at.
+    pub speed: UsbSpeed,
+    /// The identity the device descriptor must report once attached.
+    pub identity: arcen_usb_bridge::UsbDeviceId,
+    /// The classified report descriptors, checked again against what the
+    /// device returns once it is attached.
+    pub report_descriptors: Vec<arcen_usb_bridge::InterfaceReportDescriptor>,
+    /// What the descriptors declared.
+    pub profile: arcen_usb_bridge::PenTabletProfile,
+}
 
-/// Returns the speed for an exact host-authorized Hard USB lab device.
+/// Decides whether the Deck's captured device may become a virtual USB device
+/// on this host.
+///
+/// The decision is vendor-neutral and independent of the Deck's own: the
+/// device class and the HID report descriptors the Deck supplied are
+/// classified here with `arcen_usb_bridge::authorize_hard_usb_tablet` before
+/// anything reaches `usb-vhci`. Vendor and product ids are logged, never
+/// trusted. A Deck that supplies no descriptors (0.15 and older) is refused
+/// rather than admitted by vendor id.
+///
+/// The synthetic lab tablet is admitted only with `ARCEN_USB_HARD_SYNTHETIC=1`,
+/// and goes through the same classification.
+///
+/// # Errors
+///
+/// Returns a bounded operator-facing reason.
 #[cfg(feature = "usb-hard-lab")]
-#[must_use]
-pub fn authorized_device_speed(device: Option<&UsbHardDeviceMsg>) -> Option<UsbSpeed> {
-    let device = device?;
-    if device.vendor_id == WACOM_VENDOR_ID
-        && device.product_id == WACOM_INTUOS5_TOUCH_L_PRODUCT_ID
-        && device.bcd_device == WACOM_INTUOS5_TOUCH_L_BCD_DEVICE
-        && device.device_class == 0
-        && device.speed == UsbSpeed::Full
-    {
-        return Some(device.speed);
+pub fn authorize_device(device: Option<&UsbHardDeviceMsg>) -> Result<AuthorizedTablet, String> {
+    let device = device.ok_or_else(|| "the Deck did not capture a USB device".to_owned())?;
+    let synthetic = device.vendor_id == arcen_usb_bridge::ARCEN_LAB_VENDOR_ID
+        && device.product_id == arcen_usb_bridge::ARCEN_LAB_PRODUCT_ID;
+    if synthetic && std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() != Some("1") {
+        return Err("the synthetic lab tablet is not enabled on this host".to_owned());
     }
-    let synthetic_enabled = std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() == Some("1");
-    (synthetic_enabled
-        && device.vendor_id == arcen_usb_bridge::ARCEN_LAB_VENDOR_ID
-        && device.product_id == arcen_usb_bridge::ARCEN_LAB_PRODUCT_ID
-        && device.bcd_device == 0x0100
-        && device.device_class == 0
-        && device.speed == UsbSpeed::High)
-        .then_some(device.speed)
+    let report_descriptors = device
+        .report_descriptors()
+        .map_err(|error| format!("the Deck's HID report descriptors are malformed: {error}"))?;
+    let profile =
+        arcen_usb_bridge::authorize_hard_usb_tablet(device.device_class, &report_descriptors)
+            .map_err(|denial| format!("the captured USB device was refused: {denial}"))?;
+    Ok(AuthorizedTablet {
+        speed: device.speed,
+        identity: arcen_usb_bridge::UsbDeviceId {
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
+            bcd_device: device.bcd_device,
+        },
+        report_descriptors,
+        profile,
+    })
+}
+
+#[cfg(feature = "usb-hard-lab")]
+impl AuthorizedTablet {
+    /// The guard that holds every descriptor the attached device serves to
+    /// this authorization.
+    #[must_use]
+    pub fn guard(&self) -> arcen_usb_bridge::BridgedDeviceGuard {
+        arcen_usb_bridge::BridgedDeviceGuard::new(self.identity, self.report_descriptors.clone())
+    }
+}
+
+/// Without the lab importer nothing is ever bridged.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(feature = "usb-hard-lab"))]
+pub fn authorize_device(
+    _device: Option<&arcen_protocol::messages::UsbHardDeviceMsg>,
+) -> Result<AuthorizedTablet, String> {
+    Err("this Pier build does not contain the Hard USB importer".to_owned())
 }
 
 #[cfg(not(feature = "usb-hard-lab"))]
-#[must_use]
-pub fn authorized_device_speed(
-    _device: Option<&arcen_protocol::messages::UsbHardDeviceMsg>,
-) -> Option<arcen_usb_bridge::UsbSpeed> {
-    None
-}
+use arcen_usb_bridge::UsbSpeed;
 
 /// Whether this binary contains the lab importer and its device is available.
 #[must_use]
@@ -160,9 +203,20 @@ async fn run_ipc_self_test() -> Result<u64, String> {
     let binary = crate::current_pier_exe()
         .ok_or_else(|| "current fused Pier binary is unavailable".to_owned())?;
     let generation = AttachmentGeneration::new(NonZeroU64::MIN);
-    let mut process = BridgeProcess::spawn(&binary, generation, UsbSpeed::High)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut process = BridgeProcess::spawn(
+        &binary,
+        generation,
+        UsbSpeed::High,
+        arcen_usb_bridge::BridgedDeviceGuard::new(
+            SyntheticTabletDevice::identity(),
+            vec![arcen_usb_bridge::InterfaceReportDescriptor {
+                interface: 0,
+                descriptor: arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR.to_vec(),
+            }],
+        ),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let mut tablet = SyntheticTabletDevice::default();
     let report = PenSample {
         x: 0.5,
@@ -289,6 +343,9 @@ pub struct BridgeProcess {
     frames: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     reader_task: tokio::task::JoinHandle<()>,
     stderr: BufReader<ChildStderr>,
+    /// Checks every device, configuration and report descriptor the device
+    /// returns against what was authorized before the device was created.
+    guard: arcen_usb_bridge::BridgedDeviceGuard,
 }
 
 #[cfg(not(feature = "usb-hard-lab"))]
@@ -325,6 +382,7 @@ impl BridgeProcess {
         binary: &Path,
         generation: AttachmentGeneration,
         speed: UsbSpeed,
+        guard: arcen_usb_bridge::BridgedDeviceGuard,
     ) -> std::io::Result<Self> {
         let mut command = crate::command_for_helper(binary, "usb-bridge-helper");
         command
@@ -356,6 +414,7 @@ impl BridgeProcess {
             frames,
             reader_task,
             stderr: BufReader::new(stderr),
+            guard,
         })
     }
 
@@ -365,12 +424,37 @@ impl BridgeProcess {
     ///
     /// Returns an I/O error on EOF, malformed length, or pipe failure.
     pub async fn next_frame(&mut self) -> std::io::Result<Vec<u8>> {
-        self.frames.recv().await.unwrap_or_else(|| {
+        let frame = self.frames.recv().await.unwrap_or_else(|| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Hard USB helper frame reader ended",
             ))
-        })
+        })?;
+        self.observe_outbound(&frame)?;
+        Ok(frame)
+    }
+
+    /// Remembers descriptor requests and cancellations travelling to the
+    /// Deck, so their completions can be checked on the way back.
+    fn observe_outbound(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        match frame.first().copied() {
+            Some(byte) if byte == arcen_protocol::FrameType::UsbBridgeUrbSubmit as u8 => {
+                let (header, _) = arcen_protocol::decode_usb_urb_submit(frame)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+                self.guard
+                    .observe_submit(header.urb_id, header.setup)
+                    .map_err(|violation| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, violation)
+                    })
+            }
+            Some(byte) if byte == arcen_protocol::FrameType::UsbBridgeUrbCancel as u8 => {
+                let (_, urb_id) = arcen_protocol::decode_usb_urb_cancel(frame)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+                self.guard.observe_cancel(urb_id);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Sends one exact protocol frame to helper stdin.
@@ -381,6 +465,23 @@ impl BridgeProcess {
     pub async fn send_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
         if frame.is_empty() || frame.len() > MAX_HELPER_FRAME_BYTES {
             return Err(std::io::Error::other("Pier helper frame outside bound"));
+        }
+        if frame.first().copied() == Some(arcen_protocol::FrameType::UsbBridgeUrbComplete as u8) {
+            let (completion, payload) = decode_usb_urb_complete(frame)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            // A device that was authorized as a pen tablet and now describes
+            // itself differently (another class, another interface, another
+            // report descriptor) never reaches the host kernel: the frame is
+            // dropped here and the caller tears the attachment down.
+            self.guard
+                .check_completion(
+                    completion.urb_id,
+                    completion.status == UrbStatus::Success,
+                    payload,
+                )
+                .map_err(|violation| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, violation)
+                })?;
         }
         let length = u32::try_from(frame.len())
             .map_err(|_| std::io::Error::other("Pier helper frame length overflow"))?;
@@ -768,39 +869,234 @@ fn complete_urb(
 mod tests {
     use super::*;
 
+    fn device(vendor_id: u16, device_class: u8, descriptors: &[&[u8]]) -> UsbHardDeviceMsg {
+        UsbHardDeviceMsg {
+            vendor_id,
+            product_id: 0x0317,
+            bcd_device: 0x0100,
+            device_class,
+            speed: UsbSpeed::Full,
+            hid_report_descriptors: descriptors
+                .iter()
+                .zip(0_u8..)
+                .map(|(descriptor, interface)| {
+                    arcen_protocol::messages::UsbHidReportDescriptorMsg::new(interface, descriptor)
+                })
+                .collect(),
+        }
+    }
+
+    const KEYBOARD: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0,
+    ];
+
     #[test]
-    fn physical_wacom_profile_selects_full_speed() {
-        assert_eq!(
-            authorized_device_speed(Some(&UsbHardDeviceMsg {
-                vendor_id: WACOM_VENDOR_ID,
-                product_id: WACOM_INTUOS5_TOUCH_L_PRODUCT_ID,
-                bcd_device: WACOM_INTUOS5_TOUCH_L_BCD_DEVICE,
-                device_class: 0,
-                speed: UsbSpeed::Full,
-            })),
-            Some(UsbSpeed::Full)
-        );
+    fn any_vendors_classified_pen_tablet_is_authorized_at_its_own_speed() {
+        for vendor_id in [0x056a_u16, 0x256c, 0x28bd, 0x1234] {
+            let authorized = authorize_device(Some(&device(
+                vendor_id,
+                0,
+                &[
+                    arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
+                    arcen_usb_bridge::descriptor_fixtures::INTUOS5_STYLE_MOUSE_INTERFACE,
+                ],
+            )))
+            .expect("pen tablet is authorized");
+            assert_eq!(authorized.speed, UsbSpeed::Full);
+            assert_eq!(authorized.report_descriptors.len(), 2);
+            assert_eq!(
+                authorized.profile.capabilities.pressure_levels(),
+                Some(1024)
+            );
+        }
     }
 
     #[test]
-    fn wrong_identity_or_speed_is_denied() {
-        for device in [
-            UsbHardDeviceMsg {
-                vendor_id: WACOM_VENDOR_ID,
-                product_id: WACOM_INTUOS5_TOUCH_L_PRODUCT_ID,
-                bcd_device: WACOM_INTUOS5_TOUCH_L_BCD_DEVICE,
-                device_class: 0,
-                speed: UsbSpeed::High,
+    fn an_intuos5_style_tablet_is_authorized_and_its_vendor_interface_alone_is_not() {
+        use arcen_usb_bridge::descriptor_fixtures::{
+            BOOT_KEYBOARD, INTUOS5_STYLE_MOUSE_INTERFACE, INTUOS5_STYLE_PEN_INTERFACE,
+            INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE,
+        };
+        let authorized = authorize_device(Some(&device(
+            0x056a,
+            0,
+            &[
+                INTUOS5_STYLE_PEN_INTERFACE,
+                INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE,
+                INTUOS5_STYLE_MOUSE_INTERFACE,
+            ],
+        )))
+        .expect("Intuos5-style tablet is authorized");
+        assert_eq!(authorized.report_descriptors.len(), 3);
+        assert_eq!(authorized.profile.capabilities.pressure_levels(), None);
+        assert!(authorize_device(Some(&device(
+            0x056a,
+            0,
+            &[INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE]
+        )))
+        .is_err());
+        assert!(authorize_device(Some(&device(
+            0x056a,
+            0,
+            &[INTUOS5_STYLE_PEN_INTERFACE, BOOT_KEYBOARD]
+        )))
+        .is_ok());
+        assert!(authorize_device(Some(&device(0x056a, 0, &[BOOT_KEYBOARD]))).is_err());
+    }
+
+    /// The reviewed attack: a Deck claims a pen tablet, then the attached
+    /// device enumerates as mass storage. The guard built from the
+    /// authorization refuses the configuration before it reaches usb-vhci.
+    #[test]
+    fn the_authorized_guard_refuses_a_device_that_enumerates_as_mass_storage() {
+        let authorized = authorize_device(Some(&device(
+            0x1234,
+            0,
+            &[arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR],
+        )))
+        .expect("pen tablet is authorized");
+        let mut guard = authorized.guard();
+        let urb = UrbId::new(NonZeroU32::MIN);
+        guard
+            .observe_submit(
+                urb,
+                Some(SetupPacket {
+                    request_type: 0x80,
+                    request: 0x06,
+                    value: 0x0200,
+                    index: 0,
+                    length: 255,
+                }),
+            )
+            .unwrap();
+        let storage = [
+            9, 2, 25, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 1, 0x08, 0x06, 0x50, 0, // mass storage interface
+            7, 5, 0x81, 0x03, 64, 0, 1, // interrupt IN
+        ];
+        assert!(guard.check_completion(urb, true, &storage).is_err());
+    }
+
+    /// The reviewed bypass through the Linux adapter: the configuration
+    /// advertises only a keyboard prefix of the authorized keyboard+pen
+    /// report descriptor, so the kernel would never read the pen.
+    #[test]
+    fn the_authorized_guard_binds_the_advertised_report_length() {
+        let mut composite = KEYBOARD.to_vec();
+        let keyboard_length = u8::try_from(composite.len()).unwrap();
+        composite.extend_from_slice(arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR);
+        let authorized = authorize_device(Some(&device(0x1234, 0, &[&composite])))
+            .expect("keyboard+pen composite is a pen tablet");
+        let mut guard = authorized.guard();
+        let urb = UrbId::new(NonZeroU32::MIN);
+        guard
+            .observe_submit(
+                urb,
+                Some(SetupPacket {
+                    request_type: 0x80,
+                    request: 0x06,
+                    value: 0x0200,
+                    index: 0,
+                    length: 255,
+                }),
+            )
+            .unwrap();
+        let short = [
+            9,
+            2,
+            34,
+            0,
+            1,
+            1,
+            0,
+            0x80,
+            50, // configuration
+            9,
+            4,
+            0,
+            0,
+            1,
+            3,
+            0,
+            0,
+            0, // HID interface
+            9,
+            0x21,
+            0x11,
+            0x01,
+            0,
+            1,
+            0x22,
+            keyboard_length,
+            0, // keyboard prefix only
+            7,
+            5,
+            0x81,
+            3,
+            16,
+            0,
+            1, // interrupt IN
+        ];
+        assert!(guard.check_completion(urb, true, &short).is_err());
+    }
+
+    /// Express keys presented as a keyboard interface are bridged with the
+    /// pen; a game controller is not a tablet function and is refused.
+    #[test]
+    fn express_keys_are_bridged_and_game_controllers_are_not() {
+        assert!(authorize_device(Some(&device(
+            0x1234,
+            0,
+            &[
+                arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
+                KEYBOARD
+            ],
+        )))
+        .is_ok());
+        let refused = authorize_device(Some(&device(
+            0x1234,
+            0,
+            &[
+                arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
+                arcen_usb_bridge::descriptor_fixtures::GAMEPAD,
+            ],
+        )));
+        assert!(refused.is_err_and(|reason| reason.contains("never bridged")));
+    }
+
+    #[test]
+    fn non_tablets_and_legacy_claims_are_denied() {
+        assert!(authorize_device(None).is_err());
+        // A 0.15 Deck sends identity only: refused, not admitted by vendor id.
+        assert!(authorize_device(Some(&device(0x056a, 0, &[]))).is_err());
+        assert!(authorize_device(Some(&device(0x056a, 0, &[KEYBOARD]))).is_err());
+        assert!(authorize_device(Some(&device(
+            0x1234,
+            0x08,
+            &[arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR]
+        )))
+        .is_err());
+        let mut malformed = device(0x1234, 0, &[]);
+        malformed.hid_report_descriptors.push(
+            arcen_protocol::messages::UsbHidReportDescriptorMsg {
+                interface: 0,
+                descriptor: "zz".to_owned(),
             },
-            UsbHardDeviceMsg {
-                vendor_id: WACOM_VENDOR_ID,
-                product_id: 0xffff,
-                bcd_device: WACOM_INTUOS5_TOUCH_L_BCD_DEVICE,
-                device_class: 0,
-                speed: UsbSpeed::Full,
-            },
-        ] {
-            assert_eq!(authorized_device_speed(Some(&device)), None);
+        );
+        assert!(authorize_device(Some(&malformed)).is_err());
+    }
+
+    #[test]
+    fn the_synthetic_lab_tablet_needs_its_opt_in() {
+        let mut synthetic = device(
+            arcen_usb_bridge::ARCEN_LAB_VENDOR_ID,
+            0,
+            &[arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR],
+        );
+        synthetic.product_id = arcen_usb_bridge::ARCEN_LAB_PRODUCT_ID;
+        if std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() != Some("1") {
+            assert!(authorize_device(Some(&synthetic)).is_err());
         }
     }
 

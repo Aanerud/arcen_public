@@ -10,16 +10,24 @@ below is now cleared. See
 for the full design, the AppKit event gate fix (2026-08-03), and the
 confirmed capability coverage table.
 
+**Vendor neutrality (0.16.0):** any pen tablet whose HID report descriptor
+declares a pen is supported, whoever made it; no step below depends on the
+tablet's brand. The physical run above used one Wacom; tablets of other makes
+are covered by classifier and normalisation tests with synthetic descriptors
+(`shared/usb-bridge/src/hid_digitizer_tests.rs`,
+`shared/input/src/pen_axes.rs`) but have not yet been physically validated —
+re-run sections 1, 3 and 4 with any other tablet you have and record it.
+
 **Note for re-validation**: A critical macOS capture bug was found and fixed
-during this run (commit `1d6af87`). Wacom delivers pen motion with `vendorID=0`
+during this run (commit `1d6af87`). Tablet drivers deliver pen motion with `vendorID=0`
 on macOS; the original gate dropped all such events. Any re-test must use
 Arcen Deck build `1d6af87` or later.
 
 ## Prerequisites
 
-- A Wacom tablet (validated against `Intuos5 touch L`, VID `0x056A` PID
-  `0x0317`) connected to the macOS client, with Wacom's own driver suite
-  installed and running.
+- A pen tablet of any make connected to the macOS client (USB or Bluetooth),
+  with its own macOS driver installed and running if the vendor ships one
+  (physically validated so far with a Wacom `Intuos5 touch L`, `056a:0317`).
 - An Arcen Pier reachable over a direct QUIC connection: Linux
   (`arcen-pier` on the dedicated per-session Xorg target — see
   `hosts/linux/ARCHITECTURE.md`) or Windows (`arcen-pier.exe` as the
@@ -29,7 +37,8 @@ Arcen Deck build `1d6af87` or later.
   `clients/macos/SETTINGS.md`) unless a step below explicitly switches to
   **Mouse compatibility only** to exercise fallback behavior.
 
-Bridge mode operational note: `wacom_usb_bridge` is visible in Deck settings,
+Bridge mode operational note: Native tablet (USB bridged) — wire token
+`wacom_usb_bridge`, a legacy name for a vendor-neutral mode — is visible in Deck settings,
 but hosts without a complete USB bridge backend return explicit
 `tablet_mode_result.accepted = false` plus a reason; operators should expect
 `active = disabled_mouse_compat`. Native mode is explicit and never causes an
@@ -38,11 +47,18 @@ implicit switch to Tablet support.
 ## 1. macOS: presence, negotiation, and the Tablet Monitor panel
 
 1. Launch `Arcen Deck.app` (or `arcen-deck` CLI) with the tablet attached and
-   connect to a Pier. Confirm the startup log includes the Wacom vendor ID
-   (`0x056A`) in the USB inventory line
-   (`arcen_deck::logging::diagnostics::log_usb_inventory`).
+   connect to a Pier. Confirm the USB inventory line
+   (`arcen_deck::logging::diagnostics::log_usb_inventory`) counts the tablet
+   (`tablets=1`) and logs `Graphics tablet attached` for it; `brand` is a
+   label for a few well-known vendors and reads `unbranded` for any other
+   make — it never decides whether the device is a tablet. A Bluetooth tablet
+   does not appear in the USB inventory but is still detected below.
 2. Open **View > Tablet Monitor**. Confirm:
-   - `Wacom USB presence: present`.
+   - `Pen tablet: present` (from the HID report descriptors in the I/O
+     Registry, or from a pen sample AppKit already delivered). This is
+     informational: `Typed pen offered: yes` whenever the setting is on,
+     tablet attached or not, so a tablet plugged in after connecting still
+     negotiates pressure without a reconnect.
    - `Runtime installed: true` (the AppKit local-event monitor installed on
      the main thread).
    - `Negotiated: yes (typed pen)` once connected to a Pier that advertises
@@ -68,8 +84,8 @@ implicit switch to Tablet support.
    does not duplicate/fight the pen's motion (mouse-emulation suppression).
    Move the pen out of proximity; confirm ordinary mouse control returns
    immediately.
-8. **ExpressKeys/ring:** in Wacom Center (Mac), map ExpressKeys and the touch
-   ring/strip to ordinary keys or a scroll/zoom shortcut, then confirm those
+8. **Express keys/ring:** in the tablet vendor's control panel on the Mac,
+   map express keys and the touch ring/strip to ordinary keys or a scroll/zoom shortcut, then confirm those
    keypresses/scroll events arrive at the remote session through Deck's
    existing keyboard/wheel path — Arcen has no separate ExpressKeys protocol.
 9. **Tablet touch:** confirm multi-touch gestures on the tablet surface (not
@@ -125,7 +141,9 @@ sudo evtest
    `libinput debug-events` (or `evtest`) reports `TABLET_TOOL` proximity,
    motion, tip, pressure, and tilt events on the Arcen virtual device — and
    that the *existing* Arcen mouse/keyboard uinput device shows no tablet
-   axes (confirming the two devices stayed separate).
+   axes (confirming the two devices stayed separate). `evtest` reports
+   `ABS_PRESSURE` with maximum `65535` (the shared vendor-neutral range;
+   0.15 Piers declared `8191`).
 2. Confirm no rotation axis is advertised (`libinput list-devices` should
    not show a rotation capability for this device) — this is the documented
    `Unavailable` state, not a bug.
@@ -133,7 +151,7 @@ sudo evtest
    the same dedicated Xorg session and confirm a brush stroke shows varying
    width/opacity as physical pressure changes, and that tilt-sensitive
    brushes respond to physical tilt.
-4. Confirm **no Wacom driver package** is installed or required on this
+4. Confirm **no tablet vendor driver package** is installed or required on this
    Linux host for the above to work.
 5. Disconnect the client (or disable `tablet_input_enabled`) mid-stroke;
    confirm the virtual device releases every held key/button/proximity state
@@ -192,7 +210,7 @@ inferred.
 
 ### Client half: works, and needs no Apple entitlement
 
-An Intuos5 touch L (`056a:0317`) is captured with the Wacom driver installed
+One tablet (an Intuos5 touch L, `056a:0317`) was captured with its vendor driver installed
 and running and no entitlement of any kind. Reproduce with the hardware test,
 which drives the real `HidSession` rather than a probe that re-implements it:
 
@@ -207,8 +225,13 @@ to whatever runs it.
 
 `kIOReturnExclusiveAccess` from `IOHIDManagerOpen` is **transient** — another
 process holding the device — not a structural bar. It was seen against every
-matching combination on one occasion and against none of them after the Wacom
+matching combination on one occasion and against none of them after the vendor
 driver was restarted. Restart the vendor driver or replug the tablet.
+
+Since 0.16.0 the client matches by digitizer usage page and the descriptor's
+own classification, not by vendor id, and the Linux host admits a device only
+through `arcen_usb_bridge::RawHidAdmission` (pen-bearing interface of a device
+that classifies as a pen tablet). The measurement above predates that change.
 
 ### Host half: blocked, and by design it always was
 
@@ -227,7 +250,8 @@ module cost, and the reopened client entitlement question are all recorded
 there — that document is authoritative; do not re-derive it from this one.
 
 Operationally, for anyone testing today: **raw-HID passthrough cannot deliver a
-working Wacom on a Linux Pier**, so do not enable it expecting one. Use the
+working tablet whose Linux driver binds only to USB devices (as the measured
+one's does) on a Linux Pier**, so do not enable it expecting one. Use the
 typed pen path, which is the supported configuration.
 
 ## 5b. Open: tilt reaches the Linux host but is not observed by applications
@@ -256,6 +280,39 @@ Note the host writes these traces to `/var/log/arcen/arcen-pier.log`, **not** to
 the journal; `journalctl -u arcen-pier` shows none of them, which is misleading
 enough to have cost a diagnosis.
 
+## 5c. Native tablet (USB bridged) with any tablet
+
+Lab-only (`usb-hard-lab` builds of the Deck and the Linux Pier). The privileged
+`arcen-usb-helper` picks the first attached device whose interfaces are all HID
+and whose report descriptors classify as a pen tablet. It reads them from the
+I/O Registry (`IOHIDDevice` `ReportDescriptor`), so keyboards and mice it
+examines are never opened or sent anything; only an interface the registry
+left undescribed, on a device the registry already shows to be a digitizer
+with no boot-keyboard interface, is read with `GET_DESCRIPTOR(Report)`. An
+Intuos5-style tablet (pen on the vendor-defined Digitizers page `0xFF0D`)
+qualifies; its axes are reported as unknown because its reports are opaque. It sends the descriptors to the
+Deck, which forwards them in `client_hello.usb_hard_device`.
+
+1. With any pen tablet attached, run `sudo arcen-usb-helper --probe` on the Mac
+   and confirm `capture=ok` and the helper's
+   `pen tablet <vid>:<pid> admitted: evidence=... pressure_levels=...` line.
+   With no tablet attached it must report `no pen tablet is attached`.
+2. A tablet whose express keys enumerate as a keyboard or keypad is bridged
+   whole, express keys included. A device with a joystick, gamepad or
+   multi-axis controller collection is refused with "not a tablet function
+   and is never bridged; use Tablet support"; a device with no pen digitizer
+   (a plain keyboard) is never a candidate at all.
+3. Connect with Native tablet selected. On the Linux Pier, the
+   `Hard USB negotiation inputs` log line shows
+   `client_usb_hard_descriptors` (non-zero), `tablet_pressure_levels`, and
+   `tablet_refusal` absent. A refused device names its reason in
+   `tablet_mode_result.reason` (for example a 0.15 Deck: "the Deck supplied
+   no HID report descriptors; Deck 0.16.0 or newer is required").
+4. Confirm the host's own driver for that tablet binds the bridged device
+   (`dmesg`, `libinput list-devices`). A device that serves a descriptor
+   contradicting its authorization ends the session with
+   `event=usb_hard_device_refused` and the reason in the Pier log.
+
 ## 6. Teardown and logs/privacy
 
 1. During an active pen contact, force each of: focus loss, disconnect,
@@ -276,7 +333,7 @@ enough to have cost a diagnosis.
 
 Every step above can be exercised through enumeration, synthetic samples, or
 a real pen — but **completion of this feature requires an actual person
-physically moving and pressing a real Wacom pen** against the attached
+physically moving and pressing a real pen** against the attached
 tablet, observed live through Deck's Tablet Monitor panel (section 1) and
 confirmed to reach a real remote creative application on both Linux (section
 3) and Windows (section 4). Do not report this feature as fully validated,

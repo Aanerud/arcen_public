@@ -81,10 +81,10 @@ const MIN_TILE_INNER_HEIGHT_PTS: f32 = 200.0;
 /// machines.
 const FRACTION_DENOMINATOR: i64 = 4;
 
-/// The gap a "device-supplied" (Wacom) pen sequence jumps ahead of the
+/// The gap a "device-supplied" (tablet) pen sequence jumps ahead of the
 /// emitter's own counter, proving the shared emitter adopts an external
 /// device sequence and keeps allocating above it afterwards.
-const WACOM_SEQUENCE_GAP: u64 = 16;
+const DEVICE_PEN_SEQUENCE_GAP: u64 = 16;
 
 /// Nanoseconds between consecutive scripted steps. Synthetic and monotonic.
 const STEP_TIMESTAMP_STRIDE_NS: u64 = 1_000_000;
@@ -529,9 +529,9 @@ pub enum ScriptedInputStep {
         tool: PenTool,
         touching: bool,
     },
-    /// A Wacom-style sample carrying a *device-supplied* sequence ahead of
+    /// A tablet-style sample carrying a *device-supplied* sequence ahead of
     /// the emitter's counter (`RegionInputEmitter::pen_with_sequence`).
-    WacomPen {
+    DevicePen {
         monitor_index: usize,
         x_numerator: i64,
         y_numerator: i64,
@@ -599,7 +599,7 @@ pub fn scripted_trace(
             tool: PenTool::Tip,
             touching: true,
         });
-        steps.push(ScriptedInputStep::WacomPen {
+        steps.push(ScriptedInputStep::DevicePen {
             monitor_index,
             x_numerator: 3,
             y_numerator: 3,
@@ -861,13 +861,13 @@ pub fn run_input_trace(
                     false,
                 )?]
             }
-            ScriptedInputStep::WacomPen {
+            ScriptedInputStep::DevicePen {
                 monitor_index,
                 x_numerator,
                 y_numerator,
             } => {
                 let position = lab_position(monitor_index, x_numerator, y_numerator)?;
-                let device_sequence = emitter.sequence() + WACOM_SEQUENCE_GAP;
+                let device_sequence = emitter.sequence() + DEVICE_PEN_SEQUENCE_GAP;
                 vec![emitter.pen_with_sequence(
                     regions,
                     lab_pen_sample(position, PenTool::Tip, true),
@@ -2061,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wacom_step_adopts_its_device_supplied_sequence() {
+    fn the_device_pen_step_adopts_its_device_supplied_sequence() {
         let trace = trace_for(2);
         let pen_sequences = trace
             .iter()
@@ -2074,10 +2074,10 @@ mod tests {
             .map(|record| record.sequence)
             .collect::<Vec<_>>();
         // Two pen samples per monitor: the emitter-sequenced one, then the
-        // device-sequenced (Wacom) one exactly `WACOM_SEQUENCE_GAP` later.
+        // device-sequenced (tablet) one exactly `DEVICE_PEN_SEQUENCE_GAP` later.
         assert_eq!(pen_sequences.len(), 4);
-        assert_eq!(pen_sequences[1], pen_sequences[0] + WACOM_SEQUENCE_GAP);
-        assert_eq!(pen_sequences[3], pen_sequences[2] + WACOM_SEQUENCE_GAP);
+        assert_eq!(pen_sequences[1], pen_sequences[0] + DEVICE_PEN_SEQUENCE_GAP);
+        assert_eq!(pen_sequences[3], pen_sequences[2] + DEVICE_PEN_SEQUENCE_GAP);
     }
 
     #[test]

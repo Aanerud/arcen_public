@@ -6,10 +6,19 @@
 //! daemon once, launchd starts it as root from then on, and the only user-facing
 //! step is a single approval in System Settings.
 //!
+//! `SMAppService` exists only on macOS 13 and later. Deck itself runs on
+//! macOS 12, so every entry point here asks the Deck platform profile
+//! ([`crate::platform`]) first and reports [`HelperInstallState::UnsupportedOs`]
+//! instead of touching the API.
+//!
 //! See `docs/adr/0011-macos-privileged-usb-helper.md`.
 
 use objc2_foundation::NSString;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+fn helper_supported() -> bool {
+    crate::platform::current().native_usb_helper_supported()
+}
 
 /// Filename of the bundled LaunchDaemon plist, relative to
 /// `Contents/Library/LaunchDaemons/`.
@@ -32,6 +41,8 @@ pub enum HelperInstallState {
     /// system log shows `Setting up BundleProgram keys` succeeding immediately
     /// before it. Treat it like [`Self::NotRegistered`] and register.
     NotFound,
+    /// This macOS predates `SMAppService`, so the helper cannot be installed.
+    UnsupportedOs,
     /// A status this build does not know about.
     Unknown(isize),
 }
@@ -50,6 +61,9 @@ impl HelperInstallState {
             Self::NotRegistered | Self::NotFound => {
                 "Native tablet mode needs the Arcen USB helper. Installing it asks for an \
                  administrator approval once."
+            }
+            Self::UnsupportedOs => {
+                "Native tablet requires macOS 13 or later. Use Tablet support on this Mac."
             }
             Self::Unknown(_) => "The Arcen USB helper is in an unrecognised state.",
         }
@@ -71,6 +85,7 @@ impl HelperInstallState {
             Self::Enabled => "Helper installed",
             Self::RequiresApproval => "Approve helper…",
             Self::NotRegistered | Self::NotFound => "Install helper…",
+            Self::UnsupportedOs => "Requires macOS 13",
             Self::Unknown(_) => "Check helper…",
         }
     }
@@ -86,7 +101,7 @@ impl HelperInstallState {
             Self::Enabled => HelperAction::Recheck,
             Self::RequiresApproval => HelperAction::Approve,
             Self::NotRegistered | Self::NotFound => HelperAction::Install,
-            Self::Unknown(_) => HelperAction::Recheck,
+            Self::UnsupportedOs | Self::Unknown(_) => HelperAction::Recheck,
         }
     }
 }
@@ -142,6 +157,9 @@ pub fn diagnostics() -> (String, String, bool) {
 /// Reads the current registration state without changing anything.
 #[must_use]
 pub fn install_state() -> HelperInstallState {
+    if !helper_supported() {
+        return HelperInstallState::UnsupportedOs;
+    }
     // SAFETY: `status` is a property read on a live SMAppService instance.
     map_status(unsafe { daemon().status() })
 }
@@ -157,6 +175,9 @@ pub fn install_state() -> HelperInstallState {
 /// Returns the localized failure description when registration is refused, for
 /// example because the user cancelled the authentication prompt.
 pub fn register() -> Result<HelperInstallState, String> {
+    if !helper_supported() {
+        return Ok(HelperInstallState::UnsupportedOs);
+    }
     let service = daemon();
     // SAFETY: `registerAndReturnError:` is the documented registration entry
     // point; objc2 surfaces the NSError out-param as a Result.
@@ -189,6 +210,9 @@ pub fn register() -> Result<HelperInstallState, String> {
 ///
 /// Returns the localized failure description when launchd refuses removal.
 pub fn unregister() -> Result<(), String> {
+    if !helper_supported() {
+        return Ok(());
+    }
     let service = daemon();
     // SAFETY: mirror of `register`, with the same object lifetime rules.
     unsafe { service.unregisterAndReturnError() }.map_err(|error| {
@@ -201,6 +225,9 @@ pub fn unregister() -> Result<(), String> {
 
 /// Opens the Login Items pane so the user can approve a pending daemon.
 pub fn open_login_items_settings() {
+    if !helper_supported() {
+        return;
+    }
     // SAFETY: a class method with no arguments that only presents system UI.
     unsafe { SMAppService::openSystemSettingsLoginItems() };
 }
@@ -216,6 +243,7 @@ mod tests {
             HelperInstallState::RequiresApproval,
             HelperInstallState::NotRegistered,
             HelperInstallState::NotFound,
+            HelperInstallState::UnsupportedOs,
             HelperInstallState::Unknown(42),
         ] {
             assert!(
@@ -232,6 +260,7 @@ mod tests {
             HelperInstallState::RequiresApproval,
             HelperInstallState::NotRegistered,
             HelperInstallState::NotFound,
+            HelperInstallState::UnsupportedOs,
             HelperInstallState::Unknown(0),
         ] {
             assert!(
@@ -278,6 +307,7 @@ mod tests {
             HelperInstallState::RequiresApproval,
             HelperInstallState::NotRegistered,
             HelperInstallState::NotFound,
+            HelperInstallState::UnsupportedOs,
             HelperInstallState::Unknown(7),
         ] {
             assert!(
@@ -312,6 +342,7 @@ mod tests {
         for state in [
             HelperInstallState::Enabled,
             HelperInstallState::RequiresApproval,
+            HelperInstallState::UnsupportedOs,
             HelperInstallState::Unknown(0),
         ] {
             assert_ne!(
@@ -320,5 +351,16 @@ mod tests {
                 "{state:?} is already registered; installing again cannot help"
             );
         }
+    }
+
+    /// On macOS 12 nothing can be installed, so the control must neither offer
+    /// an install nor send the user to a Login Items pane that cannot help.
+    #[test]
+    fn unsupported_os_explains_itself_and_offers_no_install() {
+        let state = HelperInstallState::UnsupportedOs;
+        assert!(!state.is_ready());
+        assert_eq!(state.action(), HelperAction::Recheck);
+        assert!(state.guidance().contains("macOS 13"));
+        assert!(state.action_label().contains("macOS 13"));
     }
 }

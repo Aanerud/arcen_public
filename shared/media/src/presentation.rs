@@ -482,9 +482,72 @@ fn rounded_refresh_capacity(refresh_hz: u32, elapsed: Duration) -> u64 {
     u64::try_from(frames).unwrap_or(u64::MAX)
 }
 
+/// The clock a display-refresh pacer ages queued frames against.
+///
+/// Frames are admitted with the current host time, so their age must be
+/// measured against the refresh callback's "now", not the future scan-out
+/// target. A display link's output time runs ahead of now by the display
+/// pipeline lead, which is about 49 ms on some Intel/AMD Macs on macOS 12 --
+/// nearly the whole stale-age budget, so every frame was dropped as stale
+/// before it was ever presented. A missing (zero) or later "now" falls back to
+/// the target. This is decided from the timestamps, not the platform, so it
+/// holds wherever such a lead appears.
+#[must_use]
+pub fn pacer_clock_time(callback_time: Duration, target_time: Duration) -> Duration {
+    if callback_time.is_zero() {
+        target_time
+    } else {
+        callback_time.min(target_time)
+    }
+}
+
+/// Presenter frames the health model may count as presented.
+///
+/// A Metal-style presented handler fires for every drawable that left the
+/// in-flight state. Where the platform reports a presentation timestamp, a
+/// zero means the drawable was skipped, so only timestamped frames count. Some
+/// stacks -- observed on an Intel Mac with AMD graphics on macOS 12 -- never
+/// report a timestamp, even while the picture is visibly on screen; counting
+/// only timestamped frames there marked every healthy session "unpresented".
+/// Until a presenter has reported at least one timestamp, a presented-handler
+/// callback is the best evidence available and counts. Like
+/// [`pacer_clock_time`], this follows the evidence rather than the platform.
+#[must_use]
+pub const fn presented_frames_for_health(
+    timestamped: u64,
+    untimestamped: u64,
+    timestamp_ever_reported: bool,
+) -> u64 {
+    if timestamp_ever_reported {
+        timestamped
+    } else {
+        timestamped.saturating_add(untimestamped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacer_clock_never_runs_past_the_target_and_tolerates_missing_now() {
+        let target = Duration::from_millis(100);
+        assert_eq!(
+            pacer_clock_time(Duration::from_millis(51), target),
+            Duration::from_millis(51)
+        );
+        assert_eq!(pacer_clock_time(Duration::ZERO, target), target);
+        assert_eq!(pacer_clock_time(Duration::from_millis(120), target), target);
+    }
+
+    #[test]
+    fn untimestamped_presents_count_only_where_timestamps_are_never_reported() {
+        assert_eq!(presented_frames_for_health(0, 5, false), 5);
+        assert_eq!(presented_frames_for_health(3, 2, true), 3);
+        assert_eq!(presented_frames_for_health(0, 4, true), 0);
+        assert_eq!(presented_frames_for_health(0, 0, false), 0);
+        assert_eq!(presented_frames_for_health(u64::MAX, 1, false), u64::MAX);
+    }
 
     const NS_PER_S: u64 = 1_000_000_000;
 

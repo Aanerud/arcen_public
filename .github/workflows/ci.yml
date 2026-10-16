@@ -76,8 +76,11 @@ jobs:
           python3 -m unittest scripts/test_check_shared_contracts.py
           python3 scripts/check_shared_contracts.py --verbose
           bash scripts/ci/check-workspace-boundaries.sh
-      - name: Verify governed Opus source
-        run: bash scripts/verify-opusic-source.sh
+      - name: Verify governed vendored sources
+        run: |
+          bash scripts/verify-vendored-source.sh opusic-sys-0.7.3-arcen1
+          bash scripts/verify-vendored-source.sh apple-cf-0.9.3-arcen1
+          bash scripts/verify-vendored-source.sh videotoolbox-0.18.1-arcen1
       - name: Native source-build tools
         run: |
           sudo apt-get update

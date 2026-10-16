@@ -1,0 +1,99 @@
+[package]
+name = "videotoolbox"
+version = "0.18.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/doom-fish/videotoolbox-rs"
+repository = "https://github.com/doom-fish/videotoolbox-rs"
+description = "Safe Rust bindings for Apple's VideoToolbox framework — hardware H.264/HEVC/ProRes encode and decode on macOS"
+authors = ["Per Johansson <per@doom.fish>"]
+keywords = ["videotoolbox", "h264", "hevc", "macos", "encoder"]
+categories = ["multimedia::encoding", "multimedia::video", "api-bindings", "os::macos-apis"]
+rust-version = "1.76"
+readme = "README.md"
+build = "build.rs"
+include = [
+    "src/**/*",
+    "swift-bridge/Package.swift",
+    "swift-bridge/Sources/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-*",
+    "CHANGELOG.md",
+]
+
+[lints.rust]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+[lib]
+name = "videotoolbox"
+crate-type = ["lib"]
+
+[features]
+default = ["compression"]
+
+# VideoToolbox surface is split into independent feature flags so downstream
+# users can pull in only the pieces they need (encoder-only apps don't pay
+# for the decoder symbols, and vice versa).
+compression = []
+decompression = []
+# Future-based completion wrappers over the one-shot VideoToolbox callbacks.
+async = ["dep:doom-fish-utils"]
+# Brings in a small Swift bridge so we can reach VTFrameProcessor (an
+# Objective-C-only API the pure-C FFI can't otherwise call). Off by default
+# so existing pure-C users don't pay for the `swift build` step.
+frame_processor = ["dep:apple-metal"]
+all-features-flag = ["compression", "decompression", "async", "frame_processor"]
+
+[dependencies]
+apple-cf = { path = "../apple-cf-rs", version = ">=0.9, <0.10", default-features = false, features = ["cm", "iosurface", "cv"] }
+apple-metal = { path = "../apple-metal-rs", version = ">=0.6, <0.9", default-features = false, optional = true }
+doom-fish-utils = { path = "../doom-fish-utils", version = ">=0.1, <0.4", optional = true }
+
+[dev-dependencies]
+pollster = "0.3"
+regex-lite = "0.1"
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[[example]]
+name = "01_encode_smoke"
+required-features = ["compression"]
+
+[[example]]
+name = "02_encode_sequence"
+required-features = ["compression"]
+
+[[example]]
+name = "03_async_encode"
+required-features = ["compression", "async"]
+
+[profile.release]
+debug = "full"
+strip = "none"
+
+[[example]]
+name = "04_transfer_rotate"
+
+[[example]]
+name = "05_encoder_list"
+
+[[example]]
+name = "06_frame_processor_caps"
+required-features = ["frame_processor"]
+
+[[example]]
+name = "08_frame_processor_pipelines"
+required-features = ["frame_processor"]

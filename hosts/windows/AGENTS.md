@@ -99,6 +99,7 @@ When changing one path's privilege or ACL handling, check the other.
 
 ### Native tablet mode is not available on this host
 Windows has no USB importer — no UDE or VHF adapter exists. A Deck that requests
-`wacom_usb_bridge` against this Pier does not degrade gracefully; the session
+Native tablet (`wacom_usb_bridge` on the wire, a legacy name for the vendor-neutral
+mode) against this Pier does not degrade gracefully; the session
 drops with `websocket error: ... Connection reset without closing handshake`.
 Hard USB is Linux-only for now, so keep Windows connections on Tablet support.
