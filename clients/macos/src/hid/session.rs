@@ -38,24 +38,24 @@ pub enum HidEvent {
     },
 }
 
-/// Vendor IDs for supported tablet manufacturers.
+/// Whether a HID interface may be offered to the host at all: its report
+/// descriptor must declare a digitizer (pen, touch, or vendor-mirrored
+/// digitizer). No vendor id is consulted.
 ///
-/// SEC-raw-hid: this allow-list is enforced client-side as a first line of
-/// defence, but the host independently re-checks vendor IDs before ever
-/// creating a `/dev/uhid` device — the client's filtering is never trusted
-/// alone.
-const TABLET_VENDOR_IDS: &[u16] = &[
-    0x056A, // Wacom
-    0x256c, // Huion
-    0x28bd, // XP-Pen
-    0x5543, // UC-Logic
-    0x0b57, // Gaomon
-];
+/// SEC-raw-hid: this is a client-side first line of defence only. The host
+/// classifies every descriptor itself (`arcen_usb_bridge::RawHidAdmission`)
+/// before ever creating a `/dev/uhid` device; the client's filtering is never
+/// trusted alone.
+pub(crate) fn is_offerable_descriptor(descriptor: &[u8]) -> bool {
+    arcen_usb_bridge::declares_any_digitizer(descriptor)
+}
 
-/// Returns whether `vendor_id` belongs to a supported experimental raw-HID
-/// tablet vendor.
-pub(crate) fn is_supported_tablet_vendor(vendor_id: u16) -> bool {
-    TABLET_VENDOR_IDS.contains(&vendor_id)
+/// Whether an interface's input reports may leave this Mac: only an interface
+/// that itself declares a pen or a vendor-mirrored digitizer. A touch-only
+/// interface is announced (it corroborates a vendor-page pen on the same
+/// device) but its reports are never captured.
+pub(crate) fn forwards_reports(descriptor: &[u8]) -> bool {
+    arcen_usb_bridge::declares_pen_or_vendor_digitizer(descriptor)
 }
 
 /// Maximum number of concurrently tracked devices per session, mirroring the
@@ -77,9 +77,10 @@ const USAGE_PAGE_VENDOR_DEFINED_MIN: i64 = 0xFF00;
 /// that actually carry pen reports rather than every collection a tablet
 /// happens to publish.
 ///
-/// An Intuos5 touch L (`056a:0317`) publishes three: `0xFF0D` (vendor pen
-/// data, where the reports arrive), `0xFF00` (vendor control) and `0x0001`
-/// (Generic Desktop mouse). Only the first is needed.
+/// A tablet measured here (an Intuos5 touch L) publishes three: `0xFF0D`
+/// (vendor-mirrored digitizer, where the pen reports arrive), `0xFF00`
+/// (vendor control) and `0x0001` (Generic Desktop mouse). Only the first is
+/// needed; standards-compliant tablets publish their pen on `0x0D`.
 ///
 /// What is *not* claimed here: this is not a fix for `kIOReturnExclusiveAccess`.
 /// That failure was observed against every matching combination, including
@@ -286,16 +287,16 @@ mod imp {
     use crate::hid::iokit::*;
     use std::ffi::c_void;
 
-    /// Builds the device-matching array: one `{ VendorID: n }` dictionary
-    /// per supported tablet vendor.
+    /// Builds the device-matching array: one `{ DeviceUsagePage: page }`
+    /// dictionary per digitizer usage page, for every vendor.
     ///
     /// The manager must be told what to match. Passing null ("everything")
     /// makes `IOHIDManagerOpen` responsible for every HID device on the Mac,
     /// including keyboards, and the system refuses that outright — measured
     /// here as `IOHIDManagerOpen` failing while a digitizer-only match
-    /// succeeded. Matching the supported vendors is both narrower and what
-    /// the add callback already wanted; the callback keeps its own
-    /// vendor/usage-page check to reject a vendor's non-tablet interfaces.
+    /// succeeded. Matching digitizer collections is both narrower and
+    /// vendor-neutral; the callback then classifies each interface's report
+    /// descriptor before offering it.
     ///
     /// Returns null if any CoreFoundation allocation fails; callers treat
     /// that as a startup failure rather than falling back to matching
@@ -309,7 +310,7 @@ mod imp {
         if array.is_null() {
             return std::ptr::null_mut();
         }
-        for vendor in TABLET_VENDOR_IDS {
+        {
             for page in MATCHED_USAGE_PAGES {
                 let dictionary = CFDictionaryCreateMutable(
                     std::ptr::null_mut(),
@@ -321,13 +322,10 @@ mod imp {
                     CFRelease(array);
                     return std::ptr::null_mut();
                 }
-                let entries = [
-                    (MATCH_VENDOR_ID, i32::from(*vendor)),
-                    (
-                        MATCH_DEVICE_USAGE_PAGE,
-                        i32::try_from(*page).unwrap_or(0x0D),
-                    ),
-                ];
+                let entries = [(
+                    MATCH_DEVICE_USAGE_PAGE,
+                    i32::try_from(*page).unwrap_or(0x0D),
+                )];
                 for (name, number) in entries {
                     let key = cf_string(name);
                     let value = CFNumberCreate(
@@ -419,14 +417,7 @@ mod imp {
         let vid = cf_number_i32(vid_cf).unwrap_or(0) as u16;
         let pid = cf_number_i32(pid_cf).unwrap_or(0) as u16;
 
-        // Filter #1: only forward recognised tablet vendors. The host
-        // independently re-checks this — the client filter is defence in
-        // depth only, never trusted alone.
-        if !is_supported_tablet_vendor(vid) {
-            return;
-        }
-
-        // Filter #2: usage-page filtering. These tablets commonly expose
+        // Filter #1: usage-page filtering. These tablets commonly expose
         // multiple logical HID interfaces on the same VID/PID — including a
         // plain Generic Desktop mouse interface — and only the
         // Digitizer/vendor-defined interface should ever be captured.
@@ -518,6 +509,15 @@ mod imp {
             return;
         }
 
+        // Filter #2: the descriptor itself must declare a digitizer, whoever
+        // made the device. The host classifies it again before creating
+        // anything; this is defence in depth, never trusted alone.
+        if !is_offerable_descriptor(&descriptor) {
+            let _ = IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+            return;
+        }
+        let capture_reports = forwards_reports(&descriptor);
+
         // Per-device report buffer, sized from the device's own
         // MaxInputReportSize property (clamped to a safe bounded range)
         // instead of one hardcoded constant for every vendor/device.
@@ -536,13 +536,17 @@ mod imp {
         };
         ctx.devices.insert(device as usize, state);
 
-        IOHIDDeviceRegisterInputReportCallback(
-            device,
-            buf_ptr,
-            report_buf_len as isize,
-            on_report,
-            context,
-        );
+        // A touch-only interface is announced for corroboration, but its
+        // input reports never leave this Mac.
+        if capture_reports {
+            IOHIDDeviceRegisterInputReportCallback(
+                device,
+                buf_ptr,
+                report_buf_len as isize,
+                on_report,
+                context,
+            );
+        }
 
         send_event(
             &ctx.tx,
@@ -735,8 +739,8 @@ mod imp {
             // ExpressKey collections, and those drag the same refusal back
             // in. Narrowing to the digitizer collection is both what the
             // callback filter already wanted and the only form the system
-            // will open. The callback keeps its own vendor/usage-page check,
-            // which is still needed to reject non-tablet digitizers.
+            // will open. The callback then classifies each interface's report
+            // descriptor, which is still needed to reject non-tablet digitizers.
             let matching = build_tablet_matching_array();
             if matching.is_null() {
                 send_event(
@@ -828,14 +832,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vendor_allow_list_matches_only_known_tablet_vendors() {
-        assert!(is_supported_tablet_vendor(0x056A)); // Wacom
-        assert!(is_supported_tablet_vendor(0x256c)); // Huion
-        assert!(is_supported_tablet_vendor(0x28bd)); // XP-Pen
-        assert!(is_supported_tablet_vendor(0x5543)); // UC-Logic
-        assert!(is_supported_tablet_vendor(0x0b57)); // Gaomon
-        assert!(!is_supported_tablet_vendor(0x05ac)); // Apple, must not match
-        assert!(!is_supported_tablet_vendor(0x0000));
+    fn interfaces_are_offered_by_what_their_descriptor_says_not_by_vendor() {
+        let pen = arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR;
+        let touch: &[u8] = &[
+            0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01, 0x09, 0x22, 0xA1, 0x02, 0x09, 0x42, 0x15, 0x00,
+            0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, 0x95, 0x07, 0x81, 0x03, 0x05, 0x01,
+            0x09, 0x30, 0x09, 0x31, 0x26, 0xFF, 0x0F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xC0,
+            0xC0,
+        ];
+        let keyboard: &[u8] = &[
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+            0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0,
+        ];
+        assert!(is_offerable_descriptor(pen) && forwards_reports(pen));
+        assert!(is_offerable_descriptor(touch) && !forwards_reports(touch));
+        assert!(!is_offerable_descriptor(keyboard) && !forwards_reports(keyboard));
+        assert!(!is_offerable_descriptor(&[]));
+
+        use arcen_usb_bridge::descriptor_fixtures::{
+            INTUOS5_STYLE_MOUSE_INTERFACE, INTUOS5_STYLE_PEN_INTERFACE,
+            INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE,
+        };
+        assert!(
+            is_offerable_descriptor(INTUOS5_STYLE_PEN_INTERFACE)
+                && forwards_reports(INTUOS5_STYLE_PEN_INTERFACE),
+            "an Intuos5-style 0xFF0D pen interface is offered and forwarded"
+        );
+        assert!(!is_offerable_descriptor(
+            INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE
+        ));
+        assert!(!is_offerable_descriptor(INTUOS5_STYLE_MOUSE_INTERFACE));
     }
 
     #[test]
@@ -911,7 +937,7 @@ mod tests {
 
     /// The manager should claim only the collections that carry pen reports.
     ///
-    /// Measured collections on an Intuos5 touch L: `0xFF0D` carries the pen
+    /// Measured collections on one tablet (an Intuos5 touch L): `0xFF0D` carries the pen
     /// data, `0xFF00` is a vendor control collection that carries none, and
     /// `0x0001` is a Generic Desktop mouse. Claiming a collection the session
     /// never reads is a liability, since `IOHIDManagerOpen` must succeed for
@@ -928,7 +954,7 @@ mod tests {
         );
         assert!(
             MATCHED_USAGE_PAGES.contains(&0xFF0D),
-            "0xFF0D is where a Wacom tablet's pen reports actually arrive",
+            "0xFF0D is where vendor-mirrored digitizer pens report",
         );
         assert!(
             !MATCHED_USAGE_PAGES.contains(&USAGE_PAGE_VENDOR_DEFINED_MIN),

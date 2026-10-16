@@ -140,8 +140,6 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "apple-cf"
 version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7fd680cd0f3f02ee717b2014b26d18985c57b784384ba47213fcf8791e8c250"
 dependencies = [
  "doom-fish-utils",
 ]
@@ -174,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-audiocap"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-telemetry",
  "libpulse-binding",
@@ -183,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-capenc"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -197,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-cp-ipc"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ring",
  "serde",
@@ -207,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-credential-provider"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-cp-ipc",
  "windows 0.58.0",
@@ -217,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-macos"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -274,11 +272,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-iddcx-provider"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "arcen-identity"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -289,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-input"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-media",
  "arcen-protocol",
@@ -299,11 +297,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-input-helper"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "arcen-keel"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -312,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-media"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-keel",
  "arcen-protocol",
@@ -329,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-microphone-driver"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "mach2",
@@ -337,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-observability"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-telemetry",
  "serde_json",
@@ -347,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-outputs"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-media",
  "arcen-telemetry",
@@ -355,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-audiocap",
  "arcen-capenc",
@@ -398,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux-installer"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-session",
  "arcen-transport",
@@ -408,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-macos"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -458,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-capenc",
  "arcen-cp-ipc",
@@ -495,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows-installer"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-session",
  "arcen-transport",
@@ -506,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-protocol"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-usb-bridge",
  "getrandom 0.2.17",
@@ -518,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-region-patch-benchmark"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -527,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-session"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-telemetry",
  "serde",
@@ -538,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-telemetry"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -547,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-transport"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-identity",
  "arcen-protocol",
@@ -565,14 +563,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-bridge"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "arcen-usb-helper"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arcen-protocol",
  "arcen-usb-bridge",
@@ -4156,9 +4154,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.41"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -4201,9 +4199,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5073,8 +5071,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "videotoolbox"
 version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c2c3d936f5f1bd6f9d706c68149ea5277e11142af9e580eb08607645d635cca"
 dependencies = [
  "apple-cf",
  "doom-fish-utils",

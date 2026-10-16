@@ -1,14 +1,15 @@
 # clients/macos — `arcen-deck-macos` (Arcen Deck)
 
 **Delivery:** Arcen Deck, the macOS client. Product surface. Binary
-`arcen-deck`, app `Arcen Deck.app`, bundle id `deck.arcen.tech`.
+`arcen-deck`, apps `Arcen Deck.app` (Apple silicon) and `Arcen Deck Intel.app`
+(Intel), one bundle id `deck.arcen.tech`, macOS 12 or later.
 
 ## What this is
 
 The thin client optimized for macOS: an egui/eframe UI (connection home, session view,
 settings), QUIC/TLS 1.3 transport to an Arcen Pier, a decode pipeline (VideoToolbox H.265/H.264
 → frame queue → render), audio playback (cpal), input capture forwarded to the Pier, and
-HID device passthrough (HoIP) — physical Wacom/tablet USB reports forwarded verbatim over
+HID device passthrough (HoIP) — physical pen-tablet HID reports (any make) forwarded verbatim over
 the session wire so the remote host sees a virtual pen tablet with full pressure/tilt.
 It is deliberately separate from any future Windows/Linux Deck so each stays optimized for
 its platform's decode/render path.
@@ -73,9 +74,47 @@ sets frame rate, complete colour contract, and encoder intent together.
 what is actually displayed; a host downgrade can never leave the HDR control
 looking active while the Deck silently presents SDR.
 
+## Deck platform profile
+
+Apple silicon and Intel get separate apps from one crate, not two clients. The
+differences between them are not scattered `cfg` branches: they are answered by
+one profile, `arcen_media::deck_platform::DeckPlatform`, a pure shared type
+tested on every OS. `src/platform.rs` resolves it once per process
+(`platform::current()`) from three facts: the compile-time `target_arch`
+(`x86_64` is Intel, everything else Apple silicon), the running macOS version
+(`NSProcessInfo.operatingSystemVersion`), and whether Rosetta translates the
+process (`sysctl.proc_translated`). It gathers facts and decides nothing.
+
+| Decision | Apple silicon | Intel | Used by |
+| --- | --- | --- | --- |
+| `label()` — `deck_platform` in logs and diagnostics | `macos-apple-silicon` | `macos-intel` | start-up banner and `deck_platform` event, decode probe logs, Negotiated Truth panel, `arcen-deck platform-report` |
+| `advertised_av1(probe)` | the probe's answer, from macOS 14 (M3 and later) | never | `DecodeCapabilities::av1`, so `supports_av1` and `initial_video.capabilities.av1` |
+| `software_decode_expected()` / `assess_decode_path()` | software decode is accepted but reported `software-unexpected` (warning) | `software-expected` | decode probe log, Negotiated Truth panel |
+| `native_usb_helper_supported()` | macOS 13+ (`SMAppService`) | macOS 13+ | `usb_helper_install` reports `UnsupportedOs` on macOS 12 |
+
+Software VideoToolbox decode is accepted on both: the capability probe still
+advertises only what a real decode session accepted. Rosetta never changes a
+decision — the Intel app keeps the conservative Intel answers — it only adds a
+warning to install `Arcen Deck` instead.
+
+Two presentation-timing behaviours first seen on an Intel Mac with AMD
+graphics on macOS 12 are deliberately *not* switched on the platform, because
+nothing confines them to one: frame-pacer age is measured against the display
+link's "now" rather than its future scan-out target
+(`arcen_media::presentation::pacer_clock_time`), and presented-handler
+callbacks count as presented until a drawable has ever reported
+`presentedTime` (`arcen_media::presentation::presented_frames_for_health`).
+Both follow the timestamps they are given.
+
+The profile is not on the wire. The Pier sees the Deck's real capability flags
+and `decoder_backend` (`videotoolbox-hw`/`-sw`), which already carry what it
+needs to negotiate.
+
 ## Module map (from the proven source)
 
-- `main.rs` / `lib.rs` — entry + crate root.
+- `main.rs` / `lib.rs` — entry + crate root. `arcen-deck platform-report`
+  prints the platform profile and the real decode probe without a window.
+- `platform.rs` — resolves the Deck platform profile once (see above).
 - `credentials.rs` — credential entry/storage (zeroized).
 - `clipboard.rs` — capacity-one inbound/outbound slots, host-policy mapping,
   generation-scoped UI controller, and the main-thread AppKit pasteboard adapter.
@@ -95,15 +134,18 @@ looking active while the Deck silently presents SDR.
 - `tablet/` — the default, non-experimental typed-pen capture path: `monitor.rs`
   (main-thread AppKit `NSEvent` tabletPoint/tabletProximity local-monitor RAII
   guard), `mapper.rs` (pure native-sample → `arcen_input::PenEvent` mapper),
-  `dispatch.rs` (edge-preserving/motion-coalescing bounded dispatch), `probe.rs`
-  (USB-presence + empirical axis-capability probe), `sample.rs`, `runtime.rs`
+  `dispatch.rs` (edge-preserving/motion-coalescing bounded dispatch), `presence.rs` +
+  `hid_inventory.rs` (vendor-neutral tablet presence from I/O Registry report
+  descriptors), `probe.rs` (empirical axis-capability probe), `sample.rs`, `runtime.rs`
   (`TabletRuntime` RAII), `mod.rs`. See
   [`../../docs/architecture/pen-tablet-input.md`](../../docs/architecture/pen-tablet-input.md)
   and "Tablet / pen input" below.
 - `hid/` — `iokit.rs` (raw IOKit FFI: IOHIDManager, IOHIDDevice), `session.rs`
-  (`HidSession` + `HidEvent` — runs IOHIDManager on a dedicated CFRunLoop thread, filters
-  to tablet vendors, sends DeviceAdded/DeviceRemoved/Report events upstream), `mod.rs`.
-  Filtered vendors: Wacom 0x056A, Huion 0x256c, XP-Pen 0x28bd, UC-Logic 0x5543, Gaomon 0x0b57.
+  (`HidSession` + `HidEvent` — runs IOHIDManager on a dedicated CFRunLoop thread, matches
+  digitizer usage pages for every vendor, offers an interface only if its report
+  descriptor declares a digitizer and forwards reports only from pen-declaring
+  interfaces, sends DeviceAdded/DeviceRemoved/Report events upstream), `mod.rs`. No
+  vendor id is consulted; the host classifies every descriptor again.
   **Quarantined:** `HidSession` is not started in ordinary sessions. It compiles only
   behind the default-off `experimental-raw-hid` Cargo feature and additionally
   requires a runtime opt-in (`ARCEN_EXPERIMENTAL_RAW_HID=1`) plus a mutually
@@ -284,9 +326,11 @@ points through the current video `image_rect` (accounting for AppKit's
 bottom-left origin, backing scale, letterboxing, and fullscreen transitions);
 a bounded, edge-preserving dispatcher (`tablet/dispatch.rs`) forwards
 `arcen_protocol::messages::PenEventMsg` once the host negotiates input
-protocol v3 and pen capability. No Wacom SDK or vendor HID report parsing is
-used — Wacom's own driver remains the local decoder, already installed on
-this Mac.
+protocol v3 and pen capability. No vendor SDK or vendor HID report parsing is
+used — the tablet's own driver remains the local decoder, already installed on
+this Mac, and axis conversion is the shared `arcen_input::pen_axes`. Any pen
+tablet qualifies: presence is decided from HID report descriptors
+(`tablet/presence.rs`), never from a vendor id.
 
 `tablet_input_enabled` (default `true`, see `clients/macos/SETTINGS.md`)
 gates client pen-capability advertisement; the persisted **View > Tablet
@@ -298,21 +342,24 @@ pen/eraser holds authority; disabling the setting, losing window focus,
 leaving proximity, or session teardown/reconnect all restore ordinary mouse
 handling and release any mid-contact pen state.
 
-ExpressKeys and the touch ring/strip are configured in Wacom Center on the
-client (not by Arcen) to emit ordinary keyboard/wheel input, which Deck
+Express keys and the touch ring/strip are configured in the tablet vendor's
+control panel on the client (not by Arcen) to emit ordinary keyboard/wheel input, which Deck
 already transports. Tablet multi-touch is not transported. Only one active
 tablet/tool per session is supported. Neither Linux nor Windows requires a
-Wacom driver — see the host architecture documents for their respective
+tablet vendor's driver — see the host architecture documents for their respective
 `uinput`/synthetic-pointer injection backends.
 
 ## Signing and distribution
 
-Deck is not sandboxed. `build-deck-app.sh` has three explicit, mutually
-exclusive modes and never discovers a keychain identity automatically:
-unsigned (default), `--dev-sign` (external Apple Development identity/profile,
-verified team/bundle/entitlements, never notarized), and `--release` (external
-Developer ID identity/profile/notary profile; CMS-trusted profile, hardened
-runtime, notarize, staple, Gatekeeper). `Deck.entitlements` carries only the
+Deck is not sandboxed. `build-deck-app.sh --arch arm64|x86_64` builds one app
+per architecture (`Arcen Deck.app` or `Arcen Deck Intel.app`, cross-compiling
+with `--target` as needed; see `packaging/macos/README.md`). It has explicit,
+mutually exclusive modes and never discovers a keychain identity
+automatically: unsigned (default), `--dev-sign` (external Apple Development
+identity/profile, verified team/bundle/entitlements, never notarized),
+`--developer-id-sign` (Developer ID, verified, not notarized or zipped), and
+`--release` (external Developer ID identity/profile/notary profile;
+CMS-trusted profile, hardened runtime, notarize, staple, Gatekeeper). `Deck.entitlements` carries only the
 identity keys needed to embed a profile plus two profile-authorized
 restricted capabilities: `com.apple.developer.sustained-execution` and
 `com.apple.developer.associated-domains`. App-Sandbox-only device/network keys
@@ -348,7 +395,7 @@ a Developer ID profile cannot silently be reused in development mode either.
   networking exists only behind `wss-compat`.
 - `com.apple.developer.hid.virtual.device` entitlement request to Apple (for future
   macOS Pier, not Deck) — justification text ready in `APPLE_ENTITLEMENT_REQUESTS.md`.
-- Windows Pier pen injection: decode Wacom HID reports → `SendInput(POINTER_PEN_INFO)`.
+- Windows Pier pen injection: decode pen-tablet HID reports → `SendInput(POINTER_PEN_INFO)`.
 - macOS Pier: `IOHIDUserDeviceCreate` + `IOHIDUserDeviceHandleReport` (pending Apple
   entitlement approval).
 

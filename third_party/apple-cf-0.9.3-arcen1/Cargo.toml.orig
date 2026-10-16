@@ -1,0 +1,77 @@
+[package]
+name = "apple-cf"
+version = "0.9.3"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/doom-fish/apple-cf-rs"
+repository = "https://github.com/doom-fish/apple-cf-rs"
+description = "Safe Rust bindings for Apple's shared Core* frameworks (CoreFoundation, CoreMedia, CoreVideo, CoreGraphics, IOSurface, Dispatch)."
+authors = ["Per Johansson <per@doom.fish>"]
+keywords = ["coregraphics", "iosurface", "dispatch", "macos", "apple"]
+categories = ["api-bindings", "os::macos-apis"]
+rust-version = "1.76"
+readme = "README.md"
+build = "build.rs"
+include = [
+    "src/**/*",
+    "examples/**/*",
+    "tests/**/*",
+    "swift-bridge/Package.swift",
+    "swift-bridge/Sources/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-*",
+    "CHANGELOG.md",
+]
+
+[lints.rust]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+[lib]
+name = "apple_cf"
+crate-type = ["lib"]
+
+[features]
+default = ["cg", "iosurface", "dispatch", "cm", "cv"]
+
+# Per-framework feature flags. Downstream crates can opt into only what they need.
+cg = []
+iosurface = []
+dispatch = []
+cm = []
+cv = ["iosurface"] # CVPixelBuffer's IOSurface accessor needs the IOSurface wrapper
+
+# Convenience aggregate.
+all-frameworks = ["cg", "iosurface", "dispatch", "cm", "cv"]
+
+# Deprecated: the Metal interop module moved to its own crate,
+# `apple-metal`, in v0.1.2. This feature is now a no-op and will be
+# removed in a future major release. Switch your dependency to
+# `apple-metal = "0.1"` and use `apple_metal::{MetalDevice,
+# IOSurfaceMetalExt}` instead.
+metal = []
+
+[dependencies]
+doom-fish-utils = { path = "../doom-fish-utils", version = ">=0.1, <0.4" }
+
+[dev-dependencies]
+regex-lite = "0.1"
+apple_cf_compat_04 = { package = "apple-cf", version = "0.4.0" }
+videotoolbox = "0.10.0"
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[profile.release]
+debug = "full"

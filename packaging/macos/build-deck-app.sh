@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
-# Build "Arcen Deck.app" — the macOS client bundle.
+# Build the macOS Deck bundle for one architecture.
 #
-# Compiles arcen-deck-macos in release and assembles a minimal .app around it.
-# Output: ${ARCEN_DECK_OUTPUT_DIR:-<repo>/dist/macos}/Arcen Deck.app
-# (git-ignored; regenerate any time with this script). --release also writes
-# Arcen-Deck-<version>-macOS.zip in that output directory.
+# Compiles arcen-deck-macos in release for one target architecture and
+# assembles a minimal .app around it. The Apple-silicon and Intel Decks are two
+# separate apps built from the same source:
 #
-# Usage: packaging/macos/build-deck-app.sh [--no-build] [--release | --dev-sign | --developer-id-sign]
+#   --arch arm64    dist/macos/Arcen Deck.app        Arcen-Deck-<version>-macOS.zip
+#   --arch x86_64   dist/macos/Arcen Deck Intel.app  Arcen-Deck-Intel-<version>-macOS.zip
+#
+# The output directory is ${ARCEN_DECK_OUTPUT_DIR:-<repo>/dist/macos}
+# (git-ignored; regenerate any time with this script); only --release writes
+# the zip. The architecture comes from --arch, else ARCEN_DECK_ARCH, else the
+# building Mac. Either can be built on either kind of Mac: the script always
+# passes the matching --target to cargo, so an Apple-silicon release machine
+# cross-compiles the Intel Deck and its USB helper and signs both. There is no
+# universal binary. Both apps keep the bundle ID deck.arcen.tech, the only App
+# ID with a Developer ID provisioning profile. The minimum macOS is
+# LSMinimumSystemVersion in Deck-Info.plist, which is exported as
+# MACOSX_DEPLOYMENT_TARGET and verified in the built binaries.
+#
+# Usage: packaging/macos/build-deck-app.sh [--arch arm64|x86_64] [--no-build]
+#                                          [--release | --dev-sign | --developer-id-sign]
 #
 # Four distinct, mutually exclusive assembly modes:
 #   (default)    unsigned ordinary assembly; rejects any protected input.
@@ -26,11 +40,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 OUT="${ARCEN_DECK_OUTPUT_DIR:-$REPO/dist/macos}"
-APP="$OUT/Arcen Deck.app"
 mkdir -p "$OUT"
 BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
-BIN="$BUILD_TARGET_DIR/release/arcen-deck"
 PLIST="$HERE/Deck-Info.plist"
+# The plist's promise and the binary's load command must agree, or the app
+# either refuses to launch on a supported macOS or dies in dyld on it.
+MIN_MACOS="$(plutil -extract LSMinimumSystemVersion raw "$PLIST")"
+[[ "$MIN_MACOS" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "error: unexpected LSMinimumSystemVersion '$MIN_MACOS' in $PLIST" >&2; exit 1; }
+if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ] && [ "$MACOSX_DEPLOYMENT_TARGET" != "$MIN_MACOS" ]; then
+  echo "error: MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET disagrees with LSMinimumSystemVersion $MIN_MACOS" >&2
+  exit 1
+fi
+export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
 # Hard USB is a product feature, so the helper is embedded unless someone
 # deliberately opts out with ARCEN_EMBED_USB_HELPER=0. It defaulted to off,
 # and that silently shipped a release whose Input settings read "(not
@@ -51,19 +72,58 @@ NO_BUILD=0
 RELEASE=0
 DEV_SIGN=0
 DEVELOPER_ID_SIGN=0
-for argument in "$@"; do
-  case "$argument" in
+TARGET_ARCH="${ARCEN_DECK_ARCH:-}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --no-build) NO_BUILD=1 ;;
     --release) RELEASE=1 ;;
     --dev-sign) DEV_SIGN=1 ;;
     --developer-id-sign) DEVELOPER_ID_SIGN=1 ;;
-    *) echo "error: unknown argument: $argument" >&2; exit 2 ;;
+    --arch)
+      [ "$#" -ge 2 ] || { echo "error: --arch needs a value: arm64 or x86_64" >&2; exit 2; }
+      TARGET_ARCH="$2"
+      shift
+      ;;
+    --arch=*) TARGET_ARCH="${1#--arch=}" ;;
+    *) echo "error: unknown argument: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 if [ $((RELEASE + DEV_SIGN + DEVELOPER_ID_SIGN)) -gt 1 ]; then
   echo "error: --release, --dev-sign, and --developer-id-sign are mutually exclusive" >&2
   exit 2
 fi
+
+# One architecture per app. The Intel Deck is a separate app with its own name
+# so the two can never be mistaken for each other on a download page, in
+# /Applications, or in a support report. Both keep CFBundleIdentifier
+# deck.arcen.tech: it is the only App ID with a Developer ID provisioning
+# profile carrying the Deck's entitlements. A Mac therefore runs one of them at
+# a time, and they share settings, keychain items and privacy (TCC) grants.
+if [ -z "$TARGET_ARCH" ]; then
+  TARGET_ARCH="$(uname -m)"
+fi
+case "$TARGET_ARCH" in
+  arm64|aarch64)
+    TARGET_ARCH="arm64"
+    RUST_TARGET="aarch64-apple-darwin"
+    APP_NAME="Arcen Deck"
+    ZIP_STEM="Arcen-Deck"
+    ;;
+  x86_64)
+    RUST_TARGET="x86_64-apple-darwin"
+    APP_NAME="Arcen Deck Intel"
+    ZIP_STEM="Arcen-Deck-Intel"
+    ;;
+  *)
+    echo "error: unsupported Deck architecture '$TARGET_ARCH'; expected arm64 or x86_64" >&2
+    exit 2
+    ;;
+esac
+APP="$OUT/$APP_NAME.app"
+BIN="$BUILD_TARGET_DIR/$RUST_TARGET/release/arcen-deck"
+HELPER_BIN="$BUILD_TARGET_DIR/$RUST_TARGET/release/arcen-usb-helper"
+echo "==> Deck architecture: $TARGET_ARCH ($RUST_TARGET) -> $APP_NAME.app"
 
 normalize_deck_features() {
   local RAW="${1:-}"
@@ -119,7 +179,21 @@ if [ "$NO_BUILD" -eq 0 ]; then
     "rustc $CHANNEL "*) ;;
     *) echo "error: toolchain $CHANNEL resolved to '$RESOLVED'; expected rustc $CHANNEL" >&2; exit 1 ;;
   esac
-  echo "==> building with $RESOLVED (pinned: $CHANNEL)"
+  # `rustup run` selects the pinned cargo, but cargo finds rustc on PATH, and
+  # where rustup installs no proxies (a Homebrew rustup) that is Homebrew's
+  # rustc: an unpinned compiler with only the host's standard library, so a
+  # cross-compile fails with "can't find crate for `core`". Name the pinned
+  # rustc explicitly.
+  RUSTC="$(rustup which --toolchain "$CHANNEL" rustc)"
+  export RUSTC
+  echo "==> building with $RESOLVED (pinned: $CHANNEL, $RUSTC)"
+  # Cross-compiling needs the standard library for the requested target. Say
+  # how to get it rather than letting cargo fail deep inside the first crate.
+  if ! rustup target list --installed --toolchain "$CHANNEL" | grep -qx "$RUST_TARGET"; then
+    echo "error: Rust target $RUST_TARGET is not installed for $CHANNEL." >&2
+    echo "       rustup target add --toolchain $CHANNEL $RUST_TARGET" >&2
+    exit 1
+  fi
 
   export ARCEN_BUILD_ID="${ARCEN_BUILD_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
   export ARCEN_SOURCE_REVISION="${ARCEN_SOURCE_REVISION:-$(git -C "$REPO" rev-parse --short=12 HEAD)}"
@@ -145,20 +219,44 @@ if [ "$NO_BUILD" -eq 0 ]; then
   }
   if [ "$EMBED_USB_HELPER" = "1" ]; then
     append_deck_feature "usb-hard-lab"
-    echo "==> cargo build --locked --release -p arcen-usb-helper"
-    ( cd "$REPO" && "${CARGO[@]}" build --locked --release -p arcen-usb-helper )
+    echo "==> cargo build --locked --release --target $RUST_TARGET -p arcen-usb-helper"
+    ( cd "$REPO" && "${CARGO[@]}" build --locked --release --target "$RUST_TARGET" -p arcen-usb-helper )
   fi
-  CARGO_DECK_ARGS=(build --locked --release -p arcen-deck-macos)
+  CARGO_DECK_ARGS=(build --locked --release --target "$RUST_TARGET" -p arcen-deck-macos)
   if [ -n "$DECK_FEATURES" ]; then
     CARGO_DECK_ARGS=("${CARGO_DECK_ARGS[@]}" --features "$DECK_FEATURES")
   fi
   echo "==> cargo ${CARGO_DECK_ARGS[*]}"
-  ( cd "$REPO" && bash scripts/verify-opusic-source.sh && "${CARGO[@]}" "${CARGO_DECK_ARGS[@]}" )
+  ( cd "$REPO" \
+      && bash scripts/verify-vendored-source.sh opusic-sys-0.7.3-arcen1 \
+      && bash scripts/verify-vendored-source.sh apple-cf-0.9.3-arcen1 \
+      && bash scripts/verify-vendored-source.sh videotoolbox-0.18.1-arcen1 \
+      && "${CARGO[@]}" "${CARGO_DECK_ARGS[@]}" )
 fi
 
-[ -x "$BIN" ] || { echo "error: $BIN not found; build first"; exit 1; }
+# One architecture per artefact, and a load command matching the plist.
+verify_macho_target() {
+  local BINARY="$1"
+  local ARCHS MINOS
+  ARCHS="$(lipo -archs "$BINARY")"
+  case "$ARCHS" in
+    arm64|x86_64) ;;
+    *) echo "error: $BINARY has architectures '$ARCHS'; expected exactly one of arm64 or x86_64" >&2; exit 1 ;;
+  esac
+  MINOS="$(otool -l "$BINARY" | awk '$1 == "cmd" { in_build = ($2 == "LC_BUILD_VERSION") } in_build && $1 == "minos" { print $2; exit }')"
+  if [ "$MINOS" != "$MIN_MACOS" ]; then
+    echo "error: $BINARY targets macOS '${MINOS:-unknown}'; Deck-Info.plist promises $MIN_MACOS. Rebuild." >&2
+    exit 1
+  fi
+  printf '%s' "$ARCHS"
+}
+
+[ -x "$BIN" ] || { echo "error: $BIN not found; build first (cargo build --release --target $RUST_TARGET)"; exit 1; }
 [ -f "$ENTITLEMENTS" ] || { echo "error: entitlements file not found: $ENTITLEMENTS"; exit 1; }
 python3 "$REPO/scripts/verify_quic_product_binary.py" "$BIN"
+DECK_ARCH="$(verify_macho_target "$BIN")"
+[ "$DECK_ARCH" = "$TARGET_ARCH" ] || { echo "error: $BIN is $DECK_ARCH but $TARGET_ARCH was requested" >&2; exit 1; }
+echo "==> arcen-deck: $DECK_ARCH, macOS $MIN_MACOS or later"
 if [ "$RELEASE" -eq 1 ] && strings "$BIN" | grep -F "$DEV_TOOLS_MARKER" >/dev/null; then
     echo "error: release binary contains dev-tools marker; rebuild without dev-tools in a clean target dir" >&2
     exit 1
@@ -168,6 +266,16 @@ echo "==> assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$PLIST" "$APP/Contents/Info.plist"
+# The checked-in plist describes the Apple-silicon app; the Intel app differs
+# only in its visible name.
+plutil -replace CFBundleName -string "$APP_NAME" "$APP/Contents/Info.plist"
+plutil -replace CFBundleDisplayName -string "$APP_NAME" "$APP/Contents/Info.plist"
+for KEY in CFBundleName CFBundleDisplayName; do
+  VALUE="$(plutil -extract "$KEY" raw "$APP/Contents/Info.plist")"
+  [ "$VALUE" = "$APP_NAME" ] || { echo "error: $KEY is '$VALUE', expected '$APP_NAME'" >&2; exit 1; }
+done
+BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")"
+[ "$BUNDLE_ID" = "deck.arcen.tech" ] || { echo "error: CFBundleIdentifier is '$BUNDLE_ID', expected deck.arcen.tech" >&2; exit 1; }
 cp "$BIN" "$APP/Contents/MacOS/arcen-deck"
 cp "$REPO/legal/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
 # App icon. Generated from the first-party brand mark; regenerate with
@@ -181,12 +289,13 @@ chmod +x "$APP/Contents/MacOS/arcen-deck"
 # all. SMAppService requires the plist under Contents/Library/LaunchDaemons and
 # honours BundleProgram relative to the bundle root.
 # See docs/adr/0011-macos-privileged-usb-helper.md.
-HELPER_BIN="$BUILD_TARGET_DIR/release/arcen-usb-helper"
 HELPER_PLIST="$REPO/packaging/macos/tech.arcen.deck.usbhelper.plist"
 EMBED_HELPER=0
 if [ "$EMBED_USB_HELPER" = "1" ]; then
-  [ -x "$HELPER_BIN" ] || { echo "error: helper embedding is on but $HELPER_BIN is missing; cargo build --release -p arcen-usb-helper"; exit 1; }
+  [ -x "$HELPER_BIN" ] || { echo "error: helper embedding is on but $HELPER_BIN is missing; cargo build --release --target $RUST_TARGET -p arcen-usb-helper"; exit 1; }
   [ -f "$HELPER_PLIST" ] || { echo "error: helper LaunchDaemon plist not found: $HELPER_PLIST"; exit 1; }
+  HELPER_ARCH="$(verify_macho_target "$HELPER_BIN")"
+  [ "$HELPER_ARCH" = "$DECK_ARCH" ] || { echo "error: helper is $HELPER_ARCH but Deck is $DECK_ARCH" >&2; exit 1; }
   mkdir -p "$APP/Contents/Library/LaunchDaemons"
   cp "$HELPER_BIN" "$APP/Contents/MacOS/arcen-usb-helper"
   chmod +x "$APP/Contents/MacOS/arcen-usb-helper"
@@ -322,7 +431,7 @@ run_signed_assembly() {
         spctl --assess --type execute --verbose=2 "$APP"
         echo "==> stapled — app is notarized and Gatekeeper-clean"
         DECK_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
-        RELEASE_ZIP="$OUT/Arcen-Deck-$DECK_VERSION-macOS.zip"
+        RELEASE_ZIP="$OUT/$ZIP_STEM-$DECK_VERSION-macOS.zip"
         rm -f "$RELEASE_ZIP"
         ditto -c -k --keepParent "$APP" "$RELEASE_ZIP"
         echo "==> wrote $RELEASE_ZIP"
@@ -343,13 +452,13 @@ if [ "$RELEASE" -eq 0 ] && [ "$DEV_SIGN" -eq 0 ] && [ "$DEVELOPER_ID_SIGN" -eq 0
         exit 1
     fi
     echo "    UNSIGNED. Fine on this machine; Gatekeeper will reject it anywhere else."
-    echo "    A copy sent to someone else opens as \"Arcen Deck.app is damaged and"
+    echo "    A copy sent to someone else opens as \"$APP_NAME.app is damaged and"
     echo "    can't be opened\", because it is quarantined and not notarized."
     echo "    For anything you hand to another person, build with --release:"
     echo "      ARCEN_PROVISIONING_PROFILE=<profile> \\"
     echo "      ARCEN_CODESIGN_IDENTITY=<Developer ID Application: ...> \\"
     echo "      ARCEN_NOTARY_KEYCHAIN_PROFILE=<notary profile> \\"
-    echo "        packaging/macos/build-deck-app.sh --release"
+    echo "        packaging/macos/build-deck-app.sh --arch $TARGET_ARCH --release"
 elif [ "$DEV_SIGN" -eq 1 ]; then
     [ -n "$DEV_PROFILE" ] && [ -f "$DEV_PROFILE" ] || {
         echo "error: --dev-sign requires an external ARCEN_DEV_PROVISIONING_PROFILE file" >&2

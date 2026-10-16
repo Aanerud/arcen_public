@@ -528,7 +528,7 @@ pub struct ConnectOptions {
     /// Local persisted opt-in for typed tablet/pen input (AppKit
     /// `NSEventTypeTabletPoint`/`NSEventTypeTabletProximity` local
     /// termination). Advertised pen capability in `ClientHello` is always
-    /// `Unavailable` when this is false, regardless of actual Wacom
+    /// `Unavailable` when this is false, regardless of actual tablet
     /// presence, so the host never expects — and the typed path never
     /// activates — pen input the user has turned off.
     pub tablet_input_enabled: bool,
@@ -2051,7 +2051,7 @@ async fn run_session_correlated(
             validate_server_transport(&options, &server_hello)?;
             validate_server_region_input(&options, &server_hello)?;
             #[cfg(feature = "usb-hard-lab")]
-            if options.tablet_mode_requested == TabletModeMsg::WacomUsbBridge {
+            if options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge {
                 if !server_hello.usb_hard_v1 {
                     tracing::warn!(
                         target: crate::logging::target::TRANSPORT,
@@ -4124,39 +4124,28 @@ fn validate_server_region_input(
 }
 
 /// Truthful input capability report for this connection attempt. Region
-/// input-v1 is always available in this Deck build; `pen` (and
-/// every per-axis field, mirrored to the same value — see below) is
-/// `Available` only when the user has left typed tablet input enabled *and*
-/// this Mac currently has Wacom vendor USB presence
-/// ([`crate::tablet::wacom_usb_presence`]); `Unavailable` when the setting is
-/// off (an explicit, honest "no" rather than the default `Unknown`); and
-/// whatever [`crate::tablet::wacom_usb_presence`] itself reports otherwise
-/// (`Unavailable` when no such device is enumerated, `Unknown` if USB
-/// enumeration itself failed).
+/// input-v1 is always available in this Deck build; `pen` (and every per-axis
+/// field, mirrored to the same value) is [`crate::tablet::typed_pen_capability`]:
+/// `Available` whenever the user has left typed tablet input enabled on a
+/// macOS Deck, `Unavailable` when the setting is off.
 ///
-/// `ClientHello` is a one-shot handshake sent before the AppKit tablet
-/// monitor has observed a single live sample, so there is no empirical
-/// per-axis truth yet (unlike `crate::tablet::TabletCapabilityProbe`, which
-/// only ever raises a claim after seeing real nonzero samples). Mirroring
-/// the overall `pen` value onto every per-axis field here is a deliberate,
-/// documented simplification: it is never falsely optimistic (a Mac with no
-/// Wacom driver reports `Unavailable`/`Unknown` everywhere), and any
-/// axis-level refinement happens later, locally, in the in-session Tablet
-/// Monitor diagnostic panel — it is not re-sent over the wire mid-session.
+/// It deliberately does **not** depend on whether a tablet is attached right
+/// now ([`crate::tablet::tablet_presence`]). Typed pen samples come from
+/// AppKit tablet events, which any tablet driver produces; the hello cannot be
+/// renegotiated mid-session, so tying the capability to presence left a
+/// tablet plugged in after connecting (or one whose HID descriptors the
+/// registry does not publish) without pressure until a reconnect. Advertising
+/// it with no tablet attached sends nothing: the host merely keeps its typed
+/// pen path ready. A 0.15 host treats this exactly as it treated a Deck with a
+/// tablet attached.
+///
+/// Mirroring the overall `pen` value onto every per-axis field is a
+/// deliberate, documented simplification: `ClientHello` is a one-shot
+/// handshake with no empirical per-axis truth yet, and any axis-level
+/// refinement happens later, locally, in the in-session Tablet Monitor
+/// diagnostic panel — it is not re-sent over the wire mid-session.
 fn macos_input_capabilities(tablet_input_enabled: bool) -> InputCapabilitiesMsg {
-    let pen = if tablet_input_enabled {
-        match crate::tablet::wacom_usb_presence() {
-            arcen_input::CapabilityAvailability::Available => {
-                InputCapabilityAvailability::Available
-            }
-            arcen_input::CapabilityAvailability::Unavailable => {
-                InputCapabilityAvailability::Unavailable
-            }
-            arcen_input::CapabilityAvailability::Unknown => InputCapabilityAvailability::Unknown,
-        }
-    } else {
-        InputCapabilityAvailability::Unavailable
-    };
+    let pen = protocol_availability(crate::tablet::typed_pen_capability(tablet_input_enabled));
     InputCapabilitiesMsg {
         absolute_pointer: InputCapabilityAvailability::Available,
         relative_pointer: InputCapabilityAvailability::Available,
@@ -4172,27 +4161,30 @@ fn macos_input_capabilities(tablet_input_enabled: bool) -> InputCapabilitiesMsg 
     }
 }
 
-fn macos_tablet_mode_capabilities(tablet_input_enabled: bool) -> TabletModeCapabilitiesMsg {
-    let local = if tablet_input_enabled {
-        match crate::tablet::wacom_usb_presence() {
-            arcen_input::CapabilityAvailability::Available => {
-                InputCapabilityAvailability::Available
-            }
-            arcen_input::CapabilityAvailability::Unavailable => {
-                InputCapabilityAvailability::Unavailable
-            }
-            arcen_input::CapabilityAvailability::Unknown => InputCapabilityAvailability::Unknown,
+const fn protocol_availability(
+    availability: arcen_input::CapabilityAvailability,
+) -> InputCapabilityAvailability {
+    match availability {
+        arcen_input::CapabilityAvailability::Available => InputCapabilityAvailability::Available,
+        arcen_input::CapabilityAvailability::Unavailable => {
+            InputCapabilityAvailability::Unavailable
         }
-    } else {
-        InputCapabilityAvailability::Unavailable
-    };
+        arcen_input::CapabilityAvailability::Unknown => InputCapabilityAvailability::Unknown,
+    }
+}
+
+/// Tablet-mode capabilities: local termination follows
+/// [`crate::tablet::typed_pen_capability`] (never tablet presence, see
+/// [`macos_input_capabilities`]).
+fn macos_tablet_mode_capabilities(tablet_input_enabled: bool) -> TabletModeCapabilitiesMsg {
+    let local = protocol_availability(crate::tablet::typed_pen_capability(tablet_input_enabled));
     TabletModeCapabilitiesMsg {
         local_termination: local,
         // Physical Hard USB ownership is independent of the local AppKit
         // typed-pen setting. A feature build advertises this capability only
         // after capture succeeds and exact device metadata is attached to the
         // same ClientHello.
-        wacom_usb_bridge: if cfg!(feature = "usb-hard-lab") {
+        usb_tablet_bridge: if cfg!(feature = "usb-hard-lab") {
             InputCapabilityAvailability::Available
         } else {
             InputCapabilityAvailability::Unavailable
@@ -5232,7 +5224,7 @@ fn hid_error_remedy(reason_class: &str) -> Option<&'static str> {
     match reason_class {
         "exclusive_access" => Some(
             "another process holds the tablet right now; restart the vendor driver \
-             (e.g. Wacom's TabletDriver) or unplug and replug the tablet, then reconnect",
+             (its tablet driver) or unplug and replug the tablet, then reconnect",
         ),
         "permission_denied" | "not_permitted" => Some(
             "grant Arcen Deck access under System Settings > Privacy & Security > \
@@ -7475,10 +7467,70 @@ mod tests {
         assert!(!debug.contains("dummy-password"));
     }
 
+    /// The reviewed regression: on a Mac whose HID registry describes no pen
+    /// tablet (this test machine has none attached) and before any pen sample,
+    /// the hello still offers typed pen, so a tablet used later in the
+    /// session gets pressure without a reconnect.
+    #[test]
+    fn typed_pen_is_advertised_without_tablet_presence() {
+        let expected = if cfg!(target_os = "macos") {
+            InputCapabilityAvailability::Available
+        } else {
+            InputCapabilityAvailability::Unavailable
+        };
+        let input = macos_input_capabilities(true);
+        assert_eq!(input.pen, expected);
+        assert_eq!(input.pen_pressure, expected);
+        assert_eq!(
+            macos_tablet_mode_capabilities(true).local_termination,
+            expected
+        );
+        assert_eq!(
+            macos_input_capabilities(false).pen,
+            InputCapabilityAvailability::Unavailable
+        );
+        assert_eq!(
+            macos_tablet_mode_capabilities(false).local_termination,
+            InputCapabilityAvailability::Unavailable
+        );
+    }
+
+    /// A 0.15 host resolves the advertised capability with the same shared
+    /// rule as before: typed pen is accepted when the host can inject it.
+    #[test]
+    fn a_0_15_host_accepts_the_advertised_typed_pen_capability() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let client = macos_tablet_mode_capabilities(true);
+        let resolved = arcen_input::resolve_tablet_mode(
+            arcen_input::TabletMode::LocalTermination,
+            arcen_input::CapabilityAvailability::Available,
+            arcen_input::CapabilityAvailability::Available,
+            match client.usb_tablet_bridge {
+                InputCapabilityAvailability::Available => {
+                    arcen_input::CapabilityAvailability::Available
+                }
+                _ => arcen_input::CapabilityAvailability::Unavailable,
+            },
+            arcen_input::CapabilityAvailability::Unavailable,
+        );
+        assert_eq!(
+            client.local_termination,
+            InputCapabilityAvailability::Available
+        );
+        assert!(resolved.accepted);
+        assert_eq!(resolved.active, arcen_input::TabletMode::LocalTermination);
+        // The 0.15 wire shape is unchanged.
+        let json = serde_json::to_value(client).unwrap();
+        assert_eq!(json["local_termination"], "available");
+        assert!(json.get("wacom_usb_bridge").is_some());
+    }
+
     #[test]
     fn hard_usb_capability_does_not_depend_on_local_typed_pen_setting() {
         assert_eq!(
-            macos_tablet_mode_capabilities(false).wacom_usb_bridge,
+            macos_tablet_mode_capabilities(false).usb_tablet_bridge,
             if cfg!(feature = "usb-hard-lab") {
                 InputCapabilityAvailability::Available
             } else {

@@ -32,7 +32,7 @@ impl TabletRuntime {
     /// `None` if this is not macOS, or if AppKit refuses to install the
     /// monitor (rare — e.g. no run loop yet), or if called off the main
     /// thread; callers should treat `None` as "no typed pen capture this
-    /// run", not as an error to surface to the user (Wacom mouse-emulation
+    /// run", not as an error to surface to the user (the tablet driver's mouse-emulation
     /// fallback remains fully functional either way).
     ///
     /// `wake` runs on the main thread after each queued sample, so the UI

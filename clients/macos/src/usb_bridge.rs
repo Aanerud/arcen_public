@@ -8,11 +8,12 @@
 //! See `docs/adr/0011-macos-privileged-usb-helper.md`.
 
 use arcen_input::{PenEvent, PenTool};
-use arcen_protocol::messages::UsbHardDeviceMsg;
+use arcen_protocol::messages::{UsbHardDeviceMsg, UsbHidReportDescriptorMsg};
 use arcen_protocol::{encode_usb_urb_complete, UsbUrbCompletionHeader, UsbUrbSubmitHeader};
 use arcen_usb_bridge::{
     ControlResponse, PenSample, PenSwitch, PenSwitches, SyntheticTabletDevice, TransferDirection,
     TransferKind, UrbId, UrbStatus, UsbSpeed, ARCEN_LAB_PRODUCT_ID, ARCEN_LAB_VENDOR_ID,
+    SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
 };
 
 /// Result of admitting one host URB.
@@ -69,7 +70,7 @@ impl UsbHardResponder {
     }
 
     #[must_use]
-    pub const fn device(&self) -> UsbHardDeviceMsg {
+    pub fn device(&self) -> UsbHardDeviceMsg {
         match &self.mode {
             ResponderMode::Synthetic(_) => UsbHardDeviceMsg {
                 vendor_id: ARCEN_LAB_VENDOR_ID,
@@ -77,6 +78,10 @@ impl UsbHardResponder {
                 bcd_device: 0x0100,
                 device_class: 0,
                 speed: UsbSpeed::High,
+                hid_report_descriptors: vec![UsbHidReportDescriptorMsg::new(
+                    0,
+                    SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
+                )],
             },
             ResponderMode::Helper(client) => client.device(),
         }

@@ -98,20 +98,27 @@ Fresh-install video defaults are **Standard performance** (30 fps ceiling) and
 
 `tablet_mode_requested` stores the per-connection tablet mode:
 `local_termination` (default), `wacom_usb_bridge`, or `disabled_mouse_compat`.
+`wacom_usb_bridge` is the 0.15 spelling of Native tablet, still written so an
+older Deck can read the file; Deck also accepts the neutral
+`usb_tablet_bridge` on load. Neither spelling is tied to a tablet maker.
 Deck still persists `tablet_input_enabled` for legacy readers, but it is derived
 from mode (`true` only for `local_termination`). Mode changes require reconnect.
 The Add/Edit Connection screen owns the saved connection's value; the Advanced
 setting updates the active or last-selected saved connection.
 
 - **Tablet support** (`local_termination`): recommended for WAN and ordinary
-  remote-work connections. It activates when Deck detects the tablet and both
-  peers prove input-v3 pen support. The Wacom driver is required on this Mac
-  only; the tablet remains usable locally.
-- **Native tablet mode** (`wacom_usb_bridge`): explicit LAN/KVM opt-in for future
-  host-driver communication. It requires Wacom drivers on both this Mac and the
-  host plus a complete USB bridge backend. Current hosts reject it with an
-  explicit reason and keep the active mode at mouse compatibility; they never
-  substitute Tablet support.
+  remote-work connections. It activates when both peers prove input-v3 pen
+  support; the Deck offers it whether or not a tablet is attached when you
+  connect, so a tablet of any make plugged in (or first used) later in the
+  session works without reconnecting. The tablet's own driver, if its maker ships one, is needed on this
+  Mac only; the tablet remains usable locally.
+- **Native tablet mode** (`wacom_usb_bridge`): explicit LAN/KVM opt-in that
+  bridges the physical tablet to the host over USB so the host's own driver
+  for it takes over. It is offered for any device whose HID report descriptors
+  classify as a pen tablet, and needs a host with a complete USB bridge backend
+  (today only lab builds of the Linux Pier). Hosts without one reject it with
+  an explicit reason and keep the active mode at mouse compatibility; they
+  never substitute Tablet support.
 - **Mouse compatibility only** (`disabled_mouse_compat`): disables tablet
   redirection and keeps ordinary mouse behavior, with no tablet dependencies.
 

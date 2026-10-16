@@ -1,14 +1,20 @@
 # macOS Deck Packaging
 
-`build-deck-app.sh` builds `arcen-deck-macos` and assembles
-`dist/macos/Arcen Deck.app` using the checked-in plist and entitlements. It has three explicit,
-mutually exclusive modes and never discovers or ranks keychain identities:
+`build-deck-app.sh` builds `arcen-deck-macos` for one architecture and
+assembles `dist/macos/Arcen Deck.app` (Apple silicon) or
+`dist/macos/Arcen Deck Intel.app` (Intel) using the checked-in plist and
+entitlements (see [Architecture and minimum macOS](#architecture-and-minimum-macos)).
+Besides the default unsigned assembly it has three explicit, mutually
+exclusive signing modes and never discovers or ranks keychain identities:
 
 - **Unsigned** (default): rejects any protected release or development input.
 - **`--dev-sign`**: explicit local development signing. Requires external
   `ARCEN_DEV_PROVISIONING_PROFILE` and `ARCEN_DEV_CODESIGN_IDENTITY` (an Apple
   Development identity/profile). Verifies team/bundle/entitlements the same
   way release does, but never notarizes, staples, or runs Gatekeeper.
+- **`--developer-id-sign`**: explicit local Developer ID signing with the
+  release profile and identity, verified like `--release` but not notarized
+  and not zipped. For same-machine testing of Developer ID-only permissions.
 - **`--release`**: explicit Developer ID release signing. Requires external
   `ARCEN_PROVISIONING_PROFILE`, `ARCEN_CODESIGN_IDENTITY`, and
   `ARCEN_NOTARY_KEYCHAIN_PROFILE`.
@@ -73,6 +79,77 @@ and inspect the bundle but does not claim a
 Developer ID signature, notarization, or staple; release provenance, upgrades,
 and uninstall behavior remain Release/Security work.
 
+
+## Architecture and minimum macOS
+
+Apple silicon and Intel Macs get two separate apps, built from the same source
+by the same script. There is no universal binary.
+
+| `--arch` | App | Release zip |
+| --- | --- | --- |
+| `arm64` | `Arcen Deck.app` | `Arcen-Deck-<version>-macOS.zip` |
+| `x86_64` | `Arcen Deck Intel.app` | `Arcen-Deck-Intel-<version>-macOS.zip` |
+
+The architecture comes from `--arch arm64|x86_64` (or `--arch=…`), else
+`ARCEN_DECK_ARCH`, else the building Mac (`uname -m`). The script always passes
+the matching `--target` (`aarch64-apple-darwin` or `x86_64-apple-darwin`) to
+cargo for both the Deck and the USB helper, so binaries land in
+`target/<triple>/release/` and either app can be built on either kind of Mac.
+The release machine is Apple silicon: it cross-compiles the Intel Deck and
+signs, notarizes and staples both apps in one place:
+
+```sh
+rustup target add --toolchain 1.96.1 x86_64-apple-darwin   # once
+packaging/macos/build-deck-app.sh --arch arm64 --release
+packaging/macos/build-deck-app.sh --arch x86_64 --release
+```
+
+A missing Rust target stops the build with the `rustup target add` command to
+run. `--no-build` reads the binaries from `target/<triple>/release/` too.
+
+The Intel app differs from the Apple-silicon app only in its binaries and in
+`CFBundleName`/`CFBundleDisplayName` ("Arcen Deck Intel"), which the script
+writes into the bundle's copy of `Deck-Info.plist` and verifies. Both keep
+`CFBundleIdentifier` `deck.arcen.tech`, because that is the only App ID with a
+Developer ID provisioning profile carrying the Deck's entitlements (Hard USB
+and virtual HID included); the profile must list every certificate that signs
+with it. The consequence: macOS treats the two apps as one application. Install
+and run one of them per Mac. They share settings and saved connections
+(`~/Library/Application Support/Arcen`), keychain items, and privacy (TCC)
+grants such as Microphone, and with both installed Launch Services may open
+either copy. An Intel Deck run under Rosetta on Apple
+silicon works but logs a warning to install `Arcen Deck` instead.
+
+`LSMinimumSystemVersion` in `Deck-Info.plist` (12.0) is the single source for
+the minimum macOS. The script exports it as `MACOSX_DEPLOYMENT_TARGET`, and it
+refuses a conflicting value in the environment. After building, it requires
+that the Deck and the embedded USB helper each carry exactly one architecture,
+the one requested, and an `LC_BUILD_VERSION` `minos` equal to the plist
+value. Without this, Rust picks its own default and the app either refuses a
+supported macOS or dies in dyld on it.
+
+Two crates are path-patched in `third_party/` so the Deck loads on macOS 12 and
+builds with the Swift 5.7 toolchain of the last Xcode macOS 12 supports.
+`apple-cf` compiles its Swift bridge with `swiftc` for the target architecture
+Cargo is building for and the deployment target (for example
+`x86_64-apple-macosx12.0` when cross-compiling the Intel Deck), and
+`videotoolbox` decodes through `VTDecompressionSessionDecodeFrame` rather than a
+newer entry point. Each directory's `ARCEN_NOTICE.md` lists the changes, and
+`scripts/verify-vendored-source.sh` checks each tree against its manifest
+before every build.
+
+Native tablet (Hard USB) installs its helper with `SMAppService`, which needs
+macOS 13. On macOS 12 the Deck never calls it; the Input settings show
+"Requires macOS 13" and Tablet support remains available.
+
+What differs between the two apps at run time is decided in one place, the
+Deck platform profile (`arcen_media::deck_platform`, see
+[`clients/macos/ARCHITECTURE.md`](../../clients/macos/ARCHITECTURE.md#deck-platform-profile)).
+On an Intel Mac, VideoToolbox may decode in software when the GPU has no
+decoder for the stream; that is expected there. The Deck's capability probe
+advertises only what a real decode session accepted, so the Pier negotiates
+within it, and the Intel Deck never advertises AV1. `arcen-deck
+platform-report` prints the profile and the probe without opening a window.
 
 Building, signing and notarizing the Pier package, and the install-time
 traps that go with it, are documented in

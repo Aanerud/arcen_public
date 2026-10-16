@@ -77,7 +77,7 @@ impl TabletModeNegotiationReason {
                 "local tablet termination unavailable: host pen backend did not initialize"
             }
             Self::NativeTabletUnavailable => {
-                "Native tablet (USB bridged) is unavailable on this host: it needs a USB virtualization backend and a host Wacom driver. Use Tablet support instead; it needs no host driver and works over any network."
+                "Native tablet (USB bridged) is unavailable on this host: it needs a USB virtualization backend and a host driver for the tablet. Use Tablet support instead; it needs no host driver and works over any network."
             }
             Self::MouseCompatibilityUnavailable => {
                 "mouse compatibility mode negotiation failed unexpectedly"
@@ -145,13 +145,14 @@ pub const fn resolve_tablet_mode(
     requested: TabletMode,
     client_local_termination: CapabilityAvailability,
     host_local_termination: CapabilityAvailability,
-    client_wacom_usb_bridge: CapabilityAvailability,
-    host_wacom_usb_bridge: CapabilityAvailability,
+    client_usb_tablet_bridge: CapabilityAvailability,
+    host_usb_tablet_bridge: CapabilityAvailability,
 ) -> ResolvedTabletMode {
     let local_termination =
         super::mutual_capability(client_local_termination, host_local_termination);
-    let wacom_usb_bridge = super::mutual_capability(client_wacom_usb_bridge, host_wacom_usb_bridge);
-    let negotiation = super::negotiate_tablet_mode(requested, local_termination, wacom_usb_bridge);
+    let usb_tablet_bridge =
+        super::mutual_capability(client_usb_tablet_bridge, host_usb_tablet_bridge);
+    let negotiation = super::negotiate_tablet_mode(requested, local_termination, usb_tablet_bridge);
     let reason = if negotiation.accepted {
         TabletModeNegotiationReason::Accepted
     } else {
@@ -164,7 +165,7 @@ pub const fn resolve_tablet_mode(
             TabletMode::LocalTermination => {
                 TabletModeNegotiationReason::HostLocalTerminationUnavailable
             }
-            TabletMode::WacomUsbBridge => TabletModeNegotiationReason::NativeTabletUnavailable,
+            TabletMode::UsbTabletBridge => TabletModeNegotiationReason::NativeTabletUnavailable,
             TabletMode::DisabledMouseCompat => {
                 TabletModeNegotiationReason::MouseCompatibilityUnavailable
             }
@@ -175,7 +176,7 @@ pub const fn resolve_tablet_mode(
         active: negotiation.active,
         accepted: negotiation.accepted,
         reason,
-        reconnect_required: matches!(requested, TabletMode::WacomUsbBridge)
+        reconnect_required: matches!(requested, TabletMode::UsbTabletBridge)
             && !negotiation.accepted,
     }
 }
@@ -198,7 +199,7 @@ mod tests {
     #[test]
     fn native_tablet_never_substitutes_local_termination() {
         let resolved = resolve_tablet_mode(
-            TabletMode::WacomUsbBridge,
+            TabletMode::UsbTabletBridge,
             CapabilityAvailability::Available,
             CapabilityAvailability::Available,
             CapabilityAvailability::Available,

@@ -1,5 +1,5 @@
-//! Experimental raw-HID-over-IP passthrough for supported drawing tablets
-//! (Wacom, Huion, XP-Pen, UC-Logic, Gaomon).
+//! Experimental raw-HID-over-IP passthrough for pen tablets of any make: HID
+//! interfaces whose report descriptor declares a digitizer.
 //!
 //! # Quarantine (SEC-raw-hid)
 //!
@@ -16,8 +16,8 @@
 //! Default builds and old peers must never send or accept raw HID data. This
 //! module captures raw IOHID input reports directly from the local HID
 //! subsystem — it is not, and must never be described as, "USB bridging":
-//! no USB transport/enumeration is exposed or forwarded, only vendor-scoped
-//! HID input reports for a small allow-listed set of tablet vendors.
+//! no USB transport/enumeration is exposed or forwarded, only HID input
+//! reports from interfaces whose descriptor declares a pen.
 #[cfg(target_os = "macos")]
 pub mod iokit;
 pub mod session;

@@ -7,9 +7,11 @@
 
 use arcen_protocol::{encode_usb_urb_complete, UsbUrbCompletionHeader, UsbUrbSubmitHeader};
 use arcen_usb_bridge::{
-    evaluate_profile, AlternateSetting, AttachmentGeneration, DeviceProfile, DeviceSnapshot,
-    EndpointAddress, EndpointDescriptor, InterfaceDescriptor, InterfaceNumber, InterfaceRule,
-    ParsedConfiguration, TransferDirection, TransferKind, UrbId, UrbStatus, UsbDeviceId, UsbSpeed,
+    authorize_hard_usb_tablet, evaluate_profile, hid_report_descriptor_length,
+    hid_report_descriptor_request, AlternateSetting, AttachmentGeneration, DeviceProfile,
+    DeviceSnapshot, EndpointAddress, EndpointDescriptor, HardUsbTabletDenial, InterfaceDescriptor,
+    InterfaceNumber, InterfaceReportDescriptor, InterfaceRule, ParsedConfiguration,
+    PenTabletProfile, TransferDirection, TransferKind, UrbId, UrbStatus, UsbDeviceId, UsbSpeed,
     MAX_ENDPOINTS, MAX_INTERFACES, MAX_IN_FLIGHT_URBS,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,22 +20,24 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const WACOM_VENDOR_ID: u16 = 0x056a;
 /// Interface class every bridged interface must report.
 ///
-/// This is the invariant that replaced pinning one product id. A vendor id is
-/// only a claim -- anything can assert Wacom's -- so admissibility rests on
-/// what the device *is*: every interface must be HID. Combined with
+/// A vendor id is only a claim -- anything can assert any vendor's -- so
+/// admissibility rests on what the device *is*: every interface must be HID,
+/// and the HID report descriptors must classify as a pen tablet
+/// (`arcen_usb_bridge::classify_pen_tablet`). Combined with
 /// `evaluate_profile`'s permanently-prohibited class list, that keeps storage,
-/// hubs, smartcard and wireless-controller devices out of the bridge no matter
-/// what identity they present.
+/// hubs, smartcard and wireless-controller devices, and every keyboard, mouse
+/// and gamepad, out of the bridge no matter what identity they present.
 const USB_CLASS_HID: u8 = 0x03;
-/// Reported when no Wacom-vendor device is present at all.
+/// How long one report-descriptor read may take before the device is skipped.
+const REPORT_DESCRIPTOR_TIMEOUT: Duration = Duration::from_millis(500);
+/// Reported when no attached device classifies as a pen tablet.
 ///
 /// Distinct from an inadmissible device, because absence is the ordinary case
 /// for a user who left the tablet on another desk, and the client turns it into
 /// a quiet downgrade rather than a failure.
-pub const NO_TABLET_ATTACHED: &str = "no Wacom tablet is attached";
+pub const NO_TABLET_ATTACHED: &str = "no pen tablet is attached";
 const USB_REQUEST_CLEAR_FEATURE: u8 = 1;
 const USB_REQUEST_SET_ADDRESS: u8 = 5;
 const USB_REQUEST_SET_CONFIGURATION: u8 = 9;
@@ -47,13 +51,17 @@ const USB_RECIPIENT_MASK: u8 = 0x1f;
 const USB_FEATURE_ENDPOINT_HALT: u16 = 0;
 
 /// Identity of the captured device, reported to Deck at handshake.
-#[derive(Debug, Clone, Copy)]
+///
+/// Vendor and product ids are informational. The report descriptors are what
+/// made the device admissible, and the host classifies them again itself.
+#[derive(Debug, Clone)]
 pub struct DeviceIdentity {
     pub vendor_id: u16,
     pub product_id: u16,
     pub bcd_device: u16,
     pub device_class: u8,
     pub speed: UsbSpeed,
+    pub report_descriptors: Vec<InterfaceReportDescriptor>,
 }
 
 /// Numeric encoding of [`UsbSpeed`] for the handshake frame.
@@ -143,58 +151,108 @@ struct UrbState {
 }
 
 impl PhysicalDevice {
-    /// Captures an attached Wacom tablet.
+    /// Captures an attached pen tablet, whoever made it.
     ///
-    /// Any device presenting Wacom's vendor id is considered, rather than one
-    /// hard-coded model: the tablet on a user's desk is not the tablet the
-    /// bridge happened to be developed against. Admissibility is decided by
-    /// [`admissible_tablet`] -- every interface must be HID -- and by
-    /// `evaluate_profile`'s prohibited-class rules, both evaluated here in the
-    /// privileged process from descriptors it read itself. Deck is not trusted
-    /// to assert any of it.
+    /// Every attached device whose interfaces are all HID is considered.
+    /// Admissibility is decided here, in the privileged process, from
+    /// descriptors it reads itself: [`admissible_tablet`] (every interface is
+    /// HID), the HID report descriptors classified by
+    /// `arcen_usb_bridge::classify_pen_tablet` (a pen digitizer, not a
+    /// keyboard, mouse, gamepad or vendor-only device), and
+    /// `evaluate_profile`'s prohibited-class rules. Deck is not trusted to
+    /// assert any of it, and no vendor or product id is consulted.
     ///
-    /// When several Wacom devices are attached, the first admissible one wins,
-    /// so an inadmissible companion device does not mask a usable tablet.
+    /// Report descriptors come from the I/O Registry (`IOHIDDevice`
+    /// `ReportDescriptor`), which opens nothing and sends no request, so
+    /// examining a keyboard or mouse does not touch it at all. A USB
+    /// `GET_DESCRIPTOR(Report)` request is sent only for an interface the
+    /// registry left undescribed, on a device the registry already shows to
+    /// be a digitizer and that has no boot-keyboard interface
+    /// ([`crate::registry::fallback_plan`]). Only the admitted tablet is
+    /// captured.
+    ///
+    /// When several tablets are attached, the first admissible one wins, so an
+    /// inadmissible companion device does not mask a usable tablet.
     ///
     /// # Errors
     ///
-    /// Returns a message when no Wacom device is attached, when none of the
-    /// attached ones is admissible, or when the process lacks the privilege to
-    /// capture it.
+    /// Returns [`NO_TABLET_ATTACHED`] when no attached device classifies as a
+    /// pen tablet, a message when a pen tablet is attached but inadmissible,
+    /// or when the process lacks the privilege to capture it.
     pub fn capture() -> Result<Self, String> {
         use rusb::UsbContext;
 
         let context = rusb::Context::new().map_err(|error| error.to_string())?;
         let devices = context.devices().map_err(|error| error.to_string())?;
-        let candidates = devices
-            .iter()
-            .filter(|device| {
-                device
-                    .device_descriptor()
-                    .is_ok_and(|descriptor| descriptor.vendor_id() == WACOM_VENDOR_ID)
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Err(NO_TABLET_ATTACHED.to_owned());
-        }
+        let registry = crate::registry::hid_devices()
+            .ok_or_else(|| "read HID report descriptors from the I/O Registry".to_owned())?;
 
         let mut rejections: Vec<String> = Vec::new();
-        let mut admitted: Option<(rusb::Device<rusb::Context>, DeviceSnapshot, UsbSpeed)> = None;
-        for device in candidates {
-            match examine_candidate(&device) {
-                Ok((snapshot, speed)) => {
-                    admitted = Some((device, snapshot, speed));
+        let mut admitted: Option<(rusb::Device<rusb::Context>, Candidate)> = None;
+        for device in devices.iter() {
+            // A location is needed only to tell two identical devices apart;
+            // with one, identity alone is unambiguous and does not depend on
+            // reconstructing macOS's location id from libusb's port path.
+            let identical = devices
+                .iter()
+                .filter(
+                    |other| match (other.device_descriptor(), device.device_descriptor()) {
+                        (Ok(a), Ok(b)) => {
+                            a.vendor_id() == b.vendor_id() && a.product_id() == b.product_id()
+                        }
+                        _ => false,
+                    },
+                )
+                .count();
+            match examine_candidate(&device, &registry, identical > 1) {
+                Ok(candidate) => {
+                    admitted = Some((device, candidate));
                     break;
                 }
-                Err(reason) => rejections.push(reason),
+                Err(CandidateRejection::NotATablet) => {}
+                Err(CandidateRejection::Inadmissible(reason)) => rejections.push(reason),
             }
         }
-        let Some((device, snapshot, speed)) = admitted else {
+        let Some((device, candidate)) = admitted else {
+            if rejections.is_empty() {
+                return Err(NO_TABLET_ATTACHED.to_owned());
+            }
             return Err(format!(
-                "no attached Wacom device is admissible: {}",
+                "no attached pen tablet is admissible: {}",
                 rejections.join("; ")
             ));
         };
+        let Candidate {
+            snapshot,
+            speed,
+            report_descriptors,
+            profile,
+        } = candidate;
+        // Checked before the device is opened or detached: a handshake that
+        // cannot be sent must not cost the user their tablet.
+        if !crate::frame::hello_fits(
+            report_descriptors
+                .iter()
+                .map(|entry| entry.descriptor.len()),
+        ) {
+            return Err(format!(
+                "pen tablet {:04x}:{:04x}: its report descriptors do not fit the helper \
+                 handshake; it cannot be bridged (use Tablet support)",
+                snapshot.id.vendor_id, snapshot.id.product_id
+            ));
+        }
+        eprintln!(
+            "arcen-usb-helper: pen tablet {:04x}:{:04x} admitted: evidence={:?} \
+             pressure_levels={:?} tilt={} twist={} eraser={} barrel_buttons={}",
+            snapshot.id.vendor_id,
+            snapshot.id.product_id,
+            profile.evidence,
+            profile.capabilities.pressure_levels(),
+            profile.capabilities.has_tilt(),
+            profile.capabilities.twist.is_some(),
+            profile.capabilities.eraser,
+            profile.capabilities.barrel_buttons,
+        );
 
         let handle = device
             .open()
@@ -230,6 +288,7 @@ impl PhysicalDevice {
             bcd_device: snapshot.id.bcd_device,
             device_class: snapshot.device_class,
             speed,
+            report_descriptors,
         };
         // Bounded, because this is a root process and the queue is fed by
         // worker threads a connected client can start. At most
@@ -256,8 +315,8 @@ impl PhysicalDevice {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> DeviceIdentity {
-        self.identity
+    pub const fn identity(&self) -> &DeviceIdentity {
+        &self.identity
     }
 
     /// Admits one URB and starts it on a worker thread.
@@ -701,28 +760,137 @@ fn parsed_configuration(
     })
 }
 
+/// One device that passed every admissibility check.
+struct Candidate {
+    snapshot: DeviceSnapshot,
+    speed: UsbSpeed,
+    report_descriptors: Vec<InterfaceReportDescriptor>,
+    profile: PenTabletProfile,
+}
+
+/// Why a device was not admitted.
+enum CandidateRejection {
+    /// Not a pen tablet at all: skipped silently, like any other peripheral.
+    NotATablet,
+    /// A pen tablet that failed a bridge invariant: reported to the user.
+    Inadmissible(String),
+}
+
 /// Reads one candidate's descriptors and decides whether it may be bridged.
 ///
-/// Every check runs against descriptors read here, in the privileged process.
+/// Every check runs against descriptors read here, in the privileged process:
+/// the device and configuration descriptors libusb caches, and the HID report
+/// descriptors macOS publishes in the I/O Registry.
 fn examine_candidate(
     device: &rusb::Device<rusb::Context>,
-) -> Result<(DeviceSnapshot, UsbSpeed), String> {
+    registry: &[crate::registry::RegistryHid],
+    disambiguate_by_location: bool,
+) -> Result<Candidate, CandidateRejection> {
     let descriptor = device
         .device_descriptor()
-        .map_err(|error| format!("read physical USB device descriptor: {error}"))?;
+        .map_err(|_| CandidateRejection::NotATablet)?;
+    if descriptor.class_code() != 0x00 && descriptor.class_code() != USB_CLASS_HID {
+        return Err(CandidateRejection::NotATablet);
+    }
+    let configuration = device
+        .active_config_descriptor()
+        .map_err(|_| CandidateRejection::NotATablet)?;
+    // Cheap structural screen: a composite with storage, audio or a hub is
+    // never a bridge candidate.
+    if !configuration.interfaces().all(|interface| {
+        interface
+            .descriptors()
+            .all(|alternate| alternate.class_code() == USB_CLASS_HID)
+    }) {
+        return Err(CandidateRejection::NotATablet);
+    }
+    let hid_interfaces = hid_interfaces(&configuration);
+    let location = if disambiguate_by_location {
+        let location = device
+            .port_numbers()
+            .ok()
+            .and_then(|ports| crate::registry::location_id(device.bus_number(), &ports));
+        // Two identical devices and no way to tell them apart: refuse rather
+        // than risk pairing one device's descriptors with the other.
+        if location.is_none() {
+            return Err(CandidateRejection::NotATablet);
+        }
+        location
+    } else {
+        None
+    };
+    let mut described = match crate::registry::descriptors_for(
+        registry,
+        descriptor.vendor_id(),
+        descriptor.product_id(),
+        location,
+    ) {
+        Ok(described) => described,
+        Err(ambiguity) => {
+            return Err(CandidateRejection::Inadmissible(format!(
+                "{:04x}:{:04x}: the I/O Registry cannot tell which descriptors belong to \
+                 this device ({ambiguity:?})",
+                descriptor.vendor_id(),
+                descriptor.product_id()
+            )));
+        }
+    };
+    described.retain(|number, _| {
+        hid_interfaces
+            .iter()
+            .any(|interface| interface.number == *number)
+    });
+    // The registry alone decides whether this device is worth a closer look:
+    // without a digitizer collection there, nothing is ever sent to it.
+    let registry_declares_digitizer = described
+        .values()
+        .any(|bytes| arcen_usb_bridge::declares_any_digitizer(bytes));
+    if !registry_declares_digitizer {
+        return Err(CandidateRejection::NotATablet);
+    }
+
+    // From here on the registry shows a digitizer; every refusal is reported.
     let identity = format!(
         "{:04x}:{:04x}",
         descriptor.vendor_id(),
         descriptor.product_id()
     );
-    let speed = map_speed(device.speed()).map_err(|error| format!("{identity}: {error}"))?;
-    let configuration = device
-        .active_config_descriptor()
-        .map_err(|error| format!("{identity}: read physical USB configuration: {error}"))?;
-    let parsed =
-        parsed_configuration(&configuration).map_err(|error| format!("{identity}: {error}"))?;
-    let bcd_device = version_to_bcd(descriptor.device_version())
-        .map_err(|error| format!("{identity}: {error}"))?;
+    let inadmissible =
+        |error: String| CandidateRejection::Inadmissible(format!("{identity}: {error}"));
+    let missing =
+        crate::registry::fallback_plan(&hid_interfaces, &described, registry_declares_digitizer)
+            .map_err(|refusal| {
+                inadmissible(format!(
+                    "a HID interface has no report descriptor in the I/O Registry \
+                     and the helper will not ask the device for it ({refusal:?})"
+                ))
+            })?;
+    if !missing.is_empty() {
+        for (number, bytes) in
+            read_report_descriptors(device, &configuration, &missing).map_err(&inadmissible)?
+        {
+            described.insert(number, bytes);
+        }
+    }
+    let report_descriptors: Vec<InterfaceReportDescriptor> = described
+        .into_iter()
+        .map(|(interface, descriptor)| InterfaceReportDescriptor {
+            interface,
+            descriptor,
+        })
+        .collect();
+    // The same shared authorization the host applies: a pen tablet, nothing
+    // forwarded beside it that is not (no keyboard, keypad, game controller),
+    // and descriptors that fit the handshake.
+    let profile = match authorize_hard_usb_tablet(descriptor.class_code(), &report_descriptors) {
+        Ok(profile) => profile,
+        Err(HardUsbTabletDenial::NotPenTablet(_)) => return Err(CandidateRejection::NotATablet),
+        Err(denial) => return Err(inadmissible(denial.to_string())),
+    };
+
+    let speed = map_speed(device.speed()).map_err(&inadmissible)?;
+    let parsed = parsed_configuration(&configuration).map_err(&inadmissible)?;
+    let bcd_device = version_to_bcd(descriptor.device_version()).map_err(&inadmissible)?;
     let snapshot = DeviceSnapshot {
         id: UsbDeviceId {
             vendor_id: descriptor.vendor_id(),
@@ -732,16 +900,99 @@ fn examine_candidate(
         device_class: descriptor.class_code(),
         configuration: parsed,
     };
-    admissible_tablet(&snapshot).map_err(|error| format!("{identity}: {error}"))?;
-    evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot)
-        .map_err(|error| format!("{identity}: denied by profile: {error}"))?;
-    Ok((snapshot, speed))
+    admissible_tablet(&snapshot).map_err(&inadmissible)?;
+    evaluate_profile(true, &tablet_profile_for(&snapshot), &snapshot)
+        .map_err(|error| inadmissible(format!("denied by profile: {error}")))?;
+    Ok(Candidate {
+        snapshot,
+        speed,
+        report_descriptors,
+        profile,
+    })
 }
 
-fn wacom_profile_for(snapshot: &DeviceSnapshot) -> DeviceProfile {
+/// The HID interfaces (alternate setting 0) of a configuration.
+fn hid_interfaces(configuration: &rusb::ConfigDescriptor) -> Vec<crate::registry::HidInterface> {
+    let mut interfaces: Vec<crate::registry::HidInterface> = Vec::new();
+    for interface in configuration.interfaces() {
+        for alternate in interface.descriptors() {
+            if alternate.class_code() == USB_CLASS_HID
+                && alternate.setting_number() == 0
+                && !interfaces
+                    .iter()
+                    .any(|known| known.number == alternate.interface_number())
+            {
+                interfaces.push(crate::registry::HidInterface {
+                    number: alternate.interface_number(),
+                    subclass: alternate.sub_class_code(),
+                    protocol: alternate.protocol_code(),
+                });
+            }
+        }
+    }
+    interfaces
+}
+
+/// Reads the HID report descriptor of each interface in `only` (alternate 0)
+/// with `GET_DESCRIPTOR(Report)` on the default pipe.
+///
+/// Called only for a device the registry already shows to be a digitizer,
+/// with no boot-keyboard interface, for interfaces the registry left
+/// undescribed. The device is opened but not captured: no kernel driver is
+/// detached and no interface is claimed.
+fn read_report_descriptors(
+    device: &rusb::Device<rusb::Context>,
+    configuration: &rusb::ConfigDescriptor,
+    only: &[u8],
+) -> Result<Vec<(u8, Vec<u8>)>, String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("open for report descriptors: {error}"))?;
+    let mut descriptors: Vec<(u8, Vec<u8>)> = Vec::new();
+    for interface in configuration.interfaces() {
+        for alternate in interface.descriptors() {
+            let number = alternate.interface_number();
+            if alternate.class_code() != USB_CLASS_HID
+                || alternate.setting_number() != 0
+                || !only.contains(&number)
+                || descriptors.iter().any(|(known, _)| *known == number)
+            {
+                continue;
+            }
+            if descriptors.len() >= MAX_INTERFACES {
+                return Err("HID interface count exceeds bridge limit".to_owned());
+            }
+            let length = hid_report_descriptor_length(alternate.extra())
+                .ok_or_else(|| format!("interface {number} has no usable HID descriptor"))?;
+            let setup = hid_report_descriptor_request(number, length);
+            let mut buffer = vec![0_u8; usize::from(length)];
+            let read = handle
+                .read_control(
+                    setup.request_type,
+                    setup.request,
+                    setup.value,
+                    setup.index,
+                    &mut buffer,
+                    REPORT_DESCRIPTOR_TIMEOUT,
+                )
+                .map_err(|error| format!("read interface {number} report descriptor: {error}"))?;
+            buffer.truncate(read);
+            descriptors.push((number, buffer));
+        }
+    }
+    Ok(descriptors)
+}
+
+/// The exact profile of the device being examined.
+///
+/// Derived from the device itself, so it cannot reject anything on its own;
+/// it keeps `evaluate_profile`'s prohibited-class and internal-consistency
+/// checks in the path. Admissibility is decided by [`admissible_tablet`] and
+/// the report-descriptor classification.
+fn tablet_profile_for(snapshot: &DeviceSnapshot) -> DeviceProfile {
     DeviceProfile {
         name: format!(
-            "wacom-{:04x}-{:04x}",
+            "pen-tablet-{:04x}-{:04x}",
             snapshot.id.vendor_id, snapshot.id.product_id
         ),
         vendor_id: snapshot.id.vendor_id,
@@ -763,13 +1014,7 @@ fn wacom_profile_for(snapshot: &DeviceSnapshot) -> DeviceProfile {
     }
 }
 
-/// Rejects a Wacom-vendor device that is not wholly a HID device.
-///
-/// `wacom_profile_for` is derived from the device being examined, so it cannot
-/// by itself reject anything -- it exists to keep `evaluate_profile`'s
-/// prohibited-class and internal-consistency checks in the path. This function
-/// is the part that can say no, and it is deliberately the only place where
-/// admissibility is decided.
+/// Rejects a device that is not wholly a HID device.
 fn admissible_tablet(snapshot: &DeviceSnapshot) -> Result<(), String> {
     if snapshot.configuration.interfaces.is_empty() {
         return Err("device exposes no interfaces".to_owned());
@@ -851,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn version_to_bcd_matches_the_measured_wacom_revision() {
+    fn version_to_bcd_matches_the_measured_tablet_revision() {
         assert_eq!(version_to_bcd(rusb::Version(1, 0, 0)), Ok(0x0100));
         assert!(version_to_bcd(rusb::Version(100, 0, 0)).is_err());
     }
@@ -863,7 +1108,7 @@ mod tests {
     ) -> DeviceSnapshot {
         DeviceSnapshot {
             id: UsbDeviceId {
-                vendor_id: WACOM_VENDOR_ID,
+                vendor_id: 0x1234,
                 product_id,
                 bcd_device: 0x0100,
             },
@@ -898,11 +1143,11 @@ mod tests {
             ],
         );
         assert_eq!(admissible_tablet(&snapshot), Ok(()));
-        assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_ok());
+        assert!(evaluate_profile(true, &tablet_profile_for(&snapshot), &snapshot).is_ok());
     }
 
     #[test]
-    fn a_different_wacom_model_is_admitted_rather_than_pinned_out() {
+    fn a_different_tablet_model_is_admitted_rather_than_pinned_out() {
         // The point of the change: another product id, another interface count,
         // another revision. Pinning one model rejected every one of these.
         for (product_id, interfaces) in [
@@ -916,14 +1161,15 @@ mod tests {
                 Ok(()),
                 "product {product_id:#06x} should be admissible"
             );
-            assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_ok());
+            assert!(evaluate_profile(true, &tablet_profile_for(&snapshot), &snapshot).is_ok());
         }
     }
 
     #[test]
-    fn a_non_hid_interface_is_refused_even_under_wacoms_vendor_id() {
+    fn a_non_hid_interface_is_refused_whatever_vendor_id_it_claims() {
         // A vendor id is a claim, not a credential. Mass storage, a hub and a
-        // smartcard reader must not become bridgeable by asserting 056a.
+        // smartcard reader must not become bridgeable by asserting a tablet
+        // maker's id.
         for class in [0x08_u8, 0x09, 0x0b, 0x01, 0xe0] {
             let snapshot = snapshot_with(
                 0x0317,
@@ -935,6 +1181,25 @@ mod tests {
                 "interface class {class:#04x} should be refused"
             );
         }
+    }
+
+    /// Express keys as a boot-keyboard interface, and mouse mode as a boot
+    /// mouse, are tablet functions: both are admissible HID interfaces beside
+    /// the pen; the report descriptors still decide whether it is a tablet.
+    #[test]
+    fn express_key_keyboards_and_boot_mice_are_admissible_hid_interfaces() {
+        let with_keyboard = snapshot_with(
+            0x0317,
+            0x00,
+            &[(0, 0x03, 0x00, 0x00), (1, 0x03, 0x01, 0x01)],
+        );
+        assert_eq!(admissible_tablet(&with_keyboard), Ok(()));
+        let with_mouse = snapshot_with(
+            0x0317,
+            0x00,
+            &[(0, 0x03, 0x00, 0x00), (1, 0x03, 0x01, 0x02)],
+        );
+        assert_eq!(admissible_tablet(&with_mouse), Ok(()));
     }
 
     #[test]
@@ -951,11 +1216,11 @@ mod tests {
 
     #[test]
     fn prohibited_classes_are_still_refused_by_the_shared_policy() {
-        // `wacom_profile_for` is derived from the device, so this proves the
+        // `tablet_profile_for` is derived from the device, so this proves the
         // shared prohibited-class rules remain in the path and are not made
         // vacuous by deriving the profile.
         let snapshot = snapshot_with(0x0317, 0x09, &[(0, 0x03, 0x00, 0x00)]);
-        assert!(evaluate_profile(true, &wacom_profile_for(&snapshot), &snapshot).is_err());
+        assert!(evaluate_profile(true, &tablet_profile_for(&snapshot), &snapshot).is_err());
     }
 
     #[test]

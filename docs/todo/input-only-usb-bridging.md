@@ -231,6 +231,23 @@ decision to trust the physical device, not an Arcen malware verdict.
 
 ## Host-authoritative Pier allowlist
 
+**Status (0.16.0): what is implemented is vendor-neutral classification, not a
+VID/PID allowlist.** The lab Linux Pier no longer pins one Intuos5 identity.
+It authorizes Hard USB with `arcen_usb_bridge::authorize_hard_usb_tablet`
+from the device class and the HID report descriptors the Deck's privileged
+helper read (`UsbHardDeviceMsg.hid_report_descriptors`): the device must
+classify as a pen tablet (`classify_pen_tablet`), whoever made it. After
+attaching, `BridgedDeviceGuard` refuses any device, configuration or report
+descriptor the device returns that contradicts the authorization (another
+class, a non-HID interface, other interface numbers, other report bytes). A
+pen tablet's express keys (keyboard/keypad collections or a boot-keyboard
+interface) are bridged with it; a game-controller collection, or a device
+without a pen digitizer, never is. The helper applies the same
+classification, plus "every interface HID" and the prohibited-class rules,
+before it captures anything. The operator allowlist below remains a possible
+future restriction on top of that (an administrator narrowing which tablets
+may be bridged); it must never become the way a tablet qualifies.
+
 Authorization belongs in the common strict Pier configuration:
 
 - Linux: `/etc/arcen/pier.json`
@@ -301,13 +318,13 @@ validation rather than being ignored.
 
 ### Shipped defaults
 
-- Exact reviewed Wacom profiles ship with `enabled: true`.
-- The first profile candidate is the physically observed Intuos5 Touch L,
-  `056a:0317`; its full interface/transfer profile still requires bridge-mode
-  physical capture and review.
-- Additional Wacom models require exact VID/PID/interface evidence before they
-  are added. "All Wacom" is never a wildcard.
-- Non-Wacom example profiles ship with `enabled: false`.
+- No vendor ships with special treatment. Any device whose report descriptors
+  classify as a pen tablet is eligible; an allowlist, if one is ever added,
+  only narrows that set.
+- The physically observed device remains the Intuos5 Touch L, `056a:0317`;
+  tablets of other makes are covered by synthetic-descriptor tests only.
+- A vendor id is never a wildcard in either direction: it neither admits nor
+  refuses a device.
 - The global bridge remains unavailable until the relevant platform backend is
   installed and reports runtime availability.
 

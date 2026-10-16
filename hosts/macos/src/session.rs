@@ -973,7 +973,7 @@ pub fn server_hello_json_for_multi(
                 unavailable
             },
             gestures: available,
-            // Basic Tablet terminates locally: the Deck's Wacom driver reads
+            // Basic Tablet terminates locally: the Deck's tablet driver reads
             // the pen and this host injects finished samples as CGEvent
             // tablet events. Every field below is one the injector actually
             // sets, so the claim matches the code rather than the ambition.
@@ -1010,7 +1010,7 @@ pub fn server_hello_json_for_multi(
             // whether the entitlement has arrived, and it is recorded in
             // diagnostics. It becomes a capability only when there is an
             // importer behind it.
-            wacom_usb_bridge: unavailable,
+            usb_tablet_bridge: unavailable,
             disabled_mouse_compat: available,
         },
         clipboard: Some(arcen_media::clipboard::policy_message(
@@ -1518,7 +1518,7 @@ async fn perform_application_handshake(
 fn host_tablet_mode_capabilities() -> arcen_protocol::messages::TabletModeCapabilitiesMsg {
     arcen_protocol::messages::TabletModeCapabilitiesMsg {
         local_termination: InputCapabilityAvailability::Available,
-        wacom_usb_bridge: InputCapabilityAvailability::Unavailable,
+        usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
         disabled_mouse_compat: InputCapabilityAvailability::Available,
     }
 }
@@ -1537,8 +1537,8 @@ fn input_mode_results(
         tablet_mode_to_input(requested_tablet),
         capability_to_input(client_capabilities.local_termination),
         capability_to_input(host_capabilities.local_termination),
-        capability_to_input(client_capabilities.wacom_usb_bridge),
-        capability_to_input(host_capabilities.wacom_usb_bridge),
+        capability_to_input(client_capabilities.usb_tablet_bridge),
+        capability_to_input(host_capabilities.usb_tablet_bridge),
     );
     crate::stream::InputModeResults {
         cursor: CursorModeResultMsg {
@@ -1580,7 +1580,9 @@ const fn tablet_mode_to_input(mode: arcen_protocol::messages::TabletModeMsg) -> 
         arcen_protocol::messages::TabletModeMsg::LocalTermination => {
             InputTabletMode::LocalTermination
         }
-        arcen_protocol::messages::TabletModeMsg::WacomUsbBridge => InputTabletMode::WacomUsbBridge,
+        arcen_protocol::messages::TabletModeMsg::UsbTabletBridge => {
+            InputTabletMode::UsbTabletBridge
+        }
         arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat => {
             InputTabletMode::DisabledMouseCompat
         }
@@ -1592,7 +1594,9 @@ const fn tablet_mode_from_input(mode: InputTabletMode) -> arcen_protocol::messag
         InputTabletMode::LocalTermination => {
             arcen_protocol::messages::TabletModeMsg::LocalTermination
         }
-        InputTabletMode::WacomUsbBridge => arcen_protocol::messages::TabletModeMsg::WacomUsbBridge,
+        InputTabletMode::UsbTabletBridge => {
+            arcen_protocol::messages::TabletModeMsg::UsbTabletBridge
+        }
         InputTabletMode::DisabledMouseCompat => {
             arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat
         }
@@ -2940,7 +2944,7 @@ mod tests {
             arcen_protocol::messages::InputCapabilityAvailability::Available,
         );
         assert_eq!(
-            modes.wacom_usb_bridge,
+            modes.usb_tablet_bridge,
             arcen_protocol::messages::InputCapabilityAvailability::Unavailable,
             "native tablet has no USB host controller on this host",
         );

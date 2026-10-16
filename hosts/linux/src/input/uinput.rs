@@ -655,9 +655,10 @@ impl InputController {
     /// Destroys the virtual tablet-tool device so a bridged physical tablet is
     /// the only tablet on the seat. Returns whether a device was released.
     ///
-    /// Hard USB attaches the operator's real Wacom to this host, where the
-    /// vendor driver claims it and Xorg loads `wacom` for its Pen, eraser,
-    /// cursor and Pad nodes. `Arcen Virtual Tablet Pen` is then a *second*
+    /// Hard USB attaches the operator's real pen tablet to this host, where
+    /// the kernel's HID driver for it (`hid-generic`, `hid-uclogic`, `wacom`,
+    /// ...) claims it and Xorg loads a tablet input driver for its pen,
+    /// eraser and pad nodes. `Arcen Virtual Tablet Pen` is then a *second*
     /// tablet on the same seat, advertising tablet-tool capabilities it will
     /// never emit — in Hard USB the typed pen path is dead by construction,
     /// because capturing the device removes it from macOS and AppKit stops
@@ -789,7 +790,7 @@ fn build_tablet_device(width: u32, height: u32) -> Result<VirtualDevice, InputEr
     );
     let pressure_axis = UinputAbsSetup::new(
         AbsoluteAxisCode::ABS_PRESSURE,
-        AbsInfo::new(0, 0, pen::PRESSURE_MAX_13BIT, 0, 0, 0),
+        AbsInfo::new(0, 0, pen::PRESSURE_MAX, 0, 0, 0),
     );
     let tilt_x_axis = UinputAbsSetup::new(
         AbsoluteAxisCode::ABS_TILT_X,

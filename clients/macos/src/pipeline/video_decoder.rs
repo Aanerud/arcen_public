@@ -1912,6 +1912,8 @@ pub struct DecodeCapabilities {
     /// module) -- only this specific field, backing the pre-connection
     /// hello handshake, stays codec-level. Never a promise of 4:4:4
     /// support -- see `yuv444`, which is probed for real via HEVC Rext.
+    /// The Deck platform profile caps it: an Intel Deck never claims AV1
+    /// (`arcen_media::deck_platform::DeckPlatform::advertised_av1`).
     pub av1: bool,
     pub yuv444: bool,
     pub main10: bool,
@@ -3525,11 +3527,17 @@ mod platform {
         log_probe_result("bt601_matrix", &bt601_matrix);
         let bt2020_ncl_matrix = probe_hevc_session(baseline, false, wire::ColorMatrix::Bt2020Ncl);
         log_probe_result("bt2020_ncl_matrix", &bt2020_ncl_matrix);
-        let av1 = probe_av1_hardware_decode_supported();
+        let probe_claims_av1 = probe_av1_hardware_decode_supported();
+        let platform = crate::platform::current();
+        // The probe answers for this Mac; the platform profile caps it. No
+        // Intel Deck advertises AV1, whatever VideoToolbox says.
+        let av1 = platform.advertised_av1(probe_claims_av1);
         tracing::info!(
             target: crate::logging::target::VIDEO,
             capability = "av1",
             supported = av1,
+            probe_claims_av1,
+            deck_platform = platform.label(),
             "decode-capability probe: codec-level only (see DecodeCapabilities::av1 docs)",
         );
 
@@ -3539,6 +3547,22 @@ mod platform {
             .copied()
             .flatten()
             .or_else(|| h264.as_ref().ok().copied().flatten());
+        let decode_path = platform.assess_decode_path(hardware_accelerated);
+        if decode_path == arcen_media::deck_platform::DecodePathAssessment::UnexpectedSoftware {
+            tracing::warn!(
+                target: crate::logging::target::VIDEO,
+                deck_platform = platform.label(),
+                decode_path = decode_path.token(),
+                "decode-capability probe: VideoToolbox decodes in software on Apple silicon",
+            );
+        } else {
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                deck_platform = platform.label(),
+                decode_path = decode_path.token(),
+                "decode-capability probe: decode path",
+            );
+        }
 
         super::DecodeCapabilities {
             h264: h264.is_ok(),

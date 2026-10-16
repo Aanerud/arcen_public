@@ -1,8 +1,8 @@
 //! Whether this host can present an input device macOS did not get from
 //! hardware.
 //!
-//! Native Tablet sends a Deck's physical Wacom across the wire and expects the
-//! host to make it appear locally, so that the operator's own Wacom driver and
+//! Native Tablet sends a Deck's physical pen tablet across the wire and expects
+//! the host to make it appear locally, so that the operator's own tablet driver and
 //! every pressure-aware application see a real tablet. On macOS the route for
 //! that is `IOHIDUserDevice`: public SDK API, in IOKit's public module map,
 //! available since 10.15, needing no DriverKit extension, no system extension,

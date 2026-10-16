@@ -920,8 +920,8 @@ impl InputController {
 
     /// Injects a pen sample with its tablet surface intact.
     ///
-    /// This is Basic Tablet termination: the Deck's Wacom driver has already
-    /// read the pen, so this host turns a finished sample into the mouse
+    /// This is Basic Tablet termination: the Deck's own tablet driver has
+    /// already read the pen, so this host turns a finished sample into the mouse
     /// events macOS uses to carry tablet data. Edges — proximity, tip, barrel
     /// buttons — come from the shared planner so that a tool leaving the
     /// tablet cannot strand a press, and the annotations ride on every sample
@@ -1064,7 +1064,7 @@ impl InputController {
                 PenEdge::TipUp => self.post_pen_button(1, false, point, annotations)?,
                 PenEdge::Barrel { index, pressed } => {
                     // Barrel one is the right button and barrel two the middle
-                    // one, which is what a Wacom driver does locally. Further
+                    // one, which is what tablet drivers commonly do. Further
                     // buttons have no agreed meaning, so they are dropped
                     // rather than assigned an invented one.
                     if let Some(button) = barrel_button(index) {

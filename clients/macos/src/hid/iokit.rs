@@ -143,7 +143,7 @@ extern "C" {
 }
 
 /// `kIOReturnExclusiveAccess`. The device is already open exclusively by
-/// another owner — on macOS a Wacom tablet is held by Wacom's own
+/// another owner — on macOS a tablet is often held by its vendor's own
 /// `TabletDriver`, so a HID *listener* can never open it, with or without
 /// `kIOHIDOptionsTypeSeizeDevice`. Measured on this hardware. Reporting this
 /// as a permission problem sends the reader to grant Input Monitoring they

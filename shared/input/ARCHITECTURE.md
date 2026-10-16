@@ -20,6 +20,18 @@ APIs, or injection APIs and forbids unsafe code.
   denote the same physical angle), tool, proximity/touching, a button
   bitset, and the shared `LowLatencyMetadata`. `PenEvent::validate()` fails
   closed on any non-finite or out-of-range field.
+- `pen_axes` is the only conversion into and out of that vendor-neutral
+  contract: device logical ranges (`LogicalRange`, `normalize_logical`,
+  `scale_unit`, `tilt_logical_to_degrees`, `twist_logical_to_degrees`),
+  platform-normalized tilt (`tilt_unit_to_degrees`/`tilt_degrees_to_unit`),
+  rotation wrapping, and whole-degree host axes. Host device ranges are named
+  constants (`TYPED_PEN_PRESSURE_RANGE` `0..=65535`,
+  `WINDOWS_INK_PRESSURE_RANGE` `0..=1024`); no tablet maker's maximum is
+  assumed anywhere.
+- `TabletMode::UsbTabletBridge` is Native tablet (USB bridged) for any pen
+  tablet; it serializes as the legacy token `wacom_usb_bridge`, matching
+  `arcen_protocol::messages::TabletModeMsg`, and converts to and from it with
+  `From`.
 - `InputSequenceTracker` accepts legacy sequence zero without advancing state
   and otherwise enforces one strict sequence across every input event type,
   including pen samples.

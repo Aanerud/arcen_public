@@ -24,7 +24,10 @@ const DESCRIPTOR_STRING: u8 = 0x03;
 const DESCRIPTOR_HID: u8 = 0x21;
 const DESCRIPTOR_REPORT: u8 = 0x22;
 
-const REPORT_DESCRIPTOR: &[u8] = &[
+/// Report descriptor of the synthetic lab tablet: a standard Digitizers-page
+/// pen with tip, in-range, eraser, two barrel switches, 16-bit X/Y, 1024
+/// pressure levels and +/-90 degree tilt.
+pub const SYNTHETIC_TABLET_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x0d, // Usage Page (Digitizers)
     0x09, 0x02, // Usage (Pen)
     0xa1, 0x01, // Collection (Application)
@@ -210,7 +213,8 @@ impl SyntheticTabletDevice {
 
     #[must_use]
     pub fn configuration_descriptor() -> Vec<u8> {
-        let report_length = u16::try_from(REPORT_DESCRIPTOR.len()).unwrap_or(u16::MAX);
+        let report_length =
+            u16::try_from(SYNTHETIC_TABLET_REPORT_DESCRIPTOR.len()).unwrap_or(u16::MAX);
         let [report_lo, report_hi] = report_length.to_le_bytes();
         vec![
             9, 2, 34, 0, 1, 1, 0, 0x80, 50, // configuration
@@ -222,7 +226,7 @@ impl SyntheticTabletDevice {
 
     #[must_use]
     pub const fn report_descriptor() -> &'static [u8] {
-        REPORT_DESCRIPTOR
+        SYNTHETIC_TABLET_REPORT_DESCRIPTOR
     }
 
     /// Handles the bounded standard/class control requests needed by the lab
@@ -289,7 +293,7 @@ impl SyntheticTabletDevice {
             (DESCRIPTOR_STRING, 1) => string_descriptor("Arcen"),
             (DESCRIPTOR_STRING, 2) => string_descriptor("USB Bridge Lab Tablet"),
             (DESCRIPTOR_HID, 0) => Self::configuration_descriptor()[18..27].to_vec(),
-            (DESCRIPTOR_REPORT, 0) => REPORT_DESCRIPTOR.to_vec(),
+            (DESCRIPTOR_REPORT, 0) => SYNTHETIC_TABLET_REPORT_DESCRIPTOR.to_vec(),
             _ => return ControlResponse::Stall,
         };
         truncate(data, setup.length)
@@ -375,7 +379,7 @@ mod tests {
         });
         assert_eq!(
             report_descriptor,
-            ControlResponse::Data(REPORT_DESCRIPTOR.to_vec())
+            ControlResponse::Data(SYNTHETIC_TABLET_REPORT_DESCRIPTOR.to_vec())
         );
     }
 

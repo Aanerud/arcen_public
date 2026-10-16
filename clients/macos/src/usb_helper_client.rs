@@ -5,7 +5,7 @@
 //! it already exchanges with the host, so this boundary adds no second wire
 //! format. See `docs/adr/0011-macos-privileged-usb-helper.md`.
 
-use arcen_protocol::messages::UsbHardDeviceMsg;
+use arcen_protocol::messages::{UsbHardDeviceMsg, UsbHidReportDescriptorMsg};
 use arcen_protocol::{encode_usb_urb_cancel, encode_usb_urb_submit, UsbUrbSubmitHeader};
 use arcen_usb_bridge::{AttachmentGeneration, UrbId, UsbSpeed, MAX_TRANSFER_BYTES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,8 +66,8 @@ impl HelperClient {
     }
 
     #[must_use]
-    pub const fn device(&self) -> UsbHardDeviceMsg {
-        self.device
+    pub fn device(&self) -> UsbHardDeviceMsg {
+        self.device.clone()
     }
 
     /// Forwards one URB to the helper.
@@ -223,6 +223,11 @@ async fn read_frame(
     }
 }
 
+/// Decodes the helper's handshake: an eight-byte identity followed by the HID
+/// report descriptors that made the device admissible (count `u8`, then per
+/// descriptor interface `u8`, length `u16` LE, bytes). An older helper sends
+/// only the identity; the host then refuses Hard USB with a clear reason
+/// rather than guessing from the vendor id. A malformed trailer is refused.
 fn decode_hello(payload: &[u8]) -> Option<UsbHardDeviceMsg> {
     if payload.len() < 8 {
         return None;
@@ -233,12 +238,32 @@ fn decode_hello(payload: &[u8]) -> Option<UsbHardDeviceMsg> {
         2 => UsbSpeed::High,
         _ => return None,
     };
+    let mut hid_report_descriptors = Vec::new();
+    if let Some((&count, mut rest)) = payload[8..].split_first() {
+        if usize::from(count) > arcen_usb_bridge::MAX_INTERFACES {
+            return None;
+        }
+        for _ in 0..count {
+            let (&interface, after) = rest.split_first()?;
+            let length = usize::from(u16::from_le_bytes([*after.first()?, *after.get(1)?]));
+            if length > arcen_usb_bridge::MAX_HID_REPORT_DESCRIPTOR_BYTES {
+                return None;
+            }
+            let bytes = after.get(2..2 + length)?;
+            hid_report_descriptors.push(UsbHidReportDescriptorMsg::new(interface, bytes));
+            rest = &after[2 + length..];
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+    }
     Some(UsbHardDeviceMsg {
         vendor_id: u16::from_le_bytes([payload[0], payload[1]]),
         product_id: u16::from_le_bytes([payload[2], payload[3]]),
         bcd_device: u16::from_le_bytes([payload[4], payload[5]]),
         device_class: payload[6],
         speed,
+        hid_report_descriptors,
     })
 }
 
@@ -247,7 +272,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_decodes_the_measured_wacom_identity() {
+    fn an_older_helpers_identity_only_hello_still_decodes() {
         let payload = [0x6a, 0x05, 0x17, 0x03, 0x00, 0x01, 0x00, 0x01];
         let device = decode_hello(&payload).expect("decodes");
         assert_eq!(device.vendor_id, 0x056a);
@@ -255,6 +280,52 @@ mod tests {
         assert_eq!(device.bcd_device, 0x0100);
         assert_eq!(device.device_class, 0);
         assert_eq!(device.speed, UsbSpeed::Full);
+        assert!(device.hid_report_descriptors.is_empty());
+    }
+
+    #[test]
+    fn an_intuos5_style_hello_is_a_bridgeable_tablet() {
+        use arcen_usb_bridge::descriptor_fixtures::{
+            INTUOS5_STYLE_MOUSE_INTERFACE, INTUOS5_STYLE_PEN_INTERFACE,
+            INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE,
+        };
+        let mut payload = vec![0x6a, 0x05, 0x17, 0x03, 0x00, 0x01, 0x00, 0x01, 3];
+        for (interface, descriptor) in [
+            (0_u8, INTUOS5_STYLE_PEN_INTERFACE),
+            (1, INTUOS5_STYLE_VENDOR_CONTROL_INTERFACE),
+            (2, INTUOS5_STYLE_MOUSE_INTERFACE),
+        ] {
+            payload.push(interface);
+            payload.extend_from_slice(&u16::try_from(descriptor.len()).unwrap().to_le_bytes());
+            payload.extend_from_slice(descriptor);
+        }
+        let device = decode_hello(&payload).expect("decodes");
+        let descriptors = device.report_descriptors().expect("valid descriptors");
+        assert_eq!(descriptors.len(), 3);
+        let profile =
+            arcen_usb_bridge::authorize_hard_usb_tablet(device.device_class, &descriptors)
+                .expect("an Intuos5-style tablet is bridgeable");
+        assert_eq!(profile.capabilities.pressure_levels(), None);
+    }
+
+    #[test]
+    fn hello_carries_the_report_descriptors_of_any_vendors_tablet() {
+        let pen = arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR;
+        let mut payload = vec![0x34, 0x12, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 1, 0];
+        payload.extend_from_slice(&u16::try_from(pen.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(pen);
+        let device = decode_hello(&payload).expect("decodes");
+        assert_eq!(device.vendor_id, 0x1234);
+        let descriptors = device.report_descriptors().expect("valid descriptors");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].descriptor, pen);
+        assert!(arcen_usb_bridge::authorize_hard_usb_tablet(0, &descriptors).is_ok());
+
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(decode_hello(&trailing).is_none());
+        payload.pop();
+        assert!(decode_hello(&payload).is_none());
     }
 
     #[test]

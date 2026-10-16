@@ -1,0 +1,268 @@
+diff -ruN a/build.rs b/build.rs
+--- a/build.rs	2026-10-10 16:10:22.000000000 +0200
++++ b/build.rs	2026-10-10 16:10:22.000000000 +0200
+@@ -1,31 +1,26 @@
+ use std::env;
++use std::path::{Path, PathBuf};
+ use std::process::Command;
+ 
+-fn detect_sdk_major_version() -> Option<u32> {
+-    let output = Command::new("xcrun")
+-        .args(["--sdk", "macosx", "--show-sdk-version"])
+-        .output()
+-        .ok()?;
+-    if !output.status.success() {
+-        return None;
+-    }
+-    let version_str = String::from_utf8_lossy(&output.stdout);
+-    let major = version_str.trim().split('.').next()?;
+-    major.parse().ok()
+-}
++// Arcen patch: the upstream build ran `swift build` on a SwiftPM package
++// declaring tools 5.9 and macOS 13. That excludes macOS 12, whose newest
++// supported toolchain is Xcode 14.2 (Swift 5.7). The bridge sources are
++// compiled here as one static module with `swiftc`, for the deployment target
++// Cargo builds for (MACOSX_DEPLOYMENT_TARGET, default 12.0). The exported
++// `@_cdecl` symbols are unchanged.
++const DEFAULT_DEPLOYMENT_TARGET: &str = "12.0";
+ 
+ fn main() {
+     println!("cargo:rerun-if-changed=build.rs");
+     println!("cargo:rerun-if-env-changed=DOCS_RS");
+     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+     println!("cargo:rerun-if-env-changed=SDKROOT");
++    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+ 
+     if env::var("DOCS_RS").is_ok() {
+         return;
+     }
+ 
+-    let _ = detect_sdk_major_version(); // currently unused; reserved for future macos_* feature flags
+-
+     println!("cargo:rustc-link-lib=framework=CoreGraphics");
+     println!("cargo:rustc-link-lib=framework=IOSurface");
+     println!("cargo:rustc-link-lib=framework=CoreFoundation");
+@@ -33,35 +28,49 @@
+     println!("cargo:rustc-link-lib=framework=CoreVideo");
+     println!("cargo:rustc-link-lib=framework=Metal");
+ 
+-    let swift_dir = "swift-bridge";
+-    let out_dir = env::var("OUT_DIR").unwrap();
+-    let swift_build_dir = format!("{out_dir}/swift-build");
++    let swift_dir = Path::new("swift-bridge");
++    println!("cargo:rerun-if-changed={}", swift_dir.display());
+ 
+-    println!("cargo:rerun-if-changed={swift_dir}");
++    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
++    let swift_build_dir = out_dir.join("swift-build");
++    std::fs::create_dir_all(&swift_build_dir).expect("create Swift build directory");
+ 
+     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+-    let swift_triple = match target_arch.as_str() {
+-        "x86_64" => "x86_64-apple-macosx",
+-        "aarch64" => "arm64-apple-macosx",
++    let swift_arch = match target_arch.as_str() {
++        "x86_64" => "x86_64",
++        "aarch64" => "arm64",
+         other => panic!("apple-cf: unsupported target arch '{other}'. Expected x86_64 or aarch64."),
+     };
++    let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
++        .ok()
++        .filter(|value| !value.trim().is_empty())
++        .unwrap_or_else(|| DEFAULT_DEPLOYMENT_TARGET.to_owned());
++    let swift_target = format!("{swift_arch}-apple-macosx{}", deployment_target.trim());
+ 
+-    let swift_args = vec![
+-        "build",
+-        "-c",
+-        "release",
+-        "--triple",
+-        swift_triple,
+-        "--package-path",
+-        swift_dir,
+-        "--scratch-path",
+-        &swift_build_dir,
+-    ];
++    let mut sources = Vec::new();
++    collect_swift_sources(&swift_dir.join("Sources"), &mut sources);
++    sources.sort();
++    assert!(!sources.is_empty(), "apple-cf: no Swift bridge sources found");
+ 
+-    let output = Command::new("swift")
+-        .args(&swift_args)
++    let sdk_path = xcrun_output(&["--sdk", "macosx", "--show-sdk-path"]);
++    let library = swift_build_dir.join("libAppleCFBridge.a");
++    let output = Command::new("xcrun")
++        .args(["swiftc", "-O", "-whole-module-optimization", "-parse-as-library"])
++        // The bridge uses no regex APIs. Without this, Swift 5.7 auto-links
++        // libswift_StringProcessing, which macOS 12 does not ship.
++        .args([
++            "-Xfrontend",
++            "-disable-implicit-string-processing-module-import",
++        ])
++        .args(["-module-name", "AppleCFBridge"])
++        .args(["-target", &swift_target])
++        .args(["-sdk", &sdk_path])
++        .args(["-emit-library", "-static"])
++        .arg("-o")
++        .arg(&library)
++        .args(&sources)
+         .output()
+-        .expect("Failed to build Swift bridge");
++        .expect("Failed to run swiftc for the Swift bridge");
+ 
+     if !output.status.success() {
+         eprintln!(
+@@ -78,15 +87,69 @@
+         );
+     }
+ 
+-    link_swift_bridge(&swift_build_dir);
++    link_swift_bridge(&swift_build_dir, &sdk_path);
+ }
+ 
+-fn link_swift_bridge(swift_build_dir: &str) {
+-    println!("cargo:rustc-link-search=native={swift_build_dir}/release");
++// Only real directories and regular files belong to the bridge. The entry's
++// own file type is used, which never follows a symbolic link, so a link cannot
++// pull a directory or a Swift file from outside the governed tree into the
++// build.
++fn collect_swift_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
++    let entries = std::fs::read_dir(directory)
++        .unwrap_or_else(|error| panic!("apple-cf: cannot read {}: {error}", directory.display()));
++    for entry in entries {
++        let entry = entry.expect("read Swift bridge directory entry");
++        let path = entry.path();
++        let file_type = entry
++            .file_type()
++            .unwrap_or_else(|error| panic!("apple-cf: cannot stat {}: {error}", path.display()));
++        if file_type.is_symlink() {
++            panic!(
++                "apple-cf: refusing symbolic link in the Swift bridge sources: {}",
++                path.display()
++            );
++        } else if file_type.is_dir() {
++            collect_swift_sources(&path, sources);
++        } else if file_type.is_file()
++            && path.extension().is_some_and(|extension| extension == "swift")
++        {
++            sources.push(path);
++        }
++    }
++}
++
++fn xcrun_output(args: &[&str]) -> String {
++    let output = Command::new("xcrun")
++        .args(args)
++        .output()
++        .unwrap_or_else(|error| panic!("apple-cf: xcrun {args:?} failed: {error}"));
++    assert!(
++        output.status.success(),
++        "apple-cf: xcrun {args:?} failed: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    String::from_utf8_lossy(&output.stdout).trim().to_owned()
++}
++
++fn link_swift_bridge(swift_build_dir: &Path, sdk_path: &str) {
++    println!("cargo:rustc-link-search=native={}", swift_build_dir.display());
+     println!("cargo:rustc-link-lib=static=AppleCFBridge");
+ 
++    // The bridge auto-links the OS Swift runtime and overlays (libswiftCore
++    // and friends); their link stubs live in the SDK, not on the default
++    // linker search path.
++    println!("cargo:rustc-link-search=native={sdk_path}/usr/lib/swift");
++
+     println!("cargo:rustc-link-lib=framework=Foundation");
+ 
++    // Swift back-deployment compatibility archives that the bridge objects
++    // auto-link live beside the toolchain's swiftc.
++    let swiftc = PathBuf::from(xcrun_output(&["--find", "swiftc"]));
++    if let Some(toolchain_usr) = swiftc.parent().and_then(Path::parent) {
++        let swift_lib = toolchain_usr.join("lib/swift/macosx");
++        println!("cargo:rustc-link-search=native={}", swift_lib.display());
++    }
++
+     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+ 
+     if let Ok(output) = Command::new("xcode-select").arg("-p").output() {
+diff -ruN a/swift-bridge/Package.swift b/swift-bridge/Package.swift
+--- a/swift-bridge/Package.swift	2026-10-10 16:10:22.000000000 +0200
++++ b/swift-bridge/Package.swift	2026-10-10 16:10:22.000000000 +0200
+@@ -1,10 +1,10 @@
+-// swift-tools-version:5.9
++// swift-tools-version:5.7
+ import PackageDescription
+ 
+ let package = Package(
+     name: "AppleCFBridge",
+     platforms: [
+-        .macOS(.v13)
++        .macOS(.v12)
+     ],
+     products: [
+         .library(
+diff -ruN a/swift-bridge/Sources/CoreFoundationBridge/Primitives.swift b/swift-bridge/Sources/CoreFoundationBridge/Primitives.swift
+--- a/swift-bridge/Sources/CoreFoundationBridge/Primitives.swift	2026-10-10 16:10:22.000000000 +0200
++++ b/swift-bridge/Sources/CoreFoundationBridge/Primitives.swift	2026-10-10 16:10:22.000000000 +0200
+@@ -96,7 +96,7 @@
+     let data = Unmanaged<CFData>.fromOpaque(value).takeUnretainedValue()
+     let length = CFDataGetLength(data)
+     guard let bytePtr = CFDataGetBytePtr(data), length > 0 else { return }
+-    buffer.update(from: bytePtr, count: length)
++    buffer.initialize(from: bytePtr, count: length)
+ }
+ 
+ @_cdecl("cf_date_get_type_id")
+diff -ruN a/swift-bridge/Sources/CoreFoundationBridge/Runtime.swift b/swift-bridge/Sources/CoreFoundationBridge/Runtime.swift
+--- a/swift-bridge/Sources/CoreFoundationBridge/Runtime.swift	2026-10-10 16:10:22.000000000 +0200
++++ b/swift-bridge/Sources/CoreFoundationBridge/Runtime.swift	2026-10-10 16:10:22.000000000 +0200
+@@ -171,7 +171,7 @@
+     let count = CFDataGetLength(dataRef)
+     let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: count)
+     if let bytePtr = CFDataGetBytePtr(dataRef), count > 0 {
+-        buffer.update(from: bytePtr, count: count)
++        buffer.initialize(from: bytePtr, count: count)
+     }
+     outBytes.pointee = buffer
+     outLen.pointee = count
+diff -ruN a/swift-bridge/Sources/DispatchBridge/Dispatch.swift b/swift-bridge/Sources/DispatchBridge/Dispatch.swift
+--- a/swift-bridge/Sources/DispatchBridge/Dispatch.swift	2026-10-10 16:10:22.000000000 +0200
++++ b/swift-bridge/Sources/DispatchBridge/Dispatch.swift	2026-10-10 16:10:22.000000000 +0200
+@@ -7,13 +7,14 @@
+ @_cdecl("acf_dispatch_queue_create")
+ public func createDispatchQueue(_ label: UnsafePointer<CChar>, _ qos: Int32) -> UnsafeMutableRawPointer {
+     let labelStr = String(cString: label)
+-    let qosClass: DispatchQoS = switch qos {
+-    case 0: .background
+-    case 1: .utility
+-    case 2: .default
+-    case 3: .userInitiated
+-    case 4: .userInteractive
+-    default: .default
++    let qosClass: DispatchQoS
++    switch qos {
++    case 0: qosClass = .background
++    case 1: qosClass = .utility
++    case 2: qosClass = .default
++    case 3: qosClass = .userInitiated
++    case 4: qosClass = .userInteractive
++    default: qosClass = .default
+     }
+ 
+     let queue = DispatchQueue(label: labelStr, qos: qosClass)
+diff -ruN a/swift-bridge/Sources/DispatchBridge/DispatchExtras.swift b/swift-bridge/Sources/DispatchBridge/DispatchExtras.swift
+--- a/swift-bridge/Sources/DispatchBridge/DispatchExtras.swift	2026-10-10 16:10:22.000000000 +0200
++++ b/swift-bridge/Sources/DispatchBridge/DispatchExtras.swift	2026-10-10 16:10:22.000000000 +0200
+@@ -21,9 +21,9 @@
+ ) {
+     guard let work else { return }
+     let queue = Unmanaged<DispatchQueue>.fromOpaque(queue).takeUnretainedValue()
+-    queue.asyncAndWait {
++    queue.asyncAndWait(execute: DispatchWorkItem {
+         work(context)
+-    }
++    })
+ }
+ 
+ @_cdecl("acf_dispatch_apply_f")

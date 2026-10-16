@@ -1418,8 +1418,15 @@ pub enum TabletModeMsg {
     /// AppKit/local-termination typed pen path over input-v3.
     #[default]
     LocalTermination,
-    /// Full USB bridge path for host-native Wacom stack/device semantics.
-    WacomUsbBridge,
+    /// Native tablet: the client's physical pen tablet, of any make, is
+    /// bridged over USB so the host's own driver stack owns it.
+    ///
+    /// The wire token is `wacom_usb_bridge` for compatibility with 0.15
+    /// peers. It is a legacy name: the mode is vendor-neutral. The neutral
+    /// spelling `usb_tablet_bridge` is accepted on input but never emitted,
+    /// so an older peer always reads what a newer one writes.
+    #[serde(rename = "wacom_usb_bridge", alias = "usb_tablet_bridge")]
+    UsbTabletBridge,
     /// Disable tablet redirection and keep mouse compatibility behavior.
     DisabledMouseCompat,
 }
@@ -1518,8 +1525,11 @@ pub const fn supports_gestures_v1(
 pub struct TabletModeCapabilitiesMsg {
     #[serde(default)]
     pub local_termination: InputCapabilityAvailability,
-    #[serde(default)]
-    pub wacom_usb_bridge: InputCapabilityAvailability,
+    /// Native tablet (USB bridged) availability. Serialized under the legacy
+    /// key `wacom_usb_bridge`; the neutral key `usb_tablet_bridge` is
+    /// accepted on input. A peer must send only one of the two.
+    #[serde(default, rename = "wacom_usb_bridge", alias = "usb_tablet_bridge")]
+    pub usb_tablet_bridge: InputCapabilityAvailability,
     #[serde(default)]
     pub disabled_mouse_compat: InputCapabilityAvailability,
 }
@@ -1528,7 +1538,7 @@ impl Default for TabletModeCapabilitiesMsg {
     fn default() -> Self {
         Self {
             local_termination: InputCapabilityAvailability::Unknown,
-            wacom_usb_bridge: InputCapabilityAvailability::Unknown,
+            usb_tablet_bridge: InputCapabilityAvailability::Unknown,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         }
     }
@@ -1619,13 +1629,136 @@ impl ClipboardDataMsg {
 /// Physical or explicitly synthetic USB device bound to one Hard USB
 /// attachment. The host uses these facts only as policy input; they never
 /// authorize a device on their own.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Vendor and product ids are informational. A host decides whether the
+/// device is a pen tablet from `device_class` and `hid_report_descriptors`
+/// (`arcen_usb_bridge::authorize_hard_usb_tablet`), and then checks the
+/// descriptors the device actually returns against these
+/// (`arcen_usb_bridge::BridgedDeviceGuard`, which also validates the device and
+/// configuration descriptors it serves).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsbHardDeviceMsg {
     pub vendor_id: u16,
     pub product_id: u16,
     pub bcd_device: u16,
     pub device_class: u8,
     pub speed: UsbSpeed,
+    /// Report descriptor of every HID interface, as read by the client's
+    /// privileged capture helper. Absent on 0.15 clients; a host refuses Hard
+    /// USB without it rather than guessing from vendor ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hid_report_descriptors: Vec<UsbHidReportDescriptorMsg>,
+}
+
+/// One HID interface's report descriptor, lowercase hex on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsbHidReportDescriptorMsg {
+    pub interface: u8,
+    /// Lowercase hexadecimal descriptor bytes, at most
+    /// `2 * MAX_HID_REPORT_DESCRIPTOR_BYTES` characters.
+    pub descriptor: String,
+}
+
+/// Malformed Hard USB report-descriptor claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbHidReportDescriptorError {
+    /// More descriptors than a bridged device may have interfaces.
+    TooMany,
+    /// A descriptor exceeds `MAX_HID_REPORT_DESCRIPTOR_BYTES`.
+    TooLarge(u8),
+    /// A descriptor is not even-length hexadecimal.
+    NotHex(u8),
+}
+
+impl fmt::Display for UsbHidReportDescriptorError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooMany => formatter.write_str("too many HID report descriptors"),
+            Self::TooLarge(interface) => {
+                write!(
+                    formatter,
+                    "interface {interface} report descriptor is too large"
+                )
+            }
+            Self::NotHex(interface) => {
+                write!(
+                    formatter,
+                    "interface {interface} report descriptor is not hex"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UsbHidReportDescriptorError {}
+
+impl UsbHidReportDescriptorMsg {
+    /// Encodes one interface's descriptor for the wire.
+    #[must_use]
+    pub fn new(interface: u8, descriptor: &[u8]) -> Self {
+        use fmt::Write as _;
+        let mut hex = String::with_capacity(descriptor.len() * 2);
+        for byte in descriptor {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        Self {
+            interface,
+            descriptor: hex,
+        }
+    }
+
+    /// Decodes and bounds-checks the descriptor bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsbHidReportDescriptorError`] for oversized or non-hex data.
+    pub fn decode(
+        &self,
+    ) -> Result<arcen_usb_bridge::InterfaceReportDescriptor, UsbHidReportDescriptorError> {
+        let text = self.descriptor.as_bytes();
+        if text.len() > 2 * arcen_usb_bridge::MAX_HID_REPORT_DESCRIPTOR_BYTES {
+            return Err(UsbHidReportDescriptorError::TooLarge(self.interface));
+        }
+        if text.len() % 2 != 0 {
+            return Err(UsbHidReportDescriptorError::NotHex(self.interface));
+        }
+        let nibble = |digit: u8| match digit {
+            b'0'..=b'9' => Some(digit - b'0'),
+            b'a'..=b'f' => Some(digit - b'a' + 10),
+            b'A'..=b'F' => Some(digit - b'A' + 10),
+            _ => None,
+        };
+        let descriptor = text
+            .chunks_exact(2)
+            .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
+            .collect::<Option<Vec<u8>>>()
+            .ok_or(UsbHidReportDescriptorError::NotHex(self.interface))?;
+        Ok(arcen_usb_bridge::InterfaceReportDescriptor {
+            interface: self.interface,
+            descriptor,
+        })
+    }
+}
+
+impl UsbHardDeviceMsg {
+    /// Decodes every claimed report descriptor, refusing the whole set when
+    /// any one is malformed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsbHidReportDescriptorError`] for too many, oversized or
+    /// non-hex descriptors.
+    pub fn report_descriptors(
+        &self,
+    ) -> Result<Vec<arcen_usb_bridge::InterfaceReportDescriptor>, UsbHidReportDescriptorError> {
+        if self.hid_report_descriptors.len() > arcen_usb_bridge::MAX_INTERFACES {
+            return Err(UsbHidReportDescriptorError::TooMany);
+        }
+        self.hid_report_descriptors
+            .iter()
+            .map(UsbHidReportDescriptorMsg::decode)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1669,7 +1802,8 @@ pub struct ClientHelloMsg {
     pub microphone_output: Option<MicrophoneCapabilitiesMsg>,
     pub supports_pen: bool,
     /// Explicit, negotiated opt-in to the quarantined experimental-raw-hid
-    /// vendor passthrough (Wacom/Huion/XP-Pen/UC-Logic/Gaomon). `true` only
+    /// pen-tablet passthrough (devices whose HID report descriptor classifies
+    /// as a pen tablet; see `arcen_usb_bridge::classify_pen_tablet`). `true` only
     /// when the client was built with the `experimental-raw-hid` Cargo
     /// feature AND an operator explicitly enabled it at runtime. Absent/false
     /// on every old peer and on all default production builds — this is not
@@ -2055,7 +2189,7 @@ pub struct ServerHelloMsg {
     #[serde(default = "default_true")]
     pub supports_pen: bool,
     /// Explicit, negotiated host support for the quarantined
-    /// experimental-raw-hid vendor passthrough. `true` only when the host was
+    /// experimental-raw-hid pen-tablet passthrough. `true` only when the host was
     /// built with the `experimental-raw-hid` Cargo feature AND an operator
     /// explicitly enabled it at runtime. Absent/false on every old host and
     /// on all default production builds. A client must still see this AND
@@ -6215,23 +6349,165 @@ mod tests {
         let hello = ClientHelloMsg {
             usb_hard_v1: true,
             usb_hard_device: Some(UsbHardDeviceMsg {
-                vendor_id: 0x056a,
+                vendor_id: 0x1234,
                 product_id: 0x0317,
                 bcd_device: 0x0100,
                 device_class: 0,
                 speed: UsbSpeed::Full,
+                hid_report_descriptors: vec![UsbHidReportDescriptorMsg::new(
+                    2,
+                    arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR,
+                )],
             }),
             ..ClientHelloMsg::default()
         };
         let json = serde_json::to_value(&hello).unwrap();
-        assert_eq!(json["usb_hard_device"]["vendor_id"], 0x056a);
+        assert_eq!(json["usb_hard_device"]["vendor_id"], 0x1234);
         assert_eq!(json["usb_hard_device"]["speed"], "full");
         assert_eq!(
-            serde_json::from_value::<ClientHelloMsg>(json)
+            json["usb_hard_device"]["hid_report_descriptors"][0]["descriptor"]
+                .as_str()
                 .unwrap()
-                .usb_hard_device,
-            hello.usb_hard_device
+                .get(..8),
+            Some("050d0902")
         );
+        let decoded = serde_json::from_value::<ClientHelloMsg>(json)
+            .unwrap()
+            .usb_hard_device
+            .unwrap();
+        assert_eq!(Some(&decoded), hello.usb_hard_device.as_ref());
+        let descriptors = decoded.report_descriptors().unwrap();
+        assert_eq!(descriptors[0].interface, 2);
+        assert_eq!(
+            descriptors[0].descriptor,
+            arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR
+        );
+    }
+
+    #[test]
+    fn a_0_15_hard_usb_device_without_descriptors_still_parses_and_round_trips() {
+        let legacy = r#"{"vendor_id":1386,"product_id":791,"bcd_device":256,"device_class":0,"speed":"full"}"#;
+        let device: UsbHardDeviceMsg = serde_json::from_str(legacy).unwrap();
+        assert!(device.hid_report_descriptors.is_empty());
+        assert!(device.report_descriptors().unwrap().is_empty());
+        assert_eq!(serde_json::to_string(&device).unwrap(), legacy);
+    }
+
+    #[test]
+    fn malformed_report_descriptor_claims_are_refused_whole() {
+        let mut device = UsbHardDeviceMsg {
+            vendor_id: 0,
+            product_id: 0,
+            bcd_device: 0,
+            device_class: 0,
+            speed: UsbSpeed::High,
+            hid_report_descriptors: vec![
+                UsbHidReportDescriptorMsg::new(0, &[0x05, 0x0d]),
+                UsbHidReportDescriptorMsg {
+                    interface: 1,
+                    descriptor: "0g".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            device.report_descriptors(),
+            Err(UsbHidReportDescriptorError::NotHex(1))
+        );
+        device.hid_report_descriptors[1].descriptor = "abc".to_owned();
+        assert_eq!(
+            device.report_descriptors(),
+            Err(UsbHidReportDescriptorError::NotHex(1))
+        );
+        device.hid_report_descriptors[1].descriptor =
+            "00".repeat(arcen_usb_bridge::MAX_HID_REPORT_DESCRIPTOR_BYTES + 1);
+        assert_eq!(
+            device.report_descriptors(),
+            Err(UsbHidReportDescriptorError::TooLarge(1))
+        );
+        device.hid_report_descriptors =
+            vec![UsbHidReportDescriptorMsg::new(0, &[1]); arcen_usb_bridge::MAX_INTERFACES + 1];
+        assert_eq!(
+            device.report_descriptors(),
+            Err(UsbHidReportDescriptorError::TooMany)
+        );
+        let upper = UsbHidReportDescriptorMsg {
+            interface: 3,
+            descriptor: "0D0A".to_owned(),
+        };
+        assert_eq!(upper.decode().unwrap().descriptor, vec![0x0d, 0x0a]);
+    }
+
+    /// 0.15 Decks and Piers spell the native tablet mode `wacom_usb_bridge`.
+    /// The vendor-neutral Rust name must keep reading and writing exactly
+    /// that, so mixed 0.15/0.16 pairs negotiate unchanged.
+    #[test]
+    fn native_tablet_mode_keeps_the_0_15_wire_token() {
+        assert_eq!(
+            serde_json::to_string(&TabletModeMsg::UsbTabletBridge).unwrap(),
+            r#""wacom_usb_bridge""#
+        );
+        assert_eq!(
+            serde_json::from_str::<TabletModeMsg>(r#""wacom_usb_bridge""#).unwrap(),
+            TabletModeMsg::UsbTabletBridge
+        );
+        assert_eq!(
+            serde_json::from_str::<TabletModeMsg>(r#""usb_tablet_bridge""#).unwrap(),
+            TabletModeMsg::UsbTabletBridge
+        );
+
+        let capabilities_0_15 = r#"{"local_termination":"available","wacom_usb_bridge":"unavailable","disabled_mouse_compat":"available"}"#;
+        let capabilities: TabletModeCapabilitiesMsg =
+            serde_json::from_str(capabilities_0_15).unwrap();
+        assert_eq!(
+            capabilities.usb_tablet_bridge,
+            InputCapabilityAvailability::Unavailable
+        );
+        assert_eq!(
+            serde_json::to_string(&capabilities).unwrap(),
+            capabilities_0_15
+        );
+        let neutral: TabletModeCapabilitiesMsg = serde_json::from_str(
+            r#"{"local_termination":"available","usb_tablet_bridge":"available"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            neutral.usb_tablet_bridge,
+            InputCapabilityAvailability::Available
+        );
+
+        let result_0_15 = r#"{"type":"tablet_mode_result","requested":"wacom_usb_bridge","active":"disabled_mouse_compat","accepted":false,"reason":"unavailable","reconnect_required":true}"#;
+        let result: TabletModeResultMsg = serde_json::from_str(result_0_15).unwrap();
+        assert_eq!(result.requested, TabletModeMsg::UsbTabletBridge);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&result).unwrap())
+                .unwrap(),
+            serde_json::from_str::<serde_json::Value>(result_0_15).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_0_15_client_hello_requesting_native_tablet_round_trips() {
+        let hello = ClientHelloMsg {
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
+            tablet_mode_capabilities: TabletModeCapabilitiesMsg {
+                local_termination: InputCapabilityAvailability::Available,
+                usb_tablet_bridge: InputCapabilityAvailability::Available,
+                disabled_mouse_compat: InputCapabilityAvailability::Available,
+            },
+            ..ClientHelloMsg::default()
+        };
+        let json = serde_json::to_value(&hello).unwrap();
+        assert_eq!(json["tablet_mode_requested"], "wacom_usb_bridge");
+        assert_eq!(
+            json["tablet_mode_capabilities"]["wacom_usb_bridge"],
+            "available"
+        );
+        assert!(json["tablet_mode_capabilities"]
+            .get("usb_tablet_bridge")
+            .is_none());
+        let back: ClientHelloMsg = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.tablet_mode_requested, TabletModeMsg::UsbTabletBridge);
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
     }
 
     #[test]
@@ -6251,7 +6527,7 @@ mod tests {
             InputCapabilityAvailability::Available
         );
         assert_eq!(
-            effective.wacom_usb_bridge,
+            effective.usb_tablet_bridge,
             InputCapabilityAvailability::Unknown
         );
 

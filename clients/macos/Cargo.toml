@@ -1,6 +1,6 @@
 [package]
 name = "arcen-deck-macos"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [features]
 # SEC-raw-hid: default-off. Enables the experimental raw-HID-over-IP capture
-# path (Wacom/Huion/XP-Pen/UC-Logic/Gaomon vendor tablets) that forwards raw
+# path (HID interfaces whose report descriptor declares a digitizer) that forwards raw
 # IOHID reports to the host's `/dev/uhid`. This is NOT enabled in production
 # or default builds. Even when compiled in, the capture path additionally
 # requires an explicit runtime opt-in (env var) plus a mutually negotiated
@@ -21,9 +21,10 @@ path = "src/lib.rs"
 # This is a raw-input passthrough quarantined behind this feature — it is not
 # USB bridging (no USB transport/enumeration is involved).
 experimental-raw-hid = []
-# Lab-only Hard USB responder. Uses the real AppKit pen source but an
-# independently authored synthetic USB tablet; it does not seize the physical
-# Wacom and is not a production bridge.
+# Lab-only Hard USB responder: connects to the privileged `arcen-usb-helper`,
+# which captures whichever attached device classifies as a pen tablet, or
+# (with ARCEN_USB_HARD_SYNTHETIC=1) answers as an independently authored
+# synthetic USB tablet. Not a production bridge.
 usb-hard-lab = ["dep:rusb", "dep:objc2-service-management"]
 # Developer-only tooling. Default-off and never enabled in release/package
 # builds: it compiles in `crate::ui::virtual_monitor_lab`, the

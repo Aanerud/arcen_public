@@ -56,14 +56,21 @@ export ARCEN_CODESIGN_IDENTITY="Developer ID Application: <NAME> (<TEAM_ID>)"
 export ARCEN_PROVISIONING_PROFILE="/path/to/<profile>.provisionprofile"
 export ARCEN_NOTARY_KEYCHAIN_PROFILE="<notary-keychain-profile-name>"
 
-packaging/macos/build-deck-app.sh --release
+packaging/macos/build-deck-app.sh --arch arm64 --release    # Arcen Deck.app
+packaging/macos/build-deck-app.sh --arch x86_64 --release   # Arcen Deck Intel.app
 ```
+
+Each run builds, signs, notarises and zips one app. The Intel app is
+cross-compiled for `x86_64-apple-darwin` (`rustup target add x86_64-apple-darwin`
+once) and uses the same bundle ID, identity and provisioning profile; see
+[`packaging/macos/README.md`](../../packaging/macos/README.md#architecture-and-minimum-macos).
 
 The script then, in order:
 
 1. builds `arcen-deck-macos` release and verifies the governed Opus source;
-2. assembles `Arcen Deck.app`, embedding `Info.plist`, the app icon, the
-   third-party notices, and the provisioning profile;
+2. assembles `Arcen Deck.app` (or `Arcen Deck Intel.app`), embedding
+   `Info.plist`, the app icon, the third-party notices, and the provisioning
+   profile;
 3. validates the provisioning profile's CMS signature (it compiles
    `verify-provisioning-cms.c` with `xcrun clang` to do so, rather than trusting
    the profile blindly);

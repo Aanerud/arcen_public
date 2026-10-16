@@ -19,7 +19,7 @@ Read this before you invest time.
 |---|---|
 | **Linux Pier** (host) | Works. Multi-display is automatic: the service discovers the NVIDIA heads at start. Auto/Speed use the existing NvFBC GPU path; Grading uses a separate depth-30 XShm path for genuine 10-bit SDR. Xorg cannot report HDR, so HDR requests visibly resolve to Grading, unless the operator declares the desktop Rec.2100 PQ (`video.desktop_encoding`, for applications such as Flame's HDR UI) and PQ / BT.2020 is passed through. General desktop HDR awaits a colour-managed Wayland provider. |
 | **Windows Pier** (host) | Works. Multi-display is automatic: the service picks an eligible NVIDIA adapter at start, and an administrator can reserve a GPU for other work. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
-| **macOS Deck** (client) | Works. Signed and notarised. VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. AV1 decode needs Apple silicon M3 or later. |
+| **macOS Deck** (client) | Works. Signed and notarised. On Apple silicon VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. Two apps from one source, both for macOS 12 or later: **Arcen Deck** for Apple silicon and **Arcen Deck Intel** for Intel Macs. AV1 decode needs Apple silicon M3 or later (macOS 14); the Intel app never offers AV1, and on Intel VideoToolbox may decode in software. Native tablet needs macOS 13. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
 | **macOS Pier** | Preview. A signed, notarised package ships with each release, and a logged-in user can serve a real Deck: PAM sign-in, ScreenCaptureKit → VideoToolbox video in Auto, Speed and Grading, HDR when the display being captured has HDR headroom, one virtual display per Deck display, pointer/keyboard/pen input and trackpad gestures, clipboard both ways, host audio, and session-scoped time-zone redirection for newly launched apps. It installs as a network service under a hidden `_arcen` account plus a helper in each signed-in session ([why two parts](docs/security/macos-pier-process-model.md)). A virtual microphone (an AudioServerPlugIn) ships in the package and negotiates with the Deck, but end-to-end microphone capture has not been qualified. Not yet: deskside privacy, native tablet, and qualification of cold-boot login-window operation and of multi-display on physical hardware. FileVault's pre-boot unlock screen cannot be served. |
 | **Gateway (internet traversal)** | Not shipped. It was never finished, so it is not published as dead code. It could return — see [below](#where-help-is-wanted). |
@@ -46,6 +46,16 @@ compiled:
   streamed an Aqua desktop, proved clipboard in both directions, and verified
   `adaptive-performance` as `420v`/`Yuv420` and `color-fidelity` as
   `x444`/`Yuv444`. Host-audio end-to-end tests pass on a machine with consent.
+- **macOS Deck on Intel**, Mac Pro (2013) on macOS 12.7.6: the Intel build
+  launches, passes the Deck test suite, and decodes a 720p H.264 stream through
+  the session decoder at about 150 fps in software. Its probe reports H.264,
+  HEVC, 4:4:4 and Main 10 decode sessions but no AV1. Native tablet reports
+  that it needs macOS 13. `Arcen Deck Intel.app` cross-compiled on an
+  Apple-silicon Mac (`build-deck-app.sh --arch x86_64`) runs there too:
+  `arcen-deck platform-report` reports `macos-intel`, the same decode probe,
+  and no native tablet. From the Mac Pro it streamed and decoded Auto, Speed,
+  Grading (10-bit 4:4:4) and HDR (PQ/BT.2020) from the Windows Pier, and
+  Auto, Speed and Grading from the Linux Pier (HDR served as Grading).
 - The Linux and Windows Piers in the release matrix are Active
   Directory-joined, so the credential crossing the wire is a domain credential,
   not a local account. The macOS Pier evidence above is one lab Mac, not a
@@ -70,7 +80,7 @@ account.
 | **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. By default the host's own speakers go silent for the session (`audio.local_playback`), so nobody beside the machine hears the remote user. On macOS that silence needs **System Audio Recording**, a separate approval from Screen Recording: the helper asks for it when it starts, and until it is given the host refuses a session and tells the Deck why rather than serving it audibly. |
 | **Microphone in** | **Linux hosts; macOS Pier preview.** Client microphone into the host session, Opus or fixed-rate PCM. Enabled in the host's default configuration, and still opt-in on the Deck every launch — consent is deliberately never restored from settings. Windows needs a signed driver Arcen does not yet ship (see [Where help is wanted](#where-help-is-wanted)). The macOS Pier publishes a virtual microphone and offers it only when that device is present; end-to-end capture is built but not yet qualified. |
 | **Keyboard and pointer** | Absolute and relative motion, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. Trackpad scrolling stays precise end to end (phased deltas on macOS, high-resolution wheel on Linux, fractional and horizontal wheel on Windows). Trackpad gestures — magnify, smart zoom, swipe — are negotiated separately and injected where the host OS allows it (the macOS Pier today). |
-| **Pen and tablet** | Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own Wacom driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no Wacom driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own Wacom driver claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
+| **Pen and tablet** | Any HID pen tablet, whoever made it: a device counts as a tablet because its HID report descriptor declares a pen, never because of its vendor id. Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own tablet driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no tablet driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own driver for that tablet claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
 | **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. Linux sets `TZ` in the remote process tree; Windows temporarily changes the system timezone; the macOS Pier sets `TZ` in the served GUI session, so apps launched during the session see the Deck zone while the menu bar clock and already-running apps stay on the Mac's zone. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
@@ -204,8 +214,12 @@ Useful flags on Linux and Windows: `--dry-run` shows what would happen and chang
 
 ### The client (Deck)
 
-Download `Arcen-Deck-<version>-macOS.zip`, unzip it, and drag the app to
-`/Applications`. It is signed and notarised, so it opens normally.
+Download `Arcen-Deck-<version>-macOS.zip` for an Apple-silicon Mac, or
+`Arcen-Deck-Intel-<version>-macOS.zip` for an Intel Mac, unzip it, and drag the
+app (`Arcen Deck` or `Arcen Deck Intel`) to `/Applications`. Both are signed and
+notarised, so they open normally, and both need macOS 12 or later. Install only
+the one that matches your Mac: the two share one bundle identifier, so they
+share settings and privacy permissions and are not meant to sit side by side.
 
 ---
 
@@ -306,10 +320,12 @@ and it never treats bit depth alone as proof of HDR.
 what the Deck can actually decode, so the Deck measures its own capability at
 startup and reports it in the handshake.
 
-On macOS that means VideoToolbox, and the answer differs by machine. Every Mac
-Arcen supports decodes H.264 and HEVC in hardware, but **AV1 hardware decode
-arrived with the M3**. An M1, an M2, or any Intel Mac reports no AV1, and the
-Pier picks HEVC instead. Nothing degrades silently; the negotiation simply lands
+On macOS that means VideoToolbox, and the answer differs by machine. Every Apple-silicon
+Mac decodes H.264 and HEVC in hardware; an Intel Mac whose GPU has no decoder
+for a stream decodes it in software, and reports only what a real decode
+session accepted. **AV1 hardware decode arrived with the M3**. An M1, an M2, or
+any Intel Mac reports no AV1 (the Intel app never offers it), and the Pier
+picks HEVC instead. Nothing degrades silently; the negotiation simply lands
 somewhere else.
 
 | Host has | Deck can decode | Arcen uses |
@@ -752,7 +768,11 @@ python3 -m unittest scripts/test_validate_observability.py
 ```sh
 # macOS
 cargo build --release -p arcen-deck-macos
-packaging/macos/build-deck-app.sh              # produces dist/macos/Arcen Deck.app
+packaging/macos/build-deck-app.sh              # dist/macos/Arcen Deck.app on Apple silicon,
+                                               # dist/macos/Arcen Deck Intel.app on Intel
+packaging/macos/build-deck-app.sh --arch x86_64   # the Intel app from an Apple-silicon Mac
+# Each app targets one architecture and macOS 12; see packaging/macos/README.md.
+# On an Intel Mac, Command Line Tools 14.2 suffice.
 
 # Linux — needs libpam0g-dev and libpulse-dev
 cargo build --locked --release -p arcen-pier-linux

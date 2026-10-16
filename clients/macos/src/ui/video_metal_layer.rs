@@ -2533,7 +2533,7 @@ where
 
 unsafe extern "C-unwind" fn display_link_callback<L, F, S>(
     _display_link: NonNull<CVDisplayLink>,
-    _now: NonNull<CVTimeStamp>,
+    now: NonNull<CVTimeStamp>,
     output_time: NonNull<CVTimeStamp>,
     _flags_in: CVOptionFlags,
     _flags_out: NonNull<CVOptionFlags>,
@@ -2547,15 +2547,17 @@ where
     let owner = &*(user_info as *const DisplayLinkOwner<L, F, S>);
     let output_time = output_time.as_ref();
     let target_time = host_ticks_to_duration(output_time.hostTime);
+    let callback_time = host_ticks_to_duration(now.as_ref().hostTime);
     let refresh_period = refresh_period_from_timestamp(output_time);
     let refresh_seq = owner
         .refresh_seq
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
-    drive_display_link_vsync::<L, F, S>(
+    drive_display_link_vsync_at::<L, F, S>(
         &owner.shared,
         Arc::clone(&owner.telemetry),
         refresh_seq,
+        arcen_media::presentation::pacer_clock_time(callback_time, target_time),
         target_time,
         refresh_period,
     );
@@ -2587,10 +2589,33 @@ fn refresh_period_from_timestamp(timestamp: &CVTimeStamp) -> Duration {
     FALLBACK_REFRESH_PERIOD
 }
 
+#[cfg(test)]
 fn drive_display_link_vsync<L, F, S>(
     shared: &DedicatedThreadShared<L, F, S>,
     telemetry: Arc<DedicatedPresenterTelemetry>,
     refresh_seq: u64,
+    target_time: Duration,
+    refresh_period: Duration,
+) where
+    L: DedicatedRenderableLayer<F>,
+    F: DedicatedPacedFrame + Clone + Send + 'static,
+    S: DedicatedThreadStatus,
+{
+    drive_display_link_vsync_at(
+        shared,
+        telemetry,
+        refresh_seq,
+        target_time,
+        target_time,
+        refresh_period,
+    );
+}
+
+fn drive_display_link_vsync_at<L, F, S>(
+    shared: &DedicatedThreadShared<L, F, S>,
+    telemetry: Arc<DedicatedPresenterTelemetry>,
+    refresh_seq: u64,
+    pacer_time: Duration,
     target_time: Duration,
     refresh_period: Duration,
 ) where
@@ -2621,7 +2646,7 @@ fn drive_display_link_vsync<L, F, S>(
         let before = state.pacer.counters();
         let decision = state
             .pacer
-            .on_refresh(refresh_seq, target_time, refresh_period);
+            .on_refresh(refresh_seq, pacer_time, refresh_period);
         let after = state.pacer.counters();
         telemetry.add_pacer_delta(before, after);
         (
@@ -2639,7 +2664,7 @@ fn drive_display_link_vsync<L, F, S>(
             if let Some(layer_ref) = layer.as_mut() {
                 match layer_ref.render_at(
                     &frame.frame,
-                    frame.callback_host_time,
+                    target_time,
                     refresh_period,
                     Arc::clone(&telemetry),
                 ) {
@@ -3624,6 +3649,39 @@ mod tests {
 
         assert_eq!(thread.queue_depth_for_test(), 0);
         assert_eq!(thread.pacer_counters_for_test().dropped_hidden, 2);
+    }
+
+    #[test]
+    fn frames_are_aged_from_callback_now_not_the_future_scan_out_target() {
+        let thread: DedicatedPresenterThread<FakeGeometryLayer, u32, DedicatedPresentationStatus> =
+            DedicatedPresenterThread::default();
+        let rendered = FakeGeometryLayer::default();
+        let rendered_probe = rendered.clone();
+        {
+            let (lock, _cvar) = &*thread.shared;
+            let mut state = lock.lock().expect("state");
+            state.layer_installed = true;
+            state.visible = true;
+            state.layer = Some(rendered);
+        }
+        let arrival = Duration::from_secs(10);
+        assert!(thread.submit(9, arrival));
+        // A 30 Hz display link whose output time leads "now" by 49 ms, with
+        // the frame admitted 30 ms before the callback.
+        let now = arrival + Duration::from_millis(30);
+        let target = now + Duration::from_millis(49);
+
+        drive_display_link_vsync_at(
+            &thread.shared,
+            Arc::clone(&thread.telemetry),
+            1,
+            arcen_media::presentation::pacer_clock_time(now, target),
+            target,
+            Duration::from_micros(33_333),
+        );
+
+        assert_eq!(rendered_probe.rendered(), vec![9]);
+        assert_eq!(thread.pacer_counters_for_test().dropped_stale, 0);
     }
 
     #[test]
