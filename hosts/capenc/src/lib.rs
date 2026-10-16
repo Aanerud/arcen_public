@@ -24,6 +24,12 @@
 
 pub mod admission_probe;
 
+/// Environment variable naming the capture GPU by PCI address
+/// (`0000:00:10.0`). The Linux Pier sets it for a dedicated session to the GPU
+/// its X server drives; capenc then opens CUDA on that device instead of
+/// ordinal 0.
+pub const CAPTURE_GPU_PCI_ENV: &str = "ARCEN_CAPTURE_GPU_PCI";
+
 // Vendored NVENC bindings (bindgen output, patched to fixed-width LONG/GUID
 // so the layout is correct on both windows-x64 and linux-x64).
 #[cfg(feature = "nvenc")]

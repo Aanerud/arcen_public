@@ -320,6 +320,10 @@ pub mod cuda {
     type CuInit = unsafe extern "C" fn(u32) -> CUresult;
     type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CUresult;
     type CuDeviceGet = unsafe extern "C" fn(*mut CUdevice, i32) -> CUresult;
+    type CuDeviceGetByPciBusId =
+        unsafe extern "C" fn(*mut CUdevice, *const std::os::raw::c_char) -> CUresult;
+    type CuDeviceGetPciBusId =
+        unsafe extern "C" fn(*mut std::os::raw::c_char, i32, CUdevice) -> CUresult;
     type CuCtxCreate = unsafe extern "C" fn(*mut CUcontext, u32, CUdevice) -> CUresult;
     type CuCtxDestroy = unsafe extern "C" fn(CUcontext) -> CUresult;
     type CuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
@@ -437,21 +441,39 @@ pub mod cuda {
     }
 
     pub unsafe fn init_from_env() -> Result<Context, NativeStartupError> {
-        let ordinal = match std::env::var("ARCEN_CUDA_DEVICE") {
-            Ok(value) => value.parse::<i32>().map_err(|_| {
-                NativeStartupError::fatal("ARCEN_CUDA_DEVICE must be a signed integer")
-            })?,
-            Err(std::env::VarError::NotPresent) => 0,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(NativeStartupError::fatal(
-                    "ARCEN_CUDA_DEVICE must be valid UTF-8",
-                ));
+        fn read(name: &str) -> Result<Option<String>, NativeStartupError> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => Err(NativeStartupError::fatal(format!(
+                    "{name} must be valid UTF-8"
+                ))),
             }
-        };
-        init(ordinal)
+        }
+        let pci = read(crate::CAPTURE_GPU_PCI_ENV)?;
+        let ordinal = read("ARCEN_CUDA_DEVICE")?;
+        let request = crate::linux_policy::cuda_device_request(pci.as_deref(), ordinal.as_deref())
+            .map_err(NativeStartupError::fatal)?;
+        init(request)
     }
 
-    pub unsafe fn init(ordinal: i32) -> Result<Context, NativeStartupError> {
+    /// The PCI address of `dev`, as CUDA reports it, for the log.
+    unsafe fn device_pci(get: Option<CuDeviceGetPciBusId>, dev: CUdevice) -> String {
+        let Some(get) = get else {
+            return "unknown".to_string();
+        };
+        let mut buffer = [0 as std::os::raw::c_char; 32];
+        if get(buffer.as_mut_ptr(), buffer.len() as i32, dev) != CUDA_SUCCESS {
+            return "unknown".to_string();
+        }
+        std::ffi::CStr::from_ptr(buffer.as_ptr())
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    }
+
+    pub unsafe fn init(
+        request: crate::linux_policy::CudaDeviceRequest,
+    ) -> Result<Context, NativeStartupError> {
         let lib = dl::open("libcuda.so.1").map_err(|error| {
             NativeStartupError::unavailable(BackendUnavailableReason::RuntimeMissing, error)
         })?;
@@ -459,6 +481,8 @@ pub mod cuda {
         let cu_init: CuInit = load_startup_fn(lib, "cuInit")?;
         let cu_device_get_count: CuDeviceGetCount = load_startup_fn(lib, "cuDeviceGetCount")?;
         let cu_device_get: CuDeviceGet = load_startup_fn(lib, "cuDeviceGet")?;
+        let cu_device_get_pci_bus_id: Option<CuDeviceGetPciBusId> =
+            load_startup_fn(lib, "cuDeviceGetPCIBusId").ok();
         let cu_ctx_create: CuCtxCreate = load_startup_fn(lib, "cuCtxCreate_v2")?;
 
         let fns = Fns {
@@ -483,21 +507,48 @@ pub mod cuda {
                 "no CUDA devices reported by libcuda",
             ));
         }
-        if ordinal < 0 || ordinal >= count {
-            return Err(NativeStartupError::fatal(format!(
-                "ARCEN_CUDA_DEVICE={ordinal} outside available CUDA device range 0..{}",
-                count - 1
-            )));
-        }
-
         let mut dev = 0;
-        startup_status(cu_device_get(&mut dev, ordinal), "cuDeviceGet")?;
+        let selected = match request {
+            crate::linux_policy::CudaDeviceRequest::Ordinal(ordinal) => {
+                if ordinal < 0 || ordinal >= count {
+                    return Err(NativeStartupError::fatal(format!(
+                        "ARCEN_CUDA_DEVICE={ordinal} outside available CUDA device range 0..{}",
+                        count - 1
+                    )));
+                }
+                startup_status(cu_device_get(&mut dev, ordinal), "cuDeviceGet")?;
+                format!("device={ordinal}/{count}")
+            }
+            crate::linux_policy::CudaDeviceRequest::PciBusId(pci) => {
+                let by_pci: CuDeviceGetByPciBusId = load_startup_fn(lib, "cuDeviceGetByPCIBusId")?;
+                let name = std::ffi::CString::new(pci.as_str()).map_err(|_| {
+                    NativeStartupError::fatal("capture GPU PCI address contains NUL")
+                })?;
+                let status = by_pci(&mut dev, name.as_ptr());
+                if status != CUDA_SUCCESS {
+                    // The X screen's GPU is not one CUDA can open (hidden by
+                    // CUDA_VISIBLE_DEVICES, or not a CUDA device). Capturing
+                    // on another GPU would be wrong, so the NVIDIA path is
+                    // unavailable and Auto degrades instead.
+                    return Err(NativeStartupError::unavailable(
+                        BackendUnavailableReason::HardwareUnavailable,
+                        format!(
+                            "cuDeviceGetByPCIBusId({pci}) -> CUDA status {status}: the X server's GPU is not a usable CUDA device"
+                        ),
+                    ));
+                }
+                format!("device=pci/{count}")
+            }
+        };
 
         let mut ctx = ptr::null_mut();
         startup_status(cu_ctx_create(&mut ctx, 0, dev), "cuCtxCreate_v2")?;
         startup_status((fns.cu_ctx_set_current)(ctx), "cuCtxSetCurrent")?;
         FNS = Some(fns);
-        log(&format!("CUDA ready: device={ordinal}/{count}"));
+        log(&format!(
+            "CUDA ready: {selected} capture_gpu_pci={}",
+            device_pci(cu_device_get_pci_bus_id, dev)
+        ));
 
         Ok(Context {
             raw: ctx,

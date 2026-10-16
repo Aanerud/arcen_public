@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-linux-installer"
-version = "0.16.0"
+version = "0.16.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Single-file Linux installer for Arcen Pier."
@@ -12,6 +12,7 @@ name = "install-arcen-pier"
 path = "src/main.rs"
 
 [dependencies]
+arcen-outputs.workspace = true
 arcen-session.workspace = true
 arcen-transport = { workspace = true, default-features = false }
 rustix.workspace = true

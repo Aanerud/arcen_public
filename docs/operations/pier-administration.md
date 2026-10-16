@@ -42,6 +42,80 @@ The script builds on the target, installs runtime files, validates `/etc/arcen/p
 
 The script creates `/opt/arcen/bin`, `/usr/share/doc/arcen`, `/etc/arcen`, `/var/log/arcen`, and `/var/lib/arcen/support`. It installs `/etc/systemd/system/arcen-pier.service` with `User=root`, `Restart=on-failure` bounded by `StartLimitBurst=10` over ten minutes, ordering after `time-sync.target`, and `ExecReload=/bin/kill -HUP $MAINPID`.
 
+#### The NVIDIA GPU in `/etc/arcen/xorg.conf`
+
+Every Linux session runs its own X server from the template
+`/etc/arcen/xorg.conf`, and that template's NVIDIA `Device` section must name
+this machine's GPU with a `BusID` line. The address is a fact about one machine
+— it differs between hosts, hypervisor slots, and cloned VMs — so the packaged
+template ships without one, and the single-file installer `install-arcen-pier`
+fills it in:
+
+1. It writes the stock template when `/etc/arcen/xorg.conf` is absent (or with
+   `--force`), and otherwise keeps the existing file.
+2. It lists the PCI devices in `/sys/bus/pci/devices` and picks the NVIDIA
+   display controllers (vendor `0x10de`, class VGA `0x0300` or 3D `0x0302`).
+   Devices bound to another kernel driver, such as `vfio-pci` for a GPU passed
+   through to a guest, are not usable. QXL, virtio-gpu and BMC VGA devices are
+   ignored.
+3. If the file's `BusID` already names one of those GPUs, it is kept:
+
+   ```text
+   xorg: /etc/arcen/xorg.conf uses the NVIDIA GPU at PCI 0000:00:10.0 (BusID PCI:0:16:0)
+   ```
+
+4. If the `BusID` is missing or names a device the host does not have, the
+   installer sets it, after copying an existing file to
+   `/etc/arcen/xorg.conf.before-<version>` (not needed when it has just written
+   the stock template). A later repair never overwrites an earlier copy; it
+   takes the next free name, `.before-<version>.1`, `.2`, and so on. The file
+   is replaced atomically, mode `0644`:
+
+   ```text
+   xorg: /etc/arcen/xorg.conf named BusID "PCI:6:16:0", but the NVIDIA GPU is at 0000:00:10.0; setting BusID "PCI:0:16:0" so headless sessions can start
+   xorg: previous file kept as /etc/arcen/xorg.conf.before-<version>
+   ```
+
+   With several NVIDIA GPUs it chooses one already bound to the `nvidia`
+   driver, lowest PCI address first, and lists the others.
+5. With no usable NVIDIA GPU it changes nothing and prints a warning. Headless
+   sessions need an NVIDIA GPU with the `nvidia` driver loaded; install the
+   driver and run the installer again.
+
+This step never fails an install, and it is skipped for a staging `--prefix`;
+`--dry-run` prints what it would do.
+
+The installer repairs only a file the Pier would trust: a regular file (not a
+symbolic link) owned by root that group and other users cannot write. Anything
+else is left untouched with a warning such as `xorg: /etc/arcen/xorg.conf is not
+safe to repair: its mode 0664 lets group or other users write it`. The template
+configures a root X server, so a file another user can edit could make it load
+their code; rewriting it as root `0644` would hide that. The Pier refuses such a
+file as well, so fix its owner and mode (`chown root:root`, `chmod 0644`) and run
+the installer again.
+
+`lspci` and sysfs print addresses in **hexadecimal** (`0000:00:10.0`), while
+Xorg's `BusID` is **decimal** (`PCI:0:16:0`); a domain other than `0000` is
+written `PCI:<bus>@<domain>:<device>:<function>`. To choose a different NVIDIA
+GPU, edit the `BusID` line in `/etc/arcen/xorg.conf`; no restart is needed,
+the next session reads it. A `BusID` that names an NVIDIA GPU the host has is always
+kept, by the installer and by the Pier.
+
+The Pier checks the same thing before every X server it starts, including the
+startup head-discovery probe, and corrects a stale `BusID` **in memory only**;
+it never writes `/etc`. Look for `Xorg GPU:` in
+`/var/log/arcen/arcen-pier.log`: `outcome="kept"`, `outcome="corrected"` (the
+file is stale — rerun the installer), or `outcome="no_nvidia_gpu"`.
+
+Capture follows the same GPU. The launcher reports the address its X server
+uses, the Pier hands it to capture as `ARCEN_CAPTURE_GPU_PCI`, and capture opens
+CUDA on that PCI device rather than CUDA's device 0, so NvFBC, CUDA and NVENC
+run on the GPU that owns the screen even when the host's GPUs differ. Capture
+children also run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`. The capture log line
+`CUDA ready: ... capture_gpu_pci=0000:00:10.0` names the GPU in use. If CUDA
+cannot open that GPU, the NVIDIA path reports itself unavailable and Auto falls
+back to software encoding rather than capturing on a different GPU.
+
 `install_arcen_pier --uninstall` removes the binary and the systemd unit and
 leaves `/etc/arcen`, `/var/lib/arcen` and the logs in place. The manual
 equivalent, for hosts installed before the installer existed, is:
@@ -361,7 +435,7 @@ encoder tier.
 | `platform.session.display` | string | built-in `:10`, package `:11` | Dedicated PAM display. Valid `:1` through `:99`. | Restart |
 | `platform.session.gpu_head` | string | built-in `DFP-1`, package `DFP-2` | Dedicated NVIDIA head. Valid `DFP-0` through `DFP-3`. | Restart |
 | `platform.session.xorg_bin` | path string | built-in `/usr/libexec/Xorg` | Xorg executable. | Restart |
-| `platform.session.xorg_config_template` | path string | built-in `/run/arcen/xorg.conf`, package `/etc/arcen/xorg.conf` | Single-head NVIDIA Xorg template. | Restart |
+| `platform.session.xorg_config_template` | path string | built-in `/run/arcen/xorg.conf`, package `/etc/arcen/xorg.conf` | Single-head NVIDIA Xorg template. Its `BusID` is checked against the host's NVIDIA GPUs before each X server starts. | Restart |
 | `platform.session.runtime_root` | path string | `/run/arcen/sessions` | Root-owned session artifact directory. | Restart |
 | `platform.session.agent_bin` | path string | discovered or package path | Session agent helper. **Target state:** becomes `arcen-pier session-agent`. | Restart |
 | `platform.session.launcher_bin` | path string | discovered or package path | Privileged PAM launcher. **Target state:** becomes `arcen-pier session-launcher`. | Restart |
@@ -715,6 +789,7 @@ Interpretation: service started, TLS material loaded, OS authentication succeede
 | Capture or encode fails | capenc READY line and event 1102 fields | Auto/Speed rank AV1 → HEVC → H.264 on the approved NVENC adapter, then either host uses source-built OpenH264. Exact codec/variant pins reject substitution. Grading/HDR target HEVC 4:4:4 instead of silently becoming AV1. `not_built` means the selected backend was not compiled. `capenc READY protocol error: missing cursor` means an old Pier is deployed. Rebuild/deploy the fused Pier. |
 | Audio absent but video works | Logs for WASAPI or audiocap | Windows needs a default render endpoint for loopback. Linux audiocap can wait during idle PulseAudio monitor suspension and report a capture gap rather than killing the helper. |
 | Deck reports Match My Layout unsupported | Host `AuthRequest` has no `multi_monitor_v1`; Windows `diagnose-host` **in an interactive session**; Linux startup discovery log | The pre-auth offer is withheld when `platform.multi_monitor.advertise_enabled` is `false`, Linux automatic head discovery found no usable NVIDIA heads, Windows startup found no eligible live NVIDIA/NVENC adapter after `allowed_adapters`/`excluded_adapters`, or the selected Windows adapter has no attached or provisionable outputs. `max_monitors` is only an operator ceiling; set it to a truthful lower value for attached-output hosts that cannot serve the Deck's full layout. |
+| Every Linux session fails with `graphical session setup failed: session launcher failed: dedicated Xorg failed to start` | `Xorg GPU:` lines in `/var/log/arcen/arcen-pier.log`; the head-probe log `/run/arcen/sessions/discovery/nvidia-head-probe-<epoch>.log`; `lspci -D -d 10de:` | `(EE) No devices detected.` and `no screens found` in the X log mean the template's `BusID` names no NVIDIA GPU on this host, or the `nvidia` kernel driver is not loaded. Rerun the installer to set the `BusID`, or edit it in `/etc/arcen/xorg.conf` (decimal, `0000:00:10.0` is `PCI:0:16:0`). See "The NVIDIA GPU in `/etc/arcen/xorg.conf`". |
 | Clipboard absent | ServerHello and session logs | Clipboard starts only after exact clipboard v1 negotiation and authenticated dedicated/user session. No-auth/shared-display sessions advertise disabled. |
 
 ## 8. Upgrade and rollback

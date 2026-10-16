@@ -30,6 +30,10 @@ compiled:
 - **Linux Pier**, Autodesk Flame workstation, GRID V100D-16Q → macOS Deck:
   Auto and Speed stayed on NvFBC; Grading captured real depth-30 pixels through
   XShm; HDR resolved truthfully to 10-bit BT.709 SDR.
+- **Linux Pier, fresh install**, Rocky Linux 9.7 with Secure Boot, GRID
+  V100D-16Q, Active Directory sign-in: the stock installer found the GPU,
+  set the Xorg `BusID` itself and said so, and a Deck streamed Auto, Speed,
+  Grading and HDR (served as Grading) with sound, on the first connection.
 - **Windows Pier**, DaVinci Resolve grading workstation, GRID V100D-16Q →
   macOS Deck: Auto, Speed, Grading, and HDR all completed end to end. Grading
   used WGC FP16 without enabling HDR; HDR used WGC FP16 with verified
