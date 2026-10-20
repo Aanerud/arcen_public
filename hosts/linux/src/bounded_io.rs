@@ -42,6 +42,13 @@ where
         Self { inner }
     }
 
+    /// Waits until a byte can be read, or the stream ended (`false`),
+    /// without consuming anything. Cancel safe, unlike
+    /// [`Self::next_bounded_line`].
+    pub(crate) async fn readable(&mut self) -> std::io::Result<bool> {
+        Ok(!self.inner.fill_buf().await?.is_empty())
+    }
+
     /// Reads one line, capping buffered bytes at
     /// [`crate::eventlog::MAX_FORWARDED_DIAGNOSTIC_LINE_BYTES`] regardless
     /// of the real line's length or whether a newline ever arrives. Returns

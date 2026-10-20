@@ -58,6 +58,14 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
    message-framing codec over the QUIC stream.
 6. Capenc's stable `[capenc] enc_fps=...` pipeline line is INFO-visible; routine
    child diagnostics remain DEBUG and explicit child warnings remain WARN.
+   The damage-gated loops (Xorg depth-30 XShm and the Wayland compositions)
+   append why that second's rate was what it was, from the shared
+   `arcen_media::video::classify_frame_rate`: `fps_limiter=at_contract|
+   no_damage|rate_control|pipeline`, `rate_capped`, `contract_fps`,
+   `target_fps`, `ticks_due`, `ticks_no_change`, `fresh_frames` and
+   `busy_ms`. The ten-bit host staging also reports `avg_convert_ms`,
+   `avg_upload_ms` and `avg_upload_kib`. The Pier logs
+   `capenc frame-rate limiter changed` at INFO when the verdict changes.
 7. `server_hello`, cursor authority, video headers, input geometry, and quality
    acknowledgement use one `ResolvedMediaPlan` parsed from capenc READY. Child launch alone is never
    treated as capture/encoder readiness.
@@ -242,12 +250,17 @@ fixed device raster, `ABS_PRESSURE` on the inclusive 16-bit `0..=65535`
 range (`input/pen.rs::PRESSURE_MAX`, the shared vendor-neutral
 `arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE`; the wire carries
 normalized pressure, so no tablet maker's range is assumed),
-whole-degree `ABS_TILT_X`/`ABS_TILT_Y` (`-90..=90`), tool/proximity via
+whole-degree `ABS_TILT_X`/`ABS_TILT_Y` (`-90..=90`, resolution
+`arcen_input::virtual_device::TILT_UNITS_PER_RADIAN` so libinput reads
+degrees), tool/proximity via
 `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER`, tip contact via `BTN_TOUCH`, and two
 barrel buttons via `BTN_STYLUS`/`BTN_STYLUS2`. **No rotation axis is
 advertised**: `pen_rotation` is always reported `Unavailable` because no
 target here has proven the kernel/libinput stack recognizes a chosen evdev
-axis as tablet rotation.
+axis as tablet rotation. The tablet device is the whole pen on Xorg: the
+tool's slave pointer that xf86-input-libinput creates moves the cursor and
+clicks; the absolute mouse device carries the pen only when no tablet device
+exists.
 
 `input/pen.rs::plan_pen_edges` emits ordered, idempotent `EV_KEY` edges
 (tool bit before touch/buttons entering proximity, touch/buttons before the
@@ -262,6 +275,59 @@ alone still leaves mouse/keyboard available. No tablet vendor driver is installe
 required on this Linux host — `libinput`/Xorg see an ordinary kernel
 tablet-tool device on the dedicated per-session Xorg target described above.
 Tablet touch is not transported; only one active tool is supported.
+
+In a headless Wayland session none of this applies: a uinput device would
+reach the machine's seat, not the session. Pen goes only to an emulated
+stylus on the compositor's EIS seat. `session/wayland/eis.rs` probes for
+one at agent start with the pure-Rust `reis` client, and
+`input/wayland.rs` sends `pen` commands only when the session's hello
+reports a bound stylus, planned by the shared
+`arcen_input::pen_emulation`. No GNOME release offers one yet, so the hello
+says why. Hard USB and raw HID are refused for every Wayland session
+(`usb_bridge::session_admission`). See
+[`../../docs/architecture/linux-wayland-provider.md`](../../docs/architecture/linux-wayland-provider.md#pen-and-hard-usb-in-a-wayland-session).
+
+## Session-confined virtual input (X11)
+
+Input reaches a dedicated Xorg desktop through three kernel uinput devices
+created per attachment by `input/uinput.rs`: the keyboard plus absolute pointer
+(`a2ce:0001`), the relative pointer (`a2ce:0002`) and the tablet pen
+(`a2ce:0003`). The kernel and udev offer every input device to every X server
+on the seat, and the dedicated Xorg hot-adds devices, so before 0.17.0 it also
+took the console's own keyboard and mice and any other dedicated Xorg's Arcen
+devices.
+
+`arcen_input::virtual_device::SessionInputIdentity` names the devices for the
+session's display: `Arcen Virtual Tablet Pen (session :58)`.
+`session/launcher.rs::with_session_input_isolation` appends two
+input classes to every rendered configuration, single-head and multi-head:
+`arcen-ignore-foreign-input` ignores every device, then
+`arcen-session-input` re-admits devices whose USB id is `a2ce:*` and whose
+name carries `(session :58)`. Xorg applies the last matching class that sets
+`Ignore`. The Pier refuses uinput for an attachment whose display is not a
+dedicated `:1`..`:99`.
+
+The match is on attributes a device declares itself, so it filters ordinary
+console devices but does not authenticate: a crafted USB device or a local
+user with `/dev/uinput` access can claim vendor `a2ce` and the session token.
+The devices are also still seat0 devices: a greeter or console session that
+is active on seat0 while an attachment exists can still open them. The
+follow-up closes both with one shipped udev rule: it tags only virtual-bus
+devices (`id/bustype` `0006`, `/devices/virtual/input`) with vendor `a2ce`
+through `ENV{ID_INPUT.tags}`, which `arcen-session-input` then requires with
+`MatchTag`, and gives them a seat of their own (`ID_SEAT` keyed on a
+per-session phys, set with a correctly sized `UI_SET_PHYS`) so the dedicated
+Xorg opens them directly (`docs/security/trust-boundaries.md`, *Linux X11
+virtual input boundary*).
+
+The keyboard is also an ordinary kernel keyboard, so the kernel's SysRq filter
+reads it whatever owns the screen. PrintScreen is therefore sent as
+`KEY_PRINT` (210, X keycode 218, keysym `Print`) and never as `KEY_SYSRQ`
+(`input/keymap.rs::kernel_safe_key`). The dedicated Xorg keeps `vt1` in
+keyboard-off mode with `DontVTSwitch`/`-novtswitch`, so while it owns the
+screen the kernel acts on no other combination (no Ctrl+Alt+Del, no
+Alt+F*n* or Ctrl+Alt+F*n* console switch) except a secure-attention key if the
+console keymap binds one.
 
 ## Clipboard redirection
 
@@ -284,6 +350,39 @@ The child exits and releases a remotely owned selection on every Deck
 disconnect, including resumable detach; the persistent desktop and its restore
 leases may remain. A resumed attachment re-negotiates and starts fresh bounded
 clipboard state without altering display/timezone/media ownership.
+
+Rules shared with every Linux bridge:
+- Eligibility comes from the shared `ClipboardHostFacts`.
+- Negotiation uses the shared `ClipboardNegotiation`. Bridges receive the
+  negotiated directions in the policy message.
+- Target choice, latin-1 conversion and validation come from
+  `arcen_media::clipboard::formats`.
+- A host copy above the policy, or one offered oddly (bad INCR, type
+  mismatch), is refused and logged (`clipboard_host_item_refused`). It never
+  ends the attachment.
+- The bulk writer abandons a clipboard transfer the bulk lane cannot take and
+  sends `clipboard_transfer_failed` (`bulk_lane_full` or
+  `bulk_lane_unavailable`).
+- Every bridge reads while it writes. The Pier's `ClipboardBridgeLink` gives
+  client items to a writer task with a 5-second per-message timeout, so the
+  attachment loop never waits on a helper. A stalled Xorg child has the item
+  abandoned (`clipboard_transfer_abandoned`), and a closed one still ends the
+  attachment. The Xorg child and the Wayland agent read and write in separate
+  futures.
+- Each X11 conversion lands on its own property, from a ring of 32
+  (`_ARCEN_CLIPBOARD_<n>`). Answers on any other property are deleted
+  unread. A refused, superseded or timed-out INCR is drained: every chunk is
+  deleted unread until the zero-length end, so a stale owner's chunk can
+  never become part of the next copy. When every ring property is still
+  draining, the new copy is refused as `busy`; the child keeps running.
+
+A headless Wayland desktop has no child. Its session agent proves Mutter's
+`RemoteDesktop` clipboard at start, on a session of its own, and serves
+`arcen-clipboard.sock` (`session/wayland/clipboard.rs`). The Pier proves the
+socket (`session/wayland/socket_proof.rs`), then speaks the same bridge
+protocol on it (`ClipboardAgentIo::Session`). A missing or lost Wayland
+bridge turns the clipboard off for that attachment instead of ending it. See
+`docs/architecture/linux-wayland-provider.md` § Clipboard.
 - **Time-zone redirection is opt-in and disabled by default.**
   `--timezone-redirection` enables it for PAM-authenticated desktops;
   `--no-timezone-redirection` disables it with last-option-wins semantics, and
@@ -672,6 +771,34 @@ has two separate capture paths rather than widening the existing one.
 These are parallel implementations, not stages in one adaptive loop. Changes
 to XShm admission, conversion, cursor handling, or performance must not alter
 the NvFBC path taken by every eight-bit session.
+
+**The desktop's depth.** XShm can only read ten bits from a depth-30 server,
+and X11 has one depth per server for its whole life. At depth 30 Firefox
+(whose GPU test refuses EGL at any depth but 24, then fails its GLX fallback
+under libglvnd with `BadAccess` on `X_GLXMakeCurrent`) and Chromium/Electron
+(no 8-bit-alpha EGL/GLX config: depth-30 visuals carry two alpha bits)
+render in software; GNOME Shell, `glxgears` and GTK GL views do not care.
+So the depth is a per-desktop decision made at creation:
+
+1. Before `SessionRegistry::acquire`, `net/server.rs` asks
+   `Config::new_x11_desktop_depth` (the shared `choose_desktop_depth` over
+   `video.x11_desktop_depth`, the resolved session bit depth and
+   `video.desktop_encoding`) and hands the depth to the launcher as an
+   enumerated fact (`OpenRequest::x11_desktop_depth`, only 24 or 30).
+2. The root launcher rewrites the template's single `DefaultDepth` and
+   Display `Depth` lines, and raises (never lowers) a single head's `Virtual`
+   per axis to the served size
+   (`arcen_outputs::with_session_screen`); a template of another shape keeps
+   its own depth. After start it reads the root depth with `xdpyinfo` and
+   returns it (`LauncherResponse::x11_root_depth`); an unknown depth counts
+   as eight-bit. `SessionMetadata::x11_desktop_depth` carries it for the
+   desktop's life.
+3. After `acquire`, a sign-in whose plan is deeper than the attached desktop
+   is resolved again with `Config::attached_desktop_depth` set: the shared
+   `serve_on_fixed_depth` serves it as Auto (`eight_bit_source`), the first
+   `served_pipeline` message carries `EIGHT_BIT_DESKTOP_DETAIL`, and the
+   later `quality_settings` respawn keeps the Auto plan. The desktop is never
+   replaced for its depth.
 
 The public NvFBC headers, through API v1.9, define exactly six buffer formats:
 `ARGB` (0), `RGB` (1), `NV12` (2), `YUV444P` (3), `RGBA` (4) and `BGRA` (5).

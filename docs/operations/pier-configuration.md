@@ -18,6 +18,7 @@ templates drift apart; only paths and the `platform` section may differ.
 | --- | --- | --- |
 | `video` | 10-bit, full range, BT.709, 60 fps, encoder `auto` | Each session still gets what its preset asks for and what the host can encode. |
 | `audio.enabled` / `audio.compressed` | on / Opus | Set `compressed` to `false` for PCM on a LAN. |
+| `audio.local_playback` | `muted` | The host's own speakers stay silent for the whole session, detached time included, whether or not audio is transmitted. `audible` keeps them playing. See [Local playback](#local-playback). |
 | `microphone_input.enabled` | on | Linux creates a virtual source. Windows needs the optional microphone driver; without it the microphone is reported unavailable and the session carries on. macOS does not implement it yet. |
 | `clipboard` | both directions, all content | |
 | `redirection.timezone` | on | Linux sets `TZ` in the authenticated desktop process tree. Windows temporarily changes the system time zone under a recovery journal. macOS sets `TZ` in the served GUI launchd session for newly launched apps only. |
@@ -63,6 +64,31 @@ the host codec or configured Opus bitrate.
 `microphone_input.enabled` is also host authority. Set it to `false` to refuse
 microphone audio from the Deck: Linux then creates no virtual source, and
 Windows does not probe or feed the optional microphone driver.
+
+## Local playback
+
+`audio.local_playback` decides whether someone beside the host hears the
+remote user. It is separate from `audio.enabled`: a session that transmits no
+audio still keeps the room silent by default. With `muted` (the default) a
+host that cannot prove its speakers silent **refuses the session** and tells
+the Deck "The host could not mute its own speakers"; set `audible` to serve
+such a host anyway.
+
+| Host | `muted` | `audible` |
+| --- | --- | --- |
+| macOS | A Core Audio process tap captures the system output and mutes it; it needs System Audio Recording. | The tap captures without muting. |
+| Linux, X11 session | The session agent loads an Arcen session sink in the user's audio server (PulseAudio or `pipewire-pulse`), makes it the default, mutes **every other sink** and moves every stream onto it, and keeps that true for the whole session. Arcen records the session sink. Every change is journalled; at the end only what the lease changed is restored (a sink the user had muted stays muted), and a journal left by a killed agent is restored by the launcher. If the same user is also signed in at the console, that console's speakers are silent during the remote session too. | Nothing in the user's audio server changes; Arcen records the default sink. |
+| Linux, Wayland session | The session's audio is a private graph: its own sink and its own PulseAudio-protocol server, with no speaker, so nothing reaches the room; the same check proves it. On a host whose audio server is PulseAudio itself (no `pipewire-pulse`), the session's graph is bridged into the user's PulseAudio, which gets the X11 lease. | The session sink is also played into the user's own default sink. |
+| Windows | Not implemented yet. | — |
+
+A Linux host with neither an audio server nor a sound card is silent by
+construction and is served under `muted`.
+
+**Upgrading a Linux host.** Linux Piers before this release ignored the
+setting. An existing configuration without `local_playback` now gets the
+default, `muted`: the host's speakers go silent during sessions, and a host
+that cannot prove it refuses them. Set `"local_playback": "audible"` to keep
+the previous behaviour.
 
 ## Common sections
 

@@ -31,12 +31,25 @@ use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
 use super::agent::SessionAgent;
-use super::agent::{AgentError, AgentReady};
+use super::agent::{AgentAudioArguments, AgentError, AgentReady};
 use super::identity::{IdentityError, SessionEnvironment, UserExecution, UserIdentity};
 use crate::logging::target;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the broker waits for the launcher's ready response. A headless
+/// Wayland start is bounded by its own budget, which is longer than an Xorg
+/// start; the broker must outwait it, or it would kill a launcher that is
+/// still inside a bounded start.
+const fn open_timeout(provider: arcen_session::desktop_provider::DesktopProvider) -> Duration {
+    match provider {
+        arcen_session::desktop_provider::DesktopProvider::Xorg => OPEN_TIMEOUT,
+        arcen_session::desktop_provider::DesktopProvider::Wayland => {
+            super::wayland::WAYLAND_OPEN_TIMEOUT
+        }
+    }
+}
 const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(12);
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(target_os = "linux")]
@@ -82,10 +95,28 @@ pub enum LauncherError {
     XorgRelease,
     #[error("logind session could not be activated on seat0")]
     LogindActivation,
+    #[error("another remote desktop is active on this host (one X11 desktop per host)")]
+    SeatOccupied,
     #[error("authenticated logind session could not be unlocked")]
     LogindUnlock,
     #[error("deskside protection failed")]
     Deskside,
+    #[error("the headless Wayland provider is not built into this Pier")]
+    WaylandUnavailable,
+    #[error("headless Wayland session failed to become ready")]
+    WaylandStart,
+    #[error("the host could not prove its own speakers silent")]
+    LocalPlaybackRefused,
+    #[error("headless Wayland session release could not be proven")]
+    WaylandRelease,
+    #[error(
+        "SELinux policy does not let the launcher start the session in the context PAM assigned"
+    )]
+    SelinuxContext,
+    #[error("polkit would not keep this remote desktop from the console's rights ({0})")]
+    PolkitUnprotected(arcen_session::polkit_remote::PolkitUnprotected),
+    #[error("wayland.session_mode = native_seat, and this desktop cannot have its own seat: {}", .0.explanation())]
+    NativeSeatUnavailable(arcen_session::native_seat::NativeSeatUnavailable),
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +131,16 @@ pub struct LauncherConfig {
     pub agent_binary: PathBuf,
     pub desktop: String,
     pub deskside: crate::deskside::LinuxDesksideConfig,
+    /// Desktop provider the privileged launcher creates.
+    pub provider: arcen_session::desktop_provider::DesktopProvider,
+    /// Whether a Wayland desktop runs the compositor's Xwayland for X11
+    /// applications (the Pier's resolved `platform.session.wayland_x11_apps`).
+    pub x11_apps: bool,
+    /// The operator's `audio.local_playback` and the `pactl` the session
+    /// agent drives it with.
+    pub audio: AgentAudioArguments,
+    /// `wayland.first_login_setup` for a headless Wayland desktop.
+    pub first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup,
 }
 
 #[derive(Serialize)]
@@ -110,7 +151,9 @@ struct AuthenticateRequest<'a> {
     remote_host: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+/// The broker's `authenticate` line. Deliberately not `Debug`: it carries
+/// the password.
+#[derive(Deserialize)]
 struct OwnedAuthenticateRequest {
     command: String,
     username: String,
@@ -141,6 +184,42 @@ struct OpenRequest {
     /// display's. `None` keeps the template's EDID-less head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     display: Option<SessionDisplayMsg>,
+    /// The operator's `audio.local_playback`; absent in a request from an
+    /// older Pier, which means the safe default.
+    #[serde(default)]
+    local_playback: arcen_session::pier_config::LocalPlayback,
+    /// The `pactl` the agent drives the session's audio server with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pactl: Option<PathBuf>,
+    /// How a headless Wayland desktop records its cursor, chosen from the
+    /// opening Deck's facts. Absent means embedded; an Xorg desktop ignores
+    /// it (its cursor is never in a `ScreenCast` stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_cursor: Option<super::wayland::StreamCursorMode>,
+    /// The route to a wide composition a headless Wayland session starts
+    /// with (`force-hdr`): only for a Grading or HDR session on a host whose
+    /// qualification proved it. `None` keeps the compositor's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wayland_fidelity_route: Option<String>,
+    /// The side-by-side prefix a headless Wayland session runs its
+    /// compositor from (`capture.wayland_compositor_prefix`); absent for the
+    /// distribution's `/usr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wayland_compositor_prefix: Option<String>,
+    /// Lab (`wayland.lab_seat_pen`): the udev seat of the Pier's seat pen,
+    /// on which the compositor runs libinput.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wayland_lab_input_seat: Option<String>,
+    /// A native desktop (`wayland.session_mode`): the logind session opens
+    /// on `wayland_lab_input_seat` and the compositor runs natively there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    wayland_native_seat: bool,
+    /// The X11 depth (24 or 30) a dedicated Xorg desktop is created at,
+    /// decided by the Pier from the creating session
+    /// (`arcen_media::video::choose_desktop_depth`). Absent keeps the
+    /// template's own depth, as every desktop had before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x11_desktop_depth: Option<u8>,
 }
 
 /// A served Deck display's facts, carried to the privileged launcher.
@@ -198,6 +277,39 @@ impl SessionDisplayMsg {
         }
     }
 
+    /// The display's refresh rate.
+    pub(crate) const fn refresh_hz(&self) -> u32 {
+        self.refresh_hz
+    }
+
+    /// The display's physical size, for the virtual output's UI scale.
+    pub(crate) fn density(&self) -> arcen_session::wayland_outputs::OutputDensity {
+        let millimetres = |value: f32| {
+            if value.is_finite() && value > 0.0 && value < 100_000.0 {
+                // Range-checked above.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let rounded = value.round() as u32;
+                rounded
+            } else {
+                0
+            }
+        };
+        arcen_session::wayland_outputs::OutputDensity {
+            width_mm: millimetres(self.width_mm),
+            height_mm: millimetres(self.height_mm),
+            logical_width: 0,
+        }
+    }
+
+    /// The same display with its head created at `refresh_hz`: a headless
+    /// Wayland session's virtual output, or the refresh a dedicated Xorg
+    /// head's EDID describes.
+    #[must_use]
+    pub(crate) const fn with_refresh_hz(mut self, refresh_hz: u32) -> Self {
+        self.refresh_hz = refresh_hz;
+        self
+    }
+
     fn edid(&self) -> Result<[u8; 128], String> {
         arcen_outputs::edid::generate(arcen_outputs::edid::EdidRequest {
             width: self.width,
@@ -229,6 +341,8 @@ impl SessionDisplayMsg {
 /// sent to a client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MultiHeadPlanMsg {
+    #[serde(default = "dedicated_xorg_backend")]
+    backend: crate::display::topology::LinuxTopologyBackend,
     generation: u64,
     virtual_width: u32,
     virtual_height: u32,
@@ -257,11 +371,26 @@ struct MultiHeadMonitorPlanMsg {
     #[serde(default)]
     quality_intent: arcen_protocol::messages::MonitorQualityIntentMsg,
     mode_token: String,
+    #[serde(default = "default_refresh_hz")]
+    refresh_hz: u32,
+    #[serde(default)]
+    width_mm: u32,
+    #[serde(default)]
+    height_mm: u32,
+}
+
+const fn dedicated_xorg_backend() -> crate::display::topology::LinuxTopologyBackend {
+    crate::display::topology::LinuxTopologyBackend::DedicatedXorg
+}
+
+const fn default_refresh_hz() -> u32 {
+    60
 }
 
 impl MultiHeadPlanMsg {
     fn from_plan(plan: &crate::display::topology::LinuxTopologyPlan) -> Self {
         Self {
+            backend: plan.backend,
             generation: plan.generation.get(),
             virtual_width: plan.virtual_width,
             virtual_height: plan.virtual_height,
@@ -292,6 +421,7 @@ impl MultiHeadPlanMsg {
             .map(MultiHeadMonitorPlanMsg::into_plan)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(crate::display::topology::LinuxTopologyPlan {
+            backend: self.backend,
             generation,
             virtual_width: self.virtual_width,
             virtual_height: self.virtual_height,
@@ -321,6 +451,9 @@ impl MultiHeadMonitorPlanMsg {
             primary: monitor.primary,
             quality_intent: monitor.quality_intent,
             mode_token: monitor.mode_token.clone(),
+            refresh_hz: monitor.refresh_hz,
+            width_mm: monitor.width_mm,
+            height_mm: monitor.height_mm,
         }
     }
 
@@ -340,6 +473,9 @@ impl MultiHeadMonitorPlanMsg {
         let scale =
             arcen_media::Scale120::new(self.scale_120).map_err(|_| LauncherError::XorgConfig)?;
         Ok(crate::display::topology::LinuxMonitorPlan {
+            refresh_hz: self.refresh_hz,
+            width_mm: self.width_mm,
+            height_mm: self.height_mm,
             session_monitor_id,
             client_display_id: self.client_display_id,
             head: self.head,
@@ -370,6 +506,8 @@ impl OpenRequest {
         deskside: crate::deskside::LinuxDesksideConfig,
         multi_monitor: Option<MultiHeadPlanMsg>,
         display: Option<SessionDisplayMsg>,
+        audio: &AgentAudioArguments,
+        wayland_fidelity_route: Option<String>,
     ) -> Self {
         Self {
             command: "open".to_string(),
@@ -377,7 +515,73 @@ impl OpenRequest {
             deskside,
             multi_monitor,
             display,
+            local_playback: audio.local_playback,
+            pactl: Some(audio.pactl.clone()),
+            stream_cursor: None,
+            wayland_fidelity_route,
+            wayland_compositor_prefix: super::wayland::compositor_prefix().recorded(),
+            wayland_lab_input_seat: None,
+            wayland_native_seat: false,
+            x11_desktop_depth: None,
         }
+    }
+
+    /// The agent's audio arguments. A `pactl` that is not an absolute path
+    /// to a file falls back to the default rather than running something
+    /// relative to the agent's working directory.
+    fn audio(&self) -> AgentAudioArguments {
+        let pactl = self
+            .pactl
+            .clone()
+            .filter(|path| path.is_absolute() && path.is_file())
+            .unwrap_or_else(|| PathBuf::from(crate::media::local_playback::DEFAULT_PACTL));
+        AgentAudioArguments {
+            local_playback: self.local_playback,
+            pactl,
+        }
+    }
+
+    fn with_stream_cursor(
+        mut self,
+        stream_cursor: Option<super::wayland::StreamCursorMode>,
+    ) -> Self {
+        self.stream_cursor = stream_cursor;
+        self
+    }
+
+    fn with_lab_input_seat(mut self, seat: Option<String>) -> Self {
+        self.wayland_lab_input_seat = seat;
+        self
+    }
+
+    fn with_native_seat(mut self, native: bool) -> Self {
+        self.wayland_native_seat = native && self.wayland_lab_input_seat.is_some();
+        self
+    }
+
+    /// The seat the logind session opens on: only a valid desktop seat of a
+    /// native-seat request.
+    fn native_seat(&self) -> Option<&str> {
+        self.wayland_native_seat
+            .then_some(self.wayland_lab_input_seat.as_deref())
+            .flatten()
+            .filter(|seat| arcen_input::seat_pen::is_desktop_seat(seat))
+    }
+
+    fn with_x11_desktop_depth(mut self, depth: Option<arcen_media::video::DesktopDepth>) -> Self {
+        self.x11_desktop_depth = depth.map(arcen_media::video::DesktopDepth::x11_depth);
+        self
+    }
+
+    /// The requested depth, refusing anything but the two this launcher
+    /// renders: a request from the Pier is trusted no further than that.
+    fn x11_desktop_depth(&self) -> Result<Option<arcen_media::video::DesktopDepth>, LauncherError> {
+        self.x11_desktop_depth
+            .map(|depth| {
+                arcen_media::video::DesktopDepth::from_x11_depth(depth)
+                    .ok_or(LauncherError::Protocol)
+            })
+            .transpose()
     }
 }
 
@@ -411,6 +615,16 @@ struct LauncherResponse {
     /// `lspci -D` form of the GPU the dedicated X server drives, or empty.
     #[serde(default)]
     capture_gpu_pci: String,
+    /// The headless Wayland session's outputs, streams and input socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wayland: Option<super::wayland::WaylandAgentReady>,
+    /// The session's audio, as its agent established it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio: Option<super::agent::SessionAudioReady>,
+    /// The root depth the dedicated Xorg reported once ready; absent for a
+    /// Wayland session and from an older launcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x11_root_depth: Option<u8>,
 }
 
 /// The helper environment that pins capture to the dedicated X server's GPU.
@@ -464,6 +678,9 @@ impl LauncherResponse {
             xauthority: String::new(),
             agent_pid: 0,
             capture_gpu_pci: String::new(),
+            wayland: None,
+            audio: None,
+            x11_root_depth: None,
         }
     }
 
@@ -485,6 +702,7 @@ impl LauncherResponse {
         environment: &SessionEnvironment,
         agent: &AgentReady,
         capture_gpu_pci: Option<arcen_outputs::PciAddress>,
+        x11_root_depth: Option<u8>,
     ) -> Self {
         Self {
             status: "ready".into(),
@@ -506,6 +724,9 @@ impl LauncherResponse {
             capture_gpu_pci: capture_gpu_pci
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
+            wayland: agent.wayland.clone(),
+            audio: agent.audio.clone(),
+            x11_root_depth,
         }
     }
 
@@ -528,11 +749,27 @@ pub struct AuthenticatedLauncher {
     stdout: Option<Lines<BufReader<ChildStdout>>>,
     stderr_task: Option<JoinHandle<()>>,
     pam_permit: Option<OwnedSemaphorePermit>,
+    /// A native seat built for this desktop, kept here until the desktop
+    /// is handed over: when opening fails, it is taken apart only after the
+    /// launcher (and with it the session's compositor) has stopped.
+    #[cfg(target_os = "linux")]
+    native_pen: Option<Arc<crate::input::seat_pen::SeatPen>>,
     session_log_id: Arc<Mutex<CorrelationId>>,
     timezone: Option<IanaTimeZone>,
     deskside: crate::deskside::LinuxDesksideConfig,
     multi_monitor_plan: Option<MultiHeadPlanMsg>,
     session_display: Option<SessionDisplayMsg>,
+    stream_cursor: Option<super::wayland::StreamCursorMode>,
+    wayland_fidelity_route: Option<String>,
+    /// Lab (`wayland.lab_seat_pen`): a desktop this sign-in creates gets its
+    /// own pen on its own seat.
+    lab_seat_pen: bool,
+    /// How a desktop this sign-in creates gets its seat
+    /// (`wayland.session_mode`).
+    desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan,
+    x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
+    provider: arcen_session::desktop_provider::DesktopProvider,
+    audio: AgentAudioArguments,
 }
 
 impl AuthenticatedLauncher {
@@ -573,15 +810,90 @@ impl AuthenticatedLauncher {
         self.session_display = display;
     }
 
+    /// Sets how a headless Wayland desktop opened by this launcher records
+    /// its cursor. Must be called before [`AuthenticatedLauncher::open`].
+    pub(crate) fn set_stream_cursor_mode(&mut self, mode: super::wayland::StreamCursorMode) {
+        self.stream_cursor = Some(mode);
+    }
+
+    /// The outputs this sign-in asks a headless Wayland desktop for: a
+    /// committed virtual-output topology's (primary first, placed), or the
+    /// one served display at the origin; `None` when it named neither.
+    #[must_use]
+    pub(crate) fn requested_wayland_outputs(
+        &self,
+    ) -> Option<Vec<arcen_session::wayland_outputs::PlacedOutput>> {
+        if let Some(plan) = self.multi_monitor_plan.clone() {
+            let plan = plan.into_plan().ok()?;
+            if plan.backend != crate::display::topology::LinuxTopologyBackend::VirtualOutputs {
+                return None;
+            }
+            return plan
+                .placed_outputs()
+                .ok()
+                .map(|outputs| outputs.into_iter().map(|(_, placed)| placed).collect());
+        }
+        let display = self.session_display.as_ref()?;
+        arcen_session::wayland_session::VirtualOutputRequest::new(
+            display.width,
+            display.height,
+            display.refresh_hz,
+        )
+        .ok()
+        .map(|request| {
+            vec![
+                arcen_session::wayland_outputs::PlacedOutput::at_origin(request)
+                    .with_density(display.density()),
+            ]
+        })
+    }
+
+    /// Starts a headless Wayland session's compositor on `route` to a wide
+    /// composition (`force-hdr`), for a Grading or HDR session. Must be
+    /// called before [`AuthenticatedLauncher::open`] to take effect.
+    pub(crate) fn set_wayland_fidelity_route(&mut self, route: Option<&str>) {
+        self.wayland_fidelity_route = route.map(str::to_owned);
+    }
+
+    /// Lab (`wayland.lab_seat_pen`): a headless Wayland desktop this
+    /// sign-in creates gets its own pen ([`crate::input::seat_pen::SeatPen`])
+    /// and its compositor runs libinput on the pen's seat. A reattachment
+    /// keeps the desktop's own pen, or none. Must be called before
+    /// [`AuthenticatedLauncher::open`].
+    pub(crate) fn set_lab_seat_pen(&mut self, enabled: bool) {
+        self.lab_seat_pen = enabled;
+    }
+
+    /// How a Wayland desktop this sign-in creates gets its seat
+    /// (`wayland.session_mode`, [`arcen_session::native_seat::plan_desktop_seat`]).
+    /// A native desktop gets its own seat
+    /// ([`crate::input::seat_pen::SeatPen::create_native`]): its logind
+    /// session opens on that seat and its stock compositor runs natively
+    /// there, with the desktop's pen as a libinput tablet. Must be called
+    /// before [`AuthenticatedLauncher::open`].
+    pub(crate) fn set_desktop_seat_plan(
+        &mut self,
+        plan: arcen_session::native_seat::DesktopSeatPlan,
+    ) {
+        self.desktop_seat_plan = plan;
+    }
+
+    /// Creates a dedicated Xorg desktop at `depth` (a headless Wayland
+    /// desktop ignores it). Must be called before
+    /// [`AuthenticatedLauncher::open`] to take effect; a reattachment keeps
+    /// the depth the desktop was created at.
+    pub(crate) fn set_x11_desktop_depth(&mut self, depth: arcen_media::video::DesktopDepth) {
+        self.x11_desktop_depth = Some(depth);
+    }
+
     pub async fn authenticate(
         config: &LauncherConfig,
         username: &str,
-        password: String,
+        password: Zeroizing<String>,
         remote_host: &str,
         pam_permit: OwnedSemaphorePermit,
         session_log_id: CorrelationId,
     ) -> Result<Self, LauncherError> {
-        let password = Zeroizing::new(password);
         if !config.binary.is_file() {
             return Err(LauncherError::BinaryUnavailable);
         }
@@ -603,6 +915,11 @@ impl AuthenticatedLauncher {
             .arg(&config.agent_binary)
             .arg("--desktop-session")
             .arg(&config.desktop)
+            .arg("--desktop-provider")
+            .arg(config.provider.token())
+            .args(config.x11_apps.then_some(super::wayland::LAUNCHER_X11_FLAG))
+            .arg(super::wayland::FIRST_LOGIN_SETUP_FLAG)
+            .arg(config.first_login_setup.token())
             .arg("--session-log-id")
             .arg(session_log_id.as_str())
             .env("ARCEN_SESSION_LOG_ID", session_log_id.as_str())
@@ -635,10 +952,16 @@ impl AuthenticatedLauncher {
             password: password.as_str(),
             remote_host,
         };
-        let mut request_json =
-            Zeroizing::new(serde_json::to_string(&request).map_err(|_| LauncherError::Protocol)?);
-        request_json.push('\n');
-        stdin.write_all(request_json.as_bytes()).await?;
+        // One allocation sized for the worst-case escaping, so serializing
+        // never reallocates and leaves a stray copy of the password behind.
+        let mut request_json = Zeroizing::new(Vec::with_capacity(authenticate_request_capacity(
+            username,
+            &password,
+            remote_host,
+        )));
+        serde_json::to_writer(&mut *request_json, &request).map_err(|_| LauncherError::Protocol)?;
+        request_json.push(b'\n');
+        stdin.write_all(&request_json).await?;
         stdin.flush().await?;
 
         let mut stdout = BufReader::new(stdout).lines();
@@ -651,14 +974,105 @@ impl AuthenticatedLauncher {
                 stdout: Some(stdout),
                 stderr_task: Some(stderr_task),
                 pam_permit: Some(pam_permit),
+                #[cfg(target_os = "linux")]
+                native_pen: None,
                 session_log_id,
                 timezone: None,
                 deskside: config.deskside.clone(),
                 multi_monitor_plan: None,
                 session_display: None,
+                stream_cursor: None,
+                wayland_fidelity_route: None,
+                lab_seat_pen: false,
+                desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan::Headless {
+                    fallback: None,
+                },
+                x11_desktop_depth: None,
+                provider: config.provider,
+                audio: config.audio.clone(),
             }),
             "rejected" => Err(LauncherError::Rejected),
             _ => Err(LauncherError::Protocol),
+        }
+    }
+
+    /// Builds this desktop's native seat when its plan asks for one: the
+    /// pen on the seat and whether the desktop is native. A failure falls
+    /// back to headless with the reason logged, or refuses the desktop when
+    /// the mode requires a native seat. A native desktop's logind session
+    /// sits on its Arcen seat, so polkit's `state` must allow one (Arcen's
+    /// rule installed, polkit >= 0.106) before the seat is built.
+    #[cfg(target_os = "linux")]
+    async fn native_seat(
+        &self,
+        polkit: arcen_session::polkit_remote::PolkitState,
+    ) -> Result<(Option<Arc<crate::input::seat_pen::SeatPen>>, bool), LauncherError> {
+        use arcen_session::native_seat::{after_seat_failure, polkit_blocker, DesktopSeatPlan};
+        let mut plan = self.desktop_seat_plan;
+        if let (DesktopSeatPlan::Native { required }, Some(reason)) =
+            (plan, NATIVE_SEATS_DISABLED.get())
+        {
+            plan = after_seat_failure(required, *reason);
+        }
+        if let (DesktopSeatPlan::Native { required }, Some(reason)) = (plan, polkit_blocker(polkit))
+        {
+            plan = after_seat_failure(required, reason);
+        }
+        if let DesktopSeatPlan::Native { required } = plan {
+            let uid = self.identity.uid;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "awaited to completion, never under a timeout; the seat build is bounded (udevadm settle --timeout, SEAT_TIMEOUT polls)"
+            )]
+            let created = tokio::task::spawn_blocking(move || {
+                crate::input::seat_pen::SeatPen::create_native(uid)
+            })
+            .await;
+            match created {
+                Ok(Ok(pen)) => return Ok((Some(pen), true)),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        reason = error.reason.token(),
+                        detail = %error.detail,
+                        required,
+                        "this Wayland desktop cannot have its own seat"
+                    );
+                    plan = after_seat_failure(required, error.reason);
+                }
+                Err(_) => {
+                    plan = after_seat_failure(
+                        required,
+                        arcen_session::native_seat::NativeSeatUnavailable::SeatSetupFailed,
+                    );
+                }
+            }
+        }
+        match plan {
+            DesktopSeatPlan::Refuse(reason) => {
+                tracing::warn!(
+                    target: target::SESSION,
+                    reason = reason.token(),
+                    explanation = reason.explanation(),
+                    "wayland.session_mode = native_seat: the desktop is refused"
+                );
+                Err(LauncherError::NativeSeatUnavailable(reason))
+            }
+            DesktopSeatPlan::Headless {
+                fallback: Some(reason),
+            } => {
+                tracing::info!(
+                    target: target::SESSION,
+                    session_mode = "auto",
+                    reason = reason.token(),
+                    explanation = reason.explanation(),
+                    "this Wayland desktop is headless (no real pen)"
+                );
+                Ok((None, false))
+            }
+            DesktopSeatPlan::Headless { fallback: None } | DesktopSeatPlan::Native { .. } => {
+                Ok((None, false))
+            }
         }
     }
 
@@ -671,13 +1085,90 @@ impl AuthenticatedLauncher {
     }
 
     async fn open_inner(&mut self) -> Result<SessionLauncher, LauncherError> {
+        // polkit's state is read before anything is built: it decides
+        // whether this desktop may have a seat at all (below), and whether
+        // a native desktop may have its Arcen seat.
+        #[cfg(target_os = "linux")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "polkit tools are bounded by their own timeout (polkit_remote::TOOL_TIMEOUT)"
+        )]
+        let polkit_state = tokio::task::spawn_blocking(crate::session::polkit_remote::state)
+            .await
+            .ok();
+        // Created before the compositor starts (it opens its seat's devices
+        // once) and owned by the desktop from here: dropped with it, or right
+        // away if the desktop does not open.
+        #[cfg(target_os = "linux")]
+        let (native_pen, native_seat) = self.native_seat(polkit_state.unwrap_or_default()).await?;
+        #[cfg(target_os = "linux")]
+        self.native_pen.clone_from(&native_pen);
+        #[cfg(not(target_os = "linux"))]
+        let native_seat = false;
+        #[cfg(target_os = "linux")]
+        let seat_pen = if native_pen.is_some() {
+            native_pen
+        } else if self.lab_seat_pen {
+            let uid = self.identity.uid;
+            match tokio::task::spawn_blocking(move || crate::input::seat_pen::SeatPen::create(uid))
+                .await
+            {
+                Ok(Ok(pen)) => Some(pen),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: target::INPUT,
+                        %error,
+                        "LAB: this desktop gets no seat pen; pen input stays on the emulated seat"
+                    );
+                    None
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let lab_input_seat = seat_pen.as_ref().map(|pen| pen.seat());
+        #[cfg(not(target_os = "linux"))]
+        let lab_input_seat = None;
+        // Before anything is launched: a refusal polkit's state alone decides
+        // (no rule for a seated desktop) is made while the user has no
+        // session, so a refused remote user never holds a seat. An X11
+        // desktop sits on the console seat and a native Wayland desktop on
+        // its own Arcen seat; only a headless Wayland desktop is seatless.
+        #[cfg(target_os = "linux")]
+        let polkit_seat = crate::session::polkit_remote::desktop_seat(self.provider, native_seat);
+        #[cfg(target_os = "linux")]
+        let polkit_state = {
+            let (state, refusal) = match polkit_state {
+                Some(state) => (
+                    state,
+                    crate::session::polkit_remote::refusal_logged(state, polkit_seat),
+                ),
+                None => (
+                    arcen_session::polkit_remote::PolkitState::Unknown,
+                    (polkit_seat != arcen_session::polkit_remote::DesktopSeat::Seatless)
+                        .then_some(arcen_session::polkit_remote::PolkitUnprotected::Unverified),
+                ),
+            };
+            if let Some(reason) = refusal {
+                return Err(LauncherError::PolkitUnprotected(reason));
+            }
+            state
+        };
         let stdin = self.stdin.as_mut().ok_or(LauncherError::Protocol)?;
         let request = OpenRequest::new(
             self.timezone.clone(),
             self.deskside.clone(),
             self.multi_monitor_plan.clone(),
             self.session_display.clone(),
-        );
+            &self.audio,
+            self.wayland_fidelity_route.clone(),
+        )
+        .with_stream_cursor(self.stream_cursor)
+        .with_x11_desktop_depth(self.x11_desktop_depth)
+        .with_lab_input_seat(lab_input_seat)
+        .with_native_seat(native_seat);
         let mut request_json = serde_json::to_vec(&request).map_err(|_| LauncherError::Protocol)?;
         if request_json.len() > MAX_OPEN_REQUEST_BYTES {
             return Err(LauncherError::Protocol);
@@ -687,7 +1178,7 @@ impl AuthenticatedLauncher {
         stdin.flush().await?;
         let response = read_response(
             self.stdout.as_mut().ok_or(LauncherError::Protocol)?,
-            OPEN_TIMEOUT,
+            open_timeout(self.provider),
         )
         .await?;
         if response.status != "ready"
@@ -706,15 +1197,47 @@ impl AuthenticatedLauncher {
                     .to_string(),
             ),
         ];
-        extra_environment.extend(capture_gpu_environment(&response.capture_gpu_pci));
-        let environment = SessionEnvironment::build(
-            &self.identity,
-            &response.display,
-            (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
-            &response.desktop,
-            self.timezone.as_ref(),
-            extra_environment,
-        );
+        let environment = match response.wayland.as_ref() {
+            Some(wayland) => {
+                if response.session_type != "wayland" || !wayland.is_consistent() {
+                    return Err(LauncherError::Protocol);
+                }
+                let handoff = wayland
+                    .primary_handoff()
+                    .map_err(|_| LauncherError::Protocol)?;
+                tracing::info!(
+                    target: target::SESSION,
+                    compositor = %wayland.compositor,
+                    runtime_dir = %wayland.runtime_dir.display(),
+                    pipewire_node = handoff.node_id(),
+                    output = handoff.output().as_str(),
+                    compositor_render_node = ?handoff.compositor_render_node(),
+                    width = handoff.size().0,
+                    height = handoff.size().1,
+                    "headless Wayland session ready for capture hand-off"
+                );
+                SessionEnvironment::build_wayland(
+                    &self.identity,
+                    &response.desktop,
+                    self.timezone.as_ref(),
+                    extra_environment,
+                )
+                .with_wayland_session(wayland, &handoff)
+                .with_session_audio(response.audio.as_ref())
+            }
+            None => {
+                extra_environment.extend(capture_gpu_environment(&response.capture_gpu_pci));
+                SessionEnvironment::build(
+                    &self.identity,
+                    &response.display,
+                    (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
+                    &response.desktop,
+                    self.timezone.as_ref(),
+                    extra_environment,
+                )
+                .with_session_audio(response.audio.as_ref())
+            }
+        };
         if self.child.is_none()
             || self.stdin.is_none()
             || self.stderr_task.is_none()
@@ -722,15 +1245,78 @@ impl AuthenticatedLauncher {
         {
             return Err(LauncherError::Protocol);
         }
+        // The verified depth of an Xorg desktop; a Wayland desktop has none.
+        let x11_desktop_depth = if response.wayland.is_some() {
+            None
+        } else {
+            let depth = response
+                .x11_root_depth
+                .and_then(arcen_media::video::DesktopDepth::from_x11_depth);
+            if depth.is_none() {
+                tracing::warn!(
+                    target: target::SESSION,
+                    root_depth = ?response.x11_root_depth,
+                    "the dedicated Xorg's root depth is not one this host serves ten-bit from; the desktop is treated as eight-bit"
+                );
+            }
+            Some(depth.unwrap_or(arcen_media::video::DesktopDepth::Eight))
+        };
+        // The desktop's session is active now: it is handed over only when
+        // polkit refuses it the console's grants (an X11 session has the
+        // console seat, a native Wayland session its own Arcen seat).
+        // Between activation and this answer the session's own processes run
+        // with whatever polkit gives them; with the rule installed (checked
+        // before launch) that is the remote answer, and a refusal here kills
+        // the desktop's processes at once, before the launcher tears the
+        // session down (and releases a native seat).
+        #[cfg(target_os = "linux")]
+        {
+            use arcen_session::polkit_remote::{Admission, DesktopSeat};
+            let seat = polkit_seat;
+            let pid = response.agent_pid;
+            let session_id = response.session_id.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "polkit tools are bounded by their own timeout (polkit_remote::TOOL_TIMEOUT)"
+            )]
+            let decision = tokio::task::spawn_blocking(move || {
+                crate::session::polkit_remote::prove_desktop(pid, &session_id, seat, polkit_state)
+            })
+            .await
+            .unwrap_or(if seat == DesktopSeat::Seatless {
+                Admission::AdmitUnverified
+            } else {
+                Admission::Refuse(arcen_session::polkit_remote::PolkitUnprotected::Unverified)
+            });
+            if let Admission::Refuse(reason) = decision {
+                if response.agent_pid > 1 {
+                    signal_process_group(response.agent_pid, nix::sys::signal::Signal::SIGKILL);
+                }
+                // A native seat polkit could not keep remote stays off for
+                // this Pier's later desktops (headless under `auto`,
+                // refused under `native_seat`).
+                if native_seat {
+                    disable_native_seats(reason.into());
+                }
+                return Err(LauncherError::PolkitUnprotected(reason));
+            }
+            // The desktop owns its native seat from here (released with it).
+            self.native_pen = None;
+        }
         Ok(SessionLauncher {
             identity: self.identity.clone(),
             environment,
+            x11_desktop_depth,
+            wayland: response.wayland,
+            audio: response.audio,
             agent_pid: response.agent_pid,
             child: self.child.take().expect("launcher child checked"),
             stdin: self.stdin.take(),
             stderr_task: self.stderr_task.take().expect("stderr task checked"),
             _pam_permit: self.pam_permit.take().expect("PAM permit checked"),
             session_log_id: Arc::clone(&self.session_log_id),
+            #[cfg(target_os = "linux")]
+            seat_pen,
         })
     }
 
@@ -748,6 +1334,10 @@ impl AuthenticatedLauncher {
             finish_stderr(&mut task).await;
         }
         self.pam_permit.take();
+        #[cfg(target_os = "linux")]
+        if let Some(pen) = self.native_pen.take() {
+            release_native_seat(pen).await;
+        }
     }
 }
 
@@ -765,12 +1355,25 @@ impl Drop for AuthenticatedLauncher {
 pub struct SessionLauncher {
     pub identity: UserIdentity,
     pub environment: SessionEnvironment,
+    /// The headless Wayland session's outputs, streams and input socket;
+    /// `None` for dedicated Xorg.
+    pub wayland: Option<super::wayland::WaylandAgentReady>,
+    /// The depth the dedicated Xorg desktop runs at, as its server reported
+    /// it once ready (an unknown depth is eight-bit: nothing proves more).
+    /// `None` for a headless Wayland desktop.
+    pub x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
+    /// The session's audio, as its agent established it.
+    pub audio: Option<super::agent::SessionAudioReady>,
     pub agent_pid: u32,
     child: Child,
     stdin: Option<ChildStdin>,
     stderr_task: JoinHandle<()>,
     _pam_permit: OwnedSemaphorePermit,
     session_log_id: Arc<Mutex<CorrelationId>>,
+    /// Lab (`wayland.lab_seat_pen`): this desktop's own pen, dropped (grant
+    /// revoked, device destroyed, rule removed) with the desktop.
+    #[cfg(target_os = "linux")]
+    pub seat_pen: Option<Arc<crate::input::seat_pen::SeatPen>>,
 }
 
 impl SessionLauncher {
@@ -800,7 +1403,12 @@ impl SessionLauncher {
     pub async fn shutdown(mut self) -> bool {
         close_and_stop_launcher(&mut self.stdin, &mut self.child).await;
         finish_stderr(&mut self.stderr_task).await;
-        ensure_agent_exited(self.agent_pid).await
+        let exited = ensure_agent_exited(self.agent_pid).await;
+        #[cfg(target_os = "linux")]
+        if let Some(pen) = self.seat_pen.take().filter(|pen| pen.is_native()) {
+            release_native_seat(pen).await;
+        }
+        exited
     }
 }
 
@@ -809,6 +1417,37 @@ impl Drop for SessionLauncher {
         self.stdin.take();
         let _ = self.child.start_kill();
         self.stderr_task.abort();
+    }
+}
+
+/// Takes a native seat apart on a blocking thread (it waits for the
+/// compositor to let go of `vkms`), after its desktop's session has ended.
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "awaited to completion, never under a timeout; the vkms unload retries end after 15 s"
+)]
+async fn release_native_seat(pen: Arc<crate::input::seat_pen::SeatPen>) {
+    let _ = tokio::task::spawn_blocking(move || pen.release_native_now()).await;
+}
+
+/// Set when a native desktop's session was found not to be kept from local
+/// users' polkit grants: every later desktop of this Pier is headless
+/// (`wayland.session_mode = auto`) or refused (`native_seat`).
+#[cfg(target_os = "linux")]
+static NATIVE_SEATS_DISABLED: std::sync::OnceLock<
+    arcen_session::native_seat::NativeSeatUnavailable,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn disable_native_seats(reason: arcen_session::native_seat::NativeSeatUnavailable) {
+    if NATIVE_SEATS_DISABLED.set(reason).is_ok() {
+        tracing::error!(
+            target: target::SESSION,
+            reason = reason.token(),
+            explanation = reason.explanation(),
+            "native desktops are disabled until the Pier restarts; this desktop is refused, and later ones are headless (session_mode auto) or refused (session_mode native_seat)"
+        );
     }
 }
 
@@ -979,6 +1618,68 @@ fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) {
     let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
 }
 
+/// Takes the SELinux exec context `pam_selinux open` set on this thread so
+/// the launcher's own root helpers keep its domain, and refuses the session
+/// at once when the policy would not let the session user's first process
+/// enter that context (see [`super::selinux`]).
+#[cfg(target_os = "linux")]
+fn take_session_exec_context(
+) -> Result<Option<super::selinux::SessionSecurityContext>, LauncherError> {
+    use super::selinux::{
+        current_context, take_pam_exec_context, transition_decision, AccessDecision,
+    };
+
+    let exec_context = take_pam_exec_context().map_err(|error| {
+        tracing::error!(target: target::SESSION, %error, "the SELinux exec context PAM assigned could not be taken over");
+        LauncherError::SelinuxContext
+    })?;
+    let Some(context) = exec_context.as_ref() else {
+        return Ok(None);
+    };
+    let launcher_context = current_context();
+    let launcher_context = launcher_context
+        .as_ref()
+        .map_or("unknown", super::selinux::SessionSecurityContext::as_str);
+    match transition_decision(context) {
+        Some(AccessDecision::Denied) => {
+            tracing::error!(
+                target: target::SESSION,
+                launcher_context,
+                session_context = %context,
+                "SELinux policy does not let the launcher's domain start the session user's processes in the context PAM assigned; install Arcen's SELinux policy module (docs/security/linux-selinux.md)"
+            );
+            Err(LauncherError::SelinuxContext)
+        }
+        decision => {
+            tracing::info!(
+                target: target::SESSION,
+                launcher_context,
+                session_context = %context,
+                checked = decision.is_some(),
+                "the session user's processes will run in the SELinux context PAM assigned; the launcher's own helpers keep its domain"
+            );
+            Ok(exec_context)
+        }
+    }
+}
+
+/// The session user's first `execve` was refused while a PAM-assigned
+/// SELinux context was being entered: the policy, not the binary.
+#[cfg(target_os = "linux")]
+fn agent_exec_refused_by_selinux(error: &AgentError, environment: &SessionEnvironment) -> bool {
+    let refused = environment.exec_context().is_some()
+        && matches!(error, AgentError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied);
+    if refused {
+        tracing::error!(
+            target: target::SESSION,
+            session_context = environment.exec_context().map_or("", |context| context.as_str()),
+            %error,
+            "the session user's first process could not enter the SELinux context PAM assigned; install Arcen's SELinux policy module (docs/security/linux-selinux.md)"
+        );
+    }
+    refused
+}
+
 pub fn find_launcher_binary(explicit: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = explicit {
@@ -1014,13 +1715,44 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     let desktop = required_argument(args, "--desktop-session")?;
     let session_log_id = CorrelationId::parse_uuid(required_argument(args, "--session-log-id")?)
         .map_err(|_| LauncherError::Protocol)?;
+    let provider = match argument_value(args, "--desktop-provider") {
+        None => arcen_session::desktop_provider::DesktopProvider::Xorg,
+        Some(token) => arcen_session::desktop_provider::DesktopProvider::from_token(&token)
+            .ok_or(LauncherError::Protocol)?,
+    };
+    let wayland = provider == arcen_session::desktop_provider::DesktopProvider::Wayland;
+    if wayland && !super::wayland::WAYLAND_ADAPTER_BUILT {
+        return Err(LauncherError::WaylandUnavailable);
+    }
+    let first_login_setup = match argument_value(args, super::wayland::FIRST_LOGIN_SETUP_FLAG) {
+        None => arcen_session::desktop_session::first_login::FirstLoginSetup::Run,
+        Some(token) => {
+            arcen_session::desktop_session::first_login::FirstLoginSetup::from_token(&token)
+                .ok_or(LauncherError::Protocol)?
+        }
+    };
 
-    let stdin = tokio::io::stdin();
-    let mut commands = BufReader::new(stdin);
-    let auth_line = read_bounded_line(&mut commands, MAX_AUTH_REQUEST_BYTES).await?;
-    let auth_line = Zeroizing::new(auth_line);
+    // Before the password arrives: no other process may dump or trace the
+    // launcher's memory. A child that drops to the session user is
+    // dumpable again only through its own credential change and exec.
+    if let Err(error) = nix::sys::prctl::set_dumpable(false) {
+        tracing::warn!(target: target::SESSION, %error, "the session launcher could not make itself non-dumpable");
+    }
+    // The password line is read straight from file descriptor 0 into one
+    // pre-allocated zeroizing buffer, before any standard-library or runtime
+    // stdin buffer exists, so no reader keeps a copy of it.
+    let (auth_line, pending) =
+        read_auth_request_line(0, MAX_AUTH_REQUEST_BYTES, AUTH_TIMEOUT).map_err(|error| {
+            tracing::warn!(target: target::SESSION, %error, "the broker's authenticate request could not be read");
+            error
+        })?;
     let mut auth: OwnedAuthenticateRequest =
-        serde_json::from_str(&auth_line).map_err(|_| LauncherError::Protocol)?;
+        serde_json::from_slice(&auth_line).map_err(|_| LauncherError::Protocol)?;
+    drop(auth_line);
+    let mut commands = BufReader::new(AsyncReadExt::chain(
+        std::io::Cursor::new(pending),
+        tokio::io::stdin(),
+    ));
     if auth.command != "authenticate" {
         return Err(LauncherError::Protocol);
     }
@@ -1047,22 +1779,37 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         fn error_msg(&mut self, _message: &CStr) {}
     }
 
+    // A headless Wayland desktop hands the login password to its own
+    // keyring (see `session::wayland::keyring`); nothing else keeps a copy.
+    let keyring_password = wayland.then(|| Zeroizing::new(auth.password.as_bytes().to_vec()));
     let conversation = SecretConversation {
         username: auth.username.clone(),
         password: Zeroizing::new(std::mem::take(&mut auth.password)),
     };
     let mut context = Context::new(&pam_service, Some(&auth.username), conversation)
         .map_err(|_| LauncherError::PamInitialization)?;
-    context
-        .set_rhost(Some(&auth.remote_host))
-        .and_then(|()| context.set_tty(Some("arcen")))
-        .and_then(|()| context.set_xdisplay(Some(&display)))
-        .and_then(|()| context.putenv(format!("DISPLAY={display}")))
-        .and_then(|()| context.putenv("XDG_SESSION_TYPE=x11"))
-        .and_then(|()| context.putenv("XDG_SESSION_CLASS=user"))
-        .and_then(|()| context.putenv("XDG_SEAT=seat0"))
-        .and_then(|()| context.putenv("XDG_VTNR=1"))
-        .map_err(|_| LauncherError::PamInitialization)?;
+    if wayland {
+        // A seatless `user` session of type wayland: pam_systemd gives it
+        // its own logind session, scope and runtime directory, and logind
+        // grants it no seat devices (no DRM card, no input nodes).
+        context
+            .set_rhost(Some(&auth.remote_host))
+            .and_then(|()| context.set_tty(Some("arcen")))
+            .and_then(|()| context.putenv("XDG_SESSION_TYPE=wayland"))
+            .and_then(|()| context.putenv("XDG_SESSION_CLASS=user"))
+            .map_err(|_| LauncherError::PamInitialization)?;
+    } else {
+        context
+            .set_rhost(Some(&auth.remote_host))
+            .and_then(|()| context.set_tty(Some("arcen")))
+            .and_then(|()| context.set_xdisplay(Some(&display)))
+            .and_then(|()| context.putenv(format!("DISPLAY={display}")))
+            .and_then(|()| context.putenv("XDG_SESSION_TYPE=x11"))
+            .and_then(|()| context.putenv("XDG_SESSION_CLASS=user"))
+            .and_then(|()| context.putenv("XDG_SEAT=seat0"))
+            .and_then(|()| context.putenv("XDG_VTNR=1"))
+            .map_err(|_| LauncherError::PamInitialization)?;
+    }
     if context.authenticate(Flag::NONE).is_err() || context.acct_mgmt(Flag::NONE).is_err() {
         write_response(&LauncherResponse::error("rejected"))?;
         return Err(LauncherError::Rejected);
@@ -1078,6 +1825,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         return Ok(());
     }
     let open = parse_open_request(&command)?;
+    let x11_desktop_depth = open.x11_desktop_depth()?;
     let mut commands = commands.lines();
 
     context
@@ -1099,12 +1847,30 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
                 Ok(())
             }
         })
+        .and_then(|()| {
+            // A native desktop (`wayland.session_mode`): pam_systemd opens the logind
+            // session on the desktop's own seat (no VT; logind activates it).
+            if let Some(seat) = open.native_seat().filter(|_| wayland) {
+                context.putenv(format!("XDG_SEAT={seat}"))
+            } else {
+                Ok(())
+            }
+        })
         .map_err(|_| LauncherError::PamSession)?;
     let pam_session = match context.open_session(Flag::NONE) {
         Ok(session) => session,
         Err(_) => {
             write_response(&LauncherResponse::error("pam_error"))?;
             return Err(LauncherError::PamSession);
+        }
+    };
+    // Synchronously, on the thread PAM ran on, before anything is spawned.
+    let exec_context = match take_session_exec_context() {
+        Ok(exec_context) => exec_context,
+        Err(error) => {
+            write_response(&LauncherResponse::error("selinux_error"))?;
+            drop(pam_session);
+            return Err(error);
         }
     };
     let pam_environment = pam_session
@@ -1117,10 +1883,51 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             )
         })
         .collect::<Vec<_>>();
-    let session_id = pam_environment
+    let Some(session_id) = pam_environment
         .iter()
         .find_map(|(key, value)| (key == "XDG_SESSION_ID").then_some(value.clone()))
-        .ok_or(LauncherError::LogindSession)?;
+    else {
+        // pam_systemd succeeds without a logind session when logind answers
+        // "already occupied": another desktop holds seat0's X11 position.
+        let error = if !wayland && x11_seat_is_occupied().await {
+            LauncherError::SeatOccupied
+        } else {
+            LauncherError::LogindSession
+        };
+        write_response(&LauncherResponse::error(logind_error_status(&error)))?;
+        drop(pam_session);
+        return Err(error);
+    };
+    // Held until this function returns, on every path: the host never
+    // suspends under a desktop it serves.
+    let _sleep_inhibitor = super::sleep_inhibitor::SleepInhibitor::acquire(&session_id).await;
+    #[cfg(not(feature = "wayland-provider"))]
+    let _ = (keyring_password, first_login_setup);
+    #[cfg(feature = "wayland-provider")]
+    if wayland {
+        let x11_apps = args
+            .iter()
+            .any(|argument| argument == super::wayland::LAUNCHER_X11_FLAG);
+        let result = run_wayland_desktop(
+            &identity,
+            &open,
+            pam_environment,
+            exec_context,
+            &session_id,
+            &agent_binary,
+            &desktop,
+            &session_log_id,
+            x11_apps,
+            &mut commands,
+            super::agent::WaylandSessionServices {
+                keyring_password,
+                first_login: first_login_setup,
+            },
+        )
+        .await;
+        drop(pam_session);
+        return result;
+    }
     let multi_monitor_plan = open
         .multi_monitor
         .clone()
@@ -1155,6 +1962,13 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         &session_id,
         &identity,
         session_edid.as_ref(),
+        arcen_outputs::SessionScreen {
+            depth: x11_desktop_depth,
+            served_size: open
+                .display
+                .as_ref()
+                .map(|served| (served.width, served.height)),
+        },
     );
     let transaction = arcen_outputs::OutputTransaction::acquire(
         provider,
@@ -1200,7 +2014,9 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         &desktop,
         open.timezone.as_ref(),
         pam_environment,
-    );
+    )
+    .with_locale(&super::locale::session_locale(&identity.username))
+    .with_exec_context(exec_context);
     if environment.validate_runtime(&identity).is_err()
         || validate_logind_ownership(&environment, &identity)
             .await
@@ -1210,7 +2026,12 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         drop(pam_session);
         return Err(LauncherError::LogindSession);
     }
-    activate_logind_session(&environment).await?;
+    if let Err(error) = activate_logind_session(&environment).await {
+        write_response(&LauncherResponse::error(logind_error_status(&error)))?;
+        xorg.shutdown().await;
+        drop(pam_session);
+        return Err(error);
+    }
     let mut deskside = if open.deskside.enabled {
         Some(
             crate::deskside::LinuxDesksideGuard::arm(
@@ -1226,22 +2047,41 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     } else {
         None
     };
+    let audio = open.audio();
     let mut agent = match SessionAgent::spawn(
         &agent_binary,
         &identity,
         &environment,
         &desktop,
         &session_log_id,
+        &audio,
     )
     .await
     {
         Ok(agent) => agent,
         Err(error) => {
+            let refused = agent_exec_refused_by_selinux(&error, &environment);
             if let Some(deskside) = deskside.as_mut() {
                 let _ = deskside.restore().await;
             }
+            recover_local_playback(
+                &agent_binary,
+                &identity,
+                &environment,
+                &session_log_id,
+                &audio,
+            )
+            .await;
             xorg.shutdown().await;
             drop(pam_session);
+            if refused {
+                write_response(&LauncherResponse::error("selinux_error"))?;
+                return Err(LauncherError::SelinuxContext);
+            }
+            if matches!(error, AgentError::LocalPlaybackRefused(_)) {
+                write_response(&LauncherResponse::error("local_playback_refused"))?;
+                return Err(LauncherError::LocalPlaybackRefused);
+            }
             return Err(error.into());
         }
     };
@@ -1250,6 +2090,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         &environment,
         &agent.ready,
         xorg.gpu_pci(),
+        xorg.root_depth(),
     )) {
         agent.shutdown().await;
         if let Some(deskside) = deskside.as_mut() {
@@ -1271,7 +2112,17 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     }
 
     let deskside_restore = shutdown_desktop_resources(
-        || async { agent.shutdown().await },
+        || async {
+            agent.shutdown().await;
+            recover_local_playback(
+                &agent_binary,
+                &identity,
+                &environment,
+                &session_log_id,
+                &audio,
+            )
+            .await;
+        },
         || async {
             if let Some(deskside) = deskside.as_mut() {
                 deskside.restore().await
@@ -1284,6 +2135,447 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     .await;
     drop(pam_session);
     deskside_restore.map_err(|_| LauncherError::Deskside)
+}
+
+/// The virtual output a headless Wayland session stands for: the served
+/// Deck display when it named one, the default otherwise.
+#[cfg(any(feature = "wayland-provider", test))]
+fn wayland_output_request(
+    display: Option<&SessionDisplayMsg>,
+) -> Result<arcen_session::wayland_session::VirtualOutputRequest, LauncherError> {
+    let (width, height, refresh_hz) = display.map_or(super::wayland::DEFAULT_OUTPUT, |served| {
+        (served.width, served.height, served.refresh_hz)
+    });
+    arcen_session::wayland_session::VirtualOutputRequest::new(width, height, refresh_hz)
+        .map_err(|_| LauncherError::WaylandStart)
+}
+
+/// The placed outputs a headless Wayland session opens with: a committed
+/// virtual-output topology's outputs (primary first, at their planned
+/// positions), or the one served display.
+#[cfg(any(feature = "wayland-provider", test))]
+fn wayland_session_outputs(
+    open: &OpenRequest,
+) -> Result<Vec<arcen_session::wayland_outputs::PlacedOutput>, LauncherError> {
+    let Some(plan) = open.multi_monitor.clone() else {
+        return Ok(vec![
+            arcen_session::wayland_outputs::PlacedOutput::at_origin(wayland_output_request(
+                open.display.as_ref(),
+            )?)
+            .with_density(
+                open.display
+                    .as_ref()
+                    .map(SessionDisplayMsg::density)
+                    .unwrap_or_default(),
+            ),
+        ]);
+    };
+    let plan = plan.into_plan().map_err(|_| LauncherError::WaylandStart)?;
+    if plan.backend != crate::display::topology::LinuxTopologyBackend::VirtualOutputs {
+        tracing::warn!(
+            target: target::SESSION,
+            backend = plan.backend.token(),
+            "a headless Wayland session serves virtual outputs; this topology was planned for another backend"
+        );
+        return Err(LauncherError::WaylandStart);
+    }
+    let outputs = plan
+        .placed_outputs()
+        .map_err(|_| LauncherError::WaylandStart)?
+        .into_iter()
+        .map(|(_, placed)| placed)
+        .collect::<Vec<_>>();
+    tracing::info!(
+        target: target::SESSION,
+        outputs = outputs.len(),
+        generation = plan.generation.get(),
+        "headless Wayland session opens the committed multi-monitor topology"
+    );
+    Ok(outputs)
+}
+
+/// Runs one headless Wayland desktop inside the PAM session the caller
+/// opened, and proves its release before the caller closes PAM.
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+#[allow(clippy::too_many_arguments)] // The launcher's existing open context.
+async fn run_wayland_desktop(
+    identity: &UserIdentity,
+    open: &OpenRequest,
+    pam_environment: Vec<(String, String)>,
+    exec_context: Option<super::selinux::SessionSecurityContext>,
+    session_id: &str,
+    agent_binary: &Path,
+    desktop: &str,
+    session_log_id: &CorrelationId,
+    x11_apps: bool,
+    commands: &mut Lines<LauncherCommands>,
+    services: super::agent::WaylandSessionServices,
+) -> Result<(), LauncherError> {
+    // Stop requests are honoured from here on, including while the desktop
+    // is still starting: the Pier closing the pipe or giving up on the open,
+    // SIGTERM, or logind's SIGTERM+SIGHUP. Every one of them goes through
+    // release and PAM close rather than killing the launcher.
+    let mut stop = StopSignals::install()?;
+    let outputs = match wayland_session_outputs(open) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            write_response(&LauncherResponse::error("wayland_start_error"))?;
+            return Err(error);
+        }
+    };
+    if open.deskside.enabled {
+        tracing::info!(
+            target: target::SESSION,
+            "deskside protection guards the physical console; a seatless headless Wayland session never drives it, so it is not armed"
+        );
+    }
+    let environment = SessionEnvironment::build_wayland(
+        identity,
+        desktop,
+        open.timezone.as_ref(),
+        pam_environment,
+    )
+    .with_locale(&super::locale::session_locale(&identity.username))
+    .with_exec_context(exec_context);
+    let runtime_dir = super::wayland::private_runtime_dir(identity.uid, session_id);
+    let audio = open.audio();
+    let start = async {
+        if environment.validate_runtime(identity).is_err()
+            || validate_logind_ownership(&environment, identity)
+                .await
+                .is_err()
+            || validate_wayland_session(session_id, open.native_seat())
+                .await
+                .is_err()
+        {
+            return Err("logind_error");
+        }
+        let agent = SessionAgent::spawn_wayland(
+            agent_binary,
+            identity,
+            &environment,
+            desktop,
+            session_log_id,
+            &runtime_dir,
+            &outputs,
+            &audio,
+            open.wayland_fidelity_route.as_deref(),
+            open.wayland_compositor_prefix.as_deref(),
+            open.wayland_lab_input_seat.as_deref(),
+            open.native_seat().is_some(),
+            open.stream_cursor.unwrap_or_default(),
+            services,
+            x11_apps,
+        )
+        .await
+        .map_err(|error| {
+            if agent_exec_refused_by_selinux(&error, &environment) {
+                "selinux_error"
+            } else if matches!(error, AgentError::LocalPlaybackRefused(_)) {
+                "local_playback_refused"
+            } else {
+                tracing::warn!(target: target::SESSION, %error, "headless Wayland session failed to become ready");
+                "wayland_start_error"
+            }
+        })?;
+        if private_runtime_dir_is_safe(&runtime_dir, identity.uid) {
+            Ok(agent)
+        } else {
+            agent.shutdown_gracefully().await;
+            Err("wayland_start_error")
+        }
+    };
+    // Dropping `start` on a stop request kills a still-starting agent; its
+    // stack dies with it (parent-death signal) and the release below sweeps
+    // whatever the agent's session bus had activated.
+    let started = tokio::select! {
+        started = start => Some(started),
+        command = commands.next_line() => {
+            tracing::info!(target: target::SESSION, closed = !matches!(command, Ok(Some(_))), "stop requested while the headless Wayland session was starting");
+            None
+        }
+        () = stop.recv() => {
+            tracing::info!(target: target::SESSION, "stop signal while the headless Wayland session was starting");
+            None
+        }
+    };
+    let mut agent = match started {
+        Some(Ok(agent)) => agent,
+        Some(Err(status)) => {
+            let _ = release_wayland_session(session_id, identity, &environment, &runtime_dir, None)
+                .await;
+            recover_local_playback(agent_binary, identity, &environment, session_log_id, &audio)
+                .await;
+            write_response(&LauncherResponse::error(status))?;
+            return Err(open_response_error(status));
+        }
+        None => {
+            let _ = release_wayland_session(session_id, identity, &environment, &runtime_dir, None)
+                .await;
+            let _ = write_response(&LauncherResponse::error("wayland_start_error"));
+            return Err(LauncherError::WaylandStart);
+        }
+    };
+    // The X11 displays the compositor locked, so a compositor that died
+    // without its own shutdown has its sockets and lock files removed too.
+    let x11_displays = agent
+        .ready
+        .wayland
+        .as_ref()
+        .and_then(|wayland| wayland.x11.as_ref())
+        .and_then(|x11| x11.displays);
+    if let Err(error) = write_response(&LauncherResponse::ready(
+        identity,
+        &environment,
+        &agent.ready,
+        None,
+        None,
+    )) {
+        agent.shutdown_gracefully().await;
+        let _ = release_wayland_session(
+            session_id,
+            identity,
+            &environment,
+            &runtime_dir,
+            x11_displays,
+        )
+        .await;
+        return Err(error);
+    }
+
+    tokio::select! {
+        command = commands.next_line() => {
+            let _ = command;
+        }
+        () = stop.recv() => {}
+        _ = agent.wait_for_exit() => {
+            tracing::warn!(target: target::SESSION, "headless Wayland session agent exited");
+        }
+    }
+    agent.shutdown_gracefully().await;
+    let released = release_wayland_session(
+        session_id,
+        identity,
+        &environment,
+        &runtime_dir,
+        x11_displays,
+    )
+    .await;
+    recover_local_playback(agent_binary, identity, &environment, session_log_id, &audio).await;
+    released
+}
+
+/// logind must report the session as `wayland`, class `user`, with no seat:
+/// a seatless session receives no device ACLs, so the compositor cannot
+/// open a DRM card or input node through it.
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+async fn validate_wayland_session(
+    session_id: &str,
+    native_seat: Option<&str>,
+) -> Result<(), LauncherError> {
+    if !safe_session_id(session_id) {
+        return Err(LauncherError::LogindSession);
+    }
+    let mut show = Command::new("/usr/bin/loginctl");
+    show.args([
+        "show-session",
+        session_id,
+        "-p",
+        "Type",
+        "-p",
+        "Class",
+        "-p",
+        "Seat",
+    ]);
+    let output = command_output_with_timeout(show, LauncherError::LogindSession).await?;
+    let properties = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && wayland_properties_match(&properties, native_seat) {
+        if let Some(seat) = native_seat {
+            tracing::info!(
+                target: target::SESSION,
+                session_id,
+                seat,
+                "logind wayland session created on the desktop's own seat (native desktop)"
+            );
+        } else {
+            tracing::info!(
+                target: target::SESSION,
+                session_id,
+                "seatless logind wayland session created for the headless desktop"
+            );
+        }
+        Ok(())
+    } else {
+        Err(LauncherError::LogindSession)
+    }
+}
+
+#[cfg(any(all(target_os = "linux", feature = "wayland-provider"), test))]
+fn wayland_properties_match(properties: &str, native_seat: Option<&str>) -> bool {
+    let lines = properties.lines().map(str::trim).collect::<Vec<_>>();
+    let seat = format!("Seat={}", native_seat.unwrap_or_default());
+    lines.contains(&"Type=wayland")
+        && lines.contains(&"Class=user")
+        && lines.contains(&seat.as_str())
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+fn private_runtime_dir_is_safe(path: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+    })
+}
+
+/// The root side of teardown: whatever the agent could not release — a
+/// process of the session user left in this logind session's scope, a FUSE
+/// mount or the private runtime directory — is released here, and the result
+/// is proven before PAM closes the session.
+///
+/// The runtime directory is writable by the session user, so root never acts
+/// on paths inside it: unmounting (`fusermount -u -z`, own FUSE mounts only)
+/// and removal (`rm -rf --one-file-system`) run as the session user with the
+/// agent's privilege drop. Root only signals scope processes by pid and
+/// checks the result without following anything.
+///
+/// The X11 sockets and lock files of `x11_displays` (the displays the
+/// session's compositor locked, from the agent's ready message) live in the
+/// shared `/tmp`, not the runtime directory. Root removes them only through
+/// a descriptor of the root-owned sticky directory, after an
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` proves a socket or regular file owned by
+/// the session user, named for one of those displays, and (for a lock)
+/// holding the compositor's pid (`xwayland::remove_session_artifacts`).
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+async fn release_wayland_session(
+    session_id: &str,
+    identity: &UserIdentity,
+    environment: &SessionEnvironment,
+    runtime_dir: &Path,
+    x11_displays: Option<arcen_session::wayland_x11::SessionDisplays>,
+) -> Result<(), LauncherError> {
+    use super::wayland::stack::{
+        mounts_inside, own_session_scope, scope_processes, signal_scope_process,
+        unmount_user_fuse_inside, ScopeSignal,
+    };
+    let uid = identity.uid;
+    let Some(scope) = own_session_scope(session_id) else {
+        return Err(LauncherError::WaylandRelease);
+    };
+    for signal in [ScopeSignal::Terminate, ScopeSignal::Kill] {
+        let remaining = scope_processes(&scope, uid);
+        if remaining.is_empty() {
+            break;
+        }
+        tracing::warn!(
+            target: target::SESSION,
+            count = remaining.len(),
+            ?signal,
+            "session-user processes outlived the headless Wayland agent; signalling them"
+        );
+        for pid in remaining {
+            signal_scope_process(&scope, uid, pid, signal);
+        }
+        for _ in 0..60 {
+            if scope_processes(&scope, uid).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let x11_artifacts = x11_displays.map_or(0, |displays| {
+        super::wayland::xwayland::remove_session_artifacts(
+            &super::wayland::xwayland::X11Dirs::production(),
+            uid,
+            &displays,
+        )
+        .remaining
+        .len()
+    });
+    let as_user = |command: &mut Command| {
+        super::identity::configure_user_command(command, identity, environment).is_ok()
+    };
+    unmount_user_fuse_inside(runtime_dir, uid, as_user).await;
+    if std::fs::symlink_metadata(runtime_dir).is_ok() {
+        let mut remove = Command::new("/usr/bin/rm");
+        remove
+            .args(["-rf", "--one-file-system", "--"])
+            .arg(runtime_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if as_user(&mut remove) {
+            let _ = command_status_with_timeout(remove, LauncherError::WaylandRelease).await;
+        }
+    }
+    let remaining = scope_processes(&scope, uid).len();
+    let runtime_dir_present = std::fs::symlink_metadata(runtime_dir).is_ok();
+    let mounts = mounts_inside(runtime_dir).len();
+    if remaining == 0 && !runtime_dir_present && mounts == 0 && x11_artifacts == 0 {
+        tracing::info!(
+            target: target::SESSION,
+            session_id,
+            "headless Wayland session released: no session-user process, mount, runtime directory or X11 socket remains"
+        );
+        Ok(())
+    } else {
+        tracing::error!(
+            target: target::SESSION,
+            session_id,
+            remaining,
+            runtime_dir_present,
+            mounts,
+            x11_artifacts,
+            "headless Wayland session release could not be proven; logind removes the runtime directory with the user's last session"
+        );
+        Err(LauncherError::WaylandRelease)
+    }
+}
+
+/// Restores a local-playback lease the session's agent left on the user's
+/// own audio server (it was killed before it could release it), as the
+/// session user. Nothing runs when no journal was left.
+#[cfg(target_os = "linux")]
+async fn recover_local_playback(
+    agent_binary: &Path,
+    identity: &UserIdentity,
+    environment: &SessionEnvironment,
+    session_log_id: &CorrelationId,
+    audio: &AgentAudioArguments,
+) {
+    let journal = PathBuf::from(format!("/run/user/{}", identity.uid))
+        .join(crate::media::local_playback::JOURNAL_NAME);
+    if !journal.exists() {
+        return;
+    }
+    let mut command = crate::command_for_helper(agent_binary, "session-agent");
+    command
+        .arg(crate::media::local_playback::RECOVER_FLAG)
+        .arg("--session-log-id")
+        .arg(session_log_id.as_str())
+        .arg(crate::media::local_playback::PACTL_FLAG)
+        .arg(&audio.pactl)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if super::identity::configure_user_command(&mut command, identity, environment).is_err() {
+        return;
+    }
+    // The user's runtime directory, never a private one: the journal of a
+    // lease on the user's server is there.
+    command.env("XDG_RUNTIME_DIR", format!("/run/user/{}", identity.uid));
+    let status = match command.spawn() {
+        Ok(mut child) => tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok),
+        Err(_) => None,
+    };
+    tracing::info!(
+        target: target::SESSION,
+        recovered = status.is_some_and(|status| status.success()),
+        "a local playback lease left by the session agent was restored"
+    );
 }
 
 async fn shutdown_desktop_resources<AF, AFut, DF, DFut, XF, XFut>(
@@ -1364,6 +2656,8 @@ struct DedicatedXorgProvider<'a> {
     identity: &'a UserIdentity,
     /// The single-head session's EDID, generated from the Deck display.
     edid: Option<&'a [u8; 128]>,
+    /// The desktop's depth and the single-head screen size.
+    screen: arcen_outputs::SessionScreen,
 }
 
 #[cfg(target_os = "linux")]
@@ -1378,6 +2672,7 @@ impl<'a> DedicatedXorgProvider<'a> {
         session_id: &'a str,
         identity: &'a UserIdentity,
         edid: Option<&'a [u8; 128]>,
+        screen: arcen_outputs::SessionScreen,
     ) -> Self {
         Self {
             binary,
@@ -1388,6 +2683,7 @@ impl<'a> DedicatedXorgProvider<'a> {
             session_id,
             identity,
             edid,
+            screen,
         }
     }
 }
@@ -1457,6 +2753,31 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
             }
             _ => (config_text, None),
         };
+        let config_text = with_session_input_isolation(&config_text, self.x_display)?;
+        // A multi-head plan already sized its own `Virtual`.
+        // A single head's `Virtual` is raised to the served display if the
+        // template's is smaller, never lowered: later resizes and larger
+        // reattachments need the headroom. A multi-head plan already sized
+        // its own `Virtual`, and an EDID-less head's mode is not the served
+        // size.
+        let screen = arcen_outputs::SessionScreen {
+            served_size: if plan.is_none() && self.edid.is_some() {
+                self.screen.served_size
+            } else {
+                None
+            },
+            ..self.screen
+        };
+        let rendered = arcen_outputs::with_session_screen(&config_text, screen);
+        if rendered.kept_template_depth {
+            tracing::warn!(
+                target: target::SESSION,
+                sid = %context.session_log_id(),
+                requested_depth = ?screen.depth.map(arcen_media::video::DesktopDepth::x11_depth),
+                "the Xorg template does not carry exactly one DefaultDepth and one Display Depth line; its own depth is kept and the live root depth decides what this desktop serves"
+            );
+        }
+        let config_text = rendered.config;
         Ok(PreparedDedicatedXorg {
             display_number,
             config_text,
@@ -1615,7 +2936,82 @@ fn output_error_status(error: &LauncherError) -> &'static str {
         LauncherError::XorgStart => "xorg_start_error",
         LauncherError::XorgVerify => "xorg_verify_error",
         LauncherError::XorgRelease => "xorg_release_error",
+        LauncherError::WaylandStart => "wayland_start_error",
         _ => "output_error",
+    }
+}
+
+/// Where libinput installs its quirks, on every distribution Arcen supports.
+const SYSTEM_LIBINPUT_QUIRKS_DIR: &str = "/usr/share/libinput";
+/// The administrator's libinput overrides.
+const LOCAL_LIBINPUT_QUIRKS_OVERRIDE: &str = "/etc/libinput/local-overrides.quirks";
+/// The override's name inside a session's quirks directory: last in
+/// libinput's version sort, so it keeps the last word as it has system-wide.
+const SESSION_LOCAL_OVERRIDE_NAME: &str = "zz-local-overrides.quirks";
+
+/// The session X server's libinput quirks: the system's files, then Arcen's
+/// virtual devices' ([`arcen_input::virtual_device::libinput_quirks`]), then
+/// the administrator's overrides, in a directory private to the session.
+/// libinput reads `LIBINPUT_QUIRKS_DIR` instead of its defaults, so the
+/// session's server gets them without any system file being changed.
+///
+/// `None` (the server keeps libinput's defaults) when the system directory
+/// cannot be read or holds no quirks: an empty directory would drop every
+/// device quirk the distribution ships.
+fn prepare_libinput_quirks(
+    system_dir: &Path,
+    local_override: &Path,
+    session_dir: &Path,
+) -> Option<PathBuf> {
+    let attempt = || -> std::io::Result<Option<PathBuf>> {
+        let mut system: Vec<PathBuf> = std::fs::read_dir(system_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "quirks")
+                    && path.is_file()
+            })
+            .collect();
+        if system.is_empty() {
+            return Ok(None);
+        }
+        system.sort();
+        let dir = session_dir.join("libinput-quirks");
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+        for path in &system {
+            if let Some(name) = path.file_name() {
+                std::fs::copy(path, dir.join(name))?;
+            }
+        }
+        std::fs::write(
+            dir.join(arcen_input::virtual_device::LIBINPUT_QUIRKS_FILE_NAME),
+            arcen_input::virtual_device::libinput_quirks(),
+        )?;
+        if local_override.is_file() {
+            std::fs::copy(local_override, dir.join(SESSION_LOCAL_OVERRIDE_NAME))?;
+        }
+        Ok(Some(dir))
+    };
+    match attempt() {
+        Ok(Some(dir)) => Some(dir),
+        Ok(None) => {
+            tracing::warn!(
+                target: target::SESSION,
+                system_dir = %system_dir.display(),
+                "no libinput quirks found; the session's virtual pen keeps libinput's smoothing"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: target::SESSION,
+                %error,
+                "session libinput quirks could not be prepared; the virtual pen keeps libinput's smoothing"
+            );
+            None
+        }
     }
 }
 
@@ -1626,6 +3022,8 @@ struct DedicatedXorg {
     session_dir: PathBuf,
     xauthority: PathBuf,
     gpu_pci: Option<arcen_outputs::PciAddress>,
+    /// The root window depth the server reported once ready.
+    root_depth: Option<u8>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1660,7 +3058,15 @@ impl DedicatedXorg {
         let xauthority = session_dir.join("Xauthority");
         create_xauthority(&xauthority, x_display, identity)?;
         let log_path = session_dir.join("Xorg.log");
+        let quirks = prepare_libinput_quirks(
+            Path::new(SYSTEM_LIBINPUT_QUIRKS_DIR),
+            Path::new(LOCAL_LIBINPUT_QUIRKS_OVERRIDE),
+            &session_dir,
+        );
         let mut command = Command::new(binary);
+        if let Some(quirks) = &quirks {
+            command.env("LIBINPUT_QUIRKS_DIR", quirks);
+        }
         command
             .arg(x_display)
             .arg("-config")
@@ -1695,12 +3101,17 @@ impl DedicatedXorg {
             session_dir,
             xauthority,
             gpu_pci: prepared.gpu_pci,
+            root_depth: None,
         })
     }
 
     /// The NVIDIA GPU this server drives, for capture to open CUDA on.
     fn gpu_pci(&self) -> Option<arcen_outputs::PciAddress> {
         self.gpu_pci
+    }
+
+    fn root_depth(&self) -> Option<u8> {
+        self.root_depth
     }
 
     fn xauthority(&self) -> &str {
@@ -1714,16 +3125,23 @@ impl DedicatedXorg {
             if self.child.try_wait()?.is_some() {
                 return Err(LauncherError::XorgStart);
             }
-            let ready = Command::new("/usr/bin/xdpyinfo")
+            let probe = Command::new("/usr/bin/xdpyinfo")
                 .args(["-display", display])
                 .env("XAUTHORITY", &self.xauthority)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .await
-                .is_ok_and(|status| status.success());
-            if ready {
+                .output()
+                .await;
+            if let Some(output) = probe.ok().filter(|output| output.status.success()) {
+                self.root_depth = parse_root_depth(&String::from_utf8_lossy(&output.stdout));
+                // tracing's field macros shadow a local named `display`.
+                let x_display = display;
+                tracing::info!(
+                    target: target::SESSION,
+                    x_display,
+                    root_depth = ?self.root_depth,
+                    "dedicated session Xorg is ready"
+                );
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1970,6 +3388,34 @@ fn with_custom_edid(config: &str, head: &str, edid: &Path) -> Result<String, Lau
     Ok(rendered)
 }
 
+/// Appends the input classes that confine the dedicated X server to its own
+/// session's virtual devices.
+///
+/// The rendered server hot-adds input devices, and udev offers it every
+/// device on the seat: the console's keyboard and mice and any other
+/// session's virtual devices. The appended classes ignore all of them and
+/// re-admit only devices named for this display
+/// ([`arcen_input::virtual_device::SessionInputIdentity`]). A template that
+/// already defines either class is refused rather than merged.
+#[cfg(any(target_os = "linux", test))]
+fn with_session_input_isolation(config: &str, x_display: &str) -> Result<String, LauncherError> {
+    use arcen_input::virtual_device::{
+        SessionInputIdentity, FOREIGN_INPUT_CLASS, SESSION_INPUT_CLASS,
+    };
+    let identity =
+        SessionInputIdentity::for_x_display(x_display).map_err(|_| LauncherError::XorgConfig)?;
+    if config.contains(FOREIGN_INPUT_CLASS) || config.contains(SESSION_INPUT_CLASS) {
+        return Err(LauncherError::XorgConfig);
+    }
+    let mut rendered = config.to_owned();
+    if !rendered.is_empty() && !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered.push('\n');
+    rendered.push_str(&identity.xorg_input_classes());
+    Ok(rendered)
+}
+
 #[cfg(target_os = "linux")]
 fn render_xorg_config(template: &str, gpu_head: &str) -> Result<String, LauncherError> {
     validate_gpu_head(gpu_head)?;
@@ -1990,6 +3436,18 @@ fn render_xorg_config(template: &str, gpu_head: &str) -> Result<String, Launcher
             "\"AutoEnableDevices\" \"false\"",
             "\"AutoEnableDevices\" \"true\"",
         ))
+}
+
+/// The root window depth from `xdpyinfo`'s `depth of root window:    30 planes`.
+fn parse_root_depth(xdpyinfo: &str) -> Option<u8> {
+    xdpyinfo.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("depth of root window:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2392,6 +3850,74 @@ async fn validate_logind_ownership(
     Ok(())
 }
 
+/// The launcher-protocol status for a logind failure, so the broker reports
+/// what happened instead of a protocol failure.
+fn logind_error_status(error: &LauncherError) -> &'static str {
+    match error {
+        LauncherError::SeatOccupied => "seat_occupied",
+        LauncherError::LogindActivation => "logind_activation_error",
+        _ => "logind_error",
+    }
+}
+
+/// Whether another session holds the X11 desktop position on seat0, from
+/// logind's own session properties. A probe that fails says "not occupied":
+/// the caller then reports the plain logind failure it already had.
+#[cfg(target_os = "linux")]
+async fn x11_seat_is_occupied() -> bool {
+    let mut seat = Command::new("/usr/bin/loginctl");
+    seat.args(["show-seat", "seat0", "-p", "Sessions", "--value"]);
+    let Ok(output) = command_output_with_timeout(seat, LauncherError::LogindSession).await else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let mut sessions = Vec::new();
+    for session_id in String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter(|session_id| safe_session_id(session_id))
+    {
+        let mut show = Command::new("/usr/bin/loginctl");
+        show.args([
+            "show-session",
+            session_id,
+            "-p",
+            "Id",
+            "-p",
+            "Seat",
+            "-p",
+            "VTNr",
+            "-p",
+            "Class",
+            "-p",
+            "State",
+            "-p",
+            "Type",
+        ]);
+        let Ok(output) = command_output_with_timeout(show, LauncherError::LogindSession).await
+        else {
+            continue;
+        };
+        if let Some(fact) = arcen_session::x11_seat::SeatSessionFact::from_properties(
+            &String::from_utf8_lossy(&output.stdout),
+        ) {
+            sessions.push(fact);
+        }
+    }
+    let Some(occupant) = arcen_session::x11_seat::x11_seat_occupant(&sessions) else {
+        return false;
+    };
+    tracing::warn!(
+        target: target::SESSION,
+        occupant_session = %occupant.id,
+        occupant_state = %occupant.state,
+        occupant_type = %occupant.session_type,
+        "another desktop holds seat0's X11 position; one X11 desktop per host, so this sign-in is refused"
+    );
+    true
+}
+
 fn write_response(response: &LauncherResponse) -> Result<(), LauncherError> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, response).map_err(|_| LauncherError::Protocol)?;
@@ -2403,13 +3929,97 @@ fn write_response(response: &LauncherResponse) -> Result<(), LauncherError> {
 fn open_response_error(status: &str) -> LauncherError {
     match status {
         "logind_error" => LauncherError::LogindSession,
+        "logind_activation_error" => LauncherError::LogindActivation,
+        "seat_occupied" => LauncherError::SeatOccupied,
         "pam_error" => LauncherError::PamSession,
         "xorg_config_error" => LauncherError::XorgConfig,
         "xorg_start_error" => LauncherError::XorgStart,
         "xorg_verify_error" => LauncherError::XorgVerify,
         "xorg_release_error" => LauncherError::XorgRelease,
+        "wayland_start_error" => LauncherError::WaylandStart,
+        "selinux_error" => LauncherError::SelinuxContext,
+        "local_playback_refused" => LauncherError::LocalPlaybackRefused,
         _ => LauncherError::Protocol,
     }
+}
+
+/// The launcher's command stream after the `authenticate` line: whatever
+/// followed that line in the same read, then the rest of standard input.
+type LauncherCommands = BufReader<tokio::io::Chain<std::io::Cursor<Vec<u8>>, tokio::io::Stdin>>;
+
+/// The buffer the broker's `authenticate` line is serialized into: room for
+/// every byte escaped as `\u00XX` plus the JSON keys, so it never grows.
+fn authenticate_request_capacity(username: &str, password: &str, remote_host: &str) -> usize {
+    6 * (username.len() + password.len() + remote_host.len()) + 128
+}
+
+/// Reads one `\n`-terminated line from `fd` into a single pre-allocated
+/// zeroizing buffer of `max_bytes + 1` bytes, bounded in size and time. The
+/// buffer is never reallocated. Returns the line (without `\r\n`) and any
+/// bytes that followed it, which belong to the next command. End of input
+/// ends the line as `read_bounded_line` does; an empty input, an oversize
+/// line, a read error or the timeout is an error.
+#[cfg(target_os = "linux")]
+fn read_auth_request_line(
+    fd: std::os::fd::RawFd,
+    max_bytes: usize,
+    budget: Duration,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), LauncherError> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut buffer = Zeroizing::new(vec![0_u8; max_bytes + 1]);
+    let mut filled = 0;
+    let line_end = loop {
+        if let Some(newline) = buffer[..filled].iter().position(|&byte| byte == b'\n') {
+            break newline;
+        }
+        if filled == buffer.len() {
+            return Err(LauncherError::Protocol);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(LauncherError::Timeout);
+        }
+        let mut poll = nix::libc::pollfd {
+            fd,
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        // SAFETY: one valid pollfd on the stack, count 1.
+        let ready = unsafe { nix::libc::poll(&raw mut poll, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(LauncherError::Io(error));
+        }
+        if ready == 0 {
+            return Err(LauncherError::Timeout);
+        }
+        match nix::unistd::read(fd, &mut buffer[filled..]) {
+            Ok(0) if filled == 0 => return Err(LauncherError::Protocol),
+            Ok(0) => break filled,
+            Ok(read) => filled += read,
+            Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => {}
+            Err(errno) => return Err(LauncherError::Io(errno.into())),
+        }
+    };
+    if line_end > max_bytes {
+        return Err(LauncherError::Protocol);
+    }
+    let pending = buffer[(line_end + 1).min(filled)..filled].to_vec();
+    let mut line_len = line_end;
+    if line_len > 0 && buffer[line_len - 1] == b'\r' {
+        line_len -= 1;
+    }
+    // Shorten in place: the bytes past the line are zeroed with the buffer.
+    let mut line = buffer;
+    line[line_len..].iter_mut().for_each(|byte| *byte = 0);
+    line.truncate(line_len);
+    Ok((line, pending))
 }
 
 async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> Result<String, LauncherError>
@@ -2462,15 +4072,45 @@ fn required_argument(args: &[String], flag: &str) -> Result<String, LauncherErro
     argument_value(args, flag).ok_or(LauncherError::Protocol)
 }
 
+/// The launcher's stop signals, registered at construction so a stop that
+/// arrives before anyone awaits it is not lost — and not fatal: once
+/// installed, SIGTERM, SIGINT and SIGHUP no longer terminate the launcher.
+///
+/// logind ends a session (logout, `loginctl terminate-session`) with SIGTERM
+/// plus SIGHUP to every process in its scope; SIGHUP's default action would
+/// kill the launcher before it released the desktop.
+#[cfg(target_os = "linux")]
+struct StopSignals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(target_os = "linux")]
+impl StopSignals {
+    fn install() -> Result<Self, LauncherError> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.interrupt.recv() => {}
+            _ = self.hangup.recv() => {}
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn launcher_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut interrupt = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = interrupt.recv() => {}
+    match StopSignals::install() {
+        Ok(mut signals) => signals.recv().await,
+        Err(_) => std::future::pending().await,
     }
 }
 
@@ -2519,6 +4159,10 @@ pub fn launcher_main(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     };
+    // The desktop is already torn down and PAM closed. A blocking stdin read
+    // the broker never answers must not keep this process — the logind
+    // session's leader — alive, or logind holds the session in `closing`.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(500));
     let _ = observability
         .guard()
         .shutdown(std::time::Duration::from_secs(2));
@@ -2527,7 +4171,310 @@ pub fn launcher_main(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_session_x_server_gets_the_system_quirks_plus_the_virtual_pens() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".arcen-quirks-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let system = root.join("system");
+        let session = root.join("session");
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::create_dir_all(&session).unwrap();
+        let override_file = root.join("local-overrides.quirks");
+
+        // No system quirks: keep libinput's defaults rather than none at all.
+        assert_eq!(
+            super::prepare_libinput_quirks(&system, &override_file, &session),
+            None
+        );
+
+        std::fs::write(
+            system.join("10-generic-mouse.quirks"),
+            "[a]\nMatchUdevType=mouse\n",
+        )
+        .unwrap();
+        std::fs::write(system.join("README"), "not a quirks file").unwrap();
+        std::fs::write(&override_file, "[local]\nMatchName=x\n").unwrap();
+        let dir = super::prepare_libinput_quirks(&system, &override_file, &session).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "10-generic-mouse.quirks",
+                arcen_input::virtual_device::LIBINPUT_QUIRKS_FILE_NAME,
+                super::SESSION_LOCAL_OVERRIDE_NAME,
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                dir.join(arcen_input::virtual_device::LIBINPUT_QUIRKS_FILE_NAME)
+            )
+            .unwrap(),
+            arcen_input::virtual_device::libinput_quirks()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_broker_outwaits_a_bounded_wayland_start() {
+        use arcen_session::desktop_provider::DesktopProvider;
+        assert_eq!(open_timeout(DesktopProvider::Xorg), OPEN_TIMEOUT);
+        assert!(
+            open_timeout(DesktopProvider::Wayland)
+                > super::super::wayland::WAYLAND_AGENT_READY_TIMEOUT
+        );
+        assert!(
+            super::super::wayland::WAYLAND_AGENT_READY_TIMEOUT
+                > super::super::wayland::WAYLAND_START_BUDGET
+        );
+    }
+
+    #[test]
+    fn wayland_sessions_must_be_seatless_user_wayland_sessions() {
+        assert!(wayland_properties_match(
+            "Type=wayland\nClass=user\nSeat=\n",
+            None
+        ));
+        assert!(!wayland_properties_match(
+            "Type=wayland\nClass=user\nSeat=seat0\n",
+            None
+        ));
+        assert!(!wayland_properties_match(
+            "Type=x11\nClass=user\nSeat=\n",
+            None
+        ));
+        assert!(!wayland_properties_match(
+            "Type=wayland\nClass=background\nSeat=\n",
+            None
+        ));
+    }
+
+    #[test]
+    fn a_native_seat_session_must_be_on_exactly_its_own_seat() {
+        let seat = "seat-arcen-pen-0123456789abcdef";
+        assert!(wayland_properties_match(
+            "Type=wayland\nClass=user\nSeat=seat-arcen-pen-0123456789abcdef\n",
+            Some(seat)
+        ));
+        for refused in [
+            "Type=wayland\nClass=user\nSeat=\n",
+            "Type=wayland\nClass=user\nSeat=seat0\n",
+            "Type=wayland\nClass=user\nSeat=seat-arcen-pen-fedcba9876543210\n",
+        ] {
+            assert!(!wayland_properties_match(refused, Some(seat)), "{refused}");
+        }
+    }
+
+    #[test]
+    fn only_a_valid_desktop_seat_of_a_native_request_reaches_pam() {
+        let request = || {
+            OpenRequest::new(
+                None,
+                crate::deskside::LinuxDesksideConfig::default(),
+                None,
+                None,
+                &AgentAudioArguments::default(),
+                None,
+            )
+        };
+        let seat = "seat-arcen-pen-0123456789abcdef";
+        assert_eq!(request().native_seat(), None);
+        assert_eq!(
+            request().with_native_seat(true).native_seat(),
+            None,
+            "no seat, no native seat"
+        );
+        let native = request()
+            .with_lab_input_seat(Some(seat.into()))
+            .with_native_seat(true);
+        assert_eq!(native.native_seat(), Some(seat));
+        let json = serde_json::to_string(&native).unwrap();
+        assert_eq!(parse_open_request(&json).unwrap().native_seat(), Some(seat));
+        let seat0 = request()
+            .with_lab_input_seat(Some("seat0".into()))
+            .with_native_seat(true);
+        assert_eq!(seat0.native_seat(), None);
+        let headless = request()
+            .with_lab_input_seat(Some(seat.into()))
+            .with_native_seat(false);
+        assert_eq!(headless.native_seat(), None);
+        assert!(!serde_json::to_string(&headless).unwrap().contains("native"));
+    }
+
+    #[test]
+    fn a_headless_wayland_session_opens_a_committed_virtual_topology_primary_first() {
+        use crate::display::topology::{
+            plan_virtual_topology, wayland_output_limits, LinuxTopologyBackend,
+        };
+        let monitor = |id: &str, x: i32, primary: bool| {
+            arcen_media::RequestedMonitor::new(
+                arcen_media::Monitor {
+                    identity: arcen_media::MonitorIdentity {
+                        id: id.to_owned(),
+                        ..arcen_media::MonitorIdentity::default()
+                    },
+                    x,
+                    y: 0,
+                    width_px: 1920,
+                    height_px: 1080,
+                    scale: 1.0,
+                    refresh_hz: 60,
+                    rotation: arcen_media::Rotation::Degrees0,
+                    primary,
+                    width_mm: 0.0,
+                    height_mm: 0.0,
+                    color: None,
+                },
+                1920,
+                1080,
+            )
+            .unwrap()
+        };
+        let plan = plan_virtual_topology(
+            &arcen_media::RequestedMonitorTopology::new(vec![
+                monitor("left", -1920, false),
+                monitor("main", 0, true),
+            ])
+            .unwrap(),
+            arcen_media::TopologyGeneration::new(1).unwrap(),
+            wayland_output_limits(4),
+            arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+        )
+        .unwrap();
+        let mut request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            Some(MultiHeadPlanMsg::from_plan(&plan)),
+            None,
+            &AgentAudioArguments::default(),
+            None,
+        );
+        let outputs = wayland_session_outputs(&request).unwrap();
+        assert_eq!(
+            outputs.iter().map(|output| output.x).collect::<Vec<_>>(),
+            vec![1920, 0],
+            "the primary comes first, each output at its planned place"
+        );
+        // The DTO round-trips the backend and the refresh.
+        let back = MultiHeadPlanMsg::from_plan(&plan).into_plan().unwrap();
+        assert_eq!(back, plan);
+
+        // A plan made for dedicated Xorg never opens a Wayland session.
+        let mut xorg = plan.clone();
+        xorg.backend = LinuxTopologyBackend::DedicatedXorg;
+        request.multi_monitor = Some(MultiHeadPlanMsg::from_plan(&xorg));
+        assert!(wayland_session_outputs(&request).is_err());
+    }
+
+    #[test]
+    fn wayland_output_follows_the_served_display() {
+        let default = wayland_output_request(None).unwrap();
+        assert_eq!(
+            (default.width(), default.height(), default.refresh_hz()),
+            super::super::wayland::DEFAULT_OUTPUT
+        );
+        let served = SessionDisplayMsg {
+            width: 2560,
+            height: 1600,
+            refresh_hz: 120,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            scale: 2.0,
+            product_id: 1,
+            serial: 0,
+            color: None,
+        };
+        let output = wayland_output_request(Some(&served)).unwrap();
+        assert_eq!(
+            (output.width(), output.height(), output.refresh_hz()),
+            (2560, 1600, 120)
+        );
+        let refused = SessionDisplayMsg { width: 0, ..served };
+        assert!(wayland_output_request(Some(&refused)).is_err());
+    }
+
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn pipe_with(
+        bytes: &[u8],
+        close_writer: bool,
+    ) -> (std::os::fd::OwnedFd, Option<std::fs::File>) {
+        use std::io::Write as _;
+        let (reader, writer) = nix::unistd::pipe().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        writer.write_all(bytes).unwrap();
+        (reader, (!close_writer).then_some(writer))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_authenticate_line_is_read_whole_and_what_follows_is_kept_for_the_next_command() {
+        use std::os::fd::AsRawFd as _;
+        let line = br#"{"command":"authenticate","username":"u","password":"p\"w!-","remote_host":"203.0.113.7"}"#;
+        let mut input = line.to_vec();
+        input.extend_from_slice(b"\r\n{\"command\":\"open\"}\n");
+        let (reader, _writer) = pipe_with(&input, false);
+        let (read, pending) =
+            read_auth_request_line(reader.as_raw_fd(), MAX_AUTH_REQUEST_BYTES, AUTH_TIMEOUT)
+                .unwrap();
+        assert_eq!(&read[..], &line[..]);
+        assert_eq!(
+            read.capacity(),
+            MAX_AUTH_REQUEST_BYTES + 1,
+            "never reallocated"
+        );
+        assert_eq!(pending, b"{\"command\":\"open\"}\n");
+        let parsed: OwnedAuthenticateRequest = serde_json::from_slice(&read).unwrap();
+        assert_eq!(parsed.password, "p\"w!-");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_authenticate_line_that_is_oversize_empty_or_late_is_refused() {
+        use std::os::fd::AsRawFd as _;
+        let (reader, _writer) = pipe_with(&[b'x'; 65], false);
+        assert!(matches!(
+            read_auth_request_line(reader.as_raw_fd(), 64, AUTH_TIMEOUT),
+            Err(LauncherError::Protocol)
+        ));
+        let (reader, _) = pipe_with(b"", true);
+        assert!(matches!(
+            read_auth_request_line(reader.as_raw_fd(), 64, AUTH_TIMEOUT),
+            Err(LauncherError::Protocol)
+        ));
+        let (reader, _writer) = pipe_with(b"{\"command\"", false);
+        assert!(matches!(
+            read_auth_request_line(reader.as_raw_fd(), 64, Duration::from_millis(50)),
+            Err(LauncherError::Timeout)
+        ));
+        let (reader, _) = pipe_with(b"{\"a\":1}", true);
+        let (line, pending) = read_auth_request_line(reader.as_raw_fd(), 64, AUTH_TIMEOUT).unwrap();
+        assert_eq!(&line[..], b"{\"a\":1}");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn the_authenticate_request_buffer_never_grows_even_fully_escaped() {
+        let password = "\u{1}\"\\".repeat(40);
+        let username = "\u{2}".repeat(20);
+        let remote_host = "\u{7f}\n".repeat(10);
+        let request = AuthenticateRequest {
+            command: "authenticate",
+            username: &username,
+            password: &password,
+            remote_host: &remote_host,
+        };
+        let capacity = authenticate_request_capacity(&username, &password, &remote_host);
+        let mut buffer = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut buffer, &request).unwrap();
+        buffer.push(b'\n');
+        assert_eq!(buffer.capacity(), capacity);
+    }
 
     #[test]
     fn dedicated_xorg_release_is_only_claimed_when_every_artifact_is_gone() {
@@ -2640,12 +4587,91 @@ mod tests {
     }
 
     #[test]
+    fn an_occupied_x11_seat_reaches_the_broker_as_a_refusal_not_a_protocol_failure() {
+        for error in [
+            LauncherError::SeatOccupied,
+            LauncherError::LogindActivation,
+            LauncherError::LogindSession,
+        ] {
+            let status = logind_error_status(&error);
+            let response: LauncherResponse = serde_json::from_str(
+                &serde_json::to_string(&LauncherResponse::error(status)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::mem::discriminant(&open_response_error(&response.status)),
+                std::mem::discriminant(&error)
+            );
+        }
+        assert!(LauncherError::SeatOccupied
+            .to_string()
+            .contains("one X11 desktop per host"));
+    }
+
+    #[test]
+    fn selinux_and_wayland_refusals_survive_the_launcher_protocol_boundary() {
+        for (status, error) in [
+            ("selinux_error", LauncherError::SelinuxContext),
+            ("wayland_start_error", LauncherError::WaylandStart),
+            ("logind_error", LauncherError::LogindSession),
+            ("seat_occupied", LauncherError::SeatOccupied),
+            ("logind_activation_error", LauncherError::LogindActivation),
+            (
+                "local_playback_refused",
+                LauncherError::LocalPlaybackRefused,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&open_response_error(status)),
+                std::mem::discriminant(&error)
+            );
+        }
+    }
+
+    #[test]
+    fn open_request_carries_local_playback_and_defaults_to_muted() {
+        let audible = AgentAudioArguments {
+            local_playback: arcen_session::pier_config::LocalPlayback::Audible,
+            pactl: PathBuf::from("/usr/bin/pactl"),
+        };
+        let request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &audible,
+            None,
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"local_playback\":\"audible\""));
+        let parsed = parse_open_request(&json).unwrap();
+        assert_eq!(
+            parsed.audio().local_playback,
+            arcen_session::pier_config::LocalPlayback::Audible
+        );
+        // An older Pier's request names no policy: the safe default.
+        let old = parse_open_request(r#"{"command":"open"}"#).unwrap();
+        assert_eq!(
+            old.audio().local_playback,
+            arcen_session::pier_config::LocalPlayback::Muted
+        );
+        // A relative pactl is never run.
+        let relative = parse_open_request(r#"{"command":"open","pactl":"pactl"}"#).unwrap();
+        assert_eq!(
+            relative.audio().pactl,
+            PathBuf::from(crate::media::local_playback::DEFAULT_PACTL)
+        );
+    }
+
+    #[test]
     fn open_request_roundtrips_timezone_and_absence() {
         let timezone = IanaTimeZone::parse("Europe/Oslo").unwrap();
         let request = OpenRequest::new(
             Some(timezone.clone()),
             crate::deskside::LinuxDesksideConfig::default(),
             None,
+            None,
+            &AgentAudioArguments::default(),
             None,
         );
         let json = serde_json::to_string(&request).unwrap();
@@ -2656,10 +4682,46 @@ mod tests {
             crate::deskside::LinuxDesksideConfig::default(),
             None,
             None,
+            &AgentAudioArguments::default(),
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(parse_open_request(&json).unwrap(), request);
         assert!(!json.contains("timezone"));
+    }
+
+    #[test]
+    fn open_request_carries_the_stream_cursor_mode_only_when_set() {
+        use super::super::wayland::StreamCursorMode;
+        let plain = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &AgentAudioArguments::default(),
+            None,
+        );
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("stream_cursor"));
+        assert_eq!(parse_open_request(&json).unwrap().stream_cursor, None);
+        let metadata = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &AgentAudioArguments::default(),
+            None,
+        )
+        .with_stream_cursor(Some(StreamCursorMode::Metadata));
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("\"stream_cursor\":\"metadata\""), "{json}");
+        assert_eq!(parse_open_request(&json).unwrap(), metadata);
+        let hidden = json.replace("metadata", "hidden");
+        assert_eq!(
+            parse_open_request(&hidden).unwrap().stream_cursor,
+            Some(StreamCursorMode::Hidden)
+        );
+        assert!(parse_open_request(&json.replace("metadata", "none")).is_err());
     }
 
     fn sample_topology_plan() -> crate::display::topology::LinuxTopologyPlan {
@@ -2744,6 +4806,8 @@ mod tests {
             crate::deskside::LinuxDesksideConfig::default(),
             Some(wire),
             None,
+            &AgentAudioArguments::default(),
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("multi_monitor"));
@@ -2779,6 +4843,8 @@ mod tests {
             crate::deskside::LinuxDesksideConfig::default(),
             None,
             Some(served.clone()),
+            &AgentAudioArguments::default(),
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(parse_open_request(&json).unwrap(), request);
@@ -2819,14 +4885,121 @@ mod tests {
             crate::deskside::LinuxDesksideConfig::default(),
             None,
             None,
+            &AgentAudioArguments::default(),
+            None,
         );
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("multi_monitor"));
     }
 
     #[test]
+    fn a_wayland_fidelity_route_round_trips_and_is_omitted_when_absent() {
+        let request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &AgentAudioArguments::default(),
+            Some("force-hdr".to_owned()),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"wayland_fidelity_route\":\"force-hdr\""));
+        assert_eq!(parse_open_request(&json).unwrap(), request);
+        let plain = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &AgentAudioArguments::default(),
+            None,
+        );
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("wayland_fidelity_route"));
+        // The system compositor (no configured prefix) adds nothing.
+        assert!(!plain_json.contains("wayland_compositor_prefix"));
+        let mut prefixed = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &AgentAudioArguments::default(),
+            None,
+        );
+        prefixed.wayland_compositor_prefix = Some("/opt/arcen-gnome/51".to_owned());
+        let prefixed_json = serde_json::to_string(&prefixed).unwrap();
+        assert!(prefixed_json.contains("\"wayland_compositor_prefix\":\"/opt/arcen-gnome/51\""));
+        assert_eq!(parse_open_request(&prefixed_json).unwrap(), prefixed);
+    }
+
+    #[test]
+    fn the_x11_desktop_depth_round_trips_and_only_24_or_30_is_accepted() {
+        let plain = || {
+            OpenRequest::new(
+                None,
+                crate::deskside::LinuxDesksideConfig::default(),
+                None,
+                None,
+                &AgentAudioArguments::default(),
+                None,
+            )
+        };
+        let json = serde_json::to_string(&plain()).unwrap();
+        assert!(!json.contains("x11_desktop_depth"));
+        assert_eq!(
+            parse_open_request(&json)
+                .unwrap()
+                .x11_desktop_depth()
+                .unwrap(),
+            None
+        );
+        let mut json = String::new();
+        for depth in arcen_media::video::DesktopDepth::ALL {
+            let request = plain().with_x11_desktop_depth(Some(*depth));
+            json = serde_json::to_string(&request).unwrap();
+            assert!(json.contains(&format!("\"x11_desktop_depth\":{}", depth.x11_depth())));
+            let parsed = parse_open_request(&json).unwrap();
+            assert_eq!(parsed, request);
+            assert_eq!(parsed.x11_desktop_depth().unwrap(), Some(*depth));
+        }
+        let forged = json.replace("\"x11_desktop_depth\":30", "\"x11_desktop_depth\":16");
+        let parsed = parse_open_request(&forged).unwrap();
+        assert!(matches!(
+            parsed.x11_desktop_depth(),
+            Err(LauncherError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn the_root_depth_is_read_from_xdpyinfo() {
+        let xdpyinfo = "name of display:    :77\n  dimensions:    2560x1440 pixels (707x402 millimeters)\n  depth of root window:    30 planes\n  number of colormaps:    minimum 1, maximum 1\n";
+        assert_eq!(parse_root_depth(xdpyinfo), Some(30));
+        assert_eq!(
+            parse_root_depth("  depth of root window:    24 planes\n"),
+            Some(24)
+        );
+        assert_eq!(parse_root_depth("name of display:    :77\n"), None);
+        assert_eq!(
+            parse_root_depth("  depth of root window:    planes\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_ready_response_carries_the_root_depth_only_when_known() {
+        let older: LauncherResponse = serde_json::from_str(r#"{"status":"ready"}"#).unwrap();
+        assert_eq!(older.x11_root_depth, None);
+        let newer: LauncherResponse =
+            serde_json::from_str(r#"{"status":"ready","x11_root_depth":24}"#).unwrap();
+        assert_eq!(newer.x11_root_depth, Some(24));
+        assert!(!serde_json::to_string(&LauncherResponse::error("x"))
+            .unwrap()
+            .contains("x11_root_depth"));
+    }
+
+    #[test]
     fn multi_head_plan_msg_into_plan_rejects_a_zero_generation() {
         let wire = MultiHeadPlanMsg {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: 0,
             virtual_width: 1920,
             virtual_height: 1080,
@@ -2856,6 +5029,9 @@ mod tests {
             primary: true,
             quality_intent: arcen_protocol::messages::MonitorQualityIntentMsg::BandwidthOptimized,
             mode_token: "1920x1080".to_owned(),
+            refresh_hz: 60,
+            width_mm: 0,
+            height_mm: 0,
         };
         assert!(matches!(wire.into_plan(), Err(LauncherError::XorgConfig)));
     }
@@ -2934,6 +5110,102 @@ EndSection
         assert!(rendered.contains("\"AutoAddDevices\" \"true\""));
         assert!(rendered.contains("\"AutoEnableDevices\" \"true\""));
         assert!(render_xorg_config("DFP-0,DFP-1", "DFP-2").is_err());
+    }
+
+    #[test]
+    fn dedicated_xorg_admits_only_its_own_session_input() {
+        const TEMPLATE: &str = include_str!("../../../../packaging/linux/arcen-xorg.conf");
+        let rendered = with_session_input_isolation(TEMPLATE, ":58").unwrap();
+        assert!(rendered.starts_with(TEMPLATE));
+        let appended = &rendered[TEMPLATE.len()..];
+        let foreign = appended.find("\"arcen-ignore-foreign-input\"").unwrap();
+        let session = appended.find("\"arcen-session-input\"").unwrap();
+        assert!(foreign < session);
+        assert_eq!(rendered.matches("Section \"InputClass\"").count(), 2);
+        assert!(appended[..session].contains("Option         \"Ignore\" \"on\""));
+        assert!(!appended[..session].contains("Match"));
+        assert!(appended[session..].contains("MatchUSBID     \"a2ce:*\""));
+        assert!(appended[session..].contains("MatchProduct   \"(session :58)\""));
+        assert!(appended[session..].contains("Option         \"Ignore\" \"off\""));
+        assert_eq!(appended.matches("EndSection").count(), 2);
+    }
+
+    #[test]
+    fn session_input_isolation_is_never_merged_or_unbound() {
+        let once =
+            with_session_input_isolation("Section \"ServerFlags\"\nEndSection", ":7").unwrap();
+        assert!(once.contains("\"(session :7)\""));
+        assert!(with_session_input_isolation(&once, ":7").is_err());
+        assert!(with_session_input_isolation(&once, ":8").is_err());
+        for display in [":0", ":100", "7", ":7.0", ""] {
+            assert!(
+                with_session_input_isolation("", display).is_err(),
+                "{display}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rendered_dedicated_config_keeps_hotplug_and_takes_the_isolation() {
+        const TEMPLATE: &str = include_str!("../../../../packaging/linux/arcen-xorg.conf");
+        let single = render_xorg_config(TEMPLATE, "DFP-2").unwrap();
+        let single = with_session_input_isolation(&single, ":61").unwrap();
+        assert!(single.contains("\"AutoAddDevices\" \"true\""));
+        assert!(single.contains("\"(session :61)\""));
+        assert!(!single.contains("\"(session :6)\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_eight_bit_desktop_changes_only_its_depth_and_keeps_virtual_headroom_and_input_isolation()
+    {
+        const TEMPLATE: &str = include_str!("../../../../packaging/linux/arcen-xorg.conf");
+        let isolated =
+            with_session_input_isolation(&render_xorg_config(TEMPLATE, "DFP-0").unwrap(), ":62")
+                .unwrap();
+        let rendered = arcen_outputs::with_session_screen(
+            &isolated,
+            arcen_outputs::SessionScreen {
+                depth: Some(arcen_media::video::DesktopDepth::Eight),
+                served_size: Some((2560, 1440)),
+            },
+        );
+        assert!(!rendered.kept_template_depth);
+        let changed: Vec<(&str, &str)> = isolated
+            .lines()
+            .zip(rendered.config.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                ("    DefaultDepth   30", "    DefaultDepth   24"),
+                ("        Depth      30", "        Depth      24"),
+            ],
+            "a served display within the template's Virtual keeps its headroom for later resizes"
+        );
+        assert_eq!(isolated.lines().count(), rendered.config.lines().count());
+        assert!(rendered.config.contains("\"arcen-ignore-foreign-input\""));
+        assert!(rendered.config.contains("MatchProduct   \"(session :62)\""));
+        // Ten bits leaves the packaged template's screen exactly as shipped.
+        let ten = arcen_outputs::with_session_screen(
+            &isolated,
+            arcen_outputs::SessionScreen {
+                depth: Some(arcen_media::video::DesktopDepth::Ten),
+                served_size: None,
+            },
+        );
+        assert_eq!(ten.config, isolated);
+        // A served display larger than the template raises the screen.
+        let large = arcen_outputs::with_session_screen(
+            &isolated,
+            arcen_outputs::SessionScreen {
+                depth: None,
+                served_size: Some((6016, 3384)),
+            },
+        );
+        assert!(large.config.contains("        Virtual    6016 3384\n"));
     }
 
     #[cfg(target_os = "linux")]

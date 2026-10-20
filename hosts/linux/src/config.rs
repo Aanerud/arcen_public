@@ -48,6 +48,10 @@ pub struct LinuxSessionConfig {
     pub display: Option<String>,
     pub gpu_head: Option<String>,
     pub xorg_bin: Option<String>,
+    /// Whether headless Wayland sessions run the compositor's Xwayland for
+    /// X11 applications: `auto` (default; where the qualification record
+    /// proves it), `on` (required, or the Pier refuses to start) or `off`.
+    pub wayland_x11_apps: Option<arcen_session::wayland_x11::X11AppsSetting>,
     pub xorg_config_template: Option<String>,
     pub runtime_root: Option<String>,
     pub agent_bin: Option<String>,
@@ -134,6 +138,14 @@ pub fn load(explicit_path: Option<PathBuf>) -> Result<Option<LoadedConfig>, Stri
         .map_err(|error| format!("read Pier config {}: {error}", path.display()))?;
     let mut value: PierFileConfig = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse Pier config {}: {error}", path.display()))?;
+    value
+        .capture
+        .desktop_provider_for(arcen_session::desktop_provider::PierPlatform::Linux {
+            // Only a Linux build with the `wayland-provider` feature carries
+            // the headless Mutter session adapter.
+            wayland_adapter_built: crate::session::wayland::WAYLAND_ADAPTER_BUILT,
+        })
+        .map_err(|error| format!("Pier config {}: {error}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_optional_path(&mut value.tls.cert, base);
     resolve_optional_path(&mut value.tls.key, base);
@@ -210,6 +222,31 @@ mod tests {
         assert!(!parsed.audio.compressed);
         assert_eq!(parsed.platform.auth.mode.as_deref(), Some("pam"));
         assert_eq!(parsed.platform.capture.display.as_deref(), Some(":11"));
+    }
+
+    #[test]
+    fn wayland_provider_is_accepted_only_by_an_adapter_build() {
+        let parsed: PierFileConfig = serde_json::from_str(
+            r#"{
+                "capture":{"provider":"wayland"},
+                "audio":{"enabled":true,"compressed":false},
+                "microphone_input":{"enabled":false},
+                "platform":{}
+            }"#,
+        )
+        .expect("config");
+        let platform = arcen_session::desktop_provider::PierPlatform::Linux {
+            wayland_adapter_built: crate::session::wayland::WAYLAND_ADAPTER_BUILT,
+        };
+        let validated = parsed.capture.desktop_provider_for(platform);
+        if cfg!(all(target_os = "linux", feature = "wayland-provider")) {
+            assert_eq!(
+                validated,
+                Ok(arcen_session::desktop_provider::ProviderPreference::Wayland)
+            );
+        } else {
+            assert!(validated.is_err());
+        }
     }
 
     #[test]

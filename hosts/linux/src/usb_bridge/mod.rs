@@ -141,6 +141,34 @@ pub fn runtime_available() -> bool {
     }
 }
 
+/// How the attached session receives physical input devices: a headless
+/// Wayland session has no seat, every other session is served on the
+/// machine's seat.
+#[must_use]
+pub fn session_seat(
+    session: Option<&crate::session::lifecycle::SessionMetadata>,
+) -> arcen_usb_bridge::HardUsbSessionSeat {
+    match session {
+        Some(session) if session.session_type == "wayland" || session.wayland.is_some() => {
+            arcen_usb_bridge::HardUsbSessionSeat::Seatless
+        }
+        _ => arcen_usb_bridge::HardUsbSessionSeat::SeatBound,
+    }
+}
+
+/// Whether Hard USB may be bridged into `session` at all; a seatless
+/// (Wayland) session is refused before any helper or virtual controller is
+/// touched, because the bridged device would reach the physical seat.
+///
+/// # Errors
+///
+/// The shared denial, whose reason is shown to the Deck.
+pub fn session_admission(
+    session: Option<&crate::session::lifecycle::SessionMetadata>,
+) -> Result<(), arcen_usb_bridge::HardUsbSessionDenial> {
+    arcen_usb_bridge::admit_hard_usb_session(session_seat(session))
+}
+
 /// Generates one nonzero attachment generation from OS randomness.
 #[cfg(feature = "usb-hard-lab")]
 pub fn fresh_attachment_generation() -> std::io::Result<AttachmentGeneration> {
@@ -1105,5 +1133,51 @@ mod tests {
         for speed in [UsbSpeed::Low, UsbSpeed::Full, UsbSpeed::High] {
             assert_eq!(parse_speed(speed_label(speed)).unwrap(), speed);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_admission_tests {
+    use super::*;
+    use crate::session::lifecycle::SessionMetadata;
+    use arcen_protocol::messages::TabletModeReason;
+
+    fn session(session_type: &str) -> SessionMetadata {
+        SessionMetadata {
+            username: "artist".into(),
+            uid: 1001,
+            session_id: "c9".into(),
+            session_type: session_type.into(),
+            desktop: "gnome".into(),
+            display: String::new(),
+            agent_pid: 4242,
+            generation: 1,
+            reconnected: false,
+            timezone: None,
+            multi_monitor_plan: None,
+            multi_monitor_carrier: None,
+            audio: None,
+            wayland: None,
+            requested_outputs: None,
+            x11_desktop_depth: None,
+        }
+    }
+
+    #[test]
+    fn a_wayland_session_is_seatless_and_refused_hard_usb() {
+        let wayland = session("wayland");
+        assert_eq!(
+            session_seat(Some(&wayland)),
+            arcen_usb_bridge::HardUsbSessionSeat::Seatless
+        );
+        let denial = session_admission(Some(&wayland)).unwrap_err();
+        // The reason reaches the Deck in the tablet-mode result.
+        assert!(TabletModeReason::try_from(denial.reason().to_owned()).is_ok());
+    }
+
+    #[test]
+    fn xorg_and_console_sessions_keep_hard_usb_admission() {
+        assert_eq!(session_admission(Some(&session("x11"))), Ok(()));
+        assert_eq!(session_admission(None), Ok(()));
     }
 }

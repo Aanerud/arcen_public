@@ -15,6 +15,8 @@ pub struct WindowsPlatformConfig {
     pub iddcx: WindowsIddCxConfig,
     pub logging: WindowsLoggingConfig,
     pub first_login_timeout_secs: Option<u64>,
+    /// `grayscale` replaces ClearType for the length of each session.
+    pub font_smoothing: crate::font_smoothing::FontSmoothingPolicy,
     pub multi_monitor: WindowsMultiMonitorConfig,
 }
 
@@ -176,6 +178,10 @@ pub fn load(explicit_path: Option<PathBuf>) -> Result<Option<LoadedConfig>, Stri
         .map_err(|error| format!("read Pier config {}: {error}", path.display()))?;
     let mut value: PierFileConfig = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse Pier config {}: {error}", path.display()))?;
+    value
+        .capture
+        .desktop_provider_for(arcen_session::desktop_provider::PierPlatform::Windows)
+        .map_err(|error| format!("Pier config {}: {error}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_optional_path(&mut value.tls.cert, base);
     resolve_optional_path(&mut value.tls.key, base);

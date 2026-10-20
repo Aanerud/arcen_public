@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-usb-bridge",
+  "owner": "Shared/Architecture",
+  "description": "USB passthrough policy and state.",
+  "validation": ["shared-usb-bridge-test", "shared-usb-bridge-clippy", "workspace-boundaries"],
+  "consumers": [
+    {
+      "package": "arcen-deck-macos",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate",
+        "descriptor_fixtures",
+        "hid_digitizer",
+        "synthetic",
+        "tablet_claim",
+        "types"
+      ],
+      "paths": [
+        {
+          "id": "macos-deck-input",
+          "entry_points": ["clients/macos/src/hid/session.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-usb-hard-lab",
+          "entry_points": [
+            "clients/macos/src/usb_bridge.rs",
+            "clients/macos/src/usb_helper_client.rs"
+          ],
+          "build_profiles": ["macos-deck-usb-hard-lab"],
+          "validation": ["macos-deck-usb-hard-lab-test", "macos-deck-usb-lab"],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux",
+      "dependency_kind": "normal",
+      "contracts": [
+        "bridged_device_guard",
+        "crate",
+        "descriptor_fixtures",
+        "hid_digitizer",
+        "raw_hid",
+        "session_seat",
+        "synthetic",
+        "tablet_claim",
+        "types"
+      ],
+      "paths": [
+        {
+          "id": "linux-transport",
+          "entry_points": ["hosts/linux/src/net/server.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-usb-hard-lab",
+          "entry_points": [
+            "hosts/linux/src/usb_bridge/mod.rs",
+            "hosts/linux/src/usb_bridge/vhci.rs"
+          ],
+          "build_profiles": ["linux-pier-usb-hard-lab"],
+          "validation": ["linux-pier-usb-hard-lab-test", "linux-usb-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-protocol",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "hid_digitizer", "synthetic", "tablet_claim", "types"]
+    },
+    {
+      "package": "arcen-usb-helper",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate",
+        "descriptor",
+        "descriptor_fixtures",
+        "hid_digitizer",
+        "policy",
+        "tablet_claim",
+        "types"
+      ],
+      "paths": [
+        {
+          "id": "macos-deck-usb-helper",
+          "entry_points": ["clients/macos/usb-helper/src/capture.rs"],
+          "build_profiles": ["macos-usb-helper-apple-silicon", "macos-usb-helper-intel"],
+          "validation": [
+            "macos-usb-helper-test",
+            "macos-usb-helper-build-intel",
+            "macos-deck-usb-lab"
+          ],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-linux"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/build.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-windows"],
+      "paths": [
+        {
+          "id": "windows-installer",
+          "entry_points": [
+            "packaging/windows/installer/src/main.rs",
+            "packaging/windows/installer/build.rs"
+          ],
+          "build_profiles": ["windows-pier-installer"],
+          "validation": ["windows-pier-installer-build"],
+          "owner": "Windows Host"
+        }
+      ]
+    }
+  ]
+}

@@ -48,9 +48,22 @@ pub const TABLET_MODE_RESULT: &str = "tablet_mode_result";
 pub const DISPLAY_UPDATE: &str = "display_update";
 pub const DISPLAY_UPDATE_RESULT: &str = "display_update_result";
 pub const KEY_RESET_MODIFIERS: &str = "key_reset_modifiers";
+/// `KeyResetModifiersMsg::reason` asking the host to release everything held
+/// (keys, buttons, pen and region focus), not only keys: sent by a Pier's
+/// lane relay to its session agent when the input lane was replaced or lost
+/// (ADR 0014).
+pub const RELEASE_ALL_HELD_INPUT_REASON: &str = "input_lane_recovery";
 pub const TEXT_COMMIT: &str = "text_commit";
+/// Pier notice that a `text_commit` was not (fully) typed, or typed without
+/// proof. See [`TextCommitResultMsg`].
+pub const TEXT_COMMIT_RESULT: &str = "text_commit_result";
+/// Pier notice of which characters the session's keyboard layout types at
+/// each key position. See [`HostKeymapMsg`].
+pub const HOST_KEYMAP: &str = "host_keymap";
 pub const BUILD_IDENTITY_CAPABILITY: &str = "build_identity";
 pub const CLIPBOARD_DATA: &str = "clipboard_data";
+/// Host notice that a host-to-client clipboard transfer was abandoned.
+pub const CLIPBOARD_TRANSFER_FAILED: &str = "clipboard_transfer_failed";
 pub const AUDIO_STREAM_RESULT: &str = "audio_stream_result";
 pub const MICROPHONE_STREAM_RESULT: &str = "microphone_stream_result";
 pub const MICROPHONE_STREAM_STOP: &str = "microphone_stream_stop";
@@ -365,6 +378,9 @@ pub enum AudioStreamReason {
     CodecUnavailable,
     CodecFailure,
     CaptureUnavailable,
+    /// The audio-output lane exhausted its recovery budget (ADR 0014);
+    /// audio is disabled for the rest of the attachment.
+    LaneUnavailable,
     #[default]
     NotNegotiated,
 }
@@ -634,6 +650,12 @@ pub struct ServedPipelineMsg {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What the user can do about a downgrade, in one sentence for the
+    /// Deck to show beside it. `reason` stays the stable machine token;
+    /// this is only ever displayed. Absent for every older host and for a
+    /// downgrade with nothing the user can change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl ServedPipelineMsg {
@@ -648,9 +670,27 @@ impl ServedPipelineMsg {
             served,
             backend: backend.into(),
             reason,
+            detail: None,
         }
     }
+
+    /// The same message carrying a sentence the Deck shows the user.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
 }
+
+/// [`ServedPipelineMsg::detail`] for a ten-bit request reattaching to a
+/// persistent desktop that was started at eight bits.
+///
+/// The desktop's depth is fixed for its whole life, so the only remedies
+/// are a fresh desktop or an operator pin; the host never replaces a
+/// desktop (and the user's applications) by itself.
+pub const EIGHT_BIT_DESKTOP_DETAIL: &str = "This remote desktop was started for 8-bit presets. \
+Sign out of it and reconnect with Grading or HDR for a 10-bit desktop, or ask the host's \
+administrator to set video.x11_desktop_depth to 30.";
 
 impl StreamPipeline {
     /// Stable wire token.
@@ -1102,6 +1142,13 @@ pub struct AuthResponse {
     /// Requested cursor authority for this connection.
     #[serde(default, skip_serializing_if = "is_local_cursor_mode")]
     pub cursor_preference: CursorMode,
+    /// The client can draw host cursor images (`FrameType::CursorUpdate`).
+    ///
+    /// Sent at authentication because a host may fix how its desktop
+    /// reports the cursor when it opens that desktop (a Wayland `ScreenCast`
+    /// stream's `cursor-mode`). Absent and `false` for every older client.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_image_v1: bool,
     /// Explicit client instruction to replace a persistent desktop whose
     /// committed multi-monitor topology cannot serve this request.
     ///
@@ -1146,6 +1193,7 @@ impl std::fmt::Debug for AuthResponse {
                 &self.resume_grant.as_ref().map(|_| "<redacted>"),
             )
             .field("cursor_preference", &self.cursor_preference)
+            .field("cursor_image_v1", &self.cursor_image_v1)
             .finish()
     }
 }
@@ -1170,6 +1218,7 @@ impl AuthResponse {
             resume_holder_nonce: None,
             resume_grant: None,
             cursor_preference: CursorMode::Local,
+            cursor_image_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1193,6 +1242,7 @@ impl AuthResponse {
             resume_holder_nonce: None,
             resume_grant: None,
             cursor_preference: CursorMode::Local,
+            cursor_image_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1216,6 +1266,7 @@ impl AuthResponse {
             resume_holder_nonce: None,
             resume_grant: None,
             cursor_preference: CursorMode::Local,
+            cursor_image_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1240,6 +1291,7 @@ impl AuthResponse {
             resume_holder_nonce: None,
             resume_grant: None,
             cursor_preference: CursorMode::Local,
+            cursor_image_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1320,6 +1372,13 @@ impl AuthResponse {
     #[must_use]
     pub const fn with_cursor_preference(mut self, preference: CursorMode) -> Self {
         self.cursor_preference = preference;
+        self
+    }
+
+    /// Declares that this client draws host cursor images.
+    #[must_use]
+    pub const fn with_cursor_image_v1(mut self, supported: bool) -> Self {
+        self.cursor_image_v1 = supported;
         self
     }
 }
@@ -1492,6 +1551,32 @@ pub struct InputCapabilitiesMsg {
     /// Pen proximity/hover availability.
     #[serde(default)]
     pub pen_proximity: InputCapabilityAvailability,
+    /// Whether the pen's barrel buttons reach the desktop. A host whose pen
+    /// device carries no buttons (an emulated stylus without a button
+    /// interface) says so here; a host that predates this field leaves it
+    /// `Unknown`.
+    #[serde(default)]
+    pub pen_barrel_buttons: InputCapabilityAvailability,
+    /// Committed text (`text_commit`). From a client: it sends committed text
+    /// and understands [`TextCommitResultMsg`] and [`HostKeymapMsg`]. From a
+    /// host: it types committed text into the desktop and reports what it
+    /// could not type. `Unknown` (a peer that predates the field) never
+    /// authorizes sending `text_commit`.
+    #[serde(default)]
+    pub text_commit: InputCapabilityAvailability,
+    /// Whether the host can type characters its session's keyboard layout
+    /// lacks (emoji, another script). Meaningful only with `text_commit`.
+    #[serde(default)]
+    pub text_commit_unicode: InputCapabilityAvailability,
+}
+
+/// Whether a peer's capabilities authorize committed text (`text_commit`).
+#[must_use]
+pub const fn supports_text_commit_v1(capabilities: InputCapabilitiesMsg) -> bool {
+    matches!(
+        capabilities.text_commit,
+        InputCapabilityAvailability::Available
+    )
 }
 
 /// Whether one peer has explicitly advertised region-input-v1 support.
@@ -1622,6 +1707,39 @@ impl ClipboardDataMsg {
             kind,
             size_bytes,
             truncated,
+        }
+    }
+}
+
+/// Why a host abandoned a host-to-client clipboard transfer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardTransferFailure {
+    /// The bulk lane had no room; the transfer was dropped rather than
+    /// holding audio, input or control behind it (ADR 0014).
+    BulkLaneFull,
+    /// The bulk lane was unavailable (failed, disabled or not opened).
+    BulkLaneUnavailable,
+}
+
+/// Sent on the control lane when a host-to-client clipboard transfer was
+/// abandoned part way. The client discards any partial transfer with this
+/// sequence and may tell the user; no further chunk of it follows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardTransferFailedMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub sequence: u64,
+    pub reason: ClipboardTransferFailure,
+}
+
+impl ClipboardTransferFailedMsg {
+    #[must_use]
+    pub fn new(sequence: u64, reason: ClipboardTransferFailure) -> Self {
+        Self {
+            msg_type: CLIPBOARD_TRANSFER_FAILED.to_owned(),
+            sequence,
+            reason,
         }
     }
 }
@@ -1847,6 +1965,10 @@ pub struct ClientHelloMsg {
     pub input_capabilities: InputCapabilitiesMsg,
     #[serde(default, skip_serializing_if = "is_local_cursor_mode")]
     pub cursor_preference: CursorMode,
+    /// Echo of [`AuthResponse::cursor_image_v1`]; the authenticated value
+    /// wins when they differ.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_image_v1: bool,
     /// Tablet mode requested by the client for this connection.
     #[serde(default, skip_serializing_if = "is_default_tablet_mode")]
     pub tablet_mode_requested: TabletModeMsg,
@@ -1913,6 +2035,7 @@ impl Default for ClientHelloMsg {
             input_protocol_version: INPUT_PROTOCOL_VERSION,
             input_capabilities: InputCapabilitiesMsg::default(),
             cursor_preference: CursorMode::Local,
+            cursor_image_v1: false,
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             tablet_mode_capabilities: TabletModeCapabilitiesMsg::default(),
             device_capabilities: BTreeMap::new(),
@@ -1996,6 +2119,13 @@ impl ClientHelloMsg {
     #[must_use]
     pub const fn with_cursor_preference(mut self, preference: CursorMode) -> Self {
         self.cursor_preference = preference;
+        self
+    }
+
+    /// Attaches the same cursor-image capability sent during authentication.
+    #[must_use]
+    pub const fn with_cursor_image_v1(mut self, supported: bool) -> Self {
+        self.cursor_image_v1 = supported;
         self
     }
 
@@ -2465,6 +2595,11 @@ pub struct CursorModeResultMsg {
     pub accepted: bool,
     #[serde(default)]
     pub reason: CursorModeReason,
+    /// The host sends `FrameType::CursorUpdate` cursor images on this
+    /// attachment. Absent and `false` from older hosts and whenever the
+    /// host reports cursor shapes by name only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_images: bool,
 }
 
 fn default_cursor_mode_result_type() -> String {
@@ -2479,6 +2614,7 @@ impl Default for CursorModeResultMsg {
             active: CursorMode::Local,
             accepted: false,
             reason: CursorModeReason::default(),
+            cursor_images: false,
         }
     }
 }
@@ -2498,7 +2634,9 @@ pub const CURSOR_SHAPE: &str = "cursor_shape";
 
 /// Named host OS cursor shapes. Covers the resize-edge, text, hand, and
 /// common wait/progress shapes that matter most for remote desktop use.
-/// Pixel bitmaps (custom application cursors) are a future extension.
+/// Exact pixel images travel separately as `FrameType::CursorUpdate`
+/// ([`crate::cursor`]) to clients that declared `cursor_image_v1`; this
+/// name remains their fallback and the only shape older clients see.
 ///
 /// Unknown variants received from a newer host are deserialised as
 /// `CursorShapeKind::Default` via the custom `Deserialize` impl, so an
@@ -3949,12 +4087,28 @@ impl std::fmt::Display for PenEventValidationError {
 
 impl std::error::Error for PenEventValidationError {}
 
+/// Largest `text_commit` a peer may send, in UTF-8 bytes. Committed input
+/// method text is short; a longer composition is split into several commits.
+pub const MAX_TEXT_COMMIT_BYTES: usize = 1024;
+
+/// Text the client's input method committed (dead-key results, IME
+/// conversions, characters the host's layout types differently). Carried on
+/// the input/cursor lane, ordered with key events. Never logged: it may be a
+/// password.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextCommitMsg {
     #[serde(rename = "type", default = "default_text_commit_type")]
     pub msg_type: String,
     #[serde(default)]
     pub text: String,
+    /// The client's input sequence number, echoed in a
+    /// [`TextCommitResultMsg`]. Zero when the client does not number commits.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub sequence: u64,
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn default_text_commit_type() -> String {
@@ -3966,6 +4120,234 @@ impl Default for TextCommitMsg {
         Self {
             msg_type: default_text_commit_type(),
             text: String::new(),
+            sequence: 0,
+        }
+    }
+}
+
+/// Why a `text_commit` is not acceptable at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextCommitError {
+    /// No text.
+    Empty,
+    /// More than [`MAX_TEXT_COMMIT_BYTES`].
+    TooLong,
+    /// A control character (C0, DEL or C1): keys go as `key_event`.
+    ControlCharacter,
+    /// A Unicode noncharacter.
+    Noncharacter,
+}
+
+impl std::fmt::Display for TextCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "empty text",
+            Self::TooLong => "text longer than the commit limit",
+            Self::ControlCharacter => "text contains a control character",
+            Self::Noncharacter => "text contains a Unicode noncharacter",
+        })
+    }
+}
+
+impl std::error::Error for TextCommitError {}
+
+impl TextCommitMsg {
+    /// A commit of `text` with `sequence`.
+    #[must_use]
+    pub fn new(text: impl Into<String>, sequence: u64) -> Self {
+        Self {
+            text: text.into(),
+            sequence,
+            ..Self::default()
+        }
+    }
+
+    /// Checks the text is a printable commit within the size limit.
+    ///
+    /// # Errors
+    ///
+    /// [`TextCommitError`] for empty, oversized, control or noncharacter
+    /// text.
+    pub fn validate(&self) -> Result<(), TextCommitError> {
+        validate_commit_text(&self.text)
+    }
+}
+
+/// Checks `text` is a printable commit within [`MAX_TEXT_COMMIT_BYTES`].
+///
+/// # Errors
+///
+/// [`TextCommitError`] for empty, oversized, control or noncharacter text.
+pub fn validate_commit_text(text: &str) -> Result<(), TextCommitError> {
+    if text.is_empty() {
+        return Err(TextCommitError::Empty);
+    }
+    if text.len() > MAX_TEXT_COMMIT_BYTES {
+        return Err(TextCommitError::TooLong);
+    }
+    for character in text.chars() {
+        if character.is_control() {
+            return Err(TextCommitError::ControlCharacter);
+        }
+        let code = u32::from(character);
+        if (0xFDD0..=0xFDEF).contains(&code) || code & 0xFFFE == 0xFFFE {
+            return Err(TextCommitError::Noncharacter);
+        }
+    }
+    Ok(())
+}
+
+/// Why a host did not type (part of) a commit.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRefusalReason {
+    /// The session's active keyboard layout has no key for the character,
+    /// and the host has no other way to type it.
+    NotInSessionLayout,
+    /// The character is not on the session's layout and the compositor
+    /// offers no text input (an EIS `ei_text` device) to type it with.
+    CompositorLacksTextInput,
+    /// The session's keyboard layout is not known, so the character could
+    /// not be proven typeable.
+    KeymapUnknown,
+    /// The text is not an acceptable commit (see [`TextCommitError`]).
+    InvalidText,
+    /// The session's input connection was down or overflowed.
+    InputUnavailable,
+    /// This host or session does not type committed text.
+    HostUnsupported,
+    /// Commits arrived faster than the host accepts them.
+    RateLimited,
+    /// A reason this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl TextRefusalReason {
+    /// The wire token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::NotInSessionLayout => "not_in_session_layout",
+            Self::CompositorLacksTextInput => "compositor_lacks_text_input",
+            Self::KeymapUnknown => "keymap_unknown",
+            Self::InvalidText => "invalid_text",
+            Self::InputUnavailable => "input_unavailable",
+            Self::HostUnsupported => "host_unsupported",
+            Self::RateLimited => "rate_limited",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Most refused characters a [`TextCommitResultMsg`] echoes back.
+pub const MAX_REFUSED_TEXT_CHARS: usize = 64;
+
+/// Host notice for one `text_commit` that was not fully typed, or typed
+/// without proof that the session's layout has every character. Sent only
+/// to a client that advertised `text_commit`, and only when there is
+/// something to report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextCommitResultMsg {
+    #[serde(rename = "type", default = "default_text_commit_result_type")]
+    pub msg_type: String,
+    /// The commit's `sequence`.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Characters typed.
+    #[serde(default)]
+    pub delivered_chars: u32,
+    /// Characters not typed.
+    #[serde(default)]
+    pub refused_chars: u32,
+    /// The characters not typed, in order, at most
+    /// [`MAX_REFUSED_TEXT_CHARS`] (the client typed them; it is told which).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub refused_text: String,
+    /// Why they were not typed.
+    #[serde(default)]
+    pub reason: TextRefusalReason,
+    /// Characters were typed without proof that the session's layout has
+    /// them (the layout could not be read); the compositor may have dropped
+    /// some.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unverified: bool,
+}
+
+fn default_text_commit_result_type() -> String {
+    TEXT_COMMIT_RESULT.to_string()
+}
+
+impl Default for TextCommitResultMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_text_commit_result_type(),
+            sequence: 0,
+            delivered_chars: 0,
+            refused_chars: 0,
+            refused_text: String::new(),
+            reason: TextRefusalReason::Unknown,
+            unverified: false,
+        }
+    }
+}
+
+/// The characters one key position types on the host, unmodified and with
+/// Shift. A position whose level is a dead key or no character is `None`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostKeyCharsMsg {
+    /// The position, as the Qt key identifier a `key_event` carries.
+    pub qt_key: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<String>,
+}
+
+/// Most key positions a [`HostKeymapMsg`] carries.
+pub const MAX_HOST_KEYMAP_KEYS: usize = 128;
+
+/// Host notice of what its session's active keyboard layout types at each
+/// printable key position, so a client can tell which keystrokes the host
+/// would type differently and send those as committed text instead. Sent to
+/// a client that advertised `text_commit`, at attach and whenever the
+/// layout changes; without one the client assumes the layouts match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostKeymapMsg {
+    #[serde(rename = "type", default = "default_host_keymap_type")]
+    pub msg_type: String,
+    /// Increases with every layout change the host saw.
+    #[serde(default)]
+    pub generation: u64,
+    /// Where the host read the layout (`compositor_keymap`, `eis_keymap`).
+    #[serde(default)]
+    pub source: String,
+    /// The layouts the session's keymap holds, in group order (XKB layout
+    /// names such as `no`, `de(nodeadkeys)`).
+    #[serde(default)]
+    pub layouts: Vec<String>,
+    /// The active layout, when the host knows which one is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_layout: Option<String>,
+    /// The active layout's characters per position.
+    #[serde(default)]
+    pub keys: Vec<HostKeyCharsMsg>,
+}
+
+fn default_host_keymap_type() -> String {
+    HOST_KEYMAP.to_string()
+}
+
+impl Default for HostKeymapMsg {
+    fn default() -> Self {
+        Self {
+            msg_type: default_host_keymap_type(),
+            generation: 0,
+            source: String::new(),
+            layouts: Vec::new(),
+            active_layout: None,
+            keys: Vec::new(),
         }
     }
 }
@@ -4062,6 +4444,28 @@ mod tests {
             future.served,
             ServedStreamPipeline::Unknown("cinema".to_string())
         );
+        assert_eq!(future.detail, None);
+    }
+
+    #[test]
+    fn served_pipeline_detail_is_optional_both_ways() {
+        let plain = ServedPipelineMsg::new(
+            ServedStreamPipeline::Auto,
+            "hardware",
+            Some("eight_bit_source".to_string()),
+        );
+        assert!(!serde_json::to_string(&plain)
+            .expect("json")
+            .contains("detail"));
+        let detailed = plain.clone().with_detail(EIGHT_BIT_DESKTOP_DETAIL);
+        let json = serde_json::to_value(&detailed).expect("json");
+        assert_eq!(json["reason"], "eight_bit_source");
+        assert_eq!(json["detail"], EIGHT_BIT_DESKTOP_DETAIL);
+        let decoded: ServedPipelineMsg = serde_json::from_value(json).expect("round trip");
+        assert_eq!(decoded, detailed);
+        // The sentence names both remedies and the exact operator key.
+        assert!(EIGHT_BIT_DESKTOP_DETAIL.contains("Sign out"));
+        assert!(EIGHT_BIT_DESKTOP_DETAIL.contains("video.x11_desktop_depth"));
     }
 
     #[test]
@@ -4549,6 +4953,36 @@ mod tests {
             serde_json::to_value(auth).unwrap()["cursor_preference"],
             "host"
         );
+    }
+
+    #[test]
+    fn cursor_image_capability_is_additive_and_omitted_when_false() {
+        let auth: AuthResponse = serde_json::from_str(
+            r#"{"type":"auth_response","method":"none","username":"","credential":"","screen_width":0,"screen_height":0}"#,
+        )
+        .unwrap();
+        assert!(!auth.cursor_image_v1);
+        let auth_json = serde_json::to_value(AuthResponse::none()).unwrap();
+        assert!(auth_json.get("cursor_image_v1").is_none());
+        let hello_json = serde_json::to_value(ClientHelloMsg::default()).unwrap();
+        assert!(hello_json.get("cursor_image_v1").is_none());
+        let result_json = serde_json::to_value(CursorModeResultMsg::default()).unwrap();
+        assert!(result_json.get("cursor_images").is_none());
+
+        let auth = AuthResponse::none().with_cursor_image_v1(true);
+        let hello = ClientHelloMsg::default().with_cursor_image_v1(true);
+        assert_eq!(
+            serde_json::to_value(&auth).unwrap()["cursor_image_v1"],
+            true
+        );
+        let hello: ClientHelloMsg =
+            serde_json::from_value(serde_json::to_value(hello).unwrap()).unwrap();
+        assert!(hello.cursor_image_v1);
+        let result: CursorModeResultMsg = serde_json::from_str(
+            r#"{"type":"cursor_mode_result","requested":"local","active":"local","accepted":true,"reason":"","cursor_images":true}"#,
+        )
+        .unwrap();
+        assert!(result.cursor_images);
     }
 
     #[test]
@@ -5092,8 +5526,9 @@ mod tests {
         );
         assert_eq!(INPUT_PROTOCOL_VERSION, 4);
         // Bumped to 4 when the video header gained bit depth, colour range and
-        // matrix coefficients in its flags byte.
-        assert_eq!(crate::wire::PROTOCOL_VERSION, 4);
+        // matrix coefficients in its flags byte; to 5 when the session moved
+        // onto isolated QUIC lanes (ADR 0014).
+        assert_eq!(crate::wire::PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -5172,11 +5607,13 @@ mod tests {
             pen_rotation: InputCapabilityAvailability::Unavailable,
             pen_eraser: InputCapabilityAvailability::Available,
             pen_proximity: InputCapabilityAvailability::Available,
+            pen_barrel_buttons: InputCapabilityAvailability::Unavailable,
             ..InputCapabilitiesMsg::default()
         };
         let json = serde_json::to_value(capabilities).unwrap();
         assert_eq!(json["pen"], "available");
         assert_eq!(json["pen_rotation"], "unavailable");
+        assert_eq!(json["pen_barrel_buttons"], "unavailable");
         assert_eq!(
             serde_json::from_value::<InputCapabilitiesMsg>(json).unwrap(),
             capabilities
@@ -5193,6 +5630,10 @@ mod tests {
         assert_eq!(legacy.pen_rotation, InputCapabilityAvailability::Unknown);
         assert_eq!(legacy.pen_eraser, InputCapabilityAvailability::Unknown);
         assert_eq!(legacy.pen_proximity, InputCapabilityAvailability::Unknown);
+        assert_eq!(
+            legacy.pen_barrel_buttons,
+            InputCapabilityAvailability::Unknown
+        );
     }
 
     #[test]
@@ -6001,6 +6442,19 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_transfer_failure_names_its_sequence_and_reason() {
+        let msg = ClipboardTransferFailedMsg::new(9, ClipboardTransferFailure::BulkLaneFull);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], CLIPBOARD_TRANSFER_FAILED);
+        assert_eq!(json["sequence"], 9);
+        assert_eq!(json["reason"], "bulk_lane_full");
+        assert_eq!(
+            crate::lanes::lane_for_message_type(CLIPBOARD_TRANSFER_FAILED),
+            crate::lanes::LaneRole::Control
+        );
+    }
+
+    #[test]
     fn key_reset_modifiers_round_trips_with_type_field() {
         let msg = KeyResetModifiersMsg {
             reason: "reconnect".to_string(),
@@ -6042,6 +6496,132 @@ mod tests {
         assert_eq!(msg, TextCommitMsg::default());
         assert_eq!(msg.msg_type, TEXT_COMMIT);
         assert_eq!(msg.text, "");
+    }
+
+    #[test]
+    fn text_commit_sequence_is_optional_on_the_wire() {
+        let legacy: TextCommitMsg =
+            serde_json::from_str(r#"{"type":"text_commit","text":"x"}"#).unwrap();
+        assert_eq!(legacy.sequence, 0);
+        let numbered = TextCommitMsg::new("æ", 7);
+        let json = serde_json::to_value(&numbered).unwrap();
+        assert_eq!(json["sequence"], 7);
+        let unnumbered = serde_json::to_value(TextCommitMsg::new("æ", 0)).unwrap();
+        assert!(unnumbered.get("sequence").is_none());
+    }
+
+    #[test]
+    fn text_commit_validation_admits_printable_text_only() {
+        assert_eq!(TextCommitMsg::new("æøå 😀 日本語", 1).validate(), Ok(()));
+        assert_eq!(
+            TextCommitMsg::new("", 1).validate(),
+            Err(TextCommitError::Empty)
+        );
+        assert_eq!(
+            TextCommitMsg::new("a\nb", 1).validate(),
+            Err(TextCommitError::ControlCharacter)
+        );
+        assert_eq!(
+            TextCommitMsg::new("\u{85}", 1).validate(),
+            Err(TextCommitError::ControlCharacter)
+        );
+        assert_eq!(
+            TextCommitMsg::new("\u{FFFF}", 1).validate(),
+            Err(TextCommitError::Noncharacter)
+        );
+        assert_eq!(
+            TextCommitMsg::new("x".repeat(MAX_TEXT_COMMIT_BYTES + 1), 1).validate(),
+            Err(TextCommitError::TooLong)
+        );
+        assert_eq!(
+            TextCommitMsg::new("x".repeat(MAX_TEXT_COMMIT_BYTES), 1).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn text_commit_result_round_trips_and_tolerates_unknown_reasons() {
+        let result = TextCommitResultMsg {
+            sequence: 9,
+            delivered_chars: 3,
+            refused_chars: 1,
+            refused_text: "😀".to_owned(),
+            reason: TextRefusalReason::CompositorLacksTextInput,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["type"], TEXT_COMMIT_RESULT);
+        assert_eq!(json["reason"], "compositor_lacks_text_input");
+        assert!(json.get("unverified").is_none());
+        assert_eq!(
+            serde_json::from_value::<TextCommitResultMsg>(json).unwrap(),
+            result
+        );
+        let future: TextCommitResultMsg = serde_json::from_str(
+            r#"{"type":"text_commit_result","sequence":1,"reason":"from_the_future"}"#,
+        )
+        .unwrap();
+        assert_eq!(future.reason, TextRefusalReason::Unknown);
+        for reason in [
+            TextRefusalReason::NotInSessionLayout,
+            TextRefusalReason::CompositorLacksTextInput,
+            TextRefusalReason::KeymapUnknown,
+            TextRefusalReason::InvalidText,
+            TextRefusalReason::InputUnavailable,
+            TextRefusalReason::HostUnsupported,
+            TextRefusalReason::RateLimited,
+            TextRefusalReason::Unknown,
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), reason.token());
+        }
+    }
+
+    #[test]
+    fn host_keymap_round_trips() {
+        let keymap = HostKeymapMsg {
+            generation: 2,
+            source: "compositor_keymap".to_owned(),
+            layouts: vec!["no".to_owned(), "us".to_owned()],
+            active_layout: Some("no".to_owned()),
+            keys: vec![HostKeyCharsMsg {
+                qt_key: 0x27,
+                base: Some("æ".to_owned()),
+                shift: Some("Æ".to_owned()),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&keymap).unwrap();
+        assert_eq!(json["type"], HOST_KEYMAP);
+        assert_eq!(json["keys"][0]["base"], "æ");
+        assert_eq!(
+            serde_json::from_value::<HostKeymapMsg>(json).unwrap(),
+            keymap
+        );
+        let minimal: HostKeymapMsg = serde_json::from_str(r#"{"type":"host_keymap"}"#).unwrap();
+        assert_eq!(minimal, HostKeymapMsg::default());
+    }
+
+    #[test]
+    fn text_commit_needs_an_explicit_capability() {
+        let legacy: InputCapabilitiesMsg = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.text_commit, InputCapabilityAvailability::Unknown);
+        assert_eq!(
+            legacy.text_commit_unicode,
+            InputCapabilityAvailability::Unknown
+        );
+        assert!(!supports_text_commit_v1(legacy));
+        let unavailable = InputCapabilitiesMsg {
+            text_commit: InputCapabilityAvailability::Unavailable,
+            ..legacy
+        };
+        assert!(!supports_text_commit_v1(unavailable));
+        let available = InputCapabilitiesMsg {
+            text_commit: InputCapabilityAvailability::Available,
+            ..legacy
+        };
+        assert!(supports_text_commit_v1(available));
+        let json = serde_json::to_value(available).unwrap();
+        assert_eq!(json["text_commit"], "available");
     }
 
     #[test]

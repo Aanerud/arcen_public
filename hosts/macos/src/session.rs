@@ -983,6 +983,10 @@ pub fn server_hello_json_for_multi(
             pen_rotation: available,
             pen_eraser: available,
             pen_proximity: available,
+            pen_barrel_buttons: available,
+            // The macOS Pier does not type committed text yet.
+            text_commit: InputCapabilityAvailability::Unavailable,
+            text_commit_unicode: InputCapabilityAvailability::Unavailable,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: available,
@@ -2931,6 +2935,7 @@ mod tests {
             ("pen_rotation", input.pen_rotation),
             ("pen_eraser", input.pen_eraser),
             ("pen_proximity", input.pen_proximity),
+            ("pen_barrel_buttons", input.pen_barrel_buttons),
         ] {
             assert_eq!(
                 claim,

@@ -163,6 +163,11 @@ impl KeyboardInput {
         }
     }
 
+    /// Forgets `qt_key` as held; whether it was.
+    pub fn forget_held(&mut self, qt_key: u32) -> bool {
+        self.held_qt_keys.remove(&qt_key)
+    }
+
     pub fn drain_held(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.held_qt_keys).into_iter().collect()
     }
@@ -203,6 +208,8 @@ pub struct NativeKeyMetadata {
     pub qt_key: u32,
     pub pressed: bool,
     pub keypad: bool,
+    /// The macOS virtual key code.
+    pub key_code: u16,
 }
 
 impl NativeKeyMetadata {
@@ -210,18 +217,31 @@ impl NativeKeyMetadata {
         self.keypad && self.qt_key == 0x2A
     }
 
+    /// Keypad keys egui-winit has no physical key for (keypad decimal and
+    /// keypad equals): their events carry only the logical key, which the
+    /// layout decides (`.` on a US layout, `,` on a Norwegian one).
+    pub fn physical_unknown_to_egui(self) -> bool {
+        self.keypad && matches!(self.key_code, 65 | 81)
+    }
+
     pub fn matches(self, event: &egui::Event) -> bool {
-        matches!(
-            event,
-            egui::Event::Key {
-                key,
-                physical_key,
-                pressed,
-                ..
-            } if physical_key.unwrap_or(*key) == self.key
-                && *pressed == self.pressed
-                && (self.requires_synthetic_event() == physical_key.is_none())
-        )
+        let egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        if *pressed != self.pressed {
+            return false;
+        }
+        if self.physical_unknown_to_egui() {
+            return physical_key.is_none();
+        }
+        physical_key.unwrap_or(*key) == self.key
+            && (self.requires_synthetic_event() == physical_key.is_none())
     }
 }
 
@@ -339,6 +359,7 @@ mod native_keypad {
             qt_key,
             pressed,
             keypad,
+            key_code,
         })
     }
 }

@@ -26,6 +26,10 @@
 //!   the applied origin translation, and the "publish the negotiated bitrate
 //!   budget verbatim" rule that both hosts hand-wrote when assembling their
 //!   applied multi-region capability.
+//! - [`virtual_topology`]: placement of a requested topology onto virtual
+//!   outputs a compositor creates on demand (no head inventory).
+//! - [`ui_scale`]: the desktop UI scale for one virtual output, decided from
+//!   the client display's facts among the scales the compositor supports.
 //! - [`xorg_gpu`]: which PCI GPU a dedicated NVIDIA Xorg `Device` section
 //!   names (`BusID`), decided from host-reported PCI facts, so a template
 //!   never carries one machine's GPU address to another.
@@ -56,8 +60,11 @@ pub mod edid;
 pub mod fairness;
 pub mod nvidia_heads;
 pub mod provider;
+pub mod ui_scale;
+pub mod virtual_topology;
 pub mod windows_multi_monitor;
 pub mod xorg_gpu;
+pub mod xorg_screen;
 
 #[cfg(test)]
 mod block_on;
@@ -85,6 +92,11 @@ pub use provider::{
     OutputContext, OutputDemand, OutputProvider, OutputStage, OutputSurface, OutputTransaction,
     OutputTransactionError, OutputTransactionState, RollbackGuarantee, admits,
 };
+pub use ui_scale::{OutputScaleChoice, OutputScaleFacts, ScaleBasis, choose_output_scale};
+pub use virtual_topology::{
+    VirtualOutputLimits, VirtualOutputPlan, VirtualTopologyError, VirtualTopologyPlan,
+    plan_virtual_topology,
+};
 pub use windows_multi_monitor::{
     AdminHeadlessMode, WindowsCcdModePlan, WindowsCcdOutputKind, WindowsMultiMonitorAdapter,
     WindowsMultiMonitorPolicy, WindowsMultiMonitorRefusal, WindowsMultiMonitorSelection,
@@ -95,3 +107,4 @@ pub use xorg_gpu::{
     BoundDriver, GpuCandidate, NVIDIA_PCI_VENDOR, PciAddress, PciAddressError, XorgGpuDecision,
     XorgTemplateError, apply_bus_id, decide_xorg_gpu, resolve_xorg_gpu,
 };
+pub use xorg_screen::{RenderedScreen, SessionScreen, raised_virtual, with_session_screen};

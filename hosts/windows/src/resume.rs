@@ -15,12 +15,12 @@ use arcen_identity::{
 };
 #[cfg(test)]
 use arcen_identity::{validate_direct_resume_grant, DirectResumeValidationContext};
+use arcen_protocol::lanes::{SessionClose, SessionRecord};
 use arcen_protocol::messages::{AuthResponse, ResumeErrorCode, AUTH_METHOD_RESUME};
 use arcen_session::direct_reconnect::{
     decide_fresh_authenticated_reconnect, DirectResumeSlot, DirectResumeSlotResult,
     FreshAuthenticatedReconnectDecision, MonotonicMillis, ReconnectPolicy,
 };
-use arcen_transport::quic::DirectQuicStream;
 use arcen_transport::{ConnectionId, DirectResumeTransportBinding};
 use futures_util::{Sink, Stream};
 use ring::hmac;
@@ -30,15 +30,16 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 #[cfg(feature = "wss-compat")]
 use tokio_rustls::server::TlsStream;
-use tokio_tungstenite::{
-    tungstenite::{Error as WebSocketError, Message},
-    WebSocketStream,
-};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+#[cfg(feature = "wss-compat")]
+use tokio_tungstenite::WebSocketStream;
 use zeroize::Zeroize;
 
 #[cfg(feature = "wss-compat")]
 type DirectWssSocket = WebSocketStream<TlsStream<TcpStream>>;
-type DirectQuicSocket = WebSocketStream<DirectQuicStream>;
+type DirectQuicSocket = arcen_transport::quic::SessionLaneSocket;
 
 pub(crate) enum DirectSessionSocket {
     #[cfg(feature = "wss-compat")]
@@ -56,15 +57,13 @@ impl DirectSessionSocket {
         Self::Quic(socket)
     }
 
-    /// The Deck's audio priority stream on this connection, not yet opened.
-    /// `None` on a transport without one.
-    pub(crate) fn priority_audio(&self) -> Option<arcen_transport::quic::PriorityAudio> {
+    /// The connection's isolated lanes (ADR 0014). `None` on a transport
+    /// without lanes, which cannot carry a session.
+    pub(crate) fn lanes(&self) -> Option<arcen_transport::quic::LaneConnection> {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(arcen_transport::quic::PriorityAudio::new(
-                socket.get_ref().connection_handle(),
-            )),
+            Self::Quic(socket) => Some(socket.lanes().clone()),
         }
     }
 
@@ -73,7 +72,7 @@ impl DirectSessionSocket {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
+            Self::Quic(socket) => Some(socket.lanes().connection().clone()),
         }
     }
 
@@ -96,7 +95,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_ready(context),
-            Self::Quic(socket) => Pin::new(socket).poll_ready(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_ready(context)
+                .map_err(lane_send_error),
         }
     }
 
@@ -104,7 +105,10 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).start_send(item),
-            Self::Quic(socket) => Pin::new(socket).start_send(item),
+            Self::Quic(socket) => match message_to_record(item) {
+                Some(record) => Pin::new(socket).start_send(record).map_err(lane_send_error),
+                None => Ok(()),
+            },
         }
     }
 
@@ -115,7 +119,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_flush(context),
-            Self::Quic(socket) => Pin::new(socket).poll_flush(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_flush(context)
+                .map_err(lane_send_error),
         }
     }
 
@@ -126,7 +132,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_close(context),
-            Self::Quic(socket) => Pin::new(socket).poll_close(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_close(context)
+                .map_err(lane_send_error),
         }
     }
 }
@@ -138,9 +146,72 @@ impl Stream for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_next(context),
-            Self::Quic(socket) => Pin::new(socket).poll_next(context),
+            Self::Quic(socket) => Pin::new(socket).poll_next(context).map(|item| {
+                item.map(|result| {
+                    result
+                        .map(record_to_message)
+                        .map_err(|exit| lane_exit_error(&exit))
+                })
+            }),
         }
     }
+}
+
+/// Converts a session message to its lane record (ADR 0014). `None` for raw
+/// frames, which the session protocol never sends.
+pub(crate) fn message_to_record(message: Message) -> Option<SessionRecord> {
+    Some(match message {
+        Message::Text(text) => SessionRecord::Text(text),
+        Message::Binary(bytes) => SessionRecord::Binary(bytes),
+        Message::Ping(bytes) => SessionRecord::Ping(bytes),
+        Message::Pong(bytes) => SessionRecord::Pong(bytes),
+        Message::Close(frame) => SessionRecord::Close(frame.map(|frame| SessionClose {
+            code: u16::from(frame.code),
+            reason: frame.reason.into_owned(),
+        })),
+        Message::Frame(_) => return None,
+    })
+}
+
+/// Converts a lane record to the session message it carries.
+pub(crate) fn record_to_message(record: SessionRecord) -> Message {
+    match record {
+        SessionRecord::Text(text) => Message::Text(text),
+        SessionRecord::Binary(bytes) => Message::Binary(bytes),
+        SessionRecord::Ping(bytes) => Message::Ping(bytes),
+        SessionRecord::Pong(bytes) => Message::Pong(bytes),
+        SessionRecord::Close(close) => Message::Close(close.map(|close| CloseFrame {
+            code: CloseCode::from(close.code),
+            reason: close.reason.into(),
+        })),
+    }
+}
+
+fn lane_send_error(error: arcen_transport::quic::LaneSendError) -> WebSocketError {
+    WebSocketError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("control lane: {error}"),
+    ))
+}
+
+fn lane_exit_error(exit: &arcen_transport::quic::LaneExit) -> WebSocketError {
+    let detail = match exit {
+        arcen_transport::quic::LaneExit::ConnectionLost {
+            mismatch: Some(mismatch),
+        } => {
+            tracing::warn!(
+                target: crate::logging::NET,
+                reason = %mismatch,
+                "Deck speaks another transport layout"
+            );
+            mismatch.message()
+        }
+        other => format!("control lane ended: {other:?}"),
+    };
+    WebSocketError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        detail,
+    ))
 }
 
 const NO_DISCLAIMER_SHA256: &str =

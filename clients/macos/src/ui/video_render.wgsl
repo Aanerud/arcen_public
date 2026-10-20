@@ -32,12 +32,16 @@
 // exactly how the uniform fields below are derived from a negotiated
 // chroma/range/depth/matrix contract.
 //
-// `fs_main` samples plane0/plane1 with `textureLoad` (nearest, not
-// bilinear): they are integer code planes (`texture_2d<u32>`), and blending
-// two different YCbCr codes before the matrix is applied is not the same
-// operation as blending after -- so conversion always happens first, at the
-// source's native resolution; smoothing is deferred entirely to
-// `fs_composite`'s bilinear resolve of the already-converted picture.
+// `fs_main` reads plane0/plane1 with `textureLoad`: they are integer code
+// planes (`texture_2d<u32>`), which cannot be filtered by a sampler. Luma is
+// an exact texel fetch. A subsampled chroma plane (4:2:0, 4:2:2) is
+// reconstructed by `chroma_codes` -- a luma-guided fit over the four
+// nearest centre-sited chroma samples -- because a nearest fetch repeats
+// each sample over its whole block and paints hard colour steps on text
+// edges. The YCbCr -> RGB matrix is affine in the code values, so
+// reconstructing codes before converting is sound; only the final clamp is
+// non-linear and it still happens last. 4:4:4 keeps the exact fetch, so its
+// output is unchanged.
 
 struct VideoUniform {
     // Luma code range: `code` -> `(code - luma_offset) * luma_span_inv`,
@@ -109,6 +113,110 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
     return out;
 }
 
+// The WGSL twin of `video_metal_layer.metal`'s `chroma_codes` (luma-guided
+// "chroma from luma" reconstruction); see that function for the siting, the
+// fit and why. `VideoUniform::chroma_reference_codes` in `video_render.rs`
+// is the CPU reference both are tested against -- change all three
+// together. Integer code planes cannot be filtered, so each chroma sample's
+// block-mean luma is gathered with explicit loads here.
+const CHROMA_FIT_EPSILON: f32 = 3.0e-4;
+
+fn block_mean_luma(tap: vec2<i32>, ratio: vec2<i32>) -> f32 {
+    let last = vec2<i32>(i32(u.luma_width), i32(u.luma_height)) - vec2<i32>(1, 1);
+    var sum = 0.0;
+    for (var dy = 0; dy < ratio.y; dy++) {
+        for (var dx = 0; dx < ratio.x; dx++) {
+            let at = clamp(tap * ratio + vec2<i32>(dx, dy), vec2<i32>(0, 0), last);
+            sum += f32(textureLoad(plane0, at, 0).r);
+        }
+    }
+    let code = sum / f32(ratio.x * ratio.y);
+    return (code - u.luma_offset) * u.luma_span_inv;
+}
+
+fn chroma_codes(uv: vec2<f32>, pixel_luma: f32) -> vec2<f32> {
+    let luma_size = vec2<f32>(u.luma_width, u.luma_height);
+    let chroma_size = vec2<f32>(u.chroma_width, u.chroma_height);
+    let exact = vec2<i32>(uv * chroma_size);
+    let full = chroma_size >= luma_size;
+    let own = vec2<f32>(textureLoad(plane1, exact, 0).rg);
+    if (all(full)) {
+        return own;
+    }
+    let ratio = vec2<i32>(round(luma_size / chroma_size));
+    let position = uv * chroma_size - vec2<f32>(0.5, 0.5);
+    var base = floor(position);
+    var weight = position - base;
+    if (full.x) {
+        base.x = f32(exact.x);
+        weight.x = 0.0;
+    }
+    if (full.y) {
+        base.y = f32(exact.y);
+        weight.y = 0.0;
+    }
+    let last = vec2<i32>(chroma_size) - vec2<i32>(1, 1);
+    let c0 = clamp(vec2<i32>(base), vec2<i32>(0, 0), last);
+    var c1 = clamp(vec2<i32>(base) + vec2<i32>(1, 1), vec2<i32>(0, 0), last);
+    if (full.x) {
+        c1.x = c0.x;
+    }
+    if (full.y) {
+        c1.y = c0.y;
+    }
+    var taps = array<vec2<i32>, 4>(
+        vec2<i32>(c0.x, c0.y),
+        vec2<i32>(c1.x, c0.y),
+        vec2<i32>(c0.x, c1.y),
+        vec2<i32>(c1.x, c1.y),
+    );
+    var tap_weight = array<f32, 4>(
+        (1.0 - weight.x) * (1.0 - weight.y),
+        weight.x * (1.0 - weight.y),
+        (1.0 - weight.x) * weight.y,
+        weight.x * weight.y,
+    );
+    var tap_luma: array<f32, 4>;
+    var tap_chroma: array<vec2<f32>, 4>;
+    var low = vec2<f32>(3.0e38, 3.0e38);
+    var high = vec2<f32>(-3.0e38, -3.0e38);
+    for (var i = 0; i < 4; i++) {
+        tap_chroma[i] = vec2<f32>(textureLoad(plane1, taps[i], 0).rg);
+        low = min(low, tap_chroma[i]);
+        high = max(high, tap_chroma[i]);
+    }
+    if (all(high == low)) {
+        return own;
+    }
+    var mean_luma = 0.0;
+    var mean_chroma = vec2<f32>(0.0, 0.0);
+    for (var i = 0; i < 4; i++) {
+        tap_luma[i] = block_mean_luma(taps[i], ratio);
+        mean_luma += tap_weight[i] * tap_luma[i];
+        mean_chroma += tap_weight[i] * tap_chroma[i];
+    }
+    var luma_variance = 0.0;
+    var chroma_variance = vec2<f32>(0.0, 0.0);
+    var covariance = vec2<f32>(0.0, 0.0);
+    for (var i = 0; i < 4; i++) {
+        let dy = tap_luma[i] - mean_luma;
+        let dc = tap_chroma[i] - mean_chroma;
+        luma_variance += tap_weight[i] * dy * dy;
+        chroma_variance += tap_weight[i] * dc * dc;
+        covariance += tap_weight[i] * dy * dc;
+    }
+    let luma_here = (pixel_luma - u.luma_offset) * u.luma_span_inv;
+    let slope = covariance / (luma_variance + CHROMA_FIT_EPSILON);
+    let fitted = clamp(mean_chroma + slope * (luma_here - mean_luma), low, high);
+    let denominator = luma_variance * chroma_variance;
+    let confidence = select(
+        vec2<f32>(0.0, 0.0),
+        clamp(covariance * covariance / max(denominator, vec2<f32>(1.0e-12, 1.0e-12)), vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)),
+        denominator > vec2<f32>(0.0, 0.0),
+    );
+    return mix(own, fitted, confidence);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (u.mode == MODE_PACKED_RGBA) {
@@ -121,11 +229,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let luma_coord = vec2<i32>(in.uv * vec2<f32>(u.luma_width, u.luma_height));
-    let chroma_coord = vec2<i32>(in.uv * vec2<f32>(u.chroma_width, u.chroma_height));
     let luma_code = f32(textureLoad(plane0, luma_coord, 0).r);
-    let chroma_texel = textureLoad(plane1, chroma_coord, 0);
-    let cb_code = f32(chroma_texel.r);
-    let cr_code = f32(chroma_texel.g);
+    let chroma_code = chroma_codes(in.uv, luma_code);
+    let cb_code = chroma_code.x;
+    let cr_code = chroma_code.y;
 
     if (u.mode == MODE_IDENTITY_GBR) {
         // Identity/GBR passthrough: the host can emit this (no CoreVideo

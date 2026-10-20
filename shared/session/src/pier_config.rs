@@ -28,7 +28,33 @@ pub struct PierConfig<P> {
     pub redirection: RedirectionConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Linux headless Wayland desktop policy.
+    #[serde(default)]
+    pub wayland: WaylandConfig,
     pub platform: P,
+}
+
+/// Linux headless Wayland desktop policy (`wayland`).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WaylandConfig {
+    /// `run` (default): GNOME's first-login assistant and welcome tour run
+    /// as on a GDM login. `skip`: Arcen sets GNOME's own completion markers
+    /// for the user before the desktop starts, so neither opens. See
+    /// [`crate::desktop_session::first_login`].
+    pub first_login_setup: crate::desktop_session::first_login::FirstLoginSetup,
+    /// Lab only (default `false`): give each headless Wayland session a
+    /// virtual tablet on a private udev seat, for a compositor built with
+    /// the headless-input lab patch (see `arcen_input::seat_pen`). Not for
+    /// production: it needs a patched Mutter and grants the session user
+    /// its own virtual pen's event node.
+    pub lab_seat_pen: bool,
+    /// `auto` (default): a desktop runs its compositor natively on its own
+    /// logind seat, with a real pen, when the host's qualification proved
+    /// it and the seat can be built; otherwise headless, with the reason
+    /// logged. `native_seat`: always native, or the desktop is refused.
+    /// `headless`: never native. See [`crate::native_seat`].
+    pub session_mode: crate::native_seat::SessionMode,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -60,6 +86,46 @@ pub struct TlsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
     pub binary: Option<String>,
+    /// Linux desktop provider: `auto` (default, chosen from host facts),
+    /// or the operator override `xorg` or `wayland`. Unknown tokens fail
+    /// configuration loading; every Pier must also call
+    /// [`CaptureConfig::desktop_provider_for`] so a value it cannot honour is
+    /// refused rather than ignored. See [`crate::desktop_provider`].
+    pub provider: Option<crate::desktop_provider::ProviderPreference>,
+    /// Linux headless Wayland: the qualification record this Pier reads and
+    /// `arcen-pier wayland qualify` writes. Unset (the default) is the
+    /// production record; a development Pier names its own so it never
+    /// reads or overwrites the installed service's. See
+    /// [`crate::wayland_qualification::QualificationTarget`].
+    pub wayland_qualification_record: Option<String>,
+    /// Linux headless Wayland: whether the Pier re-qualifies the host
+    /// itself at start when an update made its record stale (default
+    /// `true`); `false` only refuses, naming the command. See
+    /// [`crate::wayland_qualification::auto_requalify_decision`].
+    pub wayland_auto_requalify: Option<bool>,
+    /// Linux headless Wayland: the prefix GNOME Shell or Mutter is installed
+    /// in (`<prefix>/bin/gnome-shell`). Unset (the default) is the
+    /// distribution's `/usr`; a side-by-side install such as
+    /// `/opt/arcen-gnome/51` is used only by Arcen's sessions. See
+    /// [`crate::compositor_prefix::CompositorPrefix`].
+    pub wayland_compositor_prefix: Option<String>,
+}
+
+impl CaptureConfig {
+    /// The configured provider preference, validated for `platform`.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::desktop_provider::validate_desktop_provider_for`].
+    pub const fn desktop_provider_for(
+        &self,
+        platform: crate::desktop_provider::PierPlatform,
+    ) -> Result<
+        crate::desktop_provider::ProviderPreference,
+        crate::desktop_provider::DesktopProviderConfigError,
+    > {
+        crate::desktop_provider::validate_desktop_provider_for(platform, self.provider)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -82,6 +148,11 @@ pub struct VideoConfig {
     /// operator's promise that a colour-managed application writes Rec.2100
     /// PQ code values into the desktop.
     pub desktop_encoding: Option<String>,
+    /// The depth a Linux Xorg desktop is created at: `auto` (default; 30
+    /// only for a desktop created by a ten-bit session or declared
+    /// `rec2100-pq`, 24 otherwise), `24`, or `30`. Fixed for the desktop's
+    /// whole life. Other hosts ignore it.
+    pub x11_desktop_depth: Option<String>,
     pub variant: Option<String>,
     pub fps: Option<u32>,
     pub encoder: Option<String>,
@@ -93,7 +164,7 @@ pub struct VideoConfig {
 /// the host machine hearing the remote user's audio is a privacy failure
 /// regardless of what the network is carrying, so the default silences local
 /// playback for the whole session even when redirection is switched off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalPlayback {
     /// Local speakers stay silent for the duration of the session.
@@ -175,6 +246,25 @@ impl LocalPlayback {
     #[must_use]
     pub const fn requires_mute(self) -> bool {
         matches!(self, Self::Muted)
+    }
+
+    /// The configuration token, also used on helper command lines.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Muted => "muted",
+            Self::Audible => "audible",
+        }
+    }
+
+    /// Parses [`Self::token`].
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "muted" => Some(Self::Muted),
+            "audible" => Some(Self::Audible),
+            _ => None,
+        }
     }
 }
 
@@ -419,6 +509,86 @@ mod tests {
             r#"{"audio":{"enabled":true,"compressed":false},"platform":{"name":"test"}}"#,
         ] {
             assert!(serde_json::from_str::<PierConfig<TestPlatform>>(document).is_err());
+        }
+    }
+
+    #[test]
+    fn first_login_setup_defaults_to_run_and_rejects_unknown_tokens() {
+        use crate::desktop_session::first_login::FirstLoginSetup;
+        let base = r#""audio":{"enabled":false,"compressed":false},
+            "microphone_input":{"enabled":false},"platform":{"name":"test"}"#;
+        let default: PierConfig<TestPlatform> =
+            serde_json::from_str(&format!("{{{base}}}")).expect("config without wayland");
+        assert_eq!(default.wayland.first_login_setup, FirstLoginSetup::Run);
+        let skip: PierConfig<TestPlatform> = serde_json::from_str(&format!(
+            r#"{{"wayland":{{"first_login_setup":"skip"}},{base}}}"#
+        ))
+        .expect("skip");
+        assert_eq!(skip.wayland.first_login_setup, FirstLoginSetup::Skip);
+        for bad in [
+            r#"{"first_login_setup":"never"}"#,
+            r#"{"first_login":"skip"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                    r#"{{"wayland":{bad},{base}}}"#
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn capture_provider_is_validated_at_load_and_per_platform() {
+        use crate::desktop_provider::{PierPlatform, ProviderPreference};
+        let base = r#""audio":{"enabled":false,"compressed":false},
+            "microphone_input":{"enabled":false},"platform":{"name":"test"}"#;
+        let linux = PierPlatform::Linux {
+            wayland_adapter_built: false,
+        };
+        let default: PierConfig<TestPlatform> =
+            serde_json::from_str(&format!("{{{base}}}")).expect("config without provider");
+        assert_eq!(
+            default.capture.desktop_provider_for(linux),
+            Ok(ProviderPreference::Auto)
+        );
+        assert!(
+            default
+                .capture
+                .desktop_provider_for(PierPlatform::Windows)
+                .is_ok()
+        );
+        let wayland: PierConfig<TestPlatform> =
+            serde_json::from_str(&format!(r#"{{"capture":{{"provider":"wayland"}},{base}}}"#))
+                .expect("config with provider");
+        assert_eq!(wayland.capture.provider, Some(ProviderPreference::Wayland));
+        assert!(wayland.capture.desktop_provider_for(linux).is_err());
+        assert!(
+            wayland
+                .capture
+                .desktop_provider_for(PierPlatform::Macos)
+                .is_err()
+        );
+        for token in ["auto", "xorg"] {
+            let configured: PierConfig<TestPlatform> =
+                serde_json::from_str(&format!(r#"{{"capture":{{"provider":"{token}"}},{base}}}"#))
+                    .expect("config with provider");
+            assert_eq!(
+                configured
+                    .capture
+                    .desktop_provider_for(linux)
+                    .map(ProviderPreference::token),
+                Ok(token)
+            );
+        }
+        for typo in ["waylnd", "Wayland", "Auto", "x11", ""] {
+            assert!(
+                serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                    r#"{{"capture":{{"provider":"{typo}"}},{base}}}"#
+                ))
+                .is_err(),
+                "{typo:?} must fail configuration loading"
+            );
         }
     }
 

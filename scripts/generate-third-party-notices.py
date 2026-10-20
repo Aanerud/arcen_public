@@ -33,7 +33,17 @@ REPO = Path(__file__).resolve().parent.parent
 # Release artefact roots, by the target triple they are built for. A package is
 # in the inventory if some artefact reaches it.
 ARTEFACTS: dict[str, list[str]] = {
-    "aarch64-apple-darwin": ["arcen-deck-macos", "arcen-usb-helper"],
+    "aarch64-apple-darwin": [
+        "arcen-deck-macos",
+        "arcen-usb-helper",
+        "arcen-pier-macos",
+        "arcen-microphone-driver",
+    ],
+    # The release zip also carries an Intel Deck (with its USB helper).
+    "x86_64-apple-darwin": [
+        "arcen-deck-macos",
+        "arcen-usb-helper",
+    ],
     "x86_64-unknown-linux-gnu": [
         "arcen-pier-linux",
         "arcen-pier-linux-installer",
@@ -43,6 +53,19 @@ ARTEFACTS: dict[str, list[str]] = {
         "arcen-credential-provider",
         "arcen-pier-windows-installer",
     ],
+}
+
+# Cargo features the release build of an artefact enables, by target triple.
+# Optional dependencies are only in the resolution when their feature is on, so
+# a release feature missing here silently drops its packages from the notices.
+# Keep in step with the release build commands (the Linux Pier is built with
+# `--features wayland-provider`; see packaging/linux/installer/README.md; the
+# Deck embeds the USB helper by default, which turns on `usb-hard-lab`; see
+# packaging/macos/build-deck-app.sh).
+RELEASE_FEATURES: dict[str, list[str]] = {
+    "aarch64-apple-darwin": ["arcen-deck-macos/usb-hard-lab"],
+    "x86_64-apple-darwin": ["arcen-deck-macos/usb-hard-lab"],
+    "x86_64-unknown-linux-gnu": ["arcen-pier-linux/wayland-provider"],
 }
 
 GENERATED_HEADING = "## Generated dependency inventory"
@@ -70,6 +93,11 @@ def cargo_metadata(target: str) -> dict:
             "1",
             "--filter-platform",
             target,
+            *(
+                ["--features", ",".join(RELEASE_FEATURES[target])]
+                if target in RELEASE_FEATURES
+                else []
+            ),
         ],
         cwd=REPO,
         capture_output=True,
@@ -185,6 +213,7 @@ def collect() -> tuple[dict[str, dict], dict[str, set[str]]]:
 
 SHORT_TARGET = {
     "aarch64-apple-darwin": "macOS",
+    "x86_64-apple-darwin": "macOS",
     "x86_64-unknown-linux-gnu": "Linux",
     "x86_64-pc-windows-msvc": "Windows",
 }
@@ -225,7 +254,9 @@ def render(inventory: dict[str, dict], targets_for: dict[str, set[str]]) -> str:
         for key in sorted(by_licence[licence], key=str.lower):
             package = inventory[key]
             artefacts = ", ".join(
-                SHORT_TARGET[target] for target in sorted(targets_for[key])
+                dict.fromkeys(
+                    SHORT_TARGET[target] for target in sorted(targets_for[key])
+                )
             )
             source = package.get("repository") or "—"
             lines.append(

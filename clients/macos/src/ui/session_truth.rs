@@ -245,8 +245,7 @@ impl NegotiatedTruth {
             self.encoder_hardware = AcceleratorClass::from_token(&served.backend)
                 .map(|class| class == AcceleratorClass::Hardware);
         }
-        let active = served.map(|served| &served.served);
-        self.pipeline_degradation = pipeline_degradation_summary(requested, active);
+        self.pipeline_degradation = served_pipeline_degradation_summary(requested, served);
     }
 }
 
@@ -370,6 +369,27 @@ pub fn pipeline_degradation_summary(
         )),
         _ => None,
     }
+}
+
+/// [`pipeline_degradation_summary`] for a host's `served_pipeline` update,
+/// naming the host's reason and, when the host gave one, what the user can
+/// do about it.
+#[must_use]
+pub fn served_pipeline_degradation_summary(
+    requested: Option<&arcen_protocol::messages::StreamPipeline>,
+    served: Option<&ServedPipelineMsg>,
+) -> Option<String> {
+    let mut summary = pipeline_degradation_summary(requested, served.map(|served| &served.served))?;
+    if let Some(reason) = served.and_then(|served| served.reason.as_deref()) {
+        summary.push_str(" (");
+        summary.push_str(reason);
+        summary.push(')');
+    }
+    if let Some(detail) = served.and_then(|served| served.detail.as_deref()) {
+        summary.push_str(". ");
+        summary.push_str(detail);
+    }
+    Some(summary)
 }
 
 // ============================================================================
@@ -678,6 +698,43 @@ mod tests {
         assert!(degradation.matrix_changed);
         assert!(degradation.primaries_changed);
         assert!(degradation.transfer_changed);
+    }
+
+    #[test]
+    fn a_served_downgrade_names_the_reason_and_what_to_do() {
+        let served = ServedPipelineMsg::new(
+            arcen_protocol::messages::ServedStreamPipeline::Auto,
+            "hardware",
+            Some("eight_bit_source".to_string()),
+        )
+        .with_detail(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL);
+        let note = served_pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Grading),
+            Some(&served),
+        )
+        .expect("a downgrade is visible");
+        assert!(note.starts_with("PIPELINE DEGRADED: requested grading, host served auto"));
+        assert!(note.contains("(eight_bit_source)"));
+        assert!(note.ends_with(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL));
+
+        let mut truth_served = served.clone();
+        truth_served.detail = None;
+        truth_served.reason = None;
+        assert_eq!(
+            served_pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Grading),
+                Some(&truth_served),
+            ),
+            pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Grading),
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Auto),
+            )
+        );
+        assert!(served_pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Auto),
+            Some(&served),
+        )
+        .is_none());
     }
 
     #[test]

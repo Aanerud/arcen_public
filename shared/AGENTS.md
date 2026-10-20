@@ -72,6 +72,34 @@ Escalate public API, wire compatibility, trust-boundary, cryptography, and new
 third-party dependency changes to Release/Security. Notify every affected
 product owner before changing shared behavior.
 
+## Shared consumer register
+
+Each shared crate's `consumers.json` lists every package that uses it (Cargo
+normal/build/dev dependencies, compiled-in shared files, installers that
+embed a consumer, and `indirect` products that reach the crate only through a
+non-shared helper), the separate product paths each one serves, and the
+validation IDs from `scripts/ci/validation-profiles.toml` that protect each
+path. The readable view is the generated
+[`docs/architecture/shared-consumers.md`](../docs/architecture/shared-consumers.md).
+
+- **Adding a product path, or a new dependency on a shared crate:** register it
+  in that crate's `consumers.json` (stable path ID, real entry points, build
+  profiles, validation IDs, owner), then run
+  `python3 scripts/check_shared_contracts.py --write-report`. The default check
+  fails on an unregistered or stale consumer, wrong features/targets, unknown
+  IDs, missing entry points, or a stale report.
+- **Changing a shared crate:** run
+  `python3 scripts/check_shared_contracts.py --impact --base main --commands`
+  and run, or obtain revision-bound evidence for, every listed validation of
+  every affected consumer path — not only this crate's own tests. `--gate`
+  with `--evidence FILE` fails while a mandatory validation lacks a `passed`
+  result for the head revision.
+- Removing a register row or catalogue validation changes what a shared change
+  must prove; it needs review by the affected path owner. A validation dropped
+  from the catalogue or from a path record, or weakened in the catalogue,
+  keeps `--gate` closed until the owner passes `--acknowledge-retired ID`,
+  even when the change touches no shared source.
+
 ## Shared video contract
 
 `arcen-media` owns the portable colour vocabulary, complete video

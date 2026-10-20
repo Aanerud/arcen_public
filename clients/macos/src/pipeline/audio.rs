@@ -66,6 +66,10 @@ pub struct PcmAudioPlayer {
 enum AudioStream {
     #[default]
     Legacy,
+    /// Protocol v5: frames may arrive on the audio lane before
+    /// `audio_stream_result` arrives on the control lane. They are dropped
+    /// until it does, never guessed at (Opus played as PCM is noise).
+    AwaitingResult,
     Disabled,
     PcmV1,
     OpusV1,
@@ -94,6 +98,15 @@ impl Default for PcmAudioPlayer {
 impl PcmAudioPlayer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A player for a lane session (protocol v5): it plays nothing until
+    /// the Pier's `audio_stream_result` says what the frames are.
+    pub fn awaiting_stream_result() -> Self {
+        Self {
+            stream: AudioStream::AwaitingResult,
+            ..Self::default()
+        }
     }
 
     pub fn set_stream_result(&mut self, result: &AudioStreamResultMsg) {
@@ -144,6 +157,13 @@ impl PcmAudioPlayer {
         match self.stream {
             AudioStream::Disabled => {
                 return self.status(0, Some("audio stream disabled by negotiation".to_string()));
+            }
+            AudioStream::AwaitingResult => {
+                self.dropped_frames = self.dropped_frames.saturating_add(1);
+                return self.status(
+                    0,
+                    Some("audio frame before audio_stream_result dropped".to_string()),
+                );
             }
             AudioStream::PcmV1
                 if header.codec != AudioCodec::Pcm || payload.len() != PCM_FRAME_BYTES =>
@@ -257,7 +277,9 @@ impl PcmAudioPlayer {
                     }
                 }
             }
-            (AudioStream::Disabled, _) => unreachable!("disabled stream returned before playout"),
+            (AudioStream::Disabled | AudioStream::AwaitingResult, _) => {
+                unreachable!("disabled or unresolved stream returned before playout")
+            }
             _ => {
                 self.dropped_frames = self.dropped_frames.saturating_add(1);
                 return self.status(
@@ -626,6 +648,26 @@ fn trim_threshold_samples(queue: &PlaybackQueue) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lane_player_drops_audio_until_the_stream_result_arrives() {
+        let mut player = PcmAudioPlayer::awaiting_stream_result();
+        let opus = [0x55_u8; 40];
+        let status = player.feed(
+            AudioHeader {
+                codec: AudioCodec::Opus,
+                timestamp_ms: 0,
+            },
+            &opus,
+        );
+        assert_eq!(status.accepted_bytes, 0);
+        assert_eq!(player.dropped_frames, 1);
+        assert_eq!(player.stream, AudioStream::AwaitingResult);
+        player.set_stream_result(&AudioStreamResultMsg::disabled(
+            AudioStreamReason::CaptureUnavailable,
+        ));
+        assert_eq!(player.stream, AudioStream::Disabled);
+    }
 
     #[test]
     fn accepts_legacy_opus_tag_as_pcm_contract() {

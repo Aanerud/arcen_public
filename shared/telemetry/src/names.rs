@@ -18,6 +18,9 @@ pub mod target {
     pub const SESSION: &str = "arcen::session";
     /// Telemetry runtime state.
     pub const TELEMETRY: &str = "arcen::telemetry";
+    /// QUIC transport and lane ownership. Same value as
+    /// `arcen_transport::LOG_TARGET_TRANSPORT`.
+    pub const TRANSPORT: &str = "arcen::transport";
 }
 
 /// Canonical structured field keys.
@@ -26,8 +29,16 @@ pub mod field {
     pub const AUTH_METHOD: &str = "auth_method";
     /// Display implementation.
     pub const DISPLAY_BACKEND: &str = "display_backend";
+    /// Capture-to-encoder copy path (`zero-copy-import`, `gpu-convert`,
+    /// `host-copy`, `cross-gpu`).
+    pub const COPY_PATH: &str = "copy_path";
+    /// Linux desktop provider (`xorg`, `wayland`).
+    pub const DESKTOP_PROVIDER: &str = "provider";
     /// Authenticated identity binding method.
     pub const IDENTITY_BINDING: &str = "identity_binding";
+    /// QUIC lane role (`control`, `video`, `audio_output`, `input_cursor`,
+    /// `microphone`, `bulk_aux`).
+    pub const LANE_ROLE: &str = "role";
     /// Effective profile source.
     pub const PROFILE_SOURCE: &str = "profile_source";
     /// Bounded failure classification.

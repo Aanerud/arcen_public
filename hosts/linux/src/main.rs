@@ -61,6 +61,11 @@ fn main() -> ExitCode {
             }
             "usb-bridge-ipc-self-test" => Some(arcen_pier_linux::usb_bridge::ipc_self_test_main()),
             "new-host-cert" => Some(arcen_pier_linux::host_cert::main(&args[2..])),
+            "wayland" => Some(arcen_pier_linux::session::wayland::wayland_main(&args[2..])),
+            #[cfg(target_os = "linux")]
+            "polkit-rule" => Some(arcen_pier_linux::session::polkit_remote::cli_main(
+                &args[2..],
+            )),
             _ => None,
         }
     }
@@ -202,7 +207,16 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(error) = runtime.block_on(arcen_pier_linux::deskside::recover_pending_display()) {
+    // Before any start-up work, which can take minutes (an automatic Wayland
+    // re-qualification): a SIGHUP from logrotate must not end the process,
+    // and a SIGTERM must stop it in order.
+    let mut signals =
+        runtime.block_on(async { arcen_pier_linux::service_signals::ServiceSignals::install() });
+
+    if let Err(error) = runtime.block_on(signals.during_startup(
+        &log_controller,
+        arcen_pier_linux::deskside::recover_pending_display(),
+    )) {
         tracing::error!(
             target: target::NET,
             %error,
@@ -212,13 +226,106 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if let Err(message) = arcen_pier_linux::session::wayland::apply_configured_compositor_prefix(
+        config.wayland_compositor_prefix.as_deref(),
+    ) {
+        tracing::error!(target: target::SESSION, "{message}");
+        eprintln!("{message}");
+        flush_logging_before_exit(&log_controller);
+        return ExitCode::FAILURE;
+    }
+    // A Pier that crashed left its desktops' seat-pen rules (their devices
+    // and grants died with it); none survives into this Pier.
+    arcen_pier_linux::input::seat_pen::sweep_stale_rules();
+    // Arcen's polkit rule follows the actions installed now (packages may
+    // have added some, or an upgrade from a build without it).
+    #[cfg(target_os = "linux")]
+    arcen_pier_linux::session::polkit_remote::ensure_at_start();
+    let mut config = config;
+    match runtime.block_on(signals.during_startup(
+        &log_controller,
+        arcen_pier_linux::session::wayland::select_configured_provider(
+            config.provider_preference,
+            &config.xorg_bin,
+            std::path::Path::new(config.wayland_qualification_target.record_path()),
+        ),
+    )) {
+        // Nothing shares the configuration yet, so this does not clone it.
+        Ok(configured) => {
+            let config = Arc::make_mut(&mut config);
+            config.desktop_provider = configured.selection.provider;
+            config.wayland_qualification = configured.qualification;
+        }
+        Err(error) => {
+            // An update that made the record stale is re-qualified here,
+            // before anything listens; every other refusal stands.
+            use arcen_pier_linux::session::wayland::{requalify_at_start, StartRequalify};
+            let stop = signals.stop_receiver();
+            match runtime.block_on(
+                signals.during_startup(&log_controller, requalify_at_start(&config, &error, stop)),
+            ) {
+                StartRequalify::Selected(configured) => {
+                    let config = Arc::make_mut(&mut config);
+                    config.desktop_provider = configured.selection.provider;
+                    config.wayland_qualification = configured.qualification;
+                }
+                StartRequalify::Refused(message) => {
+                    tracing::error!(target: target::SESSION, "{message}");
+                    eprintln!("{message}");
+                    flush_logging_before_exit(&log_controller);
+                    return ExitCode::FAILURE;
+                }
+                StartRequalify::NotApplicable => {
+                    eprintln!("{error}");
+                    flush_logging_before_exit(&log_controller);
+                    return ExitCode::FAILURE;
+                }
+                StartRequalify::Interrupted => {
+                    tracing::info!(
+                        target: target::SESSION,
+                        signal = signals.stop_requested().unwrap_or("stop"),
+                        "stopped during the automatic Wayland re-qualification; its desktop \
+                         and temporary account were removed and no attempt was recorded"
+                    );
+                    flush_logging_before_exit(&log_controller);
+                    return ExitCode::SUCCESS;
+                }
+            }
+        }
+    }
+    // Whichever way the provider was settled (the record as found, or one
+    // re-qualified after an update), X11 applications follow that record.
+    match arcen_pier_linux::session::wayland::configured_x11_plan(
+        config.desktop_provider,
+        config.wayland_x11_apps,
+        config.wayland_qualification.as_deref(),
+    ) {
+        Ok(plan) => Arc::make_mut(&mut config).wayland_x11_plan = plan,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            flush_logging_before_exit(&log_controller);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if let Some(signal) = signals.stop_requested() {
+        tracing::info!(target: target::NET, signal, "stopped before serving");
+        flush_logging_before_exit(&log_controller);
+        return ExitCode::SUCCESS;
+    }
+
     let admission_runtime = arcen_pier_linux::session_admission::SessionAdmissionRuntime::new();
 
-    match runtime.block_on(net::serve(
+    let served = runtime.block_on(net::serve(
         config,
         Arc::clone(&log_controller),
         admission_runtime,
-    )) {
+        signals,
+    ));
+    // Desktops still alive at exit take their pens with them when the
+    // process ends; their rules go now.
+    arcen_pier_linux::input::seat_pen::sweep_stale_rules();
+    match served {
         Ok(()) => {
             tracing::info!(target: target::NET, "arcen-host stopped");
             flush_logging_before_exit(&log_controller);
@@ -258,6 +365,7 @@ fn print_help() {
          \x20  arcen-pier validate-config [--config <PATH>] [overrides]\n\
          \x20  arcen-pier capenc|audiocap|input-helper|session-agent|session-launcher ...\n\
          \x20  arcen-pier new-host-cert [--directory <DIR>]\n\
+         \x20  arcen-pier wayland qualify [--write] [--user <NAME> --password-file <FILE>]\n\
          \n\
          FLAGS:\n\
          \x20   -V, --version    Print version and exit\n\

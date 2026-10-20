@@ -278,6 +278,7 @@ BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")"
 [ "$BUNDLE_ID" = "deck.arcen.tech" ] || { echo "error: CFBundleIdentifier is '$BUNDLE_ID', expected deck.arcen.tech" >&2; exit 1; }
 cp "$BIN" "$APP/Contents/MacOS/arcen-deck"
 cp "$REPO/legal/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp "$REPO/LICENSE" "$APP/Contents/Resources/LICENSE"
 # App icon. Generated from the first-party brand mark; regenerate with
 # packaging/macos/build-app-icon.sh if AppIcon.svg changes.
 [ -f "$HERE/AppIcon.icns" ] || { echo "error: app icon not found: $HERE/AppIcon.icns"; exit 1; }
@@ -433,7 +434,7 @@ run_signed_assembly() {
         DECK_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
         RELEASE_ZIP="$OUT/$ZIP_STEM-$DECK_VERSION-macOS.zip"
         rm -f "$RELEASE_ZIP"
-        ditto -c -k --keepParent "$APP" "$RELEASE_ZIP"
+        "$HERE/zip-app.sh" "$APP" "$RELEASE_ZIP"
         echo "==> wrote $RELEASE_ZIP"
     elif [ "$MODE" = "dev" ]; then
         echo "==> signed with a local Apple Development identity — development mode only, not notarized"

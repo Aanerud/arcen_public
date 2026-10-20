@@ -22,6 +22,9 @@ const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// The live Wayland probe runs `gnome-shell --help` and similar, each
+/// bounded on its own; this bounds the whole selection.
+const DESKTOP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMANDS: usize = 8;
 const COLLISION_LIMIT: u16 = 100;
 const DEFAULT_OUTPUT_DIRECTORY: &str = "/var/lib/arcen/support";
@@ -227,6 +230,7 @@ fn build_archive(file: File, generated_at: u64) -> Result<(File, usize), String>
     collect_service_diagnostics(&mut collector)?;
     collect_effective_config(&mut collector)?;
     collect_runtime_diagnostics(&mut collector)?;
+    collect_desktop_provider(&mut collector)?;
     collect_lifecycle_events(&mut collector)?;
     collector.finish()
 }
@@ -872,6 +876,171 @@ fn collect_runtime_diagnostics(collector: &mut Collector) -> Result<(), String> 
     Ok(())
 }
 
+/// What the Pier would select as its desktop provider now, and the Wayland
+/// qualification record it would read.
+///
+/// The selection runs the same start-time code as the service
+/// (`select_configured_provider`): host facts only, never a session. The
+/// record is the configured one (`capture.wayland_qualification_record`,
+/// default production), included as diagnostics; it holds versions, the
+/// Pier executable's hash and measured rates, and no secrets.
+fn collect_desktop_provider(collector: &mut Collector) -> Result<(), String> {
+    const REPORT: &str = "diagnostics/desktop-provider.json";
+    const RECORD: &str = "diagnostics/wayland-qualification.json";
+    let config = match crate::cli::parse(&[]) {
+        Ok(config) => config,
+        Err(_) => {
+            collector.notice(
+                "diagnostics/desktop-provider",
+                NoticeKind::Invalid,
+                NoticeCode::SourceInvalid,
+            )?;
+            return Ok(());
+        }
+    };
+    let record_path = PathBuf::from(config.wayland_qualification_target.record_path());
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            collector.notice(
+                "diagnostics/desktop-provider",
+                NoticeKind::Unavailable,
+                NoticeCode::DiagnosticFailed,
+            )?;
+            return Ok(());
+        }
+    };
+    // A prefix that may not be used refuses the selection, as at Pier start;
+    // nothing is evaluated (or run) for `/usr` in its place.
+    if let Err(prefix_error) = crate::session::wayland::apply_configured_compositor_prefix(
+        config.wayland_compositor_prefix.as_deref(),
+    ) {
+        let report = desktop_provider_report(
+            &config,
+            &record_path,
+            ProviderOutcome::PrefixRefused(&prefix_error),
+        );
+        let bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("serialize desktop provider diagnostics: {error}"))?;
+        collector.add_bytes(REPORT, BundleSource::Diagnostics, &bytes)?;
+        return Ok(());
+    }
+    let selected = runtime.block_on(async {
+        tokio::time::timeout(
+            DESKTOP_PROVIDER_TIMEOUT,
+            crate::session::wayland::select_configured_provider(
+                config.provider_preference,
+                &config.xorg_bin,
+                &record_path,
+            ),
+        )
+        .await
+    });
+    let report = match selected {
+        Err(_) => {
+            collector.notice(
+                "diagnostics/desktop-provider",
+                NoticeKind::TimedOut,
+                NoticeCode::DiagnosticTimedOut,
+            )?;
+            None
+        }
+        Ok(selected) => Some(desktop_provider_report(
+            &config,
+            &record_path,
+            match selected.as_ref() {
+                Ok(configured) => ProviderOutcome::Selected(
+                    &configured.selection,
+                    configured.qualification.is_some(),
+                ),
+                Err(refusal) => ProviderOutcome::Refused(refusal),
+            },
+        )),
+    };
+    if let Some(report) = report {
+        let bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("serialize desktop provider diagnostics: {error}"))?;
+        collector.add_bytes(REPORT, BundleSource::Diagnostics, &bytes)?;
+    }
+    let archive = BundlePath::new(RECORD).map_err(contract_error)?;
+    let Some(mut record) =
+        read_json_document(&record_path, MAX_DOCUMENT_BYTES, collector, &archive)?
+    else {
+        return Ok(());
+    };
+    let redactions = redact_json_document_at(&archive, &mut record).map_err(contract_error)?;
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("serialize Wayland qualification record: {error}"))?;
+    if collector.add_bytes(archive.as_str(), BundleSource::Diagnostics, &bytes)? {
+        for redaction in redactions {
+            collector.redaction(redaction)?;
+        }
+    }
+    Ok(())
+}
+
+/// What the start-time provider selection would do.
+enum ProviderOutcome<'a> {
+    /// The selection, and whether the qualification record is valid.
+    Selected(
+        &'a arcen_session::desktop_provider::DesktopProviderSelection,
+        bool,
+    ),
+    /// The selection's refusal.
+    Refused(&'a arcen_session::desktop_provider::ProviderRefusal),
+    /// The configured compositor prefix may not be used: the Pier refuses to
+    /// start before any selection.
+    PrefixRefused(&'a str),
+}
+
+fn desktop_provider_report(
+    config: &crate::cli::Config,
+    record_path: &Path,
+    selected: ProviderOutcome<'_>,
+) -> serde_json::Value {
+    let mut report = serde_json::json!({
+        "preference": config.provider_preference.token(),
+        "wayland_adapter_built": crate::session::wayland::WAYLAND_ADAPTER_BUILT,
+        "xorg_bin": config.xorg_bin.display().to_string(),
+        "record_path": record_path.display().to_string(),
+        "record_is_production": config.wayland_qualification_target.is_production(),
+        "compositor_prefix": config
+            .wayland_compositor_prefix
+            .clone()
+            .unwrap_or_else(|| arcen_session::compositor_prefix::SYSTEM_PREFIX.to_owned()),
+        // The record is valid for one Pier executable; selection here is
+        // evaluated for the binary taking the bundle.
+        "evaluated_by": std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    });
+    let outcome = match selected {
+        ProviderOutcome::Selected(selection, record_valid) => serde_json::json!({
+            "provider": selection.provider.token(),
+            "reason": selection.reason.token(),
+            "record_valid": record_valid,
+        }),
+        ProviderOutcome::Refused(refusal) => serde_json::json!({
+            "provider": null,
+            "refused": refusal.to_string(),
+            "blockers": refusal.tokens(),
+        }),
+        ProviderOutcome::PrefixRefused(error) => serde_json::json!({
+            "provider": null,
+            "refused": error,
+            "blockers": ["compositor_prefix"],
+            "compositor_prefix_error": error,
+        }),
+    };
+    if let (Some(report), serde_json::Value::Object(outcome)) = (report.as_object_mut(), outcome) {
+        report.extend(outcome);
+    }
+    report
+}
+
 fn collect_lifecycle_events(collector: &mut Collector) -> Result<(), String> {
     match crate::eventlog::query_recent_events(crate::eventlog::EventExcerptLimits::default()) {
         Ok(excerpt) => {
@@ -1347,6 +1516,54 @@ fn io_error(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_provider_report_states_the_selection_or_the_refusal() {
+        use arcen_session::desktop_provider::{
+            DesktopProvider, DesktopProviderSelection, ProviderRefusal, SelectionReason,
+        };
+        let config = crate::cli::Config::default();
+        let record = Path::new("/var/lib/arcen/wayland-qualification.json");
+        let selection = DesktopProviderSelection {
+            provider: DesktopProvider::Wayland,
+            reason: SelectionReason::WaylandQualified,
+        };
+        let selected =
+            desktop_provider_report(&config, record, ProviderOutcome::Selected(&selection, true));
+        assert_eq!(selected["provider"], "wayland");
+        assert_eq!(selected["reason"], "wayland_qualified");
+        assert_eq!(selected["record_valid"], true);
+        assert_eq!(selected["record_is_production"], true);
+        assert_eq!(selected["preference"], "auto");
+
+        let refusal = ProviderRefusal::XorgMissing { requested: true };
+        let refused = desktop_provider_report(&config, record, ProviderOutcome::Refused(&refusal));
+        assert!(refused["provider"].is_null());
+        assert_eq!(refused["blockers"], serde_json::json!(["xorg_server"]));
+        assert!(refused["refused"]
+            .as_str()
+            .is_some_and(|text| text.contains("no Xorg server")));
+        assert!(refused.get("compositor_prefix_error").is_none());
+    }
+
+    #[test]
+    fn a_refused_compositor_prefix_refuses_the_selection_in_the_report() {
+        let config = crate::cli::Config {
+            wayland_compositor_prefix: Some("/opt/arcen-gnome/51".to_owned()),
+            ..crate::cli::Config::default()
+        };
+        let record = Path::new("/var/lib/arcen/wayland-qualification.json");
+        let error = "capture.wayland_compositor_prefix /opt/arcen-gnome/51: \
+                     /opt/arcen-gnome/51/bin/gnome-shell is owned by uid 1000, not root";
+        let report =
+            desktop_provider_report(&config, record, ProviderOutcome::PrefixRefused(error));
+        assert!(report["provider"].is_null());
+        assert_eq!(report["blockers"], serde_json::json!(["compositor_prefix"]));
+        assert_eq!(report["compositor_prefix_error"], error);
+        assert_eq!(report["refused"], error);
+        assert_eq!(report["compositor_prefix"], "/opt/arcen-gnome/51");
+        assert!(report.get("reason").is_none());
+    }
 
     #[test]
     fn parser_is_strict_and_service_independent() {

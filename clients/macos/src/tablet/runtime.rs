@@ -11,7 +11,7 @@
 //! at every call site in `ui/app.rs`.
 #![forbid(unsafe_code)]
 
-use super::sample::RawTabletSample;
+use super::sample::{DispatchAgeSummary, TabletMonitorEvent};
 
 /// Owns the platform tablet event monitor's RAII lifetime plus a handle to
 /// drain its bounded sample queue. Constructing one is the only way to
@@ -35,13 +35,17 @@ impl TabletRuntime {
     /// run", not as an error to surface to the user (the tablet driver's mouse-emulation
     /// fallback remains fully functional either way).
     ///
-    /// `wake` runs on the main thread after each queued sample, so the UI
-    /// drains it promptly instead of on its next idle poll.
+    /// `sink` is offered every event on the main thread as AppKit dispatches
+    /// it and returns whether it took it. `wake` runs after an event had to
+    /// be queued instead, so the UI drains it promptly.
     #[must_use]
     #[cfg(target_os = "macos")]
-    pub fn install(wake: impl Fn() + 'static) -> Option<Self> {
+    pub fn install(
+        sink: impl Fn(TabletMonitorEvent) -> bool + 'static,
+        wake: impl Fn() + 'static,
+    ) -> Option<Self> {
         let mtm = objc2_foundation::MainThreadMarker::new()?;
-        let (monitor, sample_handle) = super::monitor::TabletEventMonitor::start(mtm, wake)?;
+        let (monitor, sample_handle) = super::monitor::TabletEventMonitor::start(mtm, sink, wake)?;
         Some(Self {
             monitor,
             sample_handle,
@@ -50,28 +54,45 @@ impl TabletRuntime {
 
     #[must_use]
     #[cfg(not(target_os = "macos"))]
-    pub fn install(_wake: impl Fn() + 'static) -> Option<Self> {
+    pub fn install(
+        _sink: impl Fn(TabletMonitorEvent) -> bool + 'static,
+        _wake: impl Fn() + 'static,
+    ) -> Option<Self> {
         None
     }
 
-    /// Drain every currently queued native sample, oldest first.
+    /// Drain every event the sink could not take, oldest first.
     #[must_use]
     #[cfg(target_os = "macos")]
-    pub fn drain(&self) -> Vec<RawTabletSample> {
+    pub fn drain(&self) -> Vec<TabletMonitorEvent> {
         self.sample_handle.drain()
     }
 
     #[must_use]
     #[cfg(not(target_os = "macos"))]
-    pub fn drain(&self) -> Vec<RawTabletSample> {
+    pub fn drain(&self) -> Vec<TabletMonitorEvent> {
         Vec::new()
+    }
+
+    /// How long monitored input waited for AppKit dispatch since the last
+    /// call.
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub fn take_dispatch_ages(&self) -> DispatchAgeSummary {
+        self.sample_handle.take_dispatch_ages()
+    }
+
+    #[must_use]
+    #[cfg(not(target_os = "macos"))]
+    pub fn take_dispatch_ages(&self) -> DispatchAgeSummary {
+        DispatchAgeSummary::default()
     }
 
     /// Samples dropped so far because the bounded producer-side queue was
     /// full and the consumer had not drained it in time (see
     /// [`super::sample::BoundedSampleQueue`]). This is the producer-side
     /// drop-oldest counter — distinct from, and reported alongside,
-    /// [`super::dispatch::TabletEventDispatcher::overflow_count`], which
+    /// `arcen_input::PenForwardingDispatcher::overflow_count`, which
     /// tracks the separate, edge-preserving consumer-side bound.
     #[must_use]
     #[cfg(target_os = "macos")]
@@ -86,6 +107,51 @@ impl TabletRuntime {
     }
 }
 
+/// Holds AppKit mouse-event coalescing off while a session window is
+/// active (see `monitor::MouseCoalescingGuard`); inert off macOS.
+#[derive(Default)]
+pub struct MouseCoalescing {
+    #[cfg(target_os = "macos")]
+    guard: Option<super::monitor::MouseCoalescingGuard>,
+}
+
+impl MouseCoalescing {
+    /// Applies the wanted state. Returns whether the setting changed. Must
+    /// run on the main thread; elsewhere it does nothing.
+    pub fn set_session_active(&mut self, active: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if self.guard.is_none() {
+                let mtm = objc2_foundation::MainThreadMarker::new();
+                self.guard = mtm.map(super::monitor::MouseCoalescingGuard::new);
+            }
+            self.guard
+                .as_mut()
+                .is_some_and(|guard| guard.set_session_active(active))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = active;
+            false
+        }
+    }
+
+    /// Whether coalescing is currently held off.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.guard
+                .as_ref()
+                .is_some_and(super::monitor::MouseCoalescingGuard::is_disabled)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -95,6 +161,6 @@ mod tests {
         // Test harnesses run off the AppKit main thread, so `install()`
         // deterministically returns `None` here rather than installing a
         // real monitor — mirrors `monitor::tests::constructing_off_the_main_thread_is_reported_as_none`.
-        assert!(TabletRuntime::install(|| {}).is_none());
+        assert!(TabletRuntime::install(|_| true, || {}).is_none());
     }
 }

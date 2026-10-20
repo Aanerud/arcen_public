@@ -525,6 +525,20 @@ impl LifecycleEmitter {
         (emitter, recorded)
     }
 
+    /// A lane telemetry sink on this emitter's runtime, under `context`
+    /// until [`arcen_transport::quic::ObservabilityLaneSink::bind`] moves it
+    /// to the session's own. `None` without an observability runtime.
+    pub(crate) fn lane_sink(
+        &self,
+        context: LifecycleContext,
+    ) -> Option<Arc<arcen_transport::quic::ObservabilityLaneSink>> {
+        self.handle.clone().map(|handle| {
+            Arc::new(arcen_transport::quic::ObservabilityLaneSink::new(
+                handle, context,
+            ))
+        })
+    }
+
     /// Builds a top-level [`LifecycleContext`] for `sid`, filling `host`
     /// from this emitter's process-local hostname. `user`/`peer_addr` are
     /// supplied by the caller: authenticated session/auth call sites pass

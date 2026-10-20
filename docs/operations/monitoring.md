@@ -531,8 +531,9 @@ Both ingest newline-delimited JSON directly with no transform:
 Answer with `SESSION_AUTH_OK`/`SESSION_AUTH_FAIL` (1100/1101,
 `fields.auth_method`, `user`, `peer_addr`) for identity and origin, and
 `CLIENT_CONNECT_OK`/`CLIENT_CONNECT_FAIL` (1503/1504) plus
-`CLIENT_START` (1500, `fields.version`/`os`/`arch`) on the Deck side for
-build/platform context. All are correlated by the shared `sid`.
+`CLIENT_START` (1500, `fields.version`/`os`/`arch`, plus the Deck's
+`bundle_short_version`/`bundle_version`/`build_id`/`source_revision`/`bundle_path`)
+on the Deck side for build/platform context. All are correlated by the shared `sid`.
 
 ### 7.2 Working / degraded / critical
 

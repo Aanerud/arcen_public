@@ -9,7 +9,7 @@ use crate::linux_policy::{
     linux_capture_backend, LinuxCaptureBackend, RequestedEncoder, SubmissionGate, SubmissionMode,
 };
 use crate::log;
-use arcen_media::video::{BackendUnavailableReason, EncoderBackend};
+use arcen_media::video::{BackendUnavailableReason, EncoderBackend, RegionPolicy};
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt::{Display, Formatter};
@@ -159,6 +159,24 @@ impl PipelineStats {
         damage_source: &str,
         qp_stats: Option<arcen_media::video::QpMapStats>,
     ) {
+        log(&self.summary_and_reset(capture, want_idr, capture_backend, damage_source, qp_stats));
+    }
+
+    /// Wall time this window spent capturing, staging and encoding.
+    fn busy(&self) -> Duration {
+        Duration::from_secs_f64(
+            (self.capture_ms_sum + self.stage_ms_sum + self.encode_ms_sum).max(0.0) / 1000.0,
+        )
+    }
+
+    fn summary_and_reset(
+        &mut self,
+        capture: (u64, u64, u64),
+        want_idr: bool,
+        capture_backend: &str,
+        damage_source: &str,
+        qp_stats: Option<arcen_media::video::QpMapStats>,
+    ) -> String {
         let average_encode_ms = if self.submitted == 0 {
             0.0
         } else {
@@ -182,7 +200,7 @@ impl PipelineStats {
                 stats.mean_dirty_fraction()
             )
         });
-        log(&format!(
+        let summary = format!(
             "enc_fps={} encode_submitted={} avg_capture_ms={average_capture_ms:.2} \
              max_capture_ms={:.2} avg_stage_ms={average_stage_ms:.2} max_stage_ms={:.2} \
              avg_encode_ms={average_encode_ms:.2} max_encode_ms={:.2} kbps={} \
@@ -207,8 +225,9 @@ impl PipelineStats {
             self.pipeline_flushes,
             self.capture_recreates,
             self.stale_outputs_dropped,
-        ));
+        );
         *self = Self::new();
+        summary
     }
 }
 
@@ -344,7 +363,10 @@ pub mod cuda {
     type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
     type CuMemcpy2D = unsafe extern "C" fn(*const Memcpy2D) -> CUresult;
     type CuMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
+    type CuMemHostRegister = unsafe extern "C" fn(*mut c_void, usize, u32) -> CUresult;
+    type CuMemHostUnregister = unsafe extern "C" fn(*mut c_void) -> CUresult;
 
+    const CU_MEMORYTYPE_HOST: u32 = 1;
     const CU_MEMORYTYPE_DEVICE: u32 = 2;
 
     #[repr(C)]
@@ -379,6 +401,9 @@ pub mod cuda {
         cu_memcpy_htod: CuMemcpyHtoD,
         cu_memcpy_2d: CuMemcpy2D,
         cu_memset_d8: CuMemsetD8,
+        /// Optional: page-locking is an optimisation, never a requirement.
+        cu_mem_host_register: Option<CuMemHostRegister>,
+        cu_mem_host_unregister: Option<CuMemHostUnregister>,
     }
 
     static mut FNS: Option<Fns> = None;
@@ -386,11 +411,20 @@ pub mod cuda {
     pub struct Context {
         raw: CUcontext,
         _lib: *mut c_void,
+        /// PCI bus id CUDA reported for the opened device, lowercase.
+        #[cfg_attr(not(feature = "wayland"), allow(dead_code))]
+        pci: Option<String>,
     }
 
     impl Context {
         pub fn as_raw(&self) -> *mut c_void {
             self.raw
+        }
+
+        /// PCI bus id of the device this context runs on, as CUDA reports it.
+        #[cfg(feature = "wayland")]
+        pub fn device_pci(&self) -> Option<&str> {
+            self.pci.as_deref()
         }
     }
 
@@ -451,7 +485,7 @@ pub mod cuda {
             }
         }
         let pci = read(crate::CAPTURE_GPU_PCI_ENV)?;
-        let ordinal = read("ARCEN_CUDA_DEVICE")?;
+        let ordinal = read(crate::CUDA_DEVICE_ENV)?;
         let request = crate::linux_policy::cuda_device_request(pci.as_deref(), ordinal.as_deref())
             .map_err(NativeStartupError::fatal)?;
         init(request)
@@ -495,6 +529,8 @@ pub mod cuda {
             cu_memcpy_htod: load_startup_fn(lib, "cuMemcpyHtoD_v2")?,
             cu_memcpy_2d: load_startup_fn(lib, "cuMemcpy2D_v2")?,
             cu_memset_d8: load_startup_fn(lib, "cuMemsetD8_v2")?,
+            cu_mem_host_register: load_startup_fn(lib, "cuMemHostRegister_v2").ok(),
+            cu_mem_host_unregister: load_startup_fn(lib, "cuMemHostUnregister").ok(),
         };
 
         startup_status(cu_init(0), "cuInit")?;
@@ -545,14 +581,13 @@ pub mod cuda {
         startup_status(cu_ctx_create(&mut ctx, 0, dev), "cuCtxCreate_v2")?;
         startup_status((fns.cu_ctx_set_current)(ctx), "cuCtxSetCurrent")?;
         FNS = Some(fns);
-        log(&format!(
-            "CUDA ready: {selected} capture_gpu_pci={}",
-            device_pci(cu_device_get_pci_bus_id, dev)
-        ));
+        let pci = device_pci(cu_device_get_pci_bus_id, dev);
+        log(&format!("CUDA ready: {selected} capture_gpu_pci={pci}"));
 
         Ok(Context {
             raw: ctx,
             _lib: lib,
+            pci: (pci != "unknown").then_some(pci),
         })
     }
 
@@ -565,6 +600,33 @@ pub mod cuda {
         let mut ptr = 0;
         check((fns.cu_mem_alloc)(&mut ptr, bytes), "cuMemAlloc_v2")?;
         Ok(ptr)
+    }
+
+    /// Page-locks an existing host allocation so host-to-device copies from
+    /// it run at full bandwidth. `Ok(false)` when the driver offers no
+    /// registration; the memory then stays pageable and every copy still works.
+    ///
+    /// # Safety
+    ///
+    /// CUDA must be initialised on this thread, and `ptr..ptr + bytes` must
+    /// stay allocated and unmoved until [`host_unregister`].
+    pub unsafe fn host_register(ptr: *mut c_void, bytes: usize) -> Result<bool, String> {
+        let Some(register) = fns()?.cu_mem_host_register else {
+            return Ok(false);
+        };
+        check(register(ptr, bytes, 0), "cuMemHostRegister_v2").map(|()| true)
+    }
+
+    /// Releases a [`host_register`] page-lock.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer [`host_register`] accepted, still allocated.
+    pub unsafe fn host_unregister(ptr: *mut c_void) -> Result<(), String> {
+        let Some(unregister) = fns()?.cu_mem_host_unregister else {
+            return Ok(());
+        };
+        check(unregister(ptr), "cuMemHostUnregister")
     }
 
     #[allow(dead_code)]
@@ -624,6 +686,43 @@ pub mod cuda {
             ..Default::default()
         };
         check((fns()?.cu_memcpy_2d)(&copy), "cuMemcpy2D_v2")
+    }
+
+    /// Host -> device 2D copy: `height` rows of `width_bytes` from `src`
+    /// (rows `src_pitch` apart) into `dst` (rows `dst_pitch` apart).
+    /// NULL-stream semantics as [`memcpy_htod`]. For pageable host memory
+    /// (a mapped `PipeWire` buffer is pageable, not CUDA-pinned) the call
+    /// returns only once the source rows have been read, so they may be
+    /// reused or released afterwards.
+    ///
+    /// # Safety
+    ///
+    /// CUDA must be initialised on this thread; `src` must be readable for
+    /// `src_pitch * (height - 1) + width_bytes` bytes and `dst` must be a
+    /// device allocation of at least `dst_pitch * height` bytes.
+    pub unsafe fn memcpy_2d_htod(
+        dst: CUdeviceptr,
+        dst_pitch: usize,
+        src: *const c_void,
+        src_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> Result<(), String> {
+        let copy = Memcpy2D {
+            src_memory_type: CU_MEMORYTYPE_HOST,
+            src_host: src,
+            src_pitch,
+            dst_memory_type: CU_MEMORYTYPE_DEVICE,
+            dst_device: dst,
+            dst_pitch,
+            width_in_bytes: width_bytes,
+            height,
+            ..Default::default()
+        };
+        check(
+            (fns()?.cu_memcpy_2d)(&copy),
+            "cuMemcpy2D_v2 (host to device)",
+        )
     }
 
     pub unsafe fn memset_d8(dst: CUdeviceptr, value: u8, bytes: usize) -> Result<(), String> {
@@ -1386,8 +1485,11 @@ unsafe fn run_encode(
     let control = crate::spawn_control_thread("NVENC");
 
     let mut stdout = std::io::stdout();
-    let mut target_dt = crate::frame_interval_from_fps(fps);
-    let mut next = Instant::now();
+    // NvFBC delivers on the head's refresh clock. Fresh frames go out as
+    // they arrive, paced to the contract; a fixed tick at the contract rate
+    // lost a third of a 60 Hz head's frames at 60 fps.
+    let mut pacer = arcen_keel::ArrivalPacer::new(crate::frame_interval_from_fps(fps));
+    let epoch = Instant::now();
     let mut latest_frame = None;
     let mut announced_layout = false;
     let mut submission_gate = SubmissionGate::new(IDLE_KEEPALIVE);
@@ -1422,6 +1524,7 @@ unsafe fn run_encode(
                 // invalidates it, so no keepalive/flush/IDR may reuse it.
                 latest_frame = None;
                 submission_gate.reset();
+                pacer.reset();
                 announced_layout = false;
                 stale_outputs_to_drop = encoder.pending_output_count();
                 stats.record_capture_recreate();
@@ -1433,9 +1536,19 @@ unsafe fn run_encode(
         }
 
         let now = Instant::now();
-        if now >= next {
-            let idr_pending = control.idr_pending();
-            let mode = submission_gate.decision(idr_pending, last_emit.elapsed());
+        let at = now.duration_since(epoch);
+        let idr_pending = control.idr_pending();
+        let mode = submission_gate.decision(idr_pending, last_emit.elapsed());
+        let fresh = matches!(
+            mode,
+            Some(SubmissionMode::FirstFrame | SubmissionMode::Idr | SubmissionMode::Activity)
+        );
+        let due = match mode {
+            Some(_) if fresh => pacer.fresh_due(at),
+            Some(_) => pacer.slot_due(at),
+            None => false,
+        };
+        if due {
             if let (Some(frame), Some(mode)) = (latest_frame, mode) {
                 // NvFBC reuses one shared CUDA buffer, while NVENC rotates
                 // through its own input ring. Restage the retained latest frame
@@ -1455,7 +1568,7 @@ unsafe fn run_encode(
                     log("consuming IDR request");
                 }
                 if let Some(fps) = control.take_framerate_fps() {
-                    target_dt = crate::frame_interval_from_fps(fps);
+                    pacer.set_interval(crate::frame_interval_from_fps(fps));
                     if let Err(error) = encoder.reconfigure_framerate(fps) {
                         log_error(&format!("live framerate reconfigure failed: {error}"));
                     }
@@ -1472,6 +1585,9 @@ unsafe fn run_encode(
                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                         stats.record_submission(mode, ms);
                         submission_gate.on_submitted(mode, out.is_some());
+                        if fresh {
+                            pacer.on_fresh_submitted(at);
+                        }
                         last_emit = now;
                         let (out, stale_dropped) =
                             discard_stale_output(out, &mut stale_outputs_to_drop);
@@ -1523,10 +1639,6 @@ unsafe fn run_encode(
                     }
                 }
             }
-            next += target_dt;
-            if next < now {
-                next = now + target_dt;
-            }
         }
 
         if sec.elapsed().as_secs_f64() >= 1.0 {
@@ -1557,6 +1669,7 @@ unsafe fn run_wide_encode(
     mut capture: crate::linux_x11::X11Capture,
     mut encoder: crate::nvenc_cuda::Encoder,
     options: EncodeOptions<'_>,
+    regions: crate::linux_policy::WideRegionOptions,
 ) -> i32 {
     let EncodeOptions {
         codec,
@@ -1598,9 +1711,43 @@ unsafe fn run_wide_encode(
     let mut stats = PipelineStats::new();
     let mut precision_attempts = 0u8;
     let mut precision_proven = false;
+    let mut pacing = crate::linux_policy::PacingWindow::default();
+    let mut target_fps = fps;
+    // Region reads need MIT-SHM; a capture that fell back to bounded
+    // XGetImage reads every picture whole, now and after any recreation.
+    let regions_ready = regions.enabled
+        && capture.supports_regions()
+        && match encoder.enable_wide_regions() {
+            Ok(engaged) => engaged,
+            Err(error) => {
+                log(&format!(
+                    "WARNING: wide region staging unavailable ({error}); every picture reads the whole frame"
+                ));
+                false
+            }
+        };
+    let mut regions_engaged =
+        crate::linux_policy::wide_regions_engaged(regions_ready, capture.supports_regions());
+    let mut diff_engaged = regions_engaged && capture.enable_frame_diff();
+    log(&format!(
+        "wide region staging: requested={} engaged={regions_engaged} \
+         whole_frame_diff={diff_engaged} verify_every={}",
+        regions.enabled,
+        regions.verify_every.map_or(0, std::num::NonZeroU32::get),
+    ));
+    let mut last_full = Instant::now();
+    let mut region_window = crate::linux_policy::RegionWindow::default();
+    let mut region_frames_total = 0u64;
+    let mut deferred_modeset = false;
+    let mut diff_backoff = 0u32;
 
     while !control.stop_requested() {
-        match capture.poll_activity() {
+        let activity = if std::mem::take(&mut deferred_modeset) {
+            Ok(crate::linux_x11::Activity::Modeset)
+        } else {
+            capture.poll_activity()
+        };
+        match activity {
             Ok(crate::linux_x11::Activity::Damage) => submission_gate.note_frame(),
             Ok(crate::linux_x11::Activity::Modeset) => {
                 capture = match capture.recreate() {
@@ -1614,6 +1761,11 @@ unsafe fn run_wide_encode(
                 submission_gate.note_frame();
                 stale_outputs_to_drop = encoder.pending_output_count();
                 stats.record_capture_recreate();
+                regions_engaged = crate::linux_policy::wide_regions_engaged(
+                    regions_ready,
+                    capture.supports_regions(),
+                );
+                diff_engaged = regions_engaged && capture.enable_frame_diff();
             }
             Ok(crate::linux_x11::Activity::None) => {
                 capture_counts.1 = capture_counts.1.saturating_add(1);
@@ -1631,51 +1783,205 @@ unsafe fn run_wide_encode(
         if now >= next {
             let idr_pending = control.idr_pending();
             let mode = submission_gate.decision(idr_pending, last_emit.elapsed());
+            pacing.record_due(mode);
             if let Some(mode) = mode {
-                let capture_started = Instant::now();
-                let frame = match capture.capture_wide() {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        log_error(&format!("X11 depth-30 capture failed: {error}"));
+                // Anything a keyframe, keepalive or refresh carries is read
+                // whole; otherwise only what XDamage reported since the last
+                // picture. A flush with nothing new re-sends the GPU frame.
+                let pending = capture.has_pending_damage();
+                let reported = capture.take_capture_region(RegionPolicy::DEFAULT);
+                let plan = crate::linux_policy::wide_capture_plan(
+                    regions_engaged,
+                    mode,
+                    idr_pending,
+                    pending,
+                    last_full.elapsed() >= crate::linux_policy::WIDE_FULL_REFRESH,
+                    reported,
+                );
+                let mut bounded = None;
+                if plan == crate::linux_policy::WideCapturePlan::Restage {
+                    let stage_started = Instant::now();
+                    if let Err(error) = encoder.restage_wide() {
+                        log_error(&format!("restage X11 depth-30 frame failed: {error}"));
+                        return 5;
+                    }
+                    stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
+                    region_window.restaged += 1;
+                } else if let crate::linux_policy::WideCapturePlan::Region(region) = plan {
+                    let capture_started = Instant::now();
+                    let frame = match capture.capture_wide_region(region) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            log_error(&format!("X11 depth-30 region capture failed: {error}"));
+                            return 3;
+                        }
+                    };
+                    stats.record_capture(capture_started.elapsed().as_secs_f64() * 1000.0);
+                    capture_counts.0 = capture_counts.0.saturating_add(1);
+                    let stage_started = Instant::now();
+                    if let Err(error) = encoder.stage_wide_host_region(
+                        frame.bytes,
+                        frame.stride,
+                        region,
+                        frame.layout,
+                    ) {
+                        log_error(&format!("stage X11 depth-30 region failed: {error}"));
+                        return 5;
+                    }
+                    stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
+                    region_window.note_region(region, width, height);
+                    bounded = Some(region);
+                } else {
+                    let capture_started = Instant::now();
+                    // With a second segment every whole read is compared with
+                    // the last one; only an unforced read may use the result.
+                    // Large differences cost a comparison and save little, so
+                    // after one the next pictures skip comparing for a while.
+                    let compare = diff_backoff == 0;
+                    diff_backoff = diff_backoff.saturating_sub(1);
+                    let (frame, bound) = if diff_engaged {
+                        match capture.capture_wide_diffed(compare) {
+                            Ok((frame, bound)) => (
+                                frame,
+                                bound.filter(|_| {
+                                    plan == crate::linux_policy::WideCapturePlan::Whole
+                                }),
+                            ),
+                            Err(error) => {
+                                log_error(&format!("X11 depth-30 capture failed: {error}"));
+                                return 3;
+                            }
+                        }
+                    } else {
+                        match capture.capture_wide() {
+                            Ok(frame) => (frame, None),
+                            Err(error) => {
+                                log_error(&format!("X11 depth-30 capture failed: {error}"));
+                                return 3;
+                            }
+                        }
+                    };
+                    stats.record_capture(capture_started.elapsed().as_secs_f64() * 1000.0);
+                    capture_counts.0 = capture_counts.0.saturating_add(1);
+                    // Only a whole frame staged whole resets the refresh clock.
+                    if bound.is_none() {
+                        last_full = Instant::now();
+                    }
+                    region_window.full += 1;
+                    if frame.width != width as usize || frame.height != height as usize {
+                        log_error("X11 depth-30 frame geometry changed without a modeset");
                         return 3;
                     }
-                };
-                stats.record_capture(capture_started.elapsed().as_secs_f64() * 1000.0);
-                capture_counts.0 = capture_counts.0.saturating_add(1);
-                if frame.width != width as usize || frame.height != height as usize {
-                    log_error("X11 depth-30 frame geometry changed without a modeset");
-                    return 3;
-                }
-                if !precision_proven && precision_attempts < 30 {
-                    let precision = frame.precision_stats(8);
-                    let off_grid_basis_points = if precision.sampled_components == 0 {
-                        0
-                    } else {
-                        precision.off_eight_bit_grid.saturating_mul(10_000)
-                            / precision.sampled_components
-                    };
-                    if precision_attempts == 0 || precision.off_eight_bit_grid != 0 {
-                        log(&format!(
-                            "X11 RGB10 source precision: sampled_components={} \
+                    if !precision_proven && precision_attempts < 30 {
+                        let precision = frame.precision_stats(8);
+                        let off_grid_basis_points = if precision.sampled_components == 0 {
+                            0
+                        } else {
+                            precision.off_eight_bit_grid.saturating_mul(10_000)
+                                / precision.sampled_components
+                        };
+                        if precision_attempts == 0 || precision.off_eight_bit_grid != 0 {
+                            log(&format!(
+                                "X11 RGB10 source precision: sampled_components={} \
                              off_8bit_grid={} off_8bit_grid_bps={} min={} max={}",
-                            precision.sampled_components,
-                            precision.off_eight_bit_grid,
-                            off_grid_basis_points,
-                            precision.minimum,
-                            precision.maximum,
-                        ));
+                                precision.sampled_components,
+                                precision.off_eight_bit_grid,
+                                off_grid_basis_points,
+                                precision.minimum,
+                                precision.maximum,
+                            ));
+                        }
+                        precision_proven = precision.off_eight_bit_grid != 0;
+                        precision_attempts = precision_attempts.saturating_add(1);
                     }
-                    precision_proven = precision.off_eight_bit_grid != 0;
-                    precision_attempts = precision_attempts.saturating_add(1);
-                }
 
-                let stage_started = Instant::now();
-                if let Err(error) = encoder.stage_wide_host(frame.bytes, frame.stride, frame.layout)
-                {
-                    log_error(&format!("stage X11 depth-30 frame failed: {error}"));
-                    return 5;
+                    let stage_started = Instant::now();
+                    let staged = match bound {
+                        Some(None) => {
+                            region_window.unchanged += 1;
+                            pacing.note_unchanged_content();
+                            encoder.restage_wide()
+                        }
+                        Some(Some(changed)) => {
+                            region_window.note_diffed(changed, width, height);
+                            if changed.width * changed.height * 2 > width as usize * height as usize
+                            {
+                                diff_backoff = crate::linux_policy::WIDE_DIFF_BACKOFF_PICTURES;
+                            }
+                            let start = changed.y * frame.stride + changed.x * 4;
+                            encoder.stage_wide_host_region(
+                                &frame.bytes[start..],
+                                frame.stride,
+                                changed,
+                                frame.layout,
+                            )
+                        }
+                        None => encoder.stage_wide_host(frame.bytes, frame.stride, frame.layout),
+                    };
+                    if let Err(error) = staged {
+                        log_error(&format!("stage X11 depth-30 frame failed: {error}"));
+                        return 5;
+                    }
+                    stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
+                    // A difference-bounded staging is checked against the very
+                    // frame it came from, so the check cannot race the screen.
+                    if let Some(Some(changed)) = bound {
+                        region_frames_total += 1;
+                        if regions
+                            .verify_every
+                            .is_some_and(|every| region_frames_total % u64::from(every.get()) == 0)
+                        {
+                            match encoder.verify_wide_frame(frame.bytes, frame.stride, frame.layout)
+                            {
+                                Ok((host, gpu)) => {
+                                    region_window.verified += 1;
+                                    region_window.mismatched_samples += host + gpu;
+                                    if host + gpu != 0 {
+                                        log(&format!(
+                                            "WARNING: wide diff verify mismatch host_samples={host} \
+                                             gpu_samples={gpu} region={}x{}+{}+{}",
+                                            changed.width, changed.height, changed.x, changed.y
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    log_error(&format!("wide diff verify failed: {error}"));
+                                    return 5;
+                                }
+                            }
+                        }
+                    }
                 }
-                stats.record_stage(stage_started.elapsed().as_secs_f64() * 1000.0);
+                if let Some(region) = bounded {
+                    region_frames_total += 1;
+                    if regions
+                        .verify_every
+                        .is_some_and(|every| region_frames_total % u64::from(every.get()) == 0)
+                    {
+                        match verify_wide_region(&mut capture, &mut encoder, &mut deferred_modeset)
+                        {
+                            Ok(Some((host, gpu))) => {
+                                region_window.verified += 1;
+                                region_window.mismatched_samples += host + gpu;
+                                if host + gpu != 0 {
+                                    log(&format!(
+                                        "WARNING: wide region verify mismatch host_samples={host} \
+                                         gpu_samples={gpu} region={}x{}+{}+{}",
+                                        region.width, region.height, region.x, region.y
+                                    ));
+                                }
+                            }
+                            Ok(None) => region_window.verify_skipped += 1,
+                            Err(error) => {
+                                log_error(&format!("wide region verify failed: {error}"));
+                                return 5;
+                            }
+                        }
+                        if capture.has_pending_damage() {
+                            submission_gate.note_frame();
+                        }
+                    }
+                }
 
                 let requested_idr = idr_pending && control.take_idr();
                 let force = mode == SubmissionMode::FirstFrame || requested_idr;
@@ -1684,6 +1990,7 @@ unsafe fn run_wide_encode(
                 }
                 if let Some(fps) = control.take_framerate_fps() {
                     target_dt = crate::frame_interval_from_fps(fps);
+                    target_fps = fps;
                     if let Err(error) = encoder.reconfigure_framerate(fps) {
                         log_error(&format!("live framerate reconfigure failed: {error}"));
                     }
@@ -1768,13 +2075,23 @@ unsafe fn run_wide_encode(
             } else {
                 "full_poll"
             };
-            stats.log_and_reset(
+            let elapsed = sec.elapsed();
+            let busy = stats.busy();
+            let summary = stats.summary_and_reset(
                 capture_counts,
                 control.idr_pending(),
                 "xshm",
                 damage_source,
                 Some(encoder.take_qp_map_stats()),
             );
+            log(&format!(
+                "{summary}{}{}{}",
+                encoder.take_wide_stage_stats().fields(),
+                region_window.fields(),
+                pacing.verdict_fields(fps, target_fps, busy, elapsed),
+            ));
+            pacing = crate::linux_policy::PacingWindow::default();
+            region_window = crate::linux_policy::RegionWindow::default();
             capture_counts = (0, 0, 0);
             sec = Instant::now();
         }
@@ -1782,6 +2099,31 @@ unsafe fn run_wide_encode(
     }
     log("NVENC-XShm control closed; dropping encoder and capture before exit");
     0
+}
+
+/// Compares the region-staged frame with a whole capture taken right after
+/// it. `None` when the screen changed in between, which would make any
+/// difference meaningless; that damage stays pending for the next picture.
+unsafe fn verify_wide_region(
+    capture: &mut crate::linux_x11::X11Capture,
+    encoder: &mut crate::nvenc_cuda::Encoder,
+    deferred_modeset: &mut bool,
+) -> Result<Option<(usize, usize)>, String> {
+    let mut quiet = |capture: &crate::linux_x11::X11Capture| -> Result<bool, String> {
+        if capture.poll_activity()? == crate::linux_x11::Activity::Modeset {
+            *deferred_modeset = true;
+        }
+        Ok(!*deferred_modeset && !capture.has_pending_damage())
+    };
+    if !quiet(capture)? {
+        return Ok(None);
+    }
+    let frame = capture.capture_wide()?;
+    let (bytes, stride, layout) = (frame.bytes.to_vec(), frame.stride, frame.layout);
+    if !quiet(capture)? {
+        return Ok(None);
+    }
+    encoder.verify_wide_frame(&bytes, stride, layout).map(Some)
 }
 
 struct SelftestCudaAllocation(cuda::CUdeviceptr);
@@ -2186,6 +2528,44 @@ unsafe fn run_admission_probe(
         ));
         return 2;
     }
+    let code = run_synthetic_admission_probe(
+        &cuda_ctx,
+        codec,
+        color,
+        intent,
+        priority,
+        qp_map_policy,
+        fps,
+        yuv444,
+        options,
+    );
+    // The NvFBC capture session goes before the CUDA context it was made in.
+    drop(capture);
+    drop(cuda_ctx);
+    code
+}
+
+/// Measures one encoder binding on synthetic frames of the probe's exact
+/// geometry: what the aggregate admission needs from a native encoder,
+/// independent of the capture source that will later feed it.
+///
+/// # Safety
+///
+/// CUDA must be initialised for `cuda_ctx` and used only on this thread.
+/// The caller drops `cuda_ctx` after anything else made in it (an NvFBC
+/// capture session first).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_synthetic_admission_probe(
+    cuda_ctx: &cuda::Context,
+    codec: &str,
+    color: crate::ColorSpec,
+    intent: arcen_media::EncodeIntent,
+    priority: arcen_media::video::MotionPriority,
+    qp_map_policy: crate::qp_map::QpMapPolicy,
+    fps: u32,
+    yuv444: bool,
+    options: &crate::admission_probe::AdmissionProbeOptions,
+) -> i32 {
     let frame_bytes = match (options.width as usize)
         .checked_mul(options.height as usize)
         .and_then(|pixels| pixels.checked_mul(if yuv444 { 3 } else { 4 }))
@@ -2255,9 +2635,7 @@ unsafe fn run_admission_probe(
             })
         });
     drop(encoder);
-    drop(capture);
     drop(source);
-    drop(cuda_ctx);
     match result {
         Ok(()) => 0,
         Err(error) => {
@@ -2455,6 +2833,13 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
         std::process::exit(2);
     }
     let framed = crate::framed_output_from_args(&args);
+    let wide_regions = match crate::linux_policy::wide_region_options(&args) {
+        Ok(regions) => regions,
+        Err(error) => {
+            log_error(&error);
+            std::process::exit(2);
+        }
+    };
     let admission_probe = match crate::admission_probe::options_from_args(&args) {
         Ok(options) => options,
         Err(error) => {
@@ -2669,7 +3054,7 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         }
                     }
                 };
-                run_wide_encode(cuda_ctx, capture, encoder, options)
+                run_wide_encode(cuda_ctx, capture, encoder, options, wide_regions)
             }
         };
         std::process::exit(code);

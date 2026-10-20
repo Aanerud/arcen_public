@@ -26,6 +26,144 @@ login window the agent runs as root, which is the one open gap. The reasons,
 the enforcing code and the installer prompts are in
 [`macos-pier-process-model.md`](macos-pier-process-model.md).
 
+## Linux Pier SELinux boundary
+
+On an SELinux host the Linux Pier and its session launcher run as the
+service domain `unconfined_service_t`; the session user's desktop runs in
+the context `pam_selinux` assigns, applied only to the processes the
+launcher starts as that user. The installer's one-rule `arcen` module
+permits that transition; a user whose context the policy does not let the
+launcher enter is refused, never run in the service's domain. See
+[`linux-selinux.md`](linux-selinux.md).
+
+## Linux remote desktops and polkit
+
+A remote desktop's user must not hold the console's polkit rights. polkit's
+systemd backend counts a subject as local when its logind session has a
+seat (`sd_session_get_seat`) and never reads logind's `Remote` flag; a
+process without a session is judged by its user's graphical session
+(`sd_uid_get_display`). A local, active subject gets each action's
+`allow_active` default — on stock systems power off, reboot, suspend,
+NetworkManager network control, udisks2 mounting and more, without a
+password. Every Linux X11 desktop is a logind session on `seat0` at VT 1
+that the launcher activates, so up to and including the first 0.17.0 build
+its remote user, and every session-less process of that user, held those
+rights. Headless Wayland desktops are seatless and were not affected.
+
+From 0.17.0 the installer installs, and the Pier rewrites at every start,
+`/etc/polkit-1/rules.d/05-arcen-remote-session.rules`
+(`arcen_session::polkit_remote`). For a subject in a seated session that
+logind records as remote (`REMOTE=1`, from `PAM_RHOST`, which every Arcen
+desktop sets to the Deck's address), that an Arcen launcher opened
+(`TTY=arcen`), or that sits on an Arcen desktop seat (`seat-arcen-pen-…`),
+it returns each installed action's `allow_any` default and `AUTH_ADMIN` for
+an action it does not know; an action whose `allow_any` is `YES` is left to
+the later rules. A session record it cannot read counts as remote (polkitd
+logs the first failure once, unless it runs with `--log-level=err` as on
+Rocky/RHEL 10; the Pier's console self-test reports it either way). Only root can create logind sessions
+(`CreateSession` is not open to other users on the system bus), so neither
+marker can be minted by an unprivileged user. The rule runs before
+distribution rules (`05-`), reads the logind record through `polkit.spawn`
+(polkit's JavaScript sees only `seat`, `session`, `local` and `active`), and
+names no session, so sign-ins never write it.
+
+A seated desktop is refused before any session is opened while the rule is
+not installed (`polkit_rule_missing`). After its session is active and
+before it is handed over, every desktop is proved: the Pier runs `pkcheck`
+against a process in the session for a fixed set of actions stock systems
+grant local users. A seated desktop is refused, and its processes killed at
+once, on any grant or missing answer (`polkit_grants_remote_session`,
+`polkit_unverified`); a seatless desktop only on a grant. At start the Pier
+also asks polkit about a local console session, when one exists, and warns
+when the console is refused a grant its defaults promise.
+
+Residual, recorded rather than claimed fixed:
+
+- polkit older than 0.106 has no JavaScript rules. There an X11 desktop is
+  still served, with a `SECURITY:` error at start and on every sign-in
+  (`polkit_no_rules`); refusing it instead is an owner decision.
+- **Later denies are bypassed.** Because the rule answers first, for a
+  remote seated desktop a site rule numbered after `05-` (or a `.pkla`
+  file) no longer applies to any action whose `allow_any` is `NO` or an
+  authentication (`AUTH_SELF`, `AUTH_ADMIN`, `_KEEP` forms): neither a later
+  grant (for example a `libvirt` group rule) nor a later deny or lockdown
+  (`NO`, or `AUTH_ADMIN` where `allow_any` is `AUTH_SELF`). Site
+  restrictions and grants for remote desktop users must be numbered
+  `00`–`04`; `arcen-pier polkit-rule status` lists later site rules
+  (`/etc/polkit-1/rules.d`) and `.pkla` files that look like restrictions. Actions whose `allow_any` is `YES` fall
+  through to the later rules unchanged.
+- **The proof window.** Between the session's activation on its seat and
+  the `pkcheck` answer (the desktop's start-up, seconds) the session's own
+  programs run with whatever polkit gives them. With the rule installed —
+  required before launch — that is the remote answer; the window matters
+  only when the installed rule is not effective, which the proof then
+  detects.
+- An action installed after the Pier last started is answered `AUTH_ADMIN`
+  until the next start.
+- The rule relies on logind's session record format and on polkitd being
+  allowed to run `cat`; if it cannot read a record it treats the session as
+  remote, which can only take rights from a console user, never give them to
+  a remote one. The console self-test makes that visible.
+
+## Linux desktop session services
+
+A Linux desktop has no display manager, so the Pier's launcher and agent do
+what one would. Each step is reviewed as a boundary (Release/Security):
+
+- **Login password to the keyring (headless Wayland only).** After PAM
+  accepts the password, the root launcher keeps one zeroizing copy until it
+  starts the session agent, writes it to the agent's standard input and
+  closes the pipe. The agent, running as the session user, makes itself
+  non-dumpable (no core dump, no ptrace by the user's other processes; its
+  children are dumpable again at their own exec). It reads the password once
+  from file descriptor 0 directly into one pre-allocated zeroizing buffer, so
+  no stdin buffer keeps a copy, bounded at 8 KiB and 5 s, then points
+  descriptor 0 at `/dev/null`. It writes the password to the standard input of
+  `gnome-keyring-daemon --unlock`, which it starts on the session's private
+  bus. Every copy is zeroized after use. The password is never in an
+  argument, an environment variable, a file or a log. It ends up exactly
+  where a GDM login puts it (`pam_gnome_keyring` hands it to the same
+  user-owned daemon). If it does not open the login keyring, the keyring
+  stays locked and applications ask, as before. A second desktop of a user
+  who is also signed in at the console runs a second keyring daemon on the
+  same keyring files, as activation already did before this; gnome-keyring
+  re-reads keyring files that change.
+- **Login-shell environment (both providers).** The agent, as the session
+  user and never as root, runs the user's login shell once
+  (`$SHELL -l -c 'exec env -0'`). The shell must be listed in `/etc/shells`
+  and must not be a no-login shell. The run is bounded to 5 s and 64 KiB,
+  and its process group is killed afterwards. The NUL-separated output is
+  filtered by `arcen_session::desktop_session::login_environment`: the
+  display, runtime directory, buses, keyring, `SSH_*`, `LD_*`, `DBUS_*`,
+  locale and time-zone variables Arcen owns never enter. Imported names are
+  logged, never their values. A failure is one log line. Nor can it change
+  how the compositor composes or which GPU and driver it uses: Mutter,
+  Clutter, Cogl and GNOME Shell switches (such as `MUTTER_DEBUG_FORCE_HDR`),
+  EGL/GLX/Mesa/GBM driver selection and `GSETTINGS_BACKEND` (which would
+  bypass the pinned settings) are denied. The compositor's command removes
+  `MUTTER_DEBUG_FORCE_HDR` unless the session is a forced-HDR one. Where the
+  user's configuration lives (`XDG_CONFIG_HOME`, `XDG_CONFIG_DIRS`) is
+  honoured: autostart, its conditions and the first-login marker are read
+  from the session's own environment. On the dedicated Xorg desktop the
+  imported variables also go to the user's bus and systemd user manager
+  (`dbus-update-activation-environment --systemd`), as gnome-session uploads
+  its environment on a GDM login.
+- **Autostart (headless Wayland).** The user's and the system's XDG autostart
+  programs run as on a GDM login, as the session user in the session's
+  scope, and are stopped at teardown. Entries that act on the host rather
+  than on the remote user's desktop never run. They are the settings
+  daemon's time zone, radio, sharing, USBGuard and modem plugins, and
+  virtual-machine console agents.
+- **Host power.** The session manager the agent serves reports
+  `SessionIsActive=false` and `CanShutdown=false` and never sets logind's
+  `IdleHint`. A per-session dconf overlay pins the suspend and power-key
+  actions to `nothing`. Deck input cannot produce a host power, sleep,
+  suspend or wake key (pinned by a test). For every desktop, on either
+  provider, the launcher holds a logind `sleep:idle` block inhibitor
+  (`systemd-inhibit`) that goes away with the launcher's pipe. A host serving
+  a remote desktop never suspends under it, except by a privileged request or
+  a physical lid close.
+
 ## Direct-QUIC certificate boundary
 
 Direct QUIC is the only live transport and listens on UDP 18444. The
@@ -154,6 +292,55 @@ privacy gaps and local denial of service. SAS/secure desktop, kernel HID,
 pen/tablet, physical hot-plug, sleep/resume, and driver-reset behavior are
 explicit non-claims pending physical lab evidence.
 
+## Linux X11 virtual input boundary
+
+A remote user's input reaches their dedicated Xorg desktop through kernel
+uinput devices. The goal is that no other input reaches it. Up to and including
+the first 0.17.0 build, the dedicated Xorg hot-added every input device on
+seat0: the physical or hypervisor console's keyboard and mice could type and
+click in a remote desktop the console cannot see, and a second dedicated Xorg
+on the same host received another session's Arcen devices.
+
+From 0.17.0 each dedicated Xorg ignores every input device unless it reports
+vendor `a2ce` and its name carries the session token (`Arcen Virtual …
+(session :N)`). The Pier's three devices match; ordinary console keyboards,
+mice and tablets, and another session's Arcen devices, do not. The match is on
+attributes a device chooses for itself, so it is a filter, not an
+authentication: see the residual list. The Pier also never emits `KEY_SYSRQ`,
+so a remote Alt+PrintScreen cannot reach the host kernel's SysRq handler.
+
+Residual, recorded rather than claimed fixed:
+
+- The admission match is impersonable. Vendor id and device name are
+  self-declared: a crafted USB device that reports vendor `a2ce` and a product
+  string containing `(session :N)`, or a local user who can open `/dev/uinput`
+  (some distributions grant this through `uaccess` rules, for example
+  `steam-devices`) and creates such a device, is admitted to that session's
+  desktop. A1 stops ordinary console devices; it does not stop a deliberate
+  impersonation. The fix is part of the follow-up below: a shipped udev rule
+  tags only virtual-bus devices (`id/bustype` `0006`, under
+  `/devices/virtual/input`) with vendor `a2ce` through `ENV{ID_INPUT.tags}`,
+  and the session's input class adds `MatchTag`, which closes the USB route.
+  Restricting who may open `/dev/uinput` is host policy.
+- The Arcen devices remain seat0 devices. A display manager greeter or a
+  local session that becomes active on seat0 while an attachment exists (after
+  a VT change, a display manager restart or a local logout) can open them and
+  receive remote input. Every X11 sign-in activates its own session on seat0,
+  which keeps the greeter inactive in normal operation. The fix is to assign
+  the devices to a per-session seat with a shipped udev rule (the same rule
+  that adds the virtual-bus tag above) and have the dedicated Xorg open them
+  directly; it needs installer and Release/Security review.
+- The kernel reads the Arcen keyboard like any other keyboard, whatever the
+  seat. While the dedicated Xorg owns the screen the console keyboard is off,
+  and the kernel acts only on SysRq (never sent) and on a secure-attention key
+  if the console keymap binds one; if a local administrator switches the
+  console to a text VT during a session, remote keystrokes reach that console.
+- A bridged Hard USB tablet and an experimental raw-HID device (both absent
+  from release builds) are not admitted by the dedicated Xorg on X11.
+
+The Wayland provider creates no kernel input devices and is outside this
+boundary.
+
 ## Direct-QUIC resume boundary
 
 The draft SessionAutoReconnect implementation applies only to macOS Deck
@@ -213,6 +400,32 @@ The initial disclaimer digest/version remains fixed through resume. Windows
 retains its display watchdog/journal and system-wide time-zone lease; Linux
 retains the dedicated-Xorg display resources and process-tree time-zone lease.
 Final drain revokes resume before restoring/releasing them.
+
+**Same-user takeover (Linux Pier, ADR 0014 Amendment 6).** A session's
+own user may continue it without its resume grant, in two cases only:
+
+- *Detached session.* A fresh sign-in that passes full PAM authentication
+  as the **same user** takes the detached session over at authentication
+  (`arcen_session::direct_reconnect::fresh_sign_in` →
+  `TakeOverDetached`): the owner retires the resume grant (its holder is
+  recorded, so the old Deck's resume is refused with "this session was taken
+  over by a newer sign-in of the same user"), releases the held display and
+  session slot, and keeps the desktop, to which the newcomer reattaches.
+  Another user is refused after authenticating and the session is
+  untouched. With a sign-in disclaimer configured the detached
+  authentication request carries none to acknowledge, so only resume
+  continues such a session.
+- *Attached session.* A sign-in never takes over a live attachment. The
+  same user's newcomer may only prove the attached Deck's peer silent (no
+  datagram for 3 s while the 1 s keep-alive runs); a silent or already
+  timed-out attachment is then handed over the same way. Another user's
+  attachment is never probed.
+
+The trust consequence: knowledge of the user's password now continues the
+user's own detached desktop without the Deck that held it, exactly as it
+already could after the reconnect window expired; it never reaches another
+user's desktop. Holding a stolen resume grant gains nothing once the owner
+signed in again.
 
 Adversarial unit tests cover token/signature tamper, every identity binding,
 exact `2W` lifetime bounds, attached rotation, malformed/oversized tokens, one

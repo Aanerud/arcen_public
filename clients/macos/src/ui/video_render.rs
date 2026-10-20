@@ -674,6 +674,132 @@ impl VideoUniform {
         debug_assert_eq!(bytes.len(), 48);
         bytes
     }
+
+    /// CPU reference for the shaders' chroma reconstruction
+    /// (`chroma_codes` in `video_render.wgsl` and `video_metal_layer.metal`):
+    /// a luma-guided fit over the four nearest centre-sited chroma samples,
+    /// blended towards the pixel's own block sample by the fit's r^2; the
+    /// exact fetch for 4:4:4. `luma(x, y)` returns the luma code at a luma
+    /// texel and `chroma(x, y)` the `(Cb, Cr)` codes at a chroma texel.
+    #[cfg(test)]
+    pub(crate) fn chroma_reference_codes(
+        &self,
+        uv: [f32; 2],
+        pixel_luma: f32,
+        luma: impl Fn(u32, u32) -> f32,
+        chroma: impl Fn(u32, u32) -> [f32; 2],
+    ) -> [f32; 2] {
+        const EPSILON: f32 = 3.0e-4;
+        let luma_size = [self.luma_width, self.luma_height];
+        let chroma_size = [self.chroma_width, self.chroma_height];
+        let exact = [
+            (uv[0] * chroma_size[0]) as i64,
+            (uv[1] * chroma_size[1]) as i64,
+        ];
+        let own = chroma(exact[0] as u32, exact[1] as u32);
+        let full = [
+            chroma_size[0] >= luma_size[0],
+            chroma_size[1] >= luma_size[1],
+        ];
+        if full[0] && full[1] {
+            return own;
+        }
+        let ratio = [
+            (luma_size[0] / chroma_size[0]).round() as i64,
+            (luma_size[1] / chroma_size[1]).round() as i64,
+        ];
+        let mut c0 = [0_i64; 2];
+        let mut c1 = [0_i64; 2];
+        let mut weight = [0.0_f32; 2];
+        for axis in 0..2 {
+            let last = chroma_size[axis] as i64 - 1;
+            if full[axis] {
+                c0[axis] = exact[axis].clamp(0, last);
+                c1[axis] = c0[axis];
+            } else {
+                let position = uv[axis] * chroma_size[axis] - 0.5;
+                let base = position.floor();
+                weight[axis] = position - base;
+                c0[axis] = (base as i64).clamp(0, last);
+                c1[axis] = (base as i64 + 1).clamp(0, last);
+            }
+        }
+        let normalise = |code: f32| (code - self.luma_offset) * self.luma_span_inv;
+        let block_mean = |cx: i64, cy: i64| {
+            let mut sum = 0.0;
+            for dy in 0..ratio[1] {
+                for dx in 0..ratio[0] {
+                    let x = (cx * ratio[0] + dx).clamp(0, luma_size[0] as i64 - 1);
+                    let y = (cy * ratio[1] + dy).clamp(0, luma_size[1] as i64 - 1);
+                    sum += luma(x as u32, y as u32);
+                }
+            }
+            normalise(sum / (ratio[0] * ratio[1]) as f32)
+        };
+        let taps = [
+            ((c0[0], c0[1]), (1.0 - weight[0]) * (1.0 - weight[1])),
+            ((c1[0], c0[1]), weight[0] * (1.0 - weight[1])),
+            ((c0[0], c1[1]), (1.0 - weight[0]) * weight[1]),
+            ((c1[0], c1[1]), weight[0] * weight[1]),
+        ];
+        let samples: Vec<(f32, f32, [f32; 2])> = taps
+            .iter()
+            .map(|&((x, y), w)| (w, block_mean(x, y), chroma(x as u32, y as u32)))
+            .collect();
+        let mean_luma: f32 = samples.iter().map(|(w, y, _)| w * y).sum();
+        let luma_variance: f32 = samples
+            .iter()
+            .map(|(w, y, _)| w * (y - mean_luma) * (y - mean_luma))
+            .sum();
+        let luma_here = normalise(pixel_luma);
+        let mut out = [0.0; 2];
+        for channel in 0..2 {
+            let mean: f32 = samples.iter().map(|(w, _, c)| w * c[channel]).sum();
+            let variance: f32 = samples
+                .iter()
+                .map(|(w, _, c)| w * (c[channel] - mean) * (c[channel] - mean))
+                .sum();
+            let covariance: f32 = samples
+                .iter()
+                .map(|(w, y, c)| w * (y - mean_luma) * (c[channel] - mean))
+                .sum();
+            let low = samples
+                .iter()
+                .map(|s| s.2[channel])
+                .fold(f32::INFINITY, f32::min);
+            let high = samples
+                .iter()
+                .map(|s| s.2[channel])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let slope = covariance / (luma_variance + EPSILON);
+            let fitted = (mean + slope * (luma_here - mean_luma)).clamp(low, high);
+            let denominator = luma_variance * variance;
+            let confidence = if denominator > 0.0 {
+                (covariance * covariance / denominator.max(1.0e-12)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            out[channel] = own[channel] + (fitted - own[channel]) * confidence;
+        }
+        out
+    }
+
+    /// CPU reference for the shaders' YCbCr/GBR -> RGB step, from codes.
+    #[cfg(test)]
+    pub(crate) fn reference_rgb(&self, luma_code: f32, cb_code: f32, cr_code: f32) -> [f32; 3] {
+        let clamp = |v: f32| v.clamp(0.0, 1.0);
+        if self.mode == ShaderMode::IdentityGbr as u32 {
+            let scale = |code: f32| clamp((code - self.luma_offset) * self.luma_span_inv);
+            return [scale(cr_code), scale(luma_code), scale(cb_code)];
+        }
+        let luma_norm = (luma_code - self.luma_offset) * self.luma_span_inv;
+        let blue_diff = (cb_code - self.chroma_center) * self.chroma_span_inv;
+        let red_diff = (cr_code - self.chroma_center) * self.chroma_span_inv;
+        let red = luma_norm + 2.0 * (1.0 - self.kr) * red_diff;
+        let blue = luma_norm + 2.0 * (1.0 - self.kb) * blue_diff;
+        let green = (luma_norm - self.kr * red - self.kb * blue) * self.kg_inv;
+        [clamp(red), clamp(green), clamp(blue)]
+    }
 }
 
 // ============================================================================
@@ -1962,6 +2088,20 @@ fn root_presentation_layer(
     Ok(metal_layer)
 }
 
+/// Refresh period of the screen currently showing the root window, from
+/// `NSScreen.maximumFramesPerSecond` (macOS 12+, the Deck's minimum). `None`
+/// off the main thread, before the window exists, or for a screen that
+/// reports no rate.
+pub(crate) fn root_display_refresh_period() -> Option<std::time::Duration> {
+    let mtm = objc2_foundation::MainThreadMarker::new()?;
+    let window = find_root_window(mtm)?;
+    let frames_per_second = window.screen()?.maximumFramesPerSecond();
+    u32::try_from(frames_per_second)
+        .ok()
+        .filter(|rate| *rate > 0)
+        .map(|rate| std::time::Duration::from_secs(1) / rate)
+}
+
 /// Makes the root window's presentation layer wait for display refresh
 /// (`true`) or present immediately (`false`). Returns whether the layer now
 /// has that setting.
@@ -2735,5 +2875,131 @@ mod tests {
             Some(ColorspaceOutcome::Applied)
         );
         assert!(!state.needs_attempt(ReferenceColorSpace::Srgb));
+    }
+
+    // ---- chroma reconstruction (4:2:0 / 4:2:2) -----------------------------
+
+    fn uniform_for(chroma: arcen_media::ChromaSubsampling, luma: (u32, u32)) -> VideoUniform {
+        let chroma_size = match chroma {
+            arcen_media::ChromaSubsampling::Yuv420 => (luma.0 / 2, luma.1 / 2),
+            arcen_media::ChromaSubsampling::Yuv422 => (luma.0 / 2, luma.1),
+            arcen_media::ChromaSubsampling::Yuv444 => luma,
+        };
+        VideoUniform::from_contract(
+            contract(
+                chroma,
+                arcen_media::ColorRange::Limited,
+                arcen_media::BitDepth::Eight,
+                arcen_media::ColorMatrix::Bt709,
+            ),
+            luma,
+            chroma_size,
+        )
+    }
+
+    fn pixel_uv(x: u32, y: u32, luma: (u32, u32)) -> [f32; 2] {
+        [
+            (x as f32 + 0.5) / luma.0 as f32,
+            (y as f32 + 0.5) / luma.1 as f32,
+        ]
+    }
+
+    /// A two-colour edge: a dark background (luma 30, neutral chroma) meets
+    /// a bright coloured stroke (luma 200, Cb 60) inside a 2x2 block, so the
+    /// block that straddles the edge carries their average chroma.
+    #[test]
+    fn a_two_colour_edge_is_rebuilt_at_the_luma_edge() {
+        let size = (8, 2);
+        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv420, size);
+        // Luma columns 0..=2 dark, 3..=7 bright: the edge falls inside
+        // chroma block 1 (luma columns 2 and 3).
+        let luma = |x: u32, _y: u32| if x <= 2 { 30.0 } else { 200.0 };
+        let chroma = |x: u32, _y: u32| match x {
+            0 => [128.0, 128.0],
+            1 => [94.0, 128.0], // half dark (128), half stroke (60)
+            _ => [60.0, 128.0],
+        };
+        let cb: Vec<f32> = (0..8)
+            .map(|x| u.chroma_reference_codes(pixel_uv(x, 0, size), luma(x, 0), luma, chroma)[0])
+            .collect();
+        // Nearest repeated 94 over columns 2 and 3: the dark pixel turned
+        // blue-ish and the stroke pixel lost colour. The fit restores both.
+        assert!(
+            (cb[2] - 128.0).abs() < 4.0,
+            "dark pixel keeps neutral chroma: {cb:?}"
+        );
+        assert!(
+            (cb[3] - 60.0).abs() < 4.0,
+            "stroke pixel keeps its colour: {cb:?}"
+        );
+        assert_eq!(cb[0], 128.0);
+        assert_eq!(cb[7], 60.0);
+    }
+
+    #[test]
+    fn chroma_unrelated_to_luma_keeps_each_blocks_own_sample() {
+        // Flat luma: the fit explains nothing, so every pixel keeps exactly
+        // the sample its block transmitted, as the nearest fetch did.
+        let size = (4, 4);
+        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv420, size);
+        let luma = |_x: u32, _y: u32| 100.0;
+        let chroma = |x: u32, y: u32| [(x * 50 + y * 7) as f32, 128.0];
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(
+                    u.chroma_reference_codes(pixel_uv(x, y, size), 100.0, luma, chroma),
+                    chroma(x / 2, y / 2)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn four_four_four_chroma_keeps_the_exact_texel() {
+        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv444, (4, 4));
+        let luma = |x: u32, _y: u32| (x * 60) as f32;
+        for y in 0..4 {
+            for x in 0..4 {
+                let chroma = |cx: u32, cy: u32| [(cx * 10 + cy) as f32, 0.0];
+                assert_eq!(
+                    u.chroma_reference_codes(pixel_uv(x, y, (4, 4)), luma(x, y), luma, chroma)[0],
+                    (x * 10 + y) as f32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn four_two_two_fits_along_rows_only() {
+        let size = (8, 2);
+        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv422, size);
+        let luma = |x: u32, _y: u32| if x <= 2 { 30.0 } else { 200.0 };
+        let chroma = |x: u32, y: u32| match x {
+            0 => [128.0, 100.0 + y as f32],
+            1 => [94.0, 100.0 + y as f32],
+            _ => [60.0, 100.0 + y as f32],
+        };
+        for y in 0..2 {
+            let codes = u.chroma_reference_codes(pixel_uv(3, y, size), 200.0, luma, chroma);
+            assert!((codes[0] - 60.0).abs() < 4.0);
+            assert_eq!(
+                codes[1],
+                100.0 + y as f32,
+                "rows keep their own exact sample"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wgsl_shader_parses_and_validates() {
+        use wgpu::naga;
+        let module = naga::front::wgsl::parse_str(include_str!("video_render.wgsl"))
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string("video_render.wgsl")));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("video_render.wgsl validates");
     }
 }

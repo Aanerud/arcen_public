@@ -69,6 +69,15 @@ pub fn apply_startup_discovery(config: &mut Config) {
     if !config.multi_monitor.advertise_enabled || !config.multi_monitor.heads.is_empty() {
         return;
     }
+    // A headless Wayland session's monitors are compositor virtual outputs,
+    // not NVIDIA heads; probing an Xorg server there proves nothing.
+    if config.desktop_provider == arcen_session::desktop_provider::DesktopProvider::Wayland {
+        tracing::info!(
+            target: crate::logging::target::SESSION,
+            "Linux multi-monitor serves Wayland virtual outputs; NVIDIA head discovery skipped"
+        );
+        return;
+    }
     if config.encoder != crate::media::capenc::EncoderSelection::Auto
         && config.encoder != crate::media::capenc::EncoderSelection::NativeNvenc
     {

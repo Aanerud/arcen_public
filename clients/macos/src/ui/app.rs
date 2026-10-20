@@ -7,14 +7,14 @@ use crate::protocol::messages::{
     AuthRequest, ClientMonitor, CursorMode, CursorModeResultMsg, GestureMagnifyMsg,
     GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, HealthPongMsg, HealthStatsMsg,
     InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg, MouseButtonMsg,
-    MouseMoveRelativeMsg, PenEventMsg, PenToolMsg, PointerMotionMode, ScrollPhaseMsg,
-    ServerHelloMsg, SwipeDirectionMsg, TabletModeMsg, TabletModeResultMsg,
+    MouseMoveRelativeMsg, PointerMotionMode, ScrollPhaseMsg, ServerHelloMsg, SwipeDirectionMsg,
+    TabletModeMsg, TabletModeResultMsg,
 };
 use crate::reconnect::{
     fresh_holder_nonce, ConnectionIdentity, MonotonicClock, ReconnectController, ReconnectPhase,
     SystemClock, SystemJitter,
 };
-use crate::tablet::{TabletEventDispatcher, TabletMapper, ViewSize};
+use crate::tablet::{TabletMonitorEvent, ViewSize};
 use crate::transport::tls::{CertInfo, TlsTrustConfig};
 use crate::transport::websocket::{
     spawn_resume_session, spawn_session, spawn_session_opt_in, AuthSubmission, AuthenticationKind,
@@ -40,6 +40,7 @@ use crate::ui::multi_window_runtime::{
     MultiWindowEnterAttempt, MultiWindowEnterPoll, MultiWindowPlan, ViewportBindObservation,
 };
 use crate::ui::multi_window_session::ValidatedAppliedTopology;
+use crate::ui::pen_input::{PenInput, PenLink, PenRoute, SharedInputSequence, SharedRegionRuntime};
 use crate::ui::region_runtime::{DeckRegionRuntime, LegacyRegionWireMessage, RegionViewport};
 use crate::ui::session_truth::{self, ActiveContract, ExactnessReadout, NegotiatedTruth};
 use crate::ui::theme;
@@ -48,7 +49,7 @@ use crate::ui::video_metal_layer::{
     DedicatedPresentationStatus, DedicatedVideoPresenter,
 };
 use crate::ui::video_render::RemoteVideoFrame;
-use arcen_input::{FractionalMotionAccumulator, PenEvent, PenTool, RegionInputWireMessage};
+use arcen_input::{FractionalMotionAccumulator, PenTool, RegionInputWireMessage};
 use arcen_telemetry::{rate_per_second, rounded_percentiles_ms};
 use arcen_transport::tls::TlsPin;
 #[cfg(target_os = "macos")]
@@ -56,7 +57,9 @@ use objc2_core_graphics::CGColor;
 #[cfg(target_os = "macos")]
 use objc2_quartz_core::CATransaction;
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -314,6 +317,47 @@ fn ui_poll_interval(transitioning: bool, since_local_input: Option<Duration>) ->
     }
 }
 
+/// Never ask for UI passes faster than the display under the root window
+/// refreshes: a faster request only blocks the main thread in
+/// `nextDrawable` until the next vblank, and while it is blocked AppKit
+/// cannot dispatch input.
+/// Longest pen samples wait for a swallowed key release to be recovered.
+/// Recovery sends it after `arcen_input::text::LOST_RELEASE_GRACE` (80 ms)
+/// on a pass; this only bounds a recovery that never runs.
+const MAX_PEN_HOLD_FOR_RECOVERED_RELEASE: Duration = Duration::from_millis(250);
+
+/// Pen samples waiting for a swallowed key release to be recovered. The
+/// bound applies once per pending release: after it expires, pen input is not
+/// held again until no release is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PenRecoveryHold {
+    Idle,
+    Holding(Instant),
+    Expired,
+}
+
+impl PenRecoveryHold {
+    /// The next state, and whether pen samples stay held this pass.
+    fn step(self, release_pending: bool, now: Instant) -> (Self, bool) {
+        if !release_pending {
+            return (Self::Idle, false);
+        }
+        match self {
+            Self::Idle => (Self::Holding(now), true),
+            Self::Holding(since)
+                if now.saturating_duration_since(since) < MAX_PEN_HOLD_FOR_RECOVERED_RELEASE =>
+            {
+                (self, true)
+            }
+            Self::Holding(_) | Self::Expired => (Self::Expired, false),
+        }
+    }
+}
+
+fn paced_ui_poll_interval(interval: Duration, refresh_period: Option<Duration>) -> Duration {
+    refresh_period.map_or(interval, |period| interval.max(period))
+}
+
 fn should_schedule_session_poll(
     screen: &AppScreen,
     has_session_commands: bool,
@@ -415,6 +459,81 @@ struct DeferredSecondaryViewportState {
     texture_upload_ms: Vec<f64>,
     present_or_acquire_ms: Vec<f64>,
     fresh_frame_samples: Vec<bool>,
+    /// The cursor this viewport shows over its video, as root decided it.
+    host_cursor: SecondaryHostCursor,
+    presented_host_cursor: Option<PresentedHostCursor>,
+}
+
+/// The cursor a secondary viewport shows over its video: the same as root's
+/// (a host image, hidden, or a named shape), so a pointer that crosses to
+/// another display keeps the host's cursor.
+#[derive(Default)]
+struct SecondaryHostCursor {
+    icon: egui::CursorIcon,
+    image: Option<(
+        arcen_protocol::cursor::CursorImageId,
+        arcen_media::cursor::CursorImage,
+    )>,
+}
+
+/// Shows `host` in the secondary viewport of `ctx` while the pointer is over
+/// `image_rect`, the video of a stream `stream_width` pixels wide.
+fn apply_secondary_host_cursor(
+    ctx: &egui::Context,
+    host: &SecondaryHostCursor,
+    presented: &mut Option<PresentedHostCursor>,
+    image_rect: egui::Rect,
+    stream_width: Option<usize>,
+) {
+    let hovered = ctx
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|position| image_rect.contains(position));
+    if !hovered {
+        return;
+    }
+    ctx.set_cursor_icon(host.icon);
+    if let (Some((id, image)), Some(stream_width)) = (host.image.as_ref(), stream_width) {
+        if let Some(image) = present_host_cursor(presented, *id, image, image_rect, stream_width) {
+            ctx.set_cursor_image(Some(image));
+        }
+    }
+}
+
+/// `image` prepared for the native cursor at the scale `image_rect` shows a
+/// stream `stream_width` pixels wide at, reusing `presented` when the image
+/// and scale are unchanged.
+fn present_host_cursor(
+    presented: &mut Option<PresentedHostCursor>,
+    id: arcen_protocol::cursor::CursorImageId,
+    image: &arcen_media::cursor::CursorImage,
+    image_rect: egui::Rect,
+    stream_width: usize,
+) -> Option<egui::CustomCursorImage> {
+    if stream_width == 0 {
+        return None;
+    }
+    let points_per_pixel = image_rect.width() / stream_width as f32;
+    let scale_key = (points_per_pixel * 256.0).round() as u32;
+    if let Some(shown) = presented
+        .as_ref()
+        .filter(|shown| shown.id == id && shown.scale_key == scale_key)
+    {
+        return Some(shown.image.clone());
+    }
+    // Premultiplied: winit's macOS cursor is an `NSBitmapImageRep` with the
+    // default (premultiplied) alpha.
+    let prepared = image.present(points_per_pixel);
+    let custom = egui::CustomCursorImage {
+        rgba: prepared.rgba_premultiplied,
+        size: [prepared.width, prepared.height],
+        hotspot: [prepared.hotspot.0, prepared.hotspot.1],
+    };
+    *presented = Some(PresentedHostCursor {
+        id,
+        scale_key,
+        image: custom.clone(),
+    });
+    Some(custom)
 }
 
 #[derive(Debug, Clone)]
@@ -2133,6 +2252,41 @@ fn root_viewport_visible_for_presenter(viewport: &egui::ViewportInfo) -> bool {
 }
 
 #[must_use]
+
+/// The last host cursor image handed to the native cursor.
+struct PresentedHostCursor {
+    id: arcen_protocol::cursor::CursorImageId,
+    scale_key: u32,
+    image: egui::CustomCursorImage,
+}
+
+/// A named host cursor shape as the native compositor cursor, so movement
+/// stays responsive (composited by the window server, not repaint-gated).
+fn shape_cursor_icon(shape: arcen_protocol::messages::CursorShapeKind) -> egui::CursorIcon {
+    use arcen_protocol::messages::CursorShapeKind;
+    match shape {
+        CursorShapeKind::Default => egui::CursorIcon::Default,
+        CursorShapeKind::Text => egui::CursorIcon::Text,
+        CursorShapeKind::ResizeNs => egui::CursorIcon::ResizeVertical,
+        CursorShapeKind::ResizeEw => egui::CursorIcon::ResizeHorizontal,
+        CursorShapeKind::ResizeNwse => egui::CursorIcon::ResizeNwSe,
+        CursorShapeKind::ResizeNesw => egui::CursorIcon::ResizeNeSw,
+        CursorShapeKind::ResizeAll => egui::CursorIcon::Move,
+        CursorShapeKind::NotAllowed => egui::CursorIcon::NotAllowed,
+        CursorShapeKind::Pointer => egui::CursorIcon::PointingHand,
+        CursorShapeKind::Crosshair => egui::CursorIcon::Crosshair,
+        CursorShapeKind::Grab => egui::CursorIcon::Grab,
+        CursorShapeKind::Grabbing => egui::CursorIcon::Grabbing,
+        CursorShapeKind::ZoomIn => egui::CursorIcon::ZoomIn,
+        CursorShapeKind::ZoomOut => egui::CursorIcon::ZoomOut,
+        CursorShapeKind::Wait => egui::CursorIcon::Wait,
+        CursorShapeKind::Progress => egui::CursorIcon::Progress,
+        CursorShapeKind::Help => egui::CursorIcon::Help,
+        // When the host cursor is hidden (full-screen/game), match it.
+        CursorShapeKind::Hidden => egui::CursorIcon::None,
+    }
+}
+
 fn aspect_fit_rect(container: egui::Rect, frame_size: Option<[usize; 2]>, ppp: f32) -> egui::Rect {
     let Some([w, h]) = frame_size else {
         return container;
@@ -2460,6 +2614,11 @@ struct ClientSettings {
     /// and reports back, while intent is a one-way knob that never changes
     /// which pixels are asked for (see [`arcen_media::EncodeIntent`]).
     encode_intent: arcen_media::EncodeIntent,
+    /// How typed characters reach a host that takes committed text
+    /// (`arcen_input::text::TypingMode`; Auto by default).
+    typing_mode: arcen_input::text::TypingMode,
+    /// What each Option key does (left Alt, right characters by default).
+    option_key_mode: arcen_input::text::OptionKeyMode,
 }
 
 const SAVED_CONNECTIONS_VERSION: u32 = 2;
@@ -2513,6 +2672,8 @@ impl Default for ClientSettings {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             color_fidelity: ColorFidelitySettings::default(),
             encode_intent: arcen_media::EncodeIntent::default(),
+            typing_mode: arcen_input::text::TypingMode::default(),
+            option_key_mode: arcen_input::text::OptionKeyMode::default(),
         }
     }
 }
@@ -2872,7 +3033,8 @@ pub struct ArcenApp {
     /// requested logical topology plus the host-applied/media roster;
     /// primary-only sessions install a one-region compatibility aggregate
     /// once the first frame establishes its physical extent.
-    region_runtime: Option<DeckRegionRuntime>,
+    /// Shared with pen input, which emits through the same region state.
+    region_runtime: SharedRegionRuntime,
     /// Wall-clock start of the current [`MultiWindowSessionState::Active`]
     /// attempt, tracked separately from `MultiWindowEnterAttempt` itself
     /// (which is driven by a caller-supplied `Duration`, not a live clock --
@@ -2913,12 +3075,6 @@ pub struct ArcenApp {
     /// from a torn-down session can never misroute a later legacy-session
     /// sample.
     secondary_tablet_targets: Vec<(isize, arcen_media::SessionMonitorId, ViewSize)>,
-    /// Region viewport selected for each mapped tablet sample. This is the
-    /// authoritative routing identity consumed by the shared Region* path.
-    tablet_region_viewports: HashMap<u64, RegionViewport>,
-    /// Region identity of the last real pen sample, retained so a synthetic
-    /// proximity-out release stays on the same pen-targeted region.
-    last_pen_region_viewport: Option<RegionViewport>,
     /// Additional native viewports queued to receive an explicit
     /// `egui::ViewportCommand::Close` on the next `logic()` frame.
     /// `drop_session_handles` populates this (it has no `egui::Context` to
@@ -2961,7 +3117,8 @@ pub struct ArcenApp {
     audio_batch_high_water: usize,
     audio_frames_seen: u64,
     audio_bytes_accepted: u64,
-    input_sequence: u64,
+    /// Session-global input sequence, shared with pen input.
+    input_sequence: SharedInputSequence,
     last_keyboard_timestamp_ns: u64,
     last_input_sent_type: String,
     last_input_sent_at: Option<Instant>,
@@ -3078,6 +3235,17 @@ pub struct ArcenApp {
     active_cursor_mode: CursorMode,
     cursor_mode_confirmed: bool,
     active_cursor_shape: arcen_protocol::messages::CursorShapeKind,
+    /// The host's cursor images (a desktop that reports its cursor
+    /// separately), drawn as the native cursor while `Local` is active.
+    host_cursor: arcen_input::cursor::DeckCursor,
+    /// Keeps this Mac's cursor while its own pen drives the pointer and the
+    /// host hid its pointer for the pen (`arcen_input::cursor::LocalPenCursor`).
+    local_pen_cursor: arcen_input::cursor::LocalPenCursor,
+    /// The host announced cursor images for this connection.
+    host_cursor_images: bool,
+    /// The last host cursor prepared for the native cursor, by image and
+    /// scale, so it is resampled only when either changes.
+    presented_host_cursor: Option<PresentedHostCursor>,
     remote_pointer_buttons: [bool; 3],
     viewport_context: Option<egui::Context>,
     last_decode_at: Option<Instant>,
@@ -3294,6 +3462,13 @@ pub struct ArcenApp {
     color_fidelity: ColorFidelitySettings,
     /// Mirrors `ClientSettings::encode_intent`.
     encode_intent: arcen_media::EncodeIntent,
+    /// Mirrors `ClientSettings::typing_mode`.
+    typing_mode: arcen_input::text::TypingMode,
+    /// Mirrors `ClientSettings::option_key_mode`.
+    option_key_mode: arcen_input::text::OptionKeyMode,
+    /// Committed text for the session: input-method commits and keystrokes
+    /// the host's layout types differently.
+    text_input: crate::ui::text_input::DeckTextInput,
     /// Why the host is not showing the size that was asked for, if it is not.
     /// Painted into the letterbox area, which only exists when there is a
     /// mismatch, so a working session is never covered by it.
@@ -3316,17 +3491,20 @@ pub struct ArcenApp {
     tablet_runtime: Option<crate::tablet::TabletRuntime>,
     #[cfg(target_os = "macos")]
     gesture_runtime: Option<crate::gestures::GestureRuntime>,
-    /// Edge-preserving, motion-coalescing dispatcher sitting between the
-    /// drained/mapped pen sample stream and the transport send call. Reset
-    /// whenever tablet authority resets (see `reset_tablet_authority`).
-    tablet_dispatcher: TabletEventDispatcher,
-    /// Stateful raw-sample → `PenEvent` mapper (tracks current tool and
-    /// proximity across samples). Reset alongside the dispatcher so a
-    /// tablet-authority reset always starts both from a clean slate.
-    tablet_mapper: TabletMapper,
-    /// Empirically observed axis capability, accumulated for the local-only
-    /// Tablet Monitor diagnostic panel. Never logged or persisted.
-    tablet_probe: crate::tablet::TabletCapabilityProbe,
+    /// Pen capture, routing and forwarding. Shared with the AppKit tablet
+    /// monitor so a sample is sent as it is dispatched, never on the next UI
+    /// pass (see `ui::pen_input`). Holds the mapper, the shared edge-preserving
+    /// dispatcher, the capability probe and the Tablet Monitor read-outs.
+    pen: Rc<RefCell<PenInput>>,
+    /// AppKit mouse-event coalescing is held off while a session window is
+    /// active, so every digitizer and mouse report reaches the Deck.
+    mouse_coalescing: crate::tablet::MouseCoalescing,
+    /// Refresh period of the display under the root window, sampled with
+    /// the display-sync check; the UI never asks for passes faster.
+    root_refresh_period: Option<Duration>,
+    /// Whether pen samples are waiting for a swallowed key release to be
+    /// recovered (see `complete_pen_pass_at`).
+    pen_recovery_hold: PenRecoveryHold,
     /// Whether the current session has negotiated typed pen input.
     /// Set provisionally in `apply_server_hello` and recomputed authoritatively
     /// in `apply_tablet_mode_result` once the host sends its confirmed result.
@@ -3344,17 +3522,6 @@ pub struct ArcenApp {
     /// (`crate::tablet::typed_pen_capability`; not tablet presence). Saved for
     /// display in the Tablet Monitor panel ("Typed pen offered").
     hello_local_pen_capability: InputCapabilityAvailability,
-    /// Most recent event the tablet pipeline actually dispatched, kept only
-    /// for the in-session Tablet Monitor diagnostic panel's live read-out
-    /// (tool/proximity/pressure/tilt/rotation). Never logged or persisted.
-    tablet_last_event: Option<arcen_input::PenEvent>,
-    /// Most recent tablet-pipeline error surfaced to the user (dispatcher
-    /// overflow, etc.), shown in the Tablet Monitor panel and cleared on the
-    /// next successful dispatch.
-    tablet_last_error: Option<String>,
-    /// Lifetime counters for the local-only Tablet Monitor diagnostic panel.
-    tablet_events_sent: u64,
-    tablet_overflow_resets: u64,
     /// Last `TabletRuntime::dropped_count()` value observed by
     /// `process_tablet_samples`. `TabletRuntime`'s producer-side
     /// `BoundedSampleQueue` is a drop-oldest queue by design (an AppKit
@@ -3606,6 +3773,8 @@ impl ArcenApp {
         // Apply the user's saved "Log level" to the already-initialised logging
         // backbone (main() brought it up at Info before the UI existed).
         crate::logging::set_level(settings.log_level.profile());
+        let region_runtime: SharedRegionRuntime = Rc::new(RefCell::new(None));
+        let input_sequence: SharedInputSequence = Rc::new(Cell::new(0));
         Self {
             config_repository,
             screen: AppScreen::Home,
@@ -3680,7 +3849,7 @@ impl ArcenApp {
                 }
             },
             multi_window_root_monitor_id: None,
-            region_runtime: None,
+            region_runtime: Rc::clone(&region_runtime),
             multi_window_started_at: None,
             pending_root_frame: None,
             secondary_textures: BTreeMap::new(),
@@ -3688,8 +3857,6 @@ impl ArcenApp {
             secondary_last_present_request: BTreeMap::new(),
             secondary_refresh_superseded_pending: BTreeMap::new(),
             secondary_tablet_targets: Vec::new(),
-            tablet_region_viewports: HashMap::new(),
-            last_pen_region_viewport: None,
             pending_viewport_closes: Vec::new(),
             root_pre_entry_snapshot: None,
             pending_root_restore: None,
@@ -3702,7 +3869,7 @@ impl ArcenApp {
             audio_batch_high_water: 0,
             audio_frames_seen: 0,
             audio_bytes_accepted: 0,
-            input_sequence: 0,
+            input_sequence: Rc::clone(&input_sequence),
             last_keyboard_timestamp_ns: 0,
             last_input_sent_type: String::new(),
             last_input_sent_at: None,
@@ -3727,6 +3894,10 @@ impl ArcenApp {
             active_cursor_mode: CursorMode::Local,
             cursor_mode_confirmed: false,
             active_cursor_shape: arcen_protocol::messages::CursorShapeKind::default(),
+            host_cursor: arcen_input::cursor::DeckCursor::Default,
+            local_pen_cursor: arcen_input::cursor::LocalPenCursor::default(),
+            host_cursor_images: false,
+            presented_host_cursor: None,
             remote_pointer_buttons: [false; 3],
             viewport_context: None,
             last_decode_at: None,
@@ -3841,6 +4012,13 @@ impl ArcenApp {
             hidpi_display_mask: settings.hidpi_display_mask,
             color_fidelity: settings.color_fidelity,
             encode_intent: settings.encode_intent,
+            typing_mode: settings.typing_mode,
+            option_key_mode: settings.option_key_mode,
+            text_input: {
+                let mut text_input = crate::ui::text_input::DeckTextInput::default();
+                text_input.configure(settings.typing_mode, settings.option_key_mode);
+                text_input
+            },
             display_note: None,
             notch_fullscreen_active: false,
             notch_fullscreen_settle: 0,
@@ -3854,17 +4032,14 @@ impl ArcenApp {
             tablet_runtime: None,
             #[cfg(target_os = "macos")]
             gesture_runtime: None,
-            tablet_dispatcher: TabletEventDispatcher::new(),
-            tablet_mapper: TabletMapper::new(),
-            tablet_probe: crate::tablet::TabletCapabilityProbe::default(),
+            pen: Rc::new(RefCell::new(PenInput::new(region_runtime, input_sequence))),
+            mouse_coalescing: crate::tablet::MouseCoalescing::default(),
+            root_refresh_period: None,
+            pen_recovery_hold: PenRecoveryHold::Idle,
             pen_negotiated: false,
             hello_input_protocol_version: 0,
             hello_pen_capability: InputCapabilityAvailability::Unknown,
             hello_local_pen_capability: InputCapabilityAvailability::Unknown,
-            tablet_last_event: None,
-            tablet_last_error: None,
-            tablet_events_sent: 0,
-            tablet_overflow_resets: 0,
             tablet_producer_drops_seen: 0,
             tablet_monitor_panel_open: false,
             tablet_left_handed: false,
@@ -3991,20 +4166,39 @@ impl eframe::App for ArcenApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.viewport_context = Some(ctx.clone());
         self.ui_load.note_pass();
+        self.sync_pen_link();
+        self.pen.borrow_mut().begin_pass();
+        self.absorb_pen_report();
+        self.sync_mouse_coalescing(ctx);
         self.keep_root_display_sync();
         self.keep_session_backstop();
         if !self.native_menu_refreshed {
+            macos_menu::set_waker(ctx);
             macos_menu::install();
             crate::ui::keyboard::install_native_keypad_monitor();
+            crate::ui::option_keys::install(ctx);
             macos_menu::disable_app_nap();
             // Install the AppKit tablet monitor once, for the app's
             // lifetime, on the same main thread `logic()` runs on — RAII:
             // dropping `ArcenApp` (process exit) uninstalls it. Only the
             // *pen-authority/dispatcher* state resets per session/setting
             // change, never this monitor itself.
+            //
+            // Every event goes straight to pen input, which sends a pen
+            // sample the moment AppKit dispatches it; only an event pen input
+            // could not take is queued, and that wakes the UI to drain it.
+            // Plain pen motion never wakes the UI; edges do, so the
+            // mouse-emulation suppression updates.
             let wake = ctx.clone();
-            self.tablet_runtime =
-                crate::tablet::TabletRuntime::install(move || wake.request_repaint());
+            let pen = Rc::clone(&self.pen);
+            self.tablet_runtime = crate::tablet::TabletRuntime::install(
+                move |event| PenInput::offer(&pen, event),
+                move || wake.request_repaint(),
+            );
+            let edge_wake = ctx.clone();
+            self.pen
+                .borrow_mut()
+                .set_edge_wake(move || edge_wake.request_repaint());
             #[cfg(target_os = "macos")]
             {
                 let wake = ctx.clone();
@@ -4026,9 +4220,9 @@ impl eframe::App for ArcenApp {
             self.session_commands.is_some(),
             transitioning,
         ) {
-            ctx.request_repaint_after(ui_poll_interval(
-                transitioning,
-                self.last_local_input.map(|at| at.elapsed()),
+            ctx.request_repaint_after(paced_ui_poll_interval(
+                ui_poll_interval(transitioning, self.last_local_input.map(|at| at.elapsed())),
+                self.root_refresh_period,
             ));
             if self.multi_window.is_active() {
                 self.multi_window_timing.note_ui_interval_wake();
@@ -4542,11 +4736,13 @@ impl ArcenApp {
             display_update_result,
             certificate_untrusted,
             pending_cursor_shape,
+            pending_host_cursor,
             served_pipeline,
             connection_status_hint,
             generation,
         ) = {
             let mut state = media.lock().expect("media state poisoned");
+            crate::ui::media_worker::mirror_audio_playback(&mut state);
             // Mirror the telemetry the overlay + logger read off `self`.
             self.video_frames_seen = state.video_frames_seen;
             self.presentation_superseded_frames = state.presentation_superseded_frames;
@@ -4639,6 +4835,7 @@ impl ArcenApp {
                 state.display_update_result.take(),
                 state.certificate_untrusted.take(),
                 state.pending_cursor_shape.take(),
+                state.pending_host_cursor.take(),
                 state.served_pipeline.take(),
                 state.connection_status_hint.clone(),
                 state.generation,
@@ -4649,6 +4846,13 @@ impl ArcenApp {
             return;
         }
         self.connection_status_hint = connection_status_hint;
+        let (text_results, host_keymap) = {
+            let mut state = media.lock().expect("media state poisoned");
+            (
+                std::mem::take(&mut state.text_commit_results),
+                state.host_keymap.take(),
+            )
+        };
 
         let native_replacement_presented = native_metadata.is_some();
         if let Some(metadata) = native_metadata {
@@ -4674,7 +4878,20 @@ impl ArcenApp {
             self.apply_cursor_mode_result(result, generation);
         }
         if let Some(shape) = pending_cursor_shape {
+            let pen = self.pen_has_authority();
+            self.local_pen_cursor.observe_shape(shape, pen);
             self.active_cursor_shape = shape;
+        }
+        if let Some(keymap) = host_keymap.as_ref() {
+            self.text_input.on_host_keymap(keymap);
+        }
+        for result in &text_results {
+            self.text_input.on_result(result);
+        }
+        if let Some(cursor) = pending_host_cursor {
+            let pen = self.pen_has_authority();
+            self.local_pen_cursor.observe(&cursor, pen);
+            self.host_cursor = cursor;
         }
         if let Some(result) = display_update_result {
             self.display_fit.handle_result(&result);
@@ -4698,6 +4915,7 @@ impl ArcenApp {
                 hello.input_protocol_version,
                 hello.input_capabilities,
             );
+            self.text_input.set_host(hello.input_capabilities);
             // A Mac host's shortcuts are Command shortcuts. The Cmd-to-Ctrl
             // swap is for hosts whose shortcut key is Control; applied to a
             // Mac it turned Cmd+A, Cmd+C and Cmd+V into Ctrl+A, Ctrl+C and
@@ -4763,12 +4981,10 @@ impl ArcenApp {
             } else {
                 "Requested tablet mode has not been confirmed by this host".to_string()
             };
-            self.tablet_dispatcher.reset();
-            self.tablet_mapper = TabletMapper::new();
-            // Reset the capability probe at session connect so the Tablet
-            // Monitor shows empirical data for this session only — capabilities
-            // observed in a previous session do not carry over.
-            self.tablet_probe = crate::tablet::TabletCapabilityProbe::default();
+            // Also resets the capability probe at session connect so the
+            // Tablet Monitor shows empirical data for this session only —
+            // capabilities observed in a previous session do not carry over.
+            self.pen.borrow_mut().reset_for_session();
             // Presence hint: if a pen tablet is already
             // plugged in when the session connects, surface a one-time log so
             // the user knows to move the pen near the tablet surface.  On
@@ -5389,10 +5605,15 @@ impl ArcenApp {
         self.host_supports_display_update = false;
         self.host_precise_scroll = false;
         self.host_gestures_v1 = false;
+        self.text_input.reset();
         self.display_fit.reset();
         self.active_cursor_mode = CursorMode::Local;
         self.cursor_mode_confirmed = false;
         self.active_cursor_shape = arcen_protocol::messages::CursorShapeKind::default();
+        self.host_cursor = arcen_input::cursor::DeckCursor::Default;
+        self.local_pen_cursor.reset();
+        self.host_cursor_images = false;
+        self.presented_host_cursor = None;
         self.remote_pointer_buttons = [false; 3];
         self.relative_motion.clear();
         // Item 3 (enablement audit): a fresh attach or a reconnect/resume
@@ -5475,7 +5696,7 @@ impl ArcenApp {
         }
         self.multi_window = MultiWindowSessionState::Inactive;
         self.multi_window_root_monitor_id = None;
-        self.region_runtime = None;
+        *self.region_runtime.borrow_mut() = None;
         self.multi_window_started_at = None;
         // Only a snapshot this exact attempt never committed reaches here
         // (a commit clears it in place, in `drive_multi_window`'s own
@@ -5534,8 +5755,7 @@ impl ArcenApp {
         // negotiated ids, or root's own plain single-monitor scrolling
         // once no multi-window session remains at all).
         self.root_scroll_accum = egui::Vec2::ZERO;
-        self.tablet_region_viewports.clear();
-        self.last_pen_region_viewport = None;
+        self.pen.borrow_mut().last_region_viewport = None;
         self.active_secondary_keyboard_focus = None;
         self.active_keyboard_viewport = None;
     }
@@ -5737,7 +5957,7 @@ impl ArcenApp {
                         }
                     }
                 }
-                self.region_runtime = Some(region_runtime);
+                *self.region_runtime.borrow_mut() = Some(region_runtime);
                 self.multi_window_root_monitor_id = root_monitor_id;
                 self.arm_multi_window_decode_isolation(&validated);
                 self.multi_window = MultiWindowSessionState::Active {
@@ -5895,14 +6115,19 @@ impl ArcenApp {
         &mut self,
         validated: &ValidatedAppliedTopology,
     ) -> bool {
-        if self.region_runtime.as_ref().is_some_and(|runtime| {
-            runtime.generation().get() == validated.generation.get()
-                && validated.monitors.iter().all(|monitor| {
-                    runtime
-                        .viewport_for_monitor(monitor.session_monitor_id)
-                        .is_some()
-                })
-        }) {
+        if self
+            .region_runtime
+            .borrow()
+            .as_ref()
+            .is_some_and(|runtime| {
+                runtime.generation().get() == validated.generation.get()
+                    && validated.monitors.iter().all(|monitor| {
+                        runtime
+                            .viewport_for_monitor(monitor.session_monitor_id)
+                            .is_some()
+                    })
+            })
+        {
             return true;
         }
         let requested_topology = self
@@ -5912,7 +6137,7 @@ impl ArcenApp {
             .map(|selection| selection.topology.clone());
         match DeckRegionRuntime::from_validated_topology(validated, requested_topology.as_ref()) {
             Ok(runtime) => {
-                self.region_runtime = Some(runtime);
+                *self.region_runtime.borrow_mut() = Some(runtime);
                 true
             }
             Err(error) => {
@@ -5927,7 +6152,7 @@ impl ArcenApp {
     }
 
     fn primary_region_viewport(&mut self) -> Option<RegionViewport> {
-        if let Some(runtime) = self.region_runtime.as_ref() {
+        if let Some(runtime) = self.region_runtime.borrow().as_ref() {
             if let Some(root_monitor_id) = self.committed_root_monitor_id() {
                 if let Some(viewport) = runtime.viewport_for_monitor(root_monitor_id) {
                     return Some(viewport);
@@ -5942,7 +6167,7 @@ impl ArcenApp {
         match DeckRegionRuntime::legacy_primary(width, height) {
             Ok(runtime) => {
                 let viewport = runtime.primary_viewport();
-                self.region_runtime = Some(runtime);
+                *self.region_runtime.borrow_mut() = Some(runtime);
                 Some(viewport)
             }
             Err(error) => {
@@ -5956,8 +6181,19 @@ impl ArcenApp {
         }
     }
 
+    fn region_viewport_for_monitor(
+        &self,
+        monitor_id: arcen_media::SessionMonitorId,
+    ) -> Option<RegionViewport> {
+        self.region_runtime
+            .borrow()
+            .as_ref()
+            .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
+    }
+
     fn uses_region_input_wire(&self) -> bool {
         self.region_runtime
+            .borrow()
             .as_ref()
             .is_some_and(DeckRegionRuntime::uses_region_wire)
     }
@@ -5967,7 +6203,8 @@ impl ArcenApp {
         messages: &[RegionInputWireMessage],
         motion_mode: PointerMotionMode,
     ) -> Vec<LegacyRegionWireMessage> {
-        let Some(runtime) = self.region_runtime.as_ref() else {
+        let region_runtime = self.region_runtime.borrow();
+        let Some(runtime) = region_runtime.as_ref() else {
             return Vec::new();
         };
         messages
@@ -6182,15 +6419,17 @@ impl ArcenApp {
     ) {
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
+            let mut region_runtime = self.region_runtime.borrow_mut();
+            let Some(runtime) = region_runtime.as_mut() else {
                 return;
             };
-            runtime.pointer_motion(
-                viewport,
-                local_fraction,
-                &mut self.input_sequence,
-                timestamp_ns,
-            )
+            {
+                let mut sequence = self.input_sequence.get();
+                let result =
+                    runtime.pointer_motion(viewport, local_fraction, &mut sequence, timestamp_ns);
+                self.input_sequence.set(sequence);
+                result
+            }
         };
         match result {
             Ok(messages) => {
@@ -6213,16 +6452,22 @@ impl ArcenApp {
     ) {
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
+            let mut region_runtime = self.region_runtime.borrow_mut();
+            let Some(runtime) = region_runtime.as_mut() else {
                 return;
             };
-            runtime.pointer_sample(
-                viewport,
-                local_fraction,
-                buttons,
-                &mut self.input_sequence,
-                timestamp_ns,
-            )
+            {
+                let mut sequence = self.input_sequence.get();
+                let result = runtime.pointer_sample(
+                    viewport,
+                    local_fraction,
+                    buttons,
+                    &mut sequence,
+                    timestamp_ns,
+                );
+                self.input_sequence.set(sequence);
+                result
+            }
         };
         match result {
             Ok(messages) => {
@@ -6246,17 +6491,23 @@ impl ArcenApp {
     ) {
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
+            let mut region_runtime = self.region_runtime.borrow_mut();
+            let Some(runtime) = region_runtime.as_mut() else {
                 return;
             };
-            runtime.pointer_button(
-                viewport,
-                local_fraction,
-                button,
-                pressed,
-                &mut self.input_sequence,
-                timestamp_ns,
-            )
+            {
+                let mut sequence = self.input_sequence.get();
+                let result = runtime.pointer_button(
+                    viewport,
+                    local_fraction,
+                    button,
+                    pressed,
+                    &mut sequence,
+                    timestamp_ns,
+                );
+                self.input_sequence.set(sequence);
+                result
+            }
         };
         match result {
             Ok(messages) => {
@@ -6281,17 +6532,23 @@ impl ArcenApp {
     ) {
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
+            let mut region_runtime = self.region_runtime.borrow_mut();
+            let Some(runtime) = region_runtime.as_mut() else {
                 return;
             };
-            runtime.pointer_scroll(
-                viewport,
-                local_fraction,
-                dx,
-                dy,
-                &mut self.input_sequence,
-                timestamp_ns,
-            )
+            {
+                let mut sequence = self.input_sequence.get();
+                let result = runtime.pointer_scroll(
+                    viewport,
+                    local_fraction,
+                    dx,
+                    dy,
+                    &mut sequence,
+                    timestamp_ns,
+                );
+                self.input_sequence.set(sequence);
+                result
+            }
         };
         match result {
             Ok(messages) => {
@@ -6347,11 +6604,7 @@ impl ArcenApp {
         if !self.ensure_region_runtime_for_validated(validated) {
             return;
         }
-        let Some(viewport) = self
-            .region_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
-        else {
+        let Some(viewport) = self.region_viewport_for_monitor(monitor_id) else {
             return;
         };
         let motion_mode = if self.secondary_pointer_lock == Some(monitor_id) {
@@ -6411,11 +6664,7 @@ impl ArcenApp {
         if !self.ensure_region_runtime_for_validated(validated) {
             return;
         }
-        let Some(viewport) = self
-            .region_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
-        else {
+        let Some(viewport) = self.region_viewport_for_monitor(monitor_id) else {
             return;
         };
         let motion_mode = if self.secondary_pointer_lock == Some(monitor_id) {
@@ -6905,6 +7154,13 @@ impl ArcenApp {
                     SecondaryReadyFrameAction::None => {}
                 }
             }
+            if self.sync_secondary_host_cursor(
+                &mut deferred_state
+                    .lock()
+                    .expect("secondary viewport state poisoned"),
+            ) {
+                request_viewport_repaint = true;
+            }
             if request_viewport_repaint {
                 ctx.request_repaint_of(viewport_id);
             }
@@ -6948,6 +7204,21 @@ impl ArcenApp {
                 }
                 let image_rect =
                     aspect_fit_rect(rect, state.frame_size, ui.ctx().pixels_per_point());
+                {
+                    let DeferredSecondaryViewportState {
+                        host_cursor,
+                        presented_host_cursor,
+                        frame_size,
+                        ..
+                    } = &mut *state;
+                    apply_secondary_host_cursor(
+                        ui.ctx(),
+                        host_cursor,
+                        presented_host_cursor,
+                        image_rect,
+                        frame_size.map(|[width, _]| width),
+                    );
+                }
                 if !state.logged_first_paint && (frame.is_some() || state.texture.is_some()) {
                     state.logged_first_paint = true;
                     let rgba_len = frame.as_ref().map_or(0, |frame| frame.rgba.len());
@@ -7424,9 +7695,7 @@ impl ArcenApp {
                     result.monitor_id,
                     self.active_secondary_keyboard_focus,
                 ) {
-                    for event in &result.keyboard_events {
-                        self.process_keyboard_event(event);
-                    }
+                    self.dispatch_keyboard_events(&result.keyboard_events);
                 }
                 // Only a viewport that actually received pointer input this
                 // paint may move the one remote pointer; one that merely
@@ -7854,12 +8123,6 @@ impl ArcenApp {
         }
     }
 
-    fn send_hard_usb_pen(&self, event: PenEvent) -> bool {
-        self.session_commands
-            .as_ref()
-            .is_some_and(|commands| commands.send(SessionCommand::HardUsbPen(event)).is_ok())
-    }
-
     fn apply_cursor_mode_result(&mut self, result: CursorModeResultMsg, generation: u64) {
         if generation != self.connection_generation {
             return;
@@ -7874,25 +8137,36 @@ impl ArcenApp {
             return;
         }
 
-        let valid = match result.requested {
-            CursorMode::Local => result.accepted && result.active == CursorMode::Local,
-            CursorMode::Host => {
-                result.accepted
-                    && result.active == CursorMode::Host
-                    && self.session_commands.is_some()
+        // Only a host-accepted request for a host-drawn cursor hides this
+        // Mac's cursor. A Local request always keeps it: it moves with the
+        // window server at display rate, never at the video's rate. A host
+        // that still draws its cursor into the video (an older Wayland Pier,
+        // or a desktop opened by a Deck that asked for a host cursor) shows
+        // a second, lagging pointer in the pixels; that is the host's to
+        // fix, never a reason to hide the one that keeps up.
+        self.active_cursor_mode = match (result.requested, result.active) {
+            (CursorMode::Host, CursorMode::Host)
+                if result.accepted && self.session_commands.is_some() =>
+            {
+                CursorMode::Host
             }
+            _ => CursorMode::Local,
         };
-        self.active_cursor_mode = if valid {
-            result.active
-        } else {
-            CursorMode::Local
-        };
+        if result.requested == CursorMode::Local && result.active == CursorMode::Host {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                reason = result.reason.as_str(),
+                "host also draws its cursor into the video; the Deck keeps drawing this Mac's cursor",
+            );
+        }
+        self.host_cursor_images = result.cursor_images;
         self.cursor_mode_confirmed = true;
         tracing::info!(
             target: crate::logging::target::SESSION,
             requested = ?result.requested,
             active = ?self.active_cursor_mode,
             accepted = result.accepted,
+            cursor_images = result.cursor_images,
             reason = result.reason.as_str(),
             "cursor authority result applied",
         );
@@ -8171,18 +8445,21 @@ impl ArcenApp {
         if self.uses_region_input_wire() {
             let timestamp_ns = Self::now_epoch_ns();
             let mut releases = Vec::new();
-            if let Some(runtime) = self.region_runtime.as_mut() {
+            if let Some(runtime) = self.region_runtime.borrow_mut().as_mut() {
                 for index in 0..self.remote_pointer_buttons.len() {
                     if !self.remote_pointer_buttons[index] {
                         continue;
                     }
                     let button = u8::try_from(index + 1).expect("three pointer buttons fit in u8");
-                    match runtime.pointer_button_at_latest(
+                    let mut sequence = self.input_sequence.get();
+                    let result = runtime.pointer_button_at_latest(
                         button,
                         false,
-                        &mut self.input_sequence,
+                        &mut sequence,
                         timestamp_ns,
-                    ) {
+                    );
+                    self.input_sequence.set(sequence);
+                    match result {
                         Ok(Some(message)) => releases.push(message),
                         Ok(None) => {}
                         Err(error) => tracing::warn!(
@@ -8218,7 +8495,7 @@ impl ArcenApp {
             }
         }
         self.remote_pointer_buttons = [false; 3];
-        if let Some(runtime) = self.region_runtime.as_mut() {
+        if let Some(runtime) = self.region_runtime.borrow_mut().as_mut() {
             runtime.release_all();
         }
     }
@@ -8538,9 +8815,15 @@ impl ArcenApp {
                 }
             };
         self.pending_connection = Some(draft.clone());
+        let deck_build = crate::build_identity::DeckBuildFacts::running();
         tracing::info!(
             target: crate::logging::target::SESSION,
             deck_version = env!("CARGO_PKG_VERSION"),
+            deck_bundle_short_version = %deck_build.bundle_short_version,
+            deck_bundle_version = %deck_build.bundle_version,
+            deck_build_id = %deck_build.build_id,
+            deck_source_revision = %deck_build.source_revision,
+            deck_bundle_path = %deck_build.bundle_path,
             protocol = arcen_protocol::PROTOCOL_VERSION,
             input_protocol = arcen_protocol::messages::INPUT_PROTOCOL_VERSION,
             tablet_mode = ?self.tablet_mode_requested,
@@ -8702,6 +8985,15 @@ impl ArcenApp {
         if !decision.should_apply {
             return;
         }
+        let refresh_period = crate::ui::video_render::root_display_refresh_period();
+        if refresh_period != self.root_refresh_period {
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                refresh_period_us = refresh_period.map(|period| period.as_micros()),
+                "root display refresh period",
+            );
+            self.root_refresh_period = refresh_period;
+        }
         if crate::ui::video_render::set_root_display_sync(decision.enabled) {
             if decision.log_transition {
                 tracing::info!(
@@ -8711,6 +9003,24 @@ impl ArcenApp {
                 );
             }
             self.root_display_sync = Some((now, decision.enabled));
+        }
+    }
+
+    /// AppKit mouse-event coalescing stays off only while a session window
+    /// (root or a secondary viewport) is the active window, and is restored
+    /// as soon as the person switches away or the session ends.
+    fn sync_mouse_coalescing(&mut self, ctx: &egui::Context) {
+        let session_window_active = matches!(self.screen, AppScreen::InSession)
+            && (ctx.input(|input| input.focused) || self.active_secondary_keyboard_focus.is_some());
+        if self
+            .mouse_coalescing
+            .set_session_active(session_window_active)
+        {
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                coalescing_disabled = session_window_active,
+                "AppKit mouse-event coalescing changed",
+            );
         }
     }
 
@@ -10289,6 +10599,8 @@ impl ArcenApp {
         let mut full_color_display_mask = self.full_color_display_mask;
         let mut hidpi_display_mask = self.hidpi_display_mask;
         let mut cursor_preference = self.cursor_preference;
+        let mut typing_mode = self.typing_mode;
+        let mut option_key_mode = self.option_key_mode;
         let mut clipboard_enabled = self.clipboard_enabled;
         let mut microphone_enabled = self.microphone_enabled;
         let mut tablet_mode_requested = self.tablet_mode_requested;
@@ -10866,6 +11178,71 @@ impl ArcenApp {
                              on the capture backend including the cursor.",
                         );
                         ui.add_space(24.0);
+                        ui.label(
+                            egui::RichText::new("Typing")
+                                .color(egui::Color32::BLACK)
+                                .size(19.0),
+                        );
+                        ui.add_space(10.0);
+                        {
+                            use arcen_input::text::{OptionKeyMode, TypingMode};
+                            settings_radio(
+                                ui,
+                                &mut typing_mode,
+                                TypingMode::Auto,
+                                Some("(Recommended)"),
+                                "Characters as on this Mac",
+                                "Keys go to the remote computer as keys, except where its keyboard \
+                                 layout would type a different character: those, and everything your \
+                                 input method composes (accents, dead keys, Japanese, Chinese, emoji), \
+                                 arrive as the characters you typed. Needs a host that types text.",
+                            );
+                            settings_radio(
+                                ui,
+                                &mut typing_mode,
+                                TypingMode::Keys,
+                                None,
+                                "Keys only",
+                                "Every key goes as a key; the remote keyboard layout decides each \
+                                 character. Best for games. The input method does not compose.",
+                            );
+                            settings_radio(
+                                ui,
+                                &mut typing_mode,
+                                TypingMode::Characters,
+                                None,
+                                "Always characters",
+                                "Every typed character arrives as typed, whatever the remote layout. \
+                                 Shortcuts still go as keys; held letter keys do not.",
+                            );
+                            ui.add_space(10.0);
+                            settings_radio(
+                                ui,
+                                &mut option_key_mode,
+                                OptionKeyMode::LeftAltRightCharacters,
+                                Some("(Recommended)"),
+                                "Left Option is Alt, right Option types characters",
+                                "Left Option sends Alt shortcuts to the remote computer; right Option \
+                                 types the special characters it types on this Mac.",
+                            );
+                            settings_radio(
+                                ui,
+                                &mut option_key_mode,
+                                OptionKeyMode::BothAlt,
+                                None,
+                                "Both Option keys are Alt",
+                                "Both Option keys send Alt shortcuts.",
+                            );
+                            settings_radio(
+                                ui,
+                                &mut option_key_mode,
+                                OptionKeyMode::BothCharacters,
+                                None,
+                                "Both Option keys type characters",
+                                "Both Option keys type this Mac's special characters.",
+                            );
+                        }
+                        ui.add_space(24.0);
                         // One surface owns every input decision. Tablet mode
                         // and non-HID USB forwarding used to live in two
                         // different tabs, and the tab named for USB was the
@@ -11396,6 +11773,8 @@ impl ArcenApp {
             || full_color_display_mask != self.full_color_display_mask
             || hidpi_display_mask != self.hidpi_display_mask
             || cursor_preference != self.cursor_preference
+            || typing_mode != self.typing_mode
+            || option_key_mode != self.option_key_mode
             || clipboard_enabled != self.clipboard_enabled
             || microphone_enabled != self.microphone_enabled
             || tablet_mode_requested != self.tablet_mode_requested;
@@ -11412,6 +11791,11 @@ impl ArcenApp {
         self.full_color_display_mask = full_color_display_mask;
         self.hidpi_display_mask = hidpi_display_mask;
         self.cursor_preference = cursor_preference;
+        if typing_mode != self.typing_mode || option_key_mode != self.option_key_mode {
+            self.typing_mode = typing_mode;
+            self.option_key_mode = option_key_mode;
+            self.text_input.configure(typing_mode, option_key_mode);
+        }
         let clipboard_disabled_now = self.clipboard_enabled && !clipboard_enabled;
         let microphone_disabled_now = self.microphone_enabled && !microphone_enabled;
         let old_tablet_input_enabled = self.tablet_input_enabled;
@@ -11702,6 +12086,8 @@ impl ArcenApp {
                 tablet_mode_requested: self.tablet_mode_requested,
                 color_fidelity: self.color_fidelity,
                 encode_intent: self.encode_intent,
+                typing_mode: self.typing_mode,
+                option_key_mode: self.option_key_mode,
             },
         )
     }
@@ -12320,6 +12706,7 @@ impl ArcenApp {
         let full_size = egui::vec2(available_w, available_h);
         let (rect, response) = ui.allocate_exact_size(full_size, egui::Sense::click_and_drag());
         let response = response.on_hover_cursor(self.viewer_cursor_icon());
+        let viewer_hovered = response.hovered();
 
         // `image_rect` is where the decoded frame lands inside `rect`.
         //
@@ -12362,6 +12749,12 @@ impl ArcenApp {
                 aspect_fit_rect(rect, Some([w, h]), ppp)
             })
             .unwrap_or(rect);
+
+        if viewer_hovered {
+            if let Some(image) = self.host_cursor_image(image_rect) {
+                ui.ctx().set_cursor_image(Some(image));
+            }
+        }
 
         let viewport_visible = ui
             .ctx()
@@ -12537,10 +12930,14 @@ impl ArcenApp {
         self.sync_keyboard_focus_across_viewports(focused_viewport);
         if viewer_focused {
             let events = ui.input(|input| input.events.clone());
-            for event in events {
-                self.process_keyboard_event(&event);
+            self.dispatch_keyboard_events(&events);
+            // The input method composes only while a host takes committed
+            // text; its candidate window sits over the video.
+            if let Some(ime) = self.text_input.ime_output(image_rect) {
+                ui.ctx().output_mut(|output| output.ime = Some(ime));
             }
         }
+        self.text_input.show(ui.ctx(), image_rect);
 
         // Drain and dispatch any tablet samples queued since the last
         // frame, mapped through this frame's `image_rect`/window geometry,
@@ -12550,32 +12947,53 @@ impl ArcenApp {
         self.process_tablet_samples(image_rect, window_height);
         let pen_has_authority = self.pen_has_authority();
 
-        if self.pointer_lock && viewer_focused {
+        let relative_motion = self.pointer_lock && viewer_focused;
+        if relative_motion {
             if let Some(motion) = ui.input(|input| input.pointer.motion()) {
                 self.send_mouse_relative(motion);
             }
-        } else if !pen_has_authority
-            && (response.hovered() || response.dragged() || response.is_pointer_button_down_on())
-            && ui.input(|input| viewport_saw_pointer_input(&input.events))
-        {
-            if let Some(pos) = ui.input(|input| input.pointer.hover_pos()) {
-                self.send_mouse_move(image_rect, pos);
-            }
         }
+        let absolute_motion = !relative_motion
+            && !pen_has_authority
+            && (response.hovered() || response.dragged() || response.is_pointer_button_down_on());
 
+        // Every pointer move and button of this pass, in the order they
+        // happened: a stroke drawn with a mouse keeps its shape instead of
+        // collapsing to one position per pass, and a click lands where it
+        // was made rather than where the pointer ended the pass.
         let pointer_pos =
             ui.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
         if !pen_has_authority {
-            if let Some(pos) = pointer_pos.or(self.last_pointer_view_pos) {
-                for (button, wire_button) in POINTER_BUTTON_WIRE_MAPPING {
-                    let pressed = ui.input(|input| input.pointer.button_pressed(button));
-                    let released = ui.input(|input| input.pointer.button_released(button));
-                    if pressed && (self.pointer_lock || rect.contains(pos)) {
-                        response.request_focus();
-                        self.send_mouse_button(image_rect, pos, wire_button, true);
+            let fallback_pos = pointer_pos.or(self.last_pointer_view_pos);
+            let pointer_events = ui.input(|input| ordered_pointer_events(&input.events));
+            for event in pointer_events {
+                match event {
+                    OrderedPointerEvent::Moved(pos) if absolute_motion => {
+                        self.send_mouse_move(image_rect, pos);
                     }
-                    if released {
-                        self.send_mouse_button(image_rect, pos, wire_button, false);
+                    OrderedPointerEvent::Moved(_) => {}
+                    OrderedPointerEvent::Button {
+                        pos,
+                        wire_button,
+                        pressed,
+                    } => {
+                        // Under pointer lock the cursor does not move with the
+                        // device, so the pass's own position stays authoritative.
+                        let Some(pos) = (if self.pointer_lock {
+                            fallback_pos.or(Some(pos))
+                        } else {
+                            Some(pos)
+                        }) else {
+                            continue;
+                        };
+                        if pressed {
+                            if self.pointer_lock || rect.contains(pos) {
+                                response.request_focus();
+                                self.send_mouse_button(image_rect, pos, wire_button, true);
+                            }
+                        } else {
+                            self.send_mouse_button(image_rect, pos, wire_button, false);
+                        }
                     }
                 }
             }
@@ -12598,8 +13016,9 @@ impl ArcenApp {
         if !wheel_events.is_empty() || smooth_scroll != egui::Vec2::ZERO {
             // What the platform actually hands the Deck for a scroll, recorded
             // because a trackpad session once delivered hundreds of pointer
-            // events and not one scroll, and nothing said why.
-            tracing::debug!(
+            // events and not one scroll, and nothing said why. Trace, not
+            // debug: it fires on every scroll frame of every gesture.
+            tracing::trace!(
                 target: crate::logging::target::INPUT,
                 wheel = ?wheel_events,
                 smooth_x = smooth_scroll.x,
@@ -12640,6 +13059,9 @@ impl ArcenApp {
         // host takes precise scroll, so gating them on the notch path meant
         // they were never sent.
         self.process_gesture_samples(response.hovered() || self.pointer_lock);
+        // Keys, buttons and scrolling for this pass have been sent: pen
+        // samples held behind them may go now.
+        self.complete_pen_pass();
     }
 
     fn paint_health_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -12804,13 +13226,13 @@ impl ArcenApp {
             self.media_inbox.malformed_video_packets,
             self.media_inbox.malformed_audio_packets,
             self.last_decode_error.as_deref().unwrap_or("-"),
-            self.input_sequence,
+            self.input_sequence.get(),
             if self.last_input_sent_type.is_empty() {
                 "-"
             } else {
                 self.last_input_sent_type.as_str()
             },
-            self.input_sequence,
+            self.input_sequence.get(),
             sent_age,
             self.last_audio_summary,
         );
@@ -12893,8 +13315,9 @@ impl ArcenApp {
         } else {
             "no (setting disabled)"
         };
-        let (tool, in_proximity, touching, pressure, tilt_x, tilt_y, rotation) = self
-            .tablet_last_event
+        let pen = self.pen.borrow();
+        let (tool, in_proximity, touching, pressure, tilt_x, tilt_y, rotation) = pen
+            .last_event
             .as_ref()
             .map(|event| {
                 (
@@ -12925,7 +13348,7 @@ impl ArcenApp {
              Pressure: {pressure:.3}  ·  tilt {tilt_x:.1}°/{tilt_y:.1}°  ·  rotation {rotation:.1}°\n\
              Events sent: {}  ·  overflow resets: {}\n\
              Producer dropped (queue full): {}\n\
-             Dispatcher edges: {}  ·  motion coalesced: {}  ·  overflow: {}\n\
+             Dispatcher edges: {}  ·  motion forwarded: {}  ·  overflow: {}\n\
              Probe — pressure: {:?}  tilt: {:?}  rotation: {:?}  eraser: {:?}  barrel: {:?}\n\
              Last error: {}",
             self.tablet_runtime.is_some(),
@@ -12938,20 +13361,20 @@ impl ArcenApp {
             },
             self.tablet_left_handed,
             self.tablet_force_proportions,
-            self.tablet_events_sent,
-            self.tablet_overflow_resets,
+            pen.events_sent,
+            pen.overflow_resets,
             self.tablet_runtime
                 .as_ref()
                 .map_or(0, crate::tablet::TabletRuntime::dropped_count),
-            self.tablet_dispatcher.edge_count(),
-            self.tablet_dispatcher.motion_coalesced_count(),
-            self.tablet_dispatcher.overflow_count(),
-            self.tablet_probe.pressure,
-            self.tablet_probe.tilt,
-            self.tablet_probe.rotation,
-            self.tablet_probe.eraser,
-            self.tablet_probe.barrel_buttons,
-            self.tablet_last_error.as_deref().unwrap_or("-"),
+            pen.dispatcher.edge_count(),
+            pen.dispatcher.motion_forwarded_count(),
+            pen.dispatcher.overflow_count(),
+            pen.probe.pressure,
+            pen.probe.tilt,
+            pen.probe.rotation,
+            pen.probe.eraser,
+            pen.probe.barrel_buttons,
+            pen.last_error.as_deref().unwrap_or("-"),
         );
         ui.painter().text(
             overlay.left_top() + egui::vec2(14.0, 14.0),
@@ -13395,6 +13818,18 @@ impl ArcenApp {
                     .saturating_add(eight_bit.0.interval_3x_plus),
                 estimated_latency_p50_us = ?ten_bit.0.latency_p50_us.or(eight_bit.0.latency_p50_us),
                 estimated_latency_p99_us = ?ten_bit.0.latency_p99_us.or(eight_bit.0.latency_p99_us),
+                on_glass_latency_p50_us = ?ten_bit
+                    .0
+                    .on_glass_latency_p50_us
+                    .or(eight_bit.0.on_glass_latency_p50_us),
+                on_glass_latency_p99_us = ?ten_bit
+                    .0
+                    .on_glass_latency_p99_us
+                    .or(eight_bit.0.on_glass_latency_p99_us),
+                presented_after_target_p50_us = ?ten_bit
+                    .0
+                    .presented_after_target_p50_us
+                    .or(eight_bit.0.presented_after_target_p50_us),
                 queue_depth_avg = format!("{queue_depth_avg:.2}"),
                 queue_depth_max,
                 refresh_period_us = ?ten_bit.0.refresh_period_us.or(eight_bit.0.refresh_period_us),
@@ -13745,35 +14180,80 @@ impl ArcenApp {
         );
     }
 
+    /// The host's cursor as this Deck shows it: what the host reports,
+    /// except a hide the host made for this Deck's own pen
+    /// (`arcen_input::cursor::LocalPenCursor`).
+    fn shown_host_cursor(&self) -> arcen_input::cursor::DeckCursor {
+        self.local_pen_cursor
+            .shown(&self.host_cursor, self.pen_has_authority())
+    }
+
     fn viewer_cursor_icon(&self) -> egui::CursorIcon {
-        use arcen_protocol::messages::CursorShapeKind;
+        use arcen_input::cursor::DeckCursor;
         if self.pointer_lock || self.active_cursor_mode == CursorMode::Host {
-            egui::CursorIcon::None
-        } else {
-            // Map the host's reported cursor shape to a native compositor cursor
-            // so movement stays responsive (compositor-composited, not repaint-gated).
-            match self.active_cursor_shape {
-                CursorShapeKind::Default => egui::CursorIcon::Default,
-                CursorShapeKind::Text => egui::CursorIcon::Text,
-                CursorShapeKind::ResizeNs => egui::CursorIcon::ResizeVertical,
-                CursorShapeKind::ResizeEw => egui::CursorIcon::ResizeHorizontal,
-                CursorShapeKind::ResizeNwse => egui::CursorIcon::ResizeNwSe,
-                CursorShapeKind::ResizeNesw => egui::CursorIcon::ResizeNeSw,
-                CursorShapeKind::ResizeAll => egui::CursorIcon::Move,
-                CursorShapeKind::NotAllowed => egui::CursorIcon::NotAllowed,
-                CursorShapeKind::Pointer => egui::CursorIcon::PointingHand,
-                CursorShapeKind::Crosshair => egui::CursorIcon::Crosshair,
-                CursorShapeKind::Grab => egui::CursorIcon::Grab,
-                CursorShapeKind::Grabbing => egui::CursorIcon::Grabbing,
-                CursorShapeKind::ZoomIn => egui::CursorIcon::ZoomIn,
-                CursorShapeKind::ZoomOut => egui::CursorIcon::ZoomOut,
-                CursorShapeKind::Wait => egui::CursorIcon::Wait,
-                CursorShapeKind::Progress => egui::CursorIcon::Progress,
-                CursorShapeKind::Help => egui::CursorIcon::Help,
-                // When the host cursor is hidden (full-screen/game), match it.
-                CursorShapeKind::Hidden => egui::CursorIcon::None,
-            }
+            return egui::CursorIcon::None;
         }
+        match self.shown_host_cursor() {
+            DeckCursor::Hidden => egui::CursorIcon::None,
+            // The image itself goes out as `cursor_image`; the arrow is the
+            // fallback for a viewport that cannot show one.
+            DeckCursor::Image { .. } => egui::CursorIcon::Default,
+            DeckCursor::Named(shape) => shape_cursor_icon(shape),
+            DeckCursor::Default => shape_cursor_icon(
+                self.local_pen_cursor
+                    .shown_shape(self.active_cursor_shape, self.pen_has_authority()),
+            ),
+        }
+    }
+
+    /// The host's cursor image prepared for the native cursor at the
+    /// viewer's scale (`image_rect` points for the stream's pixels), or
+    /// `None` when the Deck shows no host image.
+    fn host_cursor_image(&mut self, image_rect: egui::Rect) -> Option<egui::CustomCursorImage> {
+        use arcen_input::cursor::DeckCursor;
+        if self.pointer_lock || self.active_cursor_mode == CursorMode::Host {
+            return None;
+        }
+        let DeckCursor::Image { id, image, .. } = self.shown_host_cursor() else {
+            return None;
+        };
+        let [stream_width, _] = self.remote_frame_size?;
+        present_host_cursor(
+            &mut self.presented_host_cursor,
+            id,
+            &image,
+            image_rect,
+            stream_width,
+        )
+    }
+
+    /// Brings a secondary viewport's cursor in line with root's; true when
+    /// it changed, so the viewport repaints to show it.
+    fn sync_secondary_host_cursor(&self, state: &mut DeferredSecondaryViewportState) -> bool {
+        use arcen_input::cursor::DeckCursor;
+        let icon = self.viewer_cursor_icon();
+        let shown = self.shown_host_cursor();
+        let image = match &shown {
+            DeckCursor::Image { id, image, .. }
+                if !self.pointer_lock && self.active_cursor_mode != CursorMode::Host =>
+            {
+                Some((*id, image))
+            }
+            _ => None,
+        };
+        let same_image = match (&state.host_cursor.image, image) {
+            (Some((shown, _)), Some((id, _))) => *shown == id,
+            (None, None) => true,
+            _ => false,
+        };
+        if state.host_cursor.icon == icon && same_image {
+            return false;
+        }
+        state.host_cursor = SecondaryHostCursor {
+            icon,
+            image: image.map(|(id, image)| (id, image.clone())),
+        };
+        true
     }
 
     fn maybe_log_telemetry(&mut self) {
@@ -13787,6 +14267,12 @@ impl ArcenApp {
         self.last_telemetry_log_at = now;
         let (ui_passes_per_s, deck_cpu_percent) = self.ui_load.take(now);
         let ui_layout_passes_per_s = self.ui_layout_load.take(now);
+        let input_dispatch = self
+            .tablet_runtime
+            .as_ref()
+            .map(crate::tablet::TabletRuntime::take_dispatch_ages)
+            .unwrap_or_default();
+        let pen_forward = self.pen.borrow_mut().take_forward_stats();
         let (host_fps, host_bitrate, host_drops, host_input_events, host_input_sequence) = self
             .host_health
             .as_ref()
@@ -13867,8 +14353,17 @@ impl ArcenApp {
             malformed_video_packets = self.media_inbox.malformed_video_packets,
             malformed_audio_packets = self.media_inbox.malformed_audio_packets,
             waiting_for_keyframe = self.waiting_for_keyframe,
-            input_sent = self.input_sequence,
+            input_sent = self.input_sequence.get(),
             input_last = %self.last_input_sent_type,
+            input_dispatch_events = input_dispatch.count,
+            input_dispatch_age_p50_us = input_dispatch.p50_us,
+            input_dispatch_age_p99_us = input_dispatch.p99_us,
+            input_dispatch_age_max_us = input_dispatch.max_us,
+            pen_forwarded = pen_forward.forwarded,
+            pen_forward_interval_p50_us = pen_forward.interval_p50_us,
+            pen_held_for_ordering = pen_forward.held,
+            mouse_coalescing_disabled = self.mouse_coalescing.is_disabled(),
+            root_refresh_period_us = self.root_refresh_period.map(|period| period.as_micros()),
             host_input_events,
             host_input_last = host_input_sequence,
             "session telemetry",
@@ -14041,8 +14536,9 @@ impl ArcenApp {
     }
 
     fn next_input_sequence(&mut self) -> u64 {
-        self.input_sequence = self.input_sequence.saturating_add(1);
-        self.input_sequence
+        let next = self.input_sequence.get().saturating_add(1);
+        self.input_sequence.set(next);
+        next
     }
 
     fn next_keyboard_timestamp_ns(&mut self) -> u64 {
@@ -14364,6 +14860,87 @@ impl ArcenApp {
             });
     }
 
+    /// One frame's keyboard events: key positions as before, except those
+    /// the committed-text policy sends as text, plus the input method's
+    /// commits.
+    fn dispatch_keyboard_events(&mut self, events: &[egui::Event]) {
+        self.dispatch_routed_keyboard_events(events);
+        self.recover_lost_releases(
+            std::time::Instant::now(),
+            crate::ui::option_keys::virtual_key_down,
+        );
+        if let Some(after) = self.text_input.release_check_after() {
+            if let Some(ctx) = &self.viewport_context {
+                ctx.request_repaint_after(after);
+            }
+        }
+    }
+
+    /// Releases on the host the keys whose release the input method
+    /// swallowed while it composed, exactly as they were pressed.
+    fn recover_lost_releases(&mut self, now: std::time::Instant, is_down: impl Fn(u16) -> bool) {
+        for (qt_key, modifiers) in self.text_input.lost_releases(now, is_down) {
+            if !self.keyboard.forget_held(qt_key) {
+                continue;
+            }
+            let (sent, sequence) = self.send_key_event(qt_key, false, modifiers);
+            self.keyboard.record_delivery(sent);
+            tracing::debug!(
+                target: crate::logging::target::INPUT,
+                qt_key = format_args!("{qt_key:#010x}"),
+                modifiers = format_args!("{modifiers:#04x}"),
+                sent,
+                sequence,
+                "released a key whose release the input method swallowed"
+            );
+        }
+    }
+
+    fn dispatch_routed_keyboard_events(&mut self, events: &[egui::Event]) {
+        for routed in self.text_input.route(events) {
+            match routed {
+                crate::ui::text_input::RoutedInput::Key(index) => {
+                    self.process_keyboard_event(&events[index]);
+                }
+                crate::ui::text_input::RoutedInput::KeyWithoutAlt(index) => {
+                    let mut event = events[index].clone();
+                    if let egui::Event::Key { modifiers, .. } = &mut event {
+                        modifiers.alt = false;
+                    }
+                    self.process_keyboard_event(&event);
+                }
+                crate::ui::text_input::RoutedInput::Text(text) => self.send_text_commit(text),
+            }
+        }
+    }
+
+    fn send_text_commit(&mut self, text: String) {
+        let sequence = self.next_input_sequence();
+        let message = arcen_protocol::messages::TextCommitMsg::new(text, sequence);
+        if message.validate().is_err() {
+            tracing::debug!(
+                target: crate::logging::target::INPUT,
+                sequence,
+                "committed text not sendable; dropped"
+            );
+            return;
+        }
+        let chars = message.text.chars().count();
+        let sent = self.send_session_json(
+            serde_json::to_value(message).expect("TextCommitMsg must serialize to JSON"),
+        );
+        if sent {
+            self.record_input_sent("text_commit");
+        }
+        tracing::debug!(
+            target: crate::logging::target::INPUT,
+            sequence,
+            chars,
+            sent,
+            "committed text sent"
+        );
+    }
+
     fn process_keyboard_event(&mut self, event: &egui::Event) {
         if matches!(
             event,
@@ -14386,14 +14963,26 @@ impl ArcenApp {
                 self.release_pointer_lock("panic_f9");
             }
         }
-        let native_qt_key = self
+        let native = self
             .native_key_metadata
             .front()
             .copied()
-            .filter(|metadata| metadata.matches(event))
-            .and_then(|metadata| {
-                self.native_key_metadata.pop_front();
-                metadata.keypad.then_some(metadata.qt_key)
+            .filter(|metadata| metadata.matches(event));
+        if native.is_some() {
+            self.native_key_metadata.pop_front();
+        }
+        let native_qt_key = native.and_then(|metadata| metadata.keypad.then_some(metadata.qt_key));
+        // The physical key, for the keyboard's own state if the input
+        // method swallows its release.
+        // A key egui knows no physical key for has none here either: its
+        // logical key may sit elsewhere, so it is never released for lost.
+        let key_code = native
+            .map(|metadata| metadata.key_code)
+            .or_else(|| match event {
+                egui::Event::Key { physical_key, .. } => {
+                    physical_key.and_then(crate::ui::option_keys::virtual_key_code)
+                }
+                _ => None,
             });
         let action = self.keyboard.handle_event_with_native_key(
             event,
@@ -14408,6 +14997,8 @@ impl ArcenApp {
             } => {
                 let (sent, sequence) = self.send_key_event(qt_key, pressed, modifiers);
                 self.keyboard.record_delivery(sent);
+                self.text_input
+                    .key_sent(qt_key, pressed, modifiers, key_code);
                 tracing::debug!(
                     target: crate::logging::target::INPUT,
                     raw = self.keyboard.raw_count(),
@@ -14457,7 +15048,7 @@ impl ArcenApp {
                     focus = self.keyboard.focused(),
                     qt_key = format_args!("{qt_key:#010x}"),
                     modifiers = format_args!("{modifiers:#04x}"),
-                    sequence = self.input_sequence,
+                    sequence = self.input_sequence.get(),
                     reason,
                     "local keyboard reset requested",
                 );
@@ -14477,7 +15068,7 @@ impl ArcenApp {
                     focus = self.keyboard.focused(),
                     qt_key = format_args!("{qt_key:#010x}"),
                     modifiers = format_args!("{modifiers:#04x}"),
-                    sequence = self.input_sequence,
+                    sequence = self.input_sequence.get(),
                     reason,
                     "keyboard edge suppressed",
                 );
@@ -14516,6 +15107,7 @@ impl ArcenApp {
     }
 
     fn release_remote_keys(&mut self, reason: &'static str) {
+        self.text_input.focus_lost();
         let held = self.keyboard.drain_held();
         let released = held.len();
         for qt_key in held {
@@ -14570,11 +15162,7 @@ impl ArcenApp {
         // monitor that actually contains the position first, and dispatch
         // through *that* monitor's region.
         if let Some((monitor_id, fraction)) = self.resolve_pointer_drag_crossing(rect, pos) {
-            if let Some(viewport) = self
-                .region_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
-            {
+            if let Some(viewport) = self.region_viewport_for_monitor(monitor_id) {
                 self.last_pointer_view_pos = Some(Self::clamp_to_rect(rect, pos));
                 self.dispatch_region_pointer_motion(
                     viewport,
@@ -14756,11 +15344,7 @@ impl ArcenApp {
         // not back on the origin monitor -- otherwise the button-up lands at
         // the boundary and the dragged window snaps back.
         if let Some((monitor_id, fraction)) = self.resolve_pointer_drag_crossing(rect, pos) {
-            if let Some(viewport) = self
-                .region_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
-            {
+            if let Some(viewport) = self.region_viewport_for_monitor(monitor_id) {
                 if motion_mode == PointerMotionMode::Absolute {
                     self.last_pointer_view_pos = Some(Self::clamp_to_rect(rect, pos));
                 }
@@ -14940,19 +15524,25 @@ impl ArcenApp {
         };
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
+            let mut region_runtime = self.region_runtime.borrow_mut();
+            let Some(runtime) = region_runtime.as_mut() else {
                 return;
             };
-            runtime.pointer_scroll_units_with_details(
-                viewport,
-                local_fraction,
-                ux,
-                uy,
-                arcen_input::ScrollUnit::Point,
-                scroll_phase,
-                &mut self.input_sequence,
-                timestamp_ns,
-            )
+            {
+                let mut sequence = self.input_sequence.get();
+                let result = runtime.pointer_scroll_units_with_details(
+                    viewport,
+                    local_fraction,
+                    ux,
+                    uy,
+                    arcen_input::ScrollUnit::Point,
+                    scroll_phase,
+                    &mut sequence,
+                    timestamp_ns,
+                );
+                self.input_sequence.set(sequence);
+                result
+            }
         };
         let Ok(messages) = result else {
             return;
@@ -14991,178 +15581,138 @@ impl ArcenApp {
     /// and the dispatcher's last known state is in proximity. Only while
     /// this is true does `viewer_input_surface` suppress the egui
     /// mouse-emulation duplicates.
+    ///
+    /// Samples held behind an ordering barrier count: they are sent only
+    /// after this pass's mouse input, but their mouse-emulation duplicates
+    /// are already in this pass.
     fn pen_has_authority(&self) -> bool {
         tablet_mode_allows_typed_pen(self.tablet_mode_active)
             && self.pen_negotiated
-            && self.tablet_dispatcher.in_proximity()
+            && self.pen.borrow().holds_authority()
     }
 
-    /// Convert a validated, dispatched `PenEvent` into the wire
-    /// `PenEventMsg`, mapping the server coordinate exactly like
-    /// `normalized_pointer` does for mouse input (same `remote_frame_size`
-    /// scaling, same `-1` "unmapped" sentinel).
-    /// Builds the outgoing wire message for one dispatched `PenEvent`.
-    ///
-    /// This is the explicit legacy single-monitor compatibility path.
-    /// Region sessions use [`Self::send_region_pen_event`] and never derive
-    /// desktop coordinates.
-    fn pen_event_msg(&self, event: &PenEvent) -> PenEventMsg {
-        let (server_x, server_y) = self
-            .remote_frame_size
-            .map(|[width, height]| {
-                (
-                    (event.x * (width.saturating_sub(1)) as f64).round() as i32,
-                    (event.y * (height.saturating_sub(1)) as f64).round() as i32,
-                )
-            })
-            .unwrap_or((-1, -1));
-        PenEventMsg {
-            x: event.x,
-            y: event.y,
-            server_x,
-            server_y,
-            pressure: event.pressure,
-            tilt_x_degrees: event.tilt_x_degrees,
-            tilt_y_degrees: event.tilt_y_degrees,
-            rotation_degrees: event.rotation_degrees,
-            tool: match event.tool {
-                PenTool::Tip => PenToolMsg::Tip,
-                PenTool::Eraser => PenToolMsg::Eraser,
-            },
-            in_proximity: event.in_proximity,
-            touching: event.touching,
-            buttons: event.buttons,
-            sequence: event.metadata.sequence,
-            timestamp_ns: event.metadata.timestamp_ns,
-            coalescable: event.metadata.coalescable,
-            ..PenEventMsg::default()
-        }
-    }
-
-    /// Validate and send one dispatched `PenEvent` through its authoritative
-    /// region, updating the local-only Tablet Monitor counters/read-out.
-    /// Callers must already have gated on negotiated typed pen input.
-    fn send_region_pen_event(&mut self, event: PenEvent, viewport: RegionViewport) {
-        let message = {
-            let Some(runtime) = self.region_runtime.as_mut() else {
-                return;
-            };
-            match runtime.pen(viewport, event) {
-                Ok(message) => message,
-                Err(error) => {
-                    self.tablet_last_error = Some(format!("region pen event rejected: {error}"));
-                    tracing::warn!(
-                        target: crate::logging::target::INPUT,
-                        %error,
-                        "region pen event was rejected",
-                    );
-                    return;
-                }
-            }
+    /// Pushes the session state pen forwarding depends on. Runs at the start
+    /// of every pass and before any pen work done from the UI, so a sample
+    /// the AppKit callback forwards between passes uses current state.
+    fn sync_pen_link(&mut self) {
+        let link = PenLink {
+            commands: self.session_commands.clone(),
+            telemetry: self.session_telemetry.clone(),
+            remote_frame_size: self.remote_frame_size,
+            tablet_mode_active: self.tablet_mode_active,
+            pen_negotiated: self.pen_negotiated,
+            region_input_confirmed: self.region_input_confirmed,
         };
-        let sent = self.send_region_messages(vec![message], PointerMotionMode::Absolute);
-        if sent {
-            tracing::debug!(
-                target: crate::logging::target::INPUT,
-                sequence = event.metadata.sequence,
-                region_id = viewport.region_id().get(),
-                tool = ?event.tool,
-                in_proximity = event.in_proximity,
-                touching = event.touching,
-                buttons = event.buttons,
-                pressure = event.pressure,
-                "region pen event forwarded",
-            );
-            self.tablet_last_event = Some(event);
-            self.tablet_events_sent = self.tablet_events_sent.saturating_add(1);
-            self.tablet_last_error = None;
-        } else {
-            tracing::warn!(
-                target: crate::logging::target::INPUT,
-                sequence = event.metadata.sequence,
-                region_id = viewport.region_id().get(),
-                "region pen event failed to enqueue on session transport",
-            );
-            self.tablet_last_error =
-                Some("pen event failed to enqueue on session transport".to_string());
+        self.pen.borrow_mut().publish_link(link);
+    }
+
+    /// Takes what pen forwarding reported since the last call: a status
+    /// line from a fail-closed reset, the last input type sent, and whether
+    /// someone is using the pen.
+    fn absorb_pen_report(&mut self) {
+        let (status, sent, activity) = {
+            let mut pen = self.pen.borrow_mut();
+            (
+                pen.take_pending_status(),
+                pen.take_last_input_sent(),
+                pen.take_activity(),
+            )
+        };
+        if let Some(status) = status {
+            self.status = status;
+        }
+        if let Some((input_type, at)) = sent {
+            self.last_input_sent_type = input_type.to_string();
+            self.last_input_sent_at = Some(at);
+        }
+        if activity {
+            self.last_local_input = Some(Instant::now());
         }
     }
 
-    fn send_routed_pen_event(&mut self, event: PenEvent, region_viewport: Option<RegionViewport>) {
-        if let Some(region_viewport) = region_viewport {
-            self.send_region_pen_event(event, region_viewport);
-        } else if self.uses_region_input_wire() {
-            tracing::error!(
-                target: crate::logging::target::INPUT,
-                sequence = event.metadata.sequence,
-                "region pen event dropped because no authoritative viewport was resolved",
-            );
-            self.tablet_last_error =
-                Some("region pen event had no authoritative viewport".to_string());
+    /// The legacy single-monitor wire message for one pen event (see
+    /// `ui::pen_input::pen_event_msg`).
+    #[cfg(test)]
+    fn pen_event_msg(
+        &self,
+        event: &arcen_input::PenEvent,
+    ) -> crate::protocol::messages::PenEventMsg {
+        crate::ui::pen_input::pen_event_msg(event, self.remote_frame_size)
+    }
+
+    /// Sends one pen event through its region (or the legacy wire when no
+    /// region applies), exactly as a sample from the AppKit callback is sent.
+    #[cfg(test)]
+    fn send_routed_pen_event(
+        &mut self,
+        event: arcen_input::PenEvent,
+        region_viewport: Option<RegionViewport>,
+    ) {
+        self.sync_pen_link();
+        self.pen.borrow_mut().send_routed(event, region_viewport);
+        self.absorb_pen_report();
+    }
+
+    #[cfg(test)]
+    fn send_region_pen_event(&mut self, event: arcen_input::PenEvent, viewport: RegionViewport) {
+        self.send_routed_pen_event(event, Some(viewport));
+    }
+
+    #[cfg(test)]
+    fn send_pen_event(&mut self, event: arcen_input::PenEvent) {
+        self.send_routed_pen_event(event, None);
+    }
+
+    /// This pass's pen routing: the root video rectangle, multi-window
+    /// targets and region viewports the AppKit callback maps samples
+    /// through until the next pass.
+    fn pen_route(&mut self, image_rect: egui::Rect, window_height: f64) -> PenRoute {
+        let multi_window_active = self.multi_window.is_active();
+        // Legacy/single-window sessions are unambiguous: exactly one native
+        // window exists, so every sample belongs to root. The instant a
+        // multi-window attempt begins every sample must be positively
+        // resolved by window number instead (see
+        // `tablet_root_fallback_allowed`).
+        let root_window_number = if multi_window_active {
+            window_number_for_title(&self.current_root_window_title())
         } else {
-            self.send_pen_event(event);
+            None
+        };
+        let monitor_viewports = self
+            .secondary_tablet_targets
+            .iter()
+            .filter_map(|&(_, monitor_id, _)| {
+                self.region_viewport_for_monitor(monitor_id)
+                    .map(|viewport| (monitor_id, viewport))
+            })
+            .collect();
+        PenRoute {
+            root_view: Some(ViewSize::within_window(
+                window_height,
+                f64::from(image_rect.left()),
+                f64::from(image_rect.top()),
+                f64::from(image_rect.width()),
+                f64::from(image_rect.height()),
+            )),
+            multi_window_active,
+            multi_window_committed: self.multi_window.is_committed(),
+            root_window_number,
+            secondary_targets: self.secondary_tablet_targets.clone(),
+            primary_viewport: self.primary_region_viewport(),
+            monitor_viewports,
+            left_handed: self.tablet_left_handed,
         }
     }
 
-    fn send_pen_event(&mut self, event: PenEvent) {
-        let message = self.pen_event_msg(&event);
-        if message.validate().is_err() {
-            // Should be unreachable: `TabletMapper`/`TabletEventDispatcher`
-            // already validate every `PenEvent` before it reaches here. Fail
-            // closed rather than send a malformed sample.
-            self.reset_tablet_authority("pen event failed wire validation".to_string());
-            return;
-        }
-        let sent = self.send_session_json(
-            serde_json::to_value(&message).expect("PenEventMsg must serialize to JSON"),
-        );
-        if sent {
-            tracing::debug!(
-                target: crate::logging::target::INPUT,
-                sequence = message.sequence,
-                tool = ?message.tool,
-                in_proximity = message.in_proximity,
-                touching = message.touching,
-                buttons = message.buttons,
-                pressure = message.pressure,
-                "pen event forwarded to host transport",
-            );
-            self.tablet_last_event = Some(event);
-            self.tablet_events_sent = self.tablet_events_sent.saturating_add(1);
-            self.tablet_last_error = None;
-            self.record_input_sent("pen_event");
-        } else {
-            tracing::warn!(
-                target: crate::logging::target::INPUT,
-                sequence = message.sequence,
-                tool = ?message.tool,
-                in_proximity = message.in_proximity,
-                touching = message.touching,
-                buttons = message.buttons,
-                "pen event failed to enqueue on session transport",
-            );
-            self.tablet_last_error =
-                Some("pen event failed to enqueue on session transport".to_string());
-        }
-    }
-
-    /// Drain every native tablet sample queued since the last frame, map
-    /// each through the current `image_rect`/window geometry, and fold the
-    /// result through the edge-preserving dispatcher. Sends the accepted
-    /// batch over the wire only while pen input is enabled and negotiated;
-    /// otherwise the mapper/dispatcher still run (so the local-only Tablet
-    /// Monitor panel and capability probe stay live for human validation)
-    /// but nothing is sent and no mouse suppression occurs.
+    /// Publishes this pass's pen routing and drains any events the AppKit
+    /// monitor had to queue. Pen samples are otherwise mapped and sent from
+    /// the monitor callback the moment AppKit dispatches them (see
+    /// `ui::pen_input`), never on this pass.
     ///
-    /// Before draining, also checks whether `TabletRuntime`'s producer-side
-    /// `BoundedSampleQueue` has dropped any raw sample since the last
-    /// frame (see `note_tablet_producer_dropped_count`) — a loss there
-    /// never reaches this dispatch pipeline at all, so it must be checked
-    /// independently of, and in addition to, the dispatcher's own batch
-    /// overflow below.
-    ///
-    /// On dispatcher batch overflow, resets tablet authority (fail closed)
-    /// and surfaces an error rather than silently losing an edge.
+    /// Before that, checks whether the monitor's producer-side
+    /// `BoundedSampleQueue` dropped anything since the last pass (see
+    /// `note_tablet_producer_dropped_count`): a loss there never reaches
+    /// the dispatcher at all.
     fn process_tablet_samples(&mut self, image_rect: egui::Rect, window_height: f64) {
         let Some(dropped_now) = self
             .tablet_runtime
@@ -15172,196 +15722,49 @@ impl ArcenApp {
             return;
         };
         self.note_tablet_producer_dropped_count(dropped_now);
-        let Some(runtime) = &self.tablet_runtime else {
-            return;
-        };
-        let raw_samples = runtime.drain();
-        if raw_samples.is_empty() {
-            return;
-        }
-        self.last_local_input = Some(Instant::now());
-        tracing::debug!(
-            target: crate::logging::target::INPUT,
-            raw_samples = raw_samples.len(),
-            dropped_total = dropped_now,
-            "drained native tablet samples from AppKit queue",
-        );
-        let root_view = ViewSize::within_window(
-            window_height,
-            f64::from(image_rect.left()),
-            f64::from(image_rect.top()),
-            f64::from(image_rect.width()),
-            f64::from(image_rect.height()),
-        );
-        // Legacy/single-window sessions -- no multi-window attempt in
-        // progress *or* committed at all -- are unambiguous: exactly one
-        // native window can ever exist, so every sample belongs to root
-        // regardless of whether its carried `window_number` can be
-        // independently confirmed this frame -- preserves the
-        // pre-multi-monitor behavior byte-for-byte and never makes
-        // single-monitor pen input depend on a fresh AppKit window lookup
-        // succeeding every frame.
-        //
-        // The instant a multi-window attempt begins (pending *or*
-        // committed) genuine ambiguity exists and every sample must be
-        // positively resolved instead -- this must never fall back to
-        // `self.secondary_tablet_targets.is_empty()` as its own signal:
-        // that vector can legitimately still be empty for one or more
-        // frames after a multi-window attempt has begun (e.g. a
-        // just-opened secondary viewport whose own window number this
-        // exact frame's `drive_multi_window` call has not yet resolved
-        // into an entry), and treating "no secondary targets recorded yet"
-        // as "no multi-window attempt exists" would let a stray/ambiguous
-        // sample bypass straight through the root fallback below instead
-        // of being correctly dropped as ambiguous.
-        let multi_window_attempt_active = self.multi_window.is_active();
-        let root_window_number = if multi_window_attempt_active {
-            window_number_for_title(&self.current_root_window_title())
-        } else {
-            None
-        };
-        // Per the "input paused until commit" requirement -- the exact
-        // same gate `drive_multi_window`'s results loop already applies to
-        // secondary mouse/keyboard input. A secondary viewport's native
-        // window can legitimately exist (and receive real AppKit tablet
-        // callbacks) during the brief post-open, pre-confirmation window
-        // before every planned viewport has genuinely bound its exact
-        // assigned display; a sample landing there must be unavailable,
-        // never forwarded, until this transaction actually commits. Root's
-        // own samples are entirely unaffected: root behavior never depends
-        // on multi-window commit state.
-        let multi_window_committed = self.multi_window.is_committed();
-        let mut mapped = Vec::with_capacity(raw_samples.len());
-        let mut dropped_ambiguous = 0usize;
-        let mut dropped_uncommitted = 0usize;
-        for raw in raw_samples {
-            self.tablet_probe.observe(raw);
-            let target = if tablet_root_fallback_allowed(multi_window_attempt_active) {
-                Some((root_view, None))
-            } else {
-                resolve_tablet_sample_target(
-                    raw.window_number(),
-                    root_window_number,
-                    root_view,
-                    &self.secondary_tablet_targets,
-                )
-            };
-            let Some((view, monitor_id)) = target else {
-                dropped_ambiguous += 1;
-                continue;
-            };
-            if !tablet_sample_forward_allowed(monitor_id, multi_window_committed) {
-                dropped_uncommitted += 1;
-                continue;
-            }
-            let metadata = arcen_input::LowLatencyMetadata {
-                sequence: self.next_input_sequence(),
-                timestamp_ns: Self::now_epoch_ns(),
-                coalescable: true,
-            };
-            let event = match raw {
-                crate::tablet::RawTabletSample::Point(point) => {
-                    self.tablet_mapper.on_point(point, view, metadata)
-                }
-                crate::tablet::RawTabletSample::Proximity(proximity) => {
-                    self.tablet_mapper.on_proximity(proximity, view, metadata)
-                }
-            };
-            if let Some(mut event) = event {
-                if self.tablet_left_handed {
-                    event.x = 1.0 - event.x;
-                    event.tilt_x_degrees = -event.tilt_x_degrees;
-                }
-                let region_viewport = match monitor_id {
-                    Some(monitor_id) => self
-                        .region_runtime
-                        .as_ref()
-                        .and_then(|runtime| runtime.viewport_for_monitor(monitor_id)),
-                    None => self.primary_region_viewport(),
-                };
-                if let Some(region_viewport) = region_viewport {
-                    self.tablet_region_viewports
-                        .insert(event.metadata.sequence, region_viewport);
-                }
-                mapped.push(event);
-            }
-        }
-        if dropped_ambiguous > 0 {
-            tracing::warn!(
-                target: crate::logging::target::INPUT,
-                dropped_ambiguous,
-                "dropped native tablet sample(s) whose window matched neither root nor any committed secondary viewport",
-            );
-        }
-        if dropped_uncommitted > 0 {
-            // Expected and routine during the brief post-open,
-            // pre-confirmation window every multi-window entry passes
-            // through -- not a warning-worthy anomaly like
-            // `dropped_ambiguous` above.
-            tracing::debug!(
-                target: crate::logging::target::INPUT,
-                dropped_uncommitted,
-                "dropped native tablet sample(s) resolved to a secondary viewport that has not yet committed",
-            );
-        }
-        if mapped.is_empty() {
-            tracing::debug!(
-                target: crate::logging::target::INPUT,
-                "native tablet samples produced no valid pen events after mapping"
-            );
-            return;
-        }
-        let mapped_count = mapped.len();
-        match self.tablet_dispatcher.dispatch(mapped) {
-            Ok(batch) => {
-                let send =
-                    tablet_mode_allows_typed_pen(self.tablet_mode_active) && self.pen_negotiated;
-                let dispatched_count = batch.len();
-                if !send && !batch.is_empty() {
-                    // Level 3 diagnostic: explain why dispatched samples are
-                    // not being forwarded.  Logged once per batch to keep
-                    // trace output readable at 100 Hz pen sample rates.
-                    tracing::debug!(
-                        target: crate::logging::target::INPUT,
-                        batch_len = batch.len(),
-                        tablet_mode_active = ?self.tablet_mode_active,
-                        tablet_input_enabled = self.tablet_input_enabled,
-                        pen_negotiated = self.pen_negotiated,
-                        "pen samples dispatched locally but NOT sent (gate closed)",
-                    );
-                }
+        self.sync_pen_link();
+        let route = self.pen_route(image_rect, window_height);
+        let queued: Vec<TabletMonitorEvent> = self
+            .tablet_runtime
+            .as_ref()
+            .map(crate::tablet::TabletRuntime::drain)
+            .unwrap_or_default();
+        {
+            let mut pen = self.pen.borrow_mut();
+            pen.publish_route(route);
+            if !queued.is_empty() {
                 tracing::debug!(
                     target: crate::logging::target::INPUT,
-                    mapped_count,
-                    dispatched_count,
-                    send,
-                    tablet_mode_active = ?self.tablet_mode_active,
-                    pen_negotiated = self.pen_negotiated,
-                    "tablet pipeline dispatch batch ready",
+                    queued = queued.len(),
+                    dropped_total = dropped_now,
+                    "drained tablet events the AppKit monitor had to queue",
                 );
-                for event in batch {
-                    let region_viewport = self
-                        .tablet_region_viewports
-                        .remove(&event.metadata.sequence);
-                    self.last_pen_region_viewport = region_viewport;
-                    self.tablet_last_event = Some(event);
-                    if self.tablet_mode_active == TabletModeMsg::UsbTabletBridge {
-                        if !self.send_hard_usb_pen(event) {
-                            self.tablet_last_error =
-                                Some("Hard USB pen state failed to reach transport".to_string());
-                        }
-                    } else if send {
-                        self.send_routed_pen_event(event, region_viewport);
-                    }
-                }
-            }
-            Err(_overflow) => {
-                self.reset_tablet_authority(
-                    "tablet input queue overflow; pen fell back to mouse emulation".to_string(),
-                );
+                pen.on_monitor_events(queued);
             }
         }
-        self.tablet_region_viewports.clear();
+        self.absorb_pen_report();
+    }
+
+    /// The pass has sent its keyboard and pointer-button input: pen samples
+    /// held behind it may go now, in order.
+    fn complete_pen_pass(&mut self) {
+        self.complete_pen_pass_at(Instant::now());
+    }
+
+    /// As [`Self::complete_pen_pass`], except that a key release the input
+    /// method swallowed keeps pen samples held until it has been recovered
+    /// and sent: the person let go of that key before those samples, so the
+    /// host must see the release first. Bounded by
+    /// [`MAX_PEN_HOLD_FOR_RECOVERED_RELEASE`] in case recovery never runs
+    /// (keyboard focus moved away).
+    fn complete_pen_pass_at(&mut self, now: Instant) {
+        let pending = self.text_input.release_check_after().is_some();
+        let (next, hold) = self.pen_recovery_hold.step(pending, now);
+        self.pen_recovery_hold = next;
+        if !hold {
+            self.pen.borrow_mut().ui_pass_completed();
+        }
+        self.absorb_pen_report();
     }
 
     /// React to an increase in `TabletRuntime::dropped_count()` — the
@@ -15396,84 +15799,37 @@ impl ArcenApp {
         ));
     }
 
-    /// Emit a final synthetic out-of-proximity `PenEvent` if the dispatcher
-    /// still believed the tool was in proximity — sending it over the wire
-    /// when pen input is negotiated, or storing it locally (for the Tablet
-    /// Monitor panel) otherwise — without yet touching dispatcher/mapper
-    /// state. Shared by every abnormal-termination path (focus loss,
-    /// setting disable, disconnect/reconnect, terminal teardown, dispatcher
-    /// batch overflow, and producer-queue overflow) so the host is never
-    /// left believing a pen/eraser is still down once local authority
-    /// drops. A no-op when not in proximity.
-    ///
-    /// Reuses `self.last_pen_region_viewport`, so a region-session release
-    /// stays on the exact region that owned the latest real sample. Legacy
-    /// single-monitor sessions continue using their root frame mapping.
+    /// Emits a final synthetic out-of-proximity sample if the dispatcher
+    /// still believed the tool was in proximity, so the host is never left
+    /// believing a pen is down once local authority drops. Shared by every
+    /// abnormal-termination path. Reuses the region of the latest real
+    /// sample.
+    #[cfg(test)]
     fn emit_final_pen_release_if_in_proximity(&mut self) {
-        if !self.tablet_dispatcher.in_proximity() {
-            return;
-        }
-        let metadata = arcen_input::LowLatencyMetadata {
-            sequence: self.next_input_sequence(),
-            timestamp_ns: Self::now_epoch_ns(),
-            coalescable: false,
-        };
-        let region_viewport = self.last_pen_region_viewport;
-        if let Some(release) = self.tablet_dispatcher.release_event(metadata) {
-            if tablet_mode_allows_typed_pen(self.tablet_mode_active) && self.pen_negotiated {
-                self.send_routed_pen_event(release, region_viewport);
-            } else {
-                self.tablet_last_event = Some(release);
-            }
-        }
-        self.last_pen_region_viewport = None;
+        self.sync_pen_link();
+        self.pen.borrow_mut().emit_final_release_if_in_proximity();
+        self.absorb_pen_report();
     }
 
-    /// Fail-closed reset of tablet authority: emits a final out-of-proximity
-    /// release if the tool was still in proximity (see
-    /// `emit_final_pen_release_if_in_proximity`), clears the dispatcher and
-    /// mapper state (so the next sample is always treated as a fresh edge,
-    /// never a stale continuation), increments the overflow counter, and
-    /// surfaces the error in both the status line and the Tablet Monitor
-    /// panel. Does not touch `pen_negotiated` — the host-negotiated
-    /// capability for this session is unchanged; only the local dispatch
-    /// pipeline's working state resets. Used for both a dispatcher batch
-    /// overflow and a producer-queue overflow (see
-    /// `note_tablet_producer_dropped_count`) — the two are handled
-    /// identically once detected.
+    /// Fail-closed reset of tablet authority: releases the pen if needed,
+    /// clears dispatcher and mapper state, counts the reset, and surfaces
+    /// the error in the status line and the Tablet Monitor panel. Does not
+    /// touch `pen_negotiated`.
     fn reset_tablet_authority(&mut self, message: String) {
-        self.emit_final_pen_release_if_in_proximity();
-        self.tablet_dispatcher.reset();
-        self.tablet_mapper = TabletMapper::new();
-        self.tablet_overflow_resets = self.tablet_overflow_resets.saturating_add(1);
-        tracing::error!(
-            target: crate::logging::target::INPUT,
-            %message,
-            "tablet authority reset",
-        );
-        self.tablet_last_error = Some(message.clone());
-        self.status = format!("Tablet input reset: {message}");
+        self.sync_pen_link();
+        let status = self.pen.borrow_mut().reset_authority(message);
+        self.absorb_pen_report();
+        self.status = status;
     }
 
-    /// Release pen authority for an abnormal termination that does not
+    /// Releases pen authority for an abnormal termination that does not
     /// arrive as a natural proximity-leave sample: focus loss, the setting
-    /// being disabled, disconnect/reconnect, or terminal session teardown.
-    /// Emits a final synthetic out-of-proximity `PenEventMsg` if the
-    /// dispatcher believed the tool was still in proximity, then resets the
-    /// dispatcher and mapper so the next session/sample starts clean. Returns
-    /// and logs `true` only when live pen authority actually transitioned.
+    /// being disabled, disconnect/reconnect, or session teardown. Returns
+    /// `true` only when live pen authority actually ended.
     fn release_pen_authority(&mut self, reason: &'static str) -> bool {
-        let had_authority = self.tablet_dispatcher.in_proximity();
-        self.emit_final_pen_release_if_in_proximity();
-        self.tablet_dispatcher.reset();
-        self.tablet_mapper = TabletMapper::new();
-        if had_authority {
-            tracing::debug!(
-                target: crate::logging::target::INPUT,
-                reason,
-                "tablet pen authority released",
-            );
-        }
+        self.sync_pen_link();
+        let had_authority = self.pen.borrow_mut().release_authority(reason);
+        self.absorb_pen_report();
         had_authority
     }
 
@@ -15485,7 +15841,7 @@ impl ArcenApp {
             self.last_pointer_view_pos = None;
             self.last_pointer_norm = None;
             if !self.multi_window.is_active() {
-                self.region_runtime = u32::try_from(width)
+                *self.region_runtime.borrow_mut() = u32::try_from(width)
                     .ok()
                     .zip(u32::try_from(height).ok())
                     .and_then(|(width, height)| {
@@ -15666,83 +16022,6 @@ fn should_dispatch_secondary_keyboard_events(
     Some(monitor_id) == winner
 }
 
-/// Resolves which viewport's own `ViewSize` (and, for a secondary viewport,
-/// which monitor) a single native tablet sample's carried `window_number`
-/// belongs to.
-///
-/// Matches `sample_window_number` first against `root_window_number` (the
-/// current window number `window_number_for_title(ROOT_WINDOW_TITLE)`
-/// resolved this frame), then against `secondary_targets`'s own committed
-/// `(window_number, monitor_id, view)` entries (kept fresh every
-/// `drive_multi_window` call). Returns `None` when neither matches -- a
-/// sample from a window this frame does not recognize as either root or a
-/// currently open secondary viewport must be dropped rather than
-/// misrouted through root's own rect (the "fail/drop ambiguous rather than
-/// misroute" requirement): a stale sample from a just-closed viewport, or
-/// one racing ahead of `secondary_tablet_targets`'s own refresh, is exactly
-/// the case this guards against.
-#[must_use]
-fn resolve_tablet_sample_target(
-    sample_window_number: isize,
-    root_window_number: Option<isize>,
-    root_view: ViewSize,
-    secondary_targets: &[(isize, arcen_media::SessionMonitorId, ViewSize)],
-) -> Option<(ViewSize, Option<arcen_media::SessionMonitorId>)> {
-    if root_window_number == Some(sample_window_number) {
-        return Some((root_view, None));
-    }
-    secondary_targets
-        .iter()
-        .find(|(window_number, _, _)| *window_number == sample_window_number)
-        .map(|&(_, monitor_id, view)| (view, Some(monitor_id)))
-}
-
-/// Whether a native tablet sample may skip positive window-number
-/// resolution altogether and be treated as root's own, purely because no
-/// multi-window attempt exists at all this frame.
-///
-/// `true` only when `multi_window_attempt_active` is `false` -- i.e.
-/// `MultiWindowSessionState::Inactive`, every legacy and single-monitor
-/// session, where exactly one native window can ever exist. The instant an
-/// attempt begins (`MultiWindowSessionState::Active`, pending *or*
-/// committed -- see `MultiWindowSessionState::is_active`), this must be
-/// `false` even before `secondary_tablet_targets` has resolved any entry
-/// yet this frame (e.g. a just-opened secondary viewport whose own window
-/// number `drive_multi_window` has not yet confirmed): callers must not
-/// substitute `secondary_tablet_targets.is_empty()` for this check, since
-/// that vector can legitimately still be empty for one or more frames
-/// after an attempt has begun, and doing so would let a genuinely
-/// ambiguous sample bypass straight through the root fallback instead of
-/// being positively resolved (and dropped if unmatched) via
-/// [`resolve_tablet_sample_target`].
-#[must_use]
-const fn tablet_root_fallback_allowed(multi_window_attempt_active: bool) -> bool {
-    !multi_window_attempt_active
-}
-
-/// Whether a tablet sample `resolve_tablet_sample_target` has already
-/// resolved to `monitor_id` may actually be forwarded this frame, given
-/// whether the owning multi-window transaction has committed.
-///
-/// Root's own samples (`monitor_id` is `None`) are never gated by this --
-/// root behavior never depends on multi-window commit state. A sample
-/// genuinely resolved to a secondary viewport's own window, however, must
-/// be unavailable/dropped until every planned viewport has confirmed
-/// native fullscreen bind and this transaction has committed -- exactly
-/// the same "input paused until commit" requirement
-/// `drive_multi_window`'s own `self.multi_window.is_committed()` gate
-/// already enforces for secondary mouse/keyboard input. A secondary
-/// viewport's native window can legitimately already exist (and receive
-/// real AppKit tablet callbacks) during the brief post-open,
-/// pre-confirmation window before that commit.
-#[must_use]
-const fn tablet_sample_forward_allowed(
-    monitor_id: Option<arcen_media::SessionMonitorId>,
-    multi_window_committed: bool,
-) -> bool {
-    monitor_id.is_none() || multi_window_committed
-}
-
 /// Whether root's own relative pointer lock (`self.pointer_lock`) must be
 /// force-released this frame because a secondary viewport now holds OS
 /// focus.
@@ -15826,6 +16105,42 @@ fn resolve_secondary_dispatch_local_fraction(
 /// Whether a viewport's own input this frame included the pointer: a move,
 /// a button edge or a wheel. Repaints for other reasons (a new video frame)
 /// carry none, and must never move the remote pointer.
+/// One pointer move or button from a pass's events, in arrival order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OrderedPointerEvent {
+    Moved(egui::Pos2),
+    Button {
+        pos: egui::Pos2,
+        wire_button: u8,
+        pressed: bool,
+    },
+}
+
+/// The pass's pointer moves and wire-mapped buttons, in the order they
+/// happened. Buttons without a wire mapping are skipped.
+fn ordered_pointer_events(events: &[egui::Event]) -> Vec<OrderedPointerEvent> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::PointerMoved(pos) => Some(OrderedPointerEvent::Moved(*pos)),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } => POINTER_BUTTON_WIRE_MAPPING
+                .iter()
+                .find(|(candidate, _)| candidate == button)
+                .map(|&(_, wire_button)| OrderedPointerEvent::Button {
+                    pos: *pos,
+                    wire_button,
+                    pressed: *pressed,
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
 fn viewport_saw_pointer_input(events: &[egui::Event]) -> bool {
     events.iter().any(|event| {
         matches!(
@@ -17127,6 +17442,20 @@ fn load_client_settings(
     // Legacy builds persisted this independently. It is intentionally ignored
     // now: the user-facing Colour Fidelity preset is the sole authority.
     settings.encode_intent = settings.color_fidelity.preset.encode_intent();
+    if let Some(mode) = value
+        .get("typing_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(arcen_input::text::TypingMode::from_token)
+    {
+        settings.typing_mode = mode;
+    }
+    if let Some(mode) = value
+        .get("option_key_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(arcen_input::text::OptionKeyMode::from_token)
+    {
+        settings.option_key_mode = mode;
+    }
     Ok(settings)
 }
 
@@ -17175,6 +17504,14 @@ fn save_client_settings(
     value.insert(
         "hidpi_streaming".to_string(),
         settings.hidpi_streaming.into(),
+    );
+    value.insert(
+        "typing_mode".to_string(),
+        settings.typing_mode.token().into(),
+    );
+    value.insert(
+        "option_key_mode".to_string(),
+        settings.option_key_mode.token().into(),
     );
     value.insert(
         "fullscreen_uses_notch_area".to_string(),
@@ -18115,6 +18452,11 @@ fn configure_native_menu(_options: &mut eframe::NativeOptions) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::messages::PenToolMsg;
+    use crate::ui::pen_input::{
+        resolve_tablet_sample_target, tablet_root_fallback_allowed, tablet_sample_forward_allowed,
+    };
+    use arcen_input::PenEvent;
 
     #[test]
     fn the_ui_load_meter_reports_passes_and_cpu_per_window_then_resets() {
@@ -18177,6 +18519,86 @@ mod tests {
             UI_REPAINT_INTERVAL
         );
         assert_eq!(ui_poll_interval(true, None), UI_REPAINT_INTERVAL);
+    }
+
+    #[test]
+    fn the_ui_never_polls_faster_than_the_display_refreshes() {
+        let thirty_hz = Duration::from_secs(1) / 30;
+        let one_twenty_hz = Duration::from_secs(1) / 120;
+        // A 30 Hz panel: a 16 ms request would block in nextDrawable.
+        assert_eq!(
+            paced_ui_poll_interval(UI_REPAINT_INTERVAL, Some(thirty_hz)),
+            thirty_hz
+        );
+        // A faster panel never speeds the UI up beyond what was asked.
+        assert_eq!(
+            paced_ui_poll_interval(UI_REPAINT_INTERVAL, Some(one_twenty_hz)),
+            UI_REPAINT_INTERVAL
+        );
+        assert_eq!(
+            paced_ui_poll_interval(UI_IDLE_REPAINT_INTERVAL, Some(thirty_hz)),
+            UI_IDLE_REPAINT_INTERVAL.max(thirty_hz)
+        );
+        assert_eq!(
+            paced_ui_poll_interval(UI_REPAINT_INTERVAL, None),
+            UI_REPAINT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn every_pointer_move_and_button_of_a_pass_is_kept_in_order() {
+        let events = [
+            egui::Event::PointerMoved(egui::pos2(1.0, 1.0)),
+            egui::Event::PointerMoved(egui::pos2(2.0, 2.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(2.0, 2.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(egui::pos2(3.0, 3.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(3.0, 3.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: egui::pos2(3.0, 3.0),
+                button: egui::PointerButton::Extra1,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: egui::pos2(4.0, 4.0),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        assert_eq!(
+            ordered_pointer_events(&events),
+            vec![
+                OrderedPointerEvent::Moved(egui::pos2(1.0, 1.0)),
+                OrderedPointerEvent::Moved(egui::pos2(2.0, 2.0)),
+                OrderedPointerEvent::Button {
+                    pos: egui::pos2(2.0, 2.0),
+                    wire_button: 1,
+                    pressed: true,
+                },
+                OrderedPointerEvent::Moved(egui::pos2(3.0, 3.0)),
+                OrderedPointerEvent::Button {
+                    pos: egui::pos2(3.0, 3.0),
+                    wire_button: 1,
+                    pressed: false,
+                },
+                OrderedPointerEvent::Button {
+                    pos: egui::pos2(4.0, 4.0),
+                    wire_button: 3,
+                    pressed: true,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -19399,6 +19821,279 @@ mod tests {
         (app, receiver)
     }
 
+    #[test]
+    fn a_pen_sample_reaches_the_session_from_the_monitor_callback_without_a_ui_pass() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.tablet_mode_active = TabletModeMsg::LocalTermination;
+        app.pen_negotiated = true;
+        app.remote_frame_size = Some([1920, 1080]);
+        app.sync_pen_link();
+        app.pen.borrow_mut().begin_pass();
+        app.pen.borrow_mut().publish_route(PenRoute {
+            root_view: Some(ViewSize::new(1000.0, 500.0)),
+            ..PenRoute::default()
+        });
+        let before = app.input_sequence.get();
+        let sample = crate::tablet::NativeTabletPoint {
+            window_x: 500.0,
+            window_y: 250.0,
+            pressure: 0.6,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation_degrees: 0.0,
+            buttons: crate::tablet::TabletButtonMask::new(crate::tablet::TabletButtonMask::TIP),
+            device_id: 1,
+            tool: crate::tablet::NativeTabletTool::Pen,
+            window_number: 1,
+        };
+        let pen = Rc::clone(&app.pen);
+        assert!(PenInput::offer(
+            &pen,
+            TabletMonitorEvent::Sample {
+                sample: crate::tablet::RawTabletSample::Point(sample),
+                dispatch_age: Duration::ZERO,
+            }
+        ));
+        let sent = receive_json(&mut receiver);
+        assert_eq!(sent["type"], "pen_event");
+        assert_eq!(sent["touching"], true);
+        // Pen and pointer share one session-global sequence.
+        assert_eq!(sent["sequence"], before + 1);
+        assert_eq!(app.input_sequence.get(), before + 1);
+        assert!(app.pen_has_authority());
+    }
+
+    #[test]
+    fn a_pen_stroke_held_behind_a_key_suppresses_its_emulated_mouse_press() {
+        // Space-to-pan: a key edge raises the ordering barrier, then the pen
+        // comes into proximity and touches down. Those samples wait for this
+        // pass, but AppKit's mouse-emulation press for the same tip-down is
+        // already in the pass's events. It must not reach the host as a
+        // mouse button, or the pen path would later swallow its release.
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.tablet_mode_active = TabletModeMsg::LocalTermination;
+        app.pen_negotiated = true;
+        app.remote_frame_size = Some([1920, 1080]);
+        app.sync_pen_link();
+        app.pen.borrow_mut().begin_pass();
+        app.pen.borrow_mut().publish_route(PenRoute {
+            root_view: Some(ViewSize::new(1000.0, 500.0)),
+            ..PenRoute::default()
+        });
+        let pen = Rc::clone(&app.pen);
+        assert!(PenInput::offer(&pen, TabletMonitorEvent::InputEdge));
+        let tip_down = crate::tablet::NativeTabletPoint {
+            window_x: 500.0,
+            window_y: 250.0,
+            pressure: 0.6,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation_degrees: 0.0,
+            buttons: crate::tablet::TabletButtonMask::new(crate::tablet::TabletButtonMask::TIP),
+            device_id: 1,
+            tool: crate::tablet::NativeTabletTool::Pen,
+            window_number: 1,
+        };
+        assert!(PenInput::offer(
+            &pen,
+            TabletMonitorEvent::Sample {
+                sample: crate::tablet::RawTabletSample::Point(tip_down),
+                dispatch_age: Duration::ZERO,
+            }
+        ));
+        while receiver.try_recv().is_ok() {}
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
+        let press_at = egui::pos2(500.0, 250.0);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            events: vec![
+                egui::Event::PointerMoved(press_at),
+                egui::Event::PointerButton {
+                    pos: press_at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| app.viewer_input_surface(ui));
+
+        let mut sent = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let SessionCommand::Json(value) = command {
+                sent.push(value);
+            }
+        }
+        assert!(
+            sent.iter().all(|value| {
+                let kind = value["type"].as_str().unwrap_or_default();
+                !kind.starts_with("mouse_")
+                    && kind != "region_pointer_button"
+                    && kind != "region_pointer_motion"
+            }),
+            "no mouse input may leak while a held pen owns the pointer: {sent:?}"
+        );
+        assert!(app.remote_pointer_buttons.iter().all(|held| !held));
+        // The held stroke itself was sent once the pass completed.
+        assert!(sent.iter().any(|value| value["type"] == "pen_event"));
+        assert!(app.pen_has_authority());
+    }
+
+    #[test]
+    fn pen_samples_after_a_swallowed_key_release_wait_for_its_recovery() {
+        use arcen_input::text::LOST_RELEASE_GRACE;
+        let (mut app, mut receiver) = app_with_command_channel();
+        take_committed_text(&mut app);
+        app.tablet_mode_active = TabletModeMsg::LocalTermination;
+        app.pen_negotiated = true;
+        app.remote_frame_size = Some([1920, 1080]);
+        app.sync_pen_link();
+        app.pen.borrow_mut().begin_pass();
+        app.pen.borrow_mut().publish_route(PenRoute {
+            root_view: Some(ViewSize::new(1000.0, 500.0)),
+            ..PenRoute::default()
+        });
+        app.process_keyboard_event(&key_event(egui::Key::R, true, egui::Modifiers::NONE));
+        assert_eq!(receive_json(&mut receiver)["pressed"], true);
+
+        // The key is let go during a composition: AppKit's text system
+        // swallows the release, but the monitor saw the key event.
+        let pen = Rc::clone(&app.pen);
+        assert!(PenInput::offer(&pen, TabletMonitorEvent::InputEdge));
+        let hover = crate::tablet::NativeTabletPoint {
+            window_x: 500.0,
+            window_y: 250.0,
+            pressure: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation_degrees: 0.0,
+            buttons: crate::tablet::TabletButtonMask::new(0),
+            device_id: 1,
+            tool: crate::tablet::NativeTabletTool::Pen,
+            window_number: 1,
+        };
+        assert!(PenInput::offer(
+            &pen,
+            TabletMonitorEvent::Sample {
+                sample: crate::tablet::RawTabletSample::Point(hover),
+                dispatch_age: Duration::ZERO,
+            }
+        ));
+        let start = Instant::now();
+        // Pass 1: recovery notices the key is up but waits its grace; the
+        // pen sample stays held behind the unsent release.
+        app.recover_lost_releases(start, |_| false);
+        app.complete_pen_pass_at(start);
+        assert!(
+            receiver.try_recv().is_err(),
+            "nothing may overtake the release"
+        );
+        // Pass 2: the release is recovered and sent, then the pen sample.
+        app.recover_lost_releases(start + LOST_RELEASE_GRACE, |_| false);
+        app.complete_pen_pass_at(start + LOST_RELEASE_GRACE);
+        let release = receive_json(&mut receiver);
+        assert_eq!(release["pressed"], false);
+        assert_eq!(receive_json(&mut receiver)["type"], "pen_event");
+    }
+
+    #[test]
+    fn a_recovery_that_never_runs_holds_the_pen_only_briefly() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        take_committed_text(&mut app);
+        app.tablet_mode_active = TabletModeMsg::LocalTermination;
+        app.pen_negotiated = true;
+        app.sync_pen_link();
+        app.pen.borrow_mut().begin_pass();
+        app.pen.borrow_mut().publish_route(PenRoute {
+            root_view: Some(ViewSize::new(1000.0, 500.0)),
+            ..PenRoute::default()
+        });
+        app.process_keyboard_event(&key_event(egui::Key::R, true, egui::Modifiers::NONE));
+        let _ = receive_json(&mut receiver);
+        let start = Instant::now();
+        app.recover_lost_releases(start, |_| false);
+        let pen = Rc::clone(&app.pen);
+        assert!(PenInput::offer(&pen, TabletMonitorEvent::InputEdge));
+        let hover = crate::tablet::NativeTabletPoint {
+            window_x: 500.0,
+            window_y: 250.0,
+            pressure: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation_degrees: 0.0,
+            buttons: crate::tablet::TabletButtonMask::new(0),
+            device_id: 1,
+            tool: crate::tablet::NativeTabletTool::Pen,
+            window_number: 1,
+        };
+        assert!(PenInput::offer(
+            &pen,
+            TabletMonitorEvent::Sample {
+                sample: crate::tablet::RawTabletSample::Point(hover),
+                dispatch_age: Duration::ZERO,
+            }
+        ));
+        app.complete_pen_pass_at(start);
+        assert!(receiver.try_recv().is_err());
+        app.complete_pen_pass_at(start + MAX_PEN_HOLD_FOR_RECOVERED_RELEASE);
+        assert_eq!(receive_json(&mut receiver)["type"], "pen_event");
+    }
+
+    #[test]
+    fn the_recovery_hold_expires_once_per_pending_release() {
+        let start = Instant::now();
+        let cap = MAX_PEN_HOLD_FOR_RECOVERED_RELEASE;
+        let (state, hold) = PenRecoveryHold::Idle.step(true, start);
+        assert!(hold);
+        let (state, hold) = state.step(true, start + cap / 2);
+        assert!(hold);
+        let (state, hold) = state.step(true, start + cap);
+        assert!(!hold, "the bound has run out");
+        assert_eq!(state, PenRecoveryHold::Expired);
+        // Still pending: the bound does not re-arm.
+        for later in 2..10u32 {
+            let (next, hold) = state.step(true, start + cap * later);
+            assert!(!hold);
+            assert_eq!(next, PenRecoveryHold::Expired);
+        }
+        // Only once nothing is pending does a new release hold again.
+        let (state, hold) = state.step(false, start + cap * 10);
+        assert!(!hold);
+        assert_eq!(state, PenRecoveryHold::Idle);
+        assert!(state.step(true, start + cap * 11).1);
+    }
+
+    #[test]
+    fn focus_loss_leaves_no_swallowed_release_to_recover() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        take_committed_text(&mut app);
+        app.process_keyboard_event(&key_event(egui::Key::R, true, egui::Modifiers::NONE));
+        assert_eq!(receive_json(&mut receiver)["pressed"], true);
+        app.recover_lost_releases(Instant::now(), |_| false);
+        assert!(app.text_input.release_check_after().is_some());
+
+        app.release_remote_keys("focus_out");
+
+        assert!(
+            app.text_input.release_check_after().is_none(),
+            "focus loss released every key; nothing may keep holding the pen"
+        );
+        let pen = Rc::clone(&app.pen);
+        app.pen.borrow_mut().begin_pass();
+        app.pen.borrow_mut().publish_route(PenRoute {
+            root_view: Some(ViewSize::new(1000.0, 500.0)),
+            ..PenRoute::default()
+        });
+        assert!(PenInput::offer(&pen, TabletMonitorEvent::InputEdge));
+        app.complete_pen_pass_at(Instant::now());
+        assert_eq!(app.pen_recovery_hold, PenRecoveryHold::Idle);
+    }
+
     fn test_session_handle() -> crate::transport::websocket::SessionHandle {
         let (_media_tx, media) = crate::pipeline::frame_queue::incoming_media_inbox();
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -19632,9 +20327,13 @@ mod tests {
         app.sync_media_state(&egui::Context::default());
 
         let truth = app.negotiated_truth.as_ref().expect("truth");
+        // The served update's reason overrides the hello and is named.
         assert_eq!(
             truth.pipeline_degradation.as_deref(),
-            Some("PIPELINE DEGRADED: requested grading, host served custom")
+            Some(
+                "PIPELINE DEGRADED: requested grading, host served custom \
+                 (session encoder acceleration unknown)"
+            )
         );
         assert!(session_truth::should_show_truth_badge(truth));
         assert!(
@@ -20242,6 +20941,7 @@ mod tests {
             qt_key: 0x35,
             pressed: true,
             keypad: true,
+            key_code: 87,
         });
 
         app.process_keyboard_event(&key_event(egui::Key::Num5, true, egui::Modifiers::NONE));
@@ -20249,6 +20949,169 @@ mod tests {
         let press = receive_json(&mut receiver);
         assert_eq!(press["scan_code"], 0x35);
         assert_eq!(press["modifiers"], 0x10);
+    }
+
+    fn take_committed_text(app: &mut ArcenApp) {
+        app.text_input.configure(
+            arcen_input::text::TypingMode::Auto,
+            arcen_input::text::OptionKeyMode::default(),
+        );
+        app.text_input
+            .set_host(arcen_protocol::messages::InputCapabilitiesMsg {
+                text_commit: arcen_protocol::messages::InputCapabilityAvailability::Available,
+                ..arcen_protocol::messages::InputCapabilitiesMsg::default()
+            });
+    }
+
+    #[test]
+    fn keypad_keys_whose_release_a_composition_swallowed_are_released_as_pressed() {
+        use arcen_input::text::LOST_RELEASE_GRACE;
+        // Keypad 1, Enter, + and *, each with its own virtual key code.
+        for (key, qt_key, key_code) in [
+            (egui::Key::Num1, 0x31, 83_u16),
+            (egui::Key::Enter, 0x0100_0005, 76),
+            (egui::Key::Plus, 0x2B, 69),
+            (egui::Key::Num8, 0x2A, 67),
+        ] {
+            let (mut app, mut receiver) = app_with_command_channel();
+            take_committed_text(&mut app);
+            let metadata = NativeKeyMetadata {
+                key,
+                qt_key,
+                pressed: true,
+                keypad: true,
+                key_code,
+            };
+            app.native_key_metadata.push_back(metadata);
+            let event = if metadata.requires_synthetic_event() {
+                synthetic_native_key_event(metadata, egui::Modifiers::NONE)
+            } else {
+                key_event(key, true, egui::Modifiers::NONE)
+            };
+            app.process_keyboard_event(&event);
+            let press = receive_json(&mut receiver);
+            assert_eq!(press["scan_code"], qt_key);
+            assert_eq!(press["modifiers"], 0x10);
+            // A dead key starts a composition; the key is let go during it
+            // and AppKit swallows the release.
+            app.dispatch_routed_keyboard_events(&[egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "´".to_owned(),
+                active_range_chars: None,
+            })]);
+            let start = std::time::Instant::now();
+            let up = |code: u16| code != key_code;
+            app.recover_lost_releases(start, up);
+            assert!(
+                receiver.try_recv().is_err(),
+                "a queued release may still come"
+            );
+            app.recover_lost_releases(start + LOST_RELEASE_GRACE, up);
+            let release = receive_json(&mut receiver);
+            assert_eq!(release["scan_code"], qt_key, "{key:?}");
+            assert_eq!(release["pressed"], false);
+            assert_eq!(release["modifiers"], 0x10, "still a keypad key");
+            app.recover_lost_releases(start + LOST_RELEASE_GRACE * 3, |_| false);
+            // The real release, should it arrive after all, is an orphan.
+            app.native_key_metadata.push_back(NativeKeyMetadata {
+                pressed: false,
+                ..metadata
+            });
+            let release_event = if metadata.requires_synthetic_event() {
+                synthetic_native_key_event(
+                    NativeKeyMetadata {
+                        pressed: false,
+                        ..metadata
+                    },
+                    egui::Modifiers::NONE,
+                )
+            } else {
+                key_event(key, false, egui::Modifiers::NONE)
+            };
+            app.process_keyboard_event(&release_event);
+            assert!(
+                receiver.try_recv().is_err(),
+                "exactly one release for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keypad_decimal_held_past_the_grace_is_not_released_whatever_the_layout() {
+        use arcen_input::text::LOST_RELEASE_GRACE;
+        // egui-winit has no physical key for keypad decimal: its event
+        // carries the logical key, '.' on a US layout and ',' on a
+        // Norwegian one. Keypad equals likewise.
+        for (logical, key, qt_key, key_code) in [
+            (egui::Key::Period, egui::Key::Period, 0x2E, 65_u16),
+            (egui::Key::Comma, egui::Key::Period, 0x2E, 65),
+            (egui::Key::Equals, egui::Key::Equals, 0x3D, 81),
+        ] {
+            let (mut app, mut receiver) = app_with_command_channel();
+            take_committed_text(&mut app);
+            app.native_key_metadata.push_back(NativeKeyMetadata {
+                key,
+                qt_key,
+                pressed: true,
+                keypad: true,
+                key_code,
+            });
+            app.process_keyboard_event(&egui::Event::Key {
+                key: logical,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let press = receive_json(&mut receiver);
+            assert_eq!(press["scan_code"], qt_key, "{logical:?}");
+            assert_eq!(press["modifiers"], 0x10, "a keypad key");
+            assert!(app.native_key_metadata.is_empty(), "its metadata was used");
+            let start = std::time::Instant::now();
+            let held = |code: u16| code == key_code;
+            for later in [0, 1, 2, 4] {
+                app.recover_lost_releases(start + LOST_RELEASE_GRACE * later, held);
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "held {logical:?} is never released"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_without_a_physical_key_is_never_released_for_lost() {
+        use arcen_input::text::LOST_RELEASE_GRACE;
+        let (mut app, mut receiver) = app_with_command_channel();
+        take_committed_text(&mut app);
+        app.process_keyboard_event(&egui::Event::Key {
+            key: egui::Key::Period,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        assert_eq!(receive_json(&mut receiver)["pressed"], true);
+        let start = std::time::Instant::now();
+        app.recover_lost_releases(start, |_| false);
+        app.recover_lost_releases(start + LOST_RELEASE_GRACE * 2, |_| false);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_release_still_queued_when_the_key_reads_up_is_sent_once() {
+        use arcen_input::text::LOST_RELEASE_GRACE;
+        let (mut app, mut receiver) = app_with_command_channel();
+        take_committed_text(&mut app);
+        app.process_keyboard_event(&key_event(egui::Key::R, true, egui::Modifiers::NONE));
+        assert_eq!(receive_json(&mut receiver)["pressed"], true);
+        // The keyboard says up before the release event is delivered.
+        let start = std::time::Instant::now();
+        app.recover_lost_releases(start, |_| false);
+        app.process_keyboard_event(&key_event(egui::Key::R, false, egui::Modifiers::NONE));
+        let release = receive_json(&mut receiver);
+        assert_eq!(release["pressed"], false);
+        app.recover_lost_releases(start + LOST_RELEASE_GRACE * 2, |_| false);
+        assert!(receiver.try_recv().is_err(), "exactly one release");
     }
 
     #[test]
@@ -20260,12 +21123,14 @@ mod tests {
                 qt_key: 0x2A,
                 pressed: true,
                 keypad: true,
+                key_code: 67,
             };
             let main_row_eight = NativeKeyMetadata {
                 key: egui::Key::Num8,
                 qt_key: 0x38,
                 pressed: true,
                 keypad: false,
+                key_code: 28,
             };
             app.native_key_metadata = if multiply_first {
                 VecDeque::from([multiply, main_row_eight])
@@ -20729,10 +21594,12 @@ mod tests {
             monitor_id,
         )));
         app.pointer_lock = true;
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
-        assert!(app.tablet_dispatcher.in_proximity());
+        assert!(app.pen.borrow_mut().dispatcher.in_proximity());
 
         let mut raw_input = egui::RawInput {
             focused: false,
@@ -20745,7 +21612,7 @@ mod tests {
             "raw_input_hook itself must never force-release pointer lock any more"
         );
         assert!(
-            app.tablet_dispatcher.in_proximity(),
+            app.pen.borrow_mut().dispatcher.in_proximity(),
             "raw_input_hook itself must never force-release pen authority any more"
         );
         assert_no_pointer_or_pen_release_was_sent(&mut receiver);
@@ -20764,7 +21631,9 @@ mod tests {
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
         app.sync_keyboard_focus_across_viewports(Some(FocusedKeyboardViewport::Root));
         app.pointer_lock = true;
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
@@ -20780,7 +21649,7 @@ mod tests {
         )));
 
         assert!(app.pointer_lock);
-        assert!(app.tablet_dispatcher.in_proximity());
+        assert!(app.pen.borrow_mut().dispatcher.in_proximity());
         assert_no_pointer_or_pen_release_was_sent(&mut receiver);
     }
 
@@ -20793,7 +21662,9 @@ mod tests {
             monitor_id,
         )));
         app.pointer_lock = true;
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
@@ -20811,7 +21682,7 @@ mod tests {
             "a genuine total focus loss must release pointer lock"
         );
         assert!(
-            !app.tablet_dispatcher.in_proximity(),
+            !app.pen.borrow_mut().dispatcher.in_proximity(),
             "a genuine total focus loss must release pen authority"
         );
         // Drain whatever release traffic this genuine loss produced
@@ -20822,7 +21693,7 @@ mod tests {
         // state must not re-release / double-release.
         app.sync_keyboard_focus_across_viewports(None);
         assert!(!app.pointer_lock);
-        assert!(!app.tablet_dispatcher.in_proximity());
+        assert!(!app.pen.borrow_mut().dispatcher.in_proximity());
         assert_no_pointer_or_pen_release_was_sent(&mut receiver);
     }
 
@@ -21820,11 +22691,159 @@ mod tests {
     }
 
     #[test]
-    fn input_sequence_exhaustion_never_falls_back_to_legacy_zero() {
+    fn a_local_request_keeps_the_local_cursor_even_when_the_host_draws_one() {
+        let mut app = ArcenApp::default();
+        app.connection_generation = 3;
+        // A Wayland desktop that records its cursor into the video answers a
+        // client-drawn request truthfully: the cursor is in the pixels. The
+        // Mac's own cursor still moves locally; it is never traded for one
+        // that moves at the video's rate.
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Local,
+                active: CursorMode::Host,
+                accepted: false,
+                ..CursorModeResultMsg::default()
+            },
+            3,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Local);
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::Default);
+        assert!(!app.host_cursor_images);
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Local,
+                active: CursorMode::Local,
+                accepted: true,
+                cursor_images: true,
+                ..CursorModeResultMsg::default()
+            },
+            3,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Local);
+        assert!(app.host_cursor_images);
+    }
+
+    fn host_cursor_record(
+        sequence: u64,
+        appearance: arcen_protocol::cursor::CursorAppearance,
+    ) -> Vec<u8> {
+        arcen_protocol::cursor::encode_cursor_update(&arcen_protocol::cursor::CursorUpdate {
+            sequence,
+            output: 0,
+            generation: 1,
+            fallback: arcen_protocol::messages::CursorShapeKind::Default,
+            appearance,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn host_cursor_images_become_the_native_cursor_at_the_video_scale() {
+        use arcen_input::cursor::{DeckCursor, DeckCursorState};
+        use arcen_protocol::cursor::{CursorAppearance, CursorImageId, CursorImageRef};
+        let image = arcen_media::cursor::CursorImage::from_straight_rgba(
+            8,
+            8,
+            (2, 4),
+            [255, 255, 255, 128].repeat(64),
+        )
+        .unwrap();
+        let png = image
+            .encode_png(arcen_protocol::cursor::MAX_CURSOR_PNG_BYTES)
+            .unwrap();
+        let mut deck = DeckCursorState::default();
+        assert!(deck
+            .apply(&host_cursor_record(
+                1,
+                CursorAppearance::Image(CursorImageRef {
+                    id: CursorImageId::new(5).unwrap(),
+                    width: 8,
+                    height: 8,
+                    hotspot_x: 2,
+                    hotspot_y: 4,
+                    inline_png: Some(png),
+                }),
+            ))
+            .unwrap());
+
         let mut app = ArcenApp {
-            input_sequence: u64::MAX,
+            host_cursor: deck.current(),
+            remote_frame_size: Some([1920, 1080]),
             ..ArcenApp::default()
         };
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::Default);
+        // The video is shown at half size: 960 points for 1920 pixels.
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 540.0));
+        let cursor = app.host_cursor_image(rect).unwrap();
+        assert_eq!(cursor.size, [4, 4]);
+        assert_eq!(cursor.hotspot, [1, 2]);
+        // Premultiplied for AppKit: 255 at alpha 128 is 128.
+        assert_eq!(&cursor.rgba[0..4], &[128, 128, 128, 128]);
+        // Unchanged image and scale reuse the same pixels (egui-winit keys
+        // its native cursor on the `Arc`).
+        let again = app.host_cursor_image(rect).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cursor.rgba, &again.rgba));
+
+        // Hidden, pointer lock and a host-drawn cursor show no image.
+        app.pointer_lock = true;
+        assert!(app.host_cursor_image(rect).is_none());
+        app.pointer_lock = false;
+        app.host_cursor = DeckCursor::Hidden;
+        assert!(app.host_cursor_image(rect).is_none());
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::None);
+        app.host_cursor = DeckCursor::Named(arcen_protocol::messages::CursorShapeKind::Text);
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::Text);
+    }
+
+    #[test]
+    fn a_secondary_viewport_follows_roots_host_cursor() {
+        use arcen_input::cursor::DeckCursor;
+        use arcen_protocol::cursor::CursorImageId;
+        let image = arcen_media::cursor::CursorImage::from_straight_rgba(
+            8,
+            8,
+            (2, 4),
+            [255, 255, 255, 255].repeat(64),
+        )
+        .unwrap();
+        let mut app = ArcenApp {
+            host_cursor: DeckCursor::Image {
+                id: CursorImageId::new(3).unwrap(),
+                image,
+                output: 1,
+                generation: 1,
+            },
+            ..ArcenApp::default()
+        };
+        let mut state = DeferredSecondaryViewportState::default();
+        assert!(app.sync_secondary_host_cursor(&mut state));
+        assert!(!app.sync_secondary_host_cursor(&mut state), "unchanged");
+        let (id, image) = state.host_cursor.image.clone().unwrap();
+        assert_eq!(id.get(), 3);
+        // A 2560-pixel output shown 1280 points wide: half size.
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 720.0));
+        let mut presented = None;
+        let cursor = present_host_cursor(&mut presented, id, &image, rect, 2560).unwrap();
+        assert_eq!(cursor.size, [4, 4]);
+        assert_eq!(cursor.hotspot, [1, 2]);
+        assert!(present_host_cursor(&mut presented, id, &image, rect, 0).is_none());
+
+        app.host_cursor = DeckCursor::Hidden;
+        assert!(app.sync_secondary_host_cursor(&mut state));
+        assert_eq!(state.host_cursor.icon, egui::CursorIcon::None);
+        assert!(state.host_cursor.image.is_none());
+        // A host-drawn cursor hides the client's on every display.
+        app.host_cursor = DeckCursor::Default;
+        app.active_cursor_mode = CursorMode::Host;
+        app.sync_secondary_host_cursor(&mut state);
+        assert_eq!(state.host_cursor.icon, egui::CursorIcon::None);
+    }
+
+    #[test]
+    fn input_sequence_exhaustion_never_falls_back_to_legacy_zero() {
+        let mut app = ArcenApp::default();
+        app.input_sequence.set(u64::MAX);
         assert_eq!(app.next_input_sequence(), u64::MAX);
     }
 
@@ -21915,7 +22934,7 @@ mod tests {
     #[test]
     fn global_input_sequence_is_shared_between_mouse_and_pen_paths() {
         let mut app = ArcenApp::default();
-        let before = app.input_sequence;
+        let before = app.input_sequence.get();
         // A pen sample claims the next sequence value from the very same
         // counter `send_mouse_move`/`send_mouse_button` use — there is no
         // separate pen-only sequence space.
@@ -21926,6 +22945,31 @@ mod tests {
         // The next caller (mouse or keyboard) continues from where the pen
         // path left off.
         assert_eq!(app.next_input_sequence(), before + 2);
+    }
+
+    #[test]
+    fn the_pen_keeps_this_macs_cursor_when_the_host_hides_its_pointer_for_it() {
+        use arcen_input::cursor::DeckCursor;
+        let mut app = ArcenApp::default();
+        app.tablet_input_enabled = true;
+        app.pen_negotiated = true;
+        app.local_pen_cursor.observe(&DeckCursor::Default, false);
+        app.host_cursor = DeckCursor::Default;
+        app.pen
+            .borrow_mut()
+            .dispatcher
+            .dispatch(vec![valid_pen_event(1, true, false)])
+            .expect("no overflow");
+        assert!(app.pen_has_authority());
+        // Mutter hides its pointer on the tablet event; the metadata says so.
+        app.local_pen_cursor
+            .observe(&DeckCursor::Hidden, app.pen_has_authority());
+        app.host_cursor = DeckCursor::Hidden;
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::Default);
+        // Without the pen, a host hide is honoured as before.
+        let mut plain = ArcenApp::default();
+        plain.host_cursor = DeckCursor::Hidden;
+        assert_eq!(plain.viewer_cursor_icon(), egui::CursorIcon::None);
     }
 
     #[test]
@@ -21940,7 +22984,9 @@ mod tests {
             "authority requires the dispatcher to actually be in proximity"
         );
 
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
         assert!(app.pen_has_authority());
@@ -21961,27 +23007,29 @@ mod tests {
     fn release_pen_authority_is_a_no_op_when_never_in_proximity() {
         let mut app = ArcenApp::default();
         assert!(!app.release_pen_authority("focus_out"));
-        assert!(app.tablet_last_event.is_none());
-        assert!(app.tablet_last_error.is_none());
+        assert!(app.pen.borrow().last_event.is_none());
+        assert!(app.pen.borrow().last_error.is_none());
     }
 
     #[test]
     fn release_pen_authority_emits_a_final_out_of_proximity_release_and_resets() {
         let mut app = ArcenApp::default();
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
-        assert!(app.tablet_dispatcher.in_proximity());
+        assert!(app.pen.borrow_mut().dispatcher.in_proximity());
 
         assert!(app.release_pen_authority("disconnect"));
         assert!(!app.release_pen_authority("disconnect"));
 
         // The dispatcher no longer believes the tool is in proximity, so a
         // stray restore/reconnect can't suppress mouse input on stale state.
-        assert!(!app.tablet_dispatcher.in_proximity());
+        assert!(!app.pen.borrow_mut().dispatcher.in_proximity());
         // With no live session to send over, the synthetic release is still
         // recorded locally for the Tablet Monitor panel's live read-out.
-        let released = app.tablet_last_event.expect("release event recorded");
+        let released = app.pen.borrow().last_event.expect("release event recorded");
         assert!(!released.in_proximity);
         assert!(!released.touching);
     }
@@ -21994,17 +23042,20 @@ mod tests {
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
         let viewport = app
             .region_runtime
+            .borrow()
             .as_ref()
             .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
             .expect("secondary region viewport");
         app.tablet_mode_active = TabletModeMsg::LocalTermination;
         app.pen_negotiated = true;
         app.remote_frame_size = Some([1920, 1080]);
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
-        assert!(app.tablet_dispatcher.in_proximity());
-        app.last_pen_region_viewport = Some(viewport);
+        assert!(app.pen.borrow_mut().dispatcher.in_proximity());
+        app.pen.borrow_mut().last_region_viewport = Some(viewport);
 
         app.emit_final_pen_release_if_in_proximity();
 
@@ -22013,7 +23064,7 @@ mod tests {
         assert_eq!(release["region_id"], 2);
         assert_eq!(release["in_proximity"], false);
         assert_direct_region_json(&release);
-        assert!(app.last_pen_region_viewport.is_none());
+        assert!(app.pen.borrow().last_region_viewport.is_none());
     }
 
     #[test]
@@ -22027,14 +23078,16 @@ mod tests {
         app.tablet_mode_active = TabletModeMsg::LocalTermination;
         app.pen_negotiated = true;
         app.remote_frame_size = Some([1920, 1080]);
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
         app.emit_final_pen_release_if_in_proximity();
 
         let release = receive_json(&mut receiver);
-        let released_event = app.tablet_last_event.expect("release recorded");
+        let released_event = app.pen.borrow().last_event.expect("release recorded");
         let expected = app.pen_event_msg(&released_event);
         assert_ne!((expected.server_x, expected.server_y), (-1, -1));
         assert_eq!(release["server_x"], expected.server_x);
@@ -22103,16 +23156,18 @@ mod tests {
     #[test]
     fn reset_tablet_authority_fails_closed_and_surfaces_an_error() {
         let mut app = ArcenApp::default();
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
         app.reset_tablet_authority("tablet edge queue overflowed".to_string());
 
-        assert!(!app.tablet_dispatcher.in_proximity());
-        assert_eq!(app.tablet_overflow_resets, 1);
+        assert!(!app.pen.borrow_mut().dispatcher.in_proximity());
+        assert_eq!(app.pen.borrow().overflow_resets, 1);
         assert_eq!(
-            app.tablet_last_error.as_deref(),
+            app.pen.borrow().last_error.as_deref(),
             Some("tablet edge queue overflowed")
         );
         assert!(app.status.contains("tablet edge queue overflowed"));
@@ -22135,7 +23190,9 @@ mod tests {
         app.tablet_input_enabled = true;
         app.pen_negotiated = true;
         app.remote_frame_size = Some([1920, 1080]);
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
         assert!(app.pen_has_authority(), "pen must hold authority first");
@@ -22145,16 +23202,16 @@ mod tests {
         app.note_tablet_producer_dropped_count(1);
 
         assert!(
-            !app.tablet_dispatcher.in_proximity(),
+            !app.pen.borrow_mut().dispatcher.in_proximity(),
             "a producer-side drop must fail closed exactly like a dispatcher overflow"
         );
         assert!(
             !app.pen_has_authority(),
             "mouse suppression must be lifted once authority is reset"
         );
-        assert_eq!(app.tablet_overflow_resets, 1);
+        assert_eq!(app.pen.borrow().overflow_resets, 1);
         assert_eq!(app.tablet_producer_drops_seen, 1);
-        let error = app.tablet_last_error.as_deref().unwrap_or_default();
+        let error = app.pen.borrow().last_error.clone().unwrap_or_default();
         assert!(
             error.contains('1'),
             "the surfaced diagnostic must include the drop counter: {error}"
@@ -22169,7 +23226,9 @@ mod tests {
         assert_eq!(sent["in_proximity"], false);
         assert_eq!(sent["touching"], false);
         let released = app
-            .tablet_last_event
+            .pen
+            .borrow()
+            .last_event
             .expect("the sent release must also be recorded for the Tablet Monitor panel");
         assert!(!released.in_proximity);
         assert!(!released.touching);
@@ -22178,7 +23237,9 @@ mod tests {
     #[test]
     fn producer_queue_drop_count_unchanged_is_a_no_op() {
         let mut app = ArcenApp::default();
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
@@ -22186,11 +23247,11 @@ mod tests {
         app.note_tablet_producer_dropped_count(5);
 
         assert!(
-            app.tablet_dispatcher.in_proximity(),
+            app.pen.borrow_mut().dispatcher.in_proximity(),
             "an unchanged drop counter must never reset authority"
         );
-        assert_eq!(app.tablet_overflow_resets, 0);
-        assert!(app.tablet_last_error.is_none());
+        assert_eq!(app.pen.borrow().overflow_resets, 0);
+        assert!(app.pen.borrow().last_error.is_none());
     }
 
     #[test]
@@ -22203,27 +23264,29 @@ mod tests {
             tablet_producer_drops_seen: 10,
             ..ArcenApp::default()
         };
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
 
         app.note_tablet_producer_dropped_count(3);
 
         assert_eq!(app.tablet_producer_drops_seen, 10);
-        assert!(app.tablet_dispatcher.in_proximity());
-        assert_eq!(app.tablet_overflow_resets, 0);
+        assert!(app.pen.borrow_mut().dispatcher.in_proximity());
+        assert_eq!(app.pen.borrow().overflow_resets, 0);
     }
 
     #[test]
     fn producer_queue_drop_increase_while_out_of_proximity_still_resets_without_a_release() {
         let mut app = ArcenApp::default();
-        assert!(!app.tablet_dispatcher.in_proximity());
+        assert!(!app.pen.borrow_mut().dispatcher.in_proximity());
 
         app.note_tablet_producer_dropped_count(2);
 
         assert_eq!(app.tablet_producer_drops_seen, 2);
-        assert_eq!(app.tablet_overflow_resets, 1);
-        assert!(app.tablet_last_event.is_none(), "nothing to release");
+        assert_eq!(app.pen.borrow().overflow_resets, 1);
+        assert!(app.pen.borrow().last_event.is_none(), "nothing to release");
     }
 
     #[test]
@@ -22236,16 +23299,20 @@ mod tests {
         // already-counted drop could be silently "forgotten" and never
         // detected — or, worse, detected again and double-reset.
         let mut app = ArcenApp::default();
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
         app.note_tablet_producer_dropped_count(1);
         assert_eq!(app.tablet_producer_drops_seen, 1);
-        let resets_after_first_drop = app.tablet_overflow_resets;
+        let resets_after_first_drop = app.pen.borrow().overflow_resets;
 
         // Reconnect path: a fresh proximity-in sample, then a
         // disconnect-teardown release.
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(2, true, true)])
             .expect("no overflow");
         app.release_pen_authority("disconnect");
@@ -22258,15 +23325,20 @@ mod tests {
         // no-op (no double reset), while a genuinely higher total after
         // reconnect must still be detected.
         app.note_tablet_producer_dropped_count(1);
-        assert_eq!(app.tablet_overflow_resets, resets_after_first_drop);
+        assert_eq!(app.pen.borrow().overflow_resets, resets_after_first_drop);
 
-        app.tablet_dispatcher
+        app.pen
+            .borrow_mut()
+            .dispatcher
             .dispatch(vec![valid_pen_event(3, true, true)])
             .expect("no overflow");
         app.note_tablet_producer_dropped_count(4);
         assert_eq!(app.tablet_producer_drops_seen, 4);
-        assert_eq!(app.tablet_overflow_resets, resets_after_first_drop + 1);
-        assert!(!app.tablet_dispatcher.in_proximity());
+        assert_eq!(
+            app.pen.borrow().overflow_resets,
+            resets_after_first_drop + 1
+        );
+        assert!(!app.pen.borrow_mut().dispatcher.in_proximity());
     }
 
     #[test]
@@ -22276,7 +23348,7 @@ mod tests {
         // an edge (not silently coalesced away as if it were a
         // continuation) so the host reliably sees the tool re-enter
         // proximity again.
-        let mut dispatcher = TabletEventDispatcher::new();
+        let mut dispatcher = arcen_input::PenForwardingDispatcher::new();
         dispatcher
             .dispatch(vec![valid_pen_event(1, true, true)])
             .expect("no overflow");
@@ -25854,6 +26926,15 @@ mod tests {
             arcen_media::EncodeIntent::Interactive,
             "a settings.json predating encode intent must stay latency-first",
         );
+        assert_eq!(
+            defaults.typing_mode,
+            arcen_input::text::TypingMode::Auto,
+            "a settings.json predating committed text types in Auto mode",
+        );
+        assert_eq!(
+            defaults.option_key_mode,
+            arcen_input::text::OptionKeyMode::LeftAltRightCharacters,
+        );
 
         save_client_settings(
             &repository,
@@ -25887,10 +26968,20 @@ mod tests {
                     ),
                 },
                 encode_intent: arcen_media::EncodeIntent::Quality,
+                typing_mode: arcen_input::text::TypingMode::Characters,
+                option_key_mode: arcen_input::text::OptionKeyMode::BothAlt,
             },
         )
         .unwrap();
         let loaded = load_client_settings(&repository).unwrap();
+        assert_eq!(
+            loaded.typing_mode,
+            arcen_input::text::TypingMode::Characters
+        );
+        assert_eq!(
+            loaded.option_key_mode,
+            arcen_input::text::OptionKeyMode::BothAlt
+        );
         assert_eq!(loaded.log_level, LogLevel::Debug);
         assert_eq!(loaded.security_mode, SecurityMode::Low);
         assert_eq!(loaded.performance_mode, PerformanceMode::Standard);
@@ -30002,6 +31093,7 @@ mod tests {
         assert!(app.ensure_region_runtime_for_validated(&validated));
         let viewport = app
             .region_runtime
+            .borrow()
             .as_ref()
             .and_then(|runtime| {
                 runtime
@@ -30031,7 +31123,9 @@ mod tests {
             "a region session must never fall back to legacy pen_event",
         );
         assert!(app
-            .tablet_last_error
+            .pen
+            .borrow()
+            .last_error
             .as_deref()
             .is_some_and(|error| error.contains("no authoritative viewport")),);
     }
@@ -30501,6 +31595,7 @@ mod tests {
         assert!(app.ensure_region_runtime_for_validated(&validated));
         let primary_viewport = app
             .region_runtime
+            .borrow()
             .as_ref()
             .expect("region runtime")
             .primary_viewport();
@@ -31206,7 +32301,7 @@ mod tests {
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
         // The rotated secondary's own content rect is 1440x2560 (portrait).
         let secondary_view = ViewSize::new(1440.0, 2560.0);
-        let mut mapper = TabletMapper::new();
+        let mut mapper = crate::tablet::TabletMapper::new();
         let metadata = arcen_input::LowLatencyMetadata {
             sequence: 1,
             timestamp_ns: 1,
@@ -31237,6 +32332,7 @@ mod tests {
         app.remote_frame_size = Some([1920, 1080]);
         let viewport = app
             .region_runtime
+            .borrow()
             .as_ref()
             .and_then(|runtime| runtime.viewport_for_monitor(monitor_id))
             .expect("secondary region viewport");

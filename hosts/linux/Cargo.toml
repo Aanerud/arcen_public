@@ -1,6 +1,6 @@
 [package]
 name = "arcen-pier-linux"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
@@ -13,6 +13,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "arcen-pier"
 path = "src/main.rs"
+
+# Lab-only: drives a headless Wayland session end to end through PAM and the
+# privileged launcher. Never part of a release artefact.
+[[example]]
+name = "wayland_session_harness"
+required-features = ["wayland-provider"]
+
+[[example]]
+name = "wayland_clipboard_harness"
+required-features = ["wayland-provider"]
 
 [features]
 default = []
@@ -32,11 +42,19 @@ experimental-raw-hid = []
 # Lab-only Hard USB virtual-HCD importer. Production/package builds must not
 # enable this until the kernel-module/signing support boundary is approved.
 usb-hard-lab = []
-# Makes the binary eligible to consider the host-local Wayland/libei provider
-# seams. Their pure models and detection API remain compiled for diagnostics
-# and tests, but this first tranche carries no native Wayland, portal, Mutter,
-# or libei binding; runtime detection therefore remains fail-closed.
-wayland-provider = []
+# Builds the Arcen-managed headless GNOME/Mutter Wayland session adapter
+# (`session::wayland`): a private runtime directory, D-Bus session bus,
+# PipeWire and WirePlumber per session, Mutter virtual outputs, and the
+# Mutter ScreenCast/RemoteDesktop D-Bus sessions, through the pure-Rust `zbus`
+# client. Off by default; Xorg stays the default provider and Wayland is used
+# only when `capture.provider = "wayland"` is configured and every capability
+# fact is proven. The libei protocol is spoken by the pure-Rust `reis`
+# client (no libei C library is linked), to probe the compositor's EIS seat
+# for a stylus.
+# It also builds the fused capenc's Wayland capture (`arcen-capenc/wayland`),
+# which links libpipewire-0.3, so the Pier can capture the sessions it
+# starts.
+wayland-provider = ["dep:zbus", "dep:rustix", "dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
 # Dormant source compatibility only. Release/package builds must not enable
 # this feature; shipped Pier binaries expose QUIC exclusively.
 wss-compat = [
@@ -64,6 +82,7 @@ arcen-observability.workspace = true
 arcen-outputs.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 arcen-usb-bridge.workspace = true
+bytes.workspace = true
 quinn.workspace = true
 getrandom.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -97,8 +116,29 @@ ring = "0.17"
 # transport, and unit tests remain runnable on the macOS development machine.
 pam-client2 = { version = "0.5.5", default-features = false }
 evdev = "0.13.2"
-nix = { version = "0.29", features = ["fs", "ioctl", "process", "signal", "user"] }
+nix = { version = "0.29", features = ["fs", "ioctl", "process", "signal", "socket", "time", "uio", "user"] }
 x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes"] }
+# Pure-Rust D-Bus client (MIT) for the Mutter ScreenCast, RemoteDesktop and
+# DisplayConfig interfaces on a headless session's private bus. Only the
+# `wayland-provider` feature links it; it runs on the existing tokio runtime.
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"], optional = true }
+# Pure-Rust libei/libeis protocol implementation (MIT). Only the
+# `wayland-provider` feature links it: the session agent speaks to its
+# compositor's EIS server (`RemoteDesktop.ConnectToEIS`) for committed text
+# (`ei_text`) and the emulated stylus. Needs Release/Security approval as a
+# new dependency.
+reis = { version = "0.7.1", default-features = false, features = ["tokio"], optional = true }
+# pidfd_open/pidfd_send_signal for race-free signalling of session processes
+# (already a workspace dependency of the Linux installer).
+rustix = { workspace = true, optional = true }
+# Committed text into a headless Wayland session (`wayland-provider` only).
+# `xkbcommon-dl` (MIT) loads the system's libxkbcommon at run time (no build
+# dependency) to read the compositor's keymap, so the session proves a
+# character typeable before it types it; `xkeysym` (MIT OR Apache-2.0 OR
+# Zlib, no unsafe) names a character's keysym when the keymap is unknown.
+# Both were already in the lock file through winit.
+xkbcommon-dl = { version = "0.4.2", optional = true }
+xkeysym = { version = "0.2.1", optional = true }
 
 [dev-dependencies]
 rcgen = "=0.14.8"

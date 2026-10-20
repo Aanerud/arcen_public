@@ -196,6 +196,16 @@ pub fn init(profile: OperationalProfile) -> Option<PathBuf> {
         "arch",
         FieldValue::String(std::env::consts::ARCH.to_owned()),
     );
+    let build = crate::build_identity::DeckBuildFacts::running();
+    for (name, value) in [
+        ("bundle_short_version", build.bundle_short_version),
+        ("bundle_version", build.bundle_version),
+        ("build_id", build.build_id),
+        ("source_revision", build.source_revision),
+        ("bundle_path", build.bundle_path),
+    ] {
+        let _ = fields.insert(name, FieldValue::String(value));
+    }
     emit(
         LifecycleEventKind::ClientStart,
         process_sid.clone(),

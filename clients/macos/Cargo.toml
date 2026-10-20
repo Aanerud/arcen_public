@@ -1,6 +1,6 @@
 [package]
 name = "arcen-deck-macos"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -66,6 +66,7 @@ egui = "0.35"
 # Decodes the embedded app icon at startup. Already present in the dependency
 # graph through arcen-media, so this adds nothing new to a release build.
 png.workspace = true
+bytes.workspace = true
 futures-util = "0.3"
 getrandom.workspace = true
 nusb = "0.1"
@@ -97,8 +98,8 @@ apple-cf = "0.9.3"
 block2 = "0.6.2"
 core-graphics = "0.25.0"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSDate", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
 # w4-dedicated-metal-layer: the dedicated 10-bit `CAMetalLayer` video path
 # (`src/ui/video_metal_layer.rs`). Pinned to the exact versions/feature
 # style `wgpu-hal` 29.0.4 itself already resolves for `objc2-metal`/
@@ -111,7 +112,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # `video_render.rs`'s module doc for why that crate's raw-pointer-based
 # approach was needed for the *pre-existing* wgpu/egui surface) since this
 # layer is typed end to end and needs no raw `msg_send!` at all.
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "MTLAllocation", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLLibrary", "MTLPixelFormat", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLTexture", "MTLTypes"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CAEDRMetadata", "CALayer", "CAMetalLayer", "CATransaction", "objc2-metal"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor", "CGColorSpace"] }

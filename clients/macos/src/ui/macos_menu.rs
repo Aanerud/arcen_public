@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Actions the native macOS menu bar dispatches back into the egui app.
 ///
@@ -37,10 +37,24 @@ pub enum MenuCommand {
 
 static MENU_COMMANDS: Mutex<Vec<MenuCommand>> = Mutex::new(Vec::new());
 
+/// The egui context whose root viewport drains `MENU_COMMANDS`. A menu item
+/// can fire while the Deck is idle (no session polling, no pending repaint);
+/// without a wake the command would wait for the next unrelated UI event.
+static MENU_WAKER: OnceLock<egui::Context> = OnceLock::new();
+
+/// Registers the context that menu commands wake. The first registration
+/// wins: eframe gives the app one context for its lifetime.
+pub fn set_waker(ctx: &egui::Context) {
+    let _ = MENU_WAKER.set(ctx.clone());
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn push_menu_command(command: MenuCommand) {
     if let Ok(mut queue) = MENU_COMMANDS.lock() {
         queue.push(command);
+    }
+    if let Some(ctx) = MENU_WAKER.get() {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -501,4 +515,43 @@ pub fn forward_app_shortcuts_to_host(forward: bool) {
 
 pub fn disable_app_nap() {
     platform::disable_app_nap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn queued_menu_command_wakes_an_idle_event_loop() {
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        ctx.set_request_repaint_callback(move |info| {
+            if info.viewport_id == egui::ViewportId::ROOT {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        set_waker(&ctx);
+        // Settle an idle frame so no repaint is pending before the menu fires.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        wakes.store(0, Ordering::SeqCst);
+
+        push_menu_command(MenuCommand::Quit {
+            from_keyboard: false,
+        });
+
+        assert!(
+            wakes.load(Ordering::SeqCst) > 0,
+            "menu command did not wake egui"
+        );
+        assert_eq!(
+            drain_menu_commands(),
+            vec![MenuCommand::Quit {
+                from_keyboard: false
+            }]
+        );
+    }
 }

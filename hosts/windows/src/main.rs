@@ -108,6 +108,7 @@ mod encoder_admission;
 #[cfg(windows)]
 mod eventlog;
 mod first_login;
+mod font_smoothing;
 #[cfg(windows)]
 mod gpu_probe;
 #[cfg(not(windows))]
@@ -396,6 +397,8 @@ pub struct HostConfig {
     pub microphone_input_enabled: bool,
     pub clipboard_policy: arcen_media::clipboard::ClipboardPolicy,
     pub timezone_redirection: bool,
+    /// `platform.font_smoothing`: grey-scale text for the session's length.
+    pub font_smoothing: font_smoothing::FontSmoothingPolicy,
     pub reconnect_window_secs: u32,
     pub qos_targets: arcen_telemetry::QosTargets,
     pub debug_diagnostics: bool,
@@ -1447,6 +1450,7 @@ where
     let mut microphone_input_enabled = false;
     let mut clipboard_policy = arcen_media::clipboard::ClipboardPolicy::default();
     let mut timezone_redirection = false;
+    let mut font_smoothing = font_smoothing::FontSmoothingPolicy::default();
     let mut reconnect_window_secs =
         arcen_session::direct_reconnect::DEFAULT_RECONNECT_WINDOW_SECONDS;
     let mut deskside = deskside::DesksideConfig::default();
@@ -1609,6 +1613,7 @@ where
                 value,
             )?;
         }
+        font_smoothing = file.platform.font_smoothing;
         if let Some(value) = file.platform.first_login_timeout_secs {
             first_login_timeout = validated_first_login_timeout(value)?;
         }
@@ -1955,6 +1960,7 @@ where
         microphone_input_enabled,
         clipboard_policy,
         timezone_redirection,
+        font_smoothing,
         reconnect_window_secs,
         qos_targets,
         debug_diagnostics,
@@ -3350,61 +3356,55 @@ where
                                 return;
                             }
                         };
-                        // Keep the video backlog out of QUIC for this Deck's
-                        // whole connection; the task ends when it closes.
-                        tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
-                            connection.clone(),
-                        ));
-                        let stream = match tokio::time::timeout(
+                        // One lane per role (ADR 0014). The lane carrier keeps
+                        // this connection's send window interactive; a pre-lane
+                        // Deck is closed with the shared mismatch message.
+                        let socket = match arcen_transport::quic::accept_session_lanes(
+                            connection,
+                            arcen_transport::quic::LaneRuntimeConfig::new(
+                                arcen_protocol::lanes::LaneEndpoint::Pier,
+                            ),
                             WEBSOCKET_UPGRADE_TIMEOUT,
-                            arcen_transport::quic::accept_direct(connection),
                         )
                         .await
                         {
-                            Ok(Ok(stream)) => stream,
-                            Ok(Err(error)) => {
-                                tracing::debug!(
+                            Ok((lanes, control)) => {
+                                arcen_transport::quic::SessionLaneSocket::new(lanes, control)
+                            }
+                            Err(arcen_transport::quic::SessionLaneSetupError::Mismatch(
+                                mismatch,
+                            )) => {
+                                // The Deck was told why before the close.
+                                tracing::warn!(
+                                    target: NET,
+                                    %peer,
+                                    local_addr = %local_addr,
+                                    reason = %mismatch,
+                                    "refused a Deck running an incompatible Arcen release"
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                tracing::info!(
                                     target: NET,
                                     %peer,
                                     local_addr = %local_addr,
                                     %error,
                                     elapsed_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                                    "QUIC direct stream failed"
-                                );
-                                return;
-                            }
-                            Err(_) => {
-                                tracing::debug!(
-                                    target: NET,
-                                    %peer,
-                                    local_addr = %local_addr,
-                                    elapsed_ms = u64::try_from(handshake_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                                    "QUIC direct stream timed out"
+                                    "QUIC control lane not established"
                                 );
                                 return;
                             }
                         };
-                        let feedback = stream.feedback_snapshot();
                         tracing::debug!(
                             target: NET,
                             %peer,
-                            rtt_us = u64::try_from(feedback.rtt.as_micros()).unwrap_or(u64::MAX),
-                            current_mtu = feedback.current_mtu,
-                            congestion_window_bytes = feedback.congestion_window,
+                            rtt_us = u64::try_from(socket.lanes().connection().rtt().as_micros()).unwrap_or(u64::MAX),
                             "QUIC path established"
                         );
-                        let mut ws_config = WebSocketConfig::default();
-                        ws_config.max_message_size = Some(MAX_INBOUND_MESSAGE);
-                        ws_config.max_frame_size = Some(MAX_INBOUND_MESSAGE);
-                        let websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                            stream,
-                            Role::Server,
-                            Some(ws_config),
-                        )
-                        .await;
-                        tracing::info!(target: NET, %peer, "QUIC session stream ready");
+                        tracing::info!(target: NET, %peer, "QUIC session lanes ready");
                         session::run(
-                            crate::resume::DirectSessionSocket::quic(websocket),
+                            crate::resume::DirectSessionSocket::quic(socket),
                             config,
                             disclaimer,
                             peer.to_string(),

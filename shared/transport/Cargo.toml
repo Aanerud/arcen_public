@@ -9,16 +9,27 @@ repository.workspace = true
 
 [features]
 default = []
-quic = ["dep:bytes", "dep:quinn", "dep:tokio", "dep:tokio-util"]
+quic = [
+    "dep:arcen-observability",
+    "dep:bytes",
+    "dep:futures-core",
+    "dep:futures-sink",
+    "dep:quinn",
+    "dep:tokio",
+    "dep:tokio-util",
+]
 # Dormant compatibility policy only. Product Deck/Pier dependencies disable
 # default features and never enable this in shipped binaries.
 wss-compat = ["arcen-protocol/wss-compat", "rustls/tls12"]
 
 [dependencies]
 arcen-identity.workspace = true
+arcen-observability = { workspace = true, optional = true }
 arcen-protocol = { workspace = true, default-features = false }
 arcen-telemetry.workspace = true
 bytes = { workspace = true, optional = true }
+futures-core = { version = "0.3.33", optional = true }
+futures-sink = { version = "0.3.33", optional = true }
 quinn = { workspace = true, optional = true }
 rustls.workspace = true
 sha2.workspace = true
@@ -29,6 +40,7 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen = "=0.14.8"
+serde_json.workspace = true
 # Adds `tokio::time::pause`/`#[tokio::test(start_paused = true)]` for test
 # code only (dev-dependencies are never linked into a non-test build of
 # this crate or its dependents): used solely to prove the Carrier A

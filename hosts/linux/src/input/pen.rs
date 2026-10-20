@@ -29,6 +29,17 @@ const _: () = assert!(
         && arcen_input::pen_axes::TYPED_PEN_PRESSURE_RANGE.min() == 0
 );
 
+/// Contact floor of the Xorg tablet device: its libinput quirk
+/// (`arcen_input::virtual_device::libinput_quirks`) sets the contact
+/// thresholds at the bottom of the pressure range.
+pub const XORG_TABLET_CONTACT_FLOOR: i32 = arcen_input::virtual_device::PRESSURE_CONTACT_UPPER;
+
+/// Contact floor of the Wayland lab seat pen: the compositor's libinput reads
+/// only the system's quirks, so its default threshold (5 % of the range)
+/// decides contact.
+pub const SEAT_PEN_CONTACT_FLOOR: i32 =
+    arcen_input::virtual_device::libinput_default_contact_pressure(PRESSURE_MAX);
+
 /// Whole-degree tilt bounds. `uinput.rs` declares the `ABS_TILT_X`/
 /// `ABS_TILT_Y` `AbsInfo` with this exact range, so the wire's `-90.0..=90.0`
 /// degree convention passes straight through as whole evdev units instead of
@@ -100,25 +111,43 @@ pub struct PenAxes {
 impl PenAxes {
     /// Maps every tablet axis from one validated `PenEventMsg` and the fixed
     /// device raster `width`/`height`.
+    ///
+    /// libinput takes a pressure-capable tablet's contact from pressure, not
+    /// `BTN_TOUCH`, so the pressure is `0` out of contact and at least
+    /// `contact_floor` (the device's libinput contact threshold) in contact.
     #[must_use]
-    pub fn from_event(event: &PenEventMsg, width: u32, height: u32) -> Self {
+    pub fn from_event(event: &PenEventMsg, width: u32, height: u32, contact_floor: i32) -> Self {
         Self {
             x: normalized_axis(event.x, width),
             y: normalized_axis(event.y, height),
-            pressure: pressure_to_device(event.pressure),
+            pressure: arcen_input::virtual_device::contact_pressure(
+                pressure_to_device(event.pressure),
+                event.in_proximity && event.touching,
+                contact_floor,
+            ),
             tilt_x: tilt_to_evdev_degrees(event.tilt_x_degrees),
             tilt_y: tilt_to_evdev_degrees(event.tilt_y_degrees),
         }
     }
 
     /// Maps non-coordinate axes from a shared region pen sample while
-    /// retaining the already-transformed Xorg raster position.
+    /// retaining the already-transformed Xorg raster position; pressure as in
+    /// [`Self::from_event`].
     #[must_use]
-    pub fn from_region_sample(sample: &RegionPenSample, x: i32, y: i32) -> Self {
+    pub fn from_region_sample(
+        sample: &RegionPenSample,
+        x: i32,
+        y: i32,
+        contact_floor: i32,
+    ) -> Self {
         Self {
             x,
             y,
-            pressure: pressure_to_device(sample.pressure),
+            pressure: arcen_input::virtual_device::contact_pressure(
+                pressure_to_device(sample.pressure),
+                sample.in_proximity && sample.touching,
+                contact_floor,
+            ),
             tilt_x: tilt_to_evdev_degrees(sample.tilt_x_degrees),
             tilt_y: tilt_to_evdev_degrees(sample.tilt_y_degrees),
         }
@@ -157,6 +186,33 @@ impl PenToolState {
         }
         codes
     }
+}
+
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+
+/// The two frames (`(type, code, value)` events, each followed by a
+/// `SYN_REPORT`) that disarm libinput's forced proximity-out on a virtual
+/// tablet (`arcen_input::virtual_device::ProximityTimeoutDisarm`): a genuine
+/// proximity-in at (`x`, `y`), then a genuine proximity-out.
+///
+/// Always the pen tool, whatever tool approaches first: libinput disables
+/// the timeout only on a `BTN_TOOL_PEN` release (`evdev-tablet.c`
+/// `tablet_update_tool_state` in 1.19; `FORCED_PROXOUT_TIMEOUT` in
+/// `libinput-plugin-tablet-proximity-timer.c` from 1.30), so an eraser
+/// in/out would leave the 50 ms timeout armed.
+#[must_use]
+pub fn proximity_prelude(x: i32, y: i32) -> [Vec<(u16, u16, i32)>; 2] {
+    [
+        vec![
+            (EV_KEY, BTN_TOOL_PEN, 1),
+            (EV_ABS, ABS_X, x),
+            (EV_ABS, ABS_Y, y),
+        ],
+        vec![(EV_KEY, BTN_TOOL_PEN, 0)],
+    ]
 }
 
 fn tool_code(tool: Option<PenToolMsg>) -> Option<u16> {
@@ -284,6 +340,30 @@ fn plan_pen_edges_from_fields(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_prelude_is_always_the_pen_tool_even_for_an_eraser_first_approach() {
+        let mut disarm = arcen_input::virtual_device::ProximityTimeoutDisarm::default();
+        let eraser = sample(PenToolMsg::Eraser, true, false, 0);
+        assert!(disarm.needs_prelude(false, eraser.in_proximity));
+        let [entering, leaving] = proximity_prelude(10, 20);
+        assert_eq!(
+            entering,
+            vec![
+                (EV_KEY, BTN_TOOL_PEN, 1),
+                (EV_ABS, ABS_X, 10),
+                (EV_ABS, ABS_Y, 20)
+            ]
+        );
+        assert_eq!(leaving, vec![(EV_KEY, BTN_TOOL_PEN, 0)]);
+        assert!(entering
+            .iter()
+            .chain(&leaving)
+            .all(|&(_, code, _)| code != BTN_TOOL_RUBBER));
+        // The eraser itself is then asserted by the ordinary edge plan.
+        let (edges, _) = plan_pen_edges(PenToolState::default(), &eraser);
+        assert_eq!(edges.first(), Some(&(BTN_TOOL_RUBBER, true)));
+    }
+
     fn sample(tool: PenToolMsg, in_proximity: bool, touching: bool, buttons: u16) -> PenEventMsg {
         PenEventMsg {
             tool,
@@ -330,14 +410,70 @@ mod tests {
             pressure: 1.0,
             tilt_x_degrees: -45.0,
             tilt_y_degrees: 45.0,
+            in_proximity: true,
+            touching: true,
             ..PenEventMsg::default()
         };
-        let axes = PenAxes::from_event(&event, 1920, 1080);
+        let axes = PenAxes::from_event(&event, 1920, 1080, XORG_TABLET_CONTACT_FLOOR);
         assert_eq!(axes.x, 960);
         assert_eq!(axes.y, 270);
         assert_eq!(axes.pressure, PRESSURE_MAX);
         assert_eq!(axes.tilt_x, -45);
         assert_eq!(axes.tilt_y, 45);
+    }
+
+    #[test]
+    fn a_zero_pressure_tip_down_and_a_light_stroke_start_are_in_contact() {
+        // The Deck reports the tip down with pressure 0 (an Apple Pencil tap,
+        // a pen without pressure) or a stroke starting very lightly; libinput
+        // ignores BTN_TOUCH on a pressure-capable tablet, so the device
+        // pressure must cross its contact threshold.
+        for floor in [XORG_TABLET_CONTACT_FLOOR, SEAT_PEN_CONTACT_FLOOR] {
+            for pressure in [0.0, 0.0001, 0.02] {
+                let event = PenEventMsg {
+                    pressure,
+                    ..sample(PenToolMsg::Tip, true, true, 0)
+                };
+                let axes = PenAxes::from_event(&event, 1920, 1080, floor);
+                assert!(axes.pressure >= floor, "{pressure} -> {}", axes.pressure);
+                let region = RegionPenSample {
+                    position: arcen_input::RegionLogicalPosition {
+                        region_id: arcen_media::RegionId::new(1).expect("nonzero"),
+                        point: arcen_media::LogicalPoint { x: 0, y: 0 },
+                    },
+                    pressure,
+                    tilt_x_degrees: 0.0,
+                    tilt_y_degrees: 0.0,
+                    rotation_degrees: 0.0,
+                    tool: PenTool::Tip,
+                    in_proximity: true,
+                    touching: true,
+                    buttons: 0,
+                };
+                assert!(PenAxes::from_region_sample(&region, 0, 0, floor).pressure >= floor);
+            }
+            // Hovering, or leaving: never in contact, whatever pressure is carried.
+            let hover = PenEventMsg {
+                pressure: 0.3,
+                ..sample(PenToolMsg::Tip, true, false, 0)
+            };
+            assert_eq!(PenAxes::from_event(&hover, 1920, 1080, floor).pressure, 0);
+            let away = PenEventMsg {
+                pressure: 0.3,
+                ..sample(PenToolMsg::Tip, false, true, 0)
+            };
+            assert_eq!(PenAxes::from_event(&away, 1920, 1080, floor).pressure, 0);
+        }
+        // Firm pressure passes through untouched.
+        let firm = PenEventMsg {
+            pressure: 0.5,
+            ..sample(PenToolMsg::Tip, true, true, 0)
+        };
+        assert_eq!(
+            PenAxes::from_event(&firm, 1920, 1080, SEAT_PEN_CONTACT_FLOOR).pressure,
+            32_768
+        );
+        assert!(XORG_TABLET_CONTACT_FLOOR < SEAT_PEN_CONTACT_FLOOR);
     }
 
     #[test]

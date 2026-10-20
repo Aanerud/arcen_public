@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-outputs",
+  "owner": "Shared/Architecture",
+  "description": "Monitor lifecycle, output transactions and multi-display arrangement.",
+  "validation": [
+    "shared-outputs-test",
+    "shared-outputs-clippy",
+    "shared-outputs-tree-purity",
+    "workspace-boundaries"
+  ],
+  "consumers": [
+    {
+      "package": "arcen-capenc",
+      "dependency_kind": "normal",
+      "contracts": ["xorg_gpu"],
+      "paths": [
+        {
+          "id": "linux-xorg-auto",
+          "entry_points": ["hosts/capenc/src/linux_policy.rs"],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-speed",
+          "entry_points": ["hosts/capenc/src/linux_policy.rs"],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-speed-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux",
+      "dependency_kind": "normal",
+      "contracts": [
+        "admission",
+        "applied",
+        "atomic_start",
+        "edid",
+        "fairness",
+        "nvidia_heads",
+        "provider",
+        "provider::capability",
+        "provider::error",
+        "provider::transaction",
+        "ui_scale",
+        "virtual_topology",
+        "xorg_gpu",
+        "xorg_screen"
+      ],
+      "production_uses": [
+        {
+          "id": "linux-xorg-session-screen",
+          "gate": 8,
+          "symbol": "with_session_screen",
+          "reason": "The dedicated Xorg's depth and single-head screen size are written into the root-owned template by the shared rule, which only touches the packaged shape."
+        },
+        {
+          "id": "linux-nvidia-head-discovery",
+          "gate": 8,
+          "symbol": "choose_nvidia_xorg_heads",
+          "reason": "Linux parses and ranks NVIDIA Xorg head discovery through the shared output rule instead of keeping product-local policy."
+        }
+      ],
+      "paths": [
+        {
+          "id": "linux-xorg-auto",
+          "entry_points": ["hosts/linux/src/media/multi_capenc.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-speed",
+          "entry_points": ["hosts/linux/src/media/multi_capenc.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-speed-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-grading",
+          "entry_points": [
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/session/launcher.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-grading-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-hdr",
+          "entry_points": [
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/cli.rs",
+            "hosts/linux/src/session/launcher.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-hdr-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-software-h264",
+          "entry_points": ["hosts/linux/src/media/multi_capenc.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-software-h264-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session",
+          "entry_points": ["hosts/linux/src/session/launcher.rs", "hosts/linux/src/cli.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-multi-monitor",
+          "entry_points": [
+            "hosts/linux/src/session/multi_monitor.rs",
+            "hosts/linux/src/session/output_provider.rs",
+            "hosts/linux/src/display/nvidia_discovery.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-multi-monitor-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-multi-monitor",
+          "entry_points": [
+            "hosts/linux/src/session/multi_monitor.rs",
+            "hosts/linux/src/display/topology.rs",
+            "hosts/linux/src/session/wayland/remote.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-multi-monitor-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-session",
+          "entry_points": [
+            "hosts/linux/src/session/wayland/output.rs",
+            "hosts/linux/src/session/wayland/agent.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-session-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "normal",
+      "contracts": ["xorg_gpu"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": ["packaging/linux/installer/src/main.rs"],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-macos",
+      "dependency_kind": "normal",
+      "contracts": ["edid"],
+      "paths": [
+        {
+          "id": "macos-pier-auto",
+          "entry_points": ["hosts/macos/src/session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-auto-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-speed",
+          "entry_points": ["hosts/macos/src/session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-speed-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-grading",
+          "entry_points": ["hosts/macos/src/session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-grading-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-session",
+          "entry_points": ["hosts/macos/src/session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-app-build"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-multi-monitor",
+          "entry_points": ["hosts/macos/src/multi_monitor.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-session-lab"],
+          "owner": "macOS Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows",
+      "dependency_kind": "normal",
+      "contracts": [
+        "admission",
+        "applied",
+        "atomic_start",
+        "edid",
+        "fairness",
+        "provider",
+        "provider::capability",
+        "provider::error",
+        "provider::transaction",
+        "windows_multi_monitor"
+      ],
+      "production_uses": [
+        {
+          "id": "windows-multi-monitor-adapter-selection",
+          "gate": 2,
+          "symbol": "resolve_windows_multi_monitor_adapter",
+          "reason": "Windows gathers DXGI/NVAPI facts locally but chooses the streaming adapter through the shared allow/exclude and headless policy."
+        }
+      ],
+      "paths": [
+        {
+          "id": "windows-grading",
+          "entry_points": ["hosts/windows/src/session.rs", "hosts/windows/src/display.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-grading-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-hdr",
+          "entry_points": ["hosts/windows/src/session.rs", "hosts/windows/src/display.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-hdr-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-session",
+          "entry_points": ["hosts/windows/src/session.rs", "hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-transport",
+          "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-multi-monitor",
+          "entry_points": [
+            "hosts/windows/src/multi_monitor_topology.rs",
+            "hosts/windows/src/multi_monitor_capenc.rs",
+            "hosts/windows/src/iddcx.rs",
+            "hosts/windows/src/multi_monitor_gate.rs",
+            "hosts/windows/src/main.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-multi-monitor-lab"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-linux"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/build.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-windows"],
+      "paths": [
+        {
+          "id": "windows-installer",
+          "entry_points": [
+            "packaging/windows/installer/src/main.rs",
+            "packaging/windows/installer/build.rs"
+          ],
+          "build_profiles": ["windows-pier-installer"],
+          "validation": ["windows-pier-installer-build"],
+          "owner": "Windows Host"
+        }
+      ]
+    }
+  ]
+}

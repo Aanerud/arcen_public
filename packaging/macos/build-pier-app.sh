@@ -173,6 +173,15 @@ chmod 755 "$APP/Contents/MacOS/arcen-pier-macos"
 mkdir -p "$APP/Contents/Resources"
 cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
+# The licence and the third-party notices travel with the program, byte for
+# byte, as they do in the Deck app and the Linux and Windows installers. They
+# are copied before signing so the seal covers them.
+for notice in LICENSE legal/THIRD_PARTY_NOTICES.md; do
+  [[ -f "$REPO/$notice" ]] || { echo "error: $REPO/$notice is missing" >&2; exit 1; }
+  cp "$REPO/$notice" "$APP/Contents/Resources/$(basename "$notice")"
+  chmod 644 "$APP/Contents/Resources/$(basename "$notice")"
+done
+
 # The agent helper: a separate bundle identity for the process that holds the
 # permissions.
 #

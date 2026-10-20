@@ -217,11 +217,21 @@ dirty-block fraction.
   4K) on the tier whose whole point is throughput, very likely swamping any
   bitrate saved and corrupting the benchmark it serves.
 
-  **Practical consequence:** on Linux you can measure QP maps on the *grading*
-  tier (HEVC 4:4:4 10-bit) but not on the *performance* tier (AV1/HEVC 4:2:0
-  8-bit). Doing the latter needs either a CUDA damage kernel or an existing CPU
-  copy to piggyback on — neither worth guessing at until the ten-bit numbers
-  say whether the idea works at all.
+  **Practical consequence:** on the Xorg paths you can measure QP maps on the
+  *grading* tier (HEVC 4:4:4 10-bit) but not on the *performance* tier
+  (AV1/HEVC 4:2:0 8-bit). Doing the latter needs either a CUDA damage kernel or
+  an existing CPU copy to piggyback on — neither worth guessing at until the
+  ten-bit numbers say whether the idea works at all.
+
+  **Headless Wayland is the exception, because its damage is free.** GNOME 49
+  states what changed in each PipeWire buffer (`SPA_META_VideoDamage`), so the
+  Wayland eight-bit runner feeds those regions to the same CUDA encoder as an
+  external damage source (`Encoder::enable_external_qp_map`), as Windows feeds
+  DXGI and WGC rectangles: no readback, eight-bit included. Only a picture
+  whose frames all carried a region list is biased; a frame without one (GNOME
+  40, a malformed or overflowing list) makes the picture neutral, never
+  "clean". Logged as `Wayland QP map policy=… damage_source=compositor-regions
+  engaged=…`.
 - **Windows WGC dirty regions require the OS contract.** Windows NVENC uses OS
   damage instead of a readback on the 8-bit GPU path. Desktop Duplication feeds
   `GetFrameDirtyRects` plus conservative source+destination `GetFrameMoveRects`

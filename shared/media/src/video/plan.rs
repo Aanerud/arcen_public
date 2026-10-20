@@ -488,6 +488,25 @@ impl BackendLimits {
             cursor_in_video: self.cursor_in_video && other.cursor_in_video,
         }
     }
+
+    /// These limits for a capture source whose cursor evidence is `cursor`.
+    ///
+    /// `cursor_in_video` in a backend contract says whether that backend's
+    /// capture path can put the host cursor into the pictures it encodes
+    /// (`NvFBC` can; X11 MIT-SHM, which feeds `OpenH264` on Xorg, cannot). A
+    /// producer that has already drawn the cursor into every frame (a
+    /// Wayland compositor's `embedded` cursor mode) needs no such ability:
+    /// any encoder carries those pixels. This is the one documented case
+    /// where limits may be wider than a backend's contract, and it widens
+    /// only cursor truth, from evidence; every other axis is unchanged.
+    #[must_use]
+    pub const fn with_source_cursor(self, cursor: super::CursorEvidence) -> Self {
+        Self {
+            cursor_in_video: self.cursor_in_video
+                || matches!(cursor, super::CursorEvidence::Composited),
+            ..self
+        }
+    }
 }
 
 /// Side-effect-free availability result supplied by a platform probe.
@@ -1764,6 +1783,45 @@ mod tests {
             resolve_media_plan_degrading(request, &candidates).expect("degraded plan");
         assert_eq!(plan.cursor_mode, CursorMode::Local);
         assert!(degradation.cursor_moved_to_local);
+    }
+
+    #[test]
+    fn a_source_drawn_cursor_is_carried_by_any_encoder() {
+        use crate::video::CursorEvidence;
+        let request = MediaRequest {
+            cursor_mode: CursorMode::Host,
+            ..REQUEST
+        };
+        let contract = EncoderBackend::OpenH264.contract();
+        assert!(!contract.cursor_in_video);
+        let composited = contract.with_source_cursor(CursorEvidence::Composited);
+        let plan = resolve_media_plan(
+            request,
+            &[BackendCandidate {
+                backend: EncoderBackend::OpenH264,
+                availability: BackendAvailability::Available(composited),
+            }],
+        )
+        .expect("the producer drew the cursor");
+        assert_eq!(plan.cursor_mode, CursorMode::Host);
+        assert!(plan.cursor_in_video);
+        // Only cursor truth widens.
+        assert_eq!(
+            BackendLimits {
+                cursor_in_video: false,
+                ..composited
+            },
+            contract
+        );
+        for evidence in [
+            CursorEvidence::SeparateMetadata,
+            CursorEvidence::Absent,
+            CursorEvidence::Unknown,
+        ] {
+            assert_eq!(contract.with_source_cursor(evidence), contract);
+        }
+        let nvenc = EncoderBackend::NativeNvenc.contract();
+        assert_eq!(nvenc.with_source_cursor(CursorEvidence::Absent), nvenc);
     }
 
     #[test]

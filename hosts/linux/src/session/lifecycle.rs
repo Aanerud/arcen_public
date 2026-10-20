@@ -51,6 +51,21 @@ pub struct SessionMetadata {
     /// The carrier committed alongside [`Self::multi_monitor_plan`], or
     /// `None` exactly when `multi_monitor_plan` is `None`.
     pub multi_monitor_carrier: Option<MultiMonitorCarrierMsg>,
+    /// The headless Wayland session's outputs, streams and input socket, as
+    /// its agent reported them at start; `None` for dedicated Xorg.
+    pub wayland: Option<super::wayland::WaylandAgentReady>,
+    /// The session's audio, as its agent established it.
+    pub audio: Option<super::agent::SessionAudioReady>,
+    /// The outputs the sign-in that created or last reattached to this
+    /// headless Wayland desktop asked for (primary first): a reconfigurable
+    /// desktop is moved to them before the attachment's first capture
+    /// epoch. `None` for dedicated Xorg or when the sign-in named none.
+    pub requested_outputs: Option<Vec<arcen_session::wayland_outputs::PlacedOutput>>,
+    /// The depth this dedicated Xorg desktop was created at, as its server
+    /// reported it. Fixed for the desktop's whole life: a reattachment is
+    /// served from it and never replaces the desktop to change it. `None`
+    /// for a headless Wayland desktop.
+    pub x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
 }
 
 #[derive(Debug, Error)]
@@ -161,8 +176,9 @@ struct DesktopSession {
     timezone: Option<IanaTimeZone>,
     timezone_lease: Option<RestoreLease>,
     held_display: Option<HeldDisplayResources>,
-    /// See [`SessionMetadata::multi_monitor_plan`]. Committed once at
-    /// `Create` and never mutated afterwards.
+    /// See [`SessionMetadata::multi_monitor_plan`]. Committed at `Create`;
+    /// replaced only when a reattach moves a reconfigurable headless Wayland
+    /// desktop to another topology in place.
     multi_monitor_plan: Option<LinuxTopologyPlan>,
     multi_monitor_carrier: Option<MultiMonitorCarrierMsg>,
     /// See [`MultiMonitorEverUsable`]. Always starts `false` for a fresh
@@ -170,9 +186,21 @@ struct DesktopSession {
     /// is otherwise only ever latched to `true` via
     /// [`SessionRegistry::mark_multi_monitor_ever_usable`].
     multi_monitor_ever_usable: MultiMonitorEverUsable,
+    /// See [`SessionMetadata::requested_outputs`].
+    requested_outputs: Option<Vec<arcen_session::wayland_outputs::PlacedOutput>>,
 }
 
 impl DesktopSession {
+    /// How a headless Wayland desktop's compositor provides outputs, when
+    /// the agent serves its output socket; `None` for dedicated Xorg.
+    fn wayland_output_mode(&self) -> Option<arcen_session::wayland_outputs::VirtualOutputMode> {
+        self.launcher
+            .wayland
+            .as_ref()
+            .filter(|ready| ready.output_socket.is_some())
+            .map(|ready| ready.output_mode)
+    }
+
     fn metadata(&self, reconnected: bool) -> SessionMetadata {
         SessionMetadata {
             username: self.launcher.identity.username.clone(),
@@ -192,6 +220,10 @@ impl DesktopSession {
             timezone: self.timezone.clone(),
             multi_monitor_plan: self.multi_monitor_plan.clone(),
             multi_monitor_carrier: self.multi_monitor_carrier,
+            wayland: self.launcher.wayland.clone(),
+            audio: self.launcher.audio.clone(),
+            requested_outputs: self.requested_outputs.clone(),
+            x11_desktop_depth: self.launcher.x11_desktop_depth,
         }
     }
 
@@ -337,13 +369,62 @@ impl SessionRegistry {
                                 Arbitration::Reconnect => {
                                     let requested_plan =
                                         multi_monitor.as_ref().map(|(plan, _carrier)| plan);
-                                    let topology_matches =
-                                        existing.multi_monitor_plan.as_ref() == requested_plan;
+                                    let topology_matches = match (
+                                        existing.multi_monitor_plan.as_ref(),
+                                        requested_plan,
+                                    ) {
+                                        (Some(existing), Some(requested)) => {
+                                            existing.same_desktop(requested)
+                                        }
+                                        (existing, requested) => {
+                                            existing.is_none() && requested.is_none()
+                                        }
+                                    };
+                                    // A reconfigurable headless Wayland
+                                    // desktop moves to the requested
+                                    // topology in place (before the
+                                    // attachment's first capture epoch)
+                                    // instead of being replaced: its
+                                    // applications stay.
+                                    let requested_virtual = requested_plan.is_none_or(|plan| {
+                                        plan.backend
+                                            == crate::display::topology::LinuxTopologyBackend::VirtualOutputs
+                                    });
+                                    let in_place = requested_virtual
+                                        && existing.wayland_output_mode().is_some_and(|mode| {
+                                            arcen_session::wayland_outputs::reattach_topology_action(
+                                                mode,
+                                                topology_matches,
+                                            ) == arcen_session::wayland_outputs::TopologyReattach::ReconfigureInPlace
+                                        });
+                                    if in_place {
+                                        tracing::info!(
+                                            target: crate::logging::target::SESSION,
+                                            action = arcen_session::wayland_outputs::TopologyReattach::ReconfigureInPlace.token(),
+                                            from_monitors = existing.multi_monitor_plan.as_ref().map_or(1, |plan| plan.monitors.len()),
+                                            to_monitors = requested_plan.map_or(1, |plan| plan.monitors.len()),
+                                            "reattach moves the headless Wayland desktop to the requested topology in place"
+                                        );
+                                        existing.multi_monitor_plan = multi_monitor
+                                            .as_ref()
+                                            .map(|(plan, _carrier)| plan.clone());
+                                        existing.multi_monitor_carrier =
+                                            multi_monitor.as_ref().map(|(_plan, carrier)| *carrier);
+                                        existing.multi_monitor_ever_usable =
+                                            MultiMonitorEverUsable::new();
+                                    }
+                                    if existing.launcher.wayland.is_some() {
+                                        existing.requested_outputs = pending
+                                            .as_ref()
+                                            .expect("pending launcher")
+                                            .requested_wayland_outputs();
+                                    }
                                     // The current client layout is
                                     // authoritative. A disconnected desktop
                                     // with a different frozen topology is
                                     // replaced rather than silently reattached.
-                                    if reconnect_must_replace_desktop(topology_matches) {
+                                    if reconnect_must_replace_desktop(topology_matches || in_place)
+                                    {
                                         guard.draining = true;
                                         ExistingDecision::Replace(Box::new(
                                             guard.session.take().expect("existing session"),
@@ -463,6 +544,7 @@ impl SessionRegistry {
             original_timezone.as_deref(),
         );
         pending.set_timezone(timezone.clone());
+        let requested_outputs = pending.requested_wayland_outputs();
         let launcher = match pending.open().await {
             Ok(launcher) => launcher,
             Err(error) => {
@@ -481,6 +563,7 @@ impl SessionRegistry {
                 complete_timezone_restore_after_shutdown(&mut timezone_lease, agent_exit_confirmed);
             return Err(LifecycleError::TimezoneLease);
         }
+        let launcher_is_wayland = launcher.wayland.is_some();
         let desktop = DesktopSession {
             launcher,
             connected: true,
@@ -493,6 +576,11 @@ impl SessionRegistry {
             multi_monitor_plan: multi_monitor.as_ref().map(|(plan, _carrier)| plan.clone()),
             multi_monitor_carrier: multi_monitor.map(|(_plan, carrier)| carrier),
             multi_monitor_ever_usable: MultiMonitorEverUsable::new(),
+            requested_outputs: if launcher_is_wayland {
+                requested_outputs
+            } else {
+                None
+            },
         };
         let metadata = desktop.metadata(false);
         let execution = desktop.execution();
@@ -631,6 +719,24 @@ impl SessionRegistry {
                 && session.launcher.identity.username == username
                 && session.multi_monitor_ever_usable.get()
         })
+    }
+
+    /// Lab (`wayland.lab_seat_pen`): the pen of the desktop `generation` of
+    /// `username`, and only that desktop's.
+    #[cfg(target_os = "linux")]
+    pub fn seat_pen(
+        &self,
+        generation: u64,
+        username: &str,
+    ) -> Option<Arc<crate::input::seat_pen::SeatPen>> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .session
+            .as_ref()
+            .filter(|session| {
+                session.generation == generation && session.launcher.identity.username == username
+            })
+            .and_then(|session| session.launcher.seat_pen.clone())
     }
 
     pub async fn validate_native_session(
@@ -1044,6 +1150,14 @@ impl SessionLease {
     pub fn multi_monitor_ever_usable(&self) -> bool {
         self.registry.upgrade().is_some_and(|registry| {
             registry.multi_monitor_ever_usable(self.metadata.generation, &self.metadata.username)
+        })
+    }
+
+    /// See [`SessionRegistry::seat_pen`].
+    #[cfg(target_os = "linux")]
+    pub fn seat_pen(&self) -> Option<Arc<crate::input::seat_pen::SeatPen>> {
+        self.registry.upgrade().and_then(|registry| {
+            registry.seat_pen(self.metadata.generation, &self.metadata.username)
         })
     }
 

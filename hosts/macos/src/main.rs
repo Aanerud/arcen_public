@@ -1387,7 +1387,7 @@ async fn daemon_loop(
 
     let relays = std::sync::Arc::new(RelayCount::default());
     loop {
-        let (stream, peer) = match listener.accept_raw().await {
+        let (mut deck, peer) = match listener.accept_raw().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 eprintln!("daemon: {error}");
@@ -1402,19 +1402,15 @@ async fn daemon_loop(
             Some(held) => {
                 let registry = std::sync::Arc::clone(&registry);
                 tokio::spawn(async move {
-                    relay_one(stream, peer, &registry).await;
+                    relay_one(deck, peer, &registry).await;
                     drop(held);
                 });
             }
             None => {
                 eprintln!("refused {peer}: too many connections");
                 tokio::spawn(async move {
-                    let mut socket = arcen_pier_macos::net::framed(
-                        arcen_pier_macos::net::PierStream::Quic(stream),
-                    )
-                    .await;
-                    let _ = arcen_pier_macos::net::refuse_with_reason(
-                        &mut socket,
+                    let _ = arcen_pier_macos::net::refuse_lanes(
+                        &mut deck,
                         "too many connections to this Mac right now; try again shortly",
                     )
                     .await;
@@ -1472,7 +1468,7 @@ impl RelayCount {
 
 /// Hands one admitted Deck to the console session's agent and relays it.
 async fn relay_one(
-    stream: arcen_transport::quic::DirectQuicStream,
+    mut deck: arcen_transport::quic::SessionLaneSocket,
     peer: std::net::SocketAddr,
     registry: &arcen_pier_macos::relay::AgentRegistry,
 ) {
@@ -1499,16 +1495,16 @@ async fn relay_one(
                 kind = ?parked.kind,
                 "relaying a Deck to its desktop agent"
             );
-            let deck = stream;
-            // Keep the backlog out of QUIC. The agent decides what is worth
-            // sending — audio before video, the newest picture rather than a
-            // stale one — and it can only decide if its writes feel the path.
-            let sizing = tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
-                deck.connection_handle(),
-            ));
-            let relayed =
-                arcen_pier_macos::relay::relay_media(deck, agent, session, audio_channel).await;
-            sizing.abort();
+            // One lane per role; the lane setup already keeps the send
+            // window interactive, so the agent's writes feel the path.
+            let relayed = arcen_pier_macos::relay::relay_lanes(
+                deck,
+                agent,
+                session,
+                Some(audio_channel),
+                true,
+            )
+            .await;
             registry.end_session(session);
             match relayed {
                 Ok(stats) => tracing::info!(
@@ -1516,7 +1512,12 @@ async fn relay_one(
                     %peer,
                     to_agent = stats.to_agent,
                     to_deck = stats.to_deck,
-                    priority_audio = stats.priority_audio,
+                    side_channel_audio = stats.side_channel_audio,
+                    video_dropped = stats.lanes.video_dropped,
+                    audio_dropped = stats.lanes.audio_dropped,
+                    keyframe_requests = stats.lanes.keyframe_requests,
+                    bulk_dropped = stats.lanes.bulk_dropped,
+                    clipboard_failed = stats.lanes.clipboard_failed,
                     "relay ended"
                 ),
                 Err(error) => tracing::info!(
@@ -1529,10 +1530,7 @@ async fn relay_one(
         }
         Err(reason) => {
             eprintln!("refused {peer}: {reason}");
-            let mut socket =
-                arcen_pier_macos::net::framed(arcen_pier_macos::net::PierStream::Quic(stream))
-                    .await;
-            let _ = arcen_pier_macos::net::refuse_with_reason(&mut socket, &reason).await;
+            let _ = arcen_pier_macos::net::refuse_lanes(&mut deck, &reason).await;
         }
     }
 }
@@ -1681,12 +1679,6 @@ struct AudioChannelRequest {
     kind: arcen_session::agent_relay::DesktopSessionKind,
     service_uid: Option<u32>,
     session: u64,
-}
-
-/// Whether the Deck's hello opts in to audio on its own priority stream.
-fn client_accepts_priority_audio(client_hello: &str) -> bool {
-    serde_json::from_str::<arcen_protocol::messages::ClientHelloMsg>(client_hello)
-        .is_ok_and(|hello| hello.audio_priority_stream_v1)
 }
 
 /// How many Decks an agent will hold in sign-in at once.
@@ -2139,7 +2131,7 @@ fn deck_reason_for_audio_refusal(reason: &str) -> &'static str {
     if reason.contains("System Audio Recording") {
         "At the host, allow System Audio Recording for Arcen Agent Helper, then reconnect."
     } else {
-        "The host could not mute its own speakers, so it refused the session. See its agent log."
+        arcen_session::local_playback::DECK_REASON_NOT_MUTED
     }
 }
 
@@ -2165,17 +2157,8 @@ fn mute_policy_allows_session(
     local_playback: arcen_session::pier_config::LocalPlayback,
     evidence: Option<arcen_pier_macos::audio::MuteEvidence>,
 ) -> Result<(), String> {
-    if !local_playback.requires_mute() {
-        return Ok(());
-    }
-    match evidence {
-        Some(evidence) if evidence.honoured => Ok(()),
-        Some(evidence) => Err(format!(
-            "local playback mute was not honoured (requested={}, observed_muted={:?})",
-            evidence.requested, evidence.observed_muted
-        )),
-        None => Err("local playback mute produced no evidence".to_owned()),
-    }
+    arcen_session::local_playback::admit(local_playback, evidence)
+        .map_err(|error| error.to_string())
 }
 
 /// Describes the stream this session is about to serve, for the record.
@@ -2682,12 +2665,11 @@ async fn serve_one(
                 eprintln!("ending session because the audio result was not delivered: {error}");
                 return SessionOutcome::Failed;
             }
-            // Opened only when the Deck said it takes audio on its own
-            // priority stream; the service forwards what arrives here there.
+            // Audio never shares the session socket with video on the way
+            // to the service, which puts it on the Deck's audio lane.
             let audio_channel = match audio_channel_request {
                 Some(request)
-                    if client_accepts_priority_audio(&handshake.client_hello)
-                        && std::env::var("ARCEN_AUDIO_SIDE_CHANNEL").as_deref() != Ok("0") =>
+                    if std::env::var("ARCEN_AUDIO_SIDE_CHANNEL").as_deref() != Ok("0") =>
                 {
                     match arcen_pier_macos::relay::open_audio_channel(
                         std::path::Path::new(arcen_pier_macos::relay::AGENT_SOCKET),
@@ -2699,7 +2681,9 @@ async fn serve_one(
                     {
                         Ok(channel) => Some(channel),
                         Err(error) => {
-                            eprintln!("audio stays on the session stream: {error}");
+                            eprintln!(
+                                "audio side channel unavailable; audio shares the session socket to the service: {error}"
+                            );
                             None
                         }
                     }

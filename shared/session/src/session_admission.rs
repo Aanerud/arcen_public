@@ -234,6 +234,41 @@ impl SessionAdmissionRuntime {
     }
 }
 
+/// Why a fresh sign-in that authenticated could not take over the desktop a
+/// disconnected Deck left waiting for its resume. The Deck is told why in
+/// words that neither blame the password nor name the desktop's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachedTakeoverRefusal {
+    /// The waiting desktop belongs to another user.
+    AnotherUsersDesktop,
+    /// The waiting desktop did not answer the hand-over in time.
+    OwnerDidNotAnswer,
+}
+
+impl DetachedTakeoverRefusal {
+    /// What the Deck shows (a close reason: at most 120 bytes).
+    #[must_use]
+    pub const fn deck_reason(self) -> &'static str {
+        match self {
+            Self::AnotherUsersDesktop => {
+                "Another user's remote desktop is waiting for its owner to reconnect; try again later."
+            }
+            Self::OwnerDidNotAnswer => {
+                "The remote desktop on this host is still finishing its last connection; try again in a moment."
+            }
+        }
+    }
+
+    /// Stable token for logs.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::AnotherUsersDesktop => "another_users_desktop",
+            Self::OwnerDidNotAnswer => "owner_did_not_answer",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +329,27 @@ mod tests {
         assert_eq!(
             second.complete(&lease),
             Err(SessionAdmissionError::ForeignLease)
+        );
+    }
+
+    #[test]
+    fn a_refused_takeover_is_explained_without_blaming_the_password() {
+        for refusal in [
+            DetachedTakeoverRefusal::AnotherUsersDesktop,
+            DetachedTakeoverRefusal::OwnerDidNotAnswer,
+        ] {
+            let reason = refusal.deck_reason();
+            assert!(reason.len() <= 120, "{reason}");
+            let lower = reason.to_ascii_lowercase();
+            assert!(
+                !lower.contains("auth") && !lower.contains("password"),
+                "{reason}"
+            );
+        }
+        assert!(
+            DetachedTakeoverRefusal::AnotherUsersDesktop
+                .deck_reason()
+                .contains("Another user's remote desktop is waiting")
         );
     }
 }

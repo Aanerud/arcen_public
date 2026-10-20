@@ -17,6 +17,8 @@ pub mod cert_provisioning;
 pub mod cert_transaction;
 #[cfg(feature = "wss-compat")]
 pub mod fallback;
+pub mod lanes;
+pub mod liveness;
 pub mod path_signal;
 #[cfg(feature = "quic")]
 pub mod quic;
@@ -145,6 +147,7 @@ pub enum DeliveryMechanism {
 /// | 0x30        | HID device added        | `Control`         |
 /// | 0x31        | HID device removed      | `Control`         |
 /// | 0x32        | HID report              | `InputLowLatency` |
+/// | 0x50        | Host cursor update      | `InputLowLatency` |
 /// | _other_     | Unknown/control JSON    | `Control`         |
 ///
 /// JSON/text control messages are not binary-framed with a type byte; the
@@ -174,7 +177,7 @@ pub fn reliability_class_for_frame_byte(frame_type_byte: u8) -> ReliabilityClass
             | FrameType::UsbBridgeUrbCancel,
         )
         | Err(_) => ReliabilityClass::Control,
-        Ok(FrameType::HidReport | FrameType::UsbBridgeUrbComplete) => {
+        Ok(FrameType::HidReport | FrameType::UsbBridgeUrbComplete | FrameType::CursorUpdate) => {
             ReliabilityClass::InputLowLatency
         }
     }

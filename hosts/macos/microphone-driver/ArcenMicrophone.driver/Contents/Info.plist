@@ -13,9 +13,9 @@
   <key>CFBundlePackageType</key>
   <string>BNDL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.16.1</string>
+  <string>0.17.0</string>
   <key>CFBundleVersion</key>
-  <string>0.16.1</string>
+  <string>0.17.0</string>
   <key>CFPlugInFactories</key>
   <dict>
     <key>8F053A96-2B8D-4F88-8F90-B2E6B0F0E0A1</key>

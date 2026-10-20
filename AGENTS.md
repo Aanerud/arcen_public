@@ -82,7 +82,7 @@ applied to one capture loop. Keep their capture providers separate:
 | --- | --- | --- | --- | --- |
 | Auto / Speed, 8-bit | NvFBC → CUDA → NVENC; preserve the device-to-device fast path | DDA after real-frame proof, otherwise WGC BGRA8 | ScreenCaptureKit `420v` → VideoToolbox, untouched | Ordinary SDR decode/presentation |
 | Grading, 10-bit SDR | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → NVENC | WGC FP16 scRGB → shared SDR transfer/matrix → NVENC P16 | SCK `xf44` → VideoToolbox HEVC Main 4:4:4 10, BT.709 tags, SPS-proven | Native `xf44` → 10-bit Metal, EDR off |
-| HDR | Xorg downgrades to Grading unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`, shared `resolve_desktop_plan`, which converts SDR sessions and refuses 8-bit ones); a future proven Wayland provider may retain PQ/HLG | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | HDR virtual panel, headroom proof → SCK `xf44` PQ/BT.2020 → Core Image 203-nit white → VideoToolbox Main 4:4:4 10 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
+| HDR | Xorg downgrades to Grading unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`, shared `resolve_desktop_plan`, which converts SDR sessions and refuses 8-bit ones). Wayland on Mutter ≥ 50 with a qualified `force-hdr` route: wide `RecordMonitor` 10-bit PQ DMA-BUF → readback → NVENC P16 BT.2020/PQ (Grading converts the PQ composition to BT.709 in shared code); Mutter < 50 has no HDR screen sharing and serves Auto | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → NVENC P16 | HDR virtual panel, headroom proof → SCK `xf44` PQ/BT.2020 → Core Image 203-nit white → VideoToolbox Main 4:4:4 10 | Same 10-bit Metal path, PQ/EDR on only when the host returns PQ |
 
 Do not widen or refactor the 8-bit fast path to implement a fidelity path.
 Bit depth does not imply HDR. Capture source, transfer, primaries, matrix,
@@ -100,6 +100,7 @@ resolved plan, READY/hello truth, frame headers, and Deck presentation.
 | How input is ordered, accumulated or attributed | `shared/input` |
 | When a session may resume, and for how long | `shared/session` |
 | A new log event | `shared/telemetry`, emitted through `shared/observability` |
+| A product path that uses a shared crate, or a new dependency on one | a record in that crate's `shared/<crate>/consumers.json` |
 | Calling a platform API to capture, encode, inject or authenticate | the relevant `hosts/` or `clients/` directory, and nothing more |
 
 A platform module should read as a thin adapter: gather what the OS gives you,
@@ -127,6 +128,39 @@ hand it to a shared type, act on what comes back.
 
 `scripts/ci/check-publication-hygiene.sh` enforces most of this. Run it before
 you propose a change.
+
+---
+
+## "Unavailable" is a finding to research, not a conclusion
+
+You are expected to search and research before you declare a capability
+unavailable, and to keep working on it. Use web search, upstream repositories,
+merge requests, mailing lists, release notes and maintainers' blogs as normal
+tools. A probe on one lab machine shows what *that* stack does today; it does
+not show what Arcen can do.
+
+When something looks blocked:
+
+1. **Research upstream first.** Find the current status in the relevant project
+   (for example libei, Mutter, PipeWire, the NVIDIA driver, macOS SDKs), the
+   version that adds it, and whether a released distribution ships it. Cite
+   what you found (URL, version, date).
+2. **Build to the capability, not to today's lab.** If the upstream interface
+   exists or is landing, implement Arcen's side now behind capability
+   negotiation: advertised when the host proves it, refused visibly when not.
+   Test it against the upstream project's own test or demo server when the
+   compositor or OS does not ship it yet.
+3. **Look for another route.** A different API, protocol, or session design may
+   reach the same result. Write down the routes you considered and why.
+4. **Keep the work going.** Missing parity in one path is a work package, not a
+   release note. As orchestrator, run it in parallel with release work; never
+   park it silently.
+5. **Report honestly.** "Unavailable" may appear in user-facing docs only with
+   the evidence (what was tried, what upstream lacks, which version would add
+   it) and a tracked follow-up. "Not implemented yet" and "not possible" are
+   different statements; never write the second when you mean the first.
+
+Reference projects remain learn-only: research them, never copy from them.
 
 ---
 
@@ -168,11 +202,17 @@ cargo clippy --locked -p arcen-identity -p arcen-input -p arcen-keel \
   -- -D warnings
 cargo test --locked -p arcen-media --features software-h264-source
 cargo test --locked -p arcen-transport --features quic
+python3 scripts/check_shared_contracts.py
 scripts/ci/check-publication-hygiene.sh
 ```
 
 The shared crates are the strict-lint gate. Migrated platform crates still carry
 warnings and are tightened over time.
+
+**Changing a shared crate** also obliges you to protect its consumers, not only
+its own tests: `python3 scripts/check_shared_contracts.py --impact --base main
+--commands` lists every affected product path and the validation it needs
+(see [`docs/architecture/shared-consumers.md`](docs/architecture/shared-consumers.md)).
 
 **Dependency purity proofs.** `cargo tree --locked -p arcen-transport -e normal`
 must show no `quinn`, `tokio`, `tokio-util` or `bytes` line, and

@@ -32,6 +32,13 @@ APIs, or injection APIs and forbids unsafe code.
   tablet; it serializes as the legacy token `wacom_usb_bridge`, matching
   `arcen_protocol::messages::TabletModeMsg`, and converts to and from it with
   `From`.
+- `virtual_device::SessionInputIdentity` names a host's virtual input devices
+  for the session's dedicated X display (`Arcen Virtual Tablet Pen (session
+  :58)`, vendor `a2ce`) and renders the X server input
+  classes that admit only those devices: one class ignores every device, the
+  next re-admits `a2ce:*` devices carrying the session token. The closing
+  parenthesis keeps `:6` from matching `:61`. It performs no device or file
+  operations.
 - `InputSequenceTracker` accepts legacy sequence zero without advancing state
   and otherwise enforces one strict sequence across every input event type,
   including pen samples.

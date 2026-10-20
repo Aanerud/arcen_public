@@ -115,7 +115,10 @@ One abstraction, three producers, four consumers.
   newest encoded frame. Older runtimes have no WGC damage source, so the QP map
   path reports `damage_source=none` and does not submit a neutral map as if it
   were engaged.
-- **NvFBC (Linux path):** frame-level `bIsNewFrame` drives idle cadence now.
+- **NvFBC (Linux path):** frame-level `bIsNewFrame` drives idle cadence now,
+  and `ArrivalPacer` submits each new frame as it arrives, paced to the
+  contract (a fixed contract-rate tick lost a third of a 60 Hz head's frames;
+  ADR 0014 amendment 12).
   Public NvFBC 1.7 and 1.9 expose diff maps only through ToSys/ToGL; the existing
   zero-copy ToCuda setup has no `bWithDiffMap`, map pointer, or geometry fields.
   Fine damage therefore needs a separately reviewed ToSys/ToGL design or an

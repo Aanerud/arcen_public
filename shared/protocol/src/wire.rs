@@ -1,4 +1,7 @@
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version of the Pier/Deck session layout. 5: the session runs on isolated
+/// QUIC lanes (ADR 0014); a version-4 peer is refused with
+/// `lanes::PeerTransportMismatch`.
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const VIDEO_HEADER_SIZE: usize = 10;
 pub const REGION_VIDEO_HEADER_SIZE: usize = 26;
 /// Bit in [`VideoHeader::flags`] marking a keyframe/full-frame packet.
@@ -31,8 +34,22 @@ pub const MICROPHONE_PCM_BYTES: usize = 960 * size_of::<i16>();
 pub const JPEG_HEADER_SIZE: usize = 9;
 pub const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 pub const PNG_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Largest clipboard chunk payload a receiver accepts.
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 pub const CLIPBOARD_HEADER_SIZE: usize = 20;
+/// Largest clipboard chunk payload a sender puts in one chunk.
+///
+/// A chunk crosses the bulk lane as one session record (length prefix, kind
+/// byte, clipboard header, payload), and both lane ends refuse a bulk record
+/// larger than 1 MiB, the transport's control and bulk frame bound (ADR
+/// 0014). Filling the payload to [`CHUNK_BYTES`] made every full chunk 25
+/// bytes too large, so no clipboard item of 1 MiB or more was ever sent.
+/// The whole record of a chunk this size is exactly [`CHUNK_BYTES`].
+/// Receivers still accept payloads up to [`CHUNK_BYTES`].
+pub const CLIPBOARD_CHUNK_PAYLOAD_BYTES: usize = CHUNK_BYTES
+    - crate::lanes::SESSION_RECORD_LENGTH_BYTES
+    - crate::lanes::SESSION_RECORD_KIND_BYTES
+    - CLIPBOARD_HEADER_SIZE;
 pub const HARD_MAX_CLIPBOARD_BYTES: usize = 20 * 1024 * 1024;
 
 // HID passthrough (HoIP): client → host binary frames.
@@ -85,6 +102,8 @@ pub enum FrameType {
     UsbBridgeUrbSubmit = 0x40,
     UsbBridgeUrbCancel = 0x41,
     UsbBridgeUrbComplete = 0x42,
+    /// Host cursor image and visibility (`crate::cursor`), input/cursor lane.
+    CursorUpdate = 0x50,
 }
 
 /// Whether a binary session message is a host audio frame: the frames a Pier
@@ -358,6 +377,7 @@ impl TryFrom<u8> for FrameType {
             0x40 => Ok(Self::UsbBridgeUrbSubmit),
             0x41 => Ok(Self::UsbBridgeUrbCancel),
             0x42 => Ok(Self::UsbBridgeUrbComplete),
+            0x50 => Ok(Self::CursorUpdate),
             other => Err(ProtocolError::UnknownFrameType(other)),
         }
     }

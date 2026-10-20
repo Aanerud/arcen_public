@@ -11,6 +11,14 @@
 //! default-off `wayland-provider` feature exposes the provider trait, while
 //! runtime selection remains fail-closed because the native adapter
 //! implementation constant is false.
+//!
+//! Injection into Arcen's own headless sessions does not go through this
+//! seam: the session agent injects through
+//! [`crate::session::wayland::input::CompositorInput`], today Mutter
+//! `RemoteDesktop` D-Bus calls. A libei injector from
+//! `RemoteDesktop.Session.ConnectToEIS` replaces that trait's implementation
+//! inside the agent; these region types are what it would reconcile the
+//! EIS seat's regions with.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;

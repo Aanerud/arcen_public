@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio_worker;
 pub mod display_fit;
 pub mod home;
 mod keyboard;
@@ -9,8 +10,11 @@ pub mod multi_window_activation;
 pub mod multi_window_diagnostic;
 pub mod multi_window_runtime;
 pub mod multi_window_session;
+mod option_keys;
+pub(crate) mod pen_input;
 pub mod region_runtime;
 mod session_truth;
+pub mod text_input;
 pub mod theme;
 pub mod trusted_pins;
 mod video_metal_layer;

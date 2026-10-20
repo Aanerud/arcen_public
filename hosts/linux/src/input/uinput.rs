@@ -2,20 +2,26 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use arcen_input::virtual_device::{
+    SessionInputIdentity, VirtualInputRole, TILT_UNITS_PER_RADIAN, VIRTUAL_INPUT_VENDOR_ID,
+};
 use arcen_protocol::messages::{
     KeyEventMsg, MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg,
     PenToolMsg, PointerMotionMode, RegionPenEventMsg, RegionPointerButtonMsg,
     RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
 };
-use evdev::uinput::VirtualDevice;
+use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode,
     RelativeAxisCode, UinputAbsSetup,
 };
 
-use super::keymap::{
-    qt_key_to_evdev, LOCK_CODES, MODIFIER_CODES, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT,
+use super::edges::{
+    commit_button_edge, legacy_scroll_to_wheel_units, mouse_button_code, plan_button_edge,
+    plan_key_edges, plan_keyboard_reset_releases, plan_reset_releases, saturating_hi_res_units,
+    split_legacy_detents,
 };
+use super::keymap::{kernel_safe_key, qt_key_to_evdev, KEY_SYSRQ, LOCK_CODES};
 use super::pen::{self, PenToolState};
 use super::region_adapter::{RegionInputAdapter, XorgAxisPoint};
 use super::{InputError, InputStats};
@@ -39,6 +45,7 @@ pub struct InputController {
     horizontal_scroll_remainder: i64,
     lock_state: [bool; 3],
     pen_state: PenToolState,
+    pen_proximity_timeout: arcen_input::virtual_device::ProximityTimeoutDisarm,
     stats: Arc<InputStats>,
 }
 
@@ -62,10 +69,17 @@ impl InputController {
     /// `width × height` sets the fixed ABS axis range and must match the X11
     /// raster. ViewPortIn changes only capture scaling; pointer coordinates
     /// stay normalized across this fixed X screen.
+    ///
+    /// Every device is named for `identity`, the session whose dedicated X
+    /// server admits only devices carrying that name
+    /// ([`SessionInputIdentity::xorg_input_classes`]). The kernel still offers
+    /// these devices to every X server on the seat; their name is what keeps
+    /// them out of other sessions.
     pub fn new(
         width: u32,
         height: u32,
         region_input: Option<RegionInputAdapter>,
+        identity: SessionInputIdentity,
     ) -> Result<(Self, Arc<InputStats>), InputError> {
         if width == 0 || height == 0 {
             return Err(InputError::InvalidGeometry(width, height));
@@ -100,9 +114,8 @@ impl InputController {
         // Xorg's libinput driver initializes a device advertising REL_X/Y as
         // relative and then discards ABS_X/Y events from it. Keep absolute and
         // relative motion on distinct kernel devices.
-        let absolute_device = VirtualDevice::builder()?
-            .name("Arcen Virtual Absolute Input")
-            .input_id(InputId::new(BusType::BUS_VIRTUAL, 0xA2CE, 0x0001, 1))
+        let absolute_name = identity.device_name(VirtualInputRole::Absolute);
+        let absolute_device = session_device_builder(VirtualInputRole::Absolute, &absolute_name)?
             .with_keys(&keys)?
             .with_absolute_axis(&x_axis)?
             .with_absolute_axis(&y_axis)?
@@ -112,9 +125,8 @@ impl InputController {
             AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE]);
         let relative_axes =
             AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]);
-        let relative_device = VirtualDevice::builder()?
-            .name("Arcen Virtual Relative Pointer")
-            .input_id(InputId::new(BusType::BUS_VIRTUAL, 0xA2CE, 0x0002, 1))
+        let relative_name = identity.device_name(VirtualInputRole::Relative);
+        let relative_device = session_device_builder(VirtualInputRole::Relative, &relative_name)?
             .with_keys(&pointer_buttons)?
             .with_relative_axes(&relative_axes)?
             .build()?;
@@ -124,7 +136,7 @@ impl InputController {
         // downgraded to `tablet_device: None` rather than propagated: mouse
         // and keyboard must stay available even when the pen backend is not.
         let uinput_node_exists = std::path::Path::new("/dev/uinput").exists();
-        let tablet_device = match build_tablet_device(width, height) {
+        let tablet_device = match build_tablet_device(width, height, identity) {
             Ok(device) => {
                 tracing::info!(
                     target: "input",
@@ -181,6 +193,7 @@ impl InputController {
                 horizontal_scroll_remainder: 0,
                 lock_state: [false; 3],
                 pen_state: PenToolState::default(),
+                pen_proximity_timeout: Default::default(),
                 stats: stats.clone(),
             },
             stats,
@@ -193,6 +206,7 @@ impl InputController {
             self.stats.unmapped_keys.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
+        let code = kernel_safe_key(code);
         let edges = plan_key_edges(
             &mut self.held_keys,
             code,
@@ -202,6 +216,7 @@ impl InputController {
         if !edges.is_empty() {
             let events: Vec<InputEvent> = edges
                 .into_iter()
+                .filter(|(edge_code, _)| *edge_code != KEY_SYSRQ)
                 .map(|(edge_code, pressed)| {
                     InputEvent::new(EventType::KEY.0, edge_code, i32::from(pressed))
                 })
@@ -443,30 +458,37 @@ impl InputController {
         Ok(())
     }
 
-    /// Injects one validated `PenEventMsg` sample, moving the cursor and
-    /// firing clicks on the absolute-pointer uinput device (a master-POINTER
-    /// slave) and optionally forwarding full tablet-tool axes (pressure,
-    /// tilt) on the separate tablet-tool uinput device for XI2-aware
-    /// applications.
+    /// Injects one validated `PenEventMsg` sample on the tablet-tool uinput
+    /// device, or, when that device could not be created, as cursor motion
+    /// and clicks on the absolute-pointer device.
     ///
     /// # Device routing rationale
     ///
-    /// Xorg's xf86-input-libinput driver attaches tablet-tool uinput devices
-    /// to the master KEYBOARD, not the master POINTER, because the XI2
-    /// tablet-tool protocol tracks pen position independently from the core
-    /// cursor.  As a result, ABS_X/Y events on the tablet device do **not**
-    /// move the screen cursor — they are only visible to XI2 clients that
-    /// explicitly subscribe to `LIBINPUT_EVENT_TABLET_TOOL_AXIS`.  For WAN
-    /// tablet support we need the cursor to visibly follow the pen and clicks
-    /// to land correctly, so this function routes position and pen-tip/barrel
-    /// events through `absolute_device` (master POINTER slave, same device
-    /// that handles absolute mouse positioning) and uses `tablet_device` only
-    /// as a supplementary XI2 pressure/tilt source.
+    /// xf86-input-libinput puts the tablet device itself on the master
+    /// keyboard, and gives each tool that comes into proximity its own slave
+    /// *pointer* (`"<device> Pen (0)"` in `xinput list`). That tool device
+    /// moves the cursor and presses button 1 for the tip, so the pen needs no
+    /// other device: an application sees one pen, whose pointer events carry
+    /// pressure and tilt from the first contact on.
+    ///
+    /// The pen used to move the cursor and click through the absolute mouse
+    /// as well, with the tablet device only adding XI2 valuators. Every pen
+    /// sample then reached X clients twice, from two source devices: Firefox
+    /// started each stroke with a `mouse` pointerdown, flipped the pointer
+    /// type and id between `mouse` and `pen` inside a stroke, and a page that
+    /// ends a stroke on `pointerleave` lost ink (real-screen evidence on a
+    /// stylus test page, Xorg/GNOME 40). The absolute device remains the
+    /// fallback when no tablet device exists.
     ///
     /// Callers must call `PenEventMsg::validate()` and advance the shared
     /// input sequence tracker before calling this.
     pub fn pen_event(&mut self, message: &PenEventMsg) -> Result<(), InputError> {
-        let axes = pen::PenAxes::from_event(message, self.width, self.height);
+        let axes = pen::PenAxes::from_event(
+            message,
+            self.width,
+            self.height,
+            pen::XORG_TABLET_CONTACT_FLOOR,
+        );
         let (edges, new_state) = pen::plan_pen_edges(self.pen_state, message);
         self.inject_pen(PenInjection {
             axes,
@@ -489,8 +511,12 @@ impl InputController {
             .as_mut()
             .ok_or(InputError::RegionUnavailable)?
             .pen(message)?;
-        let axes =
-            pen::PenAxes::from_region_sample(&mapped.sample, mapped.position.x, mapped.position.y);
+        let axes = pen::PenAxes::from_region_sample(
+            &mapped.sample,
+            mapped.position.x,
+            mapped.position.y,
+            pen::XORG_TABLET_CONTACT_FLOOR,
+        );
         let (edges, new_state) = pen::plan_region_pen_edges(self.pen_state, &mapped.sample);
         self.inject_pen(PenInjection {
             axes,
@@ -537,15 +563,14 @@ impl InputController {
             seq = sequence,
             source,
             edges = edges.len(),
-            "pen_inject: absolute pointer device (cursor+click) + tablet device (XI2)"
+            "pen_inject: tablet device (absolute pointer device only without one)"
         );
 
-        // ── Cursor movement + click via the ABSOLUTE pointer device ──────
-        //
-        // Routes through the same master-POINTER slave as absolute mouse
-        // positioning, guaranteeing the screen cursor actually moves.
+        // ── Fallback without a tablet device: cursor + click via the
+        // ABSOLUTE pointer device (the pen as a mouse, no pressure).
         let mut abs_events: Vec<InputEvent> = Vec::new();
-        if in_proximity {
+        let pen_as_mouse = self.tablet_device.is_none();
+        if pen_as_mouse && in_proximity {
             // Keep the cursor at the pen position while the pen is in range.
             abs_events.push(InputEvent::new(
                 EventType::ABSOLUTE.0,
@@ -562,11 +587,11 @@ impl InputController {
         // device.  BTN_TOOL_PEN/RUBBER do not have a mouse equivalent (they
         // are proximity markers, not clickable buttons) and are skipped here;
         // they are still sent to the tablet-tool device below.
-        for &(code, pressed) in &edges {
+        for &(code, pressed) in edges.iter().filter(|_| pen_as_mouse) {
             let mouse_btn = match code {
                 pen::BTN_TOUCH => Some(KeyCode::BTN_LEFT.0), // tip contact → left click
-                pen::BTN_STYLUS => Some(KeyCode::BTN_RIGHT.0), // lower barrel → right click
-                pen::BTN_STYLUS2 => Some(KeyCode::BTN_MIDDLE.0), // upper barrel → middle click
+                pen::BTN_STYLUS => Some(KeyCode::BTN_MIDDLE.0), // lower barrel → middle, as a tablet
+                pen::BTN_STYLUS2 => Some(KeyCode::BTN_RIGHT.0), // upper barrel → right, as a tablet
                 _ => None,
             };
             if let Some(btn) = mouse_btn {
@@ -580,14 +605,15 @@ impl InputController {
             self.absolute_device.emit(&abs_events)?;
         }
 
-        // ── Supplementary XI2 data via the tablet-tool device ────────────
-        //
-        // Sends BTN_TOOL_PEN proximity markers plus ABS_PRESSURE/TILT so
-        // pressure-aware XI2 applications (Krita, GIMP) can read tablet-tool
-        // valuators directly.  Best-effort: a failure here is logged at trace
-        // but does not abort the event — cursor/click injection above already
-        // succeeded.
+        // ── The pen: proximity, tip, barrel buttons, position, pressure and
+        // tilt on the tablet-tool device, whose tool pointer moves the cursor.
         if let Some(tablet_device) = self.tablet_device.as_mut() {
+            if self
+                .pen_proximity_timeout
+                .needs_prelude(self.pen_state.tool.is_some(), in_proximity)
+            {
+                let _ = super::seat_pen::emit_proximity_prelude(tablet_device, axes.x, axes.y);
+            }
             let mut tab_events: Vec<InputEvent> = edges
                 .iter()
                 .map(|&(code, pressed)| InputEvent::new(EventType::KEY.0, code, i32::from(pressed)))
@@ -617,13 +643,7 @@ impl InputController {
                 AbsoluteAxisCode::ABS_TILT_Y.0,
                 axes.tilt_y,
             ));
-            if let Err(e) = tablet_device.emit(&tab_events) {
-                tracing::trace!(
-                    target: "input",
-                    error = %e,
-                    "pen_inject: tablet XI2 emit failed (non-fatal; cursor+click via absolute device succeeded)"
-                );
-            }
+            tablet_device.emit(&tab_events)?;
         }
 
         // Log proximity transitions only (not every event) to confirm the
@@ -633,7 +653,7 @@ impl InputController {
         if !was_in_proximity && now_in_proximity {
             tracing::debug!(
                 target: "input",
-                "pen entered proximity; cursor via absolute device, XI2 via tablet device"
+                "pen entered proximity"
             );
         } else if was_in_proximity && !now_in_proximity {
             tracing::debug!(target: "input", "pen left proximity");
@@ -643,10 +663,9 @@ impl InputController {
         Ok(())
     }
 
-    /// True because the pen pipeline always routes through the absolute
-    /// pointer device, which is always present.  The tablet-tool device
-    /// (supplementary XI2 pressure/tilt) is optional and its absence does
-    /// not prevent basic pen operation (cursor movement + clicking).
+    /// True: without the tablet-tool device the pen still moves the cursor
+    /// and clicks through the absolute pointer device, which is always
+    /// present (no pressure or tilt then).
     #[must_use]
     pub const fn pen_available(&self) -> bool {
         true
@@ -763,13 +782,18 @@ impl Drop for InputController {
 /// compositor's single coordinate mapping.
 ///
 /// Advertises exactly the capability set this backend can prove today: X/Y,
-/// pressure (documented 13-bit range), X/Y tilt (whole-degree passthrough),
+/// pressure (documented 13-bit range), X/Y tilt (whole degrees, with the
+/// resolution that makes libinput read them as degrees),
 /// proximity/tool via `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER`, tip contact via
 /// `BTN_TOUCH`, and two barrel buttons via `BTN_STYLUS`/`BTN_STYLUS2`.
 /// Deliberately omits any rotation axis: no target here has proven the
 /// kernel/libinput stack recognizes a chosen axis as tablet rotation, and an
 /// unproven axis is worse than the honest `Unavailable` default.
-fn build_tablet_device(width: u32, height: u32) -> Result<VirtualDevice, InputError> {
+fn build_tablet_device(
+    width: u32,
+    height: u32,
+    identity: SessionInputIdentity,
+) -> Result<VirtualDevice, InputError> {
     let mut keys = AttributeSet::<KeyCode>::new();
     for code in [
         KeyCode(pen::BTN_TOOL_PEN),
@@ -794,15 +818,28 @@ fn build_tablet_device(width: u32, height: u32) -> Result<VirtualDevice, InputEr
     );
     let tilt_x_axis = UinputAbsSetup::new(
         AbsoluteAxisCode::ABS_TILT_X,
-        AbsInfo::new(0, pen::TILT_MIN_DEGREES, pen::TILT_MAX_DEGREES, 0, 0, 0),
+        AbsInfo::new(
+            0,
+            pen::TILT_MIN_DEGREES,
+            pen::TILT_MAX_DEGREES,
+            0,
+            0,
+            TILT_UNITS_PER_RADIAN,
+        ),
     );
     let tilt_y_axis = UinputAbsSetup::new(
         AbsoluteAxisCode::ABS_TILT_Y,
-        AbsInfo::new(0, pen::TILT_MIN_DEGREES, pen::TILT_MAX_DEGREES, 0, 0, 0),
+        AbsInfo::new(
+            0,
+            pen::TILT_MIN_DEGREES,
+            pen::TILT_MAX_DEGREES,
+            0,
+            0,
+            TILT_UNITS_PER_RADIAN,
+        ),
     );
-    let device = VirtualDevice::builder()?
-        .name("Arcen Virtual Tablet Pen")
-        .input_id(InputId::new(BusType::BUS_VIRTUAL, 0xA2CE, 0x0003, 1))
+    let name = identity.device_name(VirtualInputRole::TabletPen);
+    let device = session_device_builder(VirtualInputRole::TabletPen, &name)?
         .with_keys(&keys)?
         .with_absolute_axis(&x_axis)?
         .with_absolute_axis(&y_axis)?
@@ -813,60 +850,20 @@ fn build_tablet_device(width: u32, height: u32) -> Result<VirtualDevice, InputEr
     Ok(device)
 }
 
-fn scroll_steps(value: f64) -> i32 {
-    if value == 0.0 || !value.is_finite() {
-        return 0;
-    }
-    let rounded = value.round() as i32;
-    if rounded == 0 {
-        value.signum() as i32
-    } else {
-        rounded
-    }
-}
-
-fn legacy_scroll_to_wheel_units(value: f64, unit: arcen_input::ScrollUnit) -> i64 {
-    match unit {
-        arcen_input::ScrollUnit::Line => i64::from(scroll_steps(value)) * 120,
-        arcen_input::ScrollUnit::Point => {
-            if value == 0.0 || !value.is_finite() {
-                0
-            } else {
-                let rounded = value.round();
-                if rounded == 0.0 {
-                    value.signum() as i64
-                } else if rounded > i64::MAX as f64 {
-                    i64::MAX
-                } else if rounded < i64::MIN as f64 {
-                    i64::MIN
-                } else {
-                    rounded as i64
-                }
-            }
-        }
-    }
-}
-
-fn split_legacy_detents(remainder: &mut i64, hi_res_units: i64) -> i32 {
-    let total = remainder.saturating_add(hi_res_units);
-    let detents = total / 120;
-    *remainder = total % 120;
-    i32::try_from(detents).unwrap_or(if detents.is_negative() {
-        i32::MIN
-    } else {
-        i32::MAX
-    })
-}
-
-fn saturating_hi_res_units(value: i64) -> i32 {
-    if value == 0 {
-        return 0;
-    }
-    i32::try_from(value).unwrap_or(if value.is_negative() {
-        i32::MIN
-    } else {
-        i32::MAX
-    })
+/// A builder already carrying `role`'s session name and identifiers.
+///
+/// No phys is set: `evdev` 0.13's `with_phys` issues `UI_SET_PHYS` with a
+/// one-byte argument size, which the kernel rejects with `EINVAL`.
+fn session_device_builder(
+    role: VirtualInputRole,
+    name: &str,
+) -> Result<VirtualDeviceBuilder<'_>, InputError> {
+    Ok(VirtualDevice::builder()?.name(name).input_id(InputId::new(
+        BusType::BUS_VIRTUAL,
+        VIRTUAL_INPUT_VENDOR_ID,
+        role.product_id(),
+        1,
+    )))
 }
 
 fn append_wheel_events(
@@ -893,15 +890,6 @@ fn append_wheel_events(
     }
 }
 
-fn mouse_button_code(button: u8) -> Result<u16, InputError> {
-    match button {
-        1 => Ok(KeyCode::BTN_LEFT.0),
-        2 => Ok(KeyCode::BTN_MIDDLE.0),
-        3 => Ok(KeyCode::BTN_RIGHT.0),
-        button => Err(InputError::InvalidButton(button)),
-    }
-}
-
 fn axis_position_events(point: XorgAxisPoint) -> [InputEvent; 2] {
     [
         InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, point.x),
@@ -920,86 +908,6 @@ fn relative_motion_events(dx: i32, dy: i32) -> [InputEvent; 2] {
     ]
 }
 
-fn plan_key_edges(
-    held: &mut HashSet<u16>,
-    code: u16,
-    pressed: bool,
-    modifiers: u32,
-) -> Vec<(u16, bool)> {
-    let mut edges = Vec::with_capacity(5);
-    if is_modifier(code) {
-        append_idempotent_edge(held, &mut edges, code, pressed);
-        return edges;
-    }
-    for (bit, modifier_code) in [
-        (MOD_SHIFT, 42),
-        (MOD_CTRL, 29),
-        (MOD_ALT, 56),
-        (MOD_META, 125),
-    ] {
-        append_idempotent_edge(held, &mut edges, modifier_code, modifiers & bit != 0);
-    }
-    append_idempotent_edge(held, &mut edges, code, pressed);
-    edges
-}
-
-fn append_idempotent_edge(
-    held: &mut HashSet<u16>,
-    edges: &mut Vec<(u16, bool)>,
-    code: u16,
-    pressed: bool,
-) {
-    let changed = if pressed {
-        held.insert(code)
-    } else {
-        held.remove(&code)
-    };
-    if changed {
-        edges.push((code, pressed));
-    }
-}
-
-fn plan_button_edge(held: &HashSet<u16>, code: u16, pressed: bool) -> Option<(u16, bool)> {
-    (held.contains(&code) != pressed).then_some((code, pressed))
-}
-
-fn commit_button_edge(held: &mut HashSet<u16>, code: u16, pressed: bool) {
-    if pressed {
-        held.insert(code);
-    } else {
-        held.remove(&code);
-    }
-}
-
-fn plan_reset_releases(held_keys: &HashSet<u16>, held_buttons: &HashSet<u16>) -> Vec<u16> {
-    let mut codes: Vec<u16> = held_keys
-        .iter()
-        .chain(held_buttons.iter())
-        .copied()
-        .collect();
-    for code in MODIFIER_CODES {
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
-    }
-    codes
-}
-
-fn plan_keyboard_reset_releases(held_keys: &HashSet<u16>) -> Vec<u16> {
-    let mut codes = held_keys.iter().copied().collect::<Vec<_>>();
-    for code in MODIFIER_CODES {
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
-    }
-    codes.sort_unstable();
-    codes
-}
-
-fn is_modifier(code: u16) -> bool {
-    MODIFIER_CODES.contains(&code)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +924,9 @@ mod tests {
         assert_eq!(pen::BTN_TOUCH, KeyCode::BTN_TOUCH.0);
         assert_eq!(pen::BTN_STYLUS, KeyCode::BTN_STYLUS.0);
         assert_eq!(pen::BTN_STYLUS2, KeyCode::BTN_STYLUS2.0);
+        assert_eq!(super::super::edges::BTN_LEFT, KeyCode::BTN_LEFT.0);
+        assert_eq!(super::super::edges::BTN_RIGHT, KeyCode::BTN_RIGHT.0);
+        assert_eq!(super::super::edges::BTN_MIDDLE, KeyCode::BTN_MIDDLE.0);
     }
 
     #[test]
@@ -1025,38 +936,6 @@ mod tests {
             pen::normalized_axis(0.5, 2560),
             pen::normalized_axis(0.5, 1800)
         );
-    }
-
-    #[test]
-    fn fractional_scroll_preserves_direction() {
-        assert_eq!(scroll_steps(0.1), 1);
-        assert_eq!(scroll_steps(-0.1), -1);
-        assert_eq!(scroll_steps(f64::NAN), 0);
-        assert_eq!(
-            legacy_scroll_to_wheel_units(0.1, arcen_input::ScrollUnit::Line),
-            120
-        );
-        assert_eq!(
-            legacy_scroll_to_wheel_units(30.4, arcen_input::ScrollUnit::Point),
-            30
-        );
-    }
-
-    #[test]
-    fn hi_res_scroll_accumulates_legacy_detents() {
-        let mut remainder = 0;
-        assert_eq!(split_legacy_detents(&mut remainder, 30), 0);
-        assert_eq!(remainder, 30);
-        assert_eq!(split_legacy_detents(&mut remainder, 89), 0);
-        assert_eq!(remainder, 119);
-        assert_eq!(split_legacy_detents(&mut remainder, 1), 1);
-        assert_eq!(remainder, 0);
-        assert_eq!(split_legacy_detents(&mut remainder, -180), -1);
-        assert_eq!(remainder, -60);
-        assert_eq!(split_legacy_detents(&mut remainder, -60), -1);
-        assert_eq!(remainder, 0);
-        assert_eq!(saturating_hi_res_units(i64::MAX), i32::MAX);
-        assert_eq!(saturating_hi_res_units(i64::MIN), i32::MIN);
     }
 
     #[test]
@@ -1092,94 +971,5 @@ mod tests {
     fn relative_edges_and_wheels_omit_absolute_position() {
         assert!(prepends_absolute_position(PointerMotionMode::Absolute));
         assert!(!prepends_absolute_position(PointerMotionMode::Relative));
-    }
-
-    #[test]
-    fn missing_ctrl_edge_is_synthesized_before_ctrl_a() {
-        let mut held = HashSet::new();
-        assert_eq!(
-            plan_key_edges(&mut held, 30, true, MOD_CTRL),
-            vec![(29, true), (30, true)]
-        );
-    }
-
-    #[test]
-    fn explicit_modifier_edges_are_idempotent() {
-        let mut held = HashSet::new();
-        assert_eq!(
-            plan_key_edges(&mut held, 29, true, MOD_CTRL),
-            vec![(29, true)]
-        );
-        assert!(plan_key_edges(&mut held, 29, true, MOD_CTRL).is_empty());
-        assert_eq!(plan_key_edges(&mut held, 29, false, 0), vec![(29, false)]);
-        assert!(plan_key_edges(&mut held, 29, false, 0).is_empty());
-    }
-
-    #[test]
-    fn modifier_mask_reconciles_shift_alt_meta_and_releases_stale_state() {
-        let mut held = HashSet::from([29]);
-        assert_eq!(
-            plan_key_edges(&mut held, 2, true, MOD_SHIFT | MOD_ALT | MOD_META),
-            vec![(42, true), (29, false), (56, true), (125, true), (2, true)]
-        );
-    }
-
-    #[test]
-    fn cmd_to_ctrl_policy_arrives_as_compact_ctrl_and_synthesizes_ctrl() {
-        let mut held = HashSet::new();
-        assert_eq!(
-            plan_key_edges(&mut held, 31, true, MOD_CTRL),
-            vec![(29, true), (31, true)]
-        );
-    }
-
-    #[test]
-    fn drag_focus_loss_releases_held_mouse_button_on_reset() {
-        let mut held_keys = HashSet::new();
-        let mut held_buttons = HashSet::new();
-        assert_eq!(
-            plan_button_edge(&held_buttons, KeyCode::BTN_LEFT.0, true),
-            Some((KeyCode::BTN_LEFT.0, true))
-        );
-        commit_button_edge(&mut held_buttons, KeyCode::BTN_LEFT.0, true);
-        assert!(plan_button_edge(&held_buttons, KeyCode::BTN_LEFT.0, true).is_none());
-
-        let releases = plan_reset_releases(&held_keys, &held_buttons);
-        assert!(releases.contains(&KeyCode::BTN_LEFT.0));
-        assert!(held_buttons.contains(&KeyCode::BTN_LEFT.0));
-        held_keys.clear();
-        held_buttons.clear();
-    }
-
-    #[test]
-    fn keyboard_reset_never_releases_a_held_mouse_button() {
-        let mut held_keys = HashSet::new();
-        held_keys.insert(30);
-        let mut held_buttons = HashSet::new();
-        held_buttons.insert(KeyCode::BTN_LEFT.0);
-
-        let keyboard_releases = plan_keyboard_reset_releases(&held_keys);
-        assert!(keyboard_releases.contains(&30));
-        assert!(!keyboard_releases.contains(&KeyCode::BTN_LEFT.0));
-
-        let full_releases = plan_reset_releases(&held_keys, &held_buttons);
-        assert!(full_releases.contains(&KeyCode::BTN_LEFT.0));
-    }
-
-    #[test]
-    fn explicit_mouse_release_is_idempotent_and_clears_tracking() {
-        let mut held = HashSet::new();
-        assert_eq!(
-            plan_button_edge(&held, KeyCode::BTN_RIGHT.0, true),
-            Some((KeyCode::BTN_RIGHT.0, true))
-        );
-        commit_button_edge(&mut held, KeyCode::BTN_RIGHT.0, true);
-        assert_eq!(
-            plan_button_edge(&held, KeyCode::BTN_RIGHT.0, false),
-            Some((KeyCode::BTN_RIGHT.0, false))
-        );
-        commit_button_edge(&mut held, KeyCode::BTN_RIGHT.0, false);
-        assert!(plan_button_edge(&held, KeyCode::BTN_RIGHT.0, false).is_none());
-        assert!(held.is_empty());
     }
 }

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Lab only: build environment for the Arcen side-by-side GNOME prefix on EL10.
+# Same base as the host, so the prefix links against the host's own system libraries.
+FROM quay.io/rockylinux/rockylinux:10
+RUN dnf -y -q install dnf-plugins-core epel-release && \
+    dnf config-manager --set-enabled crb devel appstream-source baseos-source && \
+    dnf -y -q builddep mutter gnome-shell gjs glib2 gobject-introspection libinput pipewire wayland libei gsettings-desktop-schemas || true
+RUN dnf -y -q --setopt=strict=0 install gcc gcc-c++ make cmake git wget xz bzip2 zip unzip m4 perl perl-devel \
+      python3 python3-devel python3-pip python3-setuptools python3-jinja2 python3-attrs python3-packaging \
+      rust cargo rustfmt clang clang-devel llvm llvm-devel lld nasm zlib-devel libffi-devel readline-devel libicu-devel \
+      sassc gperf gettext gettext-devel itstool libxslt docbook-style-xsl \
+      libseccomp-devel lcms2-devel libheif-devel librsvg2-devel fontconfig-devel cairo-devel cairo-gobject-devel \
+      libevdev-devel mtdev-devel libwacom-devel systemd-devel libgudev-devel libdrm-devel mesa-libgbm-devel \
+      mesa-libEGL-devel mesa-libGL-devel libglvnd-devel libxkbcommon-devel libxkbcommon-x11-devel xkeyboard-config-devel \
+      pango-devel gtk4-devel gtk3-devel graphene-devel colord-devel libcanberra-devel libdisplay-info-devel \
+      fribidi-devel harfbuzz-devel pixman-devel startup-notification-devel libX11-devel libXcomposite-devel \
+      libXfixes-devel libXi-devel libXrandr-devel libXdamage-devel libXext-devel libXtst-devel libxcb-devel \
+      libXau-devel libICE-devel libSM-devel libxkbfile-devel xorg-x11-server-Xwayland-devel \
+      gcr-devel evolution-data-server-devel gnome-desktop4-devel polkit-devel NetworkManager-libnm-devel \
+      libsecret-devel at-spi2-core-devel json-glib-devel libxml2-devel gnome-bluetooth-libs-devel \
+      dbus-devel libudev-devel pam-devel libcap-devel && dnf clean all
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip -q install 'meson==1.9.1' ninja packaging jinja2 attrs && \
+    cargo install --root /opt/cargo-tools cbindgen --locked -q || true

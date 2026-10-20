@@ -3,8 +3,9 @@
 //! The service runs as `_arcen` from boot, owns UDP 18444 and the TLS key, and
 //! has no desktop. Each graphical session runs an agent, as that session's
 //! user, which has a desktop and nothing else: no key, no listener. When a Deck
-//! is admitted the service hands its stream to the agent of the session on the
-//! console and relays bytes until either side leaves.
+//! is admitted the service hands its session to the agent of the session on
+//! the console and relays it, one QUIC lane per role, until either side
+//! leaves ([`relay_lanes`]).
 //!
 //! The exchange itself is [`arcen_session::agent_relay`]. What lives here is
 //! the macOS half: Unix sockets, the kernel's peer credentials, and which
@@ -21,7 +22,6 @@ use arcen_session::agent_relay::{
     AgentMessage, AgentRegistration, ConsoleHolder, DesktopSessionKind, MAX_RELAY_LINE_BYTES,
     ParkedAgent, RouteRefusal, ServiceMessage, select_agent, validate_registration,
 };
-use arcen_transport::quic::{PriorityAudio, PriorityAudioSend};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -516,226 +516,336 @@ where
     tokio::io::copy_bidirectional_with_sizes(deck, agent, RELAY_BUFFER, RELAY_BUFFER).await
 }
 
-/// What a media relay carried.
+/// What a lane relay carried.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MediaRelayStats {
     /// Messages forwarded from the Deck to the agent.
     pub to_agent: u64,
-    /// Messages forwarded from the agent to the Deck on the session stream.
+    /// Messages the agent sent toward the Deck (every lane).
     pub to_deck: u64,
-    /// Audio frames sent on the priority stream instead.
-    pub priority_audio: u64,
+    /// Audio frames that arrived on the agent's audio side channel.
+    pub side_channel_audio: u64,
+    /// Per-lane relay counters, once the attachment was granted.
+    pub lanes: arcen_transport::quic::LaneRelayStats,
 }
 
-/// Relays a Deck's session to its agent message by message, sending audio on
-/// the Deck's priority stream once the Deck has said it accepts one.
+/// Relays a Deck's session to its agent, one lane per role (ADR 0014).
 ///
-/// A byte relay cannot do that: it does not know where one message ends, let
-/// alone which messages are sound. So this reads WebSocket messages from both
-/// sides and forwards them unchanged — the agent speaks as the server, so this
-/// side reads it as a client — except that an audio frame goes to
-/// [`arcen_transport::quic::open_audio_priority_stream`] once the Deck's
-/// `client_hello` carries `audio_priority_stream_v1`.
+/// The agent speaks the session over one local WebSocket (it is the server,
+/// so this side reads it as a client) and, optionally, sends audio on its
+/// own side channel. This relay is the network half: control messages stay
+/// on the Deck's control lane, and once the agent has authenticated the Deck
+/// (`auth_result` with `success`) it grants the attachment and hands every
+/// other message to [`arcen_transport::quic::PierLaneRelay`], which puts
+/// video, audio, cursor and bulk traffic on their own lanes and never lets
+/// one wait for another. Deck input, microphone and bulk lanes come back to
+/// the agent in order.
+///
+/// `path_signal` sends the connection's path truth to the agent once a
+/// session has started; an in-process session samples the connection itself.
 ///
 /// # Errors
 ///
 /// Returns the first transport error when it was not a clean close.
-pub async fn relay_media(
-    deck: arcen_transport::quic::DirectQuicStream,
-    agent: UnixStream,
+pub async fn relay_lanes<A>(
+    mut deck: arcen_transport::quic::SessionLaneSocket,
+    agent: A,
     session: u64,
-    audio_channel: tokio::sync::oneshot::Receiver<UnixStream>,
-) -> Result<MediaRelayStats, String> {
+    audio_channel: Option<tokio::sync::oneshot::Receiver<UnixStream>>,
+    path_signal: bool,
+) -> Result<MediaRelayStats, String>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use arcen_protocol::lanes::SessionRecord;
+    use arcen_transport::quic::{LaneRelayEvent, PierLaneRelay, RelayRoute};
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::WebSocketStream;
-    use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
+    use tokio_tungstenite::tungstenite::protocol::Role;
 
-    let connection = deck.connection_handle();
-    let priority = std::sync::Arc::new(tokio::sync::Mutex::new(PriorityAudio::new(
-        connection.clone(),
-    )));
-    let deck_config = WebSocketConfig {
-        max_message_size: Some(crate::net::MAX_INBOUND_MESSAGE),
-        max_frame_size: Some(crate::net::MAX_INBOUND_MESSAGE),
-        ..Default::default()
-    };
+    let lanes = deck.lanes().clone();
+    let connection = lanes.connection().clone();
     // The agent is local and trusted to send large frames: a keyframe is
     // megabytes. Tungstenite's defaults already bound it.
-    let deck_ws = WebSocketStream::from_raw_socket(deck, Role::Server, Some(deck_config)).await;
     let agent_ws = WebSocketStream::from_raw_socket(agent, Role::Client, None).await;
-    let (mut deck_tx, mut deck_rx) = deck_ws.split();
     let (mut agent_tx, mut agent_rx) = agent_ws.split();
-
-    let wants_priority = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut stats = MediaRelayStats::default();
+    let mut relay: Option<PierLaneRelay> = None;
 
     // The agent's own audio channel, when it opens one: audio that never
     // shares a socket with video on the way here.
-    let side_priority = std::sync::Arc::clone(&priority);
-    let side_channel = tokio::spawn(async move {
-        match audio_channel.await {
-            Ok(channel) => forward_audio_channel(channel, side_priority).await,
-            Err(_) => 0,
-        }
+    let (side_tx, mut side_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let side_channel = audio_channel.map(|channel| {
+        tokio::spawn(async move {
+            if let Ok(channel) = channel.await {
+                read_audio_channel(channel, side_tx).await;
+            }
+        })
     });
 
-    let inbound_flag = std::sync::Arc::clone(&wants_priority);
-    let inbound = async {
-        let mut forwarded = 0_u64;
-        let mut path_state = arcen_telemetry::PathSignalState::default();
-        let path_started = tokio::time::Instant::now();
-        let mut path_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        path_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The agent authenticates the Deck over this very stream and takes
-        // nothing but the Deck's own `auth_response` until that is done, so
-        // path truth waits for the Deck's `client_hello`, which only follows
-        // a successful authentication.
-        let mut session_started = false;
-        loop {
-            tokio::select! {
-                message = deck_rx.next() => {
-                    let Some(message) = message else { break; };
-                    let message = message.map_err(|error| format!("from Deck: {error}"))?;
-                    if let Message::Text(text) = &message {
-                        if serde_json::from_str::<serde_json::Value>(text)
-                            .ok()
-                            .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
-                            .is_some_and(|kind| {
-                                arcen_session::agent_relay::ServiceMessage::is_service_type(&kind)
-                            }) {
-                            return Err("Deck sent a service-only message".to_string());
-                        }
-                        if deck_accepts_priority_audio(text) {
-                            inbound_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        session_started |= is_client_hello(text);
+    let mut path_state = arcen_telemetry::PathSignalState::default();
+    let path_started = tokio::time::Instant::now();
+    let mut path_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    path_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The agent authenticates the Deck over the control lane and takes
+    // nothing but the Deck's own `auth_response` until that is done, so path
+    // truth waits for the Deck's `client_hello`, which only follows a
+    // successful authentication.
+    let mut session_started = false;
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            event = async {
+                match relay.as_mut() {
+                    Some(relay) => relay.next_event().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                LaneRelayEvent::ToSession(record) => {
+                    if let Err(error) = agent_tx.send(record_message(record)).await {
+                        break Err(format!("to agent: {error}"));
                     }
-                    let closing = matches!(message, Message::Close(_));
-                    agent_tx
-                        .send(message)
-                        .await
-                        .map_err(|error| format!("to agent: {error}"))?;
-                    forwarded += 1;
-                    if closing {
-                        break;
+                    stats.to_agent += 1;
+                }
+                LaneRelayEvent::ToDeckControl(record) => {
+                    if let Err(error) = deck.send(record).await {
+                        break Err(format!("to Deck: {error}"));
                     }
                 }
-                _ = path_tick.tick() => {
-                    if connection.close_reason().is_some() {
-                        break;
+                LaneRelayEvent::Ended(terminal) => break Err(format!("lanes ended: {terminal}")),
+            },
+            message = deck.next() => {
+                let record = match message {
+                    None => break Ok(()),
+                    Some(Ok(record)) => record,
+                    Some(Err(exit)) => break Err(lane_exit_detail(&exit)),
+                };
+                if let SessionRecord::Text(text) = &record {
+                    if serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+                        .is_some_and(|kind| ServiceMessage::is_service_type(&kind))
+                    {
+                        break Err("Deck sent a service-only message".to_string());
                     }
-                    if !session_started {
+                    session_started |= is_client_hello(text);
+                }
+                let closing = matches!(record, SessionRecord::Close(_));
+                if let Err(error) = agent_tx.send(record_message(record)).await {
+                    break Err(format!("to agent: {error}"));
+                }
+                stats.to_agent += 1;
+                if closing {
+                    break Ok(());
+                }
+            }
+            message = agent_rx.next() => {
+                let message = match message {
+                    None => break Ok(()),
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => break Err(format!("from agent: {error}")),
+                };
+                let Some(record) = message_record(message) else {
+                    continue;
+                };
+                stats.to_deck += 1;
+                let control = match relay.as_mut() {
+                    Some(relay) => match relay.route_to_deck(record) {
+                        RelayRoute::Control(record) => record,
+                        RelayRoute::Queued(_) | RelayRoute::Dropped(_) => continue,
+                    },
+                    None if is_pre_attachment_control(&record) => record,
+                    None => {
+                        tracing::debug!(
+                            target: "arcen::relay",
+                            "agent sent lane traffic before the attachment; dropped"
+                        );
                         continue;
                     }
-                    let signal = arcen_transport::observe_quinn_path_signal(
-                            &mut path_state,
-                            path_started.elapsed(),
-                            &connection,
-                        );
-                    let message = ServiceMessage::PathSignal { session, signal };
-                    let text = serde_json::to_string(&message)
-                        .map_err(|error| format!("path signal encode: {error}"))?;
-                    agent_tx
-                        .send(Message::Text(text.into()))
-                        .await
-                        .map_err(|error| format!("to agent path signal: {error}"))?;
+                };
+                // The grant follows a successful `auth_result` and precedes
+                // `server_hello`, whichever the agent sends first.
+                let grant_before = relay.is_none() && is_text_type(&control, SERVER_HELLO);
+                let grant_after = relay.is_none() && is_successful_auth_result(&control);
+                if grant_before {
+                    match grant_lanes(&mut deck).await {
+                        Ok(()) => relay = Some(PierLaneRelay::start(&lanes)),
+                        Err(error) => break Err(error),
+                    }
                 }
-            }
-        }
-        let _ = agent_tx.close().await;
-        Ok::<u64, String>(forwarded)
-    };
-
-    let outbound_priority = std::sync::Arc::clone(&priority);
-    let outbound = async {
-        let mut to_deck = 0_u64;
-        let mut priority_audio = 0_u64;
-        while let Some(message) = agent_rx.next().await {
-            let message = message.map_err(|error| format!("from agent: {error}"))?;
-            if let Message::Binary(bytes) = &message {
-                let is_audio =
-                    bytes.first().copied() == Some(arcen_protocol::wire::FrameType::Audio as u8);
-                if is_audio && wants_priority.load(std::sync::atomic::Ordering::Relaxed) {
-                    let mut priority = outbound_priority.lock().await;
-                    if priority.usable() {
-                        match priority.send(bytes).await {
-                            PriorityAudioSend::Opened => {
-                                tracing::info!(
-                                    target: "arcen::relay",
-                                    "audio moved to its own priority stream"
-                                );
-                                priority_audio += 1;
-                                continue;
-                            }
-                            PriorityAudioSend::Sent => {
-                                priority_audio += 1;
-                                continue;
-                            }
-                            PriorityAudioSend::Unusable => {}
-                            PriorityAudioSend::OpenFailed(error) => {
-                                tracing::warn!(
-                                    target: "arcen::relay",
-                                    %error,
-                                    "no audio priority stream"
-                                );
-                            }
-                            PriorityAudioSend::WriteFailed(error) => {
-                                tracing::warn!(
-                                    target: "arcen::relay",
-                                    %error,
-                                    "audio priority stream failed"
-                                );
-                            }
-                        }
+                let closing = matches!(control, SessionRecord::Close(_));
+                if let Err(error) = deck.send(control).await {
+                    break Err(format!("to Deck: {error}"));
+                }
+                if closing {
+                    break Ok(());
+                }
+                if grant_after {
+                    match grant_lanes(&mut deck).await {
+                        Ok(()) => relay = Some(PierLaneRelay::start(&lanes)),
+                        Err(error) => break Err(error),
                     }
                 }
             }
-            let closing = matches!(message, Message::Close(_));
-            deck_tx
-                .send(message)
-                .await
-                .map_err(|error| format!("to Deck: {error}"))?;
-            to_deck += 1;
-            if closing {
-                break;
+            frame = side_rx.recv() => {
+                if let Some(frame) = frame {
+                    stats.side_channel_audio += 1;
+                    if let Some(relay) = relay.as_mut() {
+                        let _ = relay.route_to_deck(SessionRecord::Binary(frame));
+                    }
+                }
+            }
+            _ = path_tick.tick(), if path_signal => {
+                if connection.close_reason().is_some() {
+                    break Ok(());
+                }
+                if !session_started {
+                    continue;
+                }
+                let signal = arcen_transport::observe_quinn_path_signal(
+                    &mut path_state,
+                    path_started.elapsed(),
+                    &connection,
+                );
+                let message = ServiceMessage::PathSignal { session, signal };
+                let text = match serde_json::to_string(&message) {
+                    Ok(text) => text,
+                    Err(error) => break Err(format!("path signal encode: {error}")),
+                };
+                if let Err(error) = agent_tx
+                    .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                    .await
+                {
+                    break Err(format!("to agent path signal: {error}"));
+                }
             }
         }
-        let _ = deck_tx.close().await;
-        Ok::<(u64, u64), String>((to_deck, priority_audio))
     };
-
-    tokio::pin!(inbound);
-    tokio::pin!(outbound);
-    // Either side ending ends the session; the other is dropped, which
-    // closes its socket.
-    let ended = tokio::select! {
-        result = &mut inbound => result.map(|to_agent| stats.to_agent = to_agent),
-        result = &mut outbound => result.map(|(to_deck, priority_audio)| {
-            stats.to_deck = to_deck;
-            stats.priority_audio = priority_audio;
-        }),
-    };
-    side_channel.abort();
-    priority.lock().await.finish();
-    ended.map(|()| stats)
+    if let Some(side_channel) = side_channel {
+        side_channel.abort();
+    }
+    if let Some(relay) = relay.as_ref() {
+        stats.lanes = relay.stats();
+    }
+    let _ = agent_tx.close().await;
+    result.map(|()| stats)
 }
 
-/// Whether a Deck text message is a `client_hello` opting in to the audio
-/// priority stream.
+/// Authorizes the attachment's lanes and tells the Deck, on the control
+/// lane, before anything the agent sends after authentication.
+async fn grant_lanes(deck: &mut arcen_transport::quic::SessionLaneSocket) -> Result<(), String> {
+    use futures_util::SinkExt as _;
+
+    let grant = arcen_transport::quic::grant_attachment(
+        deck.lanes(),
+        arcen_transport::quic::next_attachment_generation(),
+        arcen_protocol::lanes::LaneRoleSet::all(),
+    )
+    .map_err(|error| format!("lane attachment: {error}"))?;
+    let record = arcen_protocol::lanes::session_text_record(&grant)
+        .ok_or_else(|| "lane attachment encode".to_owned())?;
+    deck.send(record)
+        .await
+        .map_err(|error| format!("to Deck: {error}"))?;
+    tracing::info!(target: "arcen::relay", "session runs on isolated lanes");
+    Ok(())
+}
+
+/// Before the grant only the control lane exists: authentication, its
+/// result, refusals and liveness.
+fn is_pre_attachment_control(record: &arcen_protocol::lanes::SessionRecord) -> bool {
+    use arcen_protocol::lanes::{LaneRole, SessionRecord, lane_for_session_text};
+    match record {
+        SessionRecord::Text(text) => lane_for_session_text(text) == LaneRole::Control,
+        SessionRecord::Binary(_) => false,
+        SessionRecord::Close(_) | SessionRecord::Ping(_) | SessionRecord::Pong(_) => true,
+    }
+}
+
+const SERVER_HELLO: &str = arcen_protocol::messages::SERVER_HELLO;
+
+fn text_json(
+    record: &arcen_protocol::lanes::SessionRecord,
+    msg_type: &str,
+) -> Option<serde_json::Value> {
+    let arcen_protocol::lanes::SessionRecord::Text(text) = record else {
+        return None;
+    };
+    if !text.contains(msg_type) {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|value| value.get("type").and_then(serde_json::Value::as_str) == Some(msg_type))
+}
+
+fn is_text_type(record: &arcen_protocol::lanes::SessionRecord, msg_type: &str) -> bool {
+    text_json(record, msg_type).is_some()
+}
+
+/// Whether the agent accepted the Deck: the point at which the attachment's
+/// lanes are granted.
+fn is_successful_auth_result(record: &arcen_protocol::lanes::SessionRecord) -> bool {
+    text_json(record, arcen_protocol::messages::AUTH_RESULT).is_some_and(|value| {
+        value.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+    })
+}
+
+fn message_record(
+    message: tokio_tungstenite::tungstenite::Message,
+) -> Option<arcen_protocol::lanes::SessionRecord> {
+    use arcen_protocol::lanes::{SessionClose, SessionRecord};
+    use tokio_tungstenite::tungstenite::Message;
+    Some(match message {
+        Message::Text(text) => SessionRecord::Text(text),
+        Message::Binary(bytes) => SessionRecord::Binary(bytes),
+        Message::Ping(bytes) => SessionRecord::Ping(bytes),
+        Message::Pong(bytes) => SessionRecord::Pong(bytes),
+        Message::Close(frame) => SessionRecord::Close(frame.map(|frame| SessionClose {
+            code: u16::from(frame.code),
+            reason: frame.reason.into_owned(),
+        })),
+        Message::Frame(_) => return None,
+    })
+}
+
+fn record_message(
+    record: arcen_protocol::lanes::SessionRecord,
+) -> tokio_tungstenite::tungstenite::Message {
+    use arcen_protocol::lanes::SessionRecord;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    match record {
+        SessionRecord::Text(text) => Message::Text(text),
+        SessionRecord::Binary(bytes) => Message::Binary(bytes),
+        SessionRecord::Ping(bytes) => Message::Ping(bytes),
+        SessionRecord::Pong(bytes) => Message::Pong(bytes),
+        SessionRecord::Close(close) => Message::Close(close.map(|close| CloseFrame {
+            code: CloseCode::from(close.code),
+            reason: close.reason.into(),
+        })),
+    }
+}
+
+/// Names a lane exit, including a Deck that speaks another transport layout.
+fn lane_exit_detail(exit: &arcen_transport::quic::LaneExit) -> String {
+    match exit {
+        arcen_transport::quic::LaneExit::ConnectionLost {
+            mismatch: Some(mismatch),
+        } => mismatch.message(),
+        other => format!("control lane ended: {other:?}"),
+    }
+}
+
+/// Whether a Deck text message is a `client_hello`.
 fn is_client_hello(text: &str) -> bool {
     text.contains(arcen_protocol::messages::CLIENT_HELLO)
         && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
             value.get("type").and_then(serde_json::Value::as_str)
                 == Some(arcen_protocol::messages::CLIENT_HELLO)
         })
-}
-
-fn deck_accepts_priority_audio(text: &str) -> bool {
-    if !text.contains(arcen_protocol::messages::CLIENT_HELLO) {
-        return false;
-    }
-    serde_json::from_str::<arcen_protocol::messages::ClientHelloMsg>(text)
-        .is_ok_and(|hello| hello.audio_priority_stream_v1)
 }
 
 /// Which agent executable the service accepts.
@@ -862,7 +972,7 @@ pub struct AttachedDeck {
 
 /// Opens the audio side channel for an attached session.
 ///
-/// Audio sent here reaches the Deck's priority stream without waiting behind
+/// Audio sent here reaches the Deck's audio lane without waiting behind
 /// video on the session socket. Frames are u32-big-endian length prefixed.
 ///
 /// # Errors
@@ -897,46 +1007,31 @@ pub async fn open_audio_channel(
     }
 }
 
-/// Forwards an agent's audio side channel onto the Deck's priority stream.
-///
-/// Returns how many frames it carried.
-pub async fn forward_audio_channel(
-    mut channel: UnixStream,
-    priority: std::sync::Arc<tokio::sync::Mutex<PriorityAudio>>,
-) -> u64 {
-    let mut forwarded = 0_u64;
+/// Reads an agent's audio side channel (u32 big-endian length-prefixed
+/// frames) into the relay. A full queue drops the frame: newer audio is
+/// worth more than older audio.
+async fn read_audio_channel(mut channel: UnixStream, frames: tokio::sync::mpsc::Sender<Vec<u8>>) {
     loop {
         let mut length = [0_u8; 4];
         if channel.read_exact(&mut length).await.is_err() {
-            return forwarded;
+            return;
         }
         let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
         if length > arcen_protocol::AUDIO_PRIORITY_MAX_FRAME_BYTES {
             tracing::warn!(target: "arcen::relay", length, "oversized audio frame; channel closed");
-            return forwarded;
+            return;
         }
         let mut frame = vec![0_u8; length];
         if channel.read_exact(&mut frame).await.is_err() {
-            return forwarded;
+            return;
         }
-        match priority.lock().await.send(&frame).await {
-            PriorityAudioSend::Opened => {
-                tracing::info!(
-                    target: "arcen::relay",
-                    "audio moved to its own priority stream"
-                );
-                forwarded += 1;
-            }
-            PriorityAudioSend::Sent => {
-                forwarded += 1;
-            }
-            PriorityAudioSend::Unusable => {}
-            PriorityAudioSend::OpenFailed(error) => {
-                tracing::warn!(target: "arcen::relay", %error, "no audio priority stream");
-            }
-            PriorityAudioSend::WriteFailed(error) => {
-                tracing::warn!(target: "arcen::relay", %error, "audio priority stream failed");
-            }
+        if !arcen_protocol::wire::is_audio_frame(&frame) {
+            tracing::warn!(target: "arcen::relay", "non-audio frame on the audio channel; closed");
+            return;
+        }
+        match frames.try_send(frame) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
         }
     }
 }
@@ -960,19 +1055,222 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn only_an_opted_in_client_hello_moves_audio() {
-        let hello = |flag: bool| {
-            serde_json::to_string(&arcen_protocol::messages::ClientHelloMsg {
-                audio_priority_stream_v1: flag,
-                ..arcen_protocol::messages::ClientHelloMsg::default()
-            })
-            .expect("hello")
+    /// A Deck, the service's listener and a fake agent behind the relay.
+    struct LaneRig {
+        deck: arcen_transport::quic::LaneConnection,
+        deck_control: arcen_transport::quic::SessionLane,
+        agent: tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        _endpoints: (crate::net::Listener, quinn::Endpoint),
+        dir: PathBuf,
+    }
+
+    async fn lane_rig(name: &str) -> LaneRig {
+        use arcen_protocol::lanes::LaneEndpoint;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join(format!("arcen-relay-lanes-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let key_pair = rcgen::KeyPair::generate().expect("key");
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("params")
+            .self_signed(&key_pair)
+            .expect("cert");
+        std::fs::write(dir.join("host.crt"), certificate.pem()).expect("write cert");
+        std::fs::write(dir.join("host.key"), key_pair.serialize_pem()).expect("write key");
+        let listener = crate::net::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            crate::net::server_config(&dir.join("host.crt"), &dir.join("host.key"))
+                .expect("config"),
+        )
+        .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.der().clone()).expect("root");
+        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        crypto.alpn_protocols = vec![arcen_transport::quic::DIRECT_QUIC_ALPN_PROTOCOL.to_vec()];
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("crypto"),
+        ));
+        client_config.transport_config(arcen_transport::quic::lane_transport_config_arc(
+            &arcen_transport::BoundedTransportPolicy::default(),
+            LaneEndpoint::Deck,
+        ));
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("client");
+        let connect = arcen_transport::quic::connect_session_lanes(
+            arcen_transport::quic::DirectQuicDialParams {
+                endpoint: client.clone(),
+                client_config,
+                remote_addr: address,
+                server_name: "localhost",
+            },
+            arcen_transport::quic::LaneRuntimeConfig::new(LaneEndpoint::Deck),
+        );
+        let (accepted, connected) = tokio::join!(listener.accept_raw(), connect);
+        let (pier, _peer) = accepted.expect("accept");
+        let (deck, deck_control) = connected.expect("connect");
+        let (agent_end, relay_end) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(relay_lanes(pier, relay_end, 1, None, false));
+        let agent = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            agent_end,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        LaneRig {
+            deck,
+            deck_control,
+            agent,
+            _endpoints: (listener, client),
+            dir,
+        }
+    }
+
+    async fn deck_text(rig: &mut LaneRig) -> String {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            rig.deck_control.reader.next_record(),
+        )
+        .await
+        .expect("in time")
+        .expect("record")
+        {
+            arcen_protocol::lanes::SessionRecord::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn video(keyframe: bool) -> Vec<u8> {
+        use arcen_protocol::wire::{
+            ChromaSubsampling, FrameType, VIDEO_KEYFRAME_FLAG, VideoCodec, VideoHeader,
+            encode_video_header,
         };
-        assert!(deck_accepts_priority_audio(&hello(true)));
-        assert!(!deck_accepts_priority_audio(&hello(false)));
-        assert!(!deck_accepts_priority_audio(r#"{"type":"auth_response"}"#));
-        assert!(!deck_accepts_priority_audio("not json client_hello"));
+        let mut frame = encode_video_header(VideoHeader {
+            frame_type: FrameType::VideoH265,
+            codec: VideoCodec::H265,
+            chroma: ChromaSubsampling::Yuv420,
+            flags: if keyframe { VIDEO_KEYFRAME_FLAG } else { 0 },
+            timestamp_ms: 0,
+            monitor_id: 0,
+            topology_generation: 0,
+            stream_epoch: 0,
+        });
+        frame.resize(frame.len() + 256 * 1024, 0x42);
+        frame
+    }
+
+    #[tokio::test]
+    async fn the_relay_grants_lanes_after_authentication_and_audio_outruns_a_stalled_video_lane() {
+        use arcen_protocol::lanes::{LaneRole, SessionRecord};
+        use arcen_transport::quic::{PeerLaneEvent, PeerLaneReader, SessionLane};
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let mut rig = lane_rig("grant").await;
+        rig.agent
+            .send(Message::Text(
+                r#"{"type":"auth_request","auth_methods":["pam"]}"#.into(),
+            ))
+            .await
+            .expect("auth_request");
+        assert!(deck_text(&mut rig).await.contains("auth_request"));
+        // No lane exists before authentication: the attachment is not granted.
+        assert!(rig.deck.open_lane(LaneRole::InputCursor).await.is_err());
+
+        rig.agent
+            .send(Message::Text(
+                r#"{"type":"auth_result","success":true}"#.into(),
+            ))
+            .await
+            .expect("auth_result");
+        rig.agent
+            .send(Message::Text(r#"{"type":"server_hello"}"#.into()))
+            .await
+            .expect("server_hello");
+        assert!(deck_text(&mut rig).await.contains("auth_result"));
+        let grant = deck_text(&mut rig).await;
+        assert!(grant.contains("lane_attachment"), "{grant}");
+        arcen_transport::quic::accept_attachment(
+            &rig.deck,
+            &serde_json::from_str(&grant).expect("grant"),
+        )
+        .expect("accepted");
+        assert!(deck_text(&mut rig).await.contains("server_hello"));
+
+        // Deck input reaches the agent on its own lane.
+        let input = SessionLane::split(
+            rig.deck
+                .open_lane(LaneRole::InputCursor)
+                .await
+                .expect("input"),
+        )
+        .expect("session lane");
+        input
+            .sender
+            .send(arcen_transport::quic::session_record_bytes(
+                &SessionRecord::Text(r#"{"type":"key_event","key":4,"down":true}"#.to_owned()),
+            ))
+            .await
+            .expect("key");
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rig.agent.next())
+            .await
+            .expect("in time")
+            .expect("message")
+            .expect("valid");
+        assert!(matches!(&delivered, Message::Text(text) if text.contains("key_event")));
+
+        // The Deck never reads video; audio still arrives, frame after frame.
+        let mut audio = PeerLaneReader::new(&rig.deck, LaneRole::AudioOutput);
+        rig.agent
+            .send(Message::Binary(video(true)))
+            .await
+            .expect("video");
+        for index in 0..120_u32 {
+            rig.agent
+                .send(Message::Binary(video(false)))
+                .await
+                .expect("video");
+            if index % 6 == 0 {
+                let mut frame =
+                    arcen_protocol::wire::encode_audio_header(arcen_protocol::wire::AudioHeader {
+                        codec: arcen_protocol::wire::AudioCodec::Opus,
+                        timestamp_ms: index,
+                    })
+                    .to_vec();
+                frame.extend_from_slice(&[7; 60]);
+                rig.agent.send(Message::Binary(frame)).await.expect("audio");
+                let event = loop {
+                    match tokio::time::timeout(Duration::from_secs(2), audio.next())
+                        .await
+                        .expect("audio is not held behind video")
+                        .expect("audio lane")
+                    {
+                        PeerLaneEvent::Frame(frame) => break frame,
+                        PeerLaneEvent::Opened { .. } | PeerLaneEvent::Lost { .. } => {}
+                    }
+                };
+                assert!(arcen_protocol::wire::is_audio_frame(&event));
+            }
+        }
+        // The relay asked the agent for a keyframe after dropping video.
+        let mut asked = false;
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_millis(500), rig.agent.next()).await
+        {
+            if matches!(&message, Message::Text(text) if text.contains("request_full_frame")) {
+                asked = true;
+                break;
+            }
+        }
+        assert!(asked, "a dropped video frame must ask for a keyframe");
+        std::fs::remove_dir_all(&rig.dir).ok();
     }
 
     #[test]

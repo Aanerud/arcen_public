@@ -126,6 +126,11 @@ here).
 Run on the target Linux Pier's dedicated per-session Xorg display (not the
 shared root console) after a session with a negotiated pen is attached.
 
+The virtual devices carry the session's display in their name, for example
+`Arcen Virtual Tablet Pen (session :58)`; the session's Xorg admits only the
+devices named for its own display (`xinput list` on the session display shows
+no console keyboard or mouse).
+
 ```bash
 # Confirm the kernel sees a distinct virtual tablet-tool device (not merged
 # into the mouse device) and that it classifies as a tablet tool:
@@ -254,11 +259,30 @@ working tablet whose Linux driver binds only to USB devices (as the measured
 one's does) on a Linux Pier**, so do not enable it expecting one. Use the
 typed pen path, which is the supported configuration.
 
-## 5b. Open: tilt reaches the Linux host but is not observed by applications
+## 5b. Tilt reaches the Linux host but is not observed by applications
 
 Reported 2026-08-12: pen tilt works on a Windows Pier and not on a Linux Pier.
 Not investigated further at the owner's direction; this records the measurement
 so the client side does not get re-examined needlessly.
+
+**Update 2026-10-19 (real-screen stylus tests, Firefox 140 and Chrome 155 on
+Xorg/GNOME 40 and on the Wayland lab seat pen).** Tilt does reach browsers,
+and two host-side faults distorted it; both are fixed:
+
+- The tilt axes declared no resolution, so libinput read them as a Wacom pen's
+  ±64° spread over `-90..=90`: a 45° tilt arrived as 32° (Chrome on Xorg, every
+  Wayland client). The axes now declare `TILT_UNITS_PER_RADIAN`.
+- On Xorg the pen also moved the cursor and clicked through the absolute mouse
+  device, so applications received every sample a second time from a device
+  without tilt or pressure (Chrome: 32 % of inked samples at pressure 0;
+  Firefox: a `mouse` pointerdown and pointer-type flips inside strokes). The
+  tablet device alone is the pen now.
+
+Firefox on Xorg reports tilt larger than sent (45° as 64°). This is the
+deliberate trade-off of the fix, not a remaining fault: xf86-input-libinput
+exposes tilt as a ±64 valuator (it caps Xorg tilt at ±64° for every tablet),
+GDK hands that to Firefox normalised to ±1, and Firefox multiplies by 90. A USB
+Wacom shows the same; Chrome reports the degrees.
 
 Tilt **does** arrive at the Linux host, with live varying values. From
 `/var/log/arcen/arcen-pier.log` with `ARCEN_LOG=input=trace`:

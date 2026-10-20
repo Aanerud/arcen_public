@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-identity",
+  "owner": "Shared/Architecture",
+  "description": "Resume grants, session grants and acknowledgement evidence.",
+  "validation": ["shared-identity-test", "shared-identity-clippy", "workspace-boundaries"],
+  "consumers": [
+    {
+      "package": "arcen-pier-linux",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "direct_resume"],
+      "paths": [
+        {
+          "id": "linux-xorg-hdr",
+          "entry_points": ["hosts/linux/src/cli.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session",
+          "entry_points": ["hosts/linux/src/cli.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-session-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-transport",
+          "entry_points": ["hosts/linux/src/net/server.rs", "hosts/linux/src/net/tls.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-session-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "direct_resume"],
+      "paths": [
+        {
+          "id": "windows-grading",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-hdr",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-audio",
+          "entry_points": ["hosts/windows/src/resume.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-session",
+          "entry_points": [
+            "hosts/windows/src/session.rs",
+            "hosts/windows/src/resume.rs",
+            "hosts/windows/src/main.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-session-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-transport",
+          "entry_points": ["hosts/windows/src/tls.rs", "hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-session-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-multi-monitor",
+          "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-transport",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "direct_resume"]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-linux"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/build.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-windows"],
+      "paths": [
+        {
+          "id": "windows-installer",
+          "entry_points": [
+            "packaging/windows/installer/src/main.rs",
+            "packaging/windows/installer/build.rs"
+          ],
+          "build_profiles": ["windows-pier-installer"],
+          "validation": ["windows-pier-installer-build"],
+          "owner": "Windows Host"
+        }
+      ]
+    }
+  ]
+}

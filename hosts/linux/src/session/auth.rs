@@ -48,7 +48,15 @@ pub(crate) enum SessionDisplayDegradation {
     MultiMonitorMatchLayout { requested_monitors: usize },
 }
 
+/// [`validate_pam_request`] for a response that still holds its credential.
+#[cfg(test)]
 pub fn validate_pam_response(response: &AuthResponse) -> Result<(), AuthError> {
+    validate_pam_request(response, &response.credential)
+}
+
+/// Validates a PAM `auth_response` whose credential the caller has already
+/// moved into a wiped buffer (`credential`).
+pub fn validate_pam_request(response: &AuthResponse, credential: &str) -> Result<(), AuthError> {
     if response.method != "pam" {
         return Err(AuthError::InvalidRequest("expected PAM method"));
     }
@@ -62,7 +70,7 @@ pub fn validate_pam_response(response: &AuthResponse) -> Result<(), AuthError> {
     {
         return Err(AuthError::InvalidRequest("invalid username characters"));
     }
-    if response.credential.is_empty() || response.credential.len() > MAX_CREDENTIAL_BYTES {
+    if credential.is_empty() || credential.len() > MAX_CREDENTIAL_BYTES {
         return Err(AuthError::InvalidRequest("invalid credential length"));
     }
     if response.monitors.len() > MAX_MONITORS {

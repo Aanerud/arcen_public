@@ -55,6 +55,9 @@ const SUPERVISOR_POLICY: SupervisorPolicy = SupervisorPolicy {
 #[derive(Debug, Clone)]
 pub struct AudioConfig {
     pub binary: PathBuf,
+    /// The monitor source to record; the default sink's monitor when
+    /// `None`.
+    pub source: Option<String>,
     pub execution: Option<UserExecution>,
     pub session_log_id: CorrelationId,
 }
@@ -214,6 +217,9 @@ fn spawn_child(config: &AudioConfig) -> std::io::Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(source) = &config.source {
+        command.args(["--source", source]);
+    }
     if let Some(execution) = &config.execution {
         execution
             .configure(&mut command)
@@ -232,6 +238,7 @@ fn spawn_child(config: &AudioConfig) -> std::io::Result<Child> {
         sample_rate = SAMPLE_RATE,
         channels = CHANNELS,
         chunk_ms = CHUNK_MS,
+        source = config.source.as_deref().unwrap_or("default sink monitor"),
         "native audiocap started"
     );
     Ok(child)
@@ -694,6 +701,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -735,6 +743,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -771,6 +780,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -811,6 +821,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -843,6 +854,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -884,6 +896,7 @@ mod tests {
         let session = spawn(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },
@@ -926,6 +939,7 @@ mod tests {
         let session = spawn_with_policy(
             AudioConfig {
                 binary: path.clone(),
+                source: None,
                 execution: None,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             },

@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 /// Pointing-device kind reported by `-[NSEvent pointingDeviceType]`.
 ///
@@ -172,6 +173,83 @@ impl RawTabletSample {
             Self::Proximity(proximity) => proximity.window_number,
         }
     }
+}
+
+/// What the AppKit event monitor hands on, in dispatch order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TabletMonitorEvent {
+    /// A pen sample, with how long it waited between the event's own
+    /// timestamp and its dispatch to this app.
+    Sample {
+        sample: RawTabletSample,
+        dispatch_age: Duration,
+    },
+    /// A key, modifier, or non-tablet mouse button/scroll event was
+    /// dispatched. Those still reach the host through the UI pass, so pen
+    /// samples dispatched after one must wait for that pass to keep the
+    /// person's order (a modifier held before a stroke must arrive first).
+    InputEdge,
+}
+
+/// Bounded record of how long input events waited before AppKit dispatched
+/// them to this app: the direct measure of whether input is waiting for the
+/// UI or presentation loop.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchAgeStats {
+    ages_us: Vec<u32>,
+    count: u64,
+    max_us: u32,
+}
+
+/// Summary of one [`DispatchAgeStats`] window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchAgeSummary {
+    pub count: u64,
+    pub p50_us: u32,
+    pub p99_us: u32,
+    pub max_us: u32,
+}
+
+impl DispatchAgeStats {
+    /// Samples kept for the percentiles of one window; later ones still
+    /// count and still raise the maximum.
+    pub const CAPACITY: usize = 4096;
+
+    pub fn record(&mut self, age: Duration) {
+        let micros = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+        self.count = self.count.saturating_add(1);
+        self.max_us = self.max_us.max(micros);
+        if self.ages_us.len() < Self::CAPACITY {
+            self.ages_us.push(micros);
+        }
+    }
+
+    /// Summarises and clears the window.
+    pub fn take(&mut self) -> DispatchAgeSummary {
+        let mut ages = std::mem::take(&mut self.ages_us);
+        let summary = DispatchAgeSummary {
+            count: self.count,
+            p50_us: percentile(&mut ages, 50),
+            p99_us: percentile(&mut ages, 99),
+            max_us: self.max_us,
+        };
+        self.count = 0;
+        self.max_us = 0;
+        ages.clear();
+        self.ages_us = ages;
+        summary
+    }
+}
+
+/// Nearest-rank percentile of `values` (sorted in place); 0 when empty.
+#[must_use]
+pub fn percentile(values: &mut [u32], percent: usize) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let rank = (values.len() * percent).div_ceil(100).max(1);
+    values[rank.min(values.len()) - 1]
 }
 
 /// A fixed-capacity FIFO queue that never blocks its producer.
@@ -360,5 +438,38 @@ mod tests {
     #[should_panic(expected = "capacity must be > 0")]
     fn bounded_queue_rejects_zero_capacity() {
         let _: BoundedSampleQueue<u32> = BoundedSampleQueue::new(0);
+    }
+
+    #[test]
+    fn dispatch_age_stats_summarise_and_reset_each_window() {
+        let mut stats = DispatchAgeStats::default();
+        for millis in 1..=100u64 {
+            stats.record(Duration::from_millis(millis));
+        }
+        let summary = stats.take();
+        assert_eq!(summary.count, 100);
+        assert_eq!(summary.p50_us, 50_000);
+        assert_eq!(summary.p99_us, 99_000);
+        assert_eq!(summary.max_us, 100_000);
+        assert_eq!(stats.take(), DispatchAgeSummary::default());
+    }
+
+    #[test]
+    fn dispatch_age_stats_stay_bounded_but_keep_counting() {
+        let mut stats = DispatchAgeStats::default();
+        for _ in 0..DispatchAgeStats::CAPACITY + 10 {
+            stats.record(Duration::from_micros(10));
+        }
+        stats.record(Duration::from_secs(5));
+        let summary = stats.take();
+        assert_eq!(summary.count, DispatchAgeStats::CAPACITY as u64 + 11);
+        assert_eq!(summary.max_us, 5_000_000);
+        assert_eq!(summary.p99_us, 10);
+    }
+
+    #[test]
+    fn percentile_of_nothing_is_zero() {
+        assert_eq!(percentile(&mut [], 50), 0);
+        assert_eq!(percentile(&mut [7], 99), 7);
     }
 }

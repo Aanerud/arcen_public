@@ -13,8 +13,11 @@ result through a dedicated `RGB10A2Unorm` HDR Metal path.
 The measured Linux path now keeps ordinary eight-bit sessions on
 NvFBC→CUDA→NVENC, while every depth above eight uses MIT-SHM against the
 dedicated depth-30 Xorg screen and uploads explicitly converted P16 samples to
-NVENC. That Linux path is genuine 10-bit SDR; HDR requests remain Windows-only
-until the color-managed Wayland provider is implemented. Both current paths
+NVENC. That Linux path is genuine 10-bit SDR. On Xorg, HDR requests resolve
+to Grading. The Wayland provider serves Grading and HDR from a wide
+`RecordMonitor` stream on Mutter ≥ 50 once qualification proves the route,
+precision and SDR white (`linux-wayland-provider.md`, "Wayland Grading and
+HDR"); Mutter 49 has no HDR screen sharing. Both current paths
 have been exercised through the deployed Piers and the macOS Deck.
 The manual release matrix covered all four presets on both hosts, nonzero
 audio, input, cursor authority/degradation, restore, and credential-free
@@ -192,6 +195,15 @@ The split is keyed on bit depth, not transfer. Grading Reference is ten-bit
 BT.709 SDR and needs XShm; otherwise it would receive an eight-bit NvFBC source
 in a ten-bit encode. Conversely, an ordinary eight-bit session never pays the
 XShm or CPU-conversion cost.
+
+The depth-30 source is a property of the desktop, not of the stream. X11 has
+one depth per server, fixed when it starts, and at depth 30 Firefox and
+Chromium/Electron lose GPU rendering. A dedicated Xorg desktop is therefore
+created at depth 30 only for a ten-bit session, a declared `rec2100-pq`
+desktop, or `video.x11_desktop_depth: 30`, and at depth 24 otherwise
+(`arcen_media::video::choose_desktop_depth`). A ten-bit request that reattaches
+to a depth-24 desktop is served as Auto with `eight_bit_source`
+(`serve_on_fixed_depth`), never as eight-bit samples in a ten-bit stream.
 
 X11 defines precision and visual masks, but no desktop HDR composition space
 or HDR metadata protocol. DaVinci Resolve's own Linux manual likewise limits
@@ -544,11 +556,18 @@ incoherent, because no encoder Arcen has can produce it.
 
 ## Outstanding
 
-- **General Linux desktop HDR needs the Wayland provider.** Xorg serves
-  genuine 10-bit SDR grading, and PQ only for a desktop the operator declares
-  Rec.2100 PQ (`video.desktop_encoding`). Compositor-owned HDR still needs the
-  provider to prove compositor HDR state plus a ten-bit capture format carrying
-  transfer/primaries metadata. On a declared PQ desktop, eight-bit sessions
+- **General Linux desktop HDR needs the Wayland provider on Mutter ≥ 50.**
+  Xorg serves genuine 10-bit SDR grading, and PQ only for a desktop the
+  operator declares Rec.2100 PQ (`video.desktop_encoding`). The Wayland
+  Grading and HDR compositions exist and are proven host-side on Mutter 50.6
+  and 51.0 in lab containers. Each one is a separate pipeline:
+  - Capture: a wide `RecordMonitor` DMA-BUF in 10-bit PQ or F16 PQ, read
+    back.
+  - Grading converts BT.2020/PQ to BT.709 SDR in shared code.
+  - Encode: NVENC HEVC Main 4:4:4 10.
+  The full Pier→Deck path still needs a GNOME ≥ 50 product host. Grading
+  through a PQ composition keeps 853 of 1024 SDR codes, not Xorg depth 30's
+  1024, until Mutter offers wide formats in SDR. On a declared PQ desktop, eight-bit sessions
   are refused rather than converted: there is no eight-bit conversion path.
 - **4:2:2 is not wired.** NV16/P210 bindings and BGRA conversion are absent,
   so the Blackwell capability question cannot yet be measured.

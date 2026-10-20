@@ -1,0 +1,906 @@
+# The reviewed catalogue of build profiles and validations named by
+# shared/*/consumers.json. Loaded only by scripts/check_shared_contracts.py.
+#
+# [template.<id>]          the only commands the checker will ever render or
+#                          run: an argv list (no shell) whose placeholders are
+#                          filled from catalogue values, never from a register.
+#                          An empty argv means the result is recorded by a
+#                          person or a lab and supplied as evidence.
+# [build_profile.<id>]     a compiled variant: package, target OS, optional
+#                          Rust target triple and Cargo features.
+# [validation.<id>]        what must pass, on which target, with which
+#                          features; kind is schema, unit, lint, build,
+#                          evidence or hardware. Hardware validations are
+#                          always recorded evidence.
+#
+# A register names validation IDs; it never carries commands or results.
+# Results live in revision-bound evidence files (see
+# docs/architecture/shared-consumers.md). Changing this file changes what a
+# shared change must prove: it needs Release/Security and Shared/Architecture
+# review.
+
+schema_version = 1
+
+# Run for every register, catalogue or documentation-only shared change.
+registry_validation = "shared-consumer-registry"
+
+# --- Templates -----------------------------------------------------------------
+
+[template.cargo-test]
+argv = ["cargo", "test", "--locked", "{target}", "-p", "{package}", "{features}"]
+
+[template.cargo-build]
+argv = ["cargo", "build", "--locked", "{target}", "-p", "{package}", "{features}"]
+
+[template.cargo-clippy-strict]
+argv = ["cargo", "clippy", "--locked", "{target}", "-p", "{package}", "{features}", "--", "-D", "warnings"]
+
+[template.python-unittest]
+argv = ["python3", "-m", "unittest", "{module}"]
+
+[template.python-script]
+argv = ["python3", "{script}"]
+
+[template.bash-script]
+argv = ["bash", "{script}"]
+
+[template.recorded]
+argv = []
+
+# --- Build profiles: shared crates ------------------------------------------------
+
+[build_profile.shared-identity]
+description = "arcen-identity, default features"
+target_os = "any"
+package = "arcen-identity"
+
+[build_profile.shared-input]
+description = "arcen-input, default features"
+target_os = "any"
+package = "arcen-input"
+
+[build_profile.shared-keel]
+description = "arcen-keel, default features"
+target_os = "any"
+package = "arcen-keel"
+
+[build_profile.shared-media]
+description = "arcen-media, default features (no native codec build)"
+target_os = "any"
+package = "arcen-media"
+
+[build_profile.shared-media-audio-opus]
+description = "arcen-media with the vendored Opus adapter"
+target_os = "any"
+package = "arcen-media"
+features = ["audio-opus"]
+
+[build_profile.shared-media-software-h264]
+description = "arcen-media with the source-built OpenH264 adapter"
+target_os = "any"
+package = "arcen-media"
+features = ["software-h264-source"]
+
+[build_profile.shared-observability]
+description = "arcen-observability, default features"
+target_os = "any"
+package = "arcen-observability"
+
+[build_profile.shared-outputs]
+description = "arcen-outputs, default features"
+target_os = "any"
+package = "arcen-outputs"
+
+[build_profile.shared-protocol]
+description = "arcen-protocol, default features"
+target_os = "any"
+package = "arcen-protocol"
+
+[build_profile.shared-session]
+description = "arcen-session, default features"
+target_os = "any"
+package = "arcen-session"
+
+[build_profile.shared-telemetry]
+description = "arcen-telemetry, default features"
+target_os = "any"
+package = "arcen-telemetry"
+
+[build_profile.shared-transport]
+description = "arcen-transport, TLS-only default (no QUIC runtime)"
+target_os = "any"
+package = "arcen-transport"
+
+[build_profile.shared-transport-quic]
+description = "arcen-transport with the optional QUIC adapter"
+target_os = "any"
+package = "arcen-transport"
+features = ["quic"]
+
+[build_profile.shared-usb-bridge]
+description = "arcen-usb-bridge, default features"
+target_os = "any"
+package = "arcen-usb-bridge"
+
+[build_profile.tools-region-patch-benchmark]
+description = "Internal region-patch benchmark tool"
+target_os = "any"
+package = "arcen-region-patch-benchmark"
+
+# --- Build profiles: Linux Pier --------------------------------------------------------
+
+[build_profile.linux-pier]
+description = "Linux Pier as shipped: Xorg session, NVENC and OpenH264 capenc, Opus, QUIC"
+target_os = "linux"
+package = "arcen-pier-linux"
+
+[build_profile.linux-pier-wayland-provider]
+description = "Linux Pier with the default-off headless Wayland session adapter and Wayland/EIS model seam compiled in"
+target_os = "linux"
+package = "arcen-pier-linux"
+features = ["wayland-provider"]
+
+[build_profile.linux-pier-usb-hard-lab]
+description = "Linux Pier with the lab-only hard USB bridge"
+target_os = "linux"
+package = "arcen-pier-linux"
+features = ["usb-hard-lab"]
+
+[build_profile.linux-capenc]
+description = "capenc as the Linux Pier links it: NvFBC/XShm capture, NVENC and OpenH264"
+target_os = "linux"
+package = "arcen-capenc"
+features = ["nvenc", "software-h264"]
+
+[build_profile.linux-capenc-wayland]
+description = "capenc with the default-off Wayland PipeWire capture and import routes (needs libpipewire-0.3 headers and libclang)"
+target_os = "linux"
+package = "arcen-capenc"
+features = ["nvenc", "software-h264", "wayland"]
+
+[build_profile.linux-audiocap]
+description = "Linux system-audio capture helper"
+target_os = "linux"
+package = "arcen-audiocap"
+
+[build_profile.linux-pier-installer]
+description = "Linux installer embedding a release arcen-pier (ARCEN_PIER_BINARY)"
+target_os = "linux"
+package = "arcen-pier-linux-installer"
+
+# --- Build profiles: Windows Pier ------------------------------------------------------
+
+[build_profile.windows-pier]
+description = "Windows Pier as shipped: WGC/DDA capenc with NVENC and OpenH264, QUIC"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-pier-windows"
+
+[build_profile.windows-capenc]
+description = "capenc as the Windows Pier links it: WGC/DDA capture, NVENC and OpenH264"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-capenc"
+features = ["nvenc", "software-h264"]
+
+[build_profile.windows-capenc-mf]
+description = "capenc Media Foundation encoder variant (not enabled by the Windows Pier)"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-capenc"
+features = ["mf"]
+
+[build_profile.windows-pier-installer]
+description = "Windows installer embedding arcen-pier.exe and the credential provider DLL"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-pier-windows-installer"
+
+# --- Build profiles: macOS Pier and Deck -------------------------------------------------
+
+[build_profile.macos-pier]
+description = "macOS Pier (in development; not a supported host release)"
+target_os = "macos"
+package = "arcen-pier-macos"
+
+[build_profile.macos-deck-apple-silicon]
+description = "macOS Deck for Apple silicon"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-deck-macos"
+
+[build_profile.macos-deck-intel]
+description = "macOS Deck for Intel Macs"
+target_os = "macos"
+rust_target = "x86_64-apple-darwin"
+package = "arcen-deck-macos"
+
+[build_profile.macos-deck-usb-hard-lab]
+description = "macOS Deck with the lab-only hard USB bridge (Apple silicon)"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-deck-macos"
+features = ["usb-hard-lab"]
+
+[build_profile.macos-usb-helper-apple-silicon]
+description = "Privileged USB helper embedded in the Apple-silicon Deck app"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-usb-helper"
+
+[build_profile.macos-usb-helper-intel]
+description = "Privileged USB helper embedded in the Intel Deck app"
+target_os = "macos"
+rust_target = "x86_64-apple-darwin"
+package = "arcen-usb-helper"
+
+# --- Validations: shared crates and the register -------------------------------------------
+
+[validation.shared-consumer-registry]
+description = "Register schema, Cargo reconciliation, production uses and generated report"
+kind = "schema"
+target_os = "any"
+template = "python-script"
+script = "scripts/check_shared_contracts.py"
+owner = "Shared/Architecture"
+
+[validation.workspace-boundaries]
+description = "Dependency direction: shared crates never depend on products"
+kind = "schema"
+target_os = "any"
+template = "bash-script"
+script = "scripts/ci/check-workspace-boundaries.sh"
+owner = "Shared/Architecture"
+
+[validation.shared-observability-conformance]
+description = "Synthetic observability conformance (telemetry vocabulary and runtime)"
+kind = "unit"
+target_os = "any"
+template = "python-unittest"
+module = "scripts/test_validate_observability.py"
+owner = "Shared/Architecture"
+
+[validation.shared-identity-test]
+description = "arcen-identity tests"
+kind = "unit"
+build_profile = "shared-identity"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-identity-clippy]
+description = "arcen-identity strict Clippy"
+kind = "lint"
+build_profile = "shared-identity"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-input-test]
+description = "arcen-input tests, including the cross-component region fixture"
+kind = "unit"
+build_profile = "shared-input"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-input-clippy]
+description = "arcen-input strict Clippy"
+kind = "lint"
+build_profile = "shared-input"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-keel-test]
+description = "arcen-keel tests"
+kind = "unit"
+build_profile = "shared-keel"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-keel-clippy]
+description = "arcen-keel strict Clippy"
+kind = "lint"
+build_profile = "shared-keel"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-media-test]
+description = "arcen-media tests, default features"
+kind = "unit"
+build_profile = "shared-media"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-media-clippy]
+description = "arcen-media strict Clippy, default features"
+kind = "lint"
+build_profile = "shared-media"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-media-audio-opus-test]
+description = "arcen-media tests with the Opus adapter"
+kind = "unit"
+build_profile = "shared-media-audio-opus"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-media-software-h264-test]
+description = "arcen-media tests with the source-built OpenH264 adapter"
+kind = "unit"
+build_profile = "shared-media-software-h264"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-media-tree-purity]
+description = "CI proof that default arcen-media excludes native codec build graphs"
+kind = "evidence"
+build_profile = "shared-media"
+template = "recorded"
+owner = "Shared/Architecture"
+
+[validation.shared-observability-test]
+description = "arcen-observability tests"
+kind = "unit"
+build_profile = "shared-observability"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-observability-clippy]
+description = "arcen-observability strict Clippy"
+kind = "lint"
+build_profile = "shared-observability"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-outputs-test]
+description = "arcen-outputs tests"
+kind = "unit"
+build_profile = "shared-outputs"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-outputs-clippy]
+description = "arcen-outputs strict Clippy"
+kind = "lint"
+build_profile = "shared-outputs"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-outputs-tree-purity]
+description = "CI proof that arcen-outputs pulls in no runtime or product package"
+kind = "evidence"
+build_profile = "shared-outputs"
+template = "recorded"
+owner = "Shared/Architecture"
+
+[validation.shared-protocol-test]
+description = "arcen-protocol tests, including wire golden vectors"
+kind = "unit"
+build_profile = "shared-protocol"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-protocol-clippy]
+description = "arcen-protocol strict Clippy"
+kind = "lint"
+build_profile = "shared-protocol"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-session-test]
+description = "arcen-session tests"
+kind = "unit"
+build_profile = "shared-session"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-session-clippy]
+description = "arcen-session strict Clippy"
+kind = "lint"
+build_profile = "shared-session"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-telemetry-test]
+description = "arcen-telemetry tests"
+kind = "unit"
+build_profile = "shared-telemetry"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-telemetry-clippy]
+description = "arcen-telemetry strict Clippy"
+kind = "lint"
+build_profile = "shared-telemetry"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-transport-test]
+description = "arcen-transport tests, TLS-only default"
+kind = "unit"
+build_profile = "shared-transport"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-transport-clippy]
+description = "arcen-transport strict Clippy"
+kind = "lint"
+build_profile = "shared-transport"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-transport-quic-test]
+description = "arcen-transport tests with the QUIC adapter (localhost, priority audio, monitor streams)"
+kind = "unit"
+build_profile = "shared-transport-quic"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-transport-tree-purity]
+description = "CI proof that default arcen-transport excludes quinn, tokio and bytes"
+kind = "evidence"
+build_profile = "shared-transport"
+template = "recorded"
+owner = "Shared/Architecture"
+
+[validation.shared-usb-bridge-test]
+description = "arcen-usb-bridge tests"
+kind = "unit"
+build_profile = "shared-usb-bridge"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-usb-bridge-clippy]
+description = "arcen-usb-bridge strict Clippy"
+kind = "lint"
+build_profile = "shared-usb-bridge"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.region-patch-benchmark-test]
+description = "Internal region-patch benchmark builds and its tests pass"
+kind = "unit"
+build_profile = "tools-region-patch-benchmark"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+# --- Validations: Linux Pier -----------------------------------------------------------------
+
+[validation.linux-pier-test]
+description = "Linux Pier tests on Linux (needs libpam0g-dev and libpulse-dev)"
+kind = "unit"
+build_profile = "linux-pier"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-pier-wayland-provider-test]
+description = "Linux Pier tests with the headless Wayland session adapter and Wayland/EIS model seam compiled in"
+kind = "unit"
+build_profile = "linux-pier-wayland-provider"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-pier-usb-hard-lab-test]
+description = "Linux Pier tests with the lab-only hard USB bridge"
+kind = "unit"
+build_profile = "linux-pier-usb-hard-lab"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-capenc-test]
+description = "capenc tests on Linux with NVENC and OpenH264 compiled in"
+kind = "unit"
+build_profile = "linux-capenc"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-capenc-wayland-test]
+description = "capenc tests on Linux with the Wayland PipeWire capture path compiled in"
+kind = "unit"
+build_profile = "linux-capenc-wayland"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-audiocap-test]
+description = "Linux audio capture helper tests"
+kind = "unit"
+build_profile = "linux-audiocap"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-pier-installer-build]
+description = "Linux installer built around a freshly built release Pier (needs ARCEN_PIER_BINARY)"
+kind = "build"
+build_profile = "linux-pier-installer"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-capture-import-lab]
+description = "Wayland capture harness on NVIDIA: PipeWire leases, host-copy upload read-back equal to the CPU reference, NVENC encode, clean teardown (scripts/lab/wayland-capture-probe.sh)"
+kind = "hardware"
+build_profile = "linux-capenc-wayland"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-auto-lab]
+description = "Wayland Auto on the headless GNOME session: capenc through the Pier's own supervision on the session's capture hand-off, ADMISSION then READY, moving and idle runs (Keel keepalive only when idle), keyframe on demand while idle, SPS/stream truth 4:2:0 8-bit limited BT.709, composited cursor (examples/wayland_session_harness --pipeline auto)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-software-lab]
+description = "Wayland software encode without NVENC: capenc's linux-wayland-software composition through the Pier's own supervision on the session's capture hand-off (shared memory only, no CUDA), ADMISSION served=software then READY backend=openh264-sw-h264 conversion_backend=cpu, embedded cursor carried as cursor=host, moving and idle runs (Keel keepalive only when idle), keyframe on demand, H.264 4:2:0 8-bit limited BT.709 stream truth, Speed visibly downgraded, an output above 1920x1200 refused or fitted before the session; the Pier's native-then-software ladder with NVENC unavailable (examples/wayland_session_harness --pipeline auto|speed --encoder software-h264|auto)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-speed-lab]
+description = "Wayland Speed admission on the qualified stack: an unqualified copying route is visibly served as Auto, a qualified rate below 60 fps clamps Speed and says so, a qualified 60 fps route serves Speed; the source is offered twice Speed's rate and a session created for Speed runs its output at the qualified paced refresh (120 Hz for a 60 Hz display); measured source rate, upload/import and encode cost recorded (examples/wayland_session_harness --pipeline speed; scripts/lab/wayland-capture-probe.sh with ARCEN_LAB_CAPENC_RUN)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-fidelity-lab]
+description = "Wayland Grading and HDR on a compositor with HDR screen sharing (Mutter >= 50, mutter!4928), host-side: arcen-pier wayland qualify on the forced-HDR route proves the RecordMonitor wide stream, capenc's ramp read back through it (native-wide precision per format and memory: 10-bit DMA-BUF 1024/1024 codes, never an shm wide format without that proof), SDR white at 203 nits, and a Grading and an HDR epoch admitted on those facts with SPS truth 4:4:4 10-bit full range (BT.709 for Grading, BT.2020/PQ for HDR); on Mutter < 50 both are refused with compositor_lacks_hdr_screencast and served visibly as Auto; the 8-bit Auto and Speed routes unchanged (arcen-pier wayland qualify; scripts/lab fidelity containers until a GNOME >= 50 host exists)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-gpu-import-lab]
+description = "Wayland gpu-convert route on NVIDIA with nvidia-drm modeset=1: DMA-BUF offered only with the importer's EGL modifiers after its GL-to-CUDA self-test, explicit sync negotiated (acquire waited, release signalled), a GPU-imported frame read back equal to the host-copy frame of the same still desktop (wayland-capture-probe verify-gpu-import at 1080p and 4K), per-frame sync/blit/CUDA-copy cost, Speed on a 120 Hz output served at the qualified rate with copy_path=gpu-convert, explicit fallback to shared memory on import failure, Auto and the shared-memory route unchanged (scripts/lab/wayland-capture-probe.sh; arcen-pier wayland qualify)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-xorg-auto-lab]
+description = "Auto on Xorg/NVIDIA: NvFBC -> CUDA -> NVENC zero-copy, 30 fps detail contract"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-xorg-speed-lab]
+description = "Speed on Xorg/NVIDIA: same NvFBC/CUDA/NVENC loop, 60 fps motion contract"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-xorg-grading-lab]
+description = "Grading on depth-30 Xorg: XShm RGB10 -> shared conversion -> NVENC 4:4:4 10-bit BT.709"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-xorg-hdr-lab]
+description = "HDR request on Xorg: truthful downgrade to Grading, or PQ with a declared Rec.2100 desktop"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-software-h264-lab]
+description = "OpenH264 software path on an Xorg session without NVENC"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-av-input-lab]
+description = "Linux audio, microphone, input and clipboard end to end with a real Deck"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-session-lab]
+description = "Linux PAM login, Xorg session, QUIC connect, reconnect and resume with a real Deck"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-session-lab]
+description = "Headless GNOME/Mutter session through PAM and the launcher: seatless logind session, virtual output, ScreenCast frame, RemoteDesktop input, compositor death, logout and teardown (examples/wayland_session_harness)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-input-lab]
+description = "Session-bound Wayland input through the Pier's WaylandInjector on the headless GNOME session: socket and agent peer proven, hello facts, first key after Escape dismissal of the first-login welcome dialog and overview, drag, modifiers, client autorepeat, keysym under a layout that has it, wheel and precise scroll direction, held-input release on lane loss, injector drop, supersession and disconnect, forced injector loss restored by reconnection and a lasting loss reported, foreign output, stale generation, out-of-bounds and foreign-peer refusals (examples/wayland_session_harness)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-clipboard-lab]
+description = "Wayland clipboard on the headless GNOME session: the agent's clipboard-only RemoteDesktop session proven at start, the clipboard socket and agent peer proven by the Pier, Deck-to-host and host-to-Deck text and PNG (latin-1 STRING served), a host copy above the policy refused while the session goes on, the clipboard across a Windowed resize, and supersession (examples/wayland_clipboard_harness and a real Deck media-smoke with ARCEN_MEDIA_SMOKE_CLIPBOARD_*)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-qualify-lab]
+description = "Host qualification on the target stack: `arcen-pier wayland qualify --write` as root runs a temporary-account headless session through PAM and the launcher, proves the capture route with capenc's Auto composition (ADMISSION and encoded access units), session input through the Pier's injector and accepted pointer motion, measures the Speed source rate per output, checks the session's PulseAudio monitor, tears down (logind session, runtime directory and account gone) and writes the record; Pier start refuses Wayland without a valid record and selects it with one"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-server-lab]
+description = "A qualified Pier with capture.provider = \"wayland\" serving a real Deck: PAM authentication, headless session at the Deck's display size, ADMISSION and READY, served-pipeline label from the admitted plan (Speed served as Auto without a qualified rate, Speed at the qualified rate with one), decoded video, audio frames, session input through the injector, reattach to the same session, teardown when the reconnect window expires"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-multi-monitor-lab]
+description = "Linux multi-monitor topology, Xorg multihead and per-monitor capenc"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-wayland-multi-monitor-lab]
+description = "A qualified Wayland Pier serving a multi-monitor Deck: `wayland qualify --multi-output` proves concurrent outputs, the offer names them, a Match My Layout request is planned onto placed RecordVirtual outputs, one capenc per output admits and encodes through the fair mux, region input lands on each output, a reattach with another layout reconfigures the outputs in place (desktop kept), and a request beyond the proven outputs degrades whole (deck multi-monitor-smoke --monitor-fixture)"
+kind = "hardware"
+build_profile = "linux-pier-wayland-provider"
+template = "recorded"
+owner = "Linux Host"
+
+[validation.linux-usb-lab]
+description = "Linux lab-only hard USB bridge with a real tablet"
+kind = "hardware"
+build_profile = "linux-pier-usb-hard-lab"
+template = "recorded"
+owner = "Linux Host"
+
+# --- Validations: Windows Pier ----------------------------------------------------------------
+
+[validation.windows-pier-test]
+description = "Windows Pier tests on Windows/MSVC"
+kind = "unit"
+build_profile = "windows-pier"
+template = "cargo-test"
+owner = "Windows Host"
+
+[validation.windows-capenc-test]
+description = "capenc tests on Windows with NVENC and OpenH264 compiled in"
+kind = "unit"
+build_profile = "windows-capenc"
+template = "cargo-test"
+owner = "Windows Host"
+
+[validation.windows-capenc-mf-build]
+description = "capenc builds with the Media Foundation encoder variant"
+kind = "build"
+build_profile = "windows-capenc-mf"
+template = "cargo-build"
+owner = "Windows Host"
+
+[validation.windows-pier-installer-build]
+description = "Windows installer built by hosts/windows/build.cmd around a fresh Pier and credential provider"
+kind = "build"
+build_profile = "windows-pier-installer"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-auto-lab]
+description = "Auto on Windows: DDA after real-frame proof, otherwise WGC BGRA8 -> NVENC"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-speed-lab]
+description = "Speed on Windows: same capture loop, 60 fps motion contract"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-grading-lab]
+description = "Grading on Windows: WGC FP16 scRGB -> shared SDR transfer/matrix -> NVENC P16"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-hdr-lab]
+description = "HDR on Windows: HDR EDID/topology and exact-target proof -> FP16 scRGB -> BT.2020/PQ -> NVENC P16"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-software-h264-lab]
+description = "OpenH264 software path on a Windows host without NVENC"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-av-input-lab]
+description = "Windows audio, microphone, input and clipboard end to end with a real Deck"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-session-lab]
+description = "Windows WTS session, credential provider first login, QUIC connect and resume"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-multi-monitor-lab]
+description = "Windows multi-monitor topology, IddCx virtual outputs and per-monitor capture"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+# --- Validations: macOS Pier ------------------------------------------------------------------
+
+[validation.macos-pier-test]
+description = "macOS Pier tests on macOS"
+kind = "unit"
+build_profile = "macos-pier"
+template = "cargo-test"
+owner = "macOS Host"
+
+[validation.macos-pier-app-build]
+description = "Signed Pier app and package from packaging/macos/build-pier-app.sh and build-pier-pkg.sh"
+kind = "build"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-auto-lab]
+description = "Auto on the macOS Pier: ScreenCaptureKit 420v -> VideoToolbox"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-speed-lab]
+description = "Speed on the macOS Pier: same SCK 420v loop, 60 fps motion contract"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-grading-lab]
+description = "Grading on the macOS Pier: SCK xf44 -> VideoToolbox HEVC Main 4:4:4 10, BT.709, SPS-proven"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-hdr-lab]
+description = "HDR on the macOS Pier: HDR virtual panel, headroom proof, SCK xf44 PQ/BT.2020"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-av-input-lab]
+description = "macOS Pier audio, input and clipboard end to end with a real Deck"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+[validation.macos-pier-session-lab]
+description = "macOS Pier Aqua session, QUIC connect, reconnect and multi-monitor"
+kind = "hardware"
+build_profile = "macos-pier"
+template = "recorded"
+owner = "macOS Host"
+
+# --- Validations: macOS Deck ------------------------------------------------------------------
+
+[validation.macos-deck-test-apple-silicon]
+description = "macOS Deck tests for Apple silicon"
+kind = "unit"
+build_profile = "macos-deck-apple-silicon"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-deck-build-intel]
+description = "macOS Deck builds for Intel Macs"
+kind = "build"
+build_profile = "macos-deck-intel"
+template = "cargo-build"
+owner = "macOS Client"
+
+[validation.macos-deck-usb-hard-lab-test]
+description = "macOS Deck tests with the lab-only hard USB bridge"
+kind = "unit"
+build_profile = "macos-deck-usb-hard-lab"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-usb-helper-test]
+description = "Privileged USB helper tests (Apple silicon)"
+kind = "unit"
+build_profile = "macos-usb-helper-apple-silicon"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-usb-helper-build-intel]
+description = "Privileged USB helper builds for Intel Macs"
+kind = "build"
+build_profile = "macos-usb-helper-intel"
+template = "cargo-build"
+owner = "macOS Client"
+
+[validation.macos-deck-app-apple-silicon]
+description = "Signed Apple-silicon Deck app from packaging/macos/build-deck-app.sh --arch arm64"
+kind = "build"
+build_profile = "macos-deck-apple-silicon"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-app-intel]
+description = "Signed Intel Deck app from packaging/macos/build-deck-app.sh --arch x86_64"
+kind = "build"
+build_profile = "macos-deck-intel"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-apple-silicon-sdr-lab]
+description = "Apple-silicon Deck: VideoToolbox decode and ordinary SDR presentation"
+kind = "hardware"
+build_profile = "macos-deck-apple-silicon"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-apple-silicon-10bit-lab]
+description = "Apple-silicon Deck: native xf44 10-bit Metal layer; EDR only for PQ"
+kind = "hardware"
+build_profile = "macos-deck-apple-silicon"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-intel-sdr-lab]
+description = "Intel Deck: VideoToolbox decode and ordinary SDR presentation"
+kind = "hardware"
+build_profile = "macos-deck-intel"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-intel-10bit-lab]
+description = "Intel Deck: native xf44 10-bit Metal layer; EDR only for PQ"
+kind = "hardware"
+build_profile = "macos-deck-intel"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-av-input-lab]
+description = "macOS Deck audio, microphone, input and clipboard end to end with a real Pier"
+kind = "hardware"
+build_profile = "macos-deck-apple-silicon"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-session-lab]
+description = "macOS Deck connect, presets, reconnect and restore with a real Pier"
+kind = "hardware"
+build_profile = "macos-deck-apple-silicon"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-usb-lab]
+description = "macOS Deck hard USB tablet bridge through the privileged helper"
+kind = "hardware"
+build_profile = "macos-deck-usb-hard-lab"
+template = "recorded"
+owner = "macOS Client"

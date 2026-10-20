@@ -244,6 +244,105 @@ pub fn health_snapshot(
     Some(fields)
 }
 
+/// Builds the fields for `LANE_REFUSED`.
+///
+/// `role` is the declared lane role token, or `unknown` when the preface
+/// never named one; `reason` is the refusal token. Never the binding.
+#[must_use]
+pub fn lane_refused(
+    role: &str,
+    reason: &str,
+    lane_generation: Option<u32>,
+) -> Option<StructuredFields> {
+    let mut fields = StructuredFields::default();
+    fields
+        .insert("role", FieldValue::String(role.to_owned()))
+        .ok()?;
+    fields
+        .insert("reason", FieldValue::String(reason.to_owned()))
+        .ok()?;
+    if let Some(generation) = lane_generation {
+        fields
+            .insert(
+                "lane_generation",
+                FieldValue::Integer(i64::from(generation)),
+            )
+            .ok()?;
+    }
+    Some(fields)
+}
+
+/// Builds the fields for `LANE_FAILED`: the lane-scoped failure and the
+/// recovery the registry chose for it.
+#[must_use]
+pub fn lane_failed(
+    role: &str,
+    failure: &str,
+    recovery: &str,
+    lane_generation: Option<u32>,
+    reset_stream: Option<bool>,
+) -> Option<StructuredFields> {
+    let mut fields = StructuredFields::default();
+    fields
+        .insert("role", FieldValue::String(role.to_owned()))
+        .ok()?;
+    fields
+        .insert("failure", FieldValue::String(failure.to_owned()))
+        .ok()?;
+    fields
+        .insert("recovery", FieldValue::String(recovery.to_owned()))
+        .ok()?;
+    if let Some(generation) = lane_generation {
+        fields
+            .insert(
+                "lane_generation",
+                FieldValue::Integer(i64::from(generation)),
+            )
+            .ok()?;
+    }
+    if let Some(reset) = reset_stream {
+        fields
+            .insert("reset_stream", FieldValue::Boolean(reset))
+            .ok()?;
+    }
+    Some(fields)
+}
+
+/// Builds the fields for `LANE_STARVED`: how long a lane's writer or queue
+/// waited beyond its role's bound, and what was waiting.
+#[must_use]
+pub fn lane_starved(
+    role: &str,
+    waited_ms: u64,
+    queued_frames: Option<u64>,
+    queued_bytes: Option<u64>,
+    cause: Option<&str>,
+) -> Option<StructuredFields> {
+    let mut fields = StructuredFields::default();
+    fields
+        .insert("role", FieldValue::String(role.to_owned()))
+        .ok()?;
+    fields
+        .insert("waited_ms", FieldValue::Integer(saturating(waited_ms)))
+        .ok()?;
+    if let Some(frames) = queued_frames {
+        fields
+            .insert("queued_frames", FieldValue::Integer(saturating(frames)))
+            .ok()?;
+    }
+    if let Some(bytes) = queued_bytes {
+        fields
+            .insert("queued_bytes", FieldValue::Integer(saturating(bytes)))
+            .ok()?;
+    }
+    if let Some(cause) = cause {
+        fields
+            .insert("cause", FieldValue::String(cause.to_owned()))
+            .ok()?;
+    }
+    Some(fields)
+}
+
 /// Clamps rather than wrapping.
 ///
 /// A duration or a frame count past `i64::MAX` is not a number anyone will
@@ -291,6 +390,28 @@ mod tests {
         assert!(accepted(
             LifecycleEventKind::HealthSnapshot,
             health_snapshot("ok", Some(58), Some(60))
+        ));
+        assert!(accepted(
+            LifecycleEventKind::LaneRefused,
+            lane_refused("video", "pre_authorization", Some(1))
+        ));
+        assert!(accepted(
+            LifecycleEventKind::LaneRefused,
+            lane_refused("unknown", "bad_magic", None)
+        ));
+        assert!(accepted(
+            LifecycleEventKind::LaneFailed,
+            lane_failed("video", "partial_frame", "reopen", Some(2), Some(true))
+        ));
+        assert!(accepted(
+            LifecycleEventKind::LaneStarved,
+            lane_starved(
+                "audio_output",
+                250,
+                Some(3),
+                Some(960),
+                Some("writer_blocked")
+            )
         ));
         assert!(accepted(
             LifecycleEventKind::SessionStreamStart,

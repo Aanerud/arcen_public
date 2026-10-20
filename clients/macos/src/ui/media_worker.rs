@@ -16,7 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::observability::ClientTelemetry;
-use crate::pipeline::audio::PcmAudioPlayer;
 use crate::pipeline::frame_queue::{
     IncomingMediaBatch, IncomingMediaReceiver, IncomingMediaTelemetry,
 };
@@ -25,10 +24,11 @@ use crate::pipeline::video_decoder::{
     DecodedVideoFrame, NativeVideoDecoder, SessionColor, VideoDecoderBackend,
 };
 use crate::protocol::messages::{
-    msg_type, AudioStreamResultMsg, AuthRequest, CursorModeResultMsg, CursorShapeMsg,
-    DisplayUpdateResultMsg, HealthPongMsg, HealthStatsMsg, ServedPipelineMsg, ServerHelloMsg,
-    TabletModeResultMsg, AUDIO_STREAM_RESULT, CURSOR_MODE_RESULT, CURSOR_SHAPE,
-    DISPLAY_UPDATE_RESULT, HEALTH_PONG, HEALTH_STATS, SERVED_PIPELINE, TABLET_MODE_RESULT,
+    msg_type, AuthRequest, CursorModeResultMsg, CursorShapeMsg, DisplayUpdateResultMsg,
+    HealthPongMsg, HealthStatsMsg, HostKeymapMsg, ServedPipelineMsg, ServerHelloMsg,
+    TabletModeResultMsg, TextCommitResultMsg, AUDIO_STREAM_RESULT, CURSOR_MODE_RESULT,
+    CURSOR_SHAPE, DISPLAY_UPDATE_RESULT, HEALTH_PONG, HEALTH_STATS, HOST_KEYMAP, SERVED_PIPELINE,
+    TABLET_MODE_RESULT, TEXT_COMMIT_RESULT,
 };
 use crate::protocol::VideoHeader;
 use crate::transport::tls::CertInfo;
@@ -244,6 +244,9 @@ fn monitor_stream_window(
 
 #[derive(Default)]
 pub struct SharedMediaState {
+    /// The audio worker's own status cell (ADR 0014): audio playout never
+    /// takes this state's lock, the UI copies the snapshot from here.
+    pub audio_playback: crate::ui::audio_worker::AudioPlaybackCell,
     pub certificate_untrusted: Option<CertInfo>,
     pub pending_auth: Option<AuthRequest>,
     pub pending_authentication: Option<SessionAuthentication>,
@@ -288,6 +291,13 @@ pub struct SharedMediaState {
     pub cursor_mode_result: Option<CursorModeResultMsg>,
     pub tablet_mode_result: Option<TabletModeResultMsg>,
     pub pending_cursor_shape: Option<arcen_protocol::messages::CursorShapeKind>,
+    /// Host reports on committed text the UI has not shown yet.
+    pub text_commit_results: Vec<TextCommitResultMsg>,
+    /// The host's newest keyboard-layout notice, not yet applied.
+    pub host_keymap: Option<HostKeymapMsg>,
+    /// The host's cursor image state, when it changed since the UI last
+    /// took it (`arcen_input::cursor::DeckCursorState`).
+    pub pending_host_cursor: Option<arcen_input::cursor::DeckCursor>,
     pub microphone_active: bool,
     pub display_update_result: Option<DisplayUpdateResultMsg>,
     pub broker_hello: bool,
@@ -428,8 +438,26 @@ pub fn spawn_media_worker(
             // Created on this thread on purpose: the VT session and the CPAL
             // stream are not Send; the worker owns them for its lifetime.
             let mut decoder = NativeVideoDecoder::new();
-            let mut audio = PcmAudioPlayer::new();
+            // Host audio plays on its own worker, fed only by the audio
+            // lane; this worker never decodes or plays audio.
+            let audio_queue = media.audio_lane().clone();
+            let _audio_queue_guard = CloseAudioQueueOnDrop(audio_queue.clone());
+            let audio_status = shared
+                .lock()
+                .expect("media state poisoned")
+                .audio_playback
+                .clone();
+            if let Err(error) =
+                crate::ui::audio_worker::spawn_audio_worker(audio_queue, audio_status)
+            {
+                tracing::error!(
+                    target: crate::logging::target::AUDIO,
+                    %error,
+                    "audio worker could not start; host audio is unavailable"
+                );
+            }
             let mut full_frame_requests = FullFrameRequestGate::default();
+            let mut host_cursor = arcen_input::cursor::DeckCursorState::default();
             let mut pending_ingress_idr = false;
             let mut last_heartbeat = Instant::now();
             let mut monitor_rate_snapshots: BTreeMap<
@@ -607,6 +635,20 @@ pub fn spawn_media_worker(
                                     state.pending_cursor_shape = Some(msg.shape);
                                 }
                             }
+                            Some(TEXT_COMMIT_RESULT) => {
+                                if let Ok(result) =
+                                    serde_json::from_value::<TextCommitResultMsg>(value)
+                                {
+                                    if state.text_commit_results.len() < 32 {
+                                        state.text_commit_results.push(result);
+                                    }
+                                }
+                            }
+                            Some(HOST_KEYMAP) => {
+                                if let Ok(keymap) = serde_json::from_value::<HostKeymapMsg>(value) {
+                                    state.host_keymap = Some(keymap);
+                                }
+                            }
                             Some(TABLET_MODE_RESULT) => {
                                 if let Ok(result) =
                                     serde_json::from_value::<TabletModeResultMsg>(value)
@@ -621,15 +663,9 @@ pub fn spawn_media_worker(
                                     state.display_update_result = Some(result);
                                 }
                             }
-                            Some(AUDIO_STREAM_RESULT) => {
-                                drop(state);
-                                if let Ok(result) =
-                                    serde_json::from_value::<AudioStreamResultMsg>(value)
-                                {
-                                    audio.set_stream_result(&result);
-                                }
-                                wake = false;
-                            }
+                            // The session loop hands `audio_stream_result`
+                            // to the audio worker itself, on receipt.
+                            Some(AUDIO_STREAM_RESULT) => wake = false,
                             Some(SERVED_PIPELINE) => {
                                 if let Ok(message) =
                                     serde_json::from_value::<ServedPipelineMsg>(value)
@@ -643,6 +679,22 @@ pub fn spawn_media_worker(
                             repaint.request_repaint();
                         }
                     }
+                    SessionEvent::CursorUpdate(bytes) => match host_cursor.apply(&bytes) {
+                        Ok(true) => {
+                            shared
+                                .lock()
+                                .expect("media state poisoned")
+                                .pending_host_cursor = Some(host_cursor.current());
+                            repaint.request_repaint();
+                        }
+                        Ok(false) => {}
+                        Err(error) => tracing::debug!(
+                            target: crate::logging::target::SESSION,
+                            %error,
+                            "host cursor record dropped"
+                        ),
+                    },
+                    SessionEvent::CursorLaneReset => host_cursor.reset_lane(),
                     SessionEvent::MicrophoneActive(active) => {
                         shared
                             .lock()
@@ -665,7 +717,6 @@ pub fn spawn_media_worker(
                             &shared,
                             &mut decoder,
                             &mut secondary_router,
-                            &mut audio,
                             &commands,
                             &mut full_frame_requests,
                             &mut pending_ingress_idr,
@@ -700,6 +751,42 @@ pub fn spawn_media_worker(
             finish(&shared, &repaint, None);
         })
         .expect("failed to spawn media worker");
+}
+
+/// Copies the audio worker's snapshot into the fields the UI and heartbeat
+/// read. Takes the audio cell's lock briefly; the audio worker never takes
+/// the media state's lock, so the order cannot deadlock.
+pub(crate) fn mirror_audio_playback(state: &mut SharedMediaState) {
+    let audio = crate::ui::audio_worker::audio_playback_snapshot(&state.audio_playback);
+    state.audio_frames_seen = audio.frames_seen;
+    state.audio_batch_high_water = audio.batch_high_water;
+    state.audio_bytes_accepted = audio.bytes_accepted;
+    state.last_audio_queued_ms = audio.queued_ms;
+    state.audio_playback_underruns = audio.playback_underruns;
+    state.audio_buffer_trim_events = audio.buffer_trim_events;
+    state.audio_buffer_trimmed_samples = audio.buffer_trimmed_samples;
+    state.last_audio_feed_gap_ms = audio.feed_gap_ms;
+    state.max_audio_feed_gap_ms = audio.max_feed_gap_ms;
+    state.audio_decode_failures = audio.decode_failures;
+    state.audio_concealed_frames = audio.concealed_frames;
+    state.audio_queue_phase = audio.queue_phase;
+    if !audio.summary.is_empty() {
+        state.last_audio_summary = audio.summary;
+    }
+    state.audio_wire_clock_age_samples = audio.wire_clock_age_samples;
+    state.audio_wire_delay_samples = audio.wire_delay_samples;
+    state.inbox.audio_dropped_packets = audio.queue_overflow_drops;
+    state.inbox.audio_high_water_depth = audio.queue_high_water;
+    state.inbox.malformed_audio_packets = audio.malformed_frames;
+}
+
+/// Ends the audio worker with the media worker, however it returns.
+struct CloseAudioQueueOnDrop(crate::pipeline::audio_lane::AudioLaneReceiver);
+
+impl Drop for CloseAudioQueueOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 fn session_end_worker_error(end: &SessionEnd) -> Option<String> {
@@ -797,7 +884,8 @@ fn maybe_heartbeat(
         return;
     }
     *last = now;
-    let state = shared.lock().expect("media state poisoned");
+    let mut state = shared.lock().expect("media state poisoned");
+    mirror_audio_playback(&mut state);
     tracing::info!(
         target: crate::logging::target::VIDEO,
         frames_seen = state.video_frames_seen,
@@ -973,7 +1061,6 @@ fn handle_media_batch(
     shared: &Arc<Mutex<SharedMediaState>>,
     decoder: &mut NativeVideoDecoder,
     secondary_router: &mut Option<MonitorFrameRouter>,
-    audio: &mut PcmAudioPlayer,
     commands: &SessionCommandSender,
     full_frame_requests: &mut FullFrameRequestGate,
     pending_ingress_idr: &mut bool,
@@ -985,9 +1072,7 @@ fn handle_media_batch(
         let now = Instant::now();
         let mut state = shared.lock().expect("media state poisoned");
         state.video_frames_seen = batch.telemetry.video_received;
-        state.audio_frames_seen = batch.telemetry.audio_received;
         state.video_batch_high_water = state.video_batch_high_water.max(batch.video.len());
-        state.audio_batch_high_water = state.audio_batch_high_water.max(batch.audio.len());
         state.malformed_media_packets = batch.telemetry.malformed_packets;
         state.inbox = batch.telemetry;
         telemetry.record_media(
@@ -1040,80 +1125,6 @@ fn handle_media_batch(
                 batch.telemetry.video_loss_epochs,
                 batch.telemetry.video_dropped_packets,
                 batch.telemetry.video_dropped_bytes,
-            );
-        }
-    }
-
-    for (header, payload) in batch.audio {
-        let clock_age = wire_clock_age_ms(header.timestamp_ms);
-        let status = audio.feed(header, &payload);
-        let mut state = shared.lock().expect("media state poisoned");
-        let delay = state.wire_delay_estimator.observe(clock_age);
-        push_ms_sample(
-            &mut state.audio_wire_clock_age_samples,
-            f64::from(clock_age),
-        );
-        push_ms_sample(&mut state.audio_wire_delay_samples, f64::from(delay));
-        let previous_underruns = state.audio_playback_underruns;
-        let previous_trim_events = state.audio_buffer_trim_events;
-        let previous_trimmed_samples = state.audio_buffer_trimmed_samples;
-        state.audio_bytes_accepted += status.accepted_bytes as u64;
-        state.last_audio_queued_ms = status.queued_ms;
-        state.audio_playback_underruns = status.playback_underruns;
-        state.audio_buffer_trim_events = status.buffer_trim_events;
-        state.audio_buffer_trimmed_samples = status.buffer_trimmed_samples;
-        state.last_audio_feed_gap_ms = status.feed_gap_ms;
-        state.max_audio_feed_gap_ms = status.max_feed_gap_ms;
-        state.audio_decode_failures = status.decode_failures;
-        state.audio_concealed_frames = status.concealed_frames;
-        state.audio_queue_phase = status.queue_phase.to_string();
-        state.last_audio_summary = if let Some(note) = status.note.as_deref() {
-            format!(
-                "Audio {} queued={} ms accepted={} bytes underruns={} trims={} gap={} ms phase={} · {}",
-                status.backend,
-                status.queued_ms,
-                status.accepted_bytes,
-                status.playback_underruns,
-                status.buffer_trim_events,
-                status.feed_gap_ms,
-                status.queue_phase,
-                note
-            )
-        } else {
-            format!(
-                "Audio {} queued={} ms accepted={} bytes underruns={} trims={} gap={} ms phase={}",
-                status.backend,
-                status.queued_ms,
-                status.accepted_bytes,
-                status.playback_underruns,
-                status.buffer_trim_events,
-                status.feed_gap_ms,
-                status.queue_phase,
-            )
-        };
-        drop(state);
-        if status.playback_underruns > previous_underruns {
-            tracing::warn!(
-                target: crate::logging::target::AUDIO,
-                playback_underruns = status.playback_underruns,
-                queued_ms = status.queued_ms,
-                feed_gap_ms = status.feed_gap_ms,
-                feed_gap_max_ms = status.max_feed_gap_ms,
-                decode_failures = status.decode_failures,
-                concealed_frames = status.concealed_frames,
-                "CoreAudio playback queue underrun; rebuffering"
-            );
-        }
-        if status.buffer_trim_events > previous_trim_events {
-            tracing::debug!(
-                target: crate::logging::target::AUDIO,
-                trim_events = status.buffer_trim_events,
-                trimmed_samples = status.buffer_trimmed_samples,
-                trimmed_samples_delta = status
-                    .buffer_trimmed_samples
-                    .saturating_sub(previous_trimmed_samples),
-                queued_ms = status.queued_ms,
-                "CoreAudio playback queue trimmed excess latency"
             );
         }
     }

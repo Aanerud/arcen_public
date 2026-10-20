@@ -13,6 +13,13 @@ BT.709 unless `video.desktop_encoding` declares the desktop Rec.2100 PQ (for
 example Flame's HDR UI), when they stay PQ / BT.2020 on the same XShm path. Deployment must install the matching depth-30 Xorg configuration and
 must not package a second capenc binary or a separate HDR component.
 
+The depth-30 template is what lets a desktop be ten-bit; each desktop's depth
+is decided when it is created (`video.x11_desktop_depth`, default `auto`: 30
+for a ten-bit session, 24 otherwise, so Firefox and Chrome keep the GPU). On a
+host used for grading in Flame or Resolve, set `video.x11_desktop_depth` to
+`30` in `/etc/arcen/pier.json`. See `docs/operations/pier-administration.md`,
+"Linux desktop depth".
+
 The deployment builds Pier with embedded NVENC and software-H.264 capenc
 support. OpenH264 is compiled from the exact crate-supplied source into the
 Pier; no
@@ -154,9 +161,18 @@ policy, and systemd unit, then starts the service:
 HOST=root@host packaging/linux/deploy-pier.sh
 ```
 
+On a host with SELinux enabled the deployment also installs
+`selinux/arcen.cil` to `/usr/share/arcen/selinux/` and loads it with
+`semodule -i`; the release installer does the same and unloads it on
+uninstall. See `docs/security/linux-selinux.md`.
+
 The unit uses `Restart=on-failure` with `StartLimitBurst=10` over ten minutes,
 so a start that fails for a passing reason is retried for about a hundred
-seconds and then given up on.
+seconds and then given up on. A death by `SIGHUP` or `SIGPIPE`, which systemd
+otherwise counts as a clean exit, is restarted too (`RestartForceExitStatus`);
+the Pier handles `SIGHUP` (logrotate's reload) and `SIGTERM` (orderly stop)
+from the start of start-up, including during an automatic Wayland
+re-qualification, which a stop abandons cleanly without recording an attempt.
 
 The unit also declares `After=time-sync.target`, but do not rely on it: that
 target is ordering only, and on a host without `systemd-time-wait-sync.service`

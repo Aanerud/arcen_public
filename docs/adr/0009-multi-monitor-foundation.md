@@ -269,6 +269,37 @@ Reasons:
 - No test, build, lint, or product behavior changes; `cargo test`/`cargo
   clippy` results for `arcen-media` and its consumers are unaffected.
 
+## Amendment (2026-10-18): virtual-output hosts and in-place reattach
+
+Recorded with `wp-multimon` (Linux headless Wayland sessions). Needs
+Shared/Architecture review.
+
+1. **Virtual-output planning is shared.** A host whose monitors are
+   compositor virtual outputs created on demand has no head inventory: every
+   requested monitor gets one output of exactly its requested size and
+   refresh. `arcen_outputs::virtual_topology::plan_virtual_topology` is that
+   placement (`AlreadyCompositorOriented`, `TranslateToNonNegative`, refresh
+   and millimetres kept, rotation only where the host says it rotates). The
+   Linux Wayland Pier uses it; the macOS Pier's own planner may adopt it.
+2. **The offer follows proof.** A virtual-output host advertises
+   `multi_monitor_v1` only up to the concurrent outputs it proved (for Linux
+   Wayland, the qualification record's `facts.multi_output`), and publishes
+   `TopologyBackendKindMsg::VirtualOutputs`.
+3. **Output UI scale is shared.** `arcen_outputs::ui_scale::choose_output_scale`
+   decides a virtual output's desktop UI scale from the client display's
+   advertised millimetres (96 DPI is 100%, the rule the Windows Pier
+   applies to its synthesised EDID) or, without them, its backing ratio,
+   among the scales the compositor supports — the facts a virtual output's
+   compositor lacks.
+4. **Reattach may reconfigure in place.** "The topology is fixed for the
+   attachment" is unchanged. Between attachments, a host whose outputs can
+   change in one verified transaction (`arcen_session::wayland_outputs::
+   reattach_topology_action` → `ReconfigureInPlace`) moves the existing
+   desktop to the new sign-in's topology before its first capture epoch
+   instead of replacing the desktop; a refused transaction keeps the live
+   outputs and the topology is refused whole, never served as a subset.
+   Hosts whose outputs are fixed keep replacing the desktop.
+
 ## Out of scope for this tranche
 
 - Deck or host product behaviour changes.

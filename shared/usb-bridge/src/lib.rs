@@ -16,6 +16,7 @@ mod hid_digitizer;
 mod ledger;
 mod policy;
 mod raw_hid;
+mod session_seat;
 mod state;
 mod synthetic;
 mod tablet_claim;
@@ -47,6 +48,7 @@ pub use policy::{
     is_permanently_prohibited_class,
 };
 pub use raw_hid::{AdmittedRawHidDevice, RawHidAdmission, RawHidRefusal};
+pub use session_seat::{HardUsbSessionDenial, HardUsbSessionSeat, admit_hard_usb_session};
 pub use state::{AttachmentMachine, AttachmentState, StateError};
 pub use synthetic::{
     ARCEN_LAB_PRODUCT_ID, ARCEN_LAB_VENDOR_ID, ControlResponse, PenSample, PenSwitch, PenSwitches,

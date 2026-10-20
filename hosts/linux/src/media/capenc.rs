@@ -20,11 +20,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use arcen_media::video::capture_handoff::{PipeWireCaptureHandoff, ScreenCastCursorMode};
 pub use arcen_media::video::ResolvedMediaPlan;
 use arcen_media::video::{
-    adaptive_codec_ladder, parse_ready_v1, parse_unavailable_v1, resolve_media_plan_degrading,
-    BackendAvailability, BackendCandidate, BackendLimits, EncoderBackend, EncoderRequest,
-    MediaRequest, PlanDegradation, ReadyExpectation, VideoVariant,
+    adaptive_codec_ladder, parse_ready_v1, parse_unavailable_v1, pipeline_for_request,
+    resolve_media_plan_degrading, BackendAvailability, BackendCandidate, BackendLimits,
+    CaptureAdmissionNotice, EncoderBackend, EncoderRequest, MediaRequest, PipelineId,
+    PlanDegradation, PresetAdmission, ReadyExpectation, StreamingPreset, VideoVariant,
+    ADMISSION_PREFIX,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -64,7 +67,45 @@ pub fn parse_encoder_selection(value: &str) -> Result<EncoderSelection, String> 
     }
 }
 
-fn apply_capture_cursor_constraint(mut config: CapencConfig) -> (CapencConfig, bool) {
+/// The capture hand-off a Wayland session put into the child's environment,
+/// when the child captures a Wayland session (Xorg sessions carry none).
+fn wayland_handoff(config: &CapencConfig) -> Option<PipeWireCaptureHandoff> {
+    let environment = &config.execution.as_ref()?.environment;
+    PipeWireCaptureHandoff::from_env(|name| environment.get(name).map(str::to_owned))
+        .ok()
+        .flatten()
+}
+
+/// A Wayland session decides cursor truth when it starts its stream: an
+/// `embedded` cursor is in the pixels (host authority), `metadata` leaves it
+/// to the Deck. capenc refuses a request that disagrees, so the request
+/// follows the stream.
+fn apply_wayland_cursor_truth(mut config: CapencConfig) -> CapencConfig {
+    let Some(handoff) = wayland_handoff(&config) else {
+        return config;
+    };
+    let authority = handoff.cursor_mode().cursor_authority();
+    if config.cursor_mode != authority {
+        tracing::info!(
+            target: target::CAPENC,
+            requested_cursor = ?config.cursor_mode,
+            active_cursor = ?authority,
+            stream_cursor_mode = handoff.cursor_mode().token(),
+            "the Wayland session's stream decides cursor authority"
+        );
+        config.cursor_mode = authority;
+    }
+    config
+}
+
+fn apply_capture_cursor_constraint(config: CapencConfig) -> (CapencConfig, bool) {
+    // A Wayland stream's cursor is whatever the session's stream decided:
+    // an embedded cursor is composed by the compositor at any bit depth, so
+    // the Xorg wide-capture constraint below does not apply.
+    if wayland_handoff(&config).is_some() {
+        return (apply_wayland_cursor_truth(config), false);
+    }
+    let mut config = config;
     let moved_to_local = matches!(config.cursor_mode, CursorMode::Host)
         && !arcen_capenc::linux_capture_supports_host_cursor(config.bit_depth);
     if moved_to_local {
@@ -145,6 +186,33 @@ pub struct CapencConfig {
     pub height: u32,
     /// Cursor authority fixed before the NvFBC session starts.
     pub cursor_mode: CursorMode,
+    /// A sustained source rate this host's qualification measured for the
+    /// stream's size (`capture-rate=`): Speed admission evidence for a
+    /// Wayland session. Never sent to an Xorg capture.
+    pub capture_rate: Option<u32>,
+    /// What `capture_rate` rests on: measured on this output, or inferred
+    /// from a larger qualified one (`capture-rate-evidence=inferred:WxH`,
+    /// sent only then).
+    pub capture_rate_evidence: arcen_media::video::CaptureRateEvidence,
+    /// The host's Wayland Speed evidence per codec token (rate and what it
+    /// rests on), used when `capture_rate` is unset: the codec a session
+    /// finally encodes with is known only after the Deck's request, so the
+    /// argv takes the entry for [`Self::codec`] at spawn time.
+    pub capture_rates_by_codec: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
+    /// The runtime guard found a Speed epoch of this attachment below
+    /// Speed's floor (`speed-runtime=below-floor`): a Speed request is served
+    /// as Auto with `speed_runtime_below_floor`. Wayland only.
+    pub speed_runtime_shortfall: bool,
+    /// This host's qualification verified capenc's `gpu-convert` DMA-BUF
+    /// import against a host-copy reference (`gpu-import=verified`): only
+    /// then does a Wayland capture offer DMA-BUF. Never sent to an Xorg
+    /// capture.
+    pub gpu_import_verified: bool,
+    /// The host's wide-composition proof as capenc tokens
+    /// (`fidelity-route=`, `wide-proven=`, `sdr-white=`), from its
+    /// qualification record: sent only to a ten-bit Wayland capture, whose
+    /// Grading or HDR composition admits nothing those facts do not prove.
+    pub wayland_fidelity_args: Vec<String>,
     /// `DISPLAY` for the child (e.g. `":0"`). None ⇒ inherit.
     pub display: Option<String>,
     /// `XAUTHORITY` for the child. None ⇒ inherit.
@@ -214,6 +282,15 @@ impl CapencConfig {
         self
     }
 
+    /// Whether this capture reports cursor images: a Wayland stream that
+    /// records its cursor as metadata under Deck-drawn authority. Such a
+    /// child writes framed-v2 stdout (`arcen_media::capenc_stream`).
+    pub(crate) fn cursor_events(&self) -> bool {
+        self.cursor_mode == CursorMode::Local
+            && wayland_handoff(self)
+                .is_some_and(|handoff| handoff.cursor_mode() == ScreenCastCursorMode::Metadata)
+    }
+
     /// Build the argv exactly as `capenc_backend.start()` does.
     ///
     /// A `variant=<id>` token is appended whenever this config's full colour
@@ -235,7 +312,11 @@ impl CapencConfig {
         if self.yuv444 {
             v.push("yuv444".to_string());
         }
-        v.push(FRAMED_OUTPUT_V1.to_string());
+        v.push(if self.cursor_events() {
+            arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
+        } else {
+            FRAMED_OUTPUT_V1.to_string()
+        });
         v.push(format!("encoder={}", self.encoder.as_arg()));
         v.push(format!(
             "cursor={}",
@@ -295,6 +376,32 @@ impl CapencConfig {
         if self.qp_map != arcen_media::video::QpMapPolicy::default() {
             v.push(format!("qp-map={}", self.qp_map.token()));
         }
+        // Only a Wayland capture admits Speed on measured rate evidence; the
+        // Xorg paths have no such argument.
+        let rate = self
+            .capture_rate
+            .map(|rate| (rate, self.capture_rate_evidence))
+            .or_else(|| {
+                self.capture_rates_by_codec
+                    .iter()
+                    .find(|(codec, ..)| *codec == self.codec)
+                    .map(|(_, rate, evidence)| (*rate, *evidence))
+            });
+        if let (Some((rate, evidence)), Some(_)) = (rate, wayland_handoff(self)) {
+            v.push(format!("capture-rate={rate}"));
+            if evidence.is_inferred() {
+                v.push(format!("capture-rate-evidence={}", evidence.token()));
+            }
+        }
+        if self.speed_runtime_shortfall && wayland_handoff(self).is_some() {
+            v.push("speed-runtime=below-floor".to_owned());
+        }
+        if self.gpu_import_verified && wayland_handoff(self).is_some() {
+            v.push("gpu-import=verified".to_owned());
+        }
+        if self.bit_depth == BitDepth::Ten && wayland_handoff(self).is_some() {
+            v.extend(self.wayland_fidelity_args.iter().cloned());
+        }
         v
     }
     fn media_request(&self) -> Result<MediaRequest, CapencStartError> {
@@ -324,6 +431,7 @@ fn forward_capenc_line(line: &str) {
     }
 }
 
+#[cfg(test)]
 async fn wait_for_ready<R>(
     reader: &mut crate::bounded_io::BoundedLineReader<R>,
     config: &CapencConfig,
@@ -331,7 +439,136 @@ async fn wait_for_ready<R>(
 where
     R: AsyncBufRead + Unpin,
 {
+    wait_for_admitted_ready(reader, config)
+        .await
+        .map(|(plan, _)| plan)
+}
+
+const fn streaming_preset(pipeline: PipelineId) -> Option<StreamingPreset> {
+    match pipeline {
+        PipelineId::Auto => Some(StreamingPreset::Auto),
+        PipelineId::Speed => Some(StreamingPreset::Speed),
+        PipelineId::Grading => Some(StreamingPreset::Grading),
+        PipelineId::Hdr => Some(StreamingPreset::Hdr),
+        PipelineId::Software => None,
+    }
+}
+
+/// Checks a capture admission against the request this config made and
+/// returns the frame rate `READY` must then state.
+///
+/// A named preset request accepts the shared admission's permitted answers
+/// (a visible Speed-to-Auto downgrade, a rate clamp); an exact request
+/// accepts only exact admission.
+fn admitted_fps(
+    notice: &CaptureAdmissionNotice,
+    config: &CapencConfig,
+) -> Result<u32, CapencStartError> {
+    let protocol = |detail: String| CapencStartError::ReadyProtocol(detail);
+    let codec = config.codec_enum()?;
+    let expected = pipeline_for_request(
+        config.video_selection,
+        config.video_configuration(codec),
+        config.fps,
+        config.motion_priority,
+    )
+    .and_then(streaming_preset);
+    let served = notice
+        .check_request(
+            expected.unwrap_or(notice.requested),
+            config.fps,
+            codec,
+            config.cursor_mode,
+        )
+        .map_err(|error| protocol(format!("capture admission: {error}")))?;
+    if expected.is_none()
+        && (!matches!(notice.admission, PresetAdmission::Admit(_))
+            || served.fps_ceiling != config.fps)
+    {
+        return Err(protocol(
+            "capture admission changed an exact request".to_string(),
+        ));
+    }
+    Ok(served.fps_ceiling)
+}
+
+fn log_admission(notice: &CaptureAdmissionNotice, config: &CapencConfig) {
+    let Some(served) = notice.served() else {
+        tracing::warn!(
+            target: target::CAPENC,
+            sid = %config.session_log_id,
+            requested = notice.requested.pipeline().token(),
+            decision = notice.admission.decision_token(),
+            capture = notice.capture.ready_token(),
+            copy_path = notice.copy_path.token(),
+            "capture source cannot serve the requested preset"
+        );
+        return;
+    };
+    let degradation = notice.degradation().unwrap_or_default();
+    let reason = match notice.admission {
+        PresetAdmission::Downgrade { reason, .. } => Some(reason.to_string()),
+        _ => served.fps_limited_by.map(|reason| reason.to_string()),
+    };
+    if degradation.is_exact() {
+        tracing::info!(
+            target: target::CAPENC,
+            sid = %config.session_log_id,
+            requested = notice.requested.pipeline().token(),
+            served = served.pipeline.token(),
+            fps = served.fps_ceiling,
+            capture = notice.capture.ready_token(),
+            copy_path = notice.copy_path.token(),
+            colour_assumed = served.colour_assumed,
+            cursor = notice.cursor.token(),
+            node = notice.frame.node_id,
+            format = notice.frame.format.token(),
+            memory = notice.frame.memory.token(),
+            "capture admitted the requested preset"
+        );
+    } else {
+        tracing::warn!(
+            target: target::CAPENC,
+            sid = %config.session_log_id,
+            requested = notice.requested.pipeline().token(),
+            served = served.pipeline.token(),
+            decision = notice.admission.decision_token(),
+            reason = reason.as_deref().unwrap_or("-"),
+            fps = served.fps_ceiling,
+            fps_clamped = degradation.fps_clamped,
+            measured_fps = ?notice.measured_fps,
+            capture = notice.capture.ready_token(),
+            copy_path = notice.copy_path.token(),
+            colour_assumed = served.colour_assumed,
+            cursor = notice.cursor.token(),
+            node = notice.frame.node_id,
+            "capture serves a degraded plan for the requested preset"
+        );
+    }
+}
+
+/// What the child stated about admission so far.
+enum AdmissionSeen {
+    /// No `ADMISSION` line: `READY` must match the request exactly.
+    None,
+    /// A served admission and the rate `READY` must state.
+    Served(Box<CaptureAdmissionNotice>, u32),
+    /// The source cannot serve the request: only `UNAVAILABLE` (or the
+    /// child's exit) may follow.
+    Unavailable,
+}
+
+/// Waits for READY, accepting one `ADMISSION` line before it from a
+/// capture source that decides admission itself (the Wayland provider).
+async fn wait_for_admitted_ready<R>(
+    reader: &mut crate::bounded_io::BoundedLineReader<R>,
+    config: &CapencConfig,
+) -> Result<(ResolvedMediaPlan, Option<CaptureAdmissionNotice>), CapencStartError>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut last_error = None;
+    let mut admission = AdmissionSeen::None;
     loop {
         match reader.next_bounded_line().await {
             Ok(Some(bounded)) => {
@@ -343,8 +580,41 @@ where
                     );
                 }
                 let line = bounded.text;
+                if line.starts_with(ADMISSION_PREFIX) {
+                    let (notice, sid) = CaptureAdmissionNotice::parse(&line).map_err(|error| {
+                        CapencStartError::ReadyProtocol(format!("ADMISSION: {error}"))
+                    })?;
+                    if sid.as_deref() != Some(config.session_log_id.as_str()) {
+                        return Err(CapencStartError::ReadyProtocol(
+                            "ADMISSION names another session".to_string(),
+                        ));
+                    }
+                    if !matches!(admission, AdmissionSeen::None) {
+                        return Err(CapencStartError::ReadyProtocol(
+                            "duplicate ADMISSION".to_string(),
+                        ));
+                    }
+                    log_admission(&notice, config);
+                    admission = if notice.served().is_some() {
+                        let fps = admitted_fps(&notice, config)?;
+                        AdmissionSeen::Served(Box::new(notice), fps)
+                    } else {
+                        // Only UNAVAILABLE or the end of the child may follow.
+                        AdmissionSeen::Unavailable
+                    };
+                    continue;
+                }
                 if line.starts_with("[capenc] READY ") {
-                    let request = config.media_request()?;
+                    let mut request = config.media_request()?;
+                    match &admission {
+                        AdmissionSeen::None => {}
+                        AdmissionSeen::Served(_, fps) => request.fps = *fps,
+                        AdmissionSeen::Unavailable => {
+                            return Err(CapencStartError::ReadyProtocol(
+                                "READY after an unavailable ADMISSION".to_string(),
+                            ));
+                        }
+                    }
                     let allowed_backends: &'static [EncoderBackend] = match config.encoder {
                         EncoderRequest::NativeNvenc => &[EncoderBackend::NativeNvenc],
                         EncoderRequest::SoftwareH264 => &[EncoderBackend::OpenH264],
@@ -390,7 +660,11 @@ where
                         ),
                     }
                     forward_capenc_line(&line);
-                    return Ok(plan);
+                    let notice = match admission {
+                        AdmissionSeen::Served(notice, _) => Some(*notice),
+                        AdmissionSeen::None | AdmissionSeen::Unavailable => None,
+                    };
+                    return Ok((plan, notice));
                 }
                 if is_capenc_unavailable(&line) {
                     forward_capenc_line(&line);
@@ -541,11 +815,20 @@ impl BitrateRequester {
     }
 }
 
+/// What capenc stated about its capture: the admission before `READY` and
+/// the latest pipeline statistics.
+struct ObservedCapture {
+    admission: Option<CaptureAdmissionNotice>,
+    stats: tokio::sync::watch::Receiver<Option<PipelineStatsSample>>,
+}
+
 /// A running `capenc` session: take the access-unit stream with
 /// [`take_frames`](Self::take_frames), request keyframes via [`idr`](Self::idr),
 /// and call [`shutdown`](Self::shutdown) (or drop) to stop the child.
 pub struct CapencSession {
     frames: Option<mpsc::Receiver<AccessUnit>>,
+    /// Boxed together so the session stays small inside `CapencHandle`.
+    observed: Box<ObservedCapture>,
     idr: IdrRequester,
     child: Child,
     idr_tx: mpsc::UnboundedSender<()>,
@@ -560,6 +843,20 @@ impl CapencSession {
 
     pub fn bitrate(&self) -> BitrateRequester {
         BitrateRequester::new(&self.idr)
+    }
+
+    /// The capture admission the child stated before READY, when its
+    /// source decides admission itself (the Wayland provider): requested
+    /// and served preset, copy path, colour and cursor truth, and the
+    /// first real frame that proves the session's capture step.
+    pub fn capture_admission(&self) -> Option<&CaptureAdmissionNotice> {
+        self.observed.admission.as_ref()
+    }
+
+    /// Follows capenc's once-a-second pipeline statistics: the latest
+    /// sample, `None` until the first.
+    pub fn pipeline_stats(&self) -> tokio::sync::watch::Receiver<Option<PipelineStatsSample>> {
+        self.observed.stats.clone()
     }
 
     /// Take the access-unit stream. Returns `None` if already taken.
@@ -719,7 +1016,8 @@ fn describe_request(config: &CapencConfig) -> String {
     )
 }
 
-/// Announce a software fallback, and say exactly what it cost.
+/// Announce a fallback (another hardware codec, or software encode), and say
+/// exactly what it cost.
 ///
 /// A degraded session must never be silent. An operator seeing a worse picture
 /// needs the requested plan, the served plan, and why the hardware path was not
@@ -731,6 +1029,19 @@ fn report_fallback(
     reason: Option<&str>,
 ) {
     let served = describe_request(resolved);
+    if resolved.encoder == EncoderRequest::NativeNvenc {
+        tracing::warn!(
+            target: target::CAPENC,
+            backend = EncoderBackend::NativeNvenc.ready_token(),
+            requested = %requested,
+            served = %served,
+            unavailable_reason = reason.unwrap_or("explicitly requested"),
+            codec_changed = degradation.codec_changed,
+            chroma_changed = degradation.chroma_changed,
+            "requested codec unavailable on the hardware encoder; trying another hardware codec"
+        );
+        return;
+    }
     if degradation.is_exact() {
         tracing::info!(
             target: target::CAPENC,
@@ -819,6 +1130,16 @@ fn native_probe_attempt(config: &CapencConfig) -> CapencConfig {
     let (mut attempt, _) = apply_capture_cursor_constraint(config.clone());
     attempt.encoder = EncoderRequest::NativeNvenc;
     attempt
+}
+
+/// Whether a native encoder opens for `config` without capturing: `None`
+/// when capenc's `probe-v1` reports it available, otherwise its
+/// `UNAVAILABLE` line. The Wayland qualification records the answer so a
+/// host without one sizes and serves its sessions in software.
+pub(crate) async fn probe_native_encoder(
+    config: &CapencConfig,
+) -> Result<Option<String>, CapencStartError> {
+    probe_native(config).await
 }
 
 async fn probe_native(config: &CapencConfig) -> Result<Option<String>, CapencStartError> {
@@ -959,9 +1280,25 @@ pub fn fit_to_encoder_limits(encoder: EncoderRequest, width: u32, height: u32) -
 /// hardware vendors, degrades by the same rules rather than by a predicate
 /// maintained per host. The returned [`PlanDegradation`] is reported by the
 /// caller; a session that looks worse than configured must be able to say why.
+/// Why a Wayland session's software fallback is refused: its output was
+/// created at its size before any encoder existed and cannot be fitted now.
+pub(crate) const WAYLAND_SOFTWARE_GEOMETRY_REFUSAL: &str =
+    "the Wayland session's output is larger than the software encoder's 1920x1200 and \
+     no hardware encoder is available";
+
+/// What the session's own stream says about the cursor, for a Wayland
+/// capture: an embedded cursor is in the pixels whatever the encoder, so
+/// OpenH264 carries `cursor=host` there (`BackendLimits::with_source_cursor`).
+fn wayland_source_cursor(config: &CapencConfig) -> Option<arcen_media::video::CursorEvidence> {
+    wayland_handoff(config).map(|handoff| handoff.cursor_mode().cursor_evidence())
+}
+
 fn software_fallback_config(
-    mut config: CapencConfig,
+    config: CapencConfig,
 ) -> Result<(CapencConfig, PlanDegradation), CapencStartError> {
+    // A Wayland stream decides cursor truth before anything is resolved.
+    let mut config = apply_wayland_cursor_truth(config);
+    let source_cursor = wayland_source_cursor(&config);
     let requested_codec = config.codec_enum()?;
     let requested_pipeline = arcen_media::video::pipeline_for_request(
         config.video_selection,
@@ -994,9 +1331,28 @@ fn software_fallback_config(
         request.height = OPENH264_LIMITS.max_height;
     }
 
+    let limits = source_cursor.map_or(OPENH264_LIMITS, |cursor| {
+        OPENH264_LIMITS.with_source_cursor(cursor)
+    });
+    if source_cursor.is_some()
+        && (config.width > limits.max_width || config.height > limits.max_height)
+    {
+        tracing::warn!(
+            target: target::CAPENC,
+            width = config.width,
+            height = config.height,
+            max_width = limits.max_width,
+            max_height = limits.max_height,
+            "software encode cannot serve this Wayland session: its output was created at a \
+             size OpenH264 cannot encode, and a Wayland output is not resized for a fallback"
+        );
+        return Err(CapencStartError::PipelineRefused(
+            WAYLAND_SOFTWARE_GEOMETRY_REFUSAL,
+        ));
+    }
     let candidates = [BackendCandidate {
         backend: EncoderBackend::OpenH264,
-        availability: BackendAvailability::Available(OPENH264_LIMITS),
+        availability: BackendAvailability::Available(limits),
     }];
     let (plan, mut degradation) =
         resolve_media_plan_degrading(request, &candidates).map_err(|error| {
@@ -1006,6 +1362,17 @@ fn software_fallback_config(
         })?;
 
     config.encoder = EncoderRequest::SoftwareH264;
+    // OpenH264 has no per-block QP-map API, and capenc's software paths
+    // refuse a map rather than ignore it; an operator's map for the
+    // requested pipeline therefore does not follow the stream into software.
+    if config.qp_map.submits_map() {
+        tracing::info!(
+            target: target::CAPENC,
+            requested_qp_map = config.qp_map.token(),
+            "software encode has no QP map; serving with qp-map=off"
+        );
+        config.qp_map = arcen_media::video::QpMapPolicy::Off;
+    }
     config.codec = plan.codec_token().to_string();
     config.yuv444 = matches!(plan.video.chroma, ChromaSubsampling::Yuv444);
     config.bit_depth = plan.video.bit_depth;
@@ -1094,13 +1461,13 @@ async fn spawn_one(
         CapencStartError::InvalidConfig("spawned capenc has no stdin pipe".to_string())
     })?;
     let mut stderr_lines = crate::bounded_io::BoundedLineReader::new(BufReader::new(stderr));
-    let plan = match tokio::time::timeout(
+    let (plan, admission) = match tokio::time::timeout(
         CAPENC_READY_TIMEOUT,
-        wait_for_ready(&mut stderr_lines, &config),
+        wait_for_admitted_ready(&mut stderr_lines, &config),
     )
     .await
     {
-        Ok(Ok(plan)) => plan,
+        Ok(Ok(ready)) => ready,
         Ok(Err(error)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -1136,9 +1503,27 @@ async fn spawn_one(
             ));
         }
     };
-    tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
+    let cursor = config.cursor_events().then(|| {
+        wayland_handoff(&config).map(|handoff| CursorTarget {
+            hub: crate::media::wayland_cursor::hub(handoff.runtime_dir()),
+            connector: handoff.output().as_str().to_owned(),
+            generation: handoff.generation().get(),
+        })
+    });
+    match cursor.flatten() {
+        Some(cursor) => {
+            tokio::spawn(
+                read_framed_v2(stdout, nal_codec, frames_tx, cursor)
+                    .instrument(helper_span.clone()),
+            );
+        }
+        None => {
+            tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
+        }
+    }
     tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
-    tokio::spawn(read_stderr(stderr_lines).instrument(helper_span));
+    let (stats_tx, stats) = tokio::sync::watch::channel(None);
+    tokio::spawn(read_stderr(stderr_lines, stats_tx).instrument(helper_span));
 
     tracing::info!(
         target: target::CAPENC,
@@ -1159,6 +1544,7 @@ async fn spawn_one(
     Ok((
         CapencSession {
             frames: Some(frames_rx),
+            observed: Box::new(ObservedCapture { admission, stats }),
             idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone()),
             child,
             idr_tx,
@@ -1178,12 +1564,15 @@ fn configure_child_environment(
         })?;
     }
     // Apply authenticated-session endpoints after `configure`, which
-    // intentionally replaces the inherited environment.
-    if let Some(display) = &config.display {
-        command.env("DISPLAY", display);
-    }
-    if let Some(xauthority) = &config.xauthority {
-        command.env("XAUTHORITY", xauthority);
+    // intentionally replaces the inherited environment. A Wayland session's
+    // child captures the hand-off's PipeWire stream and gets no X display.
+    if wayland_handoff(config).is_none() {
+        if let Some(display) = &config.display {
+            command.env("DISPLAY", display);
+        }
+        if let Some(xauthority) = &config.xauthority {
+            command.env("XAUTHORITY", xauthority);
+        }
     }
     command.env("ARCEN_SESSION_LOG_ID", config.session_log_id.as_str());
     // Defence in depth for anything that still opens CUDA by ordinal: count
@@ -1196,6 +1585,69 @@ fn configure_child_environment(
         command.env("ARCEN_CAPENC_DEBUG", "1");
     }
     Ok(())
+}
+
+/// capenc's Wayland capture harness (`wayland-capture-probe ARGS…`) in the
+/// same identity and environment a capture of `config` runs with: the
+/// session user and its capture hand-off. Qualification uses it to verify
+/// the GPU import against a host copy before the route is recorded.
+///
+/// # Errors
+///
+/// [`CapencStartError::InvalidConfig`] without a Wayland hand-off, or when
+/// the child identity cannot be applied.
+pub(crate) fn wayland_capture_probe_command(
+    config: &CapencConfig,
+    args: &[&str],
+) -> Result<Command, CapencStartError> {
+    if wayland_handoff(config).is_none() {
+        return Err(CapencStartError::InvalidConfig(
+            "the capture harness needs a Wayland capture hand-off".to_owned(),
+        ));
+    }
+    let mut command = crate::command_for_helper(&config.binary, "capenc");
+    command.arg("wayland-capture-probe").args(args);
+    configure_child_environment(&mut command, config)?;
+    Ok(command)
+}
+
+/// capenc's qualification picture (`wayland-ramp-client pq|sdr`) in the
+/// session of `config`'s Wayland hand-off, as the session user: a
+/// full-screen ten-bit ramp over a white patch, PQ-tagged or untagged.
+pub(crate) fn wayland_ramp_client_command(
+    config: &CapencConfig,
+    pq: bool,
+    seconds: u32,
+) -> Result<Command, CapencStartError> {
+    if wayland_handoff(config).is_none() {
+        return Err(CapencStartError::InvalidConfig(
+            "the ramp client needs a Wayland capture hand-off".to_owned(),
+        ));
+    }
+    let mut command = crate::command_for_helper(&config.binary, "capenc");
+    command
+        .arg("wayland-ramp-client")
+        .arg(if pq { "pq" } else { "sdr" })
+        .arg(format!("seconds={seconds}"));
+    configure_child_environment(&mut command, config)?;
+    Ok(command)
+}
+
+/// capenc measuring one frame of `config`'s ten-bit Wayland capture
+/// (`fidelity-probe`): the drawn ramp's codes and the white patch, on one
+/// `FIDELITY` line, without encoding.
+pub(crate) fn wayland_fidelity_probe_command(
+    config: &CapencConfig,
+) -> Result<Command, CapencStartError> {
+    if wayland_handoff(config).is_none() || config.bit_depth != BitDepth::Ten {
+        return Err(CapencStartError::InvalidConfig(
+            "the fidelity probe needs a ten-bit Wayland capture".to_owned(),
+        ));
+    }
+    let mut command = crate::command_for_helper(&config.binary, "capenc");
+    command.args(config.argv()).arg("fidelity-probe");
+    configure_child_environment(&mut command, config)?;
+    Ok(command)
 }
 
 pub(crate) fn admission_probe_command(
@@ -1283,6 +1735,97 @@ where
     Ok(Some(AccessUnit { data, is_keyframe }))
 }
 
+/// Where a capture's cursor events go: its desktop's hub, as the events of
+/// one output stream.
+struct CursorTarget {
+    hub: std::sync::Arc<crate::media::wayland_cursor::WaylandCursorHub>,
+    connector: String,
+    generation: u64,
+}
+
+/// framed-v2 stdout → access units and cursor events. The child runs as
+/// the desktop's user, so every record is bounded before it is read; a
+/// malformed record ends the stream like a malformed framed-v1 one.
+async fn read_framed_v2(
+    mut stdout: tokio::process::ChildStdout,
+    codec: NalCodec,
+    frames_tx: mpsc::Sender<AccessUnit>,
+    cursor: CursorTarget,
+) {
+    loop {
+        match read_framed_v2_record(&mut stdout, codec).await {
+            Ok(None) => {
+                tracing::info!(target: target::CAPENC, "capenc stdout closed (EOF)");
+                break;
+            }
+            Ok(Some(FramedV2Record::AccessUnit(au))) => {
+                if frames_tx.send(au).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Some(FramedV2Record::Cursor(event))) => {
+                cursor
+                    .hub
+                    .apply(&cursor.connector, cursor.generation, &event);
+            }
+            Err(e) => {
+                tracing::warn!(target: target::CAPENC, error = %e, "invalid framed-v2 capenc stdout");
+                break;
+            }
+        }
+    }
+}
+
+enum FramedV2Record {
+    AccessUnit(AccessUnit),
+    Cursor(arcen_media::capenc_stream::CapencCursorEvent),
+}
+
+async fn read_framed_v2_record<R>(
+    reader: &mut R,
+    codec: NalCodec,
+) -> std::io::Result<Option<FramedV2Record>>
+where
+    R: AsyncRead + Unpin,
+{
+    use arcen_media::capenc_stream::{
+        decode_cursor_event, record_body_length, record_kind, CapencRecordKind, RECORD_LENGTH_BYTES,
+    };
+    let invalid = |error: arcen_media::capenc_stream::CapencRecordError| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+    };
+    let mut length = [0u8; RECORD_LENGTH_BYTES];
+    let first = reader.read(&mut length[..1]).await?;
+    if first == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut length[1..]).await?;
+    let body_length = record_body_length(length).map_err(invalid)?;
+    let mut kind = [0u8; 1];
+    reader.read_exact(&mut kind).await?;
+    let kind = record_kind(kind[0], body_length).map_err(invalid)?;
+    let mut body = vec![0u8; body_length];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(match kind {
+        CapencRecordKind::AccessUnit => {
+            if body.len() > MAX_ACCESS_UNIT_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "framed-v2 access unit too long",
+                ));
+            }
+            let is_keyframe = access_unit_is_keyframe(&body, codec);
+            FramedV2Record::AccessUnit(AccessUnit {
+                data: body,
+                is_keyframe,
+            })
+        }
+        CapencRecordKind::Cursor => {
+            FramedV2Record::Cursor(decode_cursor_event(&body).map_err(invalid)?)
+        }
+    }))
+}
+
 /// stdin ← keyframe requests. `Stop` writes the graceful stop command and then
 /// drops stdin so older capenc children also exit on EOF.
 async fn write_stdin(
@@ -1349,12 +1892,59 @@ async fn write_stdin(
     tracing::debug!(target: target::CAPENC, "capenc stdin closed");
 }
 
+/// One of capenc's once-a-second pipeline statistics lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineStatsSample {
+    /// Counts lines seen, so equal consecutive samples stay distinguishable.
+    pub sequence: u64,
+    /// Access units emitted in that second (`enc_fps`).
+    pub encoded: u32,
+    /// Frames the capture source delivered in that second (`source_fps`),
+    /// when the capture path reports it (the Wayland compositions do).
+    pub source: Option<u32>,
+    /// Why that second's frame rate was what it was (`fps_limiter`), when the
+    /// capture loop classifies it (the damage-gated Xorg wide and Wayland
+    /// loops do).
+    pub limiter: Option<arcen_media::video::FrameRateLimiter>,
+    /// The loop's pacing target in that second (`target_fps`).
+    pub target_fps: Option<u32>,
+}
+
+impl PipelineStatsSample {
+    /// Parses a `[capenc] enc_fps=…` line.
+    #[must_use]
+    pub fn parse(line: &str, sequence: u64) -> Option<Self> {
+        let field = |name: &str| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|value| value.parse::<u32>().ok())
+        };
+        is_pipeline_stats(line).then_some(())?;
+        let limiter = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("fps_limiter="))
+            .and_then(arcen_media::video::FrameRateLimiter::from_token);
+        Some(Self {
+            sequence,
+            encoded: field("enc_fps")?,
+            source: field("source_fps"),
+            limiter,
+            target_fps: field("target_fps"),
+        })
+    }
+}
+
 /// stderr → logs. `capenc` prints `[capenc] …` diagnostics + ~1 Hz stats; the
-/// stats lines carry `avg_encode_ms=…` (harvested later for health telemetry).
-async fn read_stderr<R>(mut reader: crate::bounded_io::BoundedLineReader<R>)
-where
+/// stats lines carry `avg_encode_ms=…` (harvested later for health telemetry)
+/// and are also published as [`PipelineStatsSample`]s.
+async fn read_stderr<R>(
+    mut reader: crate::bounded_io::BoundedLineReader<R>,
+    stats: tokio::sync::watch::Sender<Option<PipelineStatsSample>>,
+) where
     R: AsyncBufRead + Unpin,
 {
+    let mut sequence = 0_u64;
+    let mut limiter = None;
     loop {
         match reader.next_bounded_line().await {
             Ok(Some(bounded)) => {
@@ -1364,6 +1954,21 @@ where
                         "capenc stderr line exceeded the bounded read limit; excess bytes \
                          discarded"
                     );
+                }
+                if let Some(sample) = PipelineStatsSample::parse(&bounded.text, sequence + 1) {
+                    sequence += 1;
+                    if sample.limiter.is_some() && sample.limiter != limiter {
+                        tracing::info!(
+                            target: target::CAPENC,
+                            previous = limiter.map(arcen_media::video::FrameRateLimiter::token),
+                            fps_limiter = sample.limiter.map(arcen_media::video::FrameRateLimiter::token),
+                            enc_fps = sample.encoded,
+                            target_fps = sample.target_fps,
+                            "capenc frame-rate limiter changed"
+                        );
+                        limiter = sample.limiter;
+                    }
+                    stats.send_replace(Some(sample));
                 }
                 forward_capenc_line(&bounded.text);
             }
@@ -1473,6 +2078,12 @@ mod tests {
             width: 3840,
             height: 2160,
             cursor_mode: CursorMode::Host,
+            capture_rate: None,
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: false,
+            wayland_fidelity_args: Vec::new(),
             display: None,
             xauthority: None,
             execution: None,
@@ -1518,6 +2129,12 @@ mod tests {
             width: 1920,
             height: 1080,
             cursor_mode: CursorMode::Local,
+            capture_rate: None,
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: false,
+            wayland_fidelity_args: Vec::new(),
             display: None,
             xauthority: None,
             execution: None,
@@ -1814,6 +2431,141 @@ mod tests {
         assert_eq!(resolved.fps, 30);
     }
 
+    /// capenc writes framed-v2 in every Wayland epoch (NVENC eight-bit, wide
+    /// Grading/HDR and OpenH264) exactly when its argv asks for it, so the
+    /// reader the Pier picks must follow the same argv for every encoder,
+    /// contract and runtime software fallback.
+    #[test]
+    fn every_wayland_epoch_reads_the_framing_its_argv_asks_for() {
+        use arcen_media::capenc_stream::FRAMED_OUTPUT_V2;
+        for encoder in [
+            EncoderRequest::Auto,
+            EncoderRequest::NativeNvenc,
+            EncoderRequest::SoftwareH264,
+        ] {
+            for (bit_depth, transfer) in [
+                (BitDepth::Eight, TransferCharacteristics::Bt709),
+                (BitDepth::Ten, TransferCharacteristics::Bt709),
+                (BitDepth::Ten, TransferCharacteristics::Pq),
+            ] {
+                for cursor in [
+                    ScreenCastCursorMode::Metadata,
+                    ScreenCastCursorMode::Embedded,
+                ] {
+                    let mut config = wayland_config(30, false, cursor);
+                    config.encoder = encoder;
+                    config.bit_depth = bit_depth;
+                    config.transfer = transfer;
+                    let mut spawned = vec![apply_wayland_cursor_truth(config.clone())];
+                    if let Ok((software, _)) = software_fallback_config(config) {
+                        spawned.push(software);
+                    }
+                    for config in spawned {
+                        let argv = config.argv();
+                        let v2 = argv.iter().any(|arg| arg == FRAMED_OUTPUT_V2);
+                        let v1 = argv.iter().any(|arg| arg == FRAMED_OUTPUT_V1);
+                        let case = format!("{encoder:?} {bit_depth:?} {transfer:?} {cursor:?}");
+                        assert!(v1 != v2, "{case}: one framing, {argv:?}");
+                        assert_eq!(config.cursor_events(), v2, "{case}");
+                        assert_eq!(v2, cursor == ScreenCastCursorMode::Metadata, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_framed_v2_reader_takes_what_capenc_writes_and_refuses_framed_v1() {
+        use arcen_media::capenc_stream::{
+            encode_cursor_event, encode_record, CapencCursorEvent, CapencCursorSprite,
+            CapencRecordKind,
+        };
+        let access_unit = [0u8, 0, 0, 1, 0x65, 0x88, 0x84];
+        let mut stdout = encode_record(CapencRecordKind::AccessUnit, &access_unit).unwrap();
+        let event = CapencCursorEvent {
+            on_output: false,
+            sprite: CapencCursorSprite::Unchanged,
+        };
+        stdout
+            .extend(encode_record(CapencRecordKind::Cursor, &encode_cursor_event(&event)).unwrap());
+        let mut reader = stdout.as_slice();
+        assert!(matches!(
+            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            Some(FramedV2Record::AccessUnit(AccessUnit { ref data, is_keyframe: true })) if data == &access_unit
+        ));
+        assert!(matches!(
+            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            Some(FramedV2Record::Cursor(ref read)) if *read == event
+        ));
+        assert!(read_framed_v2_record(&mut reader, NalCodec::H264)
+            .await
+            .unwrap()
+            .is_none());
+        // framed-v1 (`u32 length || access unit`) is not framed-v2: its
+        // first access-unit byte is read as an unknown kind.
+        let mut framed_v1 = 7u32.to_be_bytes().to_vec();
+        framed_v1.extend_from_slice(&access_unit);
+        let mut reader = framed_v1.as_slice();
+        assert!(read_framed_v2_record(&mut reader, NalCodec::H264)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn wayland_software_fallback_keeps_the_streams_cursor_and_size() {
+        // The compositor drew the cursor: OpenH264 carries it, and nothing
+        // is reported as moved to the Deck.
+        let mut embedded = wayland_config(30, false, ScreenCastCursorMode::Embedded);
+        embedded.cursor_mode = CursorMode::Host;
+        let (resolved, degradation) =
+            software_fallback_config(embedded).expect("software serves the stream");
+        assert_eq!(resolved.encoder, EncoderRequest::SoftwareH264);
+        assert_eq!(resolved.cursor_mode, CursorMode::Host);
+        assert!(!degradation.cursor_moved_to_local);
+        assert_eq!((resolved.width, resolved.height), (1920, 1080));
+        // An operator's QP map does not follow the stream into OpenH264.
+        let mut mapped = wayland_config(30, false, ScreenCastCursorMode::Embedded);
+        mapped.qp_map = arcen_media::video::QpMapPolicy::On;
+        let (resolved, _) = software_fallback_config(mapped).expect("qp map");
+        assert_eq!(resolved.qp_map, arcen_media::video::QpMapPolicy::Off);
+        assert!(!resolved
+            .argv()
+            .iter()
+            .any(|arg| arg.starts_with("qp-map=on")));
+        // A metadata stream keeps the Deck's cursor.
+        let (resolved, _) =
+            software_fallback_config(wayland_config(30, false, ScreenCastCursorMode::Metadata))
+                .expect("metadata");
+        assert_eq!(resolved.cursor_mode, CursorMode::Local);
+        // Speed is visibly degraded to 30 fps, never refused.
+        let (resolved, degradation) =
+            software_fallback_config(wayland_config(60, true, ScreenCastCursorMode::Embedded))
+                .expect("speed");
+        assert_eq!(resolved.fps, 30);
+        assert!(degradation.fps_clamped);
+        // An output larger than OpenH264's cannot be fitted after the fact.
+        let mut large = wayland_config(30, false, ScreenCastCursorMode::Embedded);
+        large.width = 2560;
+        large.height = 1600;
+        assert!(matches!(
+            software_fallback_config(large),
+            Err(CapencStartError::PipelineRefused(reason))
+                if reason == WAYLAND_SOFTWARE_GEOMETRY_REFUSAL
+        ));
+        // Xorg keeps its rule: the session display was fitted before the
+        // modeset, and MIT-SHM has no cursor in its pixels.
+        let mut xorg = native_config();
+        xorg.codec = "h264".to_string();
+        xorg.yuv444 = false;
+        xorg.fps = 30;
+        xorg.width = 1280;
+        xorg.height = 800;
+        xorg.cursor_mode = CursorMode::Host;
+        let (resolved, degradation) = software_fallback_config(xorg).expect("xorg");
+        assert_eq!(resolved.cursor_mode, CursorMode::Local);
+        assert!(degradation.cursor_moved_to_local);
+    }
+
     #[test]
     fn ready_parser_builds_typed_native_plan() {
         let cfg = native_config();
@@ -1884,6 +2636,415 @@ mod tests {
             expectation
         )
         .is_err());
+    }
+
+    /// What the Pier asks of a Wayland session: an Auto/Speed SDR8 request
+    /// with the session's capture hand-off in the child's environment.
+    fn wayland_config(fps: u32, motion: bool, cursor: ScreenCastCursorMode) -> CapencConfig {
+        let identity = crate::session::identity::UserIdentity {
+            username: "artist".into(),
+            uid: 1001,
+            gid: 100,
+            supplementary_groups: vec![100],
+            home: "/home/artist".into(),
+            shell: "/bin/bash".into(),
+        };
+        let runtime_dir = crate::session::wayland::private_runtime_dir(1001, "c9");
+        let ready = crate::session::wayland::WaylandAgentReady {
+            compositor: "gnome-shell".into(),
+            input_socket: runtime_dir.join(crate::session::wayland::INPUT_SOCKET_NAME),
+            runtime_dir: runtime_dir.clone(),
+            wayland_display: "wayland-0".into(),
+            outputs: vec![],
+            streams: vec![],
+            input_device_types: 7,
+            generation: 1,
+            compositor_render_node: None,
+            compositor_gpu_pci: None,
+            compositor_gpu_vendor: None,
+            output_mode: arcen_session::wayland_outputs::VirtualOutputMode::StartupMonitors,
+            output_socket: None,
+            x11: None,
+            cursor_mode: Default::default(),
+            clipboard: None,
+        };
+        let handoff = PipeWireCaptureHandoff::new(
+            36,
+            "Meta-0",
+            1,
+            (1920, 1080),
+            (0, 0),
+            cursor,
+            &runtime_dir,
+        )
+        .unwrap();
+        let environment = crate::session::identity::SessionEnvironment::build_wayland(
+            &identity,
+            "gnome",
+            None,
+            [("XDG_SESSION_ID".into(), "c9".into())],
+        )
+        .with_wayland_session(&ready, &handoff);
+        CapencConfig {
+            codec: "h264".to_string(),
+            fps,
+            yuv444: false,
+            video_selection: VideoSelectionIntent::AdaptivePerformance,
+            motion_priority: if motion {
+                arcen_media::video::MotionPriority::Motion
+            } else {
+                arcen_media::video::MotionPriority::Detail
+            },
+            width: 1920,
+            height: 1080,
+            cursor_mode: CursorMode::Local,
+            capture_rate: None,
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: false,
+            wayland_fidelity_args: Vec::new(),
+            display: Some(":0".into()),
+            xauthority: Some("/home/artist/.Xauthority".into()),
+            execution: Some(UserExecution::new(identity, environment)),
+            ..native_config()
+        }
+    }
+
+    fn sid() -> String {
+        native_config().session_log_id.to_string()
+    }
+
+    fn wayland_ready(fps: u32) -> String {
+        format!(
+            "[capenc] READY version=2 backend=native-nvenc codec=h264 chroma=yuv420 bit_depth=8 \
+             range=limited matrix=bt709 primaries=bt709 transfer=bt709 width=1920 height=1080 \
+             fps={fps} supports_h264=true supports_h265=true supports_yuv444=true \
+             supports_main10=true supports_full_range=true cursor=host capture=pipewire \
+             capture_zero_copy=false conversion_backend=gpu sid={}",
+            sid()
+        )
+    }
+
+    const SPEED_AS_AUTO: &str =
+        "[capenc] ADMISSION version=1 requested=speed requested_fps=60 decision=downgrade \
+        reason=copy_path_not_rate_qualified served=auto codec=h264 fps=30 transform=sdr8-rgb \
+        colour=assumed cursor_mode=host capture=pipewire copy_path=host-copy cursor=composited \
+        measured_fps=unmeasured node=36 format=bgrx8 width=1920 height=1080 memory=host-shared";
+
+    async fn admitted(
+        config: &CapencConfig,
+        lines: &[String],
+    ) -> Result<(ResolvedMediaPlan, Option<CaptureAdmissionNotice>), CapencStartError> {
+        let (reader, mut writer) = tokio::io::duplex(8192);
+        let text = lines.join("\n") + "\n";
+        tokio::spawn(async move {
+            writer.write_all(text.as_bytes()).await.unwrap();
+        });
+        let mut lines = crate::bounded_io::BoundedLineReader::new(BufReader::new(reader));
+        wait_for_admitted_ready(&mut lines, config).await
+    }
+
+    #[test]
+    fn a_qualified_capture_rate_reaches_only_a_wayland_capture() {
+        let rated = CapencConfig {
+            capture_rate: Some(58),
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: true,
+            wayland_fidelity_args: Vec::new(),
+            ..wayland_config(60, true, ScreenCastCursorMode::Embedded)
+        };
+        assert!(rated.argv().contains(&"capture-rate=58".to_owned()));
+        let unrated = wayland_config(60, true, ScreenCastCursorMode::Embedded);
+        assert!(!unrated
+            .argv()
+            .iter()
+            .any(|argument| argument.starts_with("capture-rate=")));
+        let xorg = CapencConfig {
+            capture_rate: Some(58),
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: true,
+            wayland_fidelity_args: Vec::new(),
+            ..native_config()
+        };
+        assert!(!xorg
+            .argv()
+            .iter()
+            .any(|argument| argument.starts_with("capture-rate=")));
+        // GPU import verification follows the same rule.
+        assert!(rated.argv().contains(&"gpu-import=verified".to_owned()));
+        assert!(!unrated
+            .argv()
+            .iter()
+            .any(|argument| argument.starts_with("gpu-import=")));
+        assert!(!xorg
+            .argv()
+            .iter()
+            .any(|argument| argument.starts_with("gpu-import=")));
+        // Per-codec evidence: the entry for the codec actually spawned, its
+        // inference stated; none for a codec without evidence; and a
+        // runtime shortfall is passed on.
+        let inferred = arcen_media::video::CaptureRateEvidence::Inferred {
+            width: 2560,
+            height: 1600,
+        };
+        let by_codec = CapencConfig {
+            codec: "h265".to_owned(),
+            capture_rates_by_codec: vec![("h265".to_owned(), 60, inferred)],
+            speed_runtime_shortfall: true,
+            ..wayland_config(60, true, ScreenCastCursorMode::Embedded)
+        };
+        let argv = by_codec.argv();
+        assert!(argv.contains(&"capture-rate=60".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"capture-rate-evidence=inferred:2560x1600".to_owned()));
+        assert!(argv.contains(&"speed-runtime=below-floor".to_owned()));
+        let other_codec = CapencConfig {
+            codec: "h264".to_owned(),
+            ..by_codec
+        };
+        assert!(!other_codec
+            .argv()
+            .iter()
+            .any(|argument| argument.starts_with("capture-rate")));
+    }
+
+    #[test]
+    fn fidelity_arguments_reach_only_a_ten_bit_wayland_capture() {
+        let fidelity = vec![
+            "fidelity-route=force-hdr".to_owned(),
+            "wide-proven=dmabuf".to_owned(),
+            "sdr-white=203".to_owned(),
+        ];
+        let ten_bit = CapencConfig {
+            bit_depth: BitDepth::Ten,
+            wayland_fidelity_args: fidelity.clone(),
+            ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
+        };
+        let argv = ten_bit.argv();
+        assert!(fidelity.iter().all(|argument| argv.contains(argument)));
+        let eight_bit = CapencConfig {
+            wayland_fidelity_args: fidelity.clone(),
+            ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
+        };
+        let xorg = CapencConfig {
+            bit_depth: BitDepth::Ten,
+            wayland_fidelity_args: fidelity,
+            ..native_config()
+        };
+        for config in [eight_bit, xorg] {
+            assert!(!config.argv().iter().any(|argument| {
+                argument.starts_with("fidelity-route=")
+                    || argument.starts_with("wide-proven=")
+                    || argument.starts_with("sdr-white=")
+            }));
+        }
+    }
+
+    #[test]
+    fn pipeline_stats_lines_publish_encoded_and_source_rates() {
+        let wayland = "[capenc] enc_fps=30 encode_submitted=30 source_fps=57 source_superseded=27 \
+                       avg_upload_ms=0.84 capture_backend=pipewire sid=7a2d";
+        assert_eq!(
+            PipelineStatsSample::parse(wayland, 3),
+            Some(PipelineStatsSample {
+                sequence: 3,
+                encoded: 30,
+                source: Some(57),
+                limiter: None,
+                target_fps: None,
+            })
+        );
+        let xorg_wide = "[capenc] enc_fps=11 encode_submitted=21 avg_capture_ms=3.80 \
+                         capture_backend=xshm avg_convert_ms=3.10 avg_upload_ms=2.40 \
+                         avg_upload_kib=21600 fps_limiter=no_damage rate_capped=true \
+                         contract_fps=30 target_fps=8 ticks_due=8 ticks_no_change=4 \
+                         fresh_frames=4 busy_ms=150 sid=7a2d";
+        let sample = PipelineStatsSample::parse(xorg_wide, 4).expect("wide stats line");
+        assert_eq!(sample.encoded, 11);
+        assert_eq!(
+            sample.limiter,
+            Some(arcen_media::video::FrameRateLimiter::NoDamage)
+        );
+        assert_eq!(sample.target_fps, Some(8));
+        let xorg = "[capenc] enc_fps=60 avg_encode_ms=2.1 kbps=900";
+        assert_eq!(
+            PipelineStatsSample::parse(xorg, 1).map(|sample| (sample.encoded, sample.source)),
+            Some((60, None))
+        );
+        assert_eq!(
+            PipelineStatsSample::parse("[capenc] READY version=2", 1),
+            None
+        );
+        assert_eq!(PipelineStatsSample::parse("[capenc] enc_fps=x", 1), None);
+    }
+
+    #[test]
+    fn a_wayland_child_gets_no_x_display_and_follows_the_streams_cursor() {
+        let config = wayland_config(30, false, ScreenCastCursorMode::Embedded);
+        let mut command = tokio::process::Command::new("true");
+        configure_child_environment(&mut command, &config).expect("configure");
+        let environment: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+            })
+            .collect();
+        assert!(!environment.contains_key("DISPLAY"));
+        assert!(!environment.contains_key("XAUTHORITY"));
+        assert_eq!(
+            environment
+                .get("ARCEN_CAPTURE_PROVIDER")
+                .map(String::as_str),
+            Some("wayland")
+        );
+        let (embedded, _) = apply_capture_cursor_constraint(config);
+        assert_eq!(embedded.cursor_mode, CursorMode::Host);
+        assert!(embedded.argv().contains(&"cursor=host".to_string()));
+        let (metadata, _) = apply_capture_cursor_constraint(wayland_config(
+            30,
+            false,
+            ScreenCastCursorMode::Metadata,
+        ));
+        assert_eq!(metadata.cursor_mode, CursorMode::Local);
+        // Xorg sessions are untouched.
+        let (xorg, _) = apply_capture_cursor_constraint(native_config());
+        assert_eq!(xorg.cursor_mode, CursorMode::Host);
+        // A ten-bit Wayland stream (Grading/HDR) with an embedded cursor
+        // keeps host authority: the Xorg wide-capture rule does not apply.
+        let mut wide = wayland_config(30, false, ScreenCastCursorMode::Embedded);
+        wide.bit_depth = BitDepth::Ten;
+        let (wide, moved) = apply_capture_cursor_constraint(wide);
+        assert!(!moved);
+        assert_eq!(wide.cursor_mode, CursorMode::Host);
+    }
+
+    #[tokio::test]
+    async fn a_speed_request_served_as_auto_is_accepted_only_through_its_admission() {
+        let (config, _) = apply_capture_cursor_constraint(wayland_config(
+            60,
+            true,
+            ScreenCastCursorMode::Embedded,
+        ));
+        let admission = format!("{SPEED_AS_AUTO} sid={}", sid());
+        let (plan, notice) = admitted(&config, &[admission.clone(), wayland_ready(30)])
+            .await
+            .expect("visible downgrade accepted");
+        assert_eq!(plan.fps, 30);
+        assert_eq!(plan.cursor_mode, CursorMode::Host);
+        let notice = notice.expect("admission kept");
+        assert_eq!(notice.served().unwrap().pipeline, PipelineId::Auto);
+        assert!(notice.degradation().unwrap().fps_clamped);
+        // Without the admission the same READY is a request conflict.
+        assert!(matches!(
+            admitted(&config, &[wayland_ready(30)]).await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
+        // READY must state the admitted rate, not the requested one.
+        assert!(matches!(
+            admitted(&config, &[admission.clone(), wayland_ready(60)]).await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
+        // Another session's admission, or two of them, are refused.
+        assert!(matches!(
+            admitted(&config, &[SPEED_AS_AUTO.to_string(), wayland_ready(30)]).await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
+        assert!(matches!(
+            admitted(&config, &[admission.clone(), admission, wayland_ready(30)]).await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
+        // An Auto request cannot be answered with a Speed admission.
+        let (auto, _) = apply_capture_cursor_constraint(wayland_config(
+            30,
+            false,
+            ScreenCastCursorMode::Embedded,
+        ));
+        assert!(matches!(
+            admitted(
+                &auto,
+                &[format!("{SPEED_AS_AUTO} sid={}", sid()), wayland_ready(30)]
+            )
+            .await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_admission_ends_in_the_backend_refusal() {
+        let (config, _) = apply_capture_cursor_constraint(wayland_config(
+            30,
+            false,
+            ScreenCastCursorMode::Embedded,
+        ));
+        let refused = format!(
+            "[capenc] ADMISSION version=1 requested=auto requested_fps=30 decision=unavailable \
+             reason=gpu_identity_unproven capture=pipewire copy_path=gpu-convert cursor=composited \
+             measured_fps=unmeasured node=36 format=bgrx8 width=1920 height=1080 \
+             memory=dmabuf modifier=0x0300000000606010 sid={}",
+            sid()
+        );
+        let unavailable =
+            "[capenc] UNAVAILABLE version=1 backend=native-nvenc code=unsupported_configuration"
+                .to_string();
+        assert!(matches!(
+            admitted(&config, &[refused.clone(), unavailable]).await,
+            Err(CapencStartError::BackendUnavailable(_))
+        ));
+        // After an unavailable admission, READY is a protocol error even if
+        // it matches the request exactly, and so is a second ADMISSION.
+        assert!(matches!(
+            admitted(&config, &[refused.clone(), wayland_ready(30)]).await,
+            Err(CapencStartError::ReadyProtocol(detail)) if detail.contains("unavailable")
+        ));
+        let served = format!(
+            "[capenc] ADMISSION version=1 requested=auto requested_fps=30 decision=admit \
+             served=auto codec=h264 fps=30 transform=sdr8-rgb colour=assumed cursor_mode=host \
+             capture=pipewire copy_path=host-copy cursor=composited measured_fps=unmeasured \
+             node=36 format=bgrx8 width=1920 height=1080 memory=host-shared sid={}",
+            sid()
+        );
+        assert!(matches!(
+            admitted(&config, &[refused, served, wayland_ready(30)]).await,
+            Err(CapencStartError::ReadyProtocol(detail)) if detail.contains("duplicate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_auto_request_below_the_contract_rate_is_served_at_that_rate() {
+        let (config, _) = apply_capture_cursor_constraint(wayland_config(
+            24,
+            false,
+            ScreenCastCursorMode::Embedded,
+        ));
+        let admission = format!(
+            "[capenc] ADMISSION version=1 requested=auto requested_fps=24 decision=admit \
+             served=auto codec=h264 fps=24 transform=sdr8-rgb colour=assumed cursor_mode=host \
+             capture=pipewire copy_path=host-copy cursor=composited measured_fps=unmeasured \
+             node=36 format=bgrx8 width=1920 height=1080 memory=host-shared sid={}",
+            sid()
+        );
+        let (plan, notice) = admitted(&config, &[admission.clone(), wayland_ready(24)])
+            .await
+            .expect("24 fps Auto accepted");
+        assert_eq!(plan.fps, 24);
+        assert!(notice.unwrap().degradation().unwrap().is_exact());
+        // A notice answering a 30 fps request does not answer this one.
+        assert!(matches!(
+            admitted(
+                &config,
+                &[
+                    admission.replace("requested_fps=24", "requested_fps=30"),
+                    wayland_ready(24)
+                ]
+            )
+            .await,
+            Err(CapencStartError::ReadyProtocol(_))
+        ));
     }
 
     #[tokio::test]

@@ -231,11 +231,16 @@ impl VideoQueueWaitStats {
 struct QueuedVideo<T> {
     item: T,
     enqueued_at: Instant,
+    keyframe: bool,
 }
 
 impl<T> QueuedVideo<T> {
-    const fn new(item: T, enqueued_at: Instant) -> Self {
-        Self { item, enqueued_at }
+    const fn new(item: T, enqueued_at: Instant, keyframe: bool) -> Self {
+        Self {
+            item,
+            enqueued_at,
+            keyframe,
+        }
     }
 }
 
@@ -270,6 +275,7 @@ pub struct SharedVideoQueue<T> {
     frames_sent: u64,
     frames_dropped: u64,
     bytes_sent: u64,
+    keyframe_bytes_sent: u64,
     wait_total: Duration,
     wait_max: Duration,
     wait_frames: u64,
@@ -301,6 +307,7 @@ impl<T> SharedVideoQueue<T> {
             frames_sent: 0,
             frames_dropped: 0,
             bytes_sent: 0,
+            keyframe_bytes_sent: 0,
             wait_total: Duration::ZERO,
             wait_max: Duration::ZERO,
             wait_frames: 0,
@@ -318,9 +325,10 @@ impl<T> SharedVideoQueue<T> {
         if self.closed {
             return VideoQueuePush::Closed(item);
         }
+        let keyframe = classification.keyframe || classification.recovery_point;
         if self.generation_chain && self.require_generation_recovery {
             if classification.recovery_point && self.deque.len() < self.capacity {
-                self.deque.push_back(QueuedVideo::new(item, now));
+                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
                 self.require_generation_recovery = false;
                 self.awaiting_keyframe = false;
                 self.keyframe_request_pending = false;
@@ -344,7 +352,7 @@ impl<T> SharedVideoQueue<T> {
                 .capacity
                 .saturating_sub(usize::from(self.generation_recovery.is_some()));
             if self.deque.len() < generation_capacity {
-                self.deque.push_back(QueuedVideo::new(item, now));
+                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
                 VideoQueuePush::Enqueued { cleared: 0 }
             } else {
                 let count = self.deque.len() + 1;
@@ -369,7 +377,7 @@ impl<T> SharedVideoQueue<T> {
             }
         } else if self.protected_front {
             if self.deque.len() < self.capacity {
-                self.deque.push_back(QueuedVideo::new(item, now));
+                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
                 VideoQueuePush::Enqueued { cleared: 0 }
             } else {
                 let pinned = self.deque.pop_front();
@@ -383,7 +391,7 @@ impl<T> SharedVideoQueue<T> {
                 self.awaiting_keyframe = !classification.recovery_point;
                 self.keyframe_request_pending = !classification.recovery_point;
                 if classification.recovery_point {
-                    self.deque.push_back(QueuedVideo::new(item, now));
+                    self.deque.push_back(QueuedVideo::new(item, now, keyframe));
                     self.drops_since_keyframe = 0;
                     self.keyframe_request_pending = false;
                     self.last_keyframe_request_at = None;
@@ -402,7 +410,7 @@ impl<T> SharedVideoQueue<T> {
         } else if classification.keyframe {
             let cleared = self.deque.len();
             self.deque.clear();
-            self.deque.push_back(QueuedVideo::new(item, now));
+            self.deque.push_back(QueuedVideo::new(item, now, keyframe));
             self.awaiting_keyframe = false;
             self.keyframe_request_pending = false;
             self.drops_since_keyframe = 0;
@@ -418,7 +426,7 @@ impl<T> SharedVideoQueue<T> {
                 idr_request,
             }
         } else if self.deque.len() < self.capacity {
-            self.deque.push_back(QueuedVideo::new(item, now));
+            self.deque.push_back(QueuedVideo::new(item, now, keyframe));
             VideoQueuePush::Enqueued { cleared: 0 }
         } else {
             let count = self.deque.len() + 1;
@@ -448,7 +456,7 @@ impl<T> SharedVideoQueue<T> {
         }
         let dropped = self.deque.len();
         self.deque.clear();
-        self.generation_recovery = Some(QueuedVideo::new(item, now));
+        self.generation_recovery = Some(QueuedVideo::new(item, now, true));
         self.generation_chain = true;
         self.require_generation_recovery = true;
         self.awaiting_keyframe = true;
@@ -511,7 +519,11 @@ impl<T> SharedVideoQueue<T> {
         self.wait_max = self.wait_max.max(wait);
         self.wait_frames = self.wait_frames.saturating_add(1);
         self.frames_sent = self.frames_sent.saturating_add(1);
-        self.bytes_sent = self.bytes_sent.saturating_add(bytes(&queued.item) as u64);
+        let size = bytes(&queued.item) as u64;
+        self.bytes_sent = self.bytes_sent.saturating_add(size);
+        if queued.keyframe {
+            self.keyframe_bytes_sent = self.keyframe_bytes_sent.saturating_add(size);
+        }
         Some(queued.item)
     }
 
@@ -644,6 +656,14 @@ impl<T> SharedVideoQueue<T> {
     #[must_use]
     pub const fn bytes_sent(&self) -> u64 {
         self.bytes_sent
+    }
+
+    /// The part of [`Self::bytes_sent`] that carried keyframes or recovery
+    /// points, so a rate controller can tell a keyframe burst from a path
+    /// that is filling.
+    #[must_use]
+    pub const fn keyframe_bytes_sent(&self) -> u64 {
+        self.keyframe_bytes_sent
     }
 
     /// Returns and clears queue-wait statistics for frames popped by the writer.
@@ -1108,8 +1128,18 @@ mod tests {
             )
             .enqueued()
         );
+        assert!(
+            q.push(
+                vec![4, 5],
+                FrameClassification::keyframe_is_recovery(false),
+                now
+            )
+            .enqueued()
+        );
         assert_eq!(q.pop_front_with_bytes(Vec::len), Some(vec![1, 2, 3]));
-        assert_eq!(q.frames_sent(), 1);
-        assert_eq!(q.bytes_sent(), 3);
+        assert_eq!(q.pop_front_with_bytes(Vec::len), Some(vec![4, 5]));
+        assert_eq!(q.frames_sent(), 2);
+        assert_eq!(q.bytes_sent(), 5);
+        assert_eq!(q.keyframe_bytes_sent(), 3);
     }
 }

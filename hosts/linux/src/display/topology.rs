@@ -195,6 +195,10 @@ pub enum LinuxTopologyError {
     InvalidRegion(#[from] RegionContractError),
     #[error("shared topology placement rejected the Linux layout: {0}")]
     Placement(TopologyPlacementError),
+    #[error("{0}")]
+    Virtual(arcen_outputs::VirtualTopologyError),
+    #[error("the compositor cannot lay these outputs out: {0}")]
+    CompositorLayout(arcen_session::wayland_outputs::LayoutError),
 }
 
 impl From<TopologyPlacementError> for LinuxTopologyError {
@@ -243,12 +247,43 @@ pub struct LinuxMonitorPlan {
     /// [`Self::width`]x[`Self::height`], which is what
     /// `session::xorg_multihead` states as the head's `ViewPortIn`.
     pub mode_token: String,
+    /// The client display's refresh rate.
+    pub refresh_hz: u32,
+    /// The client display's physical width in millimetres (zero unknown).
+    pub width_mm: u32,
+    /// The client display's physical height in millimetres (zero unknown).
+    pub height_mm: u32,
 }
 
-/// Complete Linux dedicated-Xorg topology plan for one committed
+/// Which kind of outputs serve a Linux topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxTopologyBackend {
+    /// One dedicated multi-head Xorg screen on NVIDIA `DFP-N` heads.
+    DedicatedXorg,
+    /// Compositor virtual outputs of a headless Wayland session, one per
+    /// monitor, created at the requested size (`head` is a placeholder
+    /// identity, never an NVIDIA head).
+    VirtualOutputs,
+}
+
+impl LinuxTopologyBackend {
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::DedicatedXorg => "dedicated_xorg",
+            Self::VirtualOutputs => "virtual_outputs",
+        }
+    }
+}
+
+/// Complete Linux topology plan (dedicated Xorg or virtual outputs) for one committed
 /// [`TopologyGeneration`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxTopologyPlan {
+    /// Which kind of outputs serve the topology.
+    pub backend: LinuxTopologyBackend,
     pub generation: TopologyGeneration,
     /// Bounding virtual framebuffer width the Xorg `Screen` section's
     /// `Virtual` directive must declare.
@@ -262,6 +297,32 @@ pub struct LinuxTopologyPlan {
 }
 
 impl LinuxTopologyPlan {
+    /// Whether a reattach requesting `other` can keep the desktop built for
+    /// `self`. A dedicated Xorg desktop is built from geometry, rotation,
+    /// scale and identity only: a client display's refresh or millimetres
+    /// (its Remote UI scale) changing must not replace it and lose its
+    /// applications. Virtual outputs carry both, so any difference counts
+    /// (and is reconfigured in place there).
+    #[must_use]
+    pub fn same_desktop(&self, other: &Self) -> bool {
+        match (self.backend, other.backend) {
+            (LinuxTopologyBackend::DedicatedXorg, LinuxTopologyBackend::DedicatedXorg) => {
+                self.without_client_display_facts() == other.without_client_display_facts()
+            }
+            _ => self == other,
+        }
+    }
+
+    fn without_client_display_facts(&self) -> Self {
+        let mut plan = self.clone();
+        for monitor in &mut plan.monitors {
+            monitor.refresh_hz = 0;
+            monitor.width_mm = 0;
+            monitor.height_mm = 0;
+        }
+        plan
+    }
+
     #[must_use]
     pub fn primary(&self) -> &LinuxMonitorPlan {
         self.monitors
@@ -286,15 +347,33 @@ impl LinuxTopologyPlan {
             .iter()
             .map(LinuxMonitorPlan::region_placement)
             .collect::<Result<Vec<_>, _>>()?;
+        let convention = match self.backend {
+            LinuxTopologyBackend::DedicatedXorg => TRANSFORM_CONVENTION,
+            LinuxTopologyBackend::VirtualOutputs => {
+                arcen_outputs::virtual_topology::VIRTUAL_TRANSFORM_CONVENTION
+            }
+        };
         Ok(arcen_media::build_region_sets(
             generation,
-            TRANSFORM_CONVENTION,
+            convention,
             &placements,
         )?)
     }
 }
 
 impl LinuxMonitorPlan {
+    /// The client display's density this monitor stands for.
+    #[must_use]
+    pub fn density(&self) -> arcen_session::wayland_outputs::OutputDensity {
+        let units_per_pixel = arcen_media::LOGICAL_UNITS_PER_PIXEL.unsigned_abs();
+        let logical_width = self.logical_rect.size().width() / units_per_pixel;
+        arcen_session::wayland_outputs::OutputDensity {
+            width_mm: self.width_mm,
+            height_mm: self.height_mm,
+            logical_width: u32::try_from(logical_width).unwrap_or(0),
+        }
+    }
+
     fn region_placement(&self) -> Result<RegionPlacement, LinuxTopologyError> {
         Ok(RegionPlacement {
             region_id: RegionId::new(u32::from(self.session_monitor_id.get()))?,
@@ -309,6 +388,165 @@ impl LinuxMonitorPlan {
                 AppliedSize::new(self.width, self.height)?,
             )?,
         })
+    }
+}
+
+/// Whole millimetres of a client-reported physical size; zero when unknown
+/// or implausible.
+fn whole_millimetres(value: f32) -> u32 {
+    if value.is_finite() && value > 0.0 && value < 100_000.0 {
+        // Range-checked above.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = value.round() as u32;
+        rounded
+    } else {
+        0
+    }
+}
+
+/// The placeholder output identity of a planned virtual output: the
+/// compositor names the real connector only when the output exists.
+#[must_use]
+pub fn virtual_output_identity(session_monitor_id: SessionMonitorId) -> String {
+    format!("virtual-{}", session_monitor_id.get())
+}
+
+/// The bounds a headless Wayland session serves for virtual outputs:
+/// `max_outputs` from the compositor's output mode and the host's
+/// qualification, edges from the shared virtual-output request bounds and
+/// the encoder's ceiling.
+#[must_use]
+pub fn wayland_output_limits(max_outputs: usize) -> arcen_outputs::VirtualOutputLimits {
+    arcen_outputs::VirtualOutputLimits {
+        max_outputs: max_outputs.min(arcen_media::MAX_MULTI_MONITOR_COUNT),
+        min_edge: MIN_MONITOR_DIMENSION_PX,
+        max_edge: MAX_HEAD_DIMENSION_PX,
+        max_desktop_edge: arcen_session::wayland_session::MAX_VIRTUAL_OUTPUT_EDGE,
+        max_refresh_hz: arcen_session::wayland_session::MAX_VIRTUAL_OUTPUT_REFRESH_HZ,
+        rotation: false,
+    }
+}
+
+/// Plans a requested topology onto the virtual outputs of a headless
+/// Wayland session: the shared placement, then the compositor's own layout
+/// rule (adjacent, non-overlapping, anchored at the origin). Atomic like
+/// [`plan_topology`].
+///
+/// # Errors
+///
+/// [`LinuxTopologyError::Virtual`] for a refusal of the shared planner,
+/// [`LinuxTopologyError::CompositorLayout`] for a layout the compositor
+/// would refuse.
+pub fn plan_virtual_topology(
+    requested: &RequestedMonitorTopology,
+    generation: TopologyGeneration,
+    limits: arcen_outputs::VirtualOutputLimits,
+    mode: arcen_session::wayland_outputs::VirtualOutputMode,
+) -> Result<LinuxTopologyPlan, LinuxTopologyError> {
+    let plan = arcen_outputs::plan_virtual_topology(requested, generation, limits)
+        .map_err(LinuxTopologyError::Virtual)?;
+    let placed = plan
+        .outputs
+        .iter()
+        .map(|output| {
+            Ok(arcen_session::wayland_outputs::PlacedOutput {
+                request: arcen_session::wayland_session::VirtualOutputRequest::new(
+                    output.width,
+                    output.height,
+                    output.refresh_hz,
+                )
+                .map_err(|_| {
+                    LinuxTopologyError::MonitorTooLarge(
+                        output.client_display_id.clone(),
+                        output.width,
+                        output.height,
+                    )
+                })?,
+                x: output.x,
+                y: output.y,
+                density: arcen_session::wayland_outputs::OutputDensity::default(),
+            })
+        })
+        .collect::<Result<Vec<_>, LinuxTopologyError>>()?;
+    arcen_session::wayland_outputs::validate_layout(&placed, mode)
+        .map_err(LinuxTopologyError::CompositorLayout)?;
+    let monitors = plan
+        .outputs
+        .into_iter()
+        .map(|output| LinuxMonitorPlan {
+            session_monitor_id: output.session_monitor_id,
+            head: virtual_output_identity(output.session_monitor_id),
+            client_display_id: output.client_display_id,
+            x: output.x,
+            y: output.y,
+            width: output.width,
+            height: output.height,
+            logical_rect: output.logical_rect,
+            physical_size: output.physical_size,
+            scale: output.scale,
+            rotation: output.rotation,
+            primary: output.primary,
+            quality_intent: MonitorQualityIntentMsg::HostDefault,
+            mode_token: format!("{}x{}", output.width, output.height),
+            refresh_hz: output.refresh_hz,
+            width_mm: output.width_mm,
+            height_mm: output.height_mm,
+        })
+        .collect();
+    Ok(LinuxTopologyPlan {
+        backend: LinuxTopologyBackend::VirtualOutputs,
+        generation: plan.generation,
+        virtual_width: plan.desktop_width,
+        virtual_height: plan.desktop_height,
+        monitors,
+    })
+}
+
+impl LinuxTopologyPlan {
+    /// The planned outputs as the compositor places them, primary first
+    /// (the compositor treats its first output as primary), each with the
+    /// index of its monitor in [`Self::monitors`].
+    ///
+    /// # Errors
+    ///
+    /// When a monitor's size or refresh is outside the virtual output
+    /// request bounds (a plan this host made never is).
+    pub fn placed_outputs(
+        &self,
+    ) -> Result<Vec<(usize, arcen_session::wayland_outputs::PlacedOutput)>, LinuxTopologyError>
+    {
+        let primary = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.primary)
+            .unwrap_or(0);
+        std::iter::once(primary)
+            .chain((0..self.monitors.len()).filter(|index| *index != primary))
+            .map(|index| {
+                let monitor = &self.monitors[index];
+                let request = arcen_session::wayland_session::VirtualOutputRequest::new(
+                    monitor.width,
+                    monitor.height,
+                    monitor.refresh_hz,
+                )
+                .map_err(|_| {
+                    LinuxTopologyError::MonitorTooLarge(
+                        monitor.client_display_id.clone(),
+                        monitor.width,
+                        monitor.height,
+                    )
+                })?;
+                Ok((
+                    index,
+                    arcen_session::wayland_outputs::PlacedOutput {
+                        request,
+                        x: monitor.x,
+                        y: monitor.y,
+                        density: monitor.density(),
+                    },
+                ))
+            })
+            .collect()
     }
 }
 
@@ -560,6 +798,9 @@ pub fn plan_topology(
             .as_str()
             .to_owned();
         plans[monitor_index] = Some(LinuxMonitorPlan {
+            refresh_hz: applied_monitor.monitor().refresh_hz,
+            width_mm: whole_millimetres(applied_monitor.monitor().width_mm),
+            height_mm: whole_millimetres(applied_monitor.monitor().height_mm),
             session_monitor_id: applied_monitor.session_monitor_id,
             client_display_id: client_display_id.clone(),
             head: head.head.clone(),
@@ -592,6 +833,7 @@ pub fn plan_topology(
     }
 
     Ok(LinuxTopologyPlan {
+        backend: LinuxTopologyBackend::DedicatedXorg,
         generation,
         virtual_width: bounds.width,
         virtual_height: bounds.height,
@@ -678,6 +920,61 @@ mod tests {
         TopologyGeneration::new(1).expect("generation")
     }
 
+    #[test]
+    fn a_virtual_topology_keeps_refresh_and_is_placed_primary_first() {
+        let mut fast = requested_monitor("b", 1920, 0, 2560, 1440, true, Rotation::Degrees0);
+        fast.monitor.refresh_hz = 120;
+        let plan = plan_virtual_topology(
+            &RequestedMonitorTopology::new(vec![
+                requested_monitor("a", 0, 0, 1920, 1080, false, Rotation::Degrees0),
+                fast,
+            ])
+            .expect("requested"),
+            generation(),
+            wayland_output_limits(4),
+            arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+        )
+        .expect("plan");
+        assert_eq!(plan.backend, LinuxTopologyBackend::VirtualOutputs);
+        assert_eq!(plan.monitors[1].refresh_hz, 120);
+        let placed = plan.placed_outputs().expect("placed");
+        assert_eq!(
+            placed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(placed[0].1.request.refresh_hz(), 120);
+        assert_eq!((placed[0].1.x, placed[1].1.x), (1920, 0));
+        let (requested, applied) = plan.region_sets().expect("region sets");
+        assert_eq!(requested.regions().len(), 2);
+        assert_eq!(applied.regions().len(), 2);
+    }
+
+    #[test]
+    fn a_virtual_layout_the_compositor_would_refuse_is_refused_whole() {
+        let gap = plan_virtual_topology(
+            &RequestedMonitorTopology::new(vec![
+                requested_monitor("a", 0, 0, 1920, 1080, true, Rotation::Degrees0),
+                requested_monitor("b", 2400, 0, 1920, 1080, false, Rotation::Degrees0),
+            ])
+            .expect("requested"),
+            generation(),
+            wayland_output_limits(4),
+            arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+        );
+        assert!(matches!(gap, Err(LinuxTopologyError::CompositorLayout(_))));
+        let too_many = plan_virtual_topology(
+            &RequestedMonitorTopology::new(vec![
+                requested_monitor("a", 0, 0, 1920, 1080, true, Rotation::Degrees0),
+                requested_monitor("b", 1920, 0, 1920, 1080, false, Rotation::Degrees0),
+            ])
+            .expect("requested"),
+            generation(),
+            wayland_output_limits(1),
+            arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+        );
+        assert!(matches!(too_many, Err(LinuxTopologyError::Virtual(_))));
+    }
+
     fn inventory(count: usize) -> HeadInventory {
         HeadInventory::uniform(VALID_HEAD_TOKENS.iter().take(count).copied()).expect("inventory")
     }
@@ -740,6 +1037,35 @@ mod tests {
         assert_eq!(plan.monitors[0].y, 0);
         assert!(plan.monitors[0].primary);
         assert_eq!(plan.monitors[0].mode_token, "1920x1080");
+    }
+
+    #[test]
+    fn an_xorg_desktop_survives_a_refresh_or_ui_scale_change_but_not_geometry() {
+        let requested = RequestedMonitorTopology::new(vec![
+            requested_monitor("primary", 0, 0, 1920, 1080, true, Rotation::Degrees0),
+            requested_monitor("second", 1920, 0, 1280, 720, false, Rotation::Degrees0),
+        ])
+        .expect("requested");
+        let plan = plan_topology(&requested, generation(), &inventory(2)).expect("plan");
+        let mut facts_changed = plan.clone();
+        facts_changed.monitors[0].refresh_hz = 120;
+        facts_changed.monitors[1].width_mm = 400;
+        facts_changed.monitors[1].height_mm = 225;
+        assert!(plan.same_desktop(&facts_changed));
+        assert!(facts_changed.same_desktop(&plan));
+
+        let mut moved = plan.clone();
+        moved.monitors[1].x += 8;
+        assert!(!plan.same_desktop(&moved));
+
+        // Virtual outputs carry refresh and millimetres: they differ.
+        let mut virtual_plan = plan.clone();
+        virtual_plan.backend = LinuxTopologyBackend::VirtualOutputs;
+        let mut virtual_changed = facts_changed.clone();
+        virtual_changed.backend = LinuxTopologyBackend::VirtualOutputs;
+        assert!(!virtual_plan.same_desktop(&virtual_changed));
+        assert!(virtual_plan.same_desktop(&virtual_plan.clone()));
+        assert!(!plan.same_desktop(&virtual_plan));
     }
 
     #[test]

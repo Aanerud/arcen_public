@@ -5,9 +5,12 @@
 //! WebSocket clients are rejected at the crypto layer, and the session then
 //! speaks the same framed messages every other Pier does.
 //!
-//! Framing is WebSocket over the QUIC stream rather than raw bytes, because
-//! that is what the Deck and the other two hosts already speak; the transport
-//! changed, the message vocabulary did not.
+//! The connection carries one QUIC lane per role (ADR 0014, protocol v5):
+//! control, video, audio output, input/cursor, microphone and bulk. The
+//! session code itself still speaks WebSocket-framed messages over one local
+//! byte stream; [`crate::relay::relay_lanes`] is the only code that touches
+//! the lanes, both for a desktop agent behind the service and for a session
+//! served in this process.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -20,34 +23,45 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
 
-use arcen_transport::quic::DirectQuicStream;
+use arcen_protocol::lanes::{LaneEndpoint, SessionClose, SessionRecord};
+use arcen_transport::quic::{LaneRuntimeConfig, SessionLaneSetupError, SessionLaneSocket};
 
 /// The only port an Arcen host listens on.
 pub const DEFAULT_PORT: u16 = 18444;
 const REFUSAL_TIMEOUT: Duration = Duration::from_secs(5);
 const ADMISSION_DEADLINE_ENV: &str = "ARCEN_ADMISSION_DEADLINE_MS";
+/// Bytes buffered between an in-process session and its lane relay. The
+/// relay never waits on a media lane, so this only smooths the copy.
+const IN_PROCESS_BUFFER: usize = 256 * 1024;
 
 /// The byte stream a Deck's session travels over.
 ///
-/// Either the Deck's own QUIC stream, when this process terminates TLS, or the
-/// local socket the network service relays that stream through, when this
-/// process is a desktop agent. The framing above it is identical, so the
-/// session code cannot tell and does not need to.
+/// Either the local end of this process's own lane relay, when this process
+/// terminates TLS, or the local socket the network service relays the
+/// session through, when this process is a desktop agent. The framing above
+/// it is identical, so the session code cannot tell and does not need to.
 #[derive(Debug)]
 pub enum PierStream {
-    /// The Deck's QUIC stream, terminated here.
-    Quic(DirectQuicStream),
-    /// The Deck's stream, relayed by the network service.
+    /// The session end of the in-process lane relay; the connection is kept
+    /// for path sampling.
+    Lanes {
+        /// Local byte stream to [`crate::relay::relay_lanes`].
+        io: tokio::io::DuplexStream,
+        /// The Deck's QUIC connection.
+        connection: quinn::Connection,
+    },
+    /// The Deck's session, relayed by the network service.
     Relayed(tokio::net::UnixStream),
 }
 
 impl PierStream {
-    /// Clones the live QUIC connection for direct sessions. Relayed agent
-    /// sessions receive path signal as injected relay control messages instead.
+    /// Clones the live QUIC connection for in-process sessions. Relayed
+    /// agent sessions receive path signal as injected relay control messages
+    /// instead.
     #[must_use]
     pub fn path_signal_connection(&self) -> Option<quinn::Connection> {
         match self {
-            Self::Quic(stream) => Some(stream.connection_handle()),
+            Self::Lanes { connection, .. } => Some(connection.clone()),
             Self::Relayed(_) => None,
         }
     }
@@ -60,7 +74,7 @@ impl tokio::io::AsyncRead for PierStream {
         buffer: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Quic(stream) => std::pin::Pin::new(stream).poll_read(context, buffer),
+            Self::Lanes { io, .. } => std::pin::Pin::new(io).poll_read(context, buffer),
             Self::Relayed(stream) => std::pin::Pin::new(stream).poll_read(context, buffer),
         }
     }
@@ -73,7 +87,7 @@ impl tokio::io::AsyncWrite for PierStream {
         buffer: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Self::Quic(stream) => std::pin::Pin::new(stream).poll_write(context, buffer),
+            Self::Lanes { io, .. } => std::pin::Pin::new(io).poll_write(context, buffer),
             Self::Relayed(stream) => std::pin::Pin::new(stream).poll_write(context, buffer),
         }
     }
@@ -83,7 +97,7 @@ impl tokio::io::AsyncWrite for PierStream {
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Quic(stream) => std::pin::Pin::new(stream).poll_flush(context),
+            Self::Lanes { io, .. } => std::pin::Pin::new(io).poll_flush(context),
             Self::Relayed(stream) => std::pin::Pin::new(stream).poll_flush(context),
         }
     }
@@ -93,7 +107,7 @@ impl tokio::io::AsyncWrite for PierStream {
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Quic(stream) => std::pin::Pin::new(stream).poll_shutdown(context),
+            Self::Lanes { io, .. } => std::pin::Pin::new(io).poll_shutdown(context),
             Self::Relayed(stream) => std::pin::Pin::new(stream).poll_shutdown(context),
         }
     }
@@ -120,6 +134,41 @@ pub async fn framed(stream: PierStream) -> PierSocket {
         ..Default::default()
     };
     WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await
+}
+
+/// Serves an accepted Deck's lanes to a session in this process: starts the
+/// lane relay on one end of a local byte stream and frames the other.
+pub async fn serve_in_process(deck: SessionLaneSocket) -> PierSocket {
+    let connection = deck.lanes().connection().clone();
+    let (session_end, relay_end) = tokio::io::duplex(IN_PROCESS_BUFFER);
+    tokio::spawn(async move {
+        match crate::relay::relay_lanes(deck, relay_end, 0, None, false).await {
+            Ok(stats) => tracing::debug!(target: "arcen::net", ?stats, "lane relay ended"),
+            Err(error) => tracing::debug!(target: "arcen::net", %error, "lane relay ended"),
+        }
+    });
+    framed(PierStream::Lanes {
+        io: session_end,
+        connection,
+    })
+    .await
+}
+
+/// Closes an accepted Deck's control lane with a reason the Deck shows, for
+/// a Deck refused before any session served it.
+///
+/// # Errors
+///
+/// Returns the send failure or timeout reason.
+pub async fn refuse_lanes(deck: &mut SessionLaneSocket, reason: &str) -> Result<(), String> {
+    let close = SessionRecord::Close(Some(SessionClose {
+        code: u16::from(CloseCode::Policy),
+        reason: close_reason_that_fits(reason),
+    }));
+    tokio::time::timeout(REFUSAL_TIMEOUT, deck.send(close))
+        .await
+        .map_err(|_| format!("timed out sending refusal: {reason}"))?
+        .map_err(|error| format!("send refusal: {error}"))
 }
 
 /// One admitted capacity-one Pier session.
@@ -236,8 +285,11 @@ pub fn server_config(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .map_err(|error| ServeError::Tls(format!("QUIC crypto: {error}")))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(arcen_transport::quic::recommended_transport_config_arc(
+    // Grants the Deck the lanes it opens (control, input/cursor, bulk,
+    // microphone) plus one replacement of each shape (ADR 0014).
+    config.transport_config(arcen_transport::quic::lane_transport_config_arc(
         &arcen_transport::BoundedTransportPolicy::default(),
+        LaneEndpoint::Pier,
     ));
     arcen_transport::quic::apply_direct_server_limits(&mut config);
     Ok(config)
@@ -310,17 +362,19 @@ impl Listener {
     ///
     /// Returns [`ServeError::Accept`] only when the endpoint is closed.
     pub async fn accept(&self) -> Result<(PierSocket, SocketAddr), ServeError> {
-        let (stream, peer) = self.accept_raw().await?;
-        Ok((framed(PierStream::Quic(stream)).await, peer))
+        let (deck, peer) = self.accept_raw().await?;
+        Ok((serve_in_process(deck).await, peer))
     }
 
-    /// Waits for one Deck and returns its stream unframed, for a service that
-    /// relays the stream rather than speaking the session itself.
+    /// Waits for one Deck and returns its lanes (the control lane as the
+    /// session socket), for a service that relays the session to an agent.
+    /// A Deck that speaks the pre-lane single stream is closed with the
+    /// shared "update the Deck and the Pier" mismatch and skipped.
     ///
     /// # Errors
     ///
     /// Returns [`ServeError::Accept`] only when the endpoint is closed.
-    pub async fn accept_raw(&self) -> Result<(DirectQuicStream, SocketAddr), ServeError> {
+    pub async fn accept_raw(&self) -> Result<(SessionLaneSocket, SocketAddr), ServeError> {
         self.accept_with_admission_budget(admission_deadline())
             .await
     }
@@ -328,7 +382,7 @@ impl Listener {
     async fn accept_with_admission_budget(
         &self,
         admission_budget: Duration,
-    ) -> Result<(DirectQuicStream, SocketAddr), ServeError> {
+    ) -> Result<(SessionLaneSocket, SocketAddr), ServeError> {
         loop {
             let incoming = self
                 .endpoint
@@ -376,26 +430,39 @@ impl Listener {
                 continue;
             }
             let close_on_timeout = connection.clone();
-            let opened =
-                tokio::time::timeout_at(deadline, arcen_transport::quic::accept_direct(connection))
-                    .await;
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
+            let opened = arcen_transport::quic::accept_session_lanes(
+                connection,
+                LaneRuntimeConfig::new(LaneEndpoint::Pier),
+                remaining,
+            )
+            .await;
             match opened {
-                Ok(Ok(stream)) => return Ok((stream, peer)),
-                Err(_) => {
+                Ok((lanes, control)) => return Ok((SessionLaneSocket::new(lanes, control), peer)),
+                Err(SessionLaneSetupError::Timeout) => {
                     close_on_timeout.close(0_u32.into(), b"admission deadline exceeded");
                     tracing::debug!(
                         target: "arcen::net",
                         %peer,
                         timeout_secs = admission_budget.as_secs(),
-                        "connection opened no stream before its admission deadline"
+                        "connection opened no control lane before its admission deadline"
                     );
                 }
-                Ok(Err(error)) => {
-                    tracing::debug!(
+                Err(SessionLaneSetupError::Mismatch(mismatch)) => {
+                    // The lane runtime told the Deck why before closing.
+                    tracing::warn!(
+                        target: "arcen::net",
+                        %peer,
+                        reason = %mismatch,
+                        "refused a Deck running an incompatible Arcen release"
+                    );
+                }
+                Err(error) => {
+                    tracing::info!(
                         target: "arcen::net",
                         %peer,
                         %error,
-                        "connection opened no usable stream"
+                        "connection opened no usable control lane"
                     );
                 }
             }
@@ -613,15 +680,17 @@ mod tests {
             .await
             .expect("stalled handshake");
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let stream =
-            arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
+        let (deck, _control) = arcen_transport::quic::connect_session_lanes(
+            arcen_transport::quic::DirectQuicDialParams {
                 endpoint: healthy,
                 client_config,
                 remote_addr: server_addr,
                 server_name: "localhost",
-            })
-            .await
-            .expect("healthy peer accepted after stalled peer expired");
+            },
+            LaneRuntimeConfig::new(LaneEndpoint::Deck),
+        )
+        .await
+        .expect("healthy peer accepted after stalled peer expired");
 
         let accepted = tokio::time::timeout(Duration::from_secs(1), accept)
             .await
@@ -629,7 +698,7 @@ mod tests {
             .expect("accept task")
             .expect("accept result");
         drop(accepted);
-        stream.close(0, b"test complete");
+        deck.connection().close(0_u32.into(), b"test complete");
         stalled_connection.close(0_u32.into(), b"test complete");
         stalled.close(0_u32.into(), b"test complete");
         std::fs::remove_dir_all(&dir).ok();
@@ -651,8 +720,9 @@ mod tests {
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(rustls).expect("quic client config");
         let mut config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
-        config.transport_config(arcen_transport::quic::recommended_transport_config_arc(
+        config.transport_config(arcen_transport::quic::lane_transport_config_arc(
             &arcen_transport::BoundedTransportPolicy::default(),
+            LaneEndpoint::Deck,
         ));
         config
     }

@@ -14,7 +14,7 @@ use arcen_deck::protocol::messages::{
 use arcen_deck::transport::tls::{parse_fingerprint, TlsTrustConfig};
 use arcen_deck::transport::websocket::{
     connect_smoke, spawn_session, AuthSubmission, ConnectOptions, FullFrameRequestGate,
-    SessionCommand, SessionCommandSender, SessionEvent, StreamProfile,
+    SessionCommand, SessionCommandSender, SessionEvent, SessionHandle, StreamProfile,
 };
 use arcen_deck::ui::app::{
     apply_automatic_remote_ui_scale_to_monitors, apply_automatic_remote_ui_scale_to_topology,
@@ -368,10 +368,10 @@ async fn main() {
                 usage:\n\
                   arcen-client\n\
                   arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
-                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed]\n\
-                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--full-color-display ID]\n\
-                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off]\n\
+                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
+                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--hidpi-displays MASK] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
+                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--text STRING]...\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                   arcen-client platform-report\n\
@@ -434,7 +434,8 @@ async fn main() {
         return;
     }
     if subcommand == Some("input-smoke") {
-        if let Err(error) = input_smoke(options).await {
+        let pen = args.iter().any(|arg| arg == "--pen");
+        if let Err(error) = input_smoke(options, flag_values(&args, "--text"), pen).await {
             eprintln!("input-smoke failed: {error}");
             shutdown_and_exit(1);
         }
@@ -946,18 +947,28 @@ fn connect_options_from_parts_with_monitors(
     });
     let displays_mode = displays_mode_from_args(args)?;
     // Smoke/quick-connect reproduces the shipped defaults: the notch-area
-    // opt-in and HiDPI streaming are GUI settings and are not exposed as flags,
-    // while Automatic UI scale normalizes a point-sized stream to 1x/96 DPI.
-    let presentation = primary_presentation_size(&monitors, false, false);
+    // opt-in is a GUI setting, and HiDPI streaming is off unless the
+    // diagnostic `--hidpi-displays` mask (bit 0 = first display) opts in;
+    // Automatic UI scale then normalizes a point-sized stream to 1x/96 DPI
+    // and a backing-pixel one to its backing ratio.
+    let hidpi_mask = flag_value(args, "--hidpi-displays")
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .map_err(|_| format!("--hidpi-displays expects a bit mask 0-255: {value}"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let presentation = primary_presentation_size(&monitors, false, hidpi_mask & 1 != 0);
     let mut selected_monitors = monitors_for_displays_mode(displays_mode, &monitors, presentation);
-    apply_automatic_remote_ui_scale_to_monitors(&mut selected_monitors, 0);
+    apply_automatic_remote_ui_scale_to_monitors(&mut selected_monitors, hidpi_mask);
     let multi_monitor_topology = (args.get(1).map(String::as_str) == Some("multi-monitor-smoke"))
         .then(|| {
             let mut topology = match fixture_displays.as_ref() {
-                Some(displays) => {
-                    arcen_deck::display::topology::build_requested_topology_from(displays, false, 0)
-                }
-                None => arcen_deck::display::topology::build_requested_topology(false, 0),
+                Some(displays) => arcen_deck::display::topology::build_requested_topology_from(
+                    displays, false, hidpi_mask,
+                ),
+                None => arcen_deck::display::topology::build_requested_topology(false, hidpi_mask),
             }
             .map_err(|error| format!("multi-monitor topology preflight failed: {error}"))?;
             if std::env::var("ARCEN_MULTI_MONITOR_ROTATE_SECONDARY")
@@ -969,7 +980,7 @@ fn connect_options_from_parts_with_monitors(
             if topology.monitors().len() < 2 {
                 return Err("multi-monitor-smoke requires at least two active displays".to_string());
             }
-            topology = apply_automatic_remote_ui_scale_to_topology(&topology, 0);
+            topology = apply_automatic_remote_ui_scale_to_topology(&topology, hidpi_mask);
             let full_color_display_ids = match flag_value(args, "--full-color-display") {
                 Some(value) if value.eq_ignore_ascii_case("all") => topology
                     .monitors()
@@ -1063,8 +1074,13 @@ fn cursor_mode_from_args(args: &[String]) -> Result<CursorMode, String> {
     }
 }
 
-async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
+async fn input_smoke(
+    mut options: ConnectOptions,
+    texts: Vec<String>,
+    pen: bool,
+) -> Result<(), String> {
     let hard_mode = options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge;
+    let mut text_capabilities = None;
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
         password: std::mem::take(&mut options.password),
@@ -1087,6 +1103,10 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
                 if hard_mode && !hello.usb_hard_v1 {
                     return Err("host did not advertise Hard USB v1".to_string());
                 }
+                text_capabilities = Some((
+                    hello.input_capabilities.text_commit,
+                    hello.input_capabilities.text_commit_unicode,
+                ));
                 hello_ready = true;
             }
             SessionEvent::Ended(end) => return Err(end.message),
@@ -1129,6 +1149,8 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
             SessionEvent::BrokerHello(_)
             | SessionEvent::MicrophoneActive(_)
             | SessionEvent::ConnectionStatusHint(_)
+            | SessionEvent::CursorUpdate(_)
+            | SessionEvent::CursorLaneReset
             | SessionEvent::PresentationRecoveryRequested => {}
         }
     }
@@ -1160,12 +1182,16 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
             tokio::time::sleep(Duration::from_millis(8)).await;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
-        session
-            .commands
-            .send(SessionCommand::Close)
-            .map_err(|_| "session closed before Hard USB teardown".to_string())?;
+        close_smoke_session(&mut session).await;
         println!("input-smoke complete usb_hard=true pen_states=750");
         return Ok(());
+    }
+
+    if !texts.is_empty() {
+        return text_smoke(&mut session, &texts, text_capabilities).await;
+    }
+    if pen {
+        return pen_smoke(&mut session).await;
     }
 
     let events = [
@@ -1186,12 +1212,176 @@ async fn input_smoke(mut options: ConnectOptions) -> Result<(), String> {
             .map_err(|_| "session closed while sending input".to_string())?;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    session
-        .commands
-        .send(SessionCommand::Close)
-        .map_err(|_| "session closed before input teardown".to_string())?;
+    close_smoke_session(&mut session).await;
     println!("input-smoke complete input_events=8 reset_events=1 keyboard=3 mouse=3 scroll=2");
     Ok(())
+}
+
+/// Lab (`input-smoke --pen`): typed pen strokes (`pen_event`) across the
+/// host desktop, each with a pressure ramp and tilt, then out of proximity.
+async fn pen_smoke(session: &mut SessionHandle) -> Result<(), String> {
+    let mut sent = 0_u32;
+    let strokes = [
+        ((0.15, 0.2), (0.85, 0.8), 45.0_f32, -30.0_f32),
+        ((0.85, 0.2), (0.15, 0.8), -45.0, 30.0),
+    ];
+    for ((x0, y0), (x1, y1), tilt_x, tilt_y) in strokes {
+        for step in 0..=120_u32 {
+            let t = f64::from(step) / 120.0;
+            let touching = (1..120).contains(&step);
+            let pressure = if touching {
+                (std::f64::consts::PI * t).sin() as f32 * 0.95 + 0.02
+            } else {
+                0.0
+            };
+            let pen = serde_json::json!({
+                "type": "pen_event",
+                "x": x0 + (x1 - x0) * t,
+                "y": y0 + (y1 - y0) * t,
+                "server_x": -1,
+                "server_y": -1,
+                "pressure": pressure,
+                "tilt_x_degrees": tilt_x * (std::f64::consts::PI * t).cos() as f32,
+                "tilt_y_degrees": tilt_y * (std::f64::consts::PI * t).sin() as f32,
+                "rotation_degrees": 0.0,
+                "tool": "tip",
+                "in_proximity": true,
+                "touching": touching,
+                "buttons": 0,
+            });
+            session
+                .commands
+                .send(SessionCommand::Json(pen))
+                .map_err(|_| "session closed while sending pen".to_string())?;
+            sent += 1;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        let away = serde_json::json!({
+            "type": "pen_event", "x": x1, "y": y1, "server_x": -1, "server_y": -1,
+            "pressure": 0.0, "tool": "tip", "in_proximity": false, "touching": false, "buttons": 0,
+        });
+        session
+            .commands
+            .send(SessionCommand::Json(away))
+            .map_err(|_| "session closed while sending pen".to_string())?;
+        sent += 1;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    close_smoke_session(session).await;
+    println!("input-smoke complete pen_events={sent}");
+    Ok(())
+}
+
+/// Sends each `--text` as committed text, the way the Deck sends its input
+/// method's commits, and prints what the host reported: its layout and every
+/// refusal (the characters and why). Text is printed only as code points.
+async fn text_smoke(
+    session: &mut SessionHandle,
+    texts: &[String],
+    capabilities: Option<(InputCapabilityAvailability, InputCapabilityAvailability)>,
+) -> Result<(), String> {
+    use arcen_deck::protocol::messages::{
+        HostKeymapMsg, TextCommitMsg, TextCommitResultMsg, HOST_KEYMAP, TEXT_COMMIT_RESULT,
+    };
+    let (text_commit, unicode) = capabilities.ok_or("no server hello")?;
+    println!("input-smoke text host text_commit={text_commit:?} text_commit_unicode={unicode:?}");
+    if text_commit != InputCapabilityAvailability::Available {
+        return Err("host does not advertise committed text".to_string());
+    }
+    let code_points = |text: &str| {
+        text.chars()
+            .map(|character| format!("U+{:04X}", u32::from(character)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // A first input reaches the session, so its layout is read and sent.
+    session
+        .commands
+        .send(SessionCommand::Json(serde_json::json!({"type":"mouse_move","x":0.5,"y":0.5,"server_x":-1,"server_y":-1,"sequence":1,"timestamp_ns":0,"coalescable":true})))
+        .map_err(|_| "session closed while sending input".to_string())?;
+    let mut refused = 0_u32;
+    let mut results = 0_u32;
+    let drain = |session: &mut SessionHandle, refused: &mut u32, results: &mut u32| {
+        while let Ok(event) = session.events.try_recv() {
+            let SessionEvent::Json(value) = event else {
+                continue;
+            };
+            match msg_type(&value) {
+                Some(HOST_KEYMAP) => {
+                    if let Ok(keymap) = serde_json::from_value::<HostKeymapMsg>(value) {
+                        println!(
+                            "input-smoke host_keymap generation={} layouts={:?} active={:?} positions={}",
+                            keymap.generation,
+                            keymap.layouts,
+                            keymap.active_layout,
+                            keymap.keys.len()
+                        );
+                    }
+                }
+                Some(TEXT_COMMIT_RESULT) => {
+                    if let Ok(result) = serde_json::from_value::<TextCommitResultMsg>(value) {
+                        *results += 1;
+                        *refused += result.refused_chars;
+                        println!(
+                            "input-smoke text_commit_result sequence={} delivered={} refused={} reason={} unverified={} refused_code_points=[{}]",
+                            result.sequence,
+                            result.delivered_chars,
+                            result.refused_chars,
+                            result.reason.token(),
+                            result.unverified,
+                            code_points(&result.refused_text)
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drain(session, &mut refused, &mut results);
+    for (index, text) in texts.iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap_or(u64::MAX) + 100;
+        let message = TextCommitMsg::new(text.clone(), sequence);
+        message
+            .validate()
+            .map_err(|error| format!("--text {}: {error}", index + 1))?;
+        println!(
+            "input-smoke text_commit sequence={sequence} code_points=[{}]",
+            code_points(text)
+        );
+        session
+            .commands
+            .send(SessionCommand::Json(
+                serde_json::to_value(message).map_err(|error| error.to_string())?,
+            ))
+            .map_err(|_| "session closed while sending text".to_string())?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drain(session, &mut refused, &mut results);
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    drain(session, &mut refused, &mut results);
+    close_smoke_session(session).await;
+    println!(
+        "input-smoke complete text_commits={} results={results} refused_chars={refused}",
+        texts.len()
+    );
+    Ok(())
+}
+
+/// Ends a smoke session the way the Deck app does: a clean close the Pier
+/// sees at once, instead of a vanished process whose connection it must
+/// time out before the desktop can be attached again.
+async fn close_smoke_session(session: &mut SessionHandle) {
+    let _ = session.commands.send(SessionCommand::Close);
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = session.events.recv().await {
+            if matches!(event, SessionEvent::Ended(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 fn server_reports_remote_input(hello: &ServerHelloMsg) -> bool {
@@ -1204,6 +1394,40 @@ fn server_reports_remote_input(hello: &ServerHelloMsg) -> bool {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     typed_input || legacy_input
+}
+
+/// Smoke clipboard files from a comma-separated path list: name, wire kind
+/// (`.png` is an image, anything else UTF-8 text) and bytes.
+fn smoke_clipboard_files(
+    variable: &str,
+) -> Result<
+    std::collections::VecDeque<(
+        String,
+        arcen_protocol::messages::ClipboardContentKind,
+        Vec<u8>,
+    )>,
+    String,
+> {
+    let Ok(list) = std::env::var(variable) else {
+        return Ok(std::collections::VecDeque::new());
+    };
+    list.split(',')
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("{variable}: {path}: {error}"))?;
+            let kind = if path.to_ascii_lowercase().ends_with(".png") {
+                arcen_protocol::messages::ClipboardContentKind::ImagePng
+            } else {
+                arcen_protocol::messages::ClipboardContentKind::TextUtf8
+            };
+            let name = std::path::Path::new(path).file_name().map_or_else(
+                || path.to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            Ok((name, kind, bytes))
+        })
+        .collect()
 }
 
 async fn media_smoke(
@@ -1228,11 +1452,21 @@ async fn media_smoke(
     let requested_displays_mode = options.displays_mode.clone();
     let requested_multi_monitor_topology = options.multi_monitor_topology.clone();
     let microphone_requested = options.microphone_enabled;
+    let tablet_input_requested = options.tablet_input_enabled;
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
         password: std::mem::take(&mut options.password),
     });
-    let mut session = spawn_session(options);
+    // ARCEN_MEDIA_SMOKE_RESUME=1 opts into direct resume the way the Deck
+    // app does (the host may then hold the desktop for a reconnect window).
+    let mut session = if std::env::var("ARCEN_MEDIA_SMOKE_RESUME").is_ok_and(|value| value == "1") {
+        let nonce = arcen_deck::reconnect::fresh_holder_nonce()
+            .map_err(|error| format!("resume holder nonce: {error}"))?;
+        arcen_deck::transport::websocket::spawn_session_opt_in(options, nonce)
+    } else {
+        spawn_session(options)
+    };
+    let result: Result<(), String> = async {
     let mut decoders = BTreeMap::<u16, NativeVideoDecoder>::new();
     let mut expected_monitor_ids = BTreeSet::<u16>::new();
     let mut expected_wire_profiles = BTreeMap::<
@@ -1249,7 +1483,8 @@ async fn media_smoke(
     let mut input_probe_sent = false;
     let mut input_probe_confirmed = !require_multi_monitor;
     let mut require_last_pen_type = false;
-    let mut audio = PcmAudioPlayer::new();
+    let mut probe_pen = true;
+    let mut audio = PcmAudioPlayer::awaiting_stream_result();
     let discard_audio =
         std::env::var("ARCEN_AUDIO_SINK").is_ok_and(|value| value.eq_ignore_ascii_case("discard"));
     let mut video_packets = 0_u64;
@@ -1284,6 +1519,11 @@ async fn media_smoke(
         .unwrap_or_else(|| target_duration.unwrap_or_default() + Duration::from_secs(60));
     let mut last_health_ping = Instant::now();
     let mut health_sequence = 0_u64;
+    // Nothing but the authentication answer may be queued before the host
+    // accepted the sign-in: the session reads any other command there as
+    // declining it. A sign-in can take longer than one health interval
+    // (PAM, a same-user liveness proof).
+    let mut authentication_accepted = false;
     let mut last_health = None;
     let mut microphone_result_seen = false;
     // Set when the host answers that this session carries no audio. Without it
@@ -1309,6 +1549,56 @@ async fn media_smoke(
     };
     let mut dumped_aus = 0_u32;
     let mut dump_complete = false;
+    // ARCEN_MEDIA_SMOKE_RESIZE=WxH[,WxH...]: once video decodes, ask the host
+    // for each size in turn (`display_update`), one every
+    // ARCEN_MEDIA_SMOKE_RESIZE_EVERY seconds (default 4), and report each
+    // result and each decoded size change. Needs `--displays-mode windowed`.
+    let mut resize_plan = std::env::var("ARCEN_MEDIA_SMOKE_RESIZE")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|size| {
+                    let (width, height) = size.trim().split_once('x')?;
+                    Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+                })
+                .collect::<std::collections::VecDeque<_>>()
+        })
+        .unwrap_or_default();
+    let resize_every = Duration::from_secs(
+        std::env::var("ARCEN_MEDIA_SMOKE_RESIZE_EVERY")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4),
+    );
+    let mut next_resize_at: Option<Instant> = None;
+    // ARCEN_MEDIA_SMOKE_INPUT=1: send absolute pointer motion every 50 ms
+    // once video decodes (input across resizes and recoveries).
+    let smoke_input = std::env::var("ARCEN_MEDIA_SMOKE_INPUT").is_ok_and(|value| value == "1");
+    let smoke_escape = std::env::var("ARCEN_MEDIA_SMOKE_ESCAPE").is_ok_and(|value| value == "1");
+    let smoke_cursor_report =
+        std::env::var("ARCEN_MEDIA_SMOKE_CURSOR").is_ok_and(|value| value == "1");
+    let mut smoke_cursor = arcen_input::cursor::DeckCursorState::default();
+    let mut input_sequence = 0_u64;
+    let mut last_input_at = Instant::now();
+    let mut resize_sequence = 0_u64;
+    let mut last_decoded_size: Option<(usize, usize)> = None;
+    // ARCEN_MEDIA_SMOKE_CLIPBOARD_SEND=path[,path...]: once video decodes,
+    // offer each file as the Deck clipboard (`.png` as an image, anything
+    // else as UTF-8 text), one every ARCEN_MEDIA_SMOKE_CLIPBOARD_EVERY
+    // seconds (default 3). Each host clipboard item that arrives is reported
+    // by kind, size and which ARCEN_MEDIA_SMOKE_CLIPBOARD_EXPECT file it
+    // equals; never by content.
+    let mut clipboard_plan = smoke_clipboard_files("ARCEN_MEDIA_SMOKE_CLIPBOARD_SEND")?;
+    let clipboard_expected = smoke_clipboard_files("ARCEN_MEDIA_SMOKE_CLIPBOARD_EXPECT")?;
+    let clipboard_every = Duration::from_secs(
+        std::env::var("ARCEN_MEDIA_SMOKE_CLIPBOARD_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(3),
+    );
+    let mut clipboard_sequence = 0_u64;
+    let mut next_clipboard_at: Option<Instant> = None;
 
     loop {
         if full_frame_requests
@@ -1320,10 +1610,15 @@ async fn media_smoke(
         let remaining = smoke_timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(format!(
-                "media smoke timed out after {}s (video_packets={video_packets}, audio_packets={audio_packets}, received_monitors={:?}, decoded_monitors={:?}, microphone_active={microphone_active})",
+                "media smoke timed out after {}s (video_packets={video_packets}, audio_packets={audio_packets}, received_monitors={:?}, decoded_monitors={:?}, microphone_active={microphone_active}, input_probe_confirmed={input_probe_confirmed}, decoders_wanting_keyframe={:?})",
                 smoke_timeout.as_secs(),
                 received_monitor_ids,
-                decoded_monitor_ids
+                decoded_monitor_ids,
+                decoders
+                    .iter()
+                    .filter(|(_, decoder)| decoder.wants_keyframe())
+                    .map(|(monitor, _)| *monitor)
+                    .collect::<Vec<_>>()
             ));
         }
         let wait = full_frame_requests
@@ -1342,7 +1637,91 @@ async fn media_smoke(
             Err(_) => return Err("timed out waiting for media".to_string()),
         }
         .ok_or_else(|| "session ended before media arrived".to_string())?;
-        if last_health_ping.elapsed() >= Duration::from_secs(5) {
+        if smoke_input
+            && last_decoded_size.is_some()
+            && last_input_at.elapsed() >= Duration::from_millis(50)
+        {
+            input_sequence += 1;
+            // ARCEN_MEDIA_SMOKE_ESCAPE=1: press and release Escape twice
+            // first (a GNOME desktop starts in the Activities overview).
+            if smoke_escape && input_sequence <= 4 {
+                let _ = session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "key_event", "scan_code": 0x0100_0000_u32,
+                        "pressed": input_sequence % 2 == 1, "modifiers": 0,
+                        "sequence": input_sequence
+                    })));
+            } else {
+                let phase = (input_sequence % 100) as f64 / 100.0;
+                let _ = session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "mouse_move", "x": phase, "y": 1.0 - phase,
+                        "server_x": -1, "server_y": -1, "sequence": input_sequence,
+                        "timestamp_ns": 0, "coalescable": true
+                    })));
+            }
+            last_input_at = Instant::now();
+        }
+        if last_decoded_size.is_some() && !clipboard_plan.is_empty() {
+            let due = *next_clipboard_at.get_or_insert_with(Instant::now);
+            if Instant::now() >= due {
+                if let Some((name, kind, bytes)) = clipboard_plan.pop_front() {
+                    clipboard_sequence += 1;
+                    let size = bytes.len();
+                    let queued = arcen_deck::clipboard::ClipboardItem::new(
+                        clipboard_sequence,
+                        kind,
+                        bytes,
+                        false,
+                    )
+                    .is_some_and(|item| session.clipboard.queue_outbound(item));
+                    println!(
+                        "clipboard-sent sequence={clipboard_sequence} kind={kind:?} bytes={size} file={name} queued={queued} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                next_clipboard_at = Some(Instant::now() + clipboard_every);
+            }
+        }
+        while let Some(item) = session.clipboard.take_inbound() {
+            let matches = clipboard_expected
+                .iter()
+                .find(|(_, kind, bytes)| *kind == item.kind && *bytes == item.bytes)
+                .map_or("none", |(name, _, _)| name.as_str());
+            println!(
+                "clipboard-received sequence={} kind={:?} bytes={} truncated={} matches={matches} elapsed_ms={}",
+                item.sequence,
+                item.kind,
+                item.bytes.len(),
+                item.truncated,
+                started.elapsed().as_millis()
+            );
+        }
+        if next_resize_at.is_some_and(|at| Instant::now() >= at) {
+            if let Some((width, height)) = resize_plan.pop_front() {
+                resize_sequence += 1;
+                println!(
+                    "resize-request sequence={resize_sequence} {width}x{height} elapsed_ms={} audio_packets={audio_packets}",
+                    started.elapsed().as_millis()
+                );
+                let _ = session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "display_update",
+                        "sequence": resize_sequence,
+                        "width": width,
+                        "height": height,
+                        "scale": 1.0,
+                        "reason": "media-smoke"
+                    })));
+                next_resize_at = Some(Instant::now() + resize_every);
+            } else {
+                next_resize_at = None;
+            }
+        }
+        if authentication_accepted && last_health_ping.elapsed() >= Duration::from_secs(5) {
             health_sequence += 1;
             let _ = session
                 .commands
@@ -1417,13 +1796,20 @@ async fn media_smoke(
                 server_active_chroma =
                     active_chroma_from_pixel_format(&hello.color_caps.advertised_pix_fmt);
                 if require_multi_monitor {
-                    if hello.input_capabilities.pen != InputCapabilityAvailability::Available {
+                    // Tablet input off (`--tablet-mode off`, `--no-tablet-input`)
+                    // probes regions with pointer buttons instead of the pen,
+                    // for a host without a pen device.
+                    probe_pen = tablet_input_requested;
+                    if probe_pen
+                        && hello.input_capabilities.pen != InputCapabilityAvailability::Available
+                    {
                         return Err(
-                            "host did not advertise native pen input for the multi-monitor session"
+                            "host did not advertise native pen input for the multi-monitor session \
+                             (run with --tablet-mode off to probe without a pen)"
                                 .to_string(),
                         );
                     }
-                    require_last_pen_type = hello.server_name.contains("Windows");
+                    require_last_pen_type = probe_pen && hello.server_name.contains("Windows");
                     let capability = hello
                         .multi_monitor_v1()
                         .map_err(|error| format!("invalid multi-monitor ServerHello: {error}"))?
@@ -1539,15 +1925,28 @@ async fn media_smoke(
                     .commands
                     .send(SessionCommand::AcceptAuthentication)
                     .map_err(|_| "session closed before authentication acceptance".to_string())?;
+                authentication_accepted = true;
+                last_health_ping = Instant::now();
             }
             SessionEvent::MediaReady => {
                 let batch = session.media.take_batch();
                 if require_multi_monitor && !input_probe_sent && input_probe_points.len() >= 2 {
-                    send_multi_monitor_input_probe(&session.commands, &input_probe_points)?;
+                    send_multi_monitor_input_probe(
+                        &session.commands,
+                        &input_probe_points,
+                        probe_pen,
+                    )?;
                     input_probe_sent = true;
                 }
                 video_packets = batch.telemetry.video_received;
-                audio_packets = batch.telemetry.audio_received;
+                // Audio has its own lane and queue (ADR 0014); the video
+                // batch never carries it.
+                let audio_items = session
+                    .media
+                    .audio_lane()
+                    .recv_batch(Duration::ZERO)
+                    .unwrap_or_default();
+                audio_packets = session.media.audio_lane().counters().received;
                 if let Some(error) = &batch.malformed_error {
                     eprintln!("media-smoke ignored malformed media packet: {error}");
                 }
@@ -1559,7 +1958,18 @@ async fn media_smoke(
                     );
                 }
 
-                for (header, payload) in batch.audio {
+                for item in audio_items {
+                    let (header, payload) = match item {
+                        arcen_deck::pipeline::audio_lane::AudioLaneItem::StreamResult(result) => {
+                            audio.set_stream_result(&result);
+                            continue;
+                        }
+                        arcen_deck::pipeline::audio_lane::AudioLaneItem::Frame {
+                            header,
+                            payload,
+                            ..
+                        } => (header, payload),
+                    };
                     audio_packets_consumed += 1;
                     for sample in payload
                         .chunks_exact(2)
@@ -1693,6 +2103,20 @@ async fn media_smoke(
                             full_frame_requests.cancel_pending();
                         }
                         decoded_resolution = Some((frame.width, frame.height));
+                        if last_decoded_size != Some((frame.width, frame.height)) {
+                            if let Some((old_width, old_height)) = last_decoded_size {
+                                println!(
+                                    "decoded-size-change {old_width}x{old_height} -> {}x{} elapsed_ms={} video_packets={video_packets} audio_packets={audio_packets}",
+                                    frame.width,
+                                    frame.height,
+                                    started.elapsed().as_millis()
+                                );
+                            }
+                            last_decoded_size = Some((frame.width, frame.height));
+                            if next_resize_at.is_none() && !resize_plan.is_empty() {
+                                next_resize_at = Some(Instant::now() + resize_every);
+                            }
+                        }
                         let first_decoded_for_monitor = decoded_monitor_ids.insert(monitor_id);
                         decoded_summary = Some(format!(
                             "decoded frame monitor={} {}x{} backend={} pixfmt={} wire_codec={:?} wire_chroma={:?} ts={} video_packets={} audio_packets={}",
@@ -1748,7 +2172,7 @@ async fn media_smoke(
                             println!("health-stats {health}");
                         }
                         println!(
-                            "media-smoke complete displays_mode={} active_pipeline={} monitors_decoded={} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2}",
+                            "media-smoke complete displays_mode={} active_pipeline={} monitors_decoded={} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2} input_sent={input_sequence}",
                             requested_displays_mode,
                             host_active_pipeline,
                             decoded_monitor_ids.len().max(1),
@@ -1770,18 +2194,21 @@ async fn media_smoke(
                     if require_multi_monitor {
                         let stats = serde_json::from_value::<HealthStatsMsg>(value.clone())
                             .map_err(|error| format!("invalid health_stats: {error}"))?;
-                        input_probe_confirmed = stats.input_events >= 8
+                        // Latched: `input_events` counts one health window,
+                        // and the next window must not un-confirm the probe.
+                        let confirmed_now = stats.input_events >= 8
                             && (!require_last_pen_type
                                 || matches!(
                                     stats.last_input_type.as_str(),
                                     "pen_event" | "region_pen_event"
                                 ));
-                        if input_probe_confirmed {
+                        if confirmed_now && !input_probe_confirmed {
                             println!(
                                 "input-probe complete events={} last_type={}",
                                 stats.input_events, stats.last_input_type
                             );
                         }
+                        input_probe_confirmed |= confirmed_now;
                     }
                     last_health = Some(value);
                 } else if msg_type(&value) == Some(arcen_protocol::messages::SERVED_PIPELINE) {
@@ -1792,13 +2219,20 @@ async fn media_smoke(
                     >(value.clone())
                     {
                         println!(
-                            "served-pipeline-update served={} backend={} reason={}",
+                            "served-pipeline-update served={} backend={} reason={} detail={:?}",
                             served.served.token(),
                             served.backend,
-                            served.reason.as_deref().unwrap_or("-")
+                            served.reason.as_deref().unwrap_or("-"),
+                            served.detail.as_deref().unwrap_or("-")
                         );
                         host_active_pipeline = served.served.token().to_string();
                     }
+                } else if msg_type(&value) == Some("display_update_result") {
+                    println!(
+                        "resize-result {} elapsed_ms={} audio_packets={audio_packets}",
+                        value,
+                        started.elapsed().as_millis()
+                    );
                 } else if msg_type(&value) == Some(AUDIO_STREAM_RESULT) {
                     let result = serde_json::from_value::<AudioStreamResultMsg>(value)
                         .map_err(|error| format!("invalid audio result: {error}"))?;
@@ -1821,6 +2255,27 @@ async fn media_smoke(
             }
             SessionEvent::PresentationRecoveryRequested | SessionEvent::ConnectionStatusHint(_) => {
             }
+            // ARCEN_MEDIA_SMOKE_CURSOR=1: report every host cursor record,
+            // applied in lane order as the Deck applies them.
+            SessionEvent::CursorUpdate(bytes) => {
+                let inline = bytes.len() > arcen_protocol::cursor::CURSOR_UPDATE_HEADER_SIZE;
+                match smoke_cursor.apply(&bytes) {
+                    Ok(changed) if smoke_cursor_report => println!(
+                        "cursor-update bytes={} inline_image={inline} changed={changed} cursor={} elapsed_ms={}",
+                        bytes.len(),
+                        describe_deck_cursor(&smoke_cursor.current()),
+                        started.elapsed().as_millis()
+                    ),
+                    Ok(_) => {}
+                    Err(error) => println!("cursor-update dropped: {error}"),
+                }
+            }
+            SessionEvent::CursorLaneReset => {
+                smoke_cursor.reset_lane();
+                if smoke_cursor_report {
+                    println!("cursor-lane-reset");
+                }
+            }
             SessionEvent::MicrophoneActive(active) => {
                 if microphone_requested {
                     if active {
@@ -1839,6 +2294,10 @@ async fn media_smoke(
             SessionEvent::Ended(end) => return Err(end.message),
         }
     }
+    }
+    .await;
+    close_smoke_session(&mut session).await;
+    result
 }
 
 /// Whether the smoke has learned everything it needs to about audio.
@@ -1860,6 +2319,28 @@ const fn audio_requirement_satisfied(
         || !server_supports_audio
         || audio_refused
         || audio_packets_consumed > 0
+}
+
+fn describe_deck_cursor(cursor: &arcen_input::cursor::DeckCursor) -> String {
+    use arcen_input::cursor::DeckCursor;
+    match cursor {
+        DeckCursor::Default => "default".to_owned(),
+        DeckCursor::Hidden => "hidden".to_owned(),
+        DeckCursor::Named(shape) => format!("named:{shape:?}"),
+        DeckCursor::Image {
+            id,
+            image,
+            output,
+            generation,
+        } => format!(
+            "image:{}:{}x{}@{},{}:output{output}:gen{generation}",
+            id.get(),
+            image.width(),
+            image.height(),
+            image.hotspot().0,
+            image.hotspot().1
+        ),
+    }
 }
 
 fn rotate_secondary_for_smoke(
@@ -1901,6 +2382,7 @@ struct MultiMonitorInputProbePoint {
 
 fn multi_monitor_input_probe_events(
     points: &[MultiMonitorInputProbePoint],
+    pen: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     if points.len() < 2 {
         return Err("multi-monitor input probe requires two regions".to_string());
@@ -1945,33 +2427,51 @@ fn multi_monitor_input_probe_events(
             "delta_x":0,"delta_y":-120,
             "sequence":6,"timestamp_ns":0,"coalescable":false
         }),
-        serde_json::json!({
-            "type":"region_pen_event",
-            "region_generation":second.region_generation,"region_id":second.region_id,
-            "logical_x":second.logical_x,"logical_y":second.logical_y,
-            "pressure":0.55,"tilt_x_degrees":8.0,"tilt_y_degrees":-5.0,
-            "rotation_degrees":15.0,"tool":"tip","in_proximity":true,
-            "touching":true,"buttons":0,"sequence":7,"timestamp_ns":0,
-            "coalescable":true
-        }),
-        serde_json::json!({
-            "type":"region_pen_event",
-            "region_generation":second.region_generation,"region_id":second.region_id,
-            "logical_x":second.logical_x,"logical_y":second.logical_y,
-            "pressure":0.0,"tilt_x_degrees":0.0,"tilt_y_degrees":0.0,
-            "rotation_degrees":0.0,"tool":"tip","in_proximity":false,
-            "touching":false,"buttons":0,"sequence":8,"timestamp_ns":0,
-            "coalescable":false
-        }),
     ];
+    let mut events = events;
+    if pen {
+        events.extend([
+            serde_json::json!({
+                "type":"region_pen_event",
+                "region_generation":second.region_generation,"region_id":second.region_id,
+                "logical_x":second.logical_x,"logical_y":second.logical_y,
+                "pressure":0.55,"tilt_x_degrees":8.0,"tilt_y_degrees":-5.0,
+                "rotation_degrees":15.0,"tool":"tip","in_proximity":true,
+                "touching":true,"buttons":0,"sequence":7,"timestamp_ns":0,
+                "coalescable":true
+            }),
+            serde_json::json!({
+                "type":"region_pen_event",
+                "region_generation":second.region_generation,"region_id":second.region_id,
+                "logical_x":second.logical_x,"logical_y":second.logical_y,
+                "pressure":0.0,"tilt_x_degrees":0.0,"tilt_y_degrees":0.0,
+                "rotation_degrees":0.0,"tool":"tip","in_proximity":false,
+                "touching":false,"buttons":0,"sequence":8,"timestamp_ns":0,
+                "coalescable":false
+            }),
+        ]);
+    } else {
+        // A right click: harmless on a desktop, and an edge the host must
+        // land on the second region's output.
+        for (sequence, pressed) in [(7, true), (8, false)] {
+            events.push(serde_json::json!({
+                "type":"region_pointer_button",
+                "region_generation":second.region_generation,"region_id":second.region_id,
+                "logical_x":second.logical_x,"logical_y":second.logical_y,
+                "button":3,"pressed":pressed,"sequence":sequence,"timestamp_ns":0,
+                "coalescable":false
+            }));
+        }
+    }
     Ok(events)
 }
 
 fn send_multi_monitor_input_probe(
     commands: &SessionCommandSender,
     points: &[MultiMonitorInputProbePoint],
+    pen: bool,
 ) -> Result<(), String> {
-    for event in multi_monitor_input_probe_events(points)? {
+    for event in multi_monitor_input_probe_events(points, pen)? {
         commands
             .send(SessionCommand::Json(event))
             .map_err(|_| "session closed while sending multi-monitor input probe".to_string())?;
@@ -1982,6 +2482,14 @@ fn send_multi_monitor_input_probe(
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
+}
+
+/// Every value of a repeatable flag, in order.
+fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 #[cfg(all(test, unix))]
@@ -2001,7 +2509,7 @@ mod tests {
 
     #[test]
     fn multi_monitor_smoke_uses_region_authoritative_input_messages() {
-        let events = multi_monitor_input_probe_events(&[
+        let points = [
             MultiMonitorInputProbePoint {
                 region_generation: 9,
                 region_id: 1,
@@ -2014,8 +2522,14 @@ mod tests {
                 logical_x: 120_000,
                 logical_y: 72_000,
             },
-        ])
-        .expect("two-region probe");
+        ];
+        let without_pen = multi_monitor_input_probe_events(&points, false).expect("probe");
+        assert_eq!(without_pen.len(), 8);
+        assert_eq!(without_pen[6]["type"], "region_pointer_button");
+        assert_eq!(without_pen[6]["pressed"], true);
+        assert_eq!(without_pen[7]["pressed"], false);
+        assert_eq!(without_pen[7]["sequence"], 8);
+        let events = multi_monitor_input_probe_events(&points, true).expect("two-region probe");
 
         let types = events
             .iter()

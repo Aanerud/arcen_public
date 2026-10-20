@@ -420,6 +420,8 @@ The settings file also supports:
 - `platform.logging.rotate_mb` (default 32)
 - `logging.retention_days` (default 30, normalized to 7–100)
 - `platform.first_login_timeout_secs`
+- `platform.font_smoothing` (`unchanged` default, or `grayscale` to serve
+  ClearType sessions with grey-scale text; restored when the session ends)
 
 Explicit CLI flags override JSON values. `--output-index`, `--adapter-name`,
 and `--adapter-output-index` are available as diagnostic overrides.

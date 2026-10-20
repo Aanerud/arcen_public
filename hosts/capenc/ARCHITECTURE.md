@@ -13,7 +13,7 @@ one pixel pipeline.
 | Contract | Capture → conversion → encode | Copy boundary |
 | --- | --- | --- |
 | Linux Auto/Speed, 8-bit | NvFBC → CUDA → NVENC | Device-to-device; no host frame copy |
-| Linux Grading, 10-bit SDR | Depth-30 Xorg → MIT-SHM packed RGB10 → shared RGB10-to-P16 conversion → CUDA → NVENC | Host capture/conversion plus one host-to-device upload |
+| Linux Grading, 10-bit SDR | Depth-30 Xorg → MIT-SHM packed RGB10 (the XDamage rectangle, or the whole frame compared with the last whole frame) → shared RGB10-to-P16 conversion of what changed → page-locked host planes → CUDA master frame → NVENC slot | Host capture/conversion of the changed rectangle, one host-to-device upload of it, one device-to-device copy of the frame |
 | Linux HDR request on Xorg | Same as Linux Grading after the Pier changes transfer/primaries/matrix to BT.709 | Explicit degradation; capenc refuses PQ/HLG from Xorg |
 | Windows Auto/Speed, 8-bit | DDA after real-image proof, otherwise WGC BGRA8 → D3D11 staging → negotiated YUV → NVENC | CPU-visible conversion path |
 | Windows Grading, 10-bit SDR | WGC FP16 scRGB → shared SDR OETF/matrix → NVENC I444 P16 | CPU-visible FP16 conversion |
@@ -64,24 +64,48 @@ because the destination buffer is wider.
    Windows BGRA/FP16 conversion, MF and OpenH264 are explicit bounded
    CPU-visible paths and must identify capture backend and copy cost in
    READY/telemetry.
-4. Platform backends stay behind `cfg`; production Linux capenc uses
+4. The Linux depth-30 loop reads only what changed, and never trusts less
+   than it can prove (`wide-regions=on` by default, `off` reads every picture
+   whole).
+   - **Rectangles.** XDamage bounding boxes since the last picture become one
+     rectangle (shared `CaptureDamage`). When it covers at most half the output,
+     only that rectangle is read (`ShmGetImage` of the rectangle), converted
+     with the same per-pixel code as a whole frame
+     (`convert_packed_rgb10_region_to_i444_p16`), and uploaded into a
+     persistent GPU master frame that is copied whole into each NVENC slot.
+   - **Whole frames.** A compositor that swaps its whole frame (GNOME Shell on
+     Xorg) reports the whole screen. Such a frame is read whole into the
+     second of two MIT-SHM segments and compared with the last whole frame
+     (shared `changed_bounds`), and only the differing rectangle is converted
+     and uploaded. After a comparison finds more than half the frame changed,
+     the next 15 whole pictures skip the comparison.
+   - **Always whole.** The first picture, a keyframe, a keepalive, any picture
+     two seconds after the last whole staging, a recreated capture, a source
+     without XDamage, and any region staging (which invalidates the
+     comparison frame) read and stage everything.
+   - **Nothing new.** A pipeline flush with nothing new re-sends the master.
+   - **Verification.** `wide-region-verify=N` checks every Nth bounded staging
+     against a whole conversion: a comparison-bounded one against the frame it
+     came from, a rectangle against a whole read taken while XDamage stayed
+     quiet. The host planes and the read-back GPU master must both match.
+5. Platform backends stay behind `cfg`; production Linux capenc uses
    `--features nvenc,software-h264`.
-5. CLI stable: `--display :N`, `--monitor N`, `--fps`, `codec`, `yuv444`,
+6. CLI stable: `--display :N`, `--monitor N`, `--fps`, `codec`, `yuv444`,
    `cursor=local|host`, framed, selftest.
-6. Linux idle gating never removes the per-submission NvFBC→NVENC restage. Its one-deep
+7. Linux idle gating never removes the per-submission NvFBC→NVENC restage. Its one-deep
    NVENC pipeline receives a next-tick duplicate after first/activity/IDR so the newest
    frame cannot remain queued until keepalive.
-7. `ERR_MUST_RECREATE` invalidates NvFBC's retained CUDA pointer and cadence state.
+8. `ERR_MUST_RECREATE` invalidates NvFBC's retained CUDA pointer and cadence state.
    The first stale NVENC output already in flight is dropped before the fresh IDR is exposed.
-8. Linux emits versioned READY only after a real frame is captured, staged, and
+9. Linux emits versioned READY only after a real frame is captured, staged, and
    accepted by NVENC. READY includes the fixed cursor mode; the Pier must not
    advertise codec/chroma/backend/cursor before validating it.
-9. Windows Host cursor mode is WGC-only. The WGC cursor toggle is strict; DDA is
+10. Windows Host cursor mode is WGC-only. The WGC cursor toggle is strict; DDA is
    local-cursor-only and has no cursor-shape compositor.
-10. Linux depth-30 XShm has no host-cursor compositor. The Linux Pier resolves
+11. Linux depth-30 XShm has no host-cursor compositor. The Linux Pier resolves
     Host to Local before native preflight and live spawn; eight-bit NvFBC keeps
     its existing in-video cursor path.
-11. The default dependency graph contains no OpenH264/native build graph.
+12. The default dependency graph contains no OpenH264/native build graph.
     `software-h264` enables only `arcen-media/software-h264-source`; no host
     module calls `openh264-sys2`.
 
@@ -119,6 +143,12 @@ because the destination buffer is wider.
 - `linux_x11.rs` — XRandR/XDamage/MIT-SHM 1.2 capture, depth-24 BGRA and
   depth-30 mask-derived RGB10 layouts, bounded GetImage degradation, checked
   modeset recreation, and shared OpenH264 loop.
+- `wayland/` (feature `wayland`, default off) — Wayland provider capture: the
+  session hand-off, a `PipeWire` consumer with bounded, revocable buffer
+  leases, the `host-copy` route into the NVENC CUDA slot (proven on GNOME 40
+  shared memory), an unqualified DMA-BUF EGL/CUDA route, capture-path
+  telemetry, and the `wayland-capture-probe` lab harness. See
+  `docs/architecture/linux-wayland-provider.md`.
 - `region_schedule.rs` — host-neutral binding of `arcen-media`'s
   `RegionActivityScheduler` for both software capture loops. It owns the Keel
   damage tracker that already drives selective conversion, so one hash pass per

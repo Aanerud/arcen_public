@@ -27,7 +27,8 @@
   },
   "audio": {
     "enabled": true,
-    "compressed": true
+    "compressed": true,
+    "local_playback": "muted"
   },
   "microphone_input": {
     "enabled": true
@@ -79,6 +80,7 @@
       "display": ":11",
       "gpu_head": "DFP-2",
       "xorg_bin": "/usr/libexec/Xorg",
+      "wayland_x11_apps": "auto",
       "xorg_config_template": "/etc/arcen/xorg.conf",
       "runtime_root": "/run/arcen/sessions",
       "zoneinfo_root": "/usr/share/zoneinfo",

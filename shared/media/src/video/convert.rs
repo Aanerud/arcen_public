@@ -1429,22 +1429,149 @@ impl Rgb10Signal {
             Self::Direct => rgb,
             Self::PqBt2020ToSdrBt709 => {
                 let decode = pq_code_to_graphics_white_linear();
-                let linear = rgb.map(|code| decode[usize::from(code.min(WIDE_INPUT_MAX))]);
-                let oetf = sdr_bt709_oetf_codes();
-                BT2020_TO_BT709.map(|row| {
-                    let value = (row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2])
-                        .clamp(0.0, 1.0);
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss
-                    )]
-                    let index = (value * SDR_OETF_STEPS as f32).round() as usize;
-                    oetf[index.min(SDR_OETF_STEPS)]
-                })
+                bt2020_graphics_linear_to_sdr_bt709_codes(
+                    rgb.map(|code| decode[usize::from(code.min(WIDE_INPUT_MAX))]),
+                )
             }
         }
     }
+
+    /// Maps one pixel of half-float PQ / BT.2020 signal (`R'G'B'` in
+    /// `0.0..=1.0`, as a colour-managed compositor writes an `RGBA_F16`
+    /// screencast in an HDR colour state) into the ten-bit codes the matrix
+    /// expects.
+    ///
+    /// [`Self::Direct`] keeps the PQ signal and rounds it to ten bits.
+    /// [`Self::PqBt2020ToSdrBt709`] decodes the half-float signal itself, not
+    /// a ten-bit rounding of it: an SDR ramp composed at 203-nit white keeps
+    /// 853 of the 1024 ten-bit BT.709 codes this way, against 445 through
+    /// ten-bit PQ codes (half-float PQ steps are coarser than one SDR code
+    /// near white).
+    #[must_use]
+    #[inline]
+    pub fn map_pq_half(self, rgb: [u16; 3]) -> [u16; 3] {
+        match self {
+            Self::Direct => {
+                let codes = pq_half_to_code();
+                rgb.map(|bits| codes[usize::from(bits)])
+            }
+            Self::PqBt2020ToSdrBt709 => {
+                let decode = pq_half_to_graphics_white_linear();
+                bt2020_graphics_linear_to_sdr_bt709_codes(rgb.map(|bits| decode[usize::from(bits)]))
+            }
+        }
+    }
+}
+
+/// Linear BT.2020 light relative to 203-nit graphics white to ten-bit
+/// BT.709 SDR codes: primaries mapped, clipped at SDR white, BT.709 OETF.
+fn bt2020_graphics_linear_to_sdr_bt709_codes(linear: [f32; 3]) -> [u16; 3] {
+    let oetf = sdr_bt709_oetf_codes();
+    BT2020_TO_BT709.map(|row| {
+        let value = (row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2]).clamp(0.0, 1.0);
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let index = (value * SDR_OETF_STEPS as f32).round() as usize;
+        oetf[index.min(SDR_OETF_STEPS)]
+    })
+}
+
+/// Every half-float PQ signal to its nearest ten-bit code; negative, NaN and
+/// above-peak values clamp.
+fn pq_half_to_code() -> &'static [u16] {
+    static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..HALF_CODE_COUNT)
+            .map(|bits| {
+                let signal = half_to_f32(u16::try_from(bits).unwrap_or(u16::MAX));
+                let signal = if signal.is_nan() {
+                    0.0
+                } else {
+                    signal.clamp(0.0, 1.0)
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    (signal * f32::from(WIDE_INPUT_MAX)).round() as u16
+                }
+            })
+            .collect()
+    })
+}
+
+/// Every half-float PQ signal to linear light relative to 203-nit graphics
+/// white.
+fn pq_half_to_graphics_white_linear() -> &'static [f32] {
+    static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..HALF_CODE_COUNT)
+            .map(|bits| {
+                let signal = half_to_f32(u16::try_from(bits).unwrap_or(u16::MAX));
+                let signal = if signal.is_nan() {
+                    0.0
+                } else {
+                    signal.clamp(0.0, 1.0)
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (pq_signal_to_linear_nits(f64::from(signal))
+                        / super::pq_white::GRAPHICS_WHITE_NITS) as f32
+                }
+            })
+            .collect()
+    })
+}
+
+/// Normalise one half-float PQ / BT.2020 frame (`RGBA_F16`, R, G, B, A
+/// half-floats, little-endian) into packed `XRGB2101010` words, through
+/// [`Rgb10Signal::map_pq_half`].
+///
+/// The output is exactly what the packed RGB10 conversions consume with
+/// [`PackedRgb10Layout::XRGB2101010`] and [`Rgb10Signal::Direct`]: the
+/// signal has already been applied, so the colour matrix, chroma siting and
+/// MSB alignment stay in one place for every wide source. Alpha is ignored,
+/// as in every other capture path here.
+///
+/// # Errors
+///
+/// [`ConversionError::GeometryMismatch`] when a source or destination row is
+/// too short for the stated geometry, checked before any write.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_rgba_f16_pq_to_packed_rgb10(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    width: usize,
+    height: usize,
+    signal: Rgb10Signal,
+) -> Result<(), ConversionError> {
+    let src_row_bytes = width
+        .checked_mul(8)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    let dst_row_bytes = width
+        .checked_mul(4)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if src_stride < src_row_bytes
+        || dst_stride < dst_row_bytes
+        || src.len() < src_stride.saturating_mul(height)
+        || dst.len() < dst_stride.saturating_mul(height)
+    {
+        return Err(ConversionError::GeometryMismatch);
+    }
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + src_row_bytes];
+        let dst_row = &mut dst[row * dst_stride..row * dst_stride + dst_row_bytes];
+        for (pixel, word) in src_row.chunks_exact(8).zip(dst_row.chunks_exact_mut(4)) {
+            let half = |offset: usize| u16::from_le_bytes([pixel[offset], pixel[offset + 1]]);
+            let [r, g, b] = signal.map_pq_half([half(0), half(2), half(4)]);
+            let packed = (u32::from(r) << 20) | (u32::from(g) << 10) | u32::from(b);
+            word.copy_from_slice(&packed.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Convert a packed RGB10 frame to planar 4:4:4 sixteen-bit.
@@ -1504,19 +1631,121 @@ pub fn convert_packed_rgb10_to_i444_p16(
         let y_row = &mut y_plane[row * plane_strides[0]..row * plane_strides[0] + width];
         let u_row = &mut u_plane[row * plane_strides[1]..row * plane_strides[1] + width];
         let v_row = &mut v_plane[row * plane_strides[2]..row * plane_strides[2] + width];
-        for column in 0..width {
-            let base = column * 4;
-            let word = u32::from_le_bytes([
-                src_row[base],
-                src_row[base + 1],
-                src_row[base + 2],
-                src_row[base + 3],
-            ]);
-            let [r, g, b] = signal.map(layout.components(word));
-            y_row[column] = transform.pack_p16(transform.luma_wide(b, g, r));
-            u_row[column] = transform.pack_p16(transform.cb_wide(b, g, r));
-            v_row[column] = transform.pack_p16(transform.cr_wide(b, g, r));
+        convert_packed_rgb10_row_to_i444_p16(
+            src_row,
+            [y_row, u_row, v_row],
+            layout,
+            transform,
+            signal,
+        );
+    }
+    Ok(())
+}
+
+/// The per-pixel body every packed RGB10 to I444P16 conversion shares, so a
+/// region and a whole frame can never convert a pixel differently.
+fn convert_packed_rgb10_row_to_i444_p16(
+    src_row: &[u8],
+    [y_row, u_row, v_row]: [&mut [u16]; 3],
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+    signal: Rgb10Signal,
+) {
+    for (column, word) in src_row.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let [r, g, b] = signal.map(layout.components(word));
+        y_row[column] = transform.pack_p16(transform.luma_wide(b, g, r));
+        u_row[column] = transform.pack_p16(transform.cb_wide(b, g, r));
+        v_row[column] = transform.pack_p16(transform.cr_wide(b, g, r));
+    }
+}
+
+/// A rectangle of a frame, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRegion {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Convert a packed RGB10 sub-image into one rectangle of planar 4:4:4
+/// sixteen-bit planes that already hold the rest of the frame.
+///
+/// `src` holds only the region: `region.height` rows of `region.width`
+/// packed words at `src_stride`, as an MIT-SHM `GetImage` of that rectangle
+/// returns them. Every pixel converts exactly as
+/// [`convert_packed_rgb10_to_i444_p16`] converts it in a whole frame of
+/// `frame_width` x `frame_height`; samples outside the region are untouched.
+///
+/// # Errors
+///
+/// [`ConversionError::GeometryMismatch`] when the region is empty or leaves
+/// the frame, or a source row or plane is too short, checked before any write.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_packed_rgb10_region_to_i444_p16(
+    src: &[u8],
+    src_stride: usize,
+    planes: [&mut [u16]; 3],
+    plane_strides: [usize; 3],
+    frame_width: usize,
+    frame_height: usize,
+    region: FrameRegion,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+    signal: Rgb10Signal,
+) -> Result<(), ConversionError> {
+    let FrameRegion {
+        x,
+        y,
+        width,
+        height,
+    } = region;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or(ConversionError::GeometryMismatch)?;
+    if width == 0
+        || height == 0
+        || x.checked_add(width).is_none_or(|right| right > frame_width)
+        || y.checked_add(height)
+            .is_none_or(|bottom| bottom > frame_height)
+        || src_stride < row_bytes
+        || src.len()
+            < src_stride
+                .saturating_mul(height - 1)
+                .saturating_add(row_bytes)
+    {
+        return Err(ConversionError::GeometryMismatch);
+    }
+    let [y_plane, u_plane, v_plane] = planes;
+    for (plane, stride) in [
+        (&*y_plane, plane_strides[0]),
+        (&*u_plane, plane_strides[1]),
+        (&*v_plane, plane_strides[2]),
+    ] {
+        if stride < frame_width || plane.len() < stride.saturating_mul(frame_height) {
+            return Err(ConversionError::GeometryMismatch);
         }
+    }
+    for row in 0..height {
+        let src_row = &src[row * src_stride..row * src_stride + row_bytes];
+        let at = |stride: usize| (y + row) * stride + x;
+        let (ys, us, vs) = (
+            at(plane_strides[0]),
+            at(plane_strides[1]),
+            at(plane_strides[2]),
+        );
+        convert_packed_rgb10_row_to_i444_p16(
+            src_row,
+            [
+                &mut y_plane[ys..ys + width],
+                &mut u_plane[us..us + width],
+                &mut v_plane[vs..vs + width],
+            ],
+            layout,
+            transform,
+            signal,
+        );
     }
     Ok(())
 }
@@ -2965,5 +3194,358 @@ mod pq_to_sdr_tests {
         assert!(y[0] >> 6 >= 1020, "luma {}", y[0] >> 6);
         assert_eq!(u[0] >> 6, 512);
         assert_eq!(v[0] >> 6, 512);
+    }
+}
+
+#[cfg(test)]
+mod pq_half_tests {
+    use super::{
+        ConversionError, PackedRgb10Layout, Rgb10Signal, WIDE_INPUT_MAX,
+        convert_rgba_f16_pq_to_packed_rgb10, half_to_f32, linear_nits_to_pq_signal,
+    };
+
+    /// Nearest binary16 to a value in `0.0..=1.0` (positive halves order as
+    /// their bits do).
+    fn half(value: f32) -> u16 {
+        let (mut low, mut high) = (0u16, 0x3c00u16);
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if half_to_f32(mid) <= value {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        if (value - half_to_f32(low)).abs() <= (half_to_f32(high) - value).abs() {
+            low
+        } else {
+            high
+        }
+    }
+
+    fn pq_half(nits: f32) -> u16 {
+        half(linear_nits_to_pq_signal(nits))
+    }
+
+    fn inverse_bt709(signal: f32) -> f32 {
+        if signal < 0.081 {
+            signal / 4.5
+        } else {
+            ((signal + 0.099) / 1.099).powf(1.0 / 0.45)
+        }
+    }
+
+    #[test]
+    fn direct_rounds_the_pq_signal_to_ten_bits_exactly() {
+        for code in 0..=WIDE_INPUT_MAX {
+            let bits = half(f32::from(code) / f32::from(WIDE_INPUT_MAX));
+            assert_eq!(
+                Rgb10Signal::Direct.map_pq_half([bits, bits, bits]),
+                [code, code, code],
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_clamps_out_of_range_half_floats() {
+        // -1.0, 2.0, +inf, NaN.
+        for bits in [0xbc00, 0x4000, 0x7c00, 0x7e00] {
+            let code = Rgb10Signal::Direct.map_pq_half([bits, bits, bits])[0];
+            assert!(code == 0 || code == WIDE_INPUT_MAX, "{bits:#06x} -> {code}");
+        }
+    }
+
+    #[test]
+    fn to_sdr_places_graphics_white_at_sdr_white() {
+        let signal = Rgb10Signal::PqBt2020ToSdrBt709;
+        let white = pq_half(203.0);
+        assert!(
+            signal
+                .map_pq_half([white, white, white])
+                .iter()
+                .all(|code| *code >= 1022)
+        );
+        assert_eq!(signal.map_pq_half([0, 0, 0]), [0, 0, 0]);
+        let highlight = pq_half(1000.0);
+        assert_eq!(
+            signal.map_pq_half([highlight, highlight, highlight]),
+            [1023, 1023, 1023]
+        );
+    }
+
+    #[test]
+    fn to_sdr_from_half_floats_keeps_more_sdr_precision_than_ten_bit_pq() {
+        // An SDR ramp composed into PQ at 203-nit white. Half-float PQ has
+        // 2^-11 steps above 0.5, coarser than one ten-bit SDR code near white,
+        // so it carries 853 of the 1024 BT.709 codes (each within one code);
+        // the same ramp through ten-bit PQ codes keeps 445. Eight-bit SDR is
+        // 256. These are properties of the transfer, not of any capture.
+        let mut via_half = std::collections::BTreeSet::new();
+        let mut via_rgb10 = std::collections::BTreeSet::new();
+        let mut worst = 0i32;
+        for code in 0..=WIDE_INPUT_MAX {
+            let nits = inverse_bt709(f32::from(code) / f32::from(WIDE_INPUT_MAX)) * 203.0;
+            let bits = pq_half(nits);
+            let out = Rgb10Signal::PqBt2020ToSdrBt709.map_pq_half([bits, bits, bits])[1];
+            worst = worst.max((i32::from(out) - i32::from(code)).abs());
+            via_half.insert(out);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pq10 = (linear_nits_to_pq_signal(nits) * f32::from(WIDE_INPUT_MAX)).round() as u16;
+            via_rgb10.insert(Rgb10Signal::PqBt2020ToSdrBt709.map([pq10, pq10, pq10])[1]);
+        }
+        assert!(worst <= 1, "worst error {worst} codes");
+        assert!(via_half.len() >= 850, "{} distinct codes", via_half.len());
+        assert!(
+            (440..=450).contains(&via_rgb10.len()),
+            "{} distinct codes",
+            via_rgb10.len()
+        );
+    }
+
+    #[test]
+    fn frame_normalisation_writes_xrgb2101010_words() {
+        let one = half(1.0);
+        let zero = half(0.0);
+        let mid = half(512.0 / 1023.0);
+        let pixels: [[u16; 4]; 2] = [[one, zero, mid, one], [zero, one, zero, one]];
+        let source: Vec<u8> = pixels
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut packed = vec![0u8; 8];
+        convert_rgba_f16_pq_to_packed_rgb10(&source, 16, &mut packed, 8, 2, 1, Rgb10Signal::Direct)
+            .expect("convert");
+        let words: Vec<u32> = packed
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        assert_eq!(
+            PackedRgb10Layout::XRGB2101010.components(words[0]),
+            [1023, 0, 512]
+        );
+        assert_eq!(
+            PackedRgb10Layout::XRGB2101010.components(words[1]),
+            [0, 1023, 0]
+        );
+    }
+
+    #[test]
+    fn frame_normalisation_refuses_short_geometry() {
+        let source = vec![0u8; 16];
+        let mut packed = vec![0u8; 8];
+        assert_eq!(
+            convert_rgba_f16_pq_to_packed_rgb10(
+                &source,
+                8,
+                &mut packed,
+                8,
+                2,
+                1,
+                Rgb10Signal::Direct
+            ),
+            Err(ConversionError::GeometryMismatch)
+        );
+        assert_eq!(
+            convert_rgba_f16_pq_to_packed_rgb10(
+                &source,
+                16,
+                &mut packed,
+                4,
+                2,
+                1,
+                Rgb10Signal::Direct
+            ),
+            Err(ConversionError::GeometryMismatch)
+        );
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::{BitDepth, ColorMatrix, ColorRange};
+
+    const W: usize = 37;
+    const H: usize = 23;
+
+    fn transform() -> ColorTransform {
+        ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(WIDE_INPUT_MAX),
+        )
+    }
+
+    /// A deterministic frame of distinct ten-bit codes, with `pad` bytes of
+    /// row padding the conversion must ignore.
+    fn frame(seed: u32, pad: usize) -> (Vec<u8>, usize) {
+        let stride = W * 4 + pad;
+        let mut bytes = vec![0xA5u8; stride * H];
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        for row in 0..H {
+            for column in 0..W {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let word = state & 0x3fff_ffff;
+                bytes[row * stride + column * 4..row * stride + column * 4 + 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        (bytes, stride)
+    }
+
+    fn planes_of(src: &[u8], stride: usize, signal: Rgb10Signal) -> Vec<u16> {
+        let mut planes = vec![0u16; W * H * 3];
+        let (y, rest) = planes.split_at_mut(W * H);
+        let (u, v) = rest.split_at_mut(W * H);
+        convert_packed_rgb10_to_i444_p16(
+            src,
+            stride,
+            [y, u, v],
+            [W, W, W],
+            W,
+            H,
+            PackedRgb10Layout::XBGR2101010,
+            transform(),
+            signal,
+        )
+        .expect("whole frame converts");
+        planes
+    }
+
+    /// The region as `ShmGetImage` of that rectangle hands it back: packed,
+    /// one row of `width` words after another.
+    fn sub_image(src: &[u8], stride: usize, region: FrameRegion) -> Vec<u8> {
+        let mut out = Vec::with_capacity(region.width * region.height * 4);
+        for row in region.y..region.y + region.height {
+            let start = row * stride + region.x * 4;
+            out.extend_from_slice(&src[start..start + region.width * 4]);
+        }
+        out
+    }
+
+    fn apply_region(planes: &mut [u16], src: &[u8], region: FrameRegion, signal: Rgb10Signal) {
+        let (y, rest) = planes.split_at_mut(W * H);
+        let (u, v) = rest.split_at_mut(W * H);
+        convert_packed_rgb10_region_to_i444_p16(
+            src,
+            region.width * 4,
+            [y, u, v],
+            [W, W, W],
+            W,
+            H,
+            region,
+            PackedRgb10Layout::XBGR2101010,
+            transform(),
+            signal,
+        )
+        .expect("region converts");
+    }
+
+    /// Updating only the changed rectangle of the previous frame's planes
+    /// gives exactly the planes of converting the whole new frame.
+    #[test]
+    fn a_region_update_equals_a_whole_frame_conversion() {
+        let regions = [
+            FrameRegion {
+                x: 0,
+                y: 0,
+                width: W,
+                height: H,
+            },
+            FrameRegion {
+                x: 5,
+                y: 3,
+                width: 11,
+                height: 7,
+            },
+            FrameRegion {
+                x: W - 1,
+                y: H - 1,
+                width: 1,
+                height: 1,
+            },
+            FrameRegion {
+                x: 30,
+                y: 0,
+                width: 7,
+                height: H,
+            },
+        ];
+        for signal in [Rgb10Signal::Direct, Rgb10Signal::PqBt2020ToSdrBt709] {
+            let (before, stride) = frame(1, 12);
+            let (changed, _) = frame(2, 12);
+            for region in regions {
+                let mut after = before.clone();
+                for row in region.y..region.y + region.height {
+                    let start = row * stride + region.x * 4;
+                    let end = start + region.width * 4;
+                    after[start..end].copy_from_slice(&changed[start..end]);
+                }
+                let mut planes = planes_of(&before, stride, signal);
+                apply_region(
+                    &mut planes,
+                    &sub_image(&after, stride, region),
+                    region,
+                    signal,
+                );
+                assert_eq!(
+                    planes,
+                    planes_of(&after, stride, signal),
+                    "{region:?} {signal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_region_outside_the_frame_or_short_source_is_refused_untouched() {
+        let mut planes = vec![7u16; W * H * 3];
+        let (y, rest) = planes.split_at_mut(W * H);
+        let (u, v) = rest.split_at_mut(W * H);
+        let mut attempt = |region: FrameRegion, src_len: usize| {
+            convert_packed_rgb10_region_to_i444_p16(
+                &vec![0u8; src_len],
+                region.width * 4,
+                [&mut *y, &mut *u, &mut *v],
+                [W, W, W],
+                W,
+                H,
+                region,
+                PackedRgb10Layout::XBGR2101010,
+                transform(),
+                Rgb10Signal::Direct,
+            )
+        };
+        let inside = FrameRegion {
+            x: 1,
+            y: 1,
+            width: 4,
+            height: 4,
+        };
+        assert_eq!(
+            attempt(inside, 4 * 4 * 4 - 1),
+            Err(ConversionError::GeometryMismatch)
+        );
+        for region in [
+            FrameRegion { x: W - 3, ..inside },
+            FrameRegion { y: H - 3, ..inside },
+            FrameRegion { width: 0, ..inside },
+            FrameRegion {
+                height: 0,
+                ..inside
+            },
+        ] {
+            assert_eq!(
+                attempt(region, 4096),
+                Err(ConversionError::GeometryMismatch),
+                "{region:?}"
+            );
+        }
+        assert!(planes.iter().all(|&sample| sample == 7));
     }
 }

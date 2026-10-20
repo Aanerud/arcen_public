@@ -248,11 +248,29 @@ decoder slot.
 - DIBV5 conversion accepts exactly a 124-byte header, 32-bpp BI_RGB or standard
   BGRA bitfields, checked top-down/bottom-up rows, and sRGB. Output is top-down
   BGRA. PNG output uses a capped writer.
+- `clipboard::formats` is the one host-format table: which X11 targets and
+  MIME types carry text and PNG, the order a host reads them in (UTF-8 names,
+  then `text/plain`/`TEXT`, then latin-1 `STRING`, then `image/png`), the
+  names a host offers, latin-1 conversion, and `validate_payload` /
+  `decode_host_payload`. Oversized payloads are refused, never truncated.
+- `clipboard::bridge::SelectionBridge` is a pure event→action state machine
+  for compositors with owner-change / read / set-selection / transfer
+  clipboards (Mutter's `RemoteDesktop` today). It holds no clock and does no
+  I/O. It does not send the baseline owner, never reads back its own
+  ownership, and cancels an older read when a newer change arrives. A read is
+  bounded at `max_bytes + 1`. At most `MAX_CONCURRENT_HOST_WRITES` writes run
+  at once, and payloads are scrubbed.
+- `clipboard::eligibility` decides whether a host session may carry the
+  clipboard at all (authenticated, dedicated desktop, unprivileged user, a
+  proven native bridge) and names the first failing fact.
+- `ClipboardRequest::from_hello` and `policy_from_message` are the pure
+  mappings between the client hello, the policy wire message and the shared
+  types.
 
 The crate remains `#![forbid(unsafe_code)]`, deterministic, I/O-free,
 platform-free, and free of native handles. Wire messages, chunking, and
-reassembly remain in `arcen-protocol`; AppKit, Win32, and X11 ownership remains
-in product adapters.
+reassembly remain in `arcen-protocol`; AppKit, Win32, X11 and Mutter D-Bus
+ownership remain in product adapters.
 
 ## Video source and colour contracts
 

@@ -253,6 +253,11 @@ impl FrameQueue {
         self.inner.lock().unwrap().bytes_sent()
     }
 
+    /// The part of [`Self::bytes_sent`] that carried keyframes.
+    pub fn keyframe_bytes_sent(&self) -> u64 {
+        self.inner.lock().unwrap().keyframe_bytes_sent()
+    }
+
     pub fn take_wait_stats(&self) -> VideoQueueWaitStats {
         self.inner.lock().unwrap().take_wait_stats()
     }

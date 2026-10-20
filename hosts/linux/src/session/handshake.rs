@@ -6,6 +6,7 @@
 
 use crate::cli::{AuthMode, Config};
 use crate::session::lifecycle::SessionMetadata;
+pub use arcen_input::pen_emulation::PenCapabilityTruth;
 use arcen_media::audio::{AudioPolicy, MicrophonePolicy};
 use arcen_media::video::{EncoderBackend, ResolvedMediaPlan};
 use arcen_media::BitDepth;
@@ -24,14 +25,27 @@ use arcen_protocol::{
     negotiate_transport, sanitize_transport_capabilities, CAPABILITY_TRANSPORT_QUIC,
 };
 
+const fn input_availability(
+    availability: arcen_input::CapabilityAvailability,
+) -> InputCapabilityAvailability {
+    match availability {
+        arcen_input::CapabilityAvailability::Available => InputCapabilityAvailability::Available,
+        arcen_input::CapabilityAvailability::Unavailable => {
+            InputCapabilityAvailability::Unavailable
+        }
+        arcen_input::CapabilityAvailability::Unknown => InputCapabilityAvailability::Unknown,
+    }
+}
+
 /// Build the `server_hello` for this configuration. Advertises the host's
 /// *actual* active codec/chroma so the client's badges and decoder setup match
 /// the wire (the honesty directive — no ffmpeg-probe guesses).
 ///
-/// `pen_available` must be the runtime-established truth from
-/// `InputController::pen_available` (probed/created before this is called),
-/// never an aspirational default — `false` when the tablet-tool uinput
-/// device was not created, including when the input backend itself is off.
+/// `pen` must be the runtime-established truth from
+/// [`crate::input::PierInput::pen_capabilities`] (probed before this is
+/// called), never an aspirational default: unavailable when the tablet-tool
+/// uinput device was not created or the Wayland session's stylus was not
+/// proven, including when the input backend itself is off.
 ///
 /// `region_input_available` must likewise come from
 /// `InputController::region_input_available`; it is true only when this
@@ -45,14 +59,11 @@ pub fn build_server_hello(
     session: Option<&SessionMetadata>,
     supports_display_update: bool,
     microphone_backend_available: bool,
-    pen_available: bool,
+    pen: PenCapabilityTruth,
     region_input_available: bool,
 ) -> ServerHelloMsg {
-    let pen_availability = if pen_available {
-        InputCapabilityAvailability::Available
-    } else {
-        InputCapabilityAvailability::Unavailable
-    };
+    let usb_hard_offered = crate::usb_bridge::runtime_available()
+        && crate::usb_bridge::session_admission(session).is_ok();
     ServerHelloMsg {
         msg_type: SERVER_HELLO.to_string(),
         server_name: "Arcen Host (Rust, Linux)".to_string(),
@@ -88,8 +99,13 @@ pub fn build_server_hello(
         // `crate::input::experimental_raw_hid_runtime_enabled`). Old/default
         // hosts always advertise false, and a false-advertising host must
         // never admit raw HID frames regardless of what a client sends.
-        experimental_raw_hid: crate::input::experimental_raw_hid_runtime_enabled(),
-        usb_hard_v1: crate::usb_bridge::runtime_available(),
+        // Like Hard USB, a uhid device would reach the physical seat, never a
+        // seatless (Wayland) session.
+        experimental_raw_hid: crate::input::experimental_raw_hid_runtime_enabled()
+            && crate::usb_bridge::session_admission(session).is_ok(),
+        // A seatless (Wayland) session never offers Hard USB: the bridged
+        // device would reach the machine's physical seat, not this session.
+        usb_hard_v1: usb_hard_offered,
         // True only when this session actually holds a display guard, so the
         // client never sends display_update to a session that cannot resize.
         supports_display_update,
@@ -165,25 +181,28 @@ pub fn build_server_hello(
                 InputCapabilityAvailability::Unavailable
             },
             gestures: InputCapabilityAvailability::Unavailable,
-            // Runtime-established truth only: `Available` exactly when the
-            // separate tablet-tool uinput device was actually created before
-            // this hello was built (see `InputController::pen_available`).
-            // Pressure/tilt/eraser/proximity share that same probe because
-            // they all live on the one tablet-tool device this backend
-            // creates atomically. Rotation stays `Unavailable` even when the
-            // tool device exists: this backend never advertises or emits a
-            // rotation axis because no target here has proven the
-            // kernel/libinput stack recognizes one as tablet rotation.
-            pen: pen_availability,
-            pen_pressure: pen_availability,
-            pen_tilt: pen_availability,
-            pen_rotation: InputCapabilityAvailability::Unavailable,
-            pen_eraser: pen_availability,
-            pen_proximity: pen_availability,
+            // Runtime-established truth only, axis by axis. On Xorg every
+            // axis but rotation lives on the one tablet-tool uinput device
+            // created before this hello (no target has proven the
+            // kernel/libinput stack recognizes a rotation axis); in a
+            // Wayland session the axes are what the compositor's EIS stylus
+            // offered and the session bound.
+            pen: input_availability(pen.pen),
+            pen_pressure: input_availability(pen.pressure),
+            pen_tilt: input_availability(pen.tilt),
+            pen_rotation: input_availability(pen.rotation),
+            pen_eraser: input_availability(pen.eraser),
+            pen_proximity: input_availability(pen.proximity),
+            pen_barrel_buttons: input_availability(pen.barrel_buttons),
+            // Committed text reaches only a Wayland session that proves it
+            // can type (the attachment sets it from its injector); an Xorg
+            // session's uinput keyboard types key positions only.
+            text_commit: InputCapabilityAvailability::Unavailable,
+            text_commit_unicode: InputCapabilityAvailability::Unavailable,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
-            local_termination: pen_availability,
-            usb_tablet_bridge: if crate::usb_bridge::runtime_available() {
+            local_termination: input_availability(pen.pen),
+            usb_tablet_bridge: if usb_hard_offered {
                 InputCapabilityAvailability::Available
             } else {
                 InputCapabilityAvailability::Unavailable
@@ -288,7 +307,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         assert_eq!(hello.msg_type, SERVER_HELLO);
@@ -339,7 +358,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         assert_eq!(
@@ -354,7 +373,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             true,
         );
         assert_eq!(
@@ -385,7 +404,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         for availability in [
@@ -405,7 +424,7 @@ mod tests {
             None,
             false,
             false,
-            true,
+            PenCapabilityTruth::LINUX_UINPUT_TABLET,
             false,
         );
         for availability in [
@@ -436,7 +455,7 @@ mod tests {
                 None,
                 false,
                 false,
-                pen_available,
+                PenCapabilityTruth::linux_uinput(pen_available),
                 false,
             );
             assert_eq!(
@@ -444,6 +463,40 @@ mod tests {
                 InputCapabilityAvailability::Unavailable
             );
         }
+    }
+
+    #[test]
+    fn hello_advertises_an_emulated_stylus_axis_by_axis() {
+        let cfg = Config::default();
+        let plan = native_plan(VideoCodec::H264, false);
+        let hello = build_server_hello(
+            &cfg,
+            &plan,
+            Some(plan.backend.accelerator_class()),
+            None,
+            false,
+            false,
+            PenCapabilityTruth::emulated_stylus(arcen_input::pen_emulation::StylusBinding {
+                pressure: true,
+                tilt: true,
+                rotation: true,
+                erase: false,
+                barrel_buttons: 0,
+            }),
+            false,
+        );
+        let input = hello.input_capabilities;
+        assert_eq!(input.pen, InputCapabilityAvailability::Available);
+        assert_eq!(input.pen_rotation, InputCapabilityAvailability::Available);
+        assert_eq!(input.pen_eraser, InputCapabilityAvailability::Unavailable);
+        assert_eq!(
+            input.pen_barrel_buttons,
+            InputCapabilityAvailability::Unavailable
+        );
+        assert_eq!(
+            hello.tablet_mode_capabilities.local_termination,
+            InputCapabilityAvailability::Available
+        );
     }
 
     #[test]
@@ -466,7 +519,7 @@ mod tests {
                     None,
                     false,
                     false,
-                    false,
+                    PenCapabilityTruth::UNAVAILABLE,
                     false
                 )
                 .audio_output
@@ -512,7 +565,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         assert_eq!(hello.encoder_backend, "openh264-sw-h264");
@@ -539,7 +592,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         // NativeNvenc's contract offers ten-bit, 4:4:4, an identity matrix,
@@ -578,7 +631,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         ))
         .unwrap();
@@ -598,7 +651,7 @@ mod tests {
                 None,
                 false,
                 false,
-                false,
+                PenCapabilityTruth::UNAVAILABLE,
                 false
             )
             .supports_display_update
@@ -611,7 +664,7 @@ mod tests {
                 None,
                 true,
                 false,
-                false,
+                PenCapabilityTruth::UNAVAILABLE,
                 false
             )
             .supports_display_update
@@ -633,7 +686,7 @@ mod tests {
                 None,
                 false,
                 false,
-                false,
+                PenCapabilityTruth::UNAVAILABLE,
                 false
             )
             .requires_auth
@@ -655,6 +708,10 @@ mod tests {
             timezone: None,
             multi_monitor_plan: None,
             multi_monitor_carrier: None,
+            audio: None,
+            wayland: None,
+            requested_outputs: None,
+            x11_desktop_depth: None,
         };
         let plan = native_plan(VideoCodec::H264, false);
         let hello = build_server_hello(
@@ -664,7 +721,7 @@ mod tests {
             Some(&metadata),
             false,
             false,
-            false,
+            PenCapabilityTruth::UNAVAILABLE,
             false,
         );
         assert_eq!(hello.os_user, "artist");

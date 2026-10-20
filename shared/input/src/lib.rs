@@ -7,22 +7,36 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+pub mod cursor;
 mod gestures;
 pub mod hid_reports;
+mod lane_outbox;
 mod negotiation;
+mod output_local;
 pub mod pen_axes;
 mod pen_edges;
+pub mod pen_emulation;
+mod pen_forwarding;
 mod region;
 mod region_emitter;
 mod region_pipeline;
 mod region_state;
 mod region_wire;
+pub mod seat_pen;
+pub mod text;
+pub mod virtual_device;
 
+pub use lane_outbox::{InputLaneOutbox, InputRecordClass, PEN_CONTACT_BACKLOG_CAP};
 pub use negotiation::{
     CursorModeNegotiationReason, ResolvedCursorMode, ResolvedTabletMode,
     TabletModeNegotiationReason, resolve_cursor_mode, resolve_tablet_mode,
 };
+pub use output_local::{OutputLocalPoint, OutputRect, locate_normalized, locate_output};
 pub use pen_edges::{MAX_BARREL_BUTTONS, PenEdge, PenToolState, plan_pen_edges};
+pub use pen_forwarding::{
+    DEFAULT_PEN_EDGE_CAPACITY, PenDispatchOverflow, PenEdgeState, PenForwardMode,
+    PenForwardingDispatcher,
+};
 pub use region::{CoordinateTransformError, RegionCoordinateTransformer};
 pub use region_emitter::{RegionInputEmitError, RegionInputEmitter};
 pub use region_pipeline::{

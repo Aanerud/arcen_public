@@ -1,6 +1,9 @@
 //! Clipboard policy, sequence, echo-suppression, and raster contracts.
 
-mod image;
+pub mod bridge;
+pub mod eligibility;
+pub mod formats;
+pub(crate) mod image;
 pub mod latest;
 
 pub use image::{
@@ -66,6 +69,24 @@ pub enum ClipboardKind {
     TextUtf8,
     /// PNG image bytes.
     ImagePng,
+}
+
+impl From<arcen_protocol::messages::ClipboardContentKind> for ClipboardKind {
+    fn from(kind: arcen_protocol::messages::ClipboardContentKind) -> Self {
+        match kind {
+            arcen_protocol::messages::ClipboardContentKind::TextUtf8 => Self::TextUtf8,
+            arcen_protocol::messages::ClipboardContentKind::ImagePng => Self::ImagePng,
+        }
+    }
+}
+
+impl From<ClipboardKind> for arcen_protocol::messages::ClipboardContentKind {
+    fn from(kind: ClipboardKind) -> Self {
+        match kind {
+            ClipboardKind::TextUtf8 => Self::TextUtf8,
+            ClipboardKind::ImagePng => Self::ImagePng,
+        }
+    }
 }
 
 /// Validated host-authoritative clipboard policy.
@@ -436,6 +457,24 @@ pub struct ClipboardRequest {
     pub image: ClipboardDirections,
 }
 
+impl ClipboardRequest {
+    /// What a client hello asks the clipboard to carry.
+    #[must_use]
+    pub const fn from_hello(hello: &arcen_protocol::messages::ClientHelloMsg) -> Self {
+        Self {
+            protocol_version: hello.clipboard_protocol_version,
+            text: ClipboardDirections {
+                client_to_host: hello.clipboard_text_c2s,
+                host_to_client: hello.clipboard_text_s2c,
+            },
+            image: ClipboardDirections {
+                client_to_host: hello.clipboard_image_c2s,
+                host_to_client: hello.clipboard_image_s2c,
+            },
+        }
+    }
+}
+
 impl ClipboardNegotiation {
     /// Narrows a host policy by the client's request.
     ///
@@ -517,8 +556,75 @@ pub fn policy_message(policy: ClipboardPolicy) -> arcen_protocol::messages::Clip
     }
 }
 
+/// Reads a policy back from the wire message that advertised it: the inverse
+/// of [`policy_message`], used where a trusted parent hands a policy to a
+/// helper.
+///
+/// # Errors
+///
+/// [`ClipboardPolicyError::InvalidMaximum`] when the maximum is outside the
+/// supported range or the version is not v1 (reported as an invalid maximum
+/// of zero, because nothing can cross).
+pub fn policy_from_message(
+    message: arcen_protocol::messages::ClipboardPolicyMsg,
+) -> Result<ClipboardPolicy, ClipboardPolicyError> {
+    use arcen_protocol::messages::{ClipboardContentMsg, ClipboardDirectionMsg};
+
+    if !message.is_v1() {
+        return Err(ClipboardPolicyError::InvalidMaximum { max_bytes: 0 });
+    }
+    let direction = match message.direction {
+        ClipboardDirectionMsg::Both => ClipboardDirection::Both,
+        ClipboardDirectionMsg::ClientToHost => ClipboardDirection::ClientToHost,
+        ClipboardDirectionMsg::HostToClient => ClipboardDirection::HostToClient,
+        ClipboardDirectionMsg::Disabled => ClipboardDirection::Disabled,
+    };
+    let content = match message.content {
+        ClipboardContentMsg::All => ClipboardContent::All,
+        ClipboardContentMsg::Text => ClipboardContent::Text,
+        ClipboardContentMsg::Image => ClipboardContent::Image,
+    };
+    let max_bytes = usize::try_from(message.max_bytes).unwrap_or(usize::MAX);
+    ClipboardPolicy::new(direction, content, max_bytes)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_policy_survives_the_round_trip_through_its_message() {
+        for direction in [
+            ClipboardDirection::Both,
+            ClipboardDirection::ClientToHost,
+            ClipboardDirection::HostToClient,
+            ClipboardDirection::Disabled,
+        ] {
+            for content in [
+                ClipboardContent::All,
+                ClipboardContent::Text,
+                ClipboardContent::Image,
+            ] {
+                let policy = ClipboardPolicy::new(direction, content, 1234).unwrap();
+                assert_eq!(policy_from_message(policy_message(policy)), Ok(policy));
+            }
+        }
+        let mut message = policy_message(ClipboardPolicy::default());
+        message.protocol_version += 1;
+        assert!(policy_from_message(message).is_err());
+    }
+
+    #[test]
+    fn a_hello_maps_onto_a_request_field_by_field() {
+        let hello = arcen_protocol::messages::ClientHelloMsg {
+            clipboard_protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+            clipboard_text_c2s: true,
+            clipboard_image_s2c: true,
+            ..arcen_protocol::messages::ClientHelloMsg::default()
+        };
+        let request = ClipboardRequest::from_hello(&hello);
+        assert!(request.text.client_to_host && !request.text.host_to_client);
+        assert!(!request.image.client_to_host && request.image.host_to_client);
+    }
 
     #[test]
     fn a_client_that_switched_the_clipboard_off_gets_no_clipboard() {
