@@ -47,7 +47,7 @@ The allowlists include:
 | Configuration | Redacted `%ProgramData%\Arcen\pier.json` | Redacted `/etc/arcen/pier.json` plus redacted effective systemd configuration |
 | Recovery/runtime | Current `recovery::default_path()` display journal | Sanitized service/runtime facts; no persistent display journal |
 | Native lifecycle | Bounded sanitized `ArcenPier` Application Event Log XML | Bounded allowlisted journal JSON or hostname-stripped syslog fallback |
-| Diagnostics | Service state, OS and display/GPU inventory | Service, OS, process, display/GPU, and bounded approved command output |
+| Diagnostics | Service state, OS and display/GPU inventory | Service, OS, process, display/GPU, and bounded approved command output; the desktop provider the Pier selects at start (`diagnostics/desktop-provider.json`: preference, provider and reason, or the refusal with its blockers, and the qualification record path) and the configured Wayland qualification record itself (`diagnostics/wayland-qualification.json`, redacted like configuration) |
 
 Unavailable, denied, invalid, changed, timed-out, or over-limit sources become
 typed manifest notices rather than silent omissions. Collection does not invent
@@ -82,6 +82,13 @@ additionally never traverses `/run/arcen/sessions` (Xauthority) and excludes
 `--out` selects an operator-controlled directory. The collector does not weaken
 permissions on a custom directory; create and protect that directory before
 collection.
+
+The desktop-provider report runs the same start-time selection as the
+service, from host facts only (it never starts a session), for the Pier
+executable that takes the bundle (`evaluated_by`). A qualification record is
+valid for one Pier executable, so a bundle taken with another build than the
+installed service reports the record as stale; take bundles with the
+installed `/opt/arcen/bin/arcen-pier`.
 
 TLS certificate installation, strict-SAN upgrade action, same-key renewal, and
 operator reload are documented in

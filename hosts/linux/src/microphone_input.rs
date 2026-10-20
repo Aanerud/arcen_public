@@ -1754,14 +1754,21 @@ async fn secure_module_fifo(path: &Path, expected_uid: u32) -> Result<(), String
 
 #[cfg(target_os = "linux")]
 fn open_nonblocking_stdin() -> Result<tokio::io::unix::AsyncFd<std::fs::File>, String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::{AsFd, AsRawFd};
 
-    let input = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-        .open("/dev/stdin")
+    // Duplicate the inherited descriptor rather than reopening
+    // `/dev/stdin`: the pipe belongs to the root Pier that created it, and
+    // the kernel refuses the session user a fresh open of it (EACCES).
+    let input = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
         .map_err(|error| format!("open nonblocking microphone input: {error}"))?;
-    tokio::io::unix::AsyncFd::new(input)
+    nix::fcntl::fcntl(
+        input.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(|error| format!("open nonblocking microphone input: {error}"))?;
+    tokio::io::unix::AsyncFd::new(std::fs::File::from(input))
         .map_err(|error| format!("register nonblocking microphone input: {error}"))
 }
 

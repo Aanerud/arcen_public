@@ -77,8 +77,10 @@ below (["Future true USB bridge (not implemented)"](#future-true-usb-bridge-not-
 Any pen tablet + its macOS driver
   -> AppKit NSEvent tabletPoint / tabletProximity
   -> clients/macos/src/tablet/monitor.rs   (main-thread AppKit local event monitor, RAII)
+  -> clients/macos/src/ui/pen_input.rs     (sends each sample as AppKit dispatches it)
   -> clients/macos/src/tablet/mapper.rs    (pure native-sample -> arcen_input::PenEvent mapper)
-  -> clients/macos/src/tablet/dispatch.rs  (edge-preserving, motion-coalescing, bounded dispatch)
+  -> arcen_input::PenForwardingDispatcher  (shared edge classification; every sample forwarded)
+  -> input/cursor lane, arcen_input::InputLaneOutbox (back-pressure: hover folds, ink kept)
   -> arcen_protocol::messages::PenEventMsg (negotiated input protocol v3; PenEventMsg::validate())
   -> Linux hosts/linux/src/input/uinput.rs "Arcen Virtual Tablet Pen" uinput device
      OR Windows hosts/windows/src/input.rs PenInjector (synthetic PT_PEN pointer device)
@@ -300,13 +302,18 @@ client can show the effective mode and reason.
 ## macOS capture and Deck integration
 
 Module: `clients/macos/src/tablet/` (`mod.rs`, `sample.rs`, `probe.rs`,
-`monitor.rs`, `mapper.rs`, `dispatch.rs`, `runtime.rs`); wired into
+`monitor.rs`, `mapper.rs`, `runtime.rs`) and `clients/macos/src/ui/pen_input.rs`;
+wired into
 `clients/macos/src/ui/app.rs`, `clients/macos/src/ui/macos_menu.rs`, and the
 pen-capability parts of `clients/macos/src/transport/websocket.rs`.
 
 - `monitor.rs` is a main-thread-owned AppKit local `NSEvent` monitor RAII
-  guard (`objc2`/`objc2-app-kit`/`block2`; no vendor SDK) that delivers
-  `tabletPoint`/`tabletProximity` samples into a bounded producer queue.
+  guard (`objc2`/`objc2-app-kit`/`block2`; no vendor SDK) that hands each
+  `tabletPoint`/`tabletProximity` sample, with how long it waited for
+  dispatch (`NSEvent.timestamp`), straight to `ui/pen_input.rs`. Only an event
+  pen input cannot take at that moment (its state is borrowed, or an earlier
+  event is still queued) goes to a bounded producer queue the next UI pass
+  drains, in order.
   `runtime::TabletRuntime::install()` only ever succeeds on macOS, on the
   main thread; it degrades to an inert `None` everywhere else (off-macOS
   build, off-main-thread call, or AppKit refusing to install) and callers
@@ -322,12 +329,36 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   points are mapped through Deck's current video `image_rect` and selected
   monitor, accounting for AppKit's bottom-left origin, backing scale,
   letterboxing, and fullscreen transitions.
-- `dispatch.rs` (`TabletEventDispatcher`) folds a drained sample batch into
-  an edge-preserving, motion-coalescing, bounded output: proximity, contact,
-  tool, and button transitions are never dropped; only superseded hover/move
-  samples may coalesce. `release_event()`/`last_position()` emit one final
-  synthetic out-of-proximity release so a remote tool can never be left
-  logically stuck down.
+- **Input never waits for the UI or presentation loop.** `ui/pen_input.rs`
+  (`PenInput`) maps, classifies and sends a sample in the same AppKit
+  callback that delivered it, stamped with the event's own time. The UI pass
+  only publishes routing (video `image_rect`, multi-window targets, region
+  viewports) and session state. Measured before this: a Deck on a 30 Hz panel
+  forwarded pen samples every 33 ms, because AppKit coalesced the digitizer's
+  reports while the main thread waited for vsync and samples left only on the
+  next UI pass. Now:
+  - AppKit mouse-event coalescing (`NSEvent.isMouseCoalescingEnabled`, which
+    covers tablet events) is turned off while a session window is active and
+    restored on deactivate and quit, so every digitizer report arrives;
+  - the UI never asks for passes faster than the root display refreshes, and
+    pen motion no longer wakes the UI (only edges do), so the main thread is
+    free to dispatch events;
+  - keys, modifiers, scrolling and mouse buttons still go through the UI pass,
+    so the monitor marks them, and pen samples dispatched after one wait for
+    that pass (bounded, fail-closed) to keep the person's order;
+  - the session telemetry reports `input_dispatch_age_p50/p99/max_us`,
+    `pen_forwarded`, `pen_forward_interval_p50_us` and
+    `pen_held_for_ordering`.
+- `arcen_input::PenForwardingDispatcher` (shared, `shared/input`) classifies
+  edges: proximity, contact, tool and button transitions are marked not
+  coalescable and never dropped; motion is marked coalescable but still
+  forwarded, because pressure samples with the tip down are the ink.
+  `release_event()` emits one final synthetic out-of-proximity release so a
+  remote tool can never be left logically stuck down. Only real lane
+  back-pressure folds pen motion (`InputLaneOutbox`): hovering samples fold
+  into the previous hover of the same stroke state; tip-down samples are kept
+  until more than `PEN_CONTACT_BACKLOG_CAP` (256) wait, and every fold beyond
+  that is counted.
 - `presence.rs`/`hid_inventory.rs` answer **tablet presence** without a
   vendor id: `tablet_presence()` is `Available` when any HID device in the
   I/O Registry publishes a report descriptor that declares a pen or a
@@ -361,7 +392,7 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   presence, whether the runtime installed, negotiated state, current
   tool/proximity/touching, live pressure/tilt/rotation, lifetime
   events-sent/overflow-reset counters, producer-drop and dispatcher
-  edge/coalesced/overflow counters, the empirical capability probe, and the
+  edge/motion-forwarded/overflow counters, the empirical capability probe, and the
   last error string. It reports device/capability/liveness facts only —
   never coordinates, pressure samples, raw report bytes, or other input
   content.
@@ -392,9 +423,44 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   carries normalized pressure, so the virtual device adopts no tablet maker's
   range, and 16 bits is finer than any shipping pen; libinput normalizes by
   the declared extent), `ABS_TILT_X`/`ABS_TILT_Y` (whole-degree `-90..=90`,
-  passed straight through from the wire's degree convention), tool/proximity
+  passed straight through from the wire's degree convention, with a
+  resolution of `arcen_input::virtual_device::TILT_UNITS_PER_RADIAN` (57
+  units per radian) — libinput reads a tilt axis without a resolution as a
+  Wacom pen's ±64° spread over the range, which delivered a 45° tilt as 32°
+  to Chrome on Xorg and to every Wayland client. On Xorg this is a deliberate
+  trade-off: xf86-input-libinput exposes tilt as a ±64 valuator, as for a USB
+  Wacom, and Firefox reads it through GDK as ±1 and multiplies by 90, so it
+  reports tilt 90/64 larger than the degrees Chrome reports), tool/proximity
   via `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER`, tip contact via `BTN_TOUCH`, and two
   barrel buttons via `BTN_STYLUS`/`BTN_STYLUS2`.
+- **The tablet device is the pen; the mouse device is not used for it.**
+  xf86-input-libinput puts the tablet device on the master keyboard and gives
+  each tool in proximity its own slave pointer (`"… Pen (0)"` in
+  `xinput list`), which moves the cursor and presses button 1 for the tip and
+  buttons 2 and 3 for the lower and upper barrel switch, as with a USB tablet.
+  Until 0.17.0 the pen also moved the cursor and clicked through the
+  absolute mouse device, so X clients received each sample twice from two
+  source devices: Firefox began every stroke with a `mouse` pointerdown and
+  switched pointer type and id inside strokes, and pages that end a stroke on
+  `pointerleave` lost ink. Without a tablet device (creation failed, or Hard
+  USB released it) the pen falls back to cursor and clicks on the absolute
+  device, without pressure or tilt, with the same buttons (tip = left, lower
+  barrel = middle, upper barrel = right).
+- **Contact comes from pressure.** libinput ignores `BTN_TOUCH` on a tablet
+  with a pressure axis and puts the tool in contact when pressure reaches 5 %
+  of the range, out of it at 1 % (`evdev-tablet.c`, libinput 1.19 to 1.31). A
+  Deck contact can carry little or no pressure (a tap, the start of a light
+  stroke, a pen without pressure: `touching` is the tip or any pressure), so
+  `pen::PenAxes` reports `0` out of contact and at least the device's contact
+  threshold in contact (`arcen_input::virtual_device::contact_pressure`). The
+  Xorg tablet's quirk sets the thresholds to `AttrPressureRange=2:1`
+  (`virtual_device::PRESSURE_CONTACT_UPPER`/`LOWER`), so the floor is 2 of
+  65535 there; the Wayland lab seat pen is read by the compositor's libinput
+  with the system quirks only, so its floor is libinput's default threshold
+  plus one (3278, `libinput_default_contact_pressure`): its lightest contact
+  reads about 4 %. Without readable system quirks the session keeps
+  libinput's defaults (the launcher warns), and Xorg contacts lighter than
+  5 % are lost.
 - **Rotation is deliberately `Unavailable` on Linux.** `build_tablet_device`
   advertises no rotation axis, and `hosts/linux/src/session/handshake.rs`
   always sets `pen_rotation = Unavailable` regardless of whether the tablet
@@ -419,8 +485,55 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
 - **No tablet vendor driver runs on the Linux host.** `libinput`/Xorg see an
   ordinary kernel tablet-tool device; the Linux target is the dedicated
   Arcen Xorg session described in `hosts/linux/ARCHITECTURE.md`.
+- **libinput does not smooth the virtual pen.** libinput (1.11 and later)
+  averages a tablet tool's last four positions and tilts unless a quirk sets
+  `AttrTabletSmoothing=0` (`evdev-tablet.c`, `tablet_init_smoothing`); the
+  mouse is never smoothed. The samples the Deck sends were already filtered
+  by its own tablet driver, so the average only delayed the pen by about one
+  and a half samples: measured on the real screen, pen motion reached a
+  browser in the session 12-15 ms later than the same motion from the mouse.
+  The session launcher starts its Xorg with `LIBINPUT_QUIRKS_DIR` pointing at
+  a session-private copy of the system quirks plus
+  `arcen_input::virtual_device::libinput_quirks()` and the administrator's
+  `local-overrides.quirks` last (`prepare_libinput_quirks`); no system file
+  changes. Without readable system quirks it keeps libinput's defaults.
+- **libinput keeps the pen in proximity while it hovers still.** libinput
+  forces a tablet tool out of proximity after 50 ms without events until the
+  device has once reported a genuine release of the tool
+  (`FORCED_PROXOUT_TIMEOUT`, `evdev-tablet.c`; libinput 1.19, 1.30, 1.31). A
+  pen held still above the Deck's tablet sends nothing, so a jump to a new
+  point arrived only as a fresh proximity-in that applications did not see as
+  motion (measured on the Wayland lab seat pen: no host event for 16 pen
+  jumps). The first time a tool enters proximity on a virtual tablet, the
+  Pier injects one genuine pen-tool in/out before the real sample, even when
+  the eraser approaches first (libinput disarms only on a `BTN_TOOL_PEN` release)
+  (`arcen_input::virtual_device::ProximityTimeoutDisarm`; the uinput tablet
+  here and the lab seat pen).
 - Parse/validate every `PenEventMsg` through the existing globally sequenced
   input dispatcher before mapping or emitting.
+
+## Linux Wayland sessions (emulated stylus)
+
+A headless Wayland session cannot use the uinput tablet tool above: its
+compositor opens no input devices, and the device would reach the
+machine's physical seat. Pen goes only to an **emulated stylus** offered by
+the compositor's EIS server: libei's `ei_stylus` interface, merged for
+libei 1.7 (libinput/libei!400). The session agent probes for it at start.
+The hello advertises each axis only from what the stylus bound
+(`arcen_input::pen_emulation::PenCapabilityTruth`), so rotation can be
+available there although the uinput tool never offers it. The new
+`pen_barrel_buttons` capability says whether barrel buttons reach the
+desktop.
+
+`arcen_input::pen_emulation::StylusEmulator` turns samples into
+protocol-valid frames on top of the shared `plan_pen_edges`. It is tested
+exhaustively against a model of the protocol, and was driven through
+libei's `eis-demo-server` without a protocol error. Today no GNOME release
+offers an EIS stylus. A Wayland session therefore refuses Tablet support
+with the evidence (`stylus_not_offered`, or `no_emulated_input` on
+GNOME 40), and it refuses Native tablet (Hard USB), which would reach
+`seat0`. See
+[`linux-wayland-provider.md`](linux-wayland-provider.md#pen-and-hard-usb-in-a-wayland-session).
 
 ## Windows backend (synthetic PT_PEN pointer)
 

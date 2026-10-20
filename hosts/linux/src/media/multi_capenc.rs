@@ -50,7 +50,7 @@ use arcen_protocol::messages::{CursorMode, MonitorQualityIntentMsg};
 use arcen_telemetry::CorrelationId;
 use thiserror::Error;
 
-use crate::display::topology::LinuxTopologyPlan;
+use crate::display::topology::{LinuxTopologyBackend, LinuxTopologyPlan};
 use crate::logging::target;
 use crate::session::identity::UserExecution;
 
@@ -105,6 +105,27 @@ pub struct MonitorPipelineTemplate {
     pub xauthority: Option<String>,
     pub execution: Option<UserExecution>,
     pub session_log_id: CorrelationId,
+    /// One capture binding per monitor of a virtual-output topology (each
+    /// headless Wayland output is its own stream); empty for dedicated Xorg,
+    /// whose monitors are NvFBC outputs of one X display.
+    pub capture_bindings: Vec<MonitorCaptureBinding>,
+}
+
+/// Where one virtual output's capture comes from: the session-user
+/// execution context whose environment carries that output's own capture
+/// hand-off, and what the host's qualification proved for it.
+#[derive(Debug, Clone)]
+pub struct MonitorCaptureBinding {
+    pub session_monitor_id: SessionMonitorId,
+    /// The compositor connector the stream records.
+    pub connector: String,
+    /// Execution context carrying the output's hand-off.
+    pub execution: UserExecution,
+    /// The output's Wayland Speed evidence per codec token (rate and what
+    /// it rests on); capenc takes the entry for the codec it encodes with.
+    pub capture_rates_by_codec: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
+    /// Whether the host verified the GPU import route.
+    pub gpu_import_verified: bool,
 }
 
 impl MonitorPipelineTemplate {
@@ -157,6 +178,8 @@ pub enum MultiCapencConfigError {
     EmptyPlan,
     #[error("assigned head {0:?} is not a recognized DFP-N NvFBC output")]
     InvalidHeadToken(String),
+    #[error("virtual output {0:?} has no capture binding (no stream of the session matches it)")]
+    MissingCaptureBinding(SessionMonitorId),
     /// This experimental v1's fail-closed encoder-admission contract (see
     /// [`validate_uniform_exact_encoder_policy`]): `auto` is refused for a
     /// committed multi-monitor session outright, because its own
@@ -270,6 +293,9 @@ pub struct MonitorPipelineSpec {
     /// stable across restarts as long as head assignment does not change.
     pub output_index: u32,
     pub config: CapencConfig,
+    /// The compositor connector of a virtual output's stream; `None` for an
+    /// NvFBC output.
+    pub virtual_output: Option<String>,
 }
 
 /// Casts a validated plan-roster position (always `<= MAX_MULTI_MONITOR_COUNT`,
@@ -326,16 +352,44 @@ pub fn build_pipeline_specs(
         return Err(MultiCapencConfigError::EmptyPlan);
     }
     validate_uniform_exact_encoder_policy(plan, template.encoder)?;
+    let virtual_outputs = plan.backend == LinuxTopologyBackend::VirtualOutputs;
     plan.monitors
         .iter()
         .enumerate()
         .map(|(position, monitor)| {
-            validate_head_token(&monitor.head)?;
+            let binding = if virtual_outputs {
+                Some(
+                    template
+                        .capture_bindings
+                        .iter()
+                        .find(|binding| binding.session_monitor_id == monitor.session_monitor_id)
+                        .ok_or(MultiCapencConfigError::MissingCaptureBinding(
+                            monitor.session_monitor_id,
+                        ))?,
+                )
+            } else {
+                validate_head_token(&monitor.head)?;
+                None
+            };
             let output_index = dense_output_index(position);
+            let execution = binding.map_or_else(
+                || template.execution.clone(),
+                |binding| Some(binding.execution.clone()),
+            );
+            let capture_rates_by_codec = binding
+                .map(|binding| binding.capture_rates_by_codec.clone())
+                .unwrap_or_default();
+            let gpu_import_verified = binding.is_some_and(|binding| binding.gpu_import_verified);
+            let (display, xauthority) = if virtual_outputs {
+                (None, None)
+            } else {
+                (template.display.clone(), template.xauthority.clone())
+            };
             Ok(MonitorPipelineSpec {
                 session_monitor_id: monitor.session_monitor_id,
                 head: monitor.head.clone(),
                 output_index,
+                virtual_output: binding.map(|binding| binding.connector.clone()),
                 config: CapencConfig {
                     binary: template.binary.clone(),
                     output_index,
@@ -385,9 +439,18 @@ pub fn build_pipeline_specs(
                         width: monitor.width,
                         height: monitor.height,
                         cursor_mode: template.cursor_mode,
-                        display: template.display.clone(),
-                        xauthority: template.xauthority.clone(),
-                        execution: template.execution.clone(),
+                        capture_rate: None,
+                        capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+                        capture_rates_by_codec: capture_rates_by_codec.clone(),
+                        speed_runtime_shortfall: false,
+                        gpu_import_verified,
+                        // No wide proof covers several outputs at once (a wide
+                        // request is served as Auto before this; see
+                        // `Config::wayland_multi_output`).
+                        wayland_fidelity_args: Vec::new(),
+                        display: display.clone(),
+                        xauthority: xauthority.clone(),
+                        execution: execution.clone(),
                         session_log_id: template.session_log_id.clone(),
                     }),
                     debug_diagnostics: template.debug_diagnostics,
@@ -395,9 +458,20 @@ pub fn build_pipeline_specs(
                     width: monitor.width,
                     height: monitor.height,
                     cursor_mode: template.cursor_mode,
-                    display: template.display.clone(),
-                    xauthority: template.xauthority.clone(),
-                    execution: template.execution.clone(),
+                    // A virtual output's Speed evidence and import route are
+                    // its own hand-off's; NvFBC outputs have neither.
+                    capture_rate: None,
+                    capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+                    capture_rates_by_codec,
+                    speed_runtime_shortfall: false,
+                    gpu_import_verified,
+                    // No wide proof covers several outputs at once (a wide
+                    // request is served as Auto before this; see
+                    // `Config::wayland_multi_output`).
+                    wayland_fidelity_args: Vec::new(),
+                    display,
+                    xauthority,
+                    execution,
                     session_log_id: template.session_log_id.clone(),
                 },
             })
@@ -536,6 +610,28 @@ pub enum MultiCapencStartError {
         source: CapencStartError,
         rollback_failures: Vec<RollbackFailure<std::convert::Infallible>>,
     },
+}
+
+/// What a set of monitors serves, from each monitor's admitted epoch: their
+/// common contract, or Auto's when they differ (one monitor serving Auto
+/// means the set does not run the stronger contract), so the label never
+/// claims more than every monitor serves.
+fn set_admitted_epoch(
+    epochs: &[arcen_media::video::AdmittedEpoch],
+) -> Option<arcen_media::video::AdmittedEpoch> {
+    // TODO: a mixed set without an Auto member (for example Grading beside
+    // Speed) should report the weakest contract, or none, rather than the
+    // first; no Wayland multi-monitor set can mix them today (Speed and the
+    // wide contracts are served as Auto there).
+    let first = *epochs.first()?;
+    if epochs.iter().all(|epoch| epoch.pipeline == first.pipeline) {
+        return Some(first);
+    }
+    epochs
+        .iter()
+        .copied()
+        .find(|epoch| epoch.pipeline == arcen_media::video::PipelineId::Auto)
+        .or(Some(first))
 }
 
 /// One running monitor pipeline's routing plus its opaque handle (a real
@@ -682,6 +778,26 @@ impl MultiCapencSupervisor {
             .collect()
     }
 
+    /// The contract the monitors' captures admitted, when each decided
+    /// admission itself (Wayland outputs): see [`set_admitted_epoch`].
+    /// `None` when any monitor stated none (an NvFBC capture).
+    #[must_use]
+    pub fn admitted_epoch(&self) -> Option<arcen_media::video::AdmittedEpoch> {
+        let epochs = self
+            .pipelines
+            .iter()
+            .map(|pipeline| {
+                pipeline
+                    .handle
+                    .session
+                    .capture_admission()?
+                    .served()?
+                    .epoch()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        set_admitted_epoch(&epochs)
+    }
+
     /// Shuts down every pipeline. Always terminates every child even if one
     /// shutdown observes an error internally (each `CapencSession::shutdown`
     /// call is itself already best-effort/idempotent-safe).
@@ -788,6 +904,17 @@ pub enum CapencHandle {
 }
 
 impl CapencHandle {
+    /// The served contract a capture source stated in its admission (the
+    /// Wayland provider), or `None` when the source made no admission
+    /// decision of its own (Xorg, multi-monitor).
+    #[must_use]
+    pub fn admitted_epoch(&self) -> Option<arcen_media::video::AdmittedEpoch> {
+        match self {
+            Self::Single(session) => session.capture_admission()?.served()?.epoch(),
+            Self::Multi(supervisor) => supervisor.admitted_epoch(),
+        }
+    }
+
     /// Shuts down the active backend: the single child, or every running
     /// monitor pipeline in the supervisor.
     pub async fn shutdown(self) {
@@ -836,6 +963,12 @@ mod tests {
             width: 1920,
             height: 1080,
             cursor_mode: CursorMode::Local,
+            capture_rate: None,
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec: Vec::new(),
+            speed_runtime_shortfall: false,
+            gpu_import_verified: false,
+            wayland_fidelity_args: Vec::new(),
             display: None,
             xauthority: None,
             execution: None,
@@ -845,6 +978,7 @@ mod tests {
 
     fn spec(session_monitor_id: u16, output_index: u32) -> MonitorPipelineSpec {
         MonitorPipelineSpec {
+            virtual_output: None,
             session_monitor_id: sid(session_monitor_id),
             head: format!("DFP-{output_index}"),
             output_index,
@@ -864,6 +998,9 @@ mod tests {
         height: u32,
     ) -> LinuxMonitorPlan {
         LinuxMonitorPlan {
+            refresh_hz: 60,
+            width_mm: 0,
+            height_mm: 0,
             session_monitor_id: sid(session_monitor_id),
             client_display_id: format!("display-{session_monitor_id}"),
             head: head.to_owned(),
@@ -888,6 +1025,7 @@ mod tests {
 
     fn template() -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
+            capture_bindings: Vec::new(),
             binary: PathBuf::from("/nonexistent/arcen-capenc"),
             codec: "h264".to_owned(),
             // `NativeNvenc`, not `Auto`: these fixtures exercise
@@ -921,8 +1059,117 @@ mod tests {
         }
     }
 
+    fn virtual_binding(session_monitor_id: u16, connector: &str) -> MonitorCaptureBinding {
+        let identity = crate::session::identity::UserIdentity {
+            username: "artist".into(),
+            uid: 1001,
+            gid: 100,
+            supplementary_groups: vec![100],
+            home: "/home/artist".into(),
+            shell: "/bin/bash".into(),
+        };
+        let runtime_dir = crate::session::wayland::private_runtime_dir(1001, "c9");
+        let ready = crate::session::wayland::WaylandAgentReady {
+            compositor: "gnome-shell".into(),
+            input_socket: runtime_dir.join(crate::session::wayland::INPUT_SOCKET_NAME),
+            runtime_dir: runtime_dir.clone(),
+            wayland_display: "wayland-0".into(),
+            outputs: vec![],
+            streams: vec![],
+            input_device_types: 7,
+            generation: 3,
+            compositor_render_node: None,
+            compositor_gpu_pci: None,
+            compositor_gpu_vendor: None,
+            output_mode: arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+            output_socket: None,
+            clipboard: None,
+            x11: None,
+            cursor_mode: crate::session::wayland::StreamCursorMode::Embedded,
+        };
+        let handoff = arcen_media::video::capture_handoff::PipeWireCaptureHandoff::new(
+            40 + u32::from(session_monitor_id),
+            connector,
+            3,
+            (1920, 1080),
+            (0, 0),
+            crate::session::wayland::StreamCursorMode::Embedded.screencast(),
+            &runtime_dir,
+        )
+        .expect("hand-off");
+        let environment = crate::session::identity::SessionEnvironment::build_wayland(
+            &identity,
+            "gnome",
+            None,
+            [("XDG_SESSION_ID".into(), "c9".into())],
+        )
+        .with_wayland_session(&ready, &handoff);
+        MonitorCaptureBinding {
+            session_monitor_id: sid(session_monitor_id),
+            connector: connector.to_owned(),
+            execution: UserExecution::new(identity, environment),
+            capture_rates_by_codec: vec![(
+                "h264".to_owned(),
+                58,
+                arcen_media::video::CaptureRateEvidence::Measured,
+            )],
+            gpu_import_verified: true,
+        }
+    }
+
+    #[test]
+    fn virtual_outputs_capture_each_monitor_from_its_own_binding() {
+        let plan = LinuxTopologyPlan {
+            backend: LinuxTopologyBackend::VirtualOutputs,
+            generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
+            virtual_width: 3840,
+            virtual_height: 1080,
+            monitors: vec![
+                monitor_plan(1, "virtual-1", true),
+                monitor_plan(2, "virtual-2", false),
+            ],
+        };
+        let mut template = template();
+        template.display = Some(":0".into());
+        template.capture_bindings =
+            vec![virtual_binding(2, "Meta-2"), virtual_binding(1, "Meta-1")];
+        let specs = build_pipeline_specs(&plan, &template).expect("specs");
+        for (spec, connector) in specs.iter().zip(["Meta-1", "Meta-2"]) {
+            assert_eq!(spec.virtual_output.as_deref(), Some(connector));
+            assert_eq!(
+                spec.config.display, None,
+                "a Wayland capture names no X display"
+            );
+            assert_eq!(spec.config.capture_rate, None);
+            assert_eq!(
+                spec.config.capture_rates_by_codec,
+                vec![(
+                    "h264".to_owned(),
+                    58,
+                    arcen_media::video::CaptureRateEvidence::Measured
+                )]
+            );
+            assert!(spec.config.gpu_import_verified);
+            let execution = spec.config.execution.as_ref().expect("execution");
+            assert_eq!(
+                execution
+                    .environment
+                    .get(arcen_media::video::capture_handoff::CAPTURE_OUTPUT_ENV),
+                Some(connector),
+                "each monitor's capenc gets its own output's environment"
+            );
+        }
+
+        template.capture_bindings.pop();
+        assert!(matches!(
+            build_pipeline_specs(&plan, &template),
+            Err(MultiCapencConfigError::MissingCaptureBinding(id)) if id == sid(1)
+        ));
+    }
+
     fn template_with_encoder(encoder: EncoderSelection) -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
+            capture_bindings: Vec::new(),
             encoder,
             ..template()
         }
@@ -978,6 +1225,7 @@ mod tests {
     #[test]
     fn build_pipeline_specs_rejects_an_empty_plan() {
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: 0,
             virtual_height: 0,
@@ -997,6 +1245,7 @@ mod tests {
         // while each spec's own `head` token still reports the real DFP-N
         // assignment for diagnostics.
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: 3840,
             virtual_height: 1080,
@@ -1018,6 +1267,7 @@ mod tests {
     #[test]
     fn build_pipeline_specs_preserves_the_auth_time_colour_contract_on_every_monitor() {
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: 3840,
             virtual_height: 1080,
@@ -1049,6 +1299,7 @@ mod tests {
         // Same property, shifted by one head: DFP-1 + DFP-3 (DFP-0/DFP-2
         // unused) must still enumerate as dense NvFBC output ordinals 0, 1.
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: 3840,
             virtual_height: 1080,
@@ -1070,6 +1321,7 @@ mod tests {
     #[test]
     fn build_pipeline_specs_rejects_an_unrecognized_head_token() {
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: 1920,
             virtual_height: 1080,
@@ -1083,6 +1335,7 @@ mod tests {
 
     fn two_head_plan_sized(width: u32, height: u32) -> LinuxTopologyPlan {
         LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
             virtual_width: width * 2,
             virtual_height: height,
@@ -1515,5 +1768,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn epoch(pipeline: arcen_media::video::PipelineId) -> arcen_media::video::AdmittedEpoch {
+        let contract = arcen_media::video::pipeline_contract(pipeline);
+        arcen_media::video::AdmittedEpoch {
+            pipeline,
+            video: contract.colour,
+            fps: contract.max_fps,
+            priority: contract.priority,
+            intent: contract.intent,
+            keyframe: contract.keyframe,
+            cursor_mode: arcen_protocol::messages::CursorMode::Host,
+        }
+    }
+
+    #[test]
+    fn a_monitor_set_is_labelled_with_what_every_monitor_serves() {
+        use arcen_media::video::PipelineId;
+        assert_eq!(set_admitted_epoch(&[]), None);
+        let auto = epoch(PipelineId::Auto);
+        let speed = epoch(PipelineId::Speed);
+        assert_eq!(set_admitted_epoch(&[auto, auto]), Some(auto));
+        assert_eq!(set_admitted_epoch(&[speed, speed]), Some(speed));
+        // One monitor below the others: the set serves Auto.
+        assert_eq!(set_admitted_epoch(&[speed, auto, speed]), Some(auto));
     }
 }

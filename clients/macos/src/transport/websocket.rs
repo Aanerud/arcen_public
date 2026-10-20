@@ -6,8 +6,8 @@ use arcen_telemetry::{
     StructuredFields,
 };
 use arcen_transport::quic::{
-    connect_direct, recommended_transport_config_arc, DirectQuicDialParams, DirectQuicStream,
-    QuicTransportError, DIRECT_QUIC_ALPN_PROTOCOL,
+    connect_session_lanes, lane_transport_config_arc, DirectQuicDialParams, LaneRuntimeConfig,
+    QuicTransportError, SessionLaneSetupError, SessionLaneSocket, DIRECT_QUIC_ALPN_PROTOCOL,
 };
 use arcen_transport::BoundedTransportPolicy;
 use futures_util::{stream::FuturesUnordered, Sink, SinkExt, Stream, StreamExt};
@@ -24,18 +24,15 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 #[cfg(feature = "wss-compat")]
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+#[cfg(feature = "wss-compat")]
+use tokio_tungstenite::WebSocketStream;
+#[cfg(feature = "wss-compat")]
 use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream};
-use tokio_tungstenite::{
-    tungstenite::{
-        protocol::{Role, WebSocketConfig},
-        Error as WebSocketError, Message,
-    },
-    WebSocketStream,
-};
 use tracing::Instrument;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
@@ -44,7 +41,6 @@ use crate::clipboard::{media_policy, ClipboardItem, ClipboardSession};
 use crate::observability::ClientTelemetry;
 use crate::pipeline::frame_queue::{
     incoming_media_inbox, IncomingMediaLimits, IncomingMediaReceiver, IncomingMediaSender,
-    HDR_VIDEO_BYTE_LIMIT,
 };
 use crate::pipeline::video_decoder::{probe_decode_capabilities, DecodeCapabilities};
 use crate::protocol::auth::hash_password;
@@ -63,7 +59,7 @@ use crate::protocol::messages::{
 };
 use crate::protocol::wire::{
     decode_clipboard_chunk, encode_clipboard_chunk, encode_microphone_header, ClipboardChunkHeader,
-    FrameType, MicrophoneHeader, CHUNK_BYTES,
+    FrameType, MicrophoneHeader, CLIPBOARD_CHUNK_PAYLOAD_BYTES,
 };
 use crate::reconnect::ResumeAttempt;
 use crate::transport::connector::{resolve_transport, DirectTransportKind};
@@ -72,8 +68,9 @@ use crate::transport::tls::{
     TlsTrustError, TOFU_CAPTURE_REJECT_ERROR, TOFU_PIN_MISMATCH_ERROR,
 };
 
+#[cfg(feature = "wss-compat")]
 const MAX_INCOMING_MESSAGE_SIZE: usize =
-    HDR_VIDEO_BYTE_LIMIT + crate::protocol::REGION_VIDEO_HEADER_SIZE;
+    crate::pipeline::frame_queue::HDR_VIDEO_BYTE_LIMIT + crate::protocol::REGION_VIDEO_HEADER_SIZE;
 const MAX_INCOMING_CONTROL_SIZE: usize = 1024 * 1024;
 const MAX_RESUME_GRANT_BYTES: usize = 8_192;
 const MAX_DISCLAIMER_CONTENT_BYTES: usize = 16 * 1024;
@@ -93,7 +90,7 @@ const CLIENT_PROOF_INTERVALS: u64 = 12;
 
 #[cfg(feature = "wss-compat")]
 type DirectWssSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-type DirectQuicSocket = WebSocketStream<DirectQuicStream>;
+type DirectQuicSocket = crate::transport::lanes::DeckLaneSocket;
 
 enum DirectSessionSocket {
     #[cfg(feature = "wss-compat")]
@@ -102,82 +99,22 @@ enum DirectSessionSocket {
 }
 
 impl DirectSessionSocket {
-    async fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => {
-                socket.get_mut().write_all(bytes).await?;
-                socket.get_mut().flush().await
-            }
-            Self::Quic(socket) => {
-                socket.get_mut().write_all(bytes).await?;
-                socket.get_mut().flush().await
-            }
-        }
-    }
-
     fn quic_feedback(&self) -> Option<arcen_transport::quic::FeedbackSnapshot> {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(socket.get_ref().feedback_snapshot()),
+            Self::Quic(socket) => Some(arcen_transport::quic::FeedbackSnapshot::from_connection(
+                socket.lanes().connection(),
+            )),
         }
     }
 
-    fn quic_connection(&self) -> Option<quinn::Connection> {
+    /// The connection's lanes (ADR 0014); `None` on a transport without them.
+    fn lanes(&self) -> Option<arcen_transport::quic::LaneConnection> {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
-        }
-    }
-}
-
-/// How many audio frames from the priority stream may wait for the session
-/// loop. Over a second of audio; a loop that far behind has bigger problems,
-/// and the newest frames are the ones worth keeping.
-const PRIORITY_AUDIO_QUEUE: usize = 64;
-
-/// Reads the host's audio priority stream, when it opens one, into `sink`.
-///
-/// The host moves audio there so it never waits behind video the session
-/// stream has already accepted. Frames are the same bytes the session stream
-/// would have carried, so the session feeds them to the same media path.
-async fn read_audio_priority_stream(
-    connection: quinn::Connection,
-    sink: tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
-    let mut recv = match arcen_transport::quic::accept_audio_priority_stream(&connection).await {
-        Ok(recv) => recv,
-        Err(error) => {
-            tracing::debug!(
-                target: crate::logging::target::TRANSPORT,
-                %error,
-                "no audio priority stream from this host"
-            );
-            return;
-        }
-    };
-    tracing::info!(
-        target: crate::logging::target::TRANSPORT,
-        "audio arrives on its own priority stream"
-    );
-    loop {
-        match arcen_transport::quic::read_priority_frame(&mut recv).await {
-            Ok(Some(frame)) => {
-                // Never blocks the stream: a frame that finds the queue full
-                // is dropped and the jitter buffer conceals it.
-                let _ = sink.try_send(frame);
-            }
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(
-                    target: crate::logging::target::TRANSPORT,
-                    %error,
-                    "audio priority stream failed"
-                );
-                return;
-            }
+            Self::Quic(socket) => Some(socket.lanes().clone()),
         }
     }
 }
@@ -622,6 +559,12 @@ pub enum SessionEvent {
     ServerHello(ServerHelloMsg),
     BrokerHello(Value),
     Json(Value),
+    /// A host cursor image record (`FrameType::CursorUpdate`) from the
+    /// input/cursor lane, in lane order.
+    CursorUpdate(Vec<u8>),
+    /// The input/cursor lane was reopened: the host's cursor images start
+    /// again from an empty cache.
+    CursorLaneReset,
     MicrophoneActive(bool),
     MediaReady,
     PresentationRecoveryRequested,
@@ -1154,62 +1097,54 @@ where
     }
 }
 
-fn masked_client_binary_frame(
-    payload: &mut [u8],
-    mask: [u8; 4],
-) -> Result<Zeroizing<Vec<u8>>, ConnectSmokeError> {
-    let payload_len = u16::try_from(payload.len())
-        .map_err(|_| ConnectSmokeError::Microphone("microphone wire frame is too large"))?;
-    let mut wire = Zeroizing::new(Vec::with_capacity(payload.len() + 8));
-    wire.push(0x82);
-    if payload_len <= 125 {
-        wire.push(0x80 | payload_len as u8);
-    } else {
-        wire.push(0x80 | 126);
-        wire.extend_from_slice(&payload_len.to_be_bytes());
-    }
-    wire.extend_from_slice(&mask);
-    wire.extend(
-        payload
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| *byte ^ mask[index % mask.len()]),
-    );
-    payload.zeroize();
-    Ok(wire)
-}
-
-async fn send_microphone_bounded(
-    ws: &mut DirectSessionSocket,
-    mut payload: Zeroizing<Vec<u8>>,
+/// Queues one clipboard, HID or USB message for the bulk lane worker.
+async fn send_bulk(
+    bulk: &mpsc::Sender<Message>,
+    message: Message,
     cancellation: &SessionCancellation,
     close_receiver: &mut watch::Receiver<bool>,
 ) -> Result<(), ConnectSmokeError> {
     if cancellation.is_closed() {
         return Err(ConnectSmokeError::SessionClosed);
     }
-    arcen_protocol::decode_microphone_frame(&payload)
-        .map_err(|_| ConnectSmokeError::Microphone("invalid microphone wire frame"))?;
-    let mut mask = [0u8; 4];
-    getrandom::getrandom(&mut mask)
-        .map_err(|error| ConnectSmokeError::Randomness(error.to_string()))?;
-    let wire = masked_client_binary_frame(payload.as_mut_slice(), mask)?;
     tokio::select! {
         biased;
         () = cancellation.cancelled(close_receiver) => Err(ConnectSmokeError::SessionClosed),
-        result = timeout(OUTBOUND_WRITE_TIMEOUT, async {
-            SinkExt::flush(ws)
-                .await
-                .map_err(ConnectSmokeError::WebSocket)?;
-            ws.write_raw(&wire)
-                .await
-                .map_err(|error| ConnectSmokeError::WebSocket(
-                    tokio_tungstenite::tungstenite::Error::Io(error)
-                ))
-        }) => {
+        result = timeout(OUTBOUND_WRITE_TIMEOUT, bulk.send(message)) => {
             result
                 .map_err(|_| ConnectSmokeError::Timeout)?
+                .map_err(|_| ConnectSmokeError::TransportUnavailable(
+                    "the bulk lane is unavailable".to_owned(),
+                ))
         }
+    }
+}
+
+/// The next host message for the session loop: from the control lane, or
+/// forwarded from the bulk lane, tagged with the lane it arrived on.
+async fn next_session_message(
+    ws: &mut DirectSessionSocket,
+    bulk: &mut mpsc::Receiver<Message>,
+) -> (
+    arcen_protocol::lanes::LaneRole,
+    Option<Result<Message, WebSocketError>>,
+) {
+    tokio::select! {
+        biased;
+        message = ws.next() => (arcen_protocol::lanes::LaneRole::Control, message),
+        Some(message) = bulk.recv() => (arcen_protocol::lanes::LaneRole::BulkAux, Some(Ok(message))),
+    }
+}
+
+/// How a lane worker's end is reported: a peer on another transport layout
+/// gets the shared "update both" message; anything else is a lost
+/// transport, which the reconnect policy may resume.
+fn lane_terminal_error(terminal: Option<arcen_transport::quic::LaneTerminal>) -> ConnectSmokeError {
+    match terminal {
+        Some(arcen_transport::quic::LaneTerminal::ConnectionLost(Some(mismatch))) => {
+            ConnectSmokeError::TransportUnavailable(mismatch.message())
+        }
+        _ => ConnectSmokeError::UnexpectedEof,
     }
 }
 
@@ -1258,6 +1193,9 @@ pub enum SessionCommand {
 #[derive(Clone)]
 pub struct SessionCommandSender {
     sender: mpsc::UnboundedSender<SessionCommand>,
+    /// Input messages bypass the session loop and go straight to the
+    /// input/cursor lane's worker (ADR 0014).
+    input: Option<mpsc::UnboundedSender<Value>>,
     cancellation: Arc<SessionCancellation>,
 }
 
@@ -1269,6 +1207,18 @@ impl SessionCommandSender {
         if matches!(command, SessionCommand::Close) {
             self.cancellation.close();
         }
+        if let (Some(input), SessionCommand::Json(value)) = (self.input.as_ref(), &command) {
+            if arcen_protocol::lanes::lane_for_message_type(msg_type(value).unwrap_or_default())
+                == arcen_protocol::lanes::LaneRole::InputCursor
+            {
+                let SessionCommand::Json(value) = command else {
+                    unreachable!("matched a JSON command above")
+                };
+                return input
+                    .send(value)
+                    .map_err(|error| mpsc::error::SendError(SessionCommand::Json(error.0)));
+            }
+        }
         self.sender.send(command)
     }
 
@@ -1277,6 +1227,7 @@ impl SessionCommandSender {
         let (cancellation, _) = SessionCancellation::new();
         Self {
             sender,
+            input: None,
             cancellation,
         }
     }
@@ -1649,7 +1600,7 @@ async fn connect_smoke_correlated(
     mut options: ConnectOptions,
     session_log_id: CorrelationId,
 ) -> Result<ConnectSmokeResult, ConnectSmokeError> {
-    let (mut ws, uri, mut fsm) = open_websocket(&options, None).await?;
+    let (mut ws, uri, mut fsm) = open_websocket(&options, None, &session_log_id).await?;
 
     let first = recv_json(&mut ws, options.timeout).await?;
     match msg_type(&first).unwrap_or("<missing>") {
@@ -1743,6 +1694,7 @@ fn spawn_session_with_auth(
     let (event_tx, events) = mpsc::unbounded_channel();
     let event_sender = event_tx.clone();
     let (command_tx, commands) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (cancellation, close_receiver) = SessionCancellation::new();
     let (media_tx, media) = incoming_media_inbox();
     let clipboard = ClipboardSession::new();
@@ -1756,6 +1708,7 @@ fn spawn_session_with_auth(
             event_tx,
             media_tx,
             commands,
+            input_rx,
             task_clipboard,
             task_cancellation,
             close_receiver,
@@ -1768,6 +1721,7 @@ fn spawn_session_with_auth(
         media,
         commands: SessionCommandSender {
             sender: command_tx,
+            input: Some(input_tx),
             cancellation,
         },
         clipboard,
@@ -1782,6 +1736,7 @@ async fn run_session(
     tx: mpsc::UnboundedSender<SessionEvent>,
     media: IncomingMediaSender,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
+    input: mpsc::UnboundedReceiver<Value>,
     clipboard: ClipboardSession,
     cancellation: Arc<SessionCancellation>,
     close_receiver: watch::Receiver<bool>,
@@ -1834,6 +1789,7 @@ async fn run_session(
             tx.clone(),
             media,
             commands,
+            input,
             clipboard,
             cancellation,
             close_receiver,
@@ -1877,6 +1833,7 @@ async fn run_session_correlated(
     tx: mpsc::UnboundedSender<SessionEvent>,
     media: IncomingMediaSender,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
+    input: mpsc::UnboundedReceiver<Value>,
     clipboard: ClipboardSession,
     cancellation: Arc<SessionCancellation>,
     mut close_receiver: watch::Receiver<bool>,
@@ -1884,7 +1841,7 @@ async fn run_session_correlated(
     session_log_id: CorrelationId,
 ) -> Result<SessionEnd, ConnectSmokeError> {
     let (mut ws, _uri, mut fsm) = cancellable_setup(
-        open_websocket(&options, Some(&tx)),
+        open_websocket(&options, Some(&tx), &session_log_id),
         &cancellation,
         &mut close_receiver,
     )
@@ -1935,11 +1892,7 @@ async fn run_session_correlated(
                 .await?;
             } else {
                 let _ = tx.send(SessionEvent::AuthRequired(auth_request.clone()));
-                let command = timeout(AUTH_INTERACTION_TIMEOUT, commands.recv())
-                    .await
-                    .map_err(|_| ConnectSmokeError::Timeout)?
-                    .ok_or(ConnectSmokeError::AuthDeclined)?;
-                match command {
+                match next_sign_in_answer(&mut commands).await? {
                     SessionCommand::SubmitAuth(submission) => {
                         send_auth(
                             &mut ws,
@@ -2182,14 +2135,21 @@ async fn run_session_correlated(
     .then(|| crate::hid::HidSession::start(hid_tx.clone()));
     #[cfg(feature = "experimental-raw-hid")]
     let mut hid_devices = HashMap::<u8, (u16, u16, u64, u64)>::new();
-    let (priority_audio_tx, mut priority_audio_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(PRIORITY_AUDIO_QUEUE);
-    let priority_audio_reader = ws
-        .quic_connection()
-        .map(|connection| tokio::spawn(read_audio_priority_stream(connection, priority_audio_tx)));
+    // Every role but control runs on its own lane worker (ADR 0014): video
+    // and audio readers, input/cursor and bulk workers. The session loop
+    // below serves control only and never waits on a media lane.
+    let Some(lanes) = ws.lanes() else {
+        return Err(ConnectSmokeError::TransportUnavailable(
+            "this Deck requires the QUIC lane transport".to_owned(),
+        ));
+    };
+    let mut workers =
+        crate::transport::lanes::spawn_deck_lane_workers(&lanes, media.clone(), tx.clone(), input);
+    let mut microphone_lane = crate::transport::lanes::MicrophoneLane::default();
+    let mut bulk_disabled = false;
     let outcome = async {
       loop {
-        if clipboard.policy().is_none() {
+        if bulk_disabled || clipboard.policy().is_none() {
             clipboard_policy = None;
             if let Some(reassembler) = clipboard_reassembler.as_mut() {
                 reassembler.abort();
@@ -2224,10 +2184,24 @@ async fn run_session_correlated(
                         );
                     }
                     SessionCommand::Json(value) => {
-                        send_bounded(&mut ws, Message::Text(value.to_string()), &cancellation, &mut close_receiver).await?;
+                        let message = Message::Text(value.to_string());
+                        if crate::transport::lanes::message_lane(&message)
+                            == Some(arcen_protocol::lanes::LaneRole::BulkAux)
+                        {
+                            send_bulk(&workers.bulk_out, message, &cancellation, &mut close_receiver).await?;
+                        } else {
+                            send_bounded(&mut ws, message, &cancellation, &mut close_receiver).await?;
+                        }
                     }
                     SessionCommand::Binary(bytes) => {
-                        send_bounded(&mut ws, Message::Binary(bytes), &cancellation, &mut close_receiver).await?;
+                        let message = Message::Binary(bytes);
+                        if crate::transport::lanes::message_lane(&message)
+                            == Some(arcen_protocol::lanes::LaneRole::BulkAux)
+                        {
+                            send_bulk(&workers.bulk_out, message, &cancellation, &mut close_receiver).await?;
+                        } else {
+                            send_bounded(&mut ws, message, &cancellation, &mut close_receiver).await?;
+                        }
                     }
                     SessionCommand::HardUsbPen(event) => {
                         #[cfg(feature = "usb-hard-lab")]
@@ -2255,6 +2229,12 @@ async fn run_session_correlated(
                 return Err(ConnectSmokeError::Timeout);
             }
             _ = tokio::time::sleep_until(last_received + STALL_TIMEOUT) => {
+                // Video and audio arrive on their own lanes, not here.
+                let media_activity = tokio::time::Instant::from_std(workers.activity.last());
+                if media_activity > last_received {
+                    last_received = media_activity;
+                    continue;
+                }
                 return Err(ConnectSmokeError::Timeout);
             }
             _ = keepalive.tick() => {
@@ -2358,34 +2338,64 @@ async fn run_session_correlated(
                         "physical Hard USB completion failed: {error}"
                     ))
                 })?;
-                send_bounded(
-                    &mut ws,
+                send_bulk(
+                    &workers.bulk_out,
                     Message::Binary(completion),
                     &cancellation,
                     &mut close_receiver,
                 )
                 .await?;
             }
-            Some(frame) = priority_audio_rx.recv() => {
-                last_received = tokio::time::Instant::now();
-                match media.enqueue_bytes(&frame) {
-                    Ok(outcome) if outcome.notify => {
-                        let _ = tx.send(SessionEvent::MediaReady);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let message = format!("{error:?}");
-                        if media.record_malformed(&frame, message).notify {
-                            let _ = tx.send(SessionEvent::MediaReady);
+            terminal = workers.ended.recv() => {
+                match terminal {
+                    Some(arcen_transport::quic::LaneTerminal::Disabled(
+                        arcen_protocol::lanes::LaneRole::BulkAux,
+                    )) => {
+                        // Clipboard and Hard USB are off for the rest of the
+                        // session; the session itself goes on.
+                        bulk_disabled = true;
+                        #[cfg(feature = "usb-hard-lab")]
+                        if let Some(responder) = usb_hard_responder.take() {
+                            responder.shutdown().await;
                         }
+                        let _ = tx.send(SessionEvent::ConnectionStatusHint(Some(
+                            "Clipboard and USB are off for this session: their stream is unavailable"
+                                .to_owned(),
+                        )));
                     }
+                    Some(arcen_transport::quic::LaneTerminal::Disabled(
+                        role @ (arcen_protocol::lanes::LaneRole::AudioOutput
+                        | arcen_protocol::lanes::LaneRole::Microphone),
+                    )) => {
+                        // The Pier reports the disabled stream on the control
+                        // lane (`audio_stream_result`, `microphone_stream_stop`).
+                        tracing::warn!(
+                            target: crate::logging::target::TRANSPORT,
+                            lane = %role,
+                            "media lane disabled for this session"
+                        );
+                    }
+                    other => return Err(lane_terminal_error(other)),
                 }
             }
-            message = ws.next() => {
+            (source_lane, message) = next_session_message(&mut ws, &mut workers.bulk_in) => {
                 last_received = tokio::time::Instant::now();
                 let Some(message) = message else {
                     return Err(ConnectSmokeError::UnexpectedEof);
                 };
+                if let Ok(received) = &message {
+                    if let Some(lane) = crate::transport::lanes::message_lane(received) {
+                        if lane != source_lane {
+                            tracing::warn!(
+                                target: crate::logging::target::TRANSPORT,
+                                received_on = %source_lane,
+                                belongs_on = %lane,
+                                "host message on the wrong lane dropped",
+                            );
+                            continue;
+                        }
+                    }
+                }
                 match message? {
                     Message::Text(text) => {
                         if !control_size_allowed(text.len()) {
@@ -2413,12 +2423,60 @@ async fn run_session_correlated(
                             let _ = tx.send(SessionEvent::Authenticated(refresh));
                             continue;
                         }
+                        if msg_type(&value)
+                            == Some(arcen_protocol::messages::AUDIO_STREAM_RESULT)
+                        {
+                            // Straight to the audio worker, in order with
+                            // the audio lane's frames: the media worker may be
+                            // busy setting up a decoder, and audio must not be
+                            // played before its codec is known.
+                            if let Ok(result) = serde_json::from_value::<
+                                arcen_protocol::messages::AudioStreamResultMsg,
+                            >(value.clone())
+                            {
+                                media.audio_lane().push_stream_result(result);
+                            }
+                        }
                         if msg_type(&value) == Some(CLIPBOARD_DATA) {
                             handle_clipboard_offer(
                                 value,
                                 clipboard_policy,
                                 clipboard_reassembler.as_mut(),
                             );
+                            continue;
+                        }
+                        if msg_type(&value)
+                            == Some(arcen_protocol::messages::CLIPBOARD_TRANSFER_FAILED)
+                        {
+                            handle_clipboard_transfer_failed(
+                                &value,
+                                clipboard_reassembler.as_mut(),
+                                &tx,
+                            );
+                            continue;
+                        }
+                        if msg_type(&value) == Some(arcen_protocol::messages::TABLET_MODE_RESULT) {
+                            // A Pier that stopped Hard USB mid-session (its
+                            // bulk stream failed) says so here.
+                            #[cfg(feature = "usb-hard-lab")]
+                            if let Ok(result) = serde_json::from_value::<
+                                arcen_protocol::messages::TabletModeResultMsg,
+                            >(value.clone())
+                            {
+                                if !(result.accepted
+                                    && result.active == TabletModeMsg::UsbTabletBridge)
+                                {
+                                    if let Some(responder) = usb_hard_responder.take() {
+                                        tracing::warn!(
+                                            target: crate::logging::target::USB,
+                                            reason = ?result.reason,
+                                            "host stopped Hard USB for this session"
+                                        );
+                                        responder.shutdown().await;
+                                    }
+                                }
+                            }
+                            let _ = tx.send(SessionEvent::Json(value));
                             continue;
                         }
                         if msg_type(&value) == Some(MICROPHONE_STREAM_RESULT) {
@@ -2514,9 +2572,9 @@ async fn run_session_correlated(
                                     ))
                                 })? {
                                     crate::usb_bridge::SubmitResult::Immediate(completion) => {
-                                        send_bounded(
-                                            &mut ws,
-                                            Message::Binary(completion),
+                                        send_bulk(
+                    &workers.bulk_out,
+                    Message::Binary(completion),
                                             &cancellation,
                                             &mut close_receiver,
                                         )
@@ -2560,9 +2618,9 @@ async fn run_session_correlated(
                                 // `None` means the helper will deliver the
                                 // terminal completion asynchronously.
                                 if let Some(completion) = completion {
-                                    send_bounded(
-                                        &mut ws,
-                                        Message::Binary(completion),
+                                    send_bulk(
+                    &workers.bulk_out,
+                    Message::Binary(completion),
                                         &cancellation,
                                         &mut close_receiver,
                                     )
@@ -2594,7 +2652,7 @@ async fn run_session_correlated(
                 }
             }
             () = clipboard.outbound_notified() => {}
-            () = clipboard_send_turn(outbound.is_some()) => {
+            () = clipboard_send_turn(outbound.is_some() && workers.bulk_out.capacity() > 0) => {
                 if clipboard.policy().is_none() {
                     outbound = None;
                     continue;
@@ -2602,7 +2660,7 @@ async fn run_session_correlated(
                 let mut finished = false;
                 if let Some(transfer) = outbound.as_mut() {
                     let message = transfer.next_message()?;
-                    send_bounded(&mut ws, message, &cancellation, &mut close_receiver).await?;
+                    send_bulk(&workers.bulk_out, message, &cancellation, &mut close_receiver).await?;
                     finished = transfer.is_finished();
                 }
                 if finished {
@@ -2691,8 +2749,8 @@ async fn run_session_correlated(
                         continue;
                     }
                 };
-                if let Err(error) = send_bounded(
-                    &mut ws,
+                if let Err(error) = send_bulk(
+                    &workers.bulk_out,
                     Message::Binary(frame),
                     &cancellation,
                     &mut close_receiver,
@@ -2790,23 +2848,60 @@ async fn run_session_correlated(
                 match encoded {
                     Ok(encoded) => {
                         let encoded_bytes = encoded.len();
-                        if let Err(error) = send_microphone_bounded(
-                            &mut ws,
-                            encoded,
-                            &cancellation,
-                            &mut close_receiver,
-                        )
-                        .await
+                        arcen_protocol::decode_microphone_frame(&encoded).map_err(|_| {
+                            ConnectSmokeError::Microphone("invalid microphone wire frame")
+                        })?;
+                        // The microphone has its own lane: a full queue drops
+                        // this frame (the Pier conceals it); this loop never
+                        // waits on the lane.
+                        match microphone_lane
+                            .send(&lanes, bytes::Bytes::copy_from_slice(&encoded))
+                            .await
                         {
-                            if matches!(error, ConnectSmokeError::Timeout) {
+                            Ok(arcen_transport::quic::LaneWriteOutcome::DroppedFull) => {
                                 if let Some(runtime) = microphone.as_mut() {
-                                runtime.record_transport_timeout();
+                                    runtime.record_transport_timeout();
                                 }
                             }
-                            return Err(error);
-                        }
-                        if let Some(runtime) = microphone.as_mut() {
-                            runtime.record_sent(encoded_bytes);
+                            Ok(_) => {
+                                if let Some(runtime) = microphone.as_mut() {
+                                    runtime.record_sent(encoded_bytes);
+                                }
+                            }
+                            Err(arcen_transport::quic::LaneTerminal::Disabled(_)) => {
+                                let generation =
+                                    microphone.as_ref().map(|runtime| runtime.generation);
+                                tracing::warn!(
+                                    target: crate::logging::target::AUDIO,
+                                    event = "mic_deck_capture_failure",
+                                    sid = %session_log_id,
+                                    generation = ?generation,
+                                    reason = "lane_unavailable",
+                                    "microphone lane exhausted its recovery; microphone stopped",
+                                );
+                                if let Some(runtime) = microphone.take() {
+                                    stop_microphone_runtime(
+                                        runtime,
+                                        Some(cancellation.cleanup_deadline()),
+                                        "lane_unavailable",
+                                    )
+                                    .await;
+                                }
+                                let _ = tx.send(SessionEvent::MicrophoneActive(false));
+                                if let Some(generation) = generation {
+                                    send_bounded(
+                                        &mut ws,
+                                        microphone_stop_message(
+                                            generation,
+                                            MicrophoneStreamReason::CaptureFailure,
+                                        )?,
+                                        &cancellation,
+                                        &mut close_receiver,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Err(terminal) => return Err(lane_terminal_error(Some(terminal))),
                         }
                     }
                     Err(error) => {
@@ -2947,9 +3042,7 @@ async fn run_session_correlated(
       }
     }
     .await;
-    if let Some(reader) = priority_audio_reader {
-        reader.abort();
-    }
+    drop(workers);
 
     #[cfg(feature = "experimental-raw-hid")]
     for (device_id, (vendor_id, product_id, reports, errors)) in hid_devices.drain() {
@@ -2988,6 +3081,7 @@ async fn run_session_correlated(
 async fn open_websocket(
     options: &ConnectOptions,
     status_tx: Option<&mpsc::UnboundedSender<SessionEvent>>,
+    session_log_id: &CorrelationId,
 ) -> Result<(DirectSessionSocket, Url, ClientFsm), ConnectSmokeError> {
     let transport = resolve_transport(options)
         .map_err(|message| ConnectSmokeError::TransportUnavailable(message.to_string()))?;
@@ -3014,7 +3108,7 @@ async fn open_websocket(
         DirectTransportKind::WebSocket => {
             open_wss_socket(options).await.map(DirectSessionSocket::Wss)
         }
-        DirectTransportKind::Quic => open_quic_socket(options, status_tx)
+        DirectTransportKind::Quic => open_quic_socket(options, status_tx, Some(session_log_id))
             .await
             .map(DirectSessionSocket::Quic),
     };
@@ -3041,6 +3135,7 @@ fn map_captured_certificate_error(
     error
 }
 
+#[cfg(feature = "wss-compat")]
 fn direct_websocket_config() -> WebSocketConfig {
     WebSocketConfig {
         max_message_size: Some(MAX_INCOMING_MESSAGE_SIZE),
@@ -3084,7 +3179,24 @@ async fn open_wss_socket(options: &ConnectOptions) -> Result<DirectWssSocket, Co
 async fn open_quic_socket(
     options: &ConnectOptions,
     status_tx: Option<&mpsc::UnboundedSender<SessionEvent>>,
+    session_log_id: Option<&CorrelationId>,
 ) -> Result<DirectQuicSocket, ConnectSmokeError> {
+    // Lane refusals, failures and starvation reach the Deck's own log under
+    // its session id (ADR 0014 section 8).
+    let lane_sink = session_log_id
+        .zip(crate::logging::handle())
+        .map(|(sid, handle)| {
+            Arc::new(arcen_transport::quic::ObservabilityLaneSink::new(
+                handle,
+                arcen_observability::LifecycleContext {
+                    sid: sid.clone(),
+                    user: None,
+                    host: None,
+                    peer_addr: None,
+                    health_state: None,
+                },
+            )) as Arc<dyn arcen_transport::quic::LaneTelemetrySink>
+        });
     // The TLS configuration is built per attempt, below, so that each dialled
     // address captures into its own slot. Nothing shared is constructed here.
     let addresses = timeout(
@@ -3144,8 +3256,11 @@ async fn open_quic_socket(
             }) {
             Ok(crypto) => {
                 let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-                config.transport_config(recommended_transport_config_arc(
+                // Grants the Pier the lanes it opens (video, audio) plus one
+                // replacement each (ADR 0014).
+                config.transport_config(lane_transport_config_arc(
                     &BoundedTransportPolicy::default(),
+                    arcen_protocol::lanes::LaneEndpoint::Deck,
                 ));
                 config
             }
@@ -3154,14 +3269,28 @@ async fn open_quic_socket(
                 continue;
             }
         };
+        let lane_sink = lane_sink.clone();
         attempts.push(async move {
-            let outcome = connect_direct(DirectQuicDialParams {
-                endpoint,
-                client_config: attempt_config,
-                remote_addr,
-                server_name: options.host.as_str(),
-            })
-            .await;
+            let outcome = connect_session_lanes(
+                DirectQuicDialParams {
+                    endpoint: endpoint.clone(),
+                    client_config: attempt_config,
+                    remote_addr,
+                    server_name: options.host.as_str(),
+                },
+                match lane_sink {
+                    Some(sink) => LaneRuntimeConfig::new(arcen_protocol::lanes::LaneEndpoint::Deck)
+                        .with_telemetry(sink),
+                    None => LaneRuntimeConfig::new(arcen_protocol::lanes::LaneEndpoint::Deck),
+                },
+            )
+            .await
+            .map(|(lanes, control)| {
+                crate::transport::lanes::DeckLaneSocket::new(
+                    SessionLaneSocket::new(lanes, control),
+                    endpoint,
+                )
+            });
             (outcome, attempt_tls, remote_addr)
         });
     }
@@ -3181,22 +3310,17 @@ async fn open_quic_socket(
         tokio::select! {
             attempt = attempts.next(), if !attempts.is_empty() => {
                 match attempt {
-                    Some((Ok(stream), _attempt_tls, _remote_addr)) => {
+                    Some((Ok(socket), _attempt_tls, _remote_addr)) => {
                         tracing::debug!(
                             target: crate::logging::target::TRANSPORT,
-                            remote_addr = %stream.remote_address(),
-                            "QUIC TLS handshake and direct stream completed",
+                            remote_addr = %socket.lanes().connection().remote_address(),
+                            "QUIC TLS handshake and control lane completed",
                         );
                         publish_reachability_hint(status_tx, None);
-                        return Ok(WebSocketStream::from_raw_socket(
-                            stream,
-                            Role::Client,
-                            Some(direct_websocket_config()),
-                        )
-                        .await);
+                        return Ok(socket);
                     }
                     Some((Err(error), attempt_tls, remote_addr)) => {
-                        let mapped = quic_connect_error(error);
+                        let mapped = lane_setup_error(error);
                         if is_tofu_capture_reject_message(&mapped.to_string()) {
                             // Read the capture from the attempt that actually failed,
                             // and record which peer it was, so the user is approving a
@@ -3390,6 +3514,18 @@ fn synthetic_reachability_error(
         None => std::io::Error::from(kind),
     };
     classify_reachability_error(&error, remote_addr).map(ConnectSmokeError::NetworkReachability)
+}
+
+/// Maps a lane-carrier setup failure: a peer on another transport layout is
+/// reported with the shared "update the Deck and the Pier" message.
+fn lane_setup_error(error: SessionLaneSetupError) -> ConnectSmokeError {
+    match error {
+        SessionLaneSetupError::Connect(error) => quic_connect_error(error),
+        SessionLaneSetupError::Mismatch(mismatch) => {
+            ConnectSmokeError::TransportUnavailable(mismatch.message())
+        }
+        other => ConnectSmokeError::TransportUnavailable(other.to_string()),
+    }
 }
 
 /// Maps every [`QuicTransportError`] variant to a typed, user-safe
@@ -3798,6 +3934,32 @@ fn validate_authentication_refresh(
     })
 }
 
+/// The UI's next answer during sign-in. A session message the UI queued
+/// before the host accepted the sign-in (a health ping, a display update,
+/// pen state) is not an answer: it is dropped, never read as declining the
+/// sign-in. Sign-in can outlast such a message's interval (PAM, a same-user
+/// liveness proof); declining then logged the user's desktop out.
+async fn next_sign_in_answer(
+    commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+) -> Result<SessionCommand, ConnectSmokeError> {
+    let deadline = tokio::time::Instant::now() + AUTH_INTERACTION_TIMEOUT;
+    loop {
+        let command = tokio::time::timeout_at(deadline, commands.recv())
+            .await
+            .map_err(|_| ConnectSmokeError::Timeout)?
+            .ok_or(ConnectSmokeError::AuthDeclined)?;
+        match command {
+            SessionCommand::Json(_) | SessionCommand::Binary(_) | SessionCommand::HardUsbPen(_) => {
+                tracing::debug!(
+                    target: crate::logging::target::TRANSPORT,
+                    "session message queued before sign-in completed was dropped"
+                );
+            }
+            answer => return Ok(answer),
+        }
+    }
+}
+
 async fn await_authentication_acceptance<S>(
     ws: &mut S,
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
@@ -3807,11 +3969,7 @@ where
     S: Sink<Message> + Unpin,
     S::Error: Into<tokio_tungstenite::tungstenite::Error>,
 {
-    let command = timeout(AUTH_INTERACTION_TIMEOUT, commands.recv())
-        .await
-        .map_err(|_| ConnectSmokeError::Timeout)?
-        .ok_or(ConnectSmokeError::AuthDeclined)?;
-    match command {
+    match next_sign_in_answer(commands).await? {
         SessionCommand::AcceptAuthentication => Ok(()),
         SessionCommand::Close => {
             close_bounded(ws, cancellation.close_deadline()).await;
@@ -3828,11 +3986,17 @@ where
     }
 }
 
+/// The Deck draws host cursor images (`arcen_protocol::cursor`) as its
+/// native cursor, so a host may report its cursor as images rather than
+/// draw it into the video.
+pub(crate) const DECK_DRAWS_CURSOR_IMAGES: bool = true;
+
 fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions) -> AuthResponse {
     let mut response = response
         .with_displays(options.monitors.clone(), &options.displays_mode)
         .with_optional_timezone(options.timezone.clone())
-        .with_cursor_preference(options.cursor_preference);
+        .with_cursor_preference(options.cursor_preference)
+        .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES);
     let capabilities = probe_decode_capabilities();
     let quality = rust_viewer_quality_settings(&options.profile);
     // The first link of the HDR chain, stated where the ask is actually made.
@@ -4049,8 +4213,9 @@ fn client_hello_with_usb_device(
         tablet_mode_requested: options.tablet_mode_requested,
         tablet_mode_capabilities: macos_tablet_mode_capabilities(options.tablet_input_enabled),
         transport_capabilities: vec![selected_transport_capability(options).to_string()],
-        audio_priority_stream_v1: selected_transport_capability(options)
-            == arcen_protocol::CAPABILITY_TRANSPORT_QUIC,
+        // Protocol v5 carries audio on its own lane (ADR 0014); the pre-lane
+        // priority stream opt-in means nothing to a lane Pier.
+        audio_priority_stream_v1: false,
         // SEC-raw-hid: advertises only this client's own local runtime
         // opt-in for the experimental raw-HID tablet capture path. This is
         // one half of a mutual negotiation — the host independently decides
@@ -4067,6 +4232,7 @@ fn client_hello_with_usb_device(
             .with_display_size(&options.monitors)
             .with_optional_timezone(options.timezone.clone())
             .with_cursor_preference(options.cursor_preference)
+            .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
             .with_network_snapshot(network)
     };
     let hello = apply_decode_capabilities(hello, probe_decode_capabilities());
@@ -4158,6 +4324,11 @@ fn macos_input_capabilities(tablet_input_enabled: bool) -> InputCapabilitiesMsg 
         pen_rotation: pen,
         pen_eraser: pen,
         pen_proximity: pen,
+        pen_barrel_buttons: pen,
+        // The Deck sends its input method's committed text, and shows what a
+        // host reports it could not type.
+        text_commit: InputCapabilityAvailability::Available,
+        text_commit_unicode: InputCapabilityAvailability::Available,
     }
 }
 
@@ -4252,6 +4423,34 @@ fn negotiate_clipboard(
         return None;
     }
     Some(policy)
+}
+
+/// The host abandoned a clipboard transfer (ADR 0014: its bulk stream had
+/// no room): discard what arrived of it and say so.
+fn handle_clipboard_transfer_failed(
+    value: &Value,
+    reassembler: Option<&mut arcen_protocol::clipboard::ClipboardReassembler>,
+    events: &mpsc::UnboundedSender<SessionEvent>,
+) {
+    let Ok(failed) = serde_json::from_value::<arcen_protocol::messages::ClipboardTransferFailedMsg>(
+        value.clone(),
+    ) else {
+        return;
+    };
+    // The notice (control lane) has no order with the transfer's offer and
+    // chunks (bulk lane): only that transfer is scrubbed, a newer one is left
+    // alone, and a late offer for it is refused as stale.
+    let discarded = reassembler.is_some_and(|reassembler| reassembler.abandon(failed.sequence));
+    tracing::warn!(
+        target: crate::logging::target::TRANSPORT,
+        sequence = failed.sequence,
+        reason = ?failed.reason,
+        discarded,
+        "host abandoned a clipboard transfer"
+    );
+    let _ = events.send(SessionEvent::ConnectionStatusHint(Some(
+        "A clipboard copy from the host could not be delivered".to_owned(),
+    )));
 }
 
 fn handle_clipboard_offer(
@@ -4466,7 +4665,7 @@ impl OutboundClipboardTransfer {
         }
         let end = self
             .offset
-            .checked_add(CHUNK_BYTES)
+            .checked_add(CLIPBOARD_CHUNK_PAYLOAD_BYTES)
             .unwrap_or(self.item.bytes.len())
             .min(self.item.bytes.len());
         let total_size = u32::try_from(self.item.bytes.len())
@@ -5721,7 +5920,7 @@ mod tests {
             quic_enabled: true,
         };
         let started = Instant::now();
-        let error = match open_quic_socket(&options, None).await {
+        let error = match open_quic_socket(&options, None, None).await {
             Ok(_) => panic!("a missing CA bundle cannot produce a connection"),
             Err(error) => error,
         };
@@ -6503,6 +6702,7 @@ mod tests {
         cancellation.capture.lock().unwrap().generation = Some(Arc::clone(&cancel));
         let commands = SessionCommandSender {
             sender,
+            input: None,
             cancellation: Arc::clone(&cancellation),
         };
 
@@ -6522,66 +6722,8 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(SessionCommand::Close)));
     }
 
-    #[test]
-    fn microphone_wire_frame_masks_payload_and_zeros_plaintext_owner() {
-        let mut payload = vec![0x10, 0x20, 0x30, 0x40, 0x50];
-        let expected = payload.clone();
-        let mask = [0x01, 0x02, 0x03, 0x04];
-        let wire = masked_client_binary_frame(&mut payload, mask).unwrap();
-        assert!(payload.iter().all(|byte| *byte == 0));
-        assert_eq!(&wire[..6], &[0x82, 0x85, 1, 2, 3, 4]);
-        let recovered = wire[6..]
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| *byte ^ mask[index % mask.len()])
-            .collect::<Vec<_>>();
-        assert_eq!(recovered, expected);
-    }
-
     #[tokio::test]
-    #[cfg(feature = "wss-compat")]
-    async fn microphone_wire_frame_is_accepted_by_websocket_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut expected = encode_microphone_header(MicrophoneHeader {
-            codec: crate::protocol::AudioCodec::Pcm,
-            sequence: 1,
-            timestamp_ms: 0,
-            generation: 1,
-        })
-        .unwrap()
-        .to_vec();
-        expected.resize(
-            arcen_protocol::MICROPHONE_HEADER_SIZE + arcen_protocol::MICROPHONE_PCM_BYTES,
-            0x5a,
-        );
-        let server_expected = expected.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
-            let Some(Ok(Message::Binary(payload))) = ws.next().await else {
-                panic!("expected microphone binary frame");
-            };
-            assert_eq!(payload.as_ref(), server_expected);
-        });
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
-            .await
-            .unwrap();
-        let mut ws = DirectSessionSocket::Wss(ws);
-        let (cancellation, mut close_receiver) = SessionCancellation::new();
-        send_microphone_bounded(
-            &mut ws,
-            Zeroizing::new(expected),
-            &cancellation,
-            &mut close_receiver,
-        )
-        .await
-        .unwrap();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn quic_socket_uses_tls_and_raw_websocket_framing_end_to_end() {
+    async fn quic_socket_runs_the_session_on_the_authorized_control_lane() {
         let key_pair = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -6595,8 +6737,9 @@ mod tests {
         rustls_config.alpn_protocols = vec![DIRECT_QUIC_ALPN_PROTOCOL.to_vec()];
         let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config).unwrap();
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-        server_config.transport_config(recommended_transport_config_arc(
+        server_config.transport_config(lane_transport_config_arc(
             &BoundedTransportPolicy::default(),
+            arcen_protocol::lanes::LaneEndpoint::Pier,
         ));
         arcen_transport::quic::apply_direct_server_limits(&mut server_config);
         let server_endpoint =
@@ -6606,20 +6749,44 @@ mod tests {
         let server = tokio::spawn(async move {
             let incoming = server_endpoint_for_task.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let stream = arcen_transport::quic::accept_direct(connection)
-                .await
-                .unwrap();
-            let mut ws = WebSocketStream::from_raw_socket(
-                stream,
-                Role::Server,
-                Some(direct_websocket_config()),
+            let (lanes, control) = arcen_transport::quic::accept_session_lanes(
+                connection,
+                LaneRuntimeConfig::new(arcen_protocol::lanes::LaneEndpoint::Pier),
+                Duration::from_secs(5),
             )
-            .await;
-            ws.send(Message::Text("pier-quic".into())).await.unwrap();
+            .await
+            .unwrap();
+            let grant = arcen_transport::quic::grant_attachment(
+                &lanes,
+                std::num::NonZeroU64::new(1).unwrap(),
+                arcen_protocol::lanes::LaneRoleSet::all(),
+            )
+            .unwrap();
+            let mut ws = SessionLaneSocket::new(lanes.clone(), control);
+            ws.send(arcen_protocol::lanes::SessionRecord::Text(
+                serde_json::to_string(&grant).unwrap(),
+            ))
+            .await
+            .unwrap();
+            ws.send(arcen_protocol::lanes::SessionRecord::Text(
+                "pier-quic".into(),
+            ))
+            .await
+            .unwrap();
             assert_eq!(
                 ws.next().await.unwrap().unwrap(),
-                Message::Text("deck-quic".into())
+                arcen_protocol::lanes::SessionRecord::Text("deck-quic".into())
             );
+            // The Deck authorized the attachment from the grant, so its
+            // input lane is admitted.
+            let input = tokio::time::timeout(
+                Duration::from_secs(5),
+                lanes.next_peer_lane(arcen_protocol::lanes::LaneRole::InputCursor),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(input.role(), arcen_protocol::lanes::LaneRole::InputCursor);
             let _ = ws.next().await;
         });
 
@@ -6647,28 +6814,23 @@ mod tests {
             telemetry: Arc::new(ClientTelemetry::default()),
             quic_enabled: true,
         };
-        let mut ws = open_quic_socket(&options, None).await.unwrap();
+        let mut ws = open_quic_socket(&options, None, None).await.unwrap();
+        // `lane_attachment` is consumed by the socket, never seen here.
         assert_eq!(
             ws.next().await.unwrap().unwrap(),
             Message::Text("pier-quic".into())
         );
         ws.send(Message::Text("deck-quic".into())).await.unwrap();
-        ws.close(None).await.unwrap();
+        let input = ws
+            .lanes()
+            .open_lane(arcen_protocol::lanes::LaneRole::InputCursor)
+            .await;
+        assert!(input.is_ok());
+        SinkExt::close(&mut ws).await.unwrap();
         options.password.zeroize();
         server.await.unwrap();
         server_endpoint.close(0_u32.into(), b"test complete");
         server_endpoint.wait_idle().await;
-    }
-
-    #[test]
-    fn microphone_raw_write_flushes_tungstenite_buffer_first() {
-        let source = include_str!("websocket.rs");
-        let start = source.find("async fn send_microphone_bounded").unwrap();
-        let rest = &source[start..];
-        let body = &rest[..rest.find("\nasync fn send_setup_message").unwrap()];
-        let tungstenite_flush = body.find("SinkExt::flush(ws)").unwrap();
-        let raw_write = body.find("ws.write_raw").unwrap();
-        assert!(tungstenite_flush < raw_write);
     }
 
     #[tokio::test]
@@ -6816,6 +6978,7 @@ mod tests {
         let (sender, mut commands_rx) = mpsc::unbounded_channel();
         let commands = SessionCommandSender {
             sender,
+            input: None,
             cancellation: session_cancellation,
         };
 
@@ -6856,6 +7019,52 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_before_sign_in_completes_does_not_decline_it() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(SessionCommand::Json(
+                serde_json::json!({"type": "health_ping", "sequence": 1}),
+            ))
+            .unwrap();
+        sender.send(SessionCommand::Binary(vec![1, 2, 3])).unwrap();
+        sender.send(SessionCommand::AcceptAuthentication).unwrap();
+        assert!(matches!(
+            next_sign_in_answer(&mut receiver).await,
+            Ok(SessionCommand::AcceptAuthentication)
+        ));
+        drop(sender);
+        assert!(matches!(
+            next_sign_in_answer(&mut receiver).await,
+            Err(ConnectSmokeError::AuthDeclined)
+        ));
+    }
+
+    /// A 0.16 Deck runs tungstenite over the raw pre-lane stream; the lane
+    /// Pier's refusal must be a close frame it reads, with the reason it
+    /// prints ("host closed the connection during setup: …").
+    #[tokio::test]
+    async fn a_pre_lane_deck_reads_the_lane_piers_refusal_as_a_close_reason() {
+        use tokio::io::AsyncWriteExt;
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, Role};
+
+        let (deck_io, mut pier_io) = tokio::io::duplex(1024);
+        pier_io
+            .write_all(&arcen_protocol::lanes::legacy_direct_stream_refusal_frame())
+            .await
+            .unwrap();
+        let mut deck =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(deck_io, Role::Client, None).await;
+        let Some(Ok(Message::Close(Some(frame)))) = deck.next().await else {
+            panic!("a close frame with a reason expected");
+        };
+        assert_eq!(frame.code, CloseCode::Policy);
+        assert_eq!(
+            frame.reason.as_ref(),
+            arcen_protocol::lanes::legacy_deck_refusal_reason()
+        );
     }
 
     #[test]
@@ -7527,6 +7736,58 @@ mod tests {
         assert!(json.get("wacom_usb_bridge").is_some());
     }
 
+    fn transfer_failed(sequence: u64) -> Value {
+        serde_json::to_value(arcen_protocol::messages::ClipboardTransferFailedMsg::new(
+            sequence,
+            arcen_protocol::messages::ClipboardTransferFailure::BulkLaneFull,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_late_clipboard_failure_notice_leaves_a_newer_transfer_alone() {
+        let mut reassembler = arcen_protocol::clipboard::ClipboardReassembler::new(1024).unwrap();
+        reassembler
+            .begin(ClipboardDataMsg::new(
+                6,
+                ClipboardContentKind::TextUtf8,
+                4,
+                false,
+            ))
+            .unwrap();
+        let (events, mut hints) = mpsc::unbounded_channel();
+        handle_clipboard_transfer_failed(&transfer_failed(5), Some(&mut reassembler), &events);
+        assert_eq!(reassembler.in_flight_sequence(), Some(6));
+        assert!(matches!(
+            hints.try_recv(),
+            Ok(SessionEvent::ConnectionStatusHint(Some(_)))
+        ));
+    }
+
+    #[test]
+    fn a_clipboard_failure_notice_ahead_of_its_offer_refuses_the_offer() {
+        let mut reassembler = arcen_protocol::clipboard::ClipboardReassembler::new(1024).unwrap();
+        let (events, _hints) = mpsc::unbounded_channel();
+        handle_clipboard_transfer_failed(&transfer_failed(7), Some(&mut reassembler), &events);
+        assert_eq!(
+            reassembler.begin(ClipboardDataMsg::new(
+                7,
+                ClipboardContentKind::TextUtf8,
+                4,
+                false
+            )),
+            Err(arcen_protocol::clipboard::ClipboardReassemblyError::StaleSequence)
+        );
+        reassembler
+            .begin(ClipboardDataMsg::new(
+                8,
+                ClipboardContentKind::TextUtf8,
+                4,
+                false,
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn hard_usb_capability_does_not_depend_on_local_typed_pen_setting() {
         assert_eq!(
@@ -7633,12 +7894,12 @@ mod tests {
             protocol_version: CLIPBOARD_PROTOCOL_VERSION,
             direction: arcen_protocol::messages::ClipboardDirectionMsg::Both,
             content: arcen_protocol::messages::ClipboardContentMsg::All,
-            max_bytes: u32::try_from(CHUNK_BYTES + 1).unwrap(),
+            max_bytes: u32::try_from(CLIPBOARD_CHUNK_PAYLOAD_BYTES + 1).unwrap(),
         };
         let item = ClipboardItem::new(
             4,
             ClipboardContentKind::TextUtf8,
-            vec![b'x'; CHUNK_BYTES + 1],
+            vec![b'x'; CLIPBOARD_CHUNK_PAYLOAD_BYTES + 1],
             false,
         )
         .unwrap();
@@ -7649,7 +7910,14 @@ mod tests {
         };
         assert_eq!(
             first.len(),
-            crate::protocol::CLIPBOARD_HEADER_SIZE + CHUNK_BYTES
+            crate::protocol::CLIPBOARD_HEADER_SIZE + CLIPBOARD_CHUNK_PAYLOAD_BYTES
+        );
+        // One whole bulk-lane record, which the lane refuses above 1 MiB.
+        assert_eq!(
+            arcen_protocol::lanes::SessionRecord::Binary(first.to_vec())
+                .encode()
+                .len(),
+            crate::protocol::CHUNK_BYTES
         );
         assert!(!transfer.is_finished());
         let Message::Binary(second) = transfer.next_message().unwrap() else {

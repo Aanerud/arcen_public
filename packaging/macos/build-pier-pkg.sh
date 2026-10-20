@@ -146,11 +146,24 @@ cp "$PIER_SCRIPTS/uninstall.sh" "$PIER_SCRIPTS/common.sh" "$RESOURCES/"
 chmod 755 "$RESOURCES/uninstall.sh"
 chmod 644 "$RESOURCES/common.sh"
 
+# Anything shipping in a release artefact carries its notices. The app build
+# put them in the bundle; refuse a payload whose copies are missing or differ
+# from the source being packaged.
+for notice in LICENSE legal/THIRD_PARTY_NOTICES.md; do
+  cmp -s "$REPO/$notice" "$RESOURCES/$(basename "$notice")" || {
+    echo "error: the payload's $(basename "$notice") is missing or differs from $notice" >&2
+    exit 1
+  }
+done
+
 # Strip extended attributes before sealing. `pkgbuild` encodes any xattr it
 # finds as an AppleDouble entry in the payload, so a tree carrying quarantine
 # or Finder metadata produces a "._" companion for every file. Clearing them
 # first is what removes the companions; deleting the companions afterwards
 # does not, because they are generated at packaging time rather than copied.
+# It cannot clear `com.apple.provenance`, which macOS 26 puts on every file
+# this build writes; strip_appledouble.py drops those companions after
+# pkgbuild.
 #
 # This runs before signing, because the seal has to cover the tree as it will
 # actually ship.
@@ -231,6 +244,13 @@ pkgbuild \
   --ownership recommended \
   "$PRODUCT/$COMPONENT_PKG" >/dev/null
 
+# pkgbuild writes a "._" AppleDouble companion for every file and directory
+# that still carries an extended attribute, and on macOS 26 every file this
+# build wrote carries `com.apple.provenance`, which nothing can remove. The
+# helper drops companions that hold only that attribute, fixes the Bom and
+# file count to match, and refuses anything that carries real content.
+python3 "$HERE/strip_appledouble.py" "$PRODUCT/$COMPONENT_PKG"
+
 # The component is wrapped in a product archive, which is what Installer.app
 # opens. It exists for its installation check: the package is meant to be
 # installed on the Mac itself, by the person who approves its privacy
@@ -278,6 +298,11 @@ else
   echo "    which is a different certificate from 'Developer ID Application'."
   echo "    Without it Gatekeeper refuses the package on any other Mac."
 fi
+
+python3 "$HERE/strip_appledouble.py" --check "$PKG" || {
+  echo "error: $PKG has AppleDouble (._) entries" >&2
+  exit 1
+}
 
 # The package is notarized separately from the application inside it. Both
 # are needed: Gatekeeper checks the package when it is opened, and the app

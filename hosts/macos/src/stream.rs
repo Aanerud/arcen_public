@@ -956,6 +956,10 @@ struct Producer {
     /// The encoding rate the session wants, in bits per second; zero keeps
     /// the encoder's own.
     rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The frame rate a Detail stream runs at, as the shared rate controller
+    /// decided it (`RateController::detail_framerate`); zero keeps the
+    /// capture's own.
+    detail_fps: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// The counters a producer publishes and the requests it reads.
@@ -977,6 +981,8 @@ struct ProducerSignals<'a> {
     superseded: &'a std::sync::atomic::AtomicU64,
     /// The encoding rate the session wants; zero keeps the encoder's own.
     rate: &'a std::sync::atomic::AtomicU64,
+    /// The Detail frame rate the session wants; zero keeps the capture's own.
+    detail_fps: &'a std::sync::atomic::AtomicU32,
 }
 
 /// Spawns the capture and encode thread.
@@ -1017,6 +1023,8 @@ fn spawn_producer(
     let producer_superseded = std::sync::Arc::clone(&superseded);
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
+    let detail_fps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let producer_detail_fps = std::sync::Arc::clone(&detail_fps);
     let producer = std::thread::spawn(move || {
         produce(
             capture,
@@ -1033,6 +1041,7 @@ fn spawn_producer(
                 suppressed: &producer_suppressed,
                 superseded: &producer_superseded,
                 rate: &producer_rate,
+                detail_fps: &producer_detail_fps,
             },
         )
     });
@@ -1045,6 +1054,7 @@ fn spawn_producer(
         suppressed,
         superseded,
         rate,
+        detail_fps,
     }
 }
 
@@ -1075,6 +1085,9 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
     // not drive this one.
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
+    // Region encoders run at the capture rate; nothing reads this.
+    let detail_fps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let producer_detail_fps = std::sync::Arc::clone(&detail_fps);
     let producer = std::thread::spawn(move || {
         produce_multi(
             config,
@@ -1086,6 +1099,7 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
                 suppressed: &producer_suppressed,
                 superseded: &producer_superseded,
                 rate: &producer_rate,
+                detail_fps: &producer_detail_fps,
             },
         )
     });
@@ -1098,6 +1112,7 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
         suppressed,
         superseded,
         rate,
+        detail_fps,
     }
 }
 
@@ -1559,6 +1574,7 @@ pub async fn stream(
         suppressed: capture_suppressed,
         superseded: raw_superseded,
         rate: encode_rate,
+        detail_fps,
     } = spawn_producer(
         capture,
         codec,
@@ -1593,6 +1609,7 @@ pub async fn stream(
         motion_priority,
     );
     let mut rate_controller = arcen_media::rate_control::RateController::new(policy);
+    let mut last_detail_framerate = None;
     let mut current_served_pipeline = served_pipeline.clone();
     let mut path_state = arcen_telemetry::PathSignalState::default();
     let mut latest_path_signal: Option<arcen_media::rate_control::PathSignal> = None;
@@ -1844,8 +1861,9 @@ pub async fn stream(
                         path,
                     };
                     rate_mark = (stats.bytes_sent, stats.frames_sent, total_queue);
-                    if rate_control && let Some(change) = rate_controller.observe(sample) {
-                        encode_rate.store(change.target_bps, std::sync::atomic::Ordering::Relaxed);
+                    if rate_control {
+                        if let Some(change) = rate_controller.observe(sample) {
+                            encode_rate.store(change.target_bps, std::sync::atomic::Ordering::Relaxed);
                             tracing::info!(
                                 target: arcen_telemetry::names::target::MEDIA,
                                 previous_bps = change.previous_bps,
@@ -1858,6 +1876,14 @@ pub async fn stream(
                                 mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
                                 "encoder rate follows the path"
                             );
+                        }
+                        publish_detail_framerate(
+                            &rate_controller,
+                            operational_motion_priority,
+                            fps,
+                            &detail_fps,
+                            &mut last_detail_framerate,
+                        );
                     }
                     continue;
                 }
@@ -1896,6 +1922,15 @@ pub async fn stream(
                                 encode_rate.store(
                                     start_bps,
                                     std::sync::atomic::Ordering::Relaxed,
+                                );
+                                // A new contract starts at its own rate.
+                                last_detail_framerate = None;
+                                publish_detail_framerate(
+                                    &rate_controller,
+                                    operational_motion_priority,
+                                    fps,
+                                    &detail_fps,
+                                    &mut last_detail_framerate,
                                 );
                             }
                             continue;
@@ -2026,6 +2061,7 @@ pub async fn stream_multi(
         suppressed: capture_suppressed,
         superseded: raw_superseded,
         rate: encode_rate,
+        detail_fps: _,
     } = spawn_multi_producer(MultiProducerConfig {
         monitors,
         codec,
@@ -2798,6 +2834,7 @@ fn produce(
         suppressed,
         superseded,
         rate,
+        detail_fps,
     } = signals;
     let session = CaptureSession::start(capture).map_err(StreamError::Capture)?;
 
@@ -2818,6 +2855,7 @@ fn produce(
                     keyframe_requests,
                     suppressed,
                     rate,
+                    detail_fps,
                 },
             );
             // Whatever ended the encode side, the capture side must stop
@@ -2996,6 +3034,7 @@ struct EncodeLoopContext<'a> {
     keyframe_requests: &'a std::sync::atomic::AtomicU64,
     suppressed: &'a std::sync::atomic::AtomicU64,
     rate: &'a std::sync::atomic::AtomicU64,
+    detail_fps: &'a std::sync::atomic::AtomicU32,
 }
 
 /// Whether the encode stage has nothing left to do.
@@ -3272,12 +3311,40 @@ fn observe_damage(
     }
 }
 
-fn detail_frame_interval(max_fps: u32, start_bps: u64, target_bps: u64) -> Duration {
-    Duration::from_secs_f64(
-        1.0 / f64::from(
-            arcen_media::rate_control::detail_framerate(max_fps, start_bps, target_bps).max(1),
-        ),
-    )
+/// Publishes the shared controller's Detail frame rate to the encode loop and
+/// logs every change with its reason, so a rate below the contract is never
+/// silent. Only Detail streams shed frames; other priorities publish nothing.
+fn publish_detail_framerate(
+    controller: &arcen_media::rate_control::RateController,
+    priority: arcen_media::video::MotionPriority,
+    contract_fps: u32,
+    published: &std::sync::atomic::AtomicU32,
+    last: &mut Option<arcen_media::rate_control::DetailFramerate>,
+) {
+    if priority != arcen_media::video::MotionPriority::Detail {
+        return;
+    }
+    let detail = controller.detail_framerate(contract_fps);
+    if *last == Some(detail) {
+        return;
+    }
+    published.store(detail.fps, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        target: arcen_telemetry::names::target::MEDIA,
+        fps = detail.fps,
+        contract_fps,
+        fps_reason = detail.reason.token(),
+        target_bps = controller.target_bps(),
+        bitrate_bound = controller.bitrate_bound(),
+        "encoder frame rate follows bitrate"
+    );
+    *last = Some(detail);
+}
+
+/// The pacing interval for a Detail frame rate the session published, never
+/// faster than the capture.
+fn detail_frame_interval(capture_fps: u32, detail_fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(detail_fps.clamp(1, capture_fps.max(1))))
 }
 
 /// Encodes the newest captured frame and hands it to the writer.
@@ -3308,6 +3375,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         keyframe_requests,
         suppressed,
         rate,
+        detail_fps,
         motion_priority,
         requested_pipeline,
         served_pipeline,
@@ -3324,6 +3392,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
     let start_bps = u64::from(start);
     let max_bps = u64::from(max);
     let mut detail_interval = Duration::from_secs_f64(1.0 / f64::from(capture.fps.max(1)));
+    let mut applied_detail_fps = 0_u32;
     let mut encoder = Encoder::new(
         EncoderConfig::realtime_for(
             i32::try_from(capture.width).unwrap_or(1920),
@@ -3391,11 +3460,19 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         }
         // Between frames, never inside one: VideoToolbox takes a new average
         // rate for the frames that follow.
+        // The frame rate is the shared controller's decision (published by the
+        // session with its reason logged): it keeps the contract's rate while
+        // the stream is content-limited, so it is not derived from the rate here.
+        let wanted_fps = detail_fps.load(std::sync::atomic::Ordering::Relaxed);
+        if motion_priority == arcen_media::video::MotionPriority::Detail
+            && wanted_fps != 0
+            && wanted_fps != applied_detail_fps
+        {
+            detail_interval = detail_frame_interval(capture.fps, wanted_fps);
+            applied_detail_fps = wanted_fps;
+        }
         let wanted = rate.load(std::sync::atomic::Ordering::Relaxed);
         if wanted != 0 && wanted != applied_rate {
-            if motion_priority == arcen_media::video::MotionPriority::Detail {
-                detail_interval = detail_frame_interval(capture.fps, start_bps, wanted);
-            }
             match encoder.set_average_bitrate(wanted) {
                 Ok(()) => applied_rate = wanted,
                 Err(error) => {
@@ -3817,6 +3894,7 @@ fn produce_multi(
         suppressed: _,
         superseded: _superseded,
         rate,
+        detail_fps: _,
     } = signals;
     let capture = crate::multi_capture::MultiDisplayCapture::start_configured(
         monitors.iter().map(|monitor| monitor.capture).collect(),
@@ -4143,6 +4221,66 @@ fn read_clipboard_offer(text: &str) -> Option<arcen_protocol::messages::Clipboar
 #[allow(clippy::cast_precision_loss, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_detail_stream_publishes_the_controllers_frame_rate_once_per_change() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let controller = arcen_media::rate_control::RateController::new(
+            arcen_media::rate_control::RateControlPolicy::for_ceiling(40_000_000),
+        );
+        let published = AtomicU32::new(0);
+        let mut last = None;
+        super::publish_detail_framerate(
+            &controller,
+            arcen_media::video::MotionPriority::Detail,
+            30,
+            &published,
+            &mut last,
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 30);
+        assert_eq!(last, Some(controller.detail_framerate(30)));
+        // An unchanged decision is not republished.
+        published.store(0, Ordering::Relaxed);
+        super::publish_detail_framerate(
+            &controller,
+            arcen_media::video::MotionPriority::Detail,
+            30,
+            &published,
+            &mut last,
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_motion_stream_never_publishes_a_detail_frame_rate() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let controller = arcen_media::rate_control::RateController::new(
+            arcen_media::rate_control::RateControlPolicy::for_ceiling(40_000_000),
+        );
+        let published = AtomicU32::new(0);
+        let mut last = None;
+        super::publish_detail_framerate(
+            &controller,
+            arcen_media::video::MotionPriority::Motion,
+            60,
+            &published,
+            &mut last,
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 0);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn the_detail_interval_never_outruns_the_capture() {
+        assert_eq!(
+            super::detail_frame_interval(30, 60),
+            std::time::Duration::from_secs_f64(1.0 / 30.0)
+        );
+        assert_eq!(
+            super::detail_frame_interval(30, 10),
+            std::time::Duration::from_secs_f64(1.0 / 10.0)
+        );
+    }
+
     #[test]
     fn opus_audio_is_labelled_opus_and_decodes_with_the_shared_decoder() {
         let tier = arcen_media::audio::AudioBitrateTier::Kbps128;

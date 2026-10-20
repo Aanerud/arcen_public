@@ -185,7 +185,7 @@ pub fn png_to_dibv5(encoded: &[u8], limits: ImageLimits) -> Result<Vec<u8>, Clip
     Ok(dib)
 }
 
-fn image_info(
+pub(crate) fn image_info(
     width: u32,
     height: u32,
     limits: ImageLimits,
@@ -216,7 +216,7 @@ fn image_info(
     })
 }
 
-fn decode_png_rgba(
+pub(crate) fn decode_png_rgba(
     encoded: &[u8],
     limits: ImageLimits,
 ) -> Result<(ImageInfo, Vec<u8>), ClipboardImageError> {
@@ -425,7 +425,7 @@ fn decode_dibv5_rgba(
     Ok((info, rgba))
 }
 
-fn encode_png_rgba(
+pub(crate) fn encode_png_rgba(
     info: ImageInfo,
     rgba: &[u8],
     maximum: usize,

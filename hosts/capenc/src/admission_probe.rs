@@ -140,6 +140,51 @@ where
     value.parse().map_err(|_| format!("invalid {name}"))
 }
 
+/// `admission-v1` for the software encoder: representative pictures through
+/// a real `OpenH264` session at the binding's exact geometry. It needs no
+/// capture, so the Xorg and Wayland software paths run the identical probe.
+/// Returns the process exit code.
+#[cfg(all(target_os = "linux", any(feature = "software-h264", feature = "nvenc")))]
+pub(crate) fn run_software_probe(
+    video: arcen_media::VideoConfiguration,
+    fps: u32,
+    options: &AdmissionProbeOptions,
+) -> i32 {
+    use arcen_media::video::{SoftwareH264Session, SoftwareSessionConfig};
+    let config = SoftwareSessionConfig::for_stream(options.width, options.height, fps, video);
+    let mut session = match SoftwareH264Session::new(config) {
+        Ok(session) => session,
+        Err(error) => {
+            crate::log(&format!("ERROR: OpenH264 admission init failed: {error}"));
+            return 4;
+        }
+    };
+    session.stage_black();
+    let mut counter = 0u8;
+    let result = run_probe_loop(options, std::io::stdout().lock(), |input| {
+        counter = counter.wrapping_add(1);
+        session.stage_probe_picture(input.kind, input.dirty_ratio, counter);
+        if input.force_idr {
+            session.force_idr();
+        }
+        let started = Instant::now();
+        let output = session
+            .encode()
+            .map_err(|error| format!("OpenH264 admission encode: {error}"))?;
+        Ok(ProbeEncodeResult {
+            encode_latency: started.elapsed(),
+            delivered: output.is_some(),
+        })
+    });
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            crate::log(&format!("ERROR: {error}"));
+            5
+        }
+    }
+}
+
 pub(crate) fn run_probe_loop<W, F>(
     options: &AdmissionProbeOptions,
     mut writer: W,

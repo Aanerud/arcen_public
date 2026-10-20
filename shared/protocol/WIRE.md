@@ -25,7 +25,24 @@ owner implements, versions, updates this file, and announces the diff.
   visibility, and `#[non_exhaustive]` coverage without changing the wire or
   bumping `PROTOCOL_VERSION`; those are crate-API breaks, not wire breaks.
 
-Current: `PROTOCOL_VERSION = 3`, `input_protocol_version = 3`, crate `0.1.0`.
+Current: `PROTOCOL_VERSION = 5`, `input_protocol_version = 4`, crate `0.1.0`.
+Version 5 moved the session onto isolated QUIC lanes (one stream per role,
+`arcen_protocol::lanes`, ADR 0014); the messages below are unchanged, only
+their envelope (`SessionRecord` on the control, input/cursor and bulk lanes;
+the length-prefixed media frame on the video, audio-output and microphone
+lanes) and the lane each travels on. A version-4 peer is refused with the
+shared "update the Deck and the Pier to the same release" message. Older
+"remains 3" notes below record the version at the time of each change.
+
+Lane-era vocabulary (v5): `clipboard_transfer_failed` (control lane,
+`{sequence, reason: bulk_lane_full | bulk_lane_unavailable}`) tells the
+client a host-to-client clipboard transfer was abandoned; the client
+discards what arrived of that sequence only (never a newer transfer: the
+notice and the bulk lane are unordered) and treats a later offer for it as
+stale. `key_reset_modifiers` with reason
+`input_lane_recovery` (`RELEASE_ALL_HELD_INPUT_REASON`) asks a host to
+release every held key, button, pen and region focus state; any other
+reason keeps its key-only meaning.
 
 The region-scoped input structs below are additive, dormant wire vocabulary.
 Products do not advertise or send them yet, so neither active version constant
@@ -124,6 +141,35 @@ completions fail closed.
 Control/cancel submissions route as `ReliabilityClass::Control`; completions
 route as `InputLowLatency`, which remains `ReliableStream` and is never
 datagram-eligible.
+
+### Host cursor update v1 (`0x50`) — big-endian, input/cursor lane
+
+Sent host → Deck only on the input/cursor lane, only to a Deck that declared
+`AuthResponse.cursor_image_v1`, and only while `local` cursor authority is
+active (`arcen_protocol::cursor`). One record is the whole current cursor
+state, so a sender may keep only the newest one.
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 1 | `0x50` |
+| 1 | 1 | version `1` |
+| 2 | 1 | flags: bit0 visible, bit1 image inline; other bits must be zero |
+| 3 | 1 | fallback `CursorShapeKind` index (`default`=0 … `hidden`=17; unknown reads as `default`) |
+| 4 | 8 | sequence, strictly increasing per attachment |
+| 12 | 4 | host's output number, stable for the desktop (0: single output); not a session monitor id |
+| 16 | 4 | output generation of the image's pixel space |
+| 20 | 4 | image id (0 exactly when hidden) |
+| 24 | 8 | width, height, hotspot x, hotspot y (`u16` each, stream pixels) |
+| 32 | 4 | PNG length (0 unless inline) |
+| 36 | n | straight-alpha RGBA PNG |
+
+A visible image is 1–256 pixels per side with its hotspot inside it; an
+inline PNG is at most 60 KiB, so a record never exceeds the input lane's
+64 KiB frame. The image travels inline only when the receiver does not hold
+its id: both ends run the same deterministic LRU (`arcen_input::cursor`),
+touched once per record in lane order and reset when the input lane is
+reopened. Malformed records are dropped and the current cursor kept. Routed
+as `InputLowLatency` (reliable stream, never a datagram).
 
 ---
 
@@ -661,6 +707,36 @@ Compatibility remains additive:
   `MouseButtonMsg`, `MouseScrollMsg`, `KeyEventMsg`, or `InputCapabilitiesMsg`
   pointer/cursor field's legacy default.
 
+### Committed text (protocol v3, additive, capability-gated)
+
+A key event names a key position and the host's layout picks the character.
+Committed text names the characters: what the client's input method composed
+(dead keys, IME conversions, emoji) and keystrokes the host's layout would type
+differently. It is gated by two `InputCapabilitiesMsg` fields, both
+`#[serde(default)]` and therefore `Unknown` on a peer that predates them; no
+input-protocol version bump:
+
+| Field | From the client | From the host |
+|---|---|---|
+| `text_commit` | it sends `text_commit` and understands `text_commit_result` and `host_keymap` | it types `text_commit` and reports what it could not type |
+| `text_commit_unicode` | — | it can type characters its session layout lacks |
+
+`supports_text_commit_v1(caps)` is true only for `text_commit = available`. A
+client sends `text_commit` only to a host that advertised it; a host sends the
+two notices only to a client that advertised it.
+
+| Rust type | Wire `type` | Direction, lane | Fields |
+|---|---|---|---|
+| `TextCommitMsg` | `text_commit` | client → host, input/cursor | `text: String`, `sequence: u64 = 0` (omitted when 0). `validate()`: non-empty, ≤ `MAX_TEXT_COMMIT_BYTES` (1024) UTF-8 bytes, no C0/C1/DEL control, no noncharacter. |
+| `TextCommitResultMsg` | `text_commit_result` | host → client, input/cursor | `sequence`, `delivered_chars`, `refused_chars`, `refused_text` (≤ 64 characters, omitted when empty), `reason: TextRefusalReason`, `unverified: bool` (omitted when false). Sent only when something was refused or typed without proof. |
+| `HostKeymapMsg` | `host_keymap` | host → client, input/cursor | `generation`, `source` (`compositor_keymap`, `eis_keymap`), `layouts` (XKB names in group order), `active_layout?`, `keys: [{qt_key, base?, shift?}]` (≤ 128). Sent at attach and on every layout change; absent means "unknown". |
+
+`TextRefusalReason` tokens: `not_in_session_layout`,
+`compositor_lacks_text_input`, `keymap_unknown`, `invalid_text`,
+`input_unavailable`, `host_unsupported`, `rate_limited`, and `unknown`
+(`#[serde(other)]`, so a newer reason never fails to parse). Text is never
+logged by either side, only counts.
+
 ### Legacy mouse/key input compatibility (protocol v3)
 
 Pre-Phase-3 clients send only the original fields shown below. Rust consumers
@@ -812,6 +888,30 @@ credential; logs and support bundles must not contain them. See
 
 ---
 
+### QUIC lane preface v1 (dormant, ADR 0014)
+
+`arcen_protocol::lanes` defines the target transport layout: one QUIC stream
+per role, each starting with a fixed 36-byte preface (big-endian):
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 4 | magic | `ARLN` |
+| 4 | 2 | version | `LANE_PROTOCOL_VERSION` = 1 |
+| 6 | 1 | role | 1 control, 2 video, 3 audio_output, 4 input_cursor, 5 microphone, 6 bulk_aux |
+| 7 | 1 | flags | reserved, zero |
+| 8 | 8 | attachment generation | zero for control, nonzero otherwise |
+| 16 | 4 | lane generation | nonzero, strictly increasing per role |
+| 20 | 16 | binding | zero for control; the Pier-issued binding otherwise |
+
+After authentication the Pier sends `lane_attachment`
+(`lane_protocol_version`, `attachment_generation`, `binding` as 32 lowercase
+hex digits, `roles`) on the control lane; unknown fields are rejected. Media
+lanes carry the audio priority stream's framing: each binary frame prefixed
+by its `u32` length. A lane endpoint that meets the legacy
+`arcen-direct-v1\0` preface or another lane version closes with application
+code `0x41524C01` and a readable reason. No product sends any of this yet;
+`PROTOCOL_VERSION` moves to 5 when products switch.
+
 ## Auth
 
 - `auth::hash_password(password, challenge)` = `sha256(f"{password}:{challenge}")`
@@ -831,6 +931,25 @@ legacy `common/session_fsm.py` contract.
 
 ## Changelog
 
+- **2026-10-18 — host cursor images (additive)** — Add
+  `FrameType::CursorUpdate = 0x50` on the input/cursor lane
+  (`arcen_protocol::cursor`), `AuthResponse.cursor_image_v1` and its
+  `ClientHelloMsg` echo, and `CursorModeResultMsg.cursor_images`. All new
+  fields default to `false` and are omitted when false, so older peers see
+  byte-identical messages; `wire::PROTOCOL_VERSION` stays 5. Older Decks
+  never receive the record and keep the `cursor_shape` names.
+- **2026-10-18 — committed text** — Additive, no version bump:
+  `InputCapabilitiesMsg.text_commit` / `text_commit_unicode` (default
+  `Unknown`), `TextCommitMsg.sequence` and `validate()`, new host notices
+  `text_commit_result` and `host_keymap` on the input/cursor lane, the
+  `TextRefusalReason` vocabulary, and `supports_text_commit_v1`. Needs
+  Shared/Architecture review.
+- **2026-10-17 — dormant QUIC lane contract (ADR 0014)** — Add
+  `arcen_protocol::lanes`: role table, fixed 36-byte lane preface v1,
+  `lane_attachment` grant DTO, and legacy/other-version classification.
+  Nothing is sent by any product, so `wire::PROTOCOL_VERSION` stays 4; it
+  becomes 5 in the change that switches Deck and Pier to lanes, with no
+  legacy single-stream fallback.
 - **2026-09-28 — `AuthResult.session_setup_failed`** — Additive, defaulted
   `bool`, omitted when false; `wire::PROTOCOL_VERSION` unchanged. A Windows
   Pier sets it on every refusal after the credentials were verified, so a

@@ -2216,10 +2216,19 @@ mod tests {
         );
         let slow = capped_bitrate_bps(1920, 1080, 30, SDR.0, SDR.1);
         assert_eq!(start, slow);
+        let sixty = arcen_media::video::average_bitrate_bps(1920, 1080, 60, SDR.0, SDR.1);
+        assert_eq!(
+            contract
+                .bitrate
+                .evidence_gate_bps(1920, 1080, 60, SDR.0, SDR.1),
+            Some(sixty),
+            "an unproven clean path still stops at the 60 fps shape"
+        );
+        assert_eq!(sixty, start * 2);
         assert_eq!(
             ceiling,
-            arcen_media::video::average_bitrate_bps(1920, 1080, 60, SDR.0, SDR.1)
+            sixty * arcen_media::video::PROVEN_PATH_HEADROOM,
+            "a proven path may climb past it"
         );
-        assert_eq!(ceiling, start * 2);
     }
 }

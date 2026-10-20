@@ -1,0 +1,1154 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-media",
+  "owner": "Shared/Architecture",
+  "description": "Codec negotiation, preset contracts, colour, conversion, rate control, clipboard and audio rules.",
+  "validation": [
+    "shared-media-test",
+    "shared-media-clippy",
+    "shared-media-audio-opus-test",
+    "shared-media-software-h264-test",
+    "shared-media-tree-purity",
+    "workspace-boundaries"
+  ],
+  "consumers": [
+    {
+      "package": "arcen-capenc",
+      "dependency_kind": "normal",
+      "contracts": [
+        "annexb",
+        "capenc_control",
+        "capenc_stream",
+        "crate",
+        "cursor",
+        "encoder_admission",
+        "hevc_sps",
+        "multi_monitor",
+        "region",
+        "region_activity",
+        "region_schedule",
+        "test_pattern",
+        "video",
+        "video::bitrate",
+        "video::capture_admission",
+        "video::capture_handoff",
+        "video::capture_lease",
+        "video::capture_notice",
+        "video::capture_rate",
+        "video::capture_region",
+        "video::capture_surface",
+        "video::compositor_fidelity",
+        "video::convert",
+        "video::desktop_encoding",
+        "video::fps_limiter",
+        "video::pipeline",
+        "video::plan",
+        "video::pq_white",
+        "video::preset",
+        "video::qpmap",
+        "video::variant"
+      ],
+      "forwarded_features": {
+        "software-av1": [
+          "software-av1-source"
+        ],
+        "software-h264": [
+          "software-h264-source"
+        ]
+      },
+      "production_uses": [
+        {
+          "id": "desktop-conversion",
+          "gate": 1,
+          "symbol": "conversion_for_output",
+          "reason": "capenc derives its source conversion from the shared rule instead of restating it."
+        },
+        {
+          "id": "motion-priority-capenc",
+          "gate": 7,
+          "symbol": "requested_motion_priority",
+          "reason": "capenc parses the shared detail/motion priority token once, so NVENC policy and future rate control read the same preference."
+        },
+        {
+          "id": "capenc-control-line",
+          "gate": 6,
+          "symbol": "CapencControlCommand",
+          "reason": "The capenc stdin protocol, including live BITRATE updates, is parsed and formatted by the shared helper."
+        }
+      ],
+      "paths": [
+        {
+          "id": "linux-xorg-auto",
+          "entry_points": [
+            "hosts/capenc/src/linux.rs",
+            "hosts/capenc/src/linux_policy.rs",
+            "hosts/capenc/src/nvenc_cuda.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-speed",
+          "entry_points": [
+            "hosts/capenc/src/linux.rs",
+            "hosts/capenc/src/linux_policy.rs",
+            "hosts/capenc/src/nvenc_cuda.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-speed-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-grading",
+          "entry_points": [
+            "hosts/capenc/src/linux.rs",
+            "hosts/capenc/src/linux_x11.rs",
+            "hosts/capenc/src/nvenc_cuda.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-grading-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-hdr",
+          "entry_points": [
+            "hosts/capenc/src/linux.rs",
+            "hosts/capenc/src/linux_x11.rs",
+            "hosts/capenc/src/nvenc_cuda.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-xorg-hdr-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-software-h264",
+          "entry_points": [
+            "hosts/capenc/src/linux_x11.rs",
+            "hosts/capenc/src/linux.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["linux-capenc"],
+          "validation": ["linux-capenc-test", "linux-software-h264-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "windows-auto",
+          "entry_points": [
+            "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/wgc.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc"],
+          "validation": ["windows-capenc-test", "windows-auto-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-speed",
+          "entry_points": [
+            "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/wgc.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc"],
+          "validation": ["windows-capenc-test", "windows-speed-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-grading",
+          "entry_points": [
+            "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/wgc.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc"],
+          "validation": ["windows-capenc-test", "windows-grading-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-hdr",
+          "entry_points": [
+            "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/wgc.rs",
+            "hosts/capenc/src/nvenc.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc"],
+          "validation": ["windows-capenc-test", "windows-hdr-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-software-h264",
+          "entry_points": [
+            "hosts/capenc/src/win_mf.rs",
+            "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc"],
+          "validation": ["windows-capenc-test", "windows-software-h264-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-capenc-mf",
+          "entry_points": [
+            "hosts/capenc/src/win_mf.rs",
+            "hosts/capenc/src/mf_encoder.rs",
+            "hosts/capenc/src/lib.rs"
+          ],
+          "build_profiles": ["windows-capenc-mf"],
+          "validation": ["windows-capenc-mf-build"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "linux-wayland-capture-import",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipewire.rs",
+            "hosts/capenc/src/wayland/layout.rs",
+            "hosts/capenc/src/wayland/evidence.rs",
+            "hosts/capenc/src/wayland/host_copy.rs",
+            "hosts/capenc/src/wayland/probe.rs",
+            "hosts/capenc/src/nvenc_cuda.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-capture-import-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-auto",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/auto.rs",
+            "hosts/capenc/src/wayland/pipelines/mod.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-speed",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/speed.rs",
+            "hosts/capenc/src/wayland/pipelines/mod.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-speed-lab", "linux-wayland-gpu-import-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-software",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/software.rs",
+            "hosts/capenc/src/wayland/pipelines/software_runner.rs",
+            "hosts/capenc/src/wayland/pipelines/mod.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-software-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-gpu-import",
+          "entry_points": [
+            "hosts/capenc/src/wayland/gpu_convert.rs",
+            "hosts/capenc/src/wayland/explicit_sync.rs",
+            "hosts/capenc/src/wayland/dmabuf.rs",
+            "hosts/capenc/src/wayland/pipewire.rs",
+            "hosts/capenc/src/wayland/evidence.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs",
+            "hosts/capenc/src/wayland/probe.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-gpu-import-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-grading",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/grading.rs",
+            "hosts/capenc/src/wayland/pipelines/wide.rs",
+            "hosts/capenc/src/wayland/wide_readback.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-fidelity-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-hdr",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/hdr.rs",
+            "hosts/capenc/src/wayland/pipelines/wide.rs",
+            "hosts/capenc/src/wayland/wide_readback.rs",
+            "hosts/capenc/src/wayland/ramp_client.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-fidelity-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-macos",
+      "dependency_kind": "normal",
+      "contracts": [
+        "applied_topology",
+        "audio",
+        "audio::microphone",
+        "audio::opus",
+        "audio::playout",
+        "clipboard",
+        "clipboard::image",
+        "crate",
+        "cursor",
+        "deck_platform",
+        "display_color",
+        "hevc_sps",
+        "multi_monitor",
+        "presentation",
+        "region",
+        "region_frame",
+        "test_pattern",
+        "topology_placement",
+        "video",
+        "video::convert",
+        "video::pipeline",
+        "video::plan",
+        "video::preset",
+        "video::variant"
+      ],
+      "features": ["audio-opus"],
+      "production_uses": [
+        {
+          "id": "streaming-preset-contract",
+          "gate": 7,
+          "symbol": "StreamingPreset",
+          "reason": "The Deck's preset UI must read the shared trade-off contract instead of restating marketing strings or frame-rate promises."
+        }
+      ],
+      "paths": [
+        {
+          "id": "macos-deck-apple-silicon-sdr",
+          "entry_points": [
+            "clients/macos/src/pipeline/video_decoder.rs",
+            "clients/macos/src/ui/media_worker.rs",
+            "clients/macos/src/ui/video_render.rs"
+          ],
+          "build_profiles": ["macos-deck-apple-silicon"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-app-apple-silicon",
+            "macos-deck-apple-silicon-sdr-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-apple-silicon-10bit",
+          "entry_points": [
+            "clients/macos/src/ui/video_metal_layer.rs",
+            "clients/macos/src/ui/video_render.rs",
+            "clients/macos/src/pipeline/video_decoder.rs",
+            "clients/macos/src/ui/media_worker.rs"
+          ],
+          "build_profiles": ["macos-deck-apple-silicon"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-app-apple-silicon",
+            "macos-deck-apple-silicon-10bit-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-intel-sdr",
+          "entry_points": [
+            "clients/macos/src/pipeline/video_decoder.rs",
+            "clients/macos/src/ui/media_worker.rs",
+            "clients/macos/src/ui/video_render.rs"
+          ],
+          "build_profiles": ["macos-deck-intel"],
+          "validation": [
+            "macos-deck-build-intel",
+            "macos-deck-app-intel",
+            "macos-deck-intel-sdr-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-intel-10bit",
+          "entry_points": [
+            "clients/macos/src/ui/video_metal_layer.rs",
+            "clients/macos/src/ui/video_render.rs",
+            "clients/macos/src/pipeline/video_decoder.rs",
+            "clients/macos/src/ui/media_worker.rs"
+          ],
+          "build_profiles": ["macos-deck-intel"],
+          "validation": [
+            "macos-deck-build-intel",
+            "macos-deck-app-intel",
+            "macos-deck-intel-10bit-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-audio",
+          "entry_points": [
+            "clients/macos/src/pipeline/audio.rs",
+            "clients/macos/src/ui/media_worker.rs",
+            "clients/macos/src/pipeline/frame_queue.rs"
+          ],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-microphone",
+          "entry_points": [
+            "clients/macos/src/microphone.rs",
+            "clients/macos/src/ui/media_worker.rs"
+          ],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-input",
+          "entry_points": ["clients/macos/src/ui/region_runtime.rs", "clients/macos/src/main.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-clipboard",
+          "entry_points": ["clients/macos/src/clipboard.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-session",
+          "entry_points": ["clients/macos/src/ui/app.rs", "clients/macos/src/main.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-session-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-transport",
+          "entry_points": ["clients/macos/src/transport/websocket.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-input",
+      "dependency_kind": "normal",
+      "contracts": ["capenc_stream", "cursor", "region"]
+    },
+    {
+      "package": "arcen-outputs",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "display_color", "multi_monitor", "video::plan"]
+    },
+    {
+      "package": "arcen-pier-linux",
+      "dependency_kind": "normal",
+      "contracts": [
+        "audio",
+        "audio::microphone",
+        "audio::opus",
+        "capenc_control",
+        "capenc_stream",
+        "clipboard",
+        "clipboard::image",
+        "crate",
+        "cursor",
+        "display_color",
+        "encoder_admission",
+        "multi_monitor",
+        "rate_control",
+        "region",
+        "topology_placement",
+        "video",
+        "video::bitrate",
+        "video::capture_handoff",
+        "video::capture_notice",
+        "video::compositor_fidelity",
+        "video::convert",
+        "video::desktop_depth",
+        "video::desktop_encoding",
+        "video::fps_limiter",
+        "video::frame_queue",
+        "video::intent",
+        "video::obu",
+        "video::pipeline",
+        "video::plan",
+        "video::policy",
+        "video::preset",
+        "video::qpmap",
+        "video::variant",
+        "video::wire_frame"
+      ],
+      "features": ["audio-opus"],
+      "production_uses": [
+        {
+          "id": "x11-desktop-depth",
+          "gate": 1,
+          "symbol": "serve_on_fixed_depth",
+          "reason": "A persistent Xorg desktop's depth is chosen once by the shared rule, and a ten-bit request on an eight-bit desktop is served visibly as Auto, never as eight-bit samples in a ten-bit stream."
+        },
+        {
+          "id": "desktop-plan",
+          "gate": 1,
+          "symbol": "resolve_desktop_plan",
+          "reason": "A host that cannot report its desktop's encoding resolves sessions through the shared rule, so PQ is converted or refused, never relabelled."
+        },
+        {
+          "id": "display-colour",
+          "gate": 2,
+          "symbol": "DisplayColor",
+          "reason": "A client display's gamut and HDR luminance are interpreted by the shared rule on every host."
+        },
+        {
+          "id": "video-queue",
+          "gate": 3,
+          "symbol": "SharedVideoQueue",
+          "reason": "Drop, keyframe-recovery and IDR decisions come from the shared queue; hosts keep only wakeups."
+        },
+        {
+          "id": "adaptive-rate-controller",
+          "gate": 6,
+          "symbol": "RateController",
+          "reason": "Every Pier drives live bitrate changes through the shared transport-aware controller instead of a host-local rule."
+        },
+        {
+          "id": "adaptive-rate-priority",
+          "gate": 7,
+          "symbol": "operational_rate_control_policy",
+          "reason": "Every Pier applies the served pipeline's complete shared rate-control policy to adaptive bitrate control."
+        },
+        {
+          "id": "local-video-backlog-signal",
+          "gate": 6,
+          "symbol": "take_wait_stats",
+          "reason": "Linux and Windows feed the shared controller real host-side video queue wait instead of hiding QUIC/application backlog."
+        }
+      ],
+      "paths": [
+        {
+          "id": "linux-xorg-auto",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/media/encoder_admission.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-speed",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/media/encoder_admission.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-speed-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-grading",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/media/encoder_admission.rs",
+            "hosts/linux/src/session/launcher.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-grading-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-hdr",
+          "entry_points": [
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/cli.rs",
+            "hosts/linux/src/session/launcher.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-xorg-hdr-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-software-h264",
+          "entry_points": [
+            "hosts/linux/src/media/encoder_admission.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/media/capenc.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-software-h264-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-audio",
+          "entry_points": ["hosts/linux/src/media/audio.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-av-input-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-microphone",
+          "entry_points": ["hosts/linux/src/microphone_input.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-av-input-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-input",
+          "entry_points": ["hosts/linux/src/input/region_adapter.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-av-input-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-clipboard",
+          "entry_points": ["hosts/linux/src/clipboard.rs", "hosts/linux/src/clipboard/native.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-av-input-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-clipboard",
+          "entry_points": ["hosts/linux/src/session/wayland/clipboard.rs", "hosts/linux/src/clipboard.rs", "hosts/linux/examples/wayland_clipboard_harness.rs"],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-clipboard-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session",
+          "entry_points": [
+            "hosts/linux/src/session/launcher.rs",
+            "hosts/linux/src/session/handshake.rs",
+            "hosts/linux/src/cli.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-transport",
+          "entry_points": ["hosts/linux/src/net/server.rs", "hosts/linux/src/session/client.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-multi-monitor",
+          "entry_points": [
+            "hosts/linux/src/session/multi_monitor.rs",
+            "hosts/linux/src/session/output_provider.rs",
+            "hosts/linux/src/session/xorg_multihead.rs",
+            "hosts/linux/src/display/nvidia_discovery.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-multi-monitor-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-provider-seam",
+          "entry_points": ["hosts/linux/src/display/wayland.rs", "hosts/linux/src/input/eis.rs"],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-session",
+          "entry_points": [
+            "hosts/linux/src/session/wayland/mod.rs",
+            "hosts/linux/src/session/identity.rs",
+            "hosts/linux/src/session/launcher.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-session-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-auto",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/net/server.rs",
+            "hosts/linux/examples/wayland_session_harness.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-speed",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/media/multi_capenc.rs",
+            "hosts/linux/src/net/server.rs",
+            "hosts/linux/src/cli.rs",
+            "hosts/linux/src/session/wayland/qualify.rs",
+            "hosts/linux/examples/wayland_session_harness.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-speed-lab", "linux-wayland-gpu-import-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-gpu-import",
+          "entry_points": [
+            "hosts/linux/src/media/capenc.rs",
+            "hosts/linux/src/cli.rs",
+            "hosts/linux/src/session/wayland/qualify.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-gpu-import-lab", "linux-wayland-qualify-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-qualify",
+          "entry_points": ["hosts/linux/src/session/wayland/qualify.rs"],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-qualify-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-server",
+          "entry_points": [
+            "hosts/linux/src/net/server.rs",
+            "hosts/linux/src/cli.rs",
+            "hosts/linux/src/media/capenc.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-server-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-fidelity",
+          "entry_points": [
+            "hosts/linux/src/session/wayland/qualify/fidelity.rs",
+            "hosts/linux/src/net/server.rs",
+            "hosts/linux/src/cli.rs"
+          ],
+          "build_profiles": ["linux-pier-wayland-provider"],
+          "validation": ["linux-pier-wayland-provider-test", "linux-wayland-fidelity-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-macos",
+      "dependency_kind": "normal",
+      "contracts": [
+        "annexb",
+        "audio",
+        "audio::microphone",
+        "audio::opus",
+        "clipboard",
+        "clipboard::image",
+        "clipboard::latest",
+        "crate",
+        "display_color",
+        "hevc_sps",
+        "multi_monitor",
+        "rate_control",
+        "region",
+        "session_plan",
+        "topology_placement",
+        "video",
+        "video::bitrate",
+        "video::frame_queue",
+        "video::intent",
+        "video::pipeline",
+        "video::plan",
+        "video::policy",
+        "video::pq_white",
+        "video::preset",
+        "video::wire_frame"
+      ],
+      "features": ["audio-opus"],
+      "production_uses": [
+        {
+          "id": "display-colour",
+          "gate": 2,
+          "symbol": "DisplayColor",
+          "reason": "A client display's gamut and HDR luminance are interpreted by the shared rule on every host."
+        },
+        {
+          "id": "motion-priority-macos",
+          "gate": 7,
+          "symbol": "motion_priority",
+          "reason": "The macOS Pier carries the shared detail/motion preference into its VideoToolbox encoder config for the Gate 6 controller hook."
+        },
+        {
+          "id": "adaptive-rate-controller",
+          "gate": 6,
+          "symbol": "RateController",
+          "reason": "Every Pier drives live bitrate changes through the shared transport-aware controller instead of a host-local rule."
+        },
+        {
+          "id": "adaptive-rate-priority",
+          "gate": 7,
+          "symbol": "operational_rate_control_policy",
+          "reason": "Every Pier applies the served pipeline's complete shared rate-control policy to adaptive bitrate control."
+        }
+      ],
+      "paths": [
+        {
+          "id": "macos-pier-auto",
+          "entry_points": [
+            "hosts/macos/src/capture.rs",
+            "hosts/macos/src/encode.rs",
+            "hosts/macos/src/stream.rs",
+            "hosts/macos/src/session.rs"
+          ],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-auto-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-speed",
+          "entry_points": [
+            "hosts/macos/src/capture.rs",
+            "hosts/macos/src/encode.rs",
+            "hosts/macos/src/stream.rs",
+            "hosts/macos/src/session.rs"
+          ],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-speed-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-grading",
+          "entry_points": [
+            "hosts/macos/src/capture.rs",
+            "hosts/macos/src/encode.rs",
+            "hosts/macos/src/session.rs"
+          ],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-grading-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-hdr",
+          "entry_points": [
+            "hosts/macos/src/virtual_display.rs",
+            "hosts/macos/src/hdr_white.rs",
+            "hosts/macos/src/capture.rs",
+            "hosts/macos/src/encode.rs"
+          ],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-hdr-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-audio",
+          "entry_points": ["hosts/macos/src/audio.rs", "hosts/macos/src/stream.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-microphone",
+          "entry_points": ["hosts/macos/src/microphone_input.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-input",
+          "entry_points": ["hosts/macos/src/input_session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-clipboard",
+          "entry_points": ["hosts/macos/src/clipboard_session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-session",
+          "entry_points": ["hosts/macos/src/session.rs", "hosts/macos/src/main.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-app-build"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-transport",
+          "entry_points": ["hosts/macos/src/main.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-multi-monitor",
+          "entry_points": ["hosts/macos/src/multi_monitor.rs", "hosts/macos/src/virtual_display.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-session-lab"],
+          "owner": "macOS Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows",
+      "dependency_kind": "normal",
+      "contracts": [
+        "audio",
+        "audio::microphone",
+        "audio::opus",
+        "capenc_control",
+        "clipboard",
+        "clipboard::image",
+        "crate",
+        "display_color",
+        "encoder_admission",
+        "multi_monitor",
+        "rate_control",
+        "region",
+        "topology_placement",
+        "video",
+        "video::bitrate",
+        "video::desktop_encoding",
+        "video::frame_queue",
+        "video::intent",
+        "video::obu",
+        "video::pipeline",
+        "video::plan",
+        "video::policy",
+        "video::preset",
+        "video::qpmap",
+        "video::variant",
+        "video::wire_frame"
+      ],
+      "features": ["audio-opus"],
+      "production_uses": [
+        {
+          "id": "display-colour",
+          "gate": 2,
+          "symbol": "DisplayColor",
+          "reason": "A client display's gamut and HDR luminance are interpreted by the shared rule on every host."
+        },
+        {
+          "id": "video-queue",
+          "gate": 3,
+          "symbol": "SharedVideoQueue",
+          "reason": "Drop, keyframe-recovery and IDR decisions come from the shared queue; hosts keep only wakeups."
+        },
+        {
+          "id": "adaptive-rate-controller",
+          "gate": 6,
+          "symbol": "RateController",
+          "reason": "Every Pier drives live bitrate changes through the shared transport-aware controller instead of a host-local rule."
+        },
+        {
+          "id": "adaptive-rate-priority",
+          "gate": 7,
+          "symbol": "operational_rate_control_policy",
+          "reason": "Every Pier applies the served pipeline's complete shared rate-control policy to adaptive bitrate control."
+        },
+        {
+          "id": "local-video-backlog-signal",
+          "gate": 6,
+          "symbol": "take_wait_stats",
+          "reason": "Linux and Windows feed the shared controller real host-side video queue wait instead of hiding QUIC/application backlog."
+        }
+      ],
+      "paths": [
+        {
+          "id": "windows-auto",
+          "entry_points": [
+            "hosts/windows/src/windows_session.rs",
+            "hosts/windows/src/capenc.rs",
+            "hosts/windows/src/encoder_admission.rs",
+            "hosts/windows/src/latest.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-auto-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-speed",
+          "entry_points": [
+            "hosts/windows/src/windows_session.rs",
+            "hosts/windows/src/capenc.rs",
+            "hosts/windows/src/encoder_admission.rs",
+            "hosts/windows/src/latest.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-speed-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-grading",
+          "entry_points": [
+            "hosts/windows/src/session.rs",
+            "hosts/windows/src/capenc.rs",
+            "hosts/windows/src/display.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-grading-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-hdr",
+          "entry_points": [
+            "hosts/windows/src/session.rs",
+            "hosts/windows/src/display.rs",
+            "hosts/windows/src/capenc.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-hdr-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-software-h264",
+          "entry_points": ["hosts/windows/src/encoder_admission.rs", "hosts/windows/src/capenc.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-software-h264-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-microphone",
+          "entry_points": ["hosts/windows/src/microphone_input.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-av-input-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-input",
+          "entry_points": ["hosts/windows/src/multi_monitor_input.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-av-input-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-clipboard",
+          "entry_points": ["hosts/windows/src/clipboard.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-av-input-lab"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-session",
+          "entry_points": [
+            "hosts/windows/src/windows_session.rs",
+            "hosts/windows/src/session.rs",
+            "hosts/windows/src/main.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-transport",
+          "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-multi-monitor",
+          "entry_points": [
+            "hosts/windows/src/multi_monitor_topology.rs",
+            "hosts/windows/src/multi_monitor_capenc.rs",
+            "hosts/windows/src/iddcx.rs",
+            "hosts/windows/src/multi_monitor_gate.rs",
+            "hosts/windows/src/main.rs"
+          ],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-multi-monitor-lab"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-region-patch-benchmark",
+      "dependency_kind": "normal",
+      "contracts": ["region", "region_activity"],
+      "paths": [
+        {
+          "id": "tools-region-patch-benchmark",
+          "entry_points": ["tools/region-patch-benchmark/src/lib.rs"],
+          "build_profiles": ["tools-region-patch-benchmark"],
+          "validation": ["region-patch-benchmark-test"],
+          "owner": "Shared/Architecture"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-linux"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/build.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-windows"],
+      "paths": [
+        {
+          "id": "windows-installer",
+          "entry_points": [
+            "packaging/windows/installer/src/main.rs",
+            "packaging/windows/installer/build.rs"
+          ],
+          "build_profiles": ["windows-pier-installer"],
+          "validation": ["windows-pier-installer-build"],
+          "owner": "Windows Host"
+        }
+      ]
+    }
+  ]
+}

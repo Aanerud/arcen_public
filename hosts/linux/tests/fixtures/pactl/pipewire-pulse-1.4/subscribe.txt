@@ -1,0 +1,21 @@
+Event 'new' on client #74
+Event 'remove' on client #74
+Event 'new' on client #75
+Event 'remove' on client #75
+Event 'new' on client #76
+Event 'remove' on client #76
+Event 'new' on client #77
+Event 'remove' on client #77
+Event 'new' on client #78
+Event 'remove' on client #78
+Event 'new' on client #79
+Event 'change' on sink #49
+Event 'remove' on client #79
+Event 'new' on client #80
+Event 'remove' on client #80
+Event 'new' on client #81
+Event 'remove' on client #81
+Event 'new' on client #82
+Event 'change' on sink #49
+Event 'remove' on client #82
+Got SIGINT, exiting.

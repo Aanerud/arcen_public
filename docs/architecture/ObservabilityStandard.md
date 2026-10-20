@@ -220,7 +220,7 @@ session events.
 
 | ID | Stable name | Minimum profile | Required fields | Optional fields |
 |---|---|---|---|---|
-| 1500 | `CLIENT_START` | 0 | version, os, arch | — |
+| 1500 | `CLIENT_START` | 0 | version, os, arch | bundle_short_version, bundle_version, build_id, source_revision, bundle_path |
 | 1501 | `CLIENT_STOP` | 0 | uptime_ms | reason_class |
 | 1502 | `CLIENT_CONNECT_ATTEMPT` | 2 | transport | — |
 | 1503 | `CLIENT_CONNECT_OK` | 0 | tls_version | rtt_ms |
@@ -265,7 +265,7 @@ Emitted by the client for attach/forward and by the host for inject failures
 | 1803 | `HEARTBEAT_LOST` | 0 | missed_intervals | — |
 | 1804 | `TELEMETRY_DROPPED` | 0 | sink, dropped_count | — |
 | 1805 | `EFFECTIVE_PROFILE` | 0 | profile_level, profile_name, profile_source | — |
-| 1806 | `HEALTH_SNAPSHOT` | 0 | overall_state | host_state, client_state, QoS summary fields |
+| 1806 | `HEALTH_SNAPSHOT` | 0 | overall_state | host_state, client_state, QoS summary fields, client network (client_network_kind, client_network_scope, client_link_mbps, client_mtu) |
 
 1804 is the "counted loss" escape valve (§7): any sink that dropped since the last
 heartbeat reports it here and resets its counter. 1806 is the mandatory compact
@@ -284,6 +284,27 @@ heartbeat reports it here and resets its counter. 1806 is the mandatory compact
 `sustained_execution`, `location_for_ssid` (extensible string, lowercase snake).
 Answers "is the entitlement actually in effect?" — today invisible. The macOS TCC
 input-monitoring prompt outcome (HoIP prerequisite) becomes an auditable event.
+
+---
+
+### 2000–2099 · Lanes, capture admission and provider selection
+
+| ID | Stable name | Minimum profile | Required | Optional |
+|---|---|---|---|---|
+| 2000 | `LANE_REFUSED` | 1 | role, reason | lane_generation |
+| 2001 | `LANE_FAILED` | 1 | role, failure, recovery | lane_generation, reset_stream |
+| 2002 | `LANE_STARVED` | 2 | role, waited_ms | queued_frames, queued_bytes, cause |
+| 2003 | `PRESET_ADMISSION_DECIDED` | 2 | requested_pipeline, decision | served_pipeline, reason, fallback_reason, transform, copy_path, fps_ceiling, colour_assumed |
+| 2004 | `DESKTOP_PROVIDER_SELECTED` | 0 | provider, requested | wayland_blockers |
+| 2005 | `DESKTOP_PROVIDER_UNAVAILABLE` | 0 | requested, blockers | — |
+
+Values are the stable tokens of `arcen_protocol::lanes`,
+`arcen_transport::lanes`, `arcen_media::video::capture_admission` and
+`arcen_session::desktop_provider`. `CAPTURE_PATH_SELECTED` (1105) also accepts
+optional `copy_path`, `memory`, `modifier_class`, `gpu_match`,
+`source_transfer`, `source_primaries`, `sample_precision` and `cursor`. See
+[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md); no product emits
+these yet.
 
 ---
 

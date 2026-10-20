@@ -50,7 +50,8 @@ use thiserror::Error;
 
 use crate::config::LinuxMultiMonitorConfig;
 use crate::display::topology::{
-    self, HeadCapability, HeadInventory, LinuxMonitorPlan, LinuxTopologyError, LinuxTopologyPlan,
+    self, HeadCapability, HeadInventory, LinuxMonitorPlan, LinuxTopologyBackend,
+    LinuxTopologyError, LinuxTopologyPlan,
 };
 use crate::media::capenc::EncoderSelection;
 use crate::media::multi_capenc::{
@@ -93,6 +94,45 @@ pub struct MultiMonitorGate {
     /// planned topology's exact geometry at admission time (see
     /// [`LinuxRegionAdmission::check_media_policy`]).
     pub encoder: EncoderSelection,
+    /// Set on a Pier serving headless Wayland sessions: the topology is
+    /// served by compositor virtual outputs instead of NVIDIA heads, and
+    /// [`Self::inventory`] is unused.
+    pub virtual_outputs: Option<VirtualOutputGate>,
+}
+
+/// What a Wayland Pier can serve as virtual outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualOutputGate {
+    /// Most outputs one session serves: the compositor's output mode, the
+    /// qualification record's proven concurrent outputs and the shared
+    /// roster bound, whichever is least.
+    pub max_outputs: usize,
+    /// How the compositor provides outputs.
+    pub mode: arcen_session::wayland_outputs::VirtualOutputMode,
+}
+
+impl VirtualOutputGate {
+    /// The gate for a compositor in `mode` on a host whose record proved
+    /// `proven_outputs` concurrent outputs.
+    #[must_use]
+    pub fn new(
+        mode: arcen_session::wayland_outputs::VirtualOutputMode,
+        proven_outputs: usize,
+    ) -> Self {
+        Self {
+            max_outputs: mode
+                .max_outputs()
+                .min(proven_outputs)
+                .min(arcen_media::MAX_MULTI_MONITOR_COUNT),
+            mode,
+        }
+    }
+
+    /// Whether this gate serves more than one output.
+    #[must_use]
+    pub const fn serves_several(&self) -> bool {
+        self.max_outputs >= 2
+    }
 }
 
 impl MultiMonitorGate {
@@ -103,6 +143,49 @@ impl MultiMonitorGate {
             advertise_enabled: false,
             inventory: None,
             encoder: EncoderSelection::Auto,
+            virtual_outputs: None,
+        }
+    }
+
+    /// The gate of a Pier serving headless Wayland sessions: the operator's
+    /// switch, the encoder policy, and what the compositor and the
+    /// qualification record prove. `virtual_outputs` `None` (no valid
+    /// record) withholds the offer.
+    #[must_use]
+    pub const fn wayland(
+        config: &LinuxMultiMonitorConfig,
+        encoder: EncoderSelection,
+        virtual_outputs: Option<VirtualOutputGate>,
+    ) -> Self {
+        Self {
+            advertise_enabled: config.advertise_enabled,
+            inventory: None,
+            encoder,
+            virtual_outputs,
+        }
+    }
+
+    /// Whether anything is available to plan against: NVIDIA heads, or
+    /// several proven virtual outputs.
+    fn has_outputs(&self) -> bool {
+        match self.virtual_outputs {
+            Some(gate) => gate.serves_several(),
+            None => self.usable_inventory().is_some(),
+        }
+    }
+
+    /// The `(max_monitors, supported_rotations)` this gate declares.
+    fn advertised(&self) -> Option<(u8, Vec<RotationMsg>)> {
+        match self.virtual_outputs {
+            // Mutter accepts a transform on a virtual monitor, but what its
+            // stream then carries is unproven, so virtual outputs are not
+            // rotated.
+            Some(gate) => gate
+                .serves_several()
+                .then(|| u8::try_from(gate.max_outputs).ok())
+                .flatten()
+                .map(|max| (max, vec![RotationMsg::Degrees0])),
+            None => advertised_capability(self.usable_inventory()?),
         }
     }
 
@@ -142,6 +225,7 @@ impl MultiMonitorGate {
                 advertise_enabled: true,
                 inventory: None,
                 encoder,
+                virtual_outputs: None,
             });
         }
         let heads = config
@@ -155,6 +239,7 @@ impl MultiMonitorGate {
             advertise_enabled: true,
             inventory: Some(inventory),
             encoder,
+            virtual_outputs: None,
         })
     }
 
@@ -314,8 +399,7 @@ pub fn build_offer(gate: &MultiMonitorGate) -> Option<AuthMultiMonitorOfferMsg> 
     ) {
         return None;
     }
-    let inventory = gate.usable_inventory()?;
-    let (max_monitors, supported_rotations) = advertised_capability(inventory)?;
+    let (max_monitors, supported_rotations) = gate.advertised()?;
     AuthMultiMonitorOfferMsg::new(max_monitors, supported_rotations, OFFERED_CARRIERS.to_vec()).ok()
 }
 
@@ -374,7 +458,7 @@ impl<'a> LinuxRegionAdmission<'a> {
         AdmissionGates {
             carrier_ready: MULTI_MONITOR_CARRIER_READY,
             operator_enabled: self.gate.advertise_enabled,
-            inventory_available: self.inventory.is_some(),
+            inventory_available: self.gate.has_outputs(),
             offer_advertised: self.offer.is_some(),
         }
     }
@@ -442,11 +526,21 @@ impl RegionAdmissionPolicy for LinuxRegionAdmission<'_> {
         topology: &RequestedMonitorTopology,
         generation: TopologyGeneration,
     ) -> Result<LinuxTopologyPlan, MultiMonitorDegradeReason> {
-        let Some(inventory) = self.inventory else {
-            return Err(MultiMonitorDegradeReason::NoInventoryConfigured);
-        };
-        let mut plan = topology::plan_topology(topology, generation, inventory)
-            .map_err(MultiMonitorDegradeReason::PlanningFailed)?;
+        let mut plan = match self.gate.virtual_outputs {
+            Some(virtual_outputs) => topology::plan_virtual_topology(
+                topology,
+                generation,
+                topology::wayland_output_limits(virtual_outputs.max_outputs),
+                virtual_outputs.mode,
+            ),
+            None => {
+                let Some(inventory) = self.inventory else {
+                    return Err(MultiMonitorDegradeReason::NoInventoryConfigured);
+                };
+                topology::plan_topology(topology, generation, inventory)
+            }
+        }
+        .map_err(MultiMonitorDegradeReason::PlanningFailed)?;
         for (planned, requested) in plan
             .monitors
             .iter_mut()
@@ -562,11 +656,9 @@ pub fn build_applied_capability(
     negotiated: &RegionMediaRoster,
     degradation_reason: Option<&'static str>,
 ) -> Result<ServerMultiMonitorMsg, AppliedCapabilityError> {
-    let inventory = gate
-        .usable_inventory()
+    let (max_monitors, supported_rotations) = gate
+        .advertised()
         .ok_or(AppliedCapabilityError::NoInventoryConfigured)?;
-    let (max_monitors, supported_rotations) =
-        advertised_capability(inventory).ok_or(AppliedCapabilityError::NoInventoryConfigured)?;
 
     // `display::topology::plan_topology` always translates the applied
     // bounding box's minimum origin to exactly `(0, 0)`
@@ -576,7 +668,10 @@ pub fn build_applied_capability(
     // at a non-negative origin and the shared translation is the identity.
     let translation = OriginTranslation::to_origin(0, 0);
     let descriptors = assemble_applied_regions(
-        &LinuxAppliedRegions { degradation_reason },
+        &LinuxAppliedRegions {
+            degradation_reason,
+            backend: plan.backend,
+        },
         &plan.monitors,
         media,
         negotiated,
@@ -599,7 +694,10 @@ pub fn build_applied_capability(
         max_monitors,
         supported_rotations,
         true,
-        TopologyBackendKindMsg::DedicatedXorg,
+        match plan.backend {
+            LinuxTopologyBackend::DedicatedXorg => TopologyBackendKindMsg::DedicatedXorg,
+            LinuxTopologyBackend::VirtualOutputs => TopologyBackendKindMsg::VirtualOutputs,
+        },
         OFFERED_CARRIERS.to_vec(),
         Some(applied_topology),
     )?)
@@ -613,6 +711,7 @@ pub fn build_applied_capability(
 /// [`assemble_applied_regions`]'s.
 struct LinuxAppliedRegions {
     degradation_reason: Option<&'static str>,
+    backend: LinuxTopologyBackend,
 }
 
 impl AppliedRegionAssembler for LinuxAppliedRegions {
@@ -655,11 +754,14 @@ impl AppliedRegionAssembler for LinuxAppliedRegions {
                 .map_err(|_| AppliedCapabilityError::AppliedTranslationOverflow)?,
             width_px: monitor.width,
             height_px: monitor.height,
-            // Not tracked through `LinuxTopologyPlan`/`LinuxMonitorPlan` in
-            // this tranche (the client's originally requested refresh rate
-            // is discarded during planning); documented placeholder.
-            // Diagnostic only — no invariant depends on this value.
-            refresh_hz: 60,
+            // A virtual output runs at the requested refresh. The dedicated
+            // Xorg path keeps its documented placeholder (its heads run the
+            // MetaMode's rate, which planning does not track). Diagnostic
+            // only — no invariant depends on this value.
+            refresh_hz: match self.backend {
+                LinuxTopologyBackend::DedicatedXorg => 60,
+                LinuxTopologyBackend::VirtualOutputs => monitor.refresh_hz,
+            },
             rotation: monitor.rotation.into(),
             is_primary: monitor.primary,
             media_plan: AppliedMonitorMediaPlanMsg {
@@ -750,6 +852,7 @@ mod tests {
                 .expect("inventory"),
             ),
             encoder,
+            virtual_outputs: None,
         }
     }
 
@@ -772,6 +875,7 @@ mod tests {
             advertise_enabled: true,
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
+            virtual_outputs: None,
         };
         assert!(build_offer(&gate).is_none());
     }
@@ -1042,6 +1146,7 @@ mod tests {
             advertise_enabled: true,
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
+            virtual_outputs: None,
         };
         let outcomes = [
             baseline_outcome_name(admit_requested_topology(
@@ -1147,6 +1252,7 @@ mod tests {
             advertise_enabled: true,
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
+            virtual_outputs: None,
         };
         let offer = sample_offer(2);
         let request = sample_request(vec![descriptor(
@@ -1379,6 +1485,151 @@ mod tests {
         .expect("valid negotiated roster")
     }
 
+    fn wayland_gate(proven_outputs: usize) -> MultiMonitorGate {
+        MultiMonitorGate::wayland(
+            &LinuxMultiMonitorConfig::default(),
+            EncoderSelection::NativeNvenc,
+            Some(VirtualOutputGate::new(
+                arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+                proven_outputs,
+            )),
+        )
+    }
+
+    #[test]
+    fn a_wayland_pier_offers_the_outputs_its_record_proved_without_heads() {
+        let offer = build_offer(&wayland_gate(4)).expect("offer");
+        assert_eq!(offer.max_monitors(), 4);
+        assert_eq!(offer.supported_rotations(), &[RotationMsg::Degrees0]);
+        assert_eq!(
+            build_offer(&wayland_gate(2)).expect("offer").max_monitors(),
+            2
+        );
+        // One proven output, no record, or a fixed-output compositor: no offer.
+        assert!(build_offer(&wayland_gate(1)).is_none());
+        assert!(build_offer(&MultiMonitorGate::wayland(
+            &LinuxMultiMonitorConfig::default(),
+            EncoderSelection::NativeNvenc,
+            None,
+        ))
+        .is_none());
+        assert!(build_offer(&MultiMonitorGate::wayland(
+            &LinuxMultiMonitorConfig::default(),
+            EncoderSelection::NativeNvenc,
+            Some(VirtualOutputGate::new(
+                arcen_session::wayland_outputs::VirtualOutputMode::StartupMonitors,
+                4,
+            )),
+        ))
+        .is_none());
+        // `auto` is never a multi-monitor encoder.
+        let mut auto = wayland_gate(4);
+        auto.encoder = EncoderSelection::Auto;
+        assert!(build_offer(&auto).is_none());
+    }
+
+    #[test]
+    fn a_wayland_topology_is_planned_onto_virtual_outputs_and_published_as_such() {
+        let gate = wayland_gate(4);
+        let offer = build_offer(&gate).expect("offer");
+        let request = sample_request(vec![
+            descriptor("a", 1, (0, 0), (1920, 1080), true, RotationMsg::Degrees0),
+            descriptor(
+                "b",
+                2,
+                (-1280, 0),
+                (1280, 1024),
+                false,
+                RotationMsg::Degrees0,
+            ),
+        ]);
+        let (plan, carrier) =
+            admit_request(&gate, Some(&offer), &request).expect("request must be admitted");
+        assert_eq!(plan.backend, LinuxTopologyBackend::VirtualOutputs);
+        assert_eq!((plan.virtual_width, plan.virtual_height), (3200, 1080));
+        let rects: Vec<_> = plan
+            .monitors
+            .iter()
+            .map(|monitor| (monitor.head.as_str(), monitor.x, monitor.width))
+            .collect();
+        assert_eq!(
+            rects,
+            vec![("virtual-1", 1280, 1920), ("virtual-2", 0, 1280)]
+        );
+        let placed = plan.placed_outputs().expect("placed outputs");
+        assert_eq!(placed[0].0, 0, "the primary is placed first");
+        assert_eq!((placed[0].1.x, placed[1].1.x), (1280, 0));
+
+        let media: Vec<(SessionMonitorId, ResolvedMediaPlan)> = plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.session_monitor_id,
+                    resolved_plan(monitor.width, monitor.height, 60),
+                )
+            })
+            .collect();
+        let capability = build_applied_capability(
+            &gate,
+            &plan,
+            carrier,
+            &media,
+            &negotiated_roster(&plan),
+            None,
+        )
+        .expect("applied capability must build");
+        assert_eq!(
+            capability.topology_backend(),
+            TopologyBackendKindMsg::VirtualOutputs
+        );
+        assert_eq!(capability.max_monitors(), 4);
+    }
+
+    #[test]
+    fn a_rotated_or_too_large_wayland_request_degrades_whole() {
+        let gate = wayland_gate(2);
+        let offer = build_offer(&gate).expect("offer");
+        let rotated = sample_request(vec![
+            descriptor("a", 1, (0, 0), (1920, 1080), true, RotationMsg::Degrees0),
+            descriptor(
+                "b",
+                2,
+                (1920, 0),
+                (1080, 1920),
+                false,
+                RotationMsg::Degrees90,
+            ),
+        ]);
+        assert!(matches!(
+            admit_requested_topology(&gate, Some(&offer), Some(&rotated)),
+            MultiMonitorOutcome::Degraded(_)
+        ));
+        let three = sample_request(vec![
+            descriptor("a", 1, (0, 0), (1920, 1080), true, RotationMsg::Degrees0),
+            descriptor(
+                "b",
+                2,
+                (1920, 0),
+                (1920, 1080),
+                false,
+                RotationMsg::Degrees0,
+            ),
+            descriptor(
+                "c",
+                3,
+                (3840, 0),
+                (1920, 1080),
+                false,
+                RotationMsg::Degrees0,
+            ),
+        ]);
+        assert!(matches!(
+            admit_requested_topology(&gate, Some(&offer), Some(&three)),
+            MultiMonitorOutcome::Degraded(_)
+        ));
+    }
+
     #[test]
     fn applied_media_plan_bitrate_is_the_negotiated_region_budget_verbatim() {
         let gate = enabled_gate(2);
@@ -1577,6 +1828,7 @@ mod tests {
             advertise_enabled: true,
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
+            virtual_outputs: None,
         };
         let error =
             build_applied_capability(&empty_gate, &plan, carrier, &media, &negotiated, None)

@@ -17,6 +17,22 @@ use super::linear_nits_to_pq_signal;
 /// BT.2408 reference white for graphics and SDR content in PQ, in nits.
 pub const GRAPHICS_WHITE_NITS: f64 = 203.0;
 
+/// How far a measured PQ source's SDR white may sit from
+/// [`GRAPHICS_WHITE_NITS`] and still be served as it was composed: about two
+/// ten-bit PQ codes at that level (one code is about 2.5 nits there), which
+/// is the resolution a white measured from a ten-bit capture has.
+pub const GRAPHICS_WHITE_TOLERANCE_NITS: f64 = 5.0;
+
+/// Whether a PQ source composes SDR white at [`GRAPHICS_WHITE_NITS`], within
+/// [`GRAPHICS_WHITE_TOLERANCE_NITS`]. A compositor that does (Mutter's PQ
+/// reference luminance is 203 nits) needs no rescale for HDR and converts to
+/// SDR with the shared 203-nit decode.
+#[must_use]
+pub fn is_graphics_white(source_white_nits: f64) -> bool {
+    source_white_nits.is_finite()
+        && (source_white_nits - GRAPHICS_WHITE_NITS).abs() <= GRAPHICS_WHITE_TOLERANCE_NITS
+}
+
 /// Where macOS `ScreenCaptureKit` puts SDR white in its PQ output, in nits.
 ///
 /// Measured on the lab, not taken from documentation: with the same content

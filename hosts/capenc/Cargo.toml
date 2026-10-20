@@ -1,6 +1,6 @@
 [package]
 name = "arcen-capenc"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -72,6 +72,13 @@ windows = { version = "0.58", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 x11rb = { version = "=0.13.2", default-features = false, features = ["damage", "randr", "shm"] }
+# Wayland provider capture (feature `wayland`, default off): PipeWire stream
+# consumer. MIT. Links libpipewire-0.3 and generates bindings with bindgen at
+# build time (needs the PipeWire development headers and libclang). Only the
+# PipeWire client library is linked; EGL and CUDA stay dlopen'd.
+pipewire = { version = "=0.10.1", optional = true, default-features = false }
+# Non-blocking canonical telemetry for the Wayland capture path.
+arcen-observability = { workspace = true, optional = true }
 
 # NVENC: we hand-roll a minimal FFI to nvEncodeAPI64.dll (loaded at runtime via
 # windows-rs LoadLibrary/GetProcAddress) with vendored struct definitions. The
@@ -96,6 +103,11 @@ software-h264 = ["arcen-media/software-h264-source"]
 # product runtime does not select it until an interactive 4:2:0 path and
 # software decode have both been proven.
 software-av1 = ["arcen-media/software-av1-source"]
+# Linux Wayland provider capture: bounded PipeWire buffer leases, host-copy
+# upload into the CUDA/NVENC surface, and an unqualified DMA-BUF EGL/CUDA
+# import. Default off; the Xorg NvFBC/XShm paths do not change with it. The
+# portable lease, layout and hand-off logic compiles and is tested without it.
+wayland = ["nvenc", "dep:pipewire", "dep:arcen-observability"]
 
 [dev-dependencies]
 criterion = { version = "0.6.0", default-features = false }

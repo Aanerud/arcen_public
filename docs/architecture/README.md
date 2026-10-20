@@ -92,3 +92,9 @@ See the superseding decision in
 | `arcen-input` | Active pure absolute/relative pointer, cursor-authority, global sequence ordering, typed pen/tablet (`PenEvent`/`PenTool`) capability/event contracts, and the one shared region-input encode/decode (`RegionInputWireMessage`), host pipeline (`RegionInputPipeline`), and client emitter (`RegionInputEmitter`) — see [`pen-tablet-input.md`](pen-tablet-input.md) |
 | `arcen-telemetry` | Pure correlation IDs, stable lifecycle categories, and redaction-safe fields |
 | [`arcen-observability`](observability.md) | Active OS-free tracing and I/O abstractions for canonical routing, live profile reload, and bounded sink workers |
+
+Who uses each shared crate, through which separate product path, and what each
+path must pass when that crate changes is the generated
+[shared consumer register](shared-consumers.md), built from
+`shared/<crate>/consumers.json`, `scripts/ci/validation-profiles.toml` and
+`cargo metadata` by `scripts/check_shared_contracts.py`.

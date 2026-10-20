@@ -27,10 +27,16 @@ pub struct HevcStreamTruth {
     pub bit_depth_luma: u8,
     /// Chroma sample depth in bits.
     pub bit_depth_chroma: u8,
-    /// Coded width in luma samples.
+    /// Coded width in luma samples (`pic_width_in_luma_samples`), padded to
+    /// the encoder's coding-block alignment.
     pub width: u32,
-    /// Coded height in luma samples.
+    /// Coded height in luma samples (`pic_height_in_luma_samples`).
     pub height: u32,
+    /// Width a decoder outputs: the coded width less the conformance
+    /// window, i.e. the picture the host meant to send.
+    pub display_width: u32,
+    /// Height a decoder outputs after the conformance window.
+    pub display_height: u32,
     /// The VUI colour description, when the stream states one.
     pub colour: Option<HevcColourDescription>,
 }
@@ -50,7 +56,9 @@ pub struct HevcColourDescription {
 
 impl HevcStreamTruth {
     /// A short, stable description for logs, such as
-    /// `rext 4:4:4 10-bit bt709/bt709/bt709 full`.
+    /// `rext 4:4:4 10-bit bt709/bt709/bt709 full 1800x1168 (coded 1824x1184)`.
+    /// The size is the displayed picture; the coded size follows only when
+    /// the conformance window crops alignment padding from it.
     #[must_use]
     pub fn summary(&self) -> String {
         let profile = match self.profile_idc {
@@ -78,9 +86,14 @@ impl HevcStreamTruth {
                 )
             },
         );
+        let coded = if (self.display_width, self.display_height) == (self.width, self.height) {
+            String::new()
+        } else {
+            format!(" (coded {}x{})", self.width, self.height)
+        };
         format!(
-            "{profile} {chroma} {}-bit {colour} {}x{}",
-            self.bit_depth_luma, self.width, self.height
+            "{profile} {chroma} {}-bit {colour} {}x{}{coded}",
+            self.bit_depth_luma, self.display_width, self.display_height
         )
     }
 }
@@ -186,17 +199,16 @@ pub fn parse_sps(nal: &[u8]) -> Result<HevcStreamTruth, HevcSpsError> {
     if chroma_format_idc > 3 {
         return Err(HevcSpsError::Invalid("chroma_format_idc"));
     }
-    if chroma_format_idc == 3 {
-        bits.skip(1)?; // separate_colour_plane_flag
-    }
+    let separate_colour_planes = chroma_format_idc == 3 && bits.flag()?;
     let width = bits.ue()?;
     let height = bits.ue()?;
-    if bits.flag()? {
-        // conformance_window_flag: left, right, top, bottom offsets
-        for _ in 0..4 {
-            bits.ue()?;
-        }
-    }
+    let (display_width, display_height) = conformance_window(
+        &mut bits,
+        chroma_format_idc,
+        separate_colour_planes,
+        width,
+        height,
+    )?;
     let bit_depth_luma = bits.ue()? + 8;
     let bit_depth_chroma = bits.ue()? + 8;
     if bit_depth_luma > 16 || bit_depth_chroma > 16 {
@@ -270,8 +282,46 @@ pub fn parse_sps(nal: &[u8]) -> Result<HevcStreamTruth, HevcSpsError> {
         bit_depth_chroma: u8::try_from(bit_depth_chroma).unwrap_or(u8::MAX),
         width,
         height,
+        display_width,
+        display_height,
         colour,
     })
+}
+
+/// The picture a decoder outputs: the coded size less the conformance
+/// window, whose offsets count chroma samples (H.265 7.4.3.2: `SubWidthC` and
+/// `SubHeightC`), so 4:2:0 crops two luma rows or columns per unit.
+fn conformance_window(
+    bits: &mut Bits<'_>,
+    chroma_format_idc: u32,
+    separate_colour_planes: bool,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32), HevcSpsError> {
+    if !bits.flag()? {
+        return Ok((width, height));
+    }
+    let (sub_width, sub_height) = match (chroma_format_idc, separate_colour_planes) {
+        (1, false) => (2, 2),
+        (2, false) => (2, 1),
+        _ => (1, 1),
+    };
+    let left = bits.ue()?;
+    let right = bits.ue()?;
+    let top = bits.ue()?;
+    let bottom = bits.ue()?;
+    let cropped = |size: u32, start: u32, end: u32, unit: u32| {
+        start
+            .checked_add(end)
+            .and_then(|total| total.checked_mul(unit))
+            .and_then(|crop| size.checked_sub(crop))
+            .filter(|&visible| visible > 0)
+            .ok_or(HevcSpsError::Invalid("conformance_window"))
+    };
+    Ok((
+        cropped(width, left, right, sub_width)?,
+        cropped(height, top, bottom, sub_height)?,
+    ))
 }
 
 fn profile_tier_level(
@@ -525,7 +575,13 @@ mod tests {
         depth: u32,
         colour: Option<(bool, u32, u32, u32)>,
         predicted_rps: bool,
+        /// Coded size and conformance window `[left, right, top, bottom]`;
+        /// `None` keeps the historical 1920x1088 with bottom offset 4.
+        geometry: Option<Geometry>,
     }
+
+    /// Coded `(width, height)` and conformance window `[left, right, top, bottom]`.
+    type Geometry = ((u32, u32), Option<[u32; 4]>);
 
     fn sps(fixture: &Fixture) -> Vec<u8> {
         let mut w = Writer::default();
@@ -544,13 +600,17 @@ mod tests {
         if fixture.chroma == 3 {
             w.bit(false);
         }
-        w.ue(1920);
-        w.ue(1088);
-        w.bit(true); // conformance window
-        w.ue(0);
-        w.ue(0);
-        w.ue(0);
-        w.ue(4);
+        let ((width, height), window) = fixture
+            .geometry
+            .unwrap_or(((1920, 1088), Some([0, 0, 0, 4])));
+        w.ue(width);
+        w.ue(height);
+        w.bit(window.is_some()); // conformance window
+        if let Some(window) = window {
+            for offset in window {
+                w.ue(offset);
+            }
+        }
         w.ue(fixture.depth - 8);
         w.ue(fixture.depth - 8);
         w.ue(4); // log2_max_poc_lsb_minus4
@@ -624,12 +684,15 @@ mod tests {
             depth: 10,
             colour: Some((true, 1, 1, 1)),
             predicted_rps: false,
+            geometry: None,
         }))
         .expect("parses");
         assert_eq!(truth.profile_idc, 4);
         assert_eq!(truth.chroma_format_idc, 3);
         assert_eq!((truth.bit_depth_luma, truth.bit_depth_chroma), (10, 10));
         assert_eq!((truth.width, truth.height), (1920, 1088));
+        // The fixture's bottom offset of 4 is in luma rows at 4:4:4.
+        assert_eq!((truth.display_width, truth.display_height), (1920, 1084));
         assert_eq!(
             truth.colour,
             Some(HevcColourDescription {
@@ -641,7 +704,7 @@ mod tests {
         );
         assert_eq!(
             truth.summary(),
-            "rext 4:4:4 10-bit bt709/bt709/bt709 full 1920x1088"
+            "rext 4:4:4 10-bit bt709/bt709/bt709 full 1920x1084 (coded 1920x1088)"
         );
     }
 
@@ -653,10 +716,15 @@ mod tests {
             depth: 8,
             colour: None,
             predicted_rps: true,
+            geometry: None,
         }))
         .expect("parses");
         assert_eq!(truth.colour, None);
-        assert_eq!(truth.summary(), "main 4:2:0 8-bit untagged 1920x1088");
+        assert_eq!(
+            truth.summary(),
+            "main 4:2:0 8-bit untagged 1920x1080 (coded 1920x1088)",
+            "4:2:0 offsets count chroma rows, two luma rows each"
+        );
     }
 
     #[test]
@@ -667,11 +735,12 @@ mod tests {
             depth: 10,
             colour: Some((false, 9, 16, 9)),
             predicted_rps: true,
+            geometry: None,
         }))
         .expect("parses");
         assert_eq!(
             truth.summary(),
-            "main10 4:2:0 10-bit bt2020/pq/bt2020ncl limited 1920x1088"
+            "main10 4:2:0 10-bit bt2020/pq/bt2020ncl limited 1920x1080 (coded 1920x1088)"
         );
     }
 
@@ -683,6 +752,7 @@ mod tests {
             depth: 10,
             colour: None,
             predicted_rps: false,
+            geometry: None,
         });
         let mut access_unit = vec![0, 0, 0, 1, 0x40, 1, 0x0C, 1, 0xFF];
         access_unit.extend_from_slice(&[0, 0, 0, 1]);
@@ -696,5 +766,51 @@ mod tests {
             Err(HevcSpsError::NotSps)
         );
         assert_eq!(parse_sps(&sps[..8]), Err(HevcSpsError::Truncated));
+    }
+
+    #[test]
+    fn a_windows_pier_grading_stream_reads_as_its_visible_size() {
+        // NVENC codes 1800x1168 as 1824x1184 and crops 24 columns and 16 rows
+        // with the conformance window; at 4:4:4 the offsets are luma samples.
+        let truth = parse_sps(&sps(&Fixture {
+            profile_idc: 4,
+            chroma: 3,
+            depth: 10,
+            colour: Some((true, 1, 1, 1)),
+            predicted_rps: false,
+            geometry: Some(((1824, 1184), Some([0, 24, 0, 16]))),
+        }))
+        .expect("parses");
+        assert_eq!((truth.width, truth.height), (1824, 1184));
+        assert_eq!((truth.display_width, truth.display_height), (1800, 1168));
+        assert_eq!(
+            truth.summary(),
+            "rext 4:4:4 10-bit bt709/bt709/bt709 full 1800x1168 (coded 1824x1184)"
+        );
+    }
+
+    #[test]
+    fn an_uncropped_stream_reports_one_size_and_an_impossible_window_is_refused() {
+        let exact = parse_sps(&sps(&Fixture {
+            profile_idc: 1,
+            chroma: 1,
+            depth: 8,
+            colour: None,
+            predicted_rps: false,
+            geometry: Some(((1280, 720), None)),
+        }))
+        .expect("parses");
+        assert_eq!(exact.summary(), "main 4:2:0 8-bit untagged 1280x720");
+        assert_eq!(
+            parse_sps(&sps(&Fixture {
+                profile_idc: 1,
+                chroma: 1,
+                depth: 8,
+                colour: None,
+                predicted_rps: false,
+                geometry: Some(((64, 64), Some([0, 0, 0, 32]))),
+            })),
+            Err(HevcSpsError::Invalid("conformance_window"))
+        );
     }
 }

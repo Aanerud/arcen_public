@@ -1,12 +1,12 @@
 //! Dedicated-Xorg clipboard policy, bounded relay state, and user-agent supervision.
 
-use arcen_media::clipboard::{
-    ClipboardDirection, ClipboardFlow, ClipboardKind, ClipboardPolicy, HARD_MAX_CLIPBOARD_BYTES,
+use arcen_media::clipboard::eligibility::{
+    clipboard_eligibility, ClipboardHostFacts, ClipboardIneligible,
 };
+use arcen_media::clipboard::{ClipboardPolicy, ClipboardRequest, HARD_MAX_CLIPBOARD_BYTES};
 use arcen_protocol::clipboard::{ClipboardCursor, ClipboardTransfer, ClipboardWireMessage};
 use arcen_protocol::messages::{
-    ClientHelloMsg, ClipboardContentKind, ClipboardDataMsg, ClipboardPolicyMsg,
-    CLIPBOARD_PROTOCOL_VERSION,
+    ClientHelloMsg, ClipboardContentKind, ClipboardDirectionMsg, ClipboardPolicyMsg,
 };
 use arcen_protocol::CHUNK_BYTES;
 use arcen_telemetry::CorrelationId;
@@ -28,6 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use zeroize::Zeroize;
 
+pub use arcen_media::clipboard::ClipboardNegotiation;
+
 use crate::cli::{AuthMode, Config};
 use crate::session::identity::UserExecution;
 use crate::session::lifecycle::SessionMetadata;
@@ -35,23 +37,86 @@ use crate::session::lifecycle::SessionMetadata;
 const IPC_READY_LIMIT: usize = 4096;
 const IPC_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const IPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const CLIPBOARD_POLICY_TYPE: &str = "arcen_clipboard_policy";
+pub(crate) const CLIPBOARD_POLICY_TYPE: &str = "arcen_clipboard_policy";
 
-/// Advertises disabled on no-auth/shared-display sessions and exact host policy
-/// only for authenticated dedicated-Xorg sessions.
+/// The largest WebSocket message on a clipboard bridge: one chunk frame.
+pub(crate) const BRIDGE_FRAME_LIMIT: usize = arcen_protocol::CLIPBOARD_HEADER_SIZE + CHUNK_BYTES;
+
+/// How the clipboard reaches a desktop session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardBridgeKind {
+    /// A per-attachment `session-agent --clipboard-agent` child on the
+    /// dedicated Xorg display.
+    X11Child,
+    /// The headless Wayland session agent's `arcen-clipboard.sock`.
+    WaylandSession,
+}
+
+impl ClipboardBridgeKind {
+    /// Stable token for logs.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::X11Child => "x11_child",
+            Self::WaylandSession => "wayland_session",
+        }
+    }
+}
+
+/// The shared eligibility facts of this host's session.
+///
+/// Dedicated Xorg: authenticated through PAM on the configured session
+/// display. Headless Wayland: authenticated through PAM, its own logind
+/// session, and an agent that proved its compositor clipboard at start.
+fn host_facts(cfg: &Config, session: Option<&SessionMetadata>) -> ClipboardHostFacts {
+    let authenticated = cfg.auth_mode == AuthMode::Pam && session.is_some();
+    let (dedicated_desktop, native_bridge) = match session {
+        Some(session) if session.session_type == "x11" => {
+            (session.display == cfg.session_display, true)
+        }
+        Some(session) if session.session_type == "wayland" => (
+            session.wayland.is_some(),
+            session
+                .wayland
+                .as_ref()
+                .is_some_and(|ready| ready.clipboard.is_some()),
+        ),
+        _ => (false, false),
+    };
+    ClipboardHostFacts {
+        authenticated,
+        dedicated_desktop,
+        unprivileged_user: session.is_some_and(|session| session.uid != 0),
+        native_bridge,
+    }
+}
+
+/// Whether this session may carry the clipboard, and through which bridge.
+///
+/// # Errors
+///
+/// The shared [`ClipboardIneligible`] reason.
+pub fn eligibility(
+    cfg: &Config,
+    session: Option<&SessionMetadata>,
+) -> Result<ClipboardBridgeKind, ClipboardIneligible> {
+    clipboard_eligibility(host_facts(cfg, session))?;
+    Ok(match session.map(|session| session.session_type.as_str()) {
+        Some("wayland") => ClipboardBridgeKind::WaylandSession,
+        _ => ClipboardBridgeKind::X11Child,
+    })
+}
+
+/// Advertises the exact host policy only for an eligible session, and
+/// disabled otherwise (no-auth, shared display, root, or a Wayland desktop
+/// whose compositor clipboard was not proven).
 #[must_use]
 pub fn advertised_policy(cfg: &Config, session: Option<&SessionMetadata>) -> ClipboardPolicyMsg {
-    let eligible = cfg.auth_mode == AuthMode::Pam
-        && session.is_some_and(|session| {
-            session.session_type == "x11"
-                && session.display == cfg.session_display
-                && session.uid != 0
-        });
-    let mut policy = cfg.clipboard_policy;
-    if !eligible {
-        policy.direction = ClipboardDirection::Disabled;
+    let mut message = policy_message(cfg.clipboard_policy);
+    if eligibility(cfg, session).is_err() {
+        message.direction = ClipboardDirectionMsg::Disabled;
     }
-    policy_message(policy)
+    message
 }
 
 /// Renders a policy as the wire message that advertises it.
@@ -60,66 +125,15 @@ pub fn advertised_policy(cfg: &Config, session: Option<&SessionMetadata>) -> Cli
 /// same policy for the same configuration.
 pub use arcen_media::clipboard::policy_message;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ClipboardNegotiation {
+/// The host policy narrowed by the client's hello, or `None` when this
+/// session carries no clipboard.
+#[must_use]
+pub fn negotiate(
     policy: ClipboardPolicy,
-    text_c2h: bool,
-    text_h2c: bool,
-    image_c2h: bool,
-    image_h2c: bool,
-}
-
-impl ClipboardNegotiation {
-    #[must_use]
-    pub fn from_client(
-        policy: ClipboardPolicy,
-        eligible: bool,
-        hello: &ClientHelloMsg,
-    ) -> Option<Self> {
-        if !eligible
-            || hello.clipboard_protocol_version != CLIPBOARD_PROTOCOL_VERSION
-            || matches!(policy.direction, ClipboardDirection::Disabled)
-        {
-            return None;
-        }
-        let value = Self {
-            policy,
-            text_c2h: hello.clipboard_text_c2s,
-            text_h2c: hello.clipboard_text_s2c,
-            image_c2h: hello.clipboard_image_c2s,
-            image_h2c: hello.clipboard_image_s2c,
-        };
-        (value.allows(ClipboardFlow::ClientToHost, ClipboardContentKind::TextUtf8)
-            || value.allows(ClipboardFlow::ClientToHost, ClipboardContentKind::ImagePng)
-            || value.allows(ClipboardFlow::HostToClient, ClipboardContentKind::TextUtf8)
-            || value.allows(ClipboardFlow::HostToClient, ClipboardContentKind::ImagePng))
-        .then_some(value)
-    }
-
-    #[must_use]
-    pub const fn policy(self) -> ClipboardPolicy {
-        self.policy
-    }
-
-    #[must_use]
-    pub fn allows(self, flow: ClipboardFlow, kind: ClipboardContentKind) -> bool {
-        if !self.policy.allows(flow, media_kind(kind)) {
-            return false;
-        }
-        match (flow, kind) {
-            (ClipboardFlow::ClientToHost, ClipboardContentKind::TextUtf8) => self.text_c2h,
-            (ClipboardFlow::HostToClient, ClipboardContentKind::TextUtf8) => self.text_h2c,
-            (ClipboardFlow::ClientToHost, ClipboardContentKind::ImagePng) => self.image_c2h,
-            (ClipboardFlow::HostToClient, ClipboardContentKind::ImagePng) => self.image_h2c,
-        }
-    }
-}
-
-fn media_kind(kind: ClipboardContentKind) -> ClipboardKind {
-    match kind {
-        ClipboardContentKind::TextUtf8 => ClipboardKind::TextUtf8,
-        ClipboardContentKind::ImagePng => ClipboardKind::ImagePng,
-    }
+    eligible: bool,
+    hello: &ClientHelloMsg,
+) -> Option<ClipboardNegotiation> {
+    ClipboardNegotiation::resolve(policy, eligible, ClipboardRequest::from_hello(hello))
 }
 
 pub struct ClipboardItem {
@@ -257,6 +271,13 @@ impl ClipboardWriterQueue {
     }
 
     pub async fn pop(&self) -> Result<Option<Message>, String> {
+        Ok(self.pop_with_sequence().await?.map(|(message, _)| message))
+    }
+
+    /// Like [`Self::pop`], with the sequence of the transfer the message
+    /// belongs to, so a writer that cannot deliver it can abandon exactly
+    /// that transfer.
+    pub async fn pop_with_sequence(&self) -> Result<Option<(Message, u64)>, String> {
         loop {
             {
                 let mut state = self.lock();
@@ -278,6 +299,7 @@ impl ClipboardWriterQueue {
                         .map(ClipboardTransfer::into_cursor);
                 }
                 if let Some(active) = state.active.as_mut() {
+                    let sequence = active.transfer().sequence();
                     let next = active
                         .next_message()
                         .transpose()
@@ -287,7 +309,7 @@ impl ClipboardWriterQueue {
                         if active.finished() {
                             state.active = None;
                         }
-                        return Ok(Some(message));
+                        return Ok(Some((message, sequence)));
                     }
                     state.active = None;
                     continue;
@@ -298,6 +320,21 @@ impl ClipboardWriterQueue {
             }
             self.ready.notified().await;
         }
+    }
+
+    /// Drops the rest of transfer `sequence` when it is still the active
+    /// one. A newer pending item is kept.
+    pub fn abandon(&self, sequence: u64) -> bool {
+        let mut state = self.lock();
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.transfer().sequence() == sequence)
+        {
+            state.active = None;
+            return true;
+        }
+        false
     }
 
     pub fn close(&self) {
@@ -458,6 +495,159 @@ impl Drop for IncrTransfer {
     }
 }
 
+/// How long one bridge message (an offer or one chunk) may wait for the
+/// helper to take it before the Pier stops waiting.
+pub const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why the Pier's side of a clipboard bridge stopped carrying an item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardBridgeFailure {
+    /// The helper took nothing for [`BRIDGE_SEND_TIMEOUT`]; the item was
+    /// abandoned.
+    Stalled { sequence: u64 },
+    /// The bridge socket failed.
+    Closed(String),
+}
+
+/// The Pier's end of one clipboard bridge.
+///
+/// Reading and writing are separate. Client items go to a writer task
+/// through a latest-wins mailbox, so the attachment's main loop never waits
+/// on the helper. The helper may at the same moment be writing a host item
+/// that the main loop must keep reading. With both ends only writing, the
+/// local socket buffer fills and neither side reads again.
+pub struct ClipboardBridgeLink {
+    stream: futures_util::stream::SplitStream<WebSocketStream<ClipboardAgentIo>>,
+    outbound: Arc<ClipboardMailbox>,
+    failures: tokio::sync::mpsc::Receiver<ClipboardBridgeFailure>,
+    writer: JoinHandle<()>,
+    kind: ClipboardBridgeKind,
+}
+
+impl ClipboardBridgeLink {
+    /// Splits `websocket` and starts its writer.
+    #[must_use]
+    pub fn new(websocket: WebSocketStream<ClipboardAgentIo>, kind: ClipboardBridgeKind) -> Self {
+        Self::with_timeout(websocket, kind, BRIDGE_SEND_TIMEOUT)
+    }
+
+    /// As [`Self::new`] with an explicit per-message timeout.
+    #[must_use]
+    pub fn with_timeout(
+        websocket: WebSocketStream<ClipboardAgentIo>,
+        kind: ClipboardBridgeKind,
+        timeout: Duration,
+    ) -> Self {
+        use futures_util::StreamExt;
+        let (sink, stream) = websocket.split();
+        let outbound = ClipboardMailbox::new();
+        let (failed, failures) = tokio::sync::mpsc::channel(4);
+        let writer = tokio::spawn(bridge_writer(
+            sink,
+            Arc::clone(&outbound),
+            failed,
+            kind,
+            timeout,
+        ));
+        Self {
+            stream,
+            outbound,
+            failures,
+            writer,
+            kind,
+        }
+    }
+
+    /// Which bridge this is.
+    #[must_use]
+    pub const fn kind(&self) -> ClipboardBridgeKind {
+        self.kind
+    }
+
+    /// The next message from the helper.
+    pub async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        use futures_util::StreamExt;
+        self.stream.next().await
+    }
+
+    /// Hands a client item to the writer, replacing one it has not started.
+    /// Never waits.
+    pub fn offer(&self, item: ClipboardItem) -> bool {
+        self.outbound.replace(item)
+    }
+
+    /// The next writer failure. Pending forever while the writer is healthy.
+    pub async fn failure(&mut self) -> Option<ClipboardBridgeFailure> {
+        self.failures.recv().await
+    }
+
+    /// Whichever comes first: a message from the helper, or a writer
+    /// failure.
+    pub async fn next_event(&mut self) -> ClipboardBridgeEvent {
+        use futures_util::StreamExt;
+        tokio::select! {
+            message = self.stream.next() => ClipboardBridgeEvent::Message(message),
+            Some(failure) = self.failures.recv() => ClipboardBridgeEvent::Failure(failure),
+        }
+    }
+}
+
+/// What the Pier's side of a clipboard bridge has to handle next.
+#[derive(Debug)]
+pub enum ClipboardBridgeEvent {
+    /// A message from the helper; `None` when its stream ended.
+    Message(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    /// The writer stopped carrying an item.
+    Failure(ClipboardBridgeFailure),
+}
+
+impl Drop for ClipboardBridgeLink {
+    fn drop(&mut self) {
+        self.outbound.close();
+        self.writer.abort();
+    }
+}
+
+async fn bridge_writer(
+    mut sink: futures_util::stream::SplitSink<WebSocketStream<ClipboardAgentIo>, Message>,
+    outbound: Arc<ClipboardMailbox>,
+    failed: tokio::sync::mpsc::Sender<ClipboardBridgeFailure>,
+    kind: ClipboardBridgeKind,
+    timeout: Duration,
+) {
+    while let Some(item) = outbound.take().await {
+        let sequence = item.sequence;
+        let Some(transfer) = item.into_transfer() else {
+            continue;
+        };
+        let mut cursor = transfer.into_cursor();
+        let outcome = loop {
+            let message = match cursor.next_message() {
+                None => break Ok(()),
+                Some(Err(error)) => break Err(ClipboardBridgeFailure::Closed(error.to_string())),
+                Some(Ok(message)) => match wire_message(message) {
+                    Ok(message) => message,
+                    Err(error) => break Err(ClipboardBridgeFailure::Closed(error)),
+                },
+            };
+            match tokio::time::timeout(timeout, sink.send(message)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => break Err(ClipboardBridgeFailure::Closed(error.to_string())),
+                Err(_) => break Err(ClipboardBridgeFailure::Stalled { sequence }),
+            }
+        };
+        drop(cursor);
+        if let Err(failure) = outcome {
+            let ends = matches!(failure, ClipboardBridgeFailure::Closed(_))
+                || kind == ClipboardBridgeKind::WaylandSession;
+            let _ = failed.send(failure).await;
+            if ends {
+                return;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardAgentReady {
     pub ready: bool,
@@ -469,50 +659,229 @@ pub struct ClipboardAgentReady {
     pub xfixes_minor: u32,
 }
 
+/// The first message on every clipboard bridge: the policy the helper must
+/// enforce on its side too, and, for a bridge that reads the desktop
+/// clipboard on its own, what the client asked for in each direction.
 #[derive(Debug, Serialize, Deserialize)]
-struct AgentPolicy {
+pub(crate) struct AgentPolicy {
     #[serde(rename = "type")]
-    msg_type: String,
-    policy: ClipboardPolicyMsg,
+    pub(crate) msg_type: String,
+    pub(crate) policy: ClipboardPolicyMsg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) directions: Option<AgentDirections>,
 }
 
-pub struct ClipboardAgentIo {
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+/// Which kinds may cross in which direction after negotiation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AgentDirections {
+    pub(crate) text_c2h: bool,
+    pub(crate) text_h2c: bool,
+    pub(crate) image_c2h: bool,
+    pub(crate) image_h2c: bool,
+}
+
+impl AgentPolicy {
+    pub(crate) fn new(policy: ClipboardPolicy) -> Self {
+        Self {
+            msg_type: CLIPBOARD_POLICY_TYPE.to_string(),
+            policy: policy_message(policy),
+            directions: None,
+        }
+    }
+
+    /// The whole negotiation, so the helper never reads a kind the client
+    /// did not ask for.
+    pub(crate) fn negotiated(negotiation: ClipboardNegotiation) -> Self {
+        use arcen_media::clipboard::{ClipboardFlow, ClipboardKind};
+        let allows = |flow, kind| negotiation.allows(flow, kind);
+        Self {
+            directions: Some(AgentDirections {
+                text_c2h: allows(ClipboardFlow::ClientToHost, ClipboardKind::TextUtf8),
+                text_h2c: allows(ClipboardFlow::HostToClient, ClipboardKind::TextUtf8),
+                image_c2h: allows(ClipboardFlow::ClientToHost, ClipboardKind::ImagePng),
+                image_h2c: allows(ClipboardFlow::HostToClient, ClipboardKind::ImagePng),
+            }),
+            ..Self::new(negotiation.policy())
+        }
+    }
+
+    /// The policy, when this is a v1 policy message.
+    pub(crate) fn into_policy(self) -> Option<ClipboardPolicy> {
+        (self.msg_type == CLIPBOARD_POLICY_TYPE)
+            .then(|| arcen_media::clipboard::policy_from_message(self.policy).ok())
+            .flatten()
+    }
+
+    /// The negotiation this message carries. Without directions (an older
+    /// parent) every kind the policy allows is assumed requested.
+    pub(crate) fn into_negotiation(self) -> Option<ClipboardNegotiation> {
+        use arcen_media::clipboard::ClipboardDirections;
+        let directions = self.directions;
+        let policy = self.into_policy()?;
+        let request = directions.map_or(
+            ClipboardRequest {
+                protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+                text: ClipboardDirections::both(),
+                image: ClipboardDirections::both(),
+            },
+            |directions| ClipboardRequest {
+                protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+                text: ClipboardDirections {
+                    client_to_host: directions.text_c2h,
+                    host_to_client: directions.text_h2c,
+                },
+                image: ClipboardDirections {
+                    client_to_host: directions.image_c2h,
+                    host_to_client: directions.image_h2c,
+                },
+            },
+        );
+        ClipboardNegotiation::resolve(policy, true, request)
+    }
+}
+
+/// The line a Wayland session's clipboard bridge writes before its
+/// WebSocket starts: who is serving, and through what.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardBridgeReady {
+    pub ready: bool,
+    pub pid: u32,
+    pub uid: u32,
+    pub username: String,
+    /// `mutter_remote_desktop`.
+    pub backend: String,
+}
+
+/// The byte stream under one clipboard bridge's WebSocket.
+pub enum ClipboardAgentIo {
+    /// A dedicated-Xorg `--clipboard-agent` child's stdio.
+    Child {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+    },
+    /// A Wayland session agent's `arcen-clipboard.sock`.
+    Session(tokio::net::UnixStream),
 }
 
 impl AsyncRead for ClipboardAgentIo {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stdout).poll_read(cx, buffer)
+        match self.get_mut() {
+            Self::Child { stdout, .. } => Pin::new(stdout).poll_read(cx, buffer),
+            Self::Session(stream) => Pin::new(stream).poll_read(cx, buffer),
+        }
     }
 }
 
 impl AsyncWrite for ClipboardAgentIo {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.stdin).poll_write(cx, buffer)
+        match self.get_mut() {
+            Self::Child { stdin, .. } => Pin::new(stdin).poll_write(cx, buffer),
+            Self::Session(stream) => Pin::new(stream).poll_write(cx, buffer),
+        }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.stdin).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Self::Child { stdin, .. } => Pin::new(stdin).poll_flush(cx),
+            Self::Session(stream) => Pin::new(stream).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.stdin).poll_shutdown(cx)
+        match self.get_mut() {
+            Self::Child { stdin, .. } => Pin::new(stdin).poll_shutdown(cx),
+            Self::Session(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
     }
+}
+
+pub(crate) fn bridge_websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig
+{
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(BRIDGE_FRAME_LIMIT);
+    config.max_frame_size = Some(BRIDGE_FRAME_LIMIT);
+    config
+}
+
+async fn send_policy(
+    websocket: &mut WebSocketStream<ClipboardAgentIo>,
+    policy: AgentPolicy,
+) -> Result<(), String> {
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&policy)
+                .map_err(|error| format!("serialize clipboard bridge policy: {error}"))?
+                .into(),
+        ))
+        .await
+        .map_err(|error| format!("send clipboard bridge policy: {error}"))
+}
+
+/// Connects to a headless Wayland session's clipboard bridge after proving
+/// it is the session's: the socket is private to the session user inside the
+/// session's runtime directory, the peer is the session's agent, and its
+/// ready line names the same user and process.
+///
+/// # Errors
+///
+/// A bounded reason when the bridge is absent or not proven.
+#[cfg(target_os = "linux")]
+pub async fn connect_wayland_clipboard(
+    session: &SessionMetadata,
+    negotiation: ClipboardNegotiation,
+) -> Result<WebSocketStream<ClipboardAgentIo>, String> {
+    use crate::session::wayland::{is_private_runtime_dir, socket_proof};
+    let ready = session
+        .wayland
+        .as_ref()
+        .ok_or_else(|| "not a Wayland session".to_string())?;
+    let bridge = ready
+        .clipboard
+        .as_ref()
+        .ok_or_else(|| "the session agent proved no compositor clipboard".to_string())?;
+    if !ready.is_consistent()
+        || !is_private_runtime_dir(&ready.runtime_dir, session.uid, &session.session_id)
+    {
+        return Err("clipboard socket is not in the session's runtime directory".to_string());
+    }
+    tokio::time::timeout(IPC_READY_TIMEOUT, async {
+        socket_proof::verify_private_socket(&ready.runtime_dir, &bridge.socket, session.uid)
+            .map_err(|error| error.to_string())?;
+        let stream = tokio::net::UnixStream::connect(&bridge.socket)
+            .await
+            .map_err(|error| format!("connect clipboard socket: {error}"))?;
+        socket_proof::verify_peer(&stream, session.uid, Some(session.agent_pid))
+            .map_err(|error| error.to_string())?;
+        let mut io = ClipboardAgentIo::Session(stream);
+        let line = read_ready_line(&mut io).await?;
+        let hello: ClipboardBridgeReady = serde_json::from_slice(&line)
+            .map_err(|_| "clipboard bridge READY is invalid".to_string())?;
+        if !hello.ready
+            || hello.pid != session.agent_pid
+            || hello.uid != session.uid
+            || hello.username != session.username
+        {
+            return Err("clipboard bridge READY identity mismatch".to_string());
+        }
+        let mut websocket =
+            WebSocketStream::from_raw_socket(io, Role::Client, Some(bridge_websocket_config()))
+                .await;
+        send_policy(&mut websocket, AgentPolicy::negotiated(negotiation)).await?;
+        Ok(websocket)
+    })
+    .await
+    .map_err(|_| "clipboard bridge readiness timed out".to_string())?
 }
 
 pub struct ClipboardAgentProcess {
@@ -537,7 +906,7 @@ impl Drop for ClipboardAgentProcess {
 pub async fn spawn_clipboard_agent(
     binary: &Path,
     execution: &UserExecution,
-    policy: ClipboardPolicy,
+    negotiation: ClipboardNegotiation,
     session_log_id: &CorrelationId,
 ) -> Result<(ClipboardAgentProcess, WebSocketStream<ClipboardAgentIo>), String> {
     let mut command = crate::command_for_helper(binary, "session-agent");
@@ -590,27 +959,14 @@ pub async fn spawn_clipboard_agent(
     {
         return Err("clipboard agent READY identity/XFixes mismatch".to_string());
     }
-    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-    config.max_message_size = Some(arcen_protocol::CLIPBOARD_HEADER_SIZE + CHUNK_BYTES);
-    config.max_frame_size = Some(arcen_protocol::CLIPBOARD_HEADER_SIZE + CHUNK_BYTES);
-    let io = ClipboardAgentIo { stdin, stdout };
-    let mut websocket = WebSocketStream::from_raw_socket(io, Role::Client, Some(config)).await;
-    let policy = AgentPolicy {
-        msg_type: CLIPBOARD_POLICY_TYPE.to_string(),
-        policy: policy_message(policy),
-    };
-    websocket
-        .send(Message::Text(
-            serde_json::to_string(&policy)
-                .map_err(|error| format!("serialize clipboard child policy: {error}"))?
-                .into(),
-        ))
-        .await
-        .map_err(|error| format!("send clipboard child policy: {error}"))?;
+    let io = ClipboardAgentIo::Child { stdin, stdout };
+    let mut websocket =
+        WebSocketStream::from_raw_socket(io, Role::Client, Some(bridge_websocket_config())).await;
+    send_policy(&mut websocket, AgentPolicy::negotiated(negotiation)).await?;
     Ok((ClipboardAgentProcess { child, stderr }, websocket))
 }
 
-async fn read_ready_line(stdout: &mut ChildStdout) -> Result<Vec<u8>, String> {
+async fn read_ready_line<R: AsyncRead + Unpin>(stdout: &mut R) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut line = Vec::new();
     while line.len() < IPC_READY_LIMIT {
@@ -692,8 +1048,8 @@ mod native;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arcen_media::clipboard::ClipboardContent;
-    use arcen_protocol::messages::ClipboardDirectionMsg;
+    use arcen_media::clipboard::{ClipboardContent, ClipboardDirection};
+    use arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION;
 
     fn policy() -> ClipboardPolicy {
         ClipboardPolicy::new(
@@ -720,10 +1076,188 @@ mod tests {
             clipboard_text_c2s: true,
             ..ClientHelloMsg::default()
         };
-        assert!(ClipboardNegotiation::from_client(policy(), true, &hello).is_some());
+        assert!(negotiate(policy(), true, &hello).is_some());
         hello.clipboard_protocol_version = 0;
-        assert!(ClipboardNegotiation::from_client(policy(), true, &hello).is_none());
-        assert!(ClipboardNegotiation::from_client(policy(), false, &hello).is_none());
+        assert!(negotiate(policy(), true, &hello).is_none());
+        hello.clipboard_protocol_version = CLIPBOARD_PROTOCOL_VERSION;
+        assert!(negotiate(policy(), false, &hello).is_none());
+    }
+
+    fn session(session_type: &str, display: &str, uid: u32) -> SessionMetadata {
+        SessionMetadata {
+            username: "user".into(),
+            uid,
+            session_id: "7".into(),
+            session_type: session_type.into(),
+            desktop: "gnome".into(),
+            display: display.into(),
+            agent_pid: 42,
+            generation: 1,
+            reconnected: false,
+            timezone: None,
+            multi_monitor_plan: None,
+            multi_monitor_carrier: None,
+            audio: None,
+            wayland: None,
+            requested_outputs: None,
+            x11_desktop_depth: None,
+        }
+    }
+
+    fn wayland_session(clipboard: bool) -> SessionMetadata {
+        use crate::session::wayland::{
+            WaylandAgentReady, WaylandClipboardReady, CLIPBOARD_SOCKET_NAME, INPUT_SOCKET_NAME,
+            WAYLAND_DISPLAY_NAME,
+        };
+        let runtime_dir = std::path::PathBuf::from("/run/user/1000/arcen-wayland-7");
+        let mut metadata = session("wayland", "", 1000);
+        metadata.wayland = Some(WaylandAgentReady {
+            compositor: "gnome-shell".into(),
+            input_socket: runtime_dir.join(INPUT_SOCKET_NAME),
+            wayland_display: WAYLAND_DISPLAY_NAME.into(),
+            outputs: Vec::new(),
+            streams: Vec::new(),
+            input_device_types: 7,
+            generation: 1,
+            compositor_render_node: None,
+            compositor_gpu_pci: None,
+            compositor_gpu_vendor: None,
+            output_mode: arcen_session::wayland_outputs::VirtualOutputMode::StartupMonitors,
+            output_socket: None,
+            clipboard: clipboard.then(|| WaylandClipboardReady {
+                socket: runtime_dir.join(CLIPBOARD_SOCKET_NAME),
+                interface: "org.gnome.Mutter.RemoteDesktop.Session".into(),
+                dedicated_session: true,
+            }),
+            x11: None,
+            cursor_mode: crate::session::wayland::StreamCursorMode::Embedded,
+            runtime_dir,
+        });
+        metadata
+    }
+
+    #[test]
+    fn x11_eligibility_is_unchanged() {
+        let cfg = Config {
+            auth_mode: AuthMode::Pam,
+            ..Config::default()
+        };
+        let own = session("x11", &cfg.session_display, 1000);
+        assert_eq!(
+            eligibility(&cfg, Some(&own)),
+            Ok(ClipboardBridgeKind::X11Child)
+        );
+        assert_eq!(
+            advertised_policy(&cfg, Some(&own)),
+            policy_message(cfg.clipboard_policy)
+        );
+        let other_display = session("x11", ":4242", 1000);
+        assert_eq!(
+            eligibility(&cfg, Some(&other_display)),
+            Err(ClipboardIneligible::SharedDesktop)
+        );
+        let root = session("x11", &cfg.session_display, 0);
+        assert_eq!(
+            eligibility(&cfg, Some(&root)),
+            Err(ClipboardIneligible::PrivilegedUser)
+        );
+        let no_auth = Config {
+            auth_mode: AuthMode::None,
+            ..Config::default()
+        };
+        assert_eq!(
+            advertised_policy(&no_auth, Some(&own)).direction,
+            ClipboardDirectionMsg::Disabled
+        );
+    }
+
+    #[test]
+    fn a_wayland_session_carries_the_clipboard_only_when_its_agent_proved_it() {
+        let cfg = Config {
+            auth_mode: AuthMode::Pam,
+            ..Config::default()
+        };
+        assert_eq!(
+            eligibility(&cfg, Some(&wayland_session(true))),
+            Ok(ClipboardBridgeKind::WaylandSession)
+        );
+        assert_eq!(
+            eligibility(&cfg, Some(&wayland_session(false))),
+            Err(ClipboardIneligible::NoNativeBridge)
+        );
+        assert_eq!(
+            advertised_policy(&cfg, Some(&wayland_session(false))).direction,
+            ClipboardDirectionMsg::Disabled
+        );
+        assert_eq!(
+            eligibility(&cfg, Some(&session("wayland", "", 1000))),
+            Err(ClipboardIneligible::SharedDesktop)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_stops_reading_never_blocks_the_pier() {
+        let (pier, helper) = tokio::net::UnixStream::pair().unwrap();
+        let websocket = WebSocketStream::from_raw_socket(
+            ClipboardAgentIo::Session(pier),
+            Role::Client,
+            Some(bridge_websocket_config()),
+        )
+        .await;
+        let mut link = ClipboardBridgeLink::with_timeout(
+            websocket,
+            ClipboardBridgeKind::X11Child,
+            Duration::from_millis(200),
+        );
+        // The helper end is never read: its buffer fills.
+        let started = Instant::now();
+        assert!(link.offer(
+            ClipboardItem::new(
+                7,
+                ClipboardContentKind::TextUtf8,
+                vec![b'x'; 8 * CHUNK_BYTES],
+                false
+            )
+            .unwrap()
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "offer never waits"
+        );
+        let failure = tokio::time::timeout(Duration::from_secs(5), link.failure())
+            .await
+            .expect("the stall is reported");
+        assert_eq!(
+            failure,
+            Some(ClipboardBridgeFailure::Stalled { sequence: 7 })
+        );
+        drop(helper);
+    }
+
+    #[tokio::test]
+    async fn an_undeliverable_transfer_is_abandoned_but_a_newer_one_is_kept() {
+        let queue = ClipboardWriterQueue::new();
+        assert!(queue.enqueue(
+            ClipboardItem::new(
+                1,
+                ClipboardContentKind::TextUtf8,
+                vec![b'a'; 2 * CHUNK_BYTES],
+                false
+            )
+            .unwrap()
+        ));
+        let (_, sequence) = queue.pop_with_sequence().await.unwrap().unwrap();
+        assert_eq!(sequence, 1);
+        let (_, sequence) = queue.pop_with_sequence().await.unwrap().unwrap();
+        assert_eq!(sequence, 1);
+        assert!(queue.abandon(1));
+        assert!(!queue.abandon(1));
+        assert!(queue.enqueue(
+            ClipboardItem::new(2, ClipboardContentKind::TextUtf8, b"b".to_vec(), false).unwrap()
+        ));
+        let (Message::Text(_), 2) = queue.pop_with_sequence().await.unwrap().unwrap() else {
+            panic!("the newer transfer starts with its offer");
+        };
     }
 
     #[test]

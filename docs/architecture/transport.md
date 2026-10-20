@@ -1,7 +1,12 @@
 # Transport: Direct QUIC
 
-> **STATUS (2026-07-31):** Shipped Linux and Windows Pier plus macOS Deck use
-> direct QUIC exclusively, normally on UDP 18444. WSS network code is dormant
+> **STATUS (2026-10-17):** Shipped Linux and Windows Pier plus macOS Deck use
+> direct QUIC exclusively, normally on UDP 18444. On the `wlp/workers`
+> integration branch every product (Linux, Windows and macOS Piers, the
+> macOS Deck) runs every session on isolated QUIC lanes (protocol v5, see
+> "QUIC lanes" below); a released single-stream peer is refused with the
+> shared "update the Deck and the Pier to the same release" message. WSS
+> network code is dormant
 > source behind the default-off `wss-compat` feature and is excluded from
 > product builds. `arcen-transport` remains dependency-light by default;
 > product crates opt into its Quinn feature. Arcen Span remains dormant.
@@ -28,6 +33,11 @@ separate session, grant-rotation, and resource-lifecycle contract is documented
 in [`session-auto-reconnect.md`](session-auto-reconnect.md).
 
 ## Direct product QUIC profile
+
+The single-stream profile below is what released (pre-v5) products serve.
+Every product on this branch has replaced it with the lane layout in "QUIC
+lanes"; everything about TLS, ALPN, certificates and the compatibility MTU
+still applies to them.
 
 - Pier and Deck negotiate TLS 1.3 with ALPN `arcen-quic-v1` over Quinn.
 - Both Piers use the shared reloadable certificate resolver. Deck reuses
@@ -194,6 +204,210 @@ by any of the above. Selecting Carrier A or Carrier B as the production
 default — and any product wiring of this foundation into Deck/Pier — is a
 separate, later, reviewed decision per the session plan, made only after
 recording comparative measurements against the frozen baseline.
+
+## QUIC lanes (lane protocol v1, session protocol v5)
+
+[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md) records the layout
+that replaces the single direct stream: one connection, one stream per role,
+each declared by a fixed 36-byte preface. Every product uses it
+(`wire::PROTOCOL_VERSION` 5). There is no legacy single-stream multiplexing:
+a lane Deck that reaches a single-stream Pier, and a single-stream Deck that
+reaches a lane Pier, both end with the shared mismatch message.
+
+- `arcen_protocol::lanes` owns the role table (`control`, `video`,
+  `audio_output`, `input_cursor`, `microphone`, `bulk_aux`), each role's
+  stream shape, opener and payload direction, the frame-type-to-lane map, the
+  preface codec, the `lane_attachment` grant DTO, and version-mismatch
+  classification.
+- `arcen_transport::lanes` (default features; no Quinn or Tokio) owns the
+  per-attachment `LaneRegistry`: refusal of pre-authorization, wrong-shape,
+  wrong-direction, ungranted, stale-attachment, forged-binding, duplicate and
+  stale-generation streams before any payload reaches a worker; supersession
+  by a newer peer-opened generation, carrying the role's release/reset steps; Deck-side holding of at most one early
+  Pier lane per role until authorization re-validates it; lane-scoped
+  failure and recovery; send priorities; frame bounds; and the target
+  concurrent-stream limits (Pier grants 4 bidi / 2 uni, Deck grants 0 / 3).
+- Media lanes reuse the audio priority stream's `u32` length-prefixed framing
+  and its priority of 10 for audio. Video stays one ordered lane with the
+  existing fair monitor mux (ADR 0013).
+- Lane and pre-lane builds do not interoperate; both sides report the mismatch
+  explicitly. `wire::PROTOCOL_VERSION` is 5 since the products switched.
+- `arcen_protocol::lanes::LaneStreamCode` names the stream-scoped
+  `RESET_STREAM`/`STOP_SENDING` codes (`refused`, `preface_timeout`,
+  `lane_failed`, `superseded`, `attachment_ended`, `disabled`), distinct from
+  the connection-level version-mismatch close code.
+
+### Lane runtime (`arcen_transport::quic`, `quic` feature)
+
+- `LaneConnection::start` takes over one connection's stream acceptance. Its
+  dispatcher task is the only caller of `accept_bi`/`accept_uni`; each
+  stream's preface is read concurrently (at most
+  `MAX_CONCURRENT_PREFACE_READS`) under a timeout, never past its 36 bytes,
+  so a silent or oversized stream cannot stall other lanes. The registry then
+  admits, holds (Deck, before authorization) or refuses it; a refused stream
+  is reset and stopped with `refused` or `preface_timeout` before any payload
+  is read, and a legacy `arcen-direct-v1` or other-version preface closes the
+  connection with the lane version-mismatch code. Admitted lanes are handed to
+  their role's owner (`next_peer_lane`); a supersession cancels the old
+  lane (`superseded`) and the new `Lane` carries the release-held-input /
+  request-keyframe steps the owner must apply.
+- `LaneConnection::authorize` records the grant (Pier before sending
+  `lane_attachment`, Deck after validating it) and delivers or refuses the
+  Deck's held lanes. `open_lane`/`reopen` open only the local endpoint's
+  roles with the next generation, the contract priority and the preface; a
+  recovery action never opens another role.
+- `Lane::split` gives each lane its own `LaneSender` (bounded per-role queue,
+  `LaneQueueBounds::for_role`, drained by a dedicated writer task) and
+  `LaneReceiver`. A full queue returns the record to the producer
+  (`LaneSendError::Full`) instead of dropping it, so input edges are never
+  lost silently. Media lanes use the existing `u32` length prefix. Control,
+  input/cursor and bulk lanes carry pre-encoded session frames through
+  `LaneSender`, each record written verbatim as one complete frame (ADR 0014
+  amendment 1); `Lane::into_duplex` remains for byte-stream use and is not
+  the product path for those lanes. A write that fails mid-frame resets the
+  stream (never finishes it), discards the queue and reports the failure;
+  the replacement uses a newer generation and nothing written is resent.
+- Cancellation: a lane is cancelled when it is superseded, fails, is
+  disabled or its attachment ends; reporting a failure through
+  `LaneConnection::report_failure` cancels that generation too. Its sender,
+  receiver and duplex then reset and stop their streams with the matching
+  `LaneStreamCode` and deliver nothing further; a pending `LaneDuplex` read
+  or write is woken and fails with `ConnectionAborted`, so a superseded
+  input lane cannot deliver a stale key-down. `cancellation_token()` lets an
+  owner `select!` on it. `LaneReceiver::recv_frame` and `read_chunk` are
+  cancel-safe (a partly received frame is kept and resumed);
+  `LaneSender::send` never queues a partial record but drops the record if
+  its future is dropped, so input owners use `try_send`.
+- Isolation measures beyond separate streams: per-role queues; video and bulk
+  write in 64 KiB slices and yield; an interactive lane (input, control) that
+  writes more than 64 KiB in 100 ms temporarily shares the audio priority, so
+  an input flood cannot hold microphone or audio behind strictly prioritised
+  bytes; and `lane_transport_config` (Pier grants 4 bidi / 2 uni, Deck 0 / 3)
+  keeps the 1 MiB stream window small enough that every stalled lane together
+  uses at most half of the 16 MiB connection window. The Pier still runs
+  `keep_send_window_interactive`; lanes share congestion control, so a real
+  network outage still interrupts every lane.
+- The queue sizes (`LaneQueueBounds::for_role`), starvation bounds and the
+  64 KiB / 100 ms interactive burst threshold are provisional pending lab
+  qualification on real networks.
+- `LaneConnection::status` returns a bounded per-role snapshot (state, queue
+  depth and oldest age, writer wait, sent/received counts, failures, resets,
+  supersessions, refusals, starvation episodes, priority demotions and drops
+  by reason). `LANE_REFUSED`, `LANE_FAILED` and `LANE_STARVED` are emitted
+  through a `LaneTelemetrySink` (`ObservabilityLaneSink` routes them to
+  `arcen-observability` without blocking) behind a per-connection rate limit.
+- `tests/quic_lanes.rs` proves, on loopback, that audio, input and control
+  keep bounded latency while the video lane has no stream credit and that a
+  control teardown still completes; that an input flood is pushed back
+  without losing an edge and without delaying microphone or audio; that a
+  bulk flood does not starve control, input or audio; lane failure, partial
+  frames and reopen with new generations, no duplicates and no cross-role
+  fallback; every refusal case; the Deck's pending-authorization hold; and
+  supersession steps. These are loopback measurements, not network or
+  hardware qualification.
+
+### Product adapter (`arcen_transport::quic::session_lanes`)
+
+Each product is a thin adapter over one shared layer:
+
+| Lane | Carries (existing messages, unchanged) | Linux Pier (Windows and macOS: relay, below) | Deck side |
+| --- | --- | --- | --- |
+| control (bidi, Deck opens) | authentication, `lane_attachment`, hellos, quality/display/audio/microphone negotiation and results, output transactions, health, resume grants, close | `SessionLaneSocket` as the session `Sink`/`Stream`; control writer task (control messages, resume refresh) | `SessionLaneSocket` as the session `Sink`/`Stream`; consumes `lane_attachment` |
+| video (uni, Pier opens) | every encoded video frame, fair monitor mux (ADR 0013) | video writer task (`LocalLaneWriter`); waits only for video-lane room; IDR on every monitor after a reopen | video reader → video inbox only; a replaced lane requests presentation recovery |
+| audio_output (uni, Pier opens) | audio-v1 Opus/PCM frames | audio writer task, `try_send` (full queue drops the frame); exhausted lane disables audio visibly (`audio_stream_result` reason `lane_unavailable`) | audio reader → its own queue → dedicated audio-worker thread (owns CoreAudio) |
+| input_cursor (bidi, Deck opens) | key, pointer, scroll, pen, gestures, text, held-state reset; `cursor_shape`; host → Deck `CursorUpdate` images (`0x50`, ADR 0014 amendment 11) | input worker injects in its own task; writes the newest cursor shape or image back (an image inline only when the Deck does not hold it); releases held input on supersession, failure and end | input bypasses the session loop (`SessionCommandSender`), `try_send` with an ordered outbox (edges kept; a trailing position replaced by a newer one of the same kind, trailing relative deltas summed, relative and absolute never merged); cursor messages to the UI |
+| microphone (uni, Deck opens) | microphone-v1 frames | microphone worker with the shared ingress state; consent generation untouched by lane recovery | frames queued with `try_send` when capture runs |
+| bulk_aux (bidi, Deck opens) | `clipboard_data`, clipboard chunks, HID, USB URBs | bulk reader forwards to the dispatcher (clipboard/USB state); clipboard writer and a separate USB writer task use the bulk lane; a disabled or stuck bulk lane stops Hard USB (`tablet_mode_result`) and ends nothing | bulk worker both ways; clipboard sends only when the bulk channel has room; a disabled bulk lane turns clipboard and Hard USB off, refuses further sends quietly and ends nothing |
+
+- Framing: media lanes carry the `u32` length-prefixed binary frame; session
+  lanes carry `SessionRecord`s (`u32` BE length, a kind byte — text, binary,
+  close, ping, pong — and the payload), so the same cancel-safe reader serves
+  both. `lane_for_session_text`/`lane_for_binary_message` map each message to
+  exactly one lane; a message received on another lane is dropped (control,
+  bulk) or fails that lane (input).
+- Setup: `connect_session_lanes` (Deck) and `accept_session_lanes` (Pier)
+  start the runtime, run `keep_send_window_interactive` on **both** endpoints
+  and open or accept the control lane. The Pier sends `lane_attachment`
+  (`grant_attachment`, process-monotonic attachment generation, fresh random
+  binding) before `server_hello`; the Deck authorizes with
+  `accept_attachment`. Each resume is a new connection and a new attachment.
+- Recovery: `follow_lane_exit`, `LocalLaneWriter` and `PeerLaneReader` apply
+  `LaneRecoveryPolicy` and carry the supersession steps; nothing is resent on
+  a replacement lane and no role falls back to another role's lane. An
+  attachment that ends (control failure, video or input exhausted) ends the
+  session into the existing reconnect policy.
+- Liveness (`arcen_transport::liveness`): the lane carrier sends a QUIC
+  keep-alive every 1 s and closes a connection that heard nothing for 10 s
+  (`LANE_KEEPALIVE_INTERVAL`, `LANE_IDLE_TIMEOUT`; QUIC applies the smaller
+  of the two peers' idle timeouts, so every Pier and Deck on this release
+  gets it). A Deck that vanished without closing (killed, crashed,
+  unplugged) therefore frees the session within seconds rather than 30 s.
+  The Linux Pier also registers the attached connection
+  (`quic::IncumbentAttachment`): a newcomer authenticated as the **same
+  user** that finds the session slot held proves the incumbent's peer
+  alive or silent (`prove_peer_liveness`; nothing received for 3 s,
+  `PEER_SILENCE_PROOF`, while the keep-alive runs), closes a silent one
+  with application code `0x41524C02` as a transport loss, and waits up to
+  12 s (`ATTACHMENT_HANDOVER_WAIT`) for its teardown instead of being
+  refused. A live incumbent, or another user's, is never probed or closed;
+  that newcomer is refused with the reason `shared display is busy`. The
+  Windows and macOS Piers admit before authentication, so they get the
+  shorter idle timeout only. Smoke Decks (`media-smoke`, `input-smoke`)
+  close their session explicitly before exiting.
+- Close (ADR 0014 amendment 7): closing a QUIC connection abandons stream
+  data the peer has not acknowledged, so a session never closes the
+  connection right after its last words. Closing the `SessionLaneSocket`
+  sink sends a close record (unless one was sent) and finishes the control
+  lane, as a WebSocket close did; dropping the socket closes in the
+  background, bounded by `SESSION_CONTROL_LINGER` (2 s): finish the control
+  lane, wait until QUIC confirms the peer received all of it
+  (`LaneSender::delivered`, `SendStream::stopped`), wait until the peer
+  finished its own control lane or closed, then end the attachment and close
+  with `SESSION_CLOSED_CLOSE_CODE` (`0x41524C03`, "session closed"). Both
+  sides may do this at once without waiting on each other. A reader whose
+  connection closed still hands out what QUIC received before the close,
+  and the socket's stream ends cleanly (`None`) after an orderly peer close
+  (`closed_in_order`), so a refusal (`auth_result`, a close reason) reaches
+  the Deck and a Deck's close record reaches the Pier as `client_closed`,
+  not as a transport loss. `LaneConnection::end` leaves an open control lane
+  to its socket, so a Pier that ends the attachment before dropping the
+  socket still delivers its close reason. A pre-lane Deck reaching a lane
+  Pier gets one WebSocket close frame on its own stream (status 1008, reason
+  "this Pier speaks lane protocol v1; update the Deck …"), which it prints
+  as "host closed the connection during setup", before the
+  version-mismatch close; `accept_session_lanes` returns
+  `SessionLaneSetupError::Mismatch` and every Pier logs it at warn.
+- Ordering: lanes have no order between them. Region input messages carry
+  their topology generation and the shared region state refuses a stale one;
+  legacy absolute pointer messages carry no generation and are applied to the
+  current geometry.
+- Relay Piers: the Windows broker and the macOS service (and macOS
+  `serve`, in process) keep their session in an agent behind one local
+  message socket. `arcen_transport::quic::PierLaneRelay` is their network
+  half: the caller sends control-lane messages as before; video, audio,
+  cursor and bulk messages go to their lanes without waiting (a full video
+  backlog drops, holds each broken monitor chain until its keyframe and
+  sends the agent `request_full_frame`; a full audio backlog drops); Deck
+  input (never dropped), microphone and bulk records come back to the agent
+  in order, and a replaced or lost input lane is followed at once, on the
+  same ordered channel, by `key_reset_modifiers` with reason
+  `input_lane_recovery` (release everything held). A dropped clipboard
+  transfer is abandoned and the Deck told (`clipboard_transfer_failed`);
+  the Linux Pier's own bulk writer does the same when the bulk lane cannot
+  take a clipboard record in time.
+  The Windows broker grants at the start of each
+  attachment; the macOS relay after the agent's successful `auth_result`
+  or before its `server_hello`.
+- Tests: `tests/quic_session_lanes.rs` and `tests/quic_lane_relay.rs`
+  (shared), `net::server::lane_workers` tests on the Linux Pier,
+  `relay::tests` and `tests/end_to_end.rs` on the macOS Pier,
+  `session::lane_relay_tests` on the Windows Pier and `transport::lanes`
+  tests on the Deck prove on loopback that audio, input and cursor traffic
+  keep flowing with the video lane blocked or the video consumer stalled,
+  that a video lane failure or a relay video drop requests a keyframe and
+  leaves the audio lane generation intact, that a replaced input lane
+  releases held input, and that a pre-lane peer gets the clear mismatch.
+  Not yet qualified on real networks or hardware.
 
 ## Carrier A/B benchmark diagnostic (measurement tool, not a selection)
 
@@ -710,7 +924,9 @@ The following must not be inferred from the direct carrier or advanced-adapter
 tests:
 
 - **No multi-stream/datagram product optimization.** Direct sessions currently
-  use one reliable bidirectional stream and retain WebSocket framing. The
+  use one reliable bidirectional stream and retain WebSocket framing. The lane
+  contract and shared lane runtime above are implemented and tested on
+  loopback but no product uses them yet. The
   advanced adapter's independent streams and datagrams are not product
   traffic, and the direct-monitor stream foundation above is an unselected,
   unwired building block, not a shipped Carrier B.

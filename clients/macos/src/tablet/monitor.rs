@@ -16,6 +16,11 @@
 //!   or grow unbounded memory. Every decoded sample goes through
 //!   [`super::sample::BoundedSampleQueue`], which drops the oldest sample
 //!   and counts the drop instead of blocking or growing without limit.
+//! - **Forward on arrival**: the callback first offers each event to the
+//!   caller's sink, which sends a pen sample to the host at once. The bounded
+//!   queue only holds what the sink could not take (it was busy, or an
+//!   earlier event is still queued, so order is kept); the next UI pass
+//!   drains it.
 //! - **No coordinate/sample logging**: only lifecycle events (installed,
 //!   removed, queue-full drop *counts*) are logged; raw coordinates,
 //!   pressure, tilt, rotation, or button values are never passed to
@@ -32,12 +37,14 @@ use std::sync::{Arc, Mutex};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
+use std::time::Duration;
+
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventSubtype, NSEventType};
-use objc2_foundation::MainThreadMarker;
+use objc2_foundation::{MainThreadMarker, NSProcessInfo};
 
 use super::sample::{
-    BoundedSampleQueue, NativeTabletPoint, NativeTabletProximity, NativeTabletTool,
-    RawTabletSample, TabletButtonMask,
+    BoundedSampleQueue, DispatchAgeStats, DispatchAgeSummary, NativeTabletPoint,
+    NativeTabletProximity, NativeTabletTool, RawTabletSample, TabletButtonMask, TabletMonitorEvent,
 };
 
 /// Bounded queue depth. Tablet point events can arrive well over 100 Hz;
@@ -46,7 +53,8 @@ use super::sample::{
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
 struct Shared {
-    queue: Mutex<BoundedSampleQueue<RawTabletSample>>,
+    queue: Mutex<BoundedSampleQueue<TabletMonitorEvent>>,
+    dispatch_ages: Mutex<DispatchAgeStats>,
 }
 
 /// A `Send + Sync` handle to the bounded sample queue, obtainable from the
@@ -59,9 +67,9 @@ pub struct TabletSampleHandle {
 }
 
 impl TabletSampleHandle {
-    /// Drain every currently queued sample, oldest first. Never blocks the
+    /// Drain every currently queued event, oldest first. Never blocks the
     /// AppKit callback for longer than the lock hold time of a `Vec` drain.
-    pub fn drain(&self) -> Vec<RawTabletSample> {
+    pub fn drain(&self) -> Vec<TabletMonitorEvent> {
         self.shared
             .queue
             .lock()
@@ -77,6 +85,17 @@ impl TabletSampleHandle {
             .queue
             .lock()
             .map(|queue| queue.dropped_count())
+            .unwrap_or_default()
+    }
+
+    /// How long monitored input events waited before AppKit dispatched
+    /// them, since the last call.
+    #[must_use]
+    pub fn take_dispatch_ages(&self) -> DispatchAgeSummary {
+        self.shared
+            .dispatch_ages
+            .lock()
+            .map(|mut stats| stats.take())
             .unwrap_or_default()
     }
 }
@@ -100,22 +119,29 @@ impl TabletEventMonitor {
     /// Returns `None` if AppKit refuses to install the monitor (rare; e.g.
     /// no run loop yet). Returns the monitor guard plus a cloneable
     /// [`TabletSampleHandle`] for draining decoded samples.
+    ///
+    /// `sink` is offered every event as it is dispatched and returns whether
+    /// it took it. `wake` runs after an event had to be queued instead, so
+    /// the UI drains it promptly.
     #[must_use]
     pub fn start(
         mtm: MainThreadMarker,
+        sink: impl Fn(TabletMonitorEvent) -> bool + 'static,
         wake: impl Fn() + 'static,
     ) -> Option<(Self, TabletSampleHandle)> {
-        Self::start_with_capacity(mtm, DEFAULT_QUEUE_CAPACITY, wake)
+        Self::start_with_capacity(mtm, DEFAULT_QUEUE_CAPACITY, sink, wake)
     }
 
     #[must_use]
     pub fn start_with_capacity(
         mtm: MainThreadMarker,
         capacity: usize,
+        sink: impl Fn(TabletMonitorEvent) -> bool + 'static,
         wake: impl Fn() + 'static,
     ) -> Option<(Self, TabletSampleHandle)> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(BoundedSampleQueue::new(capacity)),
+            dispatch_ages: Mutex::new(DispatchAgeStats::default()),
         });
         let callback_shared = Arc::clone(&shared);
 
@@ -141,21 +167,51 @@ impl TabletEventMonitor {
             // into AppKit's dispatch machinery — it is caught, logged, and
             // the sample is dropped instead, so a single bad event degrades
             // capture rather than aborting or corrupting the process.
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_event(event_ref)));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let dispatch_age = dispatch_age(event_ref);
+                callback_shared
+                    .dispatch_ages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(dispatch_age);
+                if is_keyboard_or_scroll(event_ref) {
+                    return Some(TabletMonitorEvent::InputEdge);
+                }
+                match decode_event(event_ref) {
+                    Some(sample) => Some(TabletMonitorEvent::Sample {
+                        sample,
+                        dispatch_age,
+                    }),
+                    None if is_mouse_button(event_ref) => Some(TabletMonitorEvent::InputEdge),
+                    None => None,
+                }
+            }));
             match outcome {
-                Ok(Some(sample)) => {
+                Ok(Some(monitor_event)) => {
                     // A poisoned mutex (panic while a sample was queued) still
                     // has valid queue contents; recovering here keeps capture
                     // alive instead of permanently losing tablet input over one
                     // panicking consumer.
-                    let mut queue = callback_shared
+                    let queued_before = !callback_shared
                         .queue
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    queue.push(sample);
-                    drop(queue);
-                    wake();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty();
+                    // Anything already queued must reach the sink first, so a
+                    // later event is queued behind it rather than overtaking.
+                    let taken = !queued_before
+                        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            sink(monitor_event)
+                        }))
+                        .unwrap_or(false);
+                    if !taken {
+                        callback_shared
+                            .queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(monitor_event);
+                        wake();
+                    }
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -191,9 +247,18 @@ impl TabletEventMonitor {
             | NSEventMask::OtherMouseDown
             | NSEventMask::OtherMouseUp
             | NSEventMask::OtherMouseDragged;
+        // Keys, modifiers and scrolling are observed (never filtered) only to
+        // mark ordering edges; see `TabletMonitorEvent::InputEdge`.
+        let ordering_mask = NSEventMask::KeyDown
+            | NSEventMask::KeyUp
+            | NSEventMask::FlagsChanged
+            | NSEventMask::ScrollWheel;
         let monitor = unsafe {
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(
-                NSEventMask::TabletPoint | NSEventMask::TabletProximity | tablet_mouse_mask,
+                NSEventMask::TabletPoint
+                    | NSEventMask::TabletProximity
+                    | tablet_mouse_mask
+                    | ordering_mask,
                 &handler,
             )
         };
@@ -222,6 +287,98 @@ impl Drop for TabletEventMonitor {
             target: crate::logging::target::INPUT,
             "AppKit tablet event monitor removed",
         );
+    }
+}
+
+/// How long `event` waited between its own timestamp and now. Both clocks
+/// are seconds of system uptime; a clock oddity reads as zero rather than as
+/// a bogus age.
+fn dispatch_age(event: &NSEvent) -> Duration {
+    let now = NSProcessInfo::processInfo().systemUptime();
+    let age = now - event.timestamp();
+    if age.is_finite() && age > 0.0 {
+        Duration::try_from_secs_f64(age.min(60.0)).unwrap_or_default()
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Keys, modifiers and scrolling reach the host through the UI pass, so they
+/// order later pen samples. They are never decoded as tablet events.
+fn is_keyboard_or_scroll(event: &NSEvent) -> bool {
+    matches!(
+        event.r#type(),
+        NSEventType::KeyDown
+            | NSEventType::KeyUp
+            | NSEventType::FlagsChanged
+            | NSEventType::ScrollWheel
+    )
+}
+
+/// Non-tablet mouse buttons also reach the host through the UI pass
+/// (`decode_event` has already claimed the tablet ones).
+fn is_mouse_button(event: &NSEvent) -> bool {
+    matches!(
+        event.r#type(),
+        NSEventType::LeftMouseDown
+            | NSEventType::LeftMouseUp
+            | NSEventType::RightMouseDown
+            | NSEventType::RightMouseUp
+            | NSEventType::OtherMouseDown
+            | NSEventType::OtherMouseUp
+    )
+}
+
+/// Turns AppKit mouse-event coalescing off while a session window is active
+/// and puts the previous setting back afterwards.
+///
+/// Coalescing (on by default) merges queued mouse-moved, mouse-dragged and
+/// tablet events into the newest one whenever the main thread is busy, which
+/// throws away pen pressure samples and stroke shape. It is a per-app
+/// setting, so the guard owns it for the app's lifetime and restores it on
+/// deactivate and on drop.
+pub struct MouseCoalescingGuard {
+    saved: Option<bool>,
+    _mtm: MainThreadMarker,
+}
+
+impl MouseCoalescingGuard {
+    #[must_use]
+    pub const fn new(mtm: MainThreadMarker) -> Self {
+        Self {
+            saved: None,
+            _mtm: mtm,
+        }
+    }
+
+    /// Whether coalescing is currently held off by this guard.
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// Disables coalescing while `active`, restores it otherwise. Returns
+    /// whether the setting changed.
+    pub fn set_session_active(&mut self, active: bool) -> bool {
+        match (active, self.saved) {
+            (true, None) => {
+                self.saved = Some(NSEvent::isMouseCoalescingEnabled());
+                NSEvent::setMouseCoalescingEnabled(false);
+                true
+            }
+            (false, Some(previous)) => {
+                NSEvent::setMouseCoalescingEnabled(previous);
+                self.saved = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Drop for MouseCoalescingGuard {
+    fn drop(&mut self) {
+        self.set_session_active(false);
     }
 }
 

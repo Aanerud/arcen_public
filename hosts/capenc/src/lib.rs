@@ -28,7 +28,10 @@ pub mod admission_probe;
 /// (`0000:00:10.0`). The Linux Pier sets it for a dedicated session to the GPU
 /// its X server drives; capenc then opens CUDA on that device instead of
 /// ordinal 0.
-pub const CAPTURE_GPU_PCI_ENV: &str = "ARCEN_CAPTURE_GPU_PCI";
+pub const CAPTURE_GPU_PCI_ENV: &str = arcen_media::video::capture_handoff::ENCODER_GPU_PCI_ENV;
+
+/// The operator's CUDA ordinal for capture when no PCI address is named.
+pub const CUDA_DEVICE_ENV: &str = "ARCEN_CUDA_DEVICE";
 
 // Vendored NVENC bindings (bindgen output, patched to fixed-width LONG/GUID
 // so the layout is correct on both windows-x64 and linux-x64).
@@ -80,10 +83,14 @@ mod linux_policy;
 // NvFBC has no ten-bit buffer format (see `linux::nvfbc`'s own constants) --
 // so the ten-bit NVENC path needs this module too, not just the software
 // encoder it was originally written for.
+#[cfg(all(feature = "nvenc", target_os = "linux"))]
+mod conversion_pool;
 #[cfg(all(any(feature = "software-h264", feature = "nvenc"), target_os = "linux"))]
 mod linux_x11;
 #[cfg(all(feature = "nvenc", target_os = "linux"))]
 mod nvenc_cuda;
+// Wayland provider capture (`wayland` feature). The portable lease, layout,
+// hand-off and evidence modules also build under `test` on every target.
 #[cfg(any(
     test,
     all(windows, any(feature = "mf", feature = "software-h264")),
@@ -95,6 +102,13 @@ mod nvenc_cuda;
 // per-platform builds legitimately leave part of it unused.
 #[allow(dead_code)]
 mod region_schedule;
+#[cfg(any(test, all(feature = "wayland", target_os = "linux")))]
+mod wayland;
+
+/// Creates or resizes a remote-monitor session's virtual output (see
+/// `wayland::materialise`); used by the Linux Pier's session agent.
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+pub use wayland::materialise::{materialise_virtual_output, MaterialisedOutput};
 
 #[cfg(any(
     test,
@@ -393,6 +407,12 @@ fn format_log_line(msg: &str, session_log_id: Option<&CorrelationId>) -> String 
     )
 }
 
+/// The attempt-scoped correlation id the parent passed, when any.
+#[cfg_attr(not(all(feature = "wayland", target_os = "linux")), allow(dead_code))]
+pub(crate) fn session_log_id() -> Option<&'static CorrelationId> {
+    SESSION_LOG_ID.get().and_then(Option::as_ref)
+}
+
 pub fn log(msg: &str) {
     let session_log_id = SESSION_LOG_ID.get().and_then(Option::as_ref);
     let _ = writeln!(
@@ -508,6 +528,20 @@ impl ColorSpec {
             matrix: variant.video.matrix,
             primaries: variant.video.primaries,
             transfer: variant.video.transfer,
+        }
+    }
+
+    /// The complete coded format this colour spec describes for `codec`.
+    #[must_use]
+    pub const fn video(self, codec: arcen_media::VideoCodec) -> arcen_media::VideoConfiguration {
+        arcen_media::VideoConfiguration {
+            codec,
+            chroma: self.chroma,
+            bit_depth: self.bit_depth,
+            range: self.range,
+            matrix: self.matrix,
+            primaries: self.primaries,
+            transfer: self.transfer,
         }
     }
 
@@ -756,6 +790,37 @@ pub(crate) fn resolved_media_plan(
     fps: u32,
     cursor_mode: CursorCaptureMode,
 ) -> Result<ResolvedMediaPlan, String> {
+    resolved_media_plan_for_source(
+        backend,
+        codec,
+        color,
+        width,
+        height,
+        fps,
+        cursor_mode,
+        arcen_media::video::CursorEvidence::Unknown,
+    )
+}
+
+/// [`resolved_media_plan`] for a capture source whose cursor evidence is
+/// `source_cursor`: a producer that drew the cursor into its frames lets any
+/// backend state `cursor=host` (`BackendLimits::with_source_cursor`).
+#[cfg(any(
+    test,
+    windows,
+    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolved_media_plan_for_source(
+    backend: EncoderBackend,
+    codec: &str,
+    color: ColorSpec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    cursor_mode: CursorCaptureMode,
+    source_cursor: arcen_media::video::CursorEvidence,
+) -> Result<ResolvedMediaPlan, String> {
     // Table lookup rather than a match: a new codec is added to the shared
     // vocabulary and is understood here without an edit.
     let codec = VideoCodec::from_token(&codec.to_ascii_lowercase()).ok_or_else(|| {
@@ -786,7 +851,7 @@ pub(crate) fn resolved_media_plan(
             ));
         }
     };
-    let contract = backend.contract();
+    let contract = backend.contract().with_source_cursor(source_cursor);
     let request = MediaRequest {
         encoder,
         video: VideoConfiguration {
@@ -873,6 +938,15 @@ pub(crate) fn announce_ready_from_with_conversion(
             session_log_id
         )
     )
+}
+
+/// States a capture admission (`[capenc] ADMISSION …`) before READY.
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+pub(crate) fn announce_admission(
+    notice: &arcen_media::video::CaptureAdmissionNotice,
+) -> std::io::Result<()> {
+    let session_log_id = session_log_id().map(CorrelationId::as_str);
+    writeln!(std::io::stderr(), "{}", notice.format(session_log_id))
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -999,6 +1073,30 @@ pub fn run_with_args(args: Vec<String>) {
                 std::process::exit(2);
             }
         };
+        if args
+            .iter()
+            .any(|argument| argument == "wayland-ramp-client")
+        {
+            #[cfg(feature = "wayland")]
+            std::process::exit(wayland::ramp_client::run(&args));
+            #[cfg(not(feature = "wayland"))]
+            {
+                log("ERROR: wayland-ramp-client requires this build to have --features wayland");
+                std::process::exit(2);
+            }
+        }
+        if args
+            .iter()
+            .any(|argument| argument == "wayland-capture-probe")
+        {
+            #[cfg(feature = "wayland")]
+            std::process::exit(wayland::probe::run(&args));
+            #[cfg(not(feature = "wayland"))]
+            {
+                log("ERROR: wayland-capture-probe requires this build to have --features wayland");
+                std::process::exit(2);
+            }
+        }
         if args.iter().any(|argument| argument == "probe-matrix") {
             #[cfg(feature = "nvenc")]
             std::process::exit(linux::probe_matrix_with_args(&args));
@@ -1015,6 +1113,25 @@ pub fn run_with_args(args: Vec<String>) {
                 std::process::exit(2);
             }
         };
+        // A Wayland session hands capenc its capture stream through the
+        // shared hand-off; Xorg sessions never set it. Dispatch once, here.
+        if std::env::var_os(arcen_media::video::capture_handoff::CAPTURE_PROVIDER_ENV).is_some() {
+            #[cfg(feature = "wayland")]
+            std::process::exit(wayland::pipelines::run(&args));
+            #[cfg(not(feature = "wayland"))]
+            {
+                log("ERROR: this session hands capenc a Wayland capture stream, but this build has no Wayland capture");
+                let _ = announce_unavailable(
+                    if requested == linux_policy::RequestedEncoder::SoftwareH264 {
+                        EncoderBackend::OpenH264
+                    } else {
+                        EncoderBackend::NativeNvenc
+                    },
+                    BackendUnavailableReason::NotBuilt,
+                );
+                std::process::exit(2);
+            }
+        }
         let startup_path = linux_policy::startup_path(
             requested,
             args.iter().any(|argument| argument == "probe-v1"),
@@ -1337,6 +1454,38 @@ mod tests {
             "max-bitrate=250000000",
             "max-bitrate=1"
         ]))
+        .is_err());
+    }
+
+    #[test]
+    fn a_source_drawn_cursor_lets_openh264_state_cursor_host() {
+        use arcen_media::video::CursorEvidence;
+        let resolve = |cursor| {
+            resolved_media_plan_for_source(
+                EncoderBackend::OpenH264,
+                "h264",
+                ColorSpec::legacy(false),
+                1920,
+                1080,
+                30,
+                CursorCaptureMode::Host,
+                cursor,
+            )
+        };
+        let plan = resolve(CursorEvidence::Composited).expect("compositor cursor");
+        assert_eq!(plan.cursor_mode, CursorMode::Host);
+        assert!(plan.cursor_in_video);
+        // Xorg MIT-SHM has no cursor in its pixels: unchanged refusal.
+        assert!(resolve(CursorEvidence::Unknown).is_err());
+        assert!(resolved_media_plan(
+            EncoderBackend::OpenH264,
+            "h264",
+            ColorSpec::legacy(false),
+            1920,
+            1080,
+            30,
+            CursorCaptureMode::Host,
+        )
         .is_err());
     }
 

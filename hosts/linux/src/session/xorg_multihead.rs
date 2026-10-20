@@ -488,6 +488,7 @@ mod tests {
     #[test]
     fn rejects_an_empty_plan() {
         let plan = LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(1).expect("generation"),
             virtual_width: 0,
             virtual_height: 0,

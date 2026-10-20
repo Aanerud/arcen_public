@@ -430,14 +430,22 @@ fn candidate_from_specs(
                 monitor_id: monitor.session_monitor_id.get(),
             });
         }
-        let display = spec
-            .config
-            .display
-            .as_deref()
-            .filter(|display| !display.trim().is_empty())
-            .ok_or(LinuxEncoderAdmissionError::MissingDisplayBinding {
-                monitor_id: monitor.session_monitor_id.get(),
-            })?;
+        // The capture an encoder is bound to: a virtual output's own stream,
+        // or an NvFBC output of the session's X display.
+        let capture = match spec.virtual_output.as_deref() {
+            Some(connector) => format!("linux-wayland:output={connector}"),
+            None => {
+                let display = spec
+                    .config
+                    .display
+                    .as_deref()
+                    .filter(|display| !display.trim().is_empty())
+                    .ok_or(LinuxEncoderAdmissionError::MissingDisplayBinding {
+                        monitor_id: monitor.session_monitor_id.get(),
+                    })?;
+                format!("linux-xorg:display={display}")
+            }
+        };
         let backend = match spec.config.encoder {
             EncoderSelection::NativeNvenc => EncoderBackend::NativeNvenc,
             EncoderSelection::SoftwareH264 => EncoderBackend::OpenH264,
@@ -485,7 +493,7 @@ fn candidate_from_specs(
         bindings.push(RegionEncoderBinding {
             session_monitor_id: monitor.session_monitor_id,
             binding_id: EncoderBindingId::new(format!(
-                "linux-xorg:display={display}:head={}:output={}:backend={}",
+                "{capture}:head={}:output={}:backend={}",
                 spec.head,
                 spec.output_index,
                 backend.ready_token()
@@ -534,6 +542,9 @@ mod tests {
         height: u32,
     ) -> LinuxMonitorPlan {
         LinuxMonitorPlan {
+            refresh_hz: 60,
+            width_mm: 0,
+            height_mm: 0,
             session_monitor_id: sid(id),
             client_display_id: format!("display-{id}"),
             head: head.to_owned(),
@@ -561,6 +572,7 @@ mod tests {
     /// it), with neither monitor demanding full color.
     fn oversize_primary_topology() -> LinuxTopologyPlan {
         LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(1).expect("generation"),
             virtual_width: 4_808,
             virtual_height: 1_962,
@@ -587,6 +599,7 @@ mod tests {
 
     fn topology() -> LinuxTopologyPlan {
         LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(7).expect("generation"),
             virtual_width: 3_840,
             virtual_height: 1_080,
@@ -609,6 +622,7 @@ mod tests {
 
     fn template() -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
+            capture_bindings: Vec::new(),
             binary: PathBuf::from("/nonexistent/arcen-capenc"),
             codec: "h265".to_owned(),
             encoder: EncoderSelection::NativeNvenc,

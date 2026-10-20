@@ -1333,7 +1333,7 @@ async fn run_correlated_broker(
             )
             .await
         } else {
-            let priority_audio = ws.priority_audio();
+            let lanes = ws.lanes();
             let path_signal_connection = ws.path_signal_connection();
             relay_client_and_agent(
                 &mut ws,
@@ -1342,7 +1342,7 @@ async fn run_correlated_broker(
                 native_user_sid,
                 &mut agent_controls,
                 &mut session_shutdown,
-                priority_audio,
+                lanes,
                 path_signal_connection,
             )
             .await
@@ -1716,6 +1716,13 @@ where
             return Err(error);
         }
     };
+    // Held for the agent's whole session; dropping it at agent exit restores
+    // the user's text smoothing.
+    #[cfg(windows)]
+    let _font_smoothing = crate::font_smoothing::FontSmoothingLease::acquire(
+        config.font_smoothing,
+        crate::font_smoothing::WindowsSmoothing,
+    );
     let resolved_output = match crate::display::resolve_output_selector(&config.output_selector) {
         Ok(output) => output,
         Err(initial_error) => {
@@ -2524,6 +2531,17 @@ where
         deskside_hooks = Some(hooks);
         deskside_protection = Some(protection);
     }
+    // A console display Windows powered off for idle makes DWM compose a few
+    // frames a second until something wakes it; capenc's keep-awake only holds
+    // it on afterwards. Wake it before the display lease, after any deskside
+    // hooks are armed so they see marked remote input.
+    let wake_events = crate::input::wake_console_display();
+    tracing::info!(
+        target: SESSION,
+        sid = %session_log_id,
+        accepted = wake_events,
+        "console display wake requested before capture"
+    );
     let output_selector = cfg.output_selector.clone();
     let display_session_log_id = session_log_id.clone();
     let display_recovery = deskside_recovery.clone();
@@ -4555,6 +4573,12 @@ fn build_server_hello_with_aggregate(
             pen_rotation: pen_capability,
             pen_eraser: pen_capability,
             pen_proximity: pen_capability,
+            pen_barrel_buttons: pen_capability,
+            // `text_commit` is typed (`KEYEVENTF_UNICODE`) but not yet
+            // advertised: the Windows owner enables it once it is validated
+            // and reported on this host.
+            text_commit: InputCapabilityAvailability::Unknown,
+            text_commit_unicode: InputCapabilityAvailability::Unknown,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_capability,
@@ -6099,6 +6123,7 @@ where
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let (mut last_frames, mut last_bytes) = video_stats.snapshot();
             let mut last_monitor_stats = video_stats.monitor_snapshot();
+            let mut last_detail_framerate = None;
             loop {
                 ticker.tick().await;
                 if path_signal_connection
@@ -6155,12 +6180,9 @@ where
                 if rate_control_enabled {
                     let change = controller.observe(sample);
                     let want_bps = controller.target_bps();
-                    let want_fps = (motion_priority == arcen_media::video::MotionPriority::Detail)
-                        .then(|| {
-                            arcen_media::rate_control::detail_framerate(
-                                plan.fps, start_bps, want_bps,
-                            )
-                        });
+                    let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
+                        .then(|| controller.detail_framerate(plan.fps));
+                    let want_fps = detail.map(|detail| detail.fps);
                     // Every tick, not only on a change: a pipeline whose
                     // mailbox was full catches up with the latest target.
                     let outcome = pipeline_sync.sync(
@@ -6178,13 +6200,35 @@ where
                             pipelines = bitrate_video,
                             pipelines_pending = outcome.pending,
                             fps = want_fps,
+                            fps_reason = detail.map(|detail| detail.reason.token()),
+                            bitrate_bound = controller.bitrate_bound(),
                             rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
                             queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
-                            loss_rate_permille = sample
-                                .path
-                                .map(|path| (path.loss_rate() * 1000.0).round() as u64),
+                            loss_rate_permille = controller
+                                .last_loss_evidence()
+                                .map(|loss| (loss.rate * 1000.0).round() as u64),
+                            loss_sample_packets =
+                                controller.last_loss_evidence().map(|loss| loss.sent_packets),
                             "encoder bitrate follows QUIC path"
                         );
+                    }
+                    // The frame rate can change without a bitrate change (the
+                    // stream starts or stops spending its target), and a rate
+                    // below the contract is never silent.
+                    if detail != last_detail_framerate {
+                        if let Some(detail) = detail {
+                            tracing::info!(
+                                target: CAPENC,
+                                fps = detail.fps,
+                                contract_fps = plan.fps,
+                                fps_reason = detail.reason.token(),
+                                target_bps = want_bps,
+                                start_bps,
+                                bitrate_bound = controller.bitrate_bound(),
+                                "encoder frame rate follows bitrate"
+                            );
+                        }
+                        last_detail_framerate = detail;
                     }
                 }
             }
@@ -7347,13 +7391,7 @@ where
         result = Err(AttachmentError::FatalCleanup(error));
     }
     log_state(peer, ServerState::Draining);
-    if let Some(region_input) = region_input.as_mut() {
-        let _ = region_input.release_all();
-    }
-    injector.close();
-    if let Some(pen) = pen.as_mut() {
-        pen.release();
-    }
+    release_all_held_input(&mut injector, &mut pen, &mut region_input);
     video_pipelines.close_frames();
     // A detached attachment must stop its writer immediately so the broker
     // can reunite the agent IPC and accept a resume. Closing only the capture
@@ -8512,6 +8550,28 @@ struct InboundAction {
     input_type: Option<&'static str>,
 }
 
+/// Whether a `key_reset_modifiers` asks for every held key, button and pen
+/// state to be released (the broker's lane relay), not only keys (a Deck's
+/// own stuck-modifier guard).
+fn releases_all_held_input(message: &KeyResetModifiersMsg) -> bool {
+    message.reason == arcen_protocol::messages::RELEASE_ALL_HELD_INPUT_REASON
+}
+
+/// Releases every held key, button, pen and region focus state.
+fn release_all_held_input(
+    injector: &mut Injector,
+    pen: &mut Option<PenInjector>,
+    region_input: &mut Option<RegionInputAdapter>,
+) {
+    if let Some(region_input) = region_input.as_mut() {
+        let _ = region_input.release_all();
+    }
+    injector.close();
+    if let Some(pen) = pen.as_mut() {
+        pen.release();
+    }
+}
+
 async fn handle_inbound(
     text: &str,
     injector: &mut Injector,
@@ -8724,8 +8784,14 @@ async fn handle_inbound(
             }
         }
         KEY_RESET_MODIFIERS => {
-            if serde_json::from_str::<KeyResetModifiersMsg>(text).is_ok() {
-                injector.reset_modifiers();
+            if let Ok(message) = serde_json::from_str::<KeyResetModifiersMsg>(text) {
+                if releases_all_held_input(&message) {
+                    // The broker's input lane was replaced or lost (ADR
+                    // 0014): nothing the Deck held may stay down.
+                    release_all_held_input(injector, pen, region_input);
+                } else {
+                    injector.reset_modifiers();
+                }
                 action.input_type = Some(KEY_RESET_MODIFIERS);
             }
         }
@@ -9191,7 +9257,7 @@ async fn relay_client_and_agent<C, CE, A>(
     native_user_sid: String,
     controls: &mut watch::Receiver<AgentControl>,
     session_shutdown: &mut watch::Receiver<bool>,
-    priority_audio: Option<arcen_transport::quic::PriorityAudio>,
+    lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
 ) -> Result<(), String>
 where
@@ -9208,7 +9274,7 @@ where
         controls,
         None,
         session_shutdown,
-        priority_audio,
+        lanes,
         path_signal_connection,
     )
     .await
@@ -9221,30 +9287,32 @@ where
         }
     }
 }
-/// Sends one audio frame on the Deck's priority stream, logging when the
-/// stream opens and when it fails. Returns whether the frame went; a frame
-/// that did not goes on the session stream.
-async fn send_priority_audio(
-    priority: &mut arcen_transport::quic::PriorityAudio,
-    frame: &[u8],
-) -> bool {
-    let outcome = priority.send(frame).await;
-    match &outcome {
-        arcen_transport::quic::PriorityAudioSend::Opened => {
-            tracing::info!(target: SESSION, "audio moved to its own priority stream");
-        }
-        arcen_transport::quic::PriorityAudioSend::OpenFailed(error)
-        | arcen_transport::quic::PriorityAudioSend::WriteFailed(error) => {
-            tracing::warn!(
-                target: SESSION,
-                %error,
-                "audio priority stream unavailable; audio stays on the session stream"
-            );
-        }
-        arcen_transport::quic::PriorityAudioSend::Sent
-        | arcen_transport::quic::PriorityAudioSend::Unusable => {}
-    }
-    outcome.delivered()
+/// Authorizes the attachment's lanes and sends `lane_attachment` on the
+/// control lane, before anything the agent sends for this attachment
+/// (ADR 0014). Each attachment, including a resumed one, is a new connection
+/// and a new grant.
+async fn grant_lanes<C>(
+    client: &mut C,
+    lanes: &arcen_transport::quic::LaneConnection,
+    write_timeout: Duration,
+) -> Result<(), String>
+where
+    C: Sink<Message> + Unpin,
+    C::Error: std::fmt::Display,
+{
+    let grant = arcen_transport::quic::grant_attachment(
+        lanes,
+        arcen_transport::quic::next_attachment_generation(),
+        arcen_protocol::lanes::LaneRoleSet::all(),
+    )
+    .map_err(|error| format!("lane attachment: {error}"))?;
+    let text =
+        serde_json::to_string(&grant).map_err(|error| format!("lane attachment: {error}"))?;
+    send_ws_with_timeout(client, Message::Text(text), write_timeout)
+        .await
+        .map_err(|error| format!("lane attachment: {error}"))?;
+    tracing::info!(target: SESSION, "session runs on isolated lanes");
+    Ok(())
 }
 
 enum RelayOutcome {
@@ -9298,7 +9366,7 @@ where
     let result = async {
         'session: loop {
         // Per attachment: a resumed Deck arrives on a new connection.
-        let priority_audio = client.priority_audio();
+        let lanes = client.lanes();
         let path_signal_connection = client.path_signal_connection();
         match relay_one_attachment(
             &mut client,
@@ -9315,7 +9383,7 @@ where
                 },
             }),
             session_shutdown,
-            priority_audio,
+            lanes,
             path_signal_connection,
         )
         .await
@@ -9646,10 +9714,11 @@ async fn relay_one_attachment<C, CE, A>(
     controls: &mut watch::Receiver<AgentControl>,
     mut resumable: Option<ResumableAttachment<'_>>,
     session_shutdown: &mut watch::Receiver<bool>,
-    // The Deck's audio priority stream, used once its `client_hello` opts in:
-    // audio then never queues behind video already accepted on the session
-    // stream. `None` keeps every frame on the session stream.
-    mut priority_audio: Option<arcen_transport::quic::PriorityAudio>,
+    // The connection's lanes (ADR 0014): the agent's messages go through the
+    // shared relay, one lane per role, and the Deck's input, microphone and
+    // bulk lanes come back to the agent. `None` only on a transport without
+    // lanes.
+    lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
 ) -> RelayOutcome
 where
@@ -9666,15 +9735,49 @@ where
     let path_signal_started = tokio::time::Instant::now();
     let mut refresh_interval: Option<tokio::time::Interval> = None;
     let mut agent_streaming = false;
-    let mut deck_accepts_priority_audio = false;
     let require_active_session = resumable.is_some();
     let write_timeout = resumable
         .as_ref()
         .map(|resumable| resumable_write_timeout(resumable.refresh.window_secs))
         .unwrap_or(WS_WRITE_TIMEOUT);
+    let mut lane_relay = match lanes.as_ref() {
+        Some(lanes) => match grant_lanes(client, lanes, write_timeout).await {
+            Ok(()) => Some(LoggedLaneRelay(
+                arcen_transport::quic::PierLaneRelay::start(lanes),
+            )),
+            Err(error) => {
+                tracing::warn!(target: SESSION, %error, "lane attachment not granted");
+                return RelayOutcome::UnexpectedLoss("client_transport");
+            }
+        },
+        None => None,
+    };
     loop {
         tokio::select! {
             biased;
+            event = async {
+                match lane_relay.as_mut() {
+                    Some(relay) => relay.0.next_event().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                arcen_transport::quic::LaneRelayEvent::ToSession(record) => {
+                    let message = crate::resume::record_to_message(record);
+                    if send_ws_with_timeout(agent, message, write_timeout).await.is_err() {
+                        return RelayOutcome::AgentFailure("session agent IPC send failed".to_string());
+                    }
+                }
+                arcen_transport::quic::LaneRelayEvent::ToDeckControl(record) => {
+                    let message = crate::resume::record_to_message(record);
+                    if send_ws_with_timeout(client, message, write_timeout).await.is_err() {
+                        return RelayOutcome::UnexpectedLoss("client_transport");
+                    }
+                }
+                arcen_transport::quic::LaneRelayEvent::Ended(terminal) => {
+                    tracing::warn!(target: SESSION, reason = %terminal, "session lanes ended");
+                    return RelayOutcome::UnexpectedLoss("client_lanes");
+                }
+            },
             _ = async {
                 match refresh_interval.as_mut() {
                     Some(interval) => {
@@ -9749,11 +9852,6 @@ where
                         return RelayOutcome::AgentFailure(
                             "client attempted to send reserved broker-agent control".to_string()
                         );
-                    }
-                    if arcen_protocol::messages::ClientHelloMsg::text_accepts_audio_priority_stream(
-                        text.as_ref(),
-                    ) {
-                        deck_accepts_priority_audio = priority_audio.is_some();
                     }
                     if send_ws_with_timeout(agent, Message::Text(text), write_timeout).await.is_err() {
                         return RelayOutcome::AgentFailure("session agent IPC send failed".to_string());
@@ -9832,19 +9930,20 @@ where
                             "session agent returned an unexpected attachment status".to_string()
                         );
                     }
-                    if send_ws_with_timeout(client, Message::Text(text), write_timeout).await.is_err() {
+                    let Some(message) = route_to_deck(lane_relay.as_mut().map(|relay| &mut relay.0), Message::Text(text)) else {
+                        continue;
+                    };
+                    if send_ws_with_timeout(client, message, write_timeout).await.is_err() {
                         return RelayOutcome::UnexpectedLoss("client_transport");
                     }
                 }
                 Some(Ok(Message::Binary(bytes))) => {
-                    if deck_accepts_priority_audio && arcen_protocol::wire::is_audio_frame(&bytes) {
-                        if let Some(priority) = priority_audio.as_mut().filter(|priority| priority.usable()) {
-                            if send_priority_audio(priority, &bytes).await {
-                                continue;
-                            }
-                        }
-                    }
-                    if send_ws_with_timeout(client, Message::Binary(bytes), write_timeout).await.is_err() {
+                    // Video, audio and bulk frames go to their own lanes and
+                    // never wait here; only control frames reach the client.
+                    let Some(message) = route_to_deck(lane_relay.as_mut().map(|relay| &mut relay.0), Message::Binary(bytes)) else {
+                        continue;
+                    };
+                    if send_ws_with_timeout(client, message, write_timeout).await.is_err() {
                         return RelayOutcome::UnexpectedLoss("client_transport");
                     }
                 }
@@ -9879,6 +9978,47 @@ where
                 }
             },
         }
+    }
+}
+
+/// The attachment's lane relay; its counters are logged when it ends.
+struct LoggedLaneRelay(arcen_transport::quic::PierLaneRelay);
+
+impl Drop for LoggedLaneRelay {
+    fn drop(&mut self) {
+        let stats = self.0.stats();
+        tracing::info!(
+            target: SESSION,
+            video_frames = stats.video_frames,
+            video_dropped = stats.video_dropped,
+            keyframe_requests = stats.keyframe_requests,
+            audio_frames = stats.audio_frames,
+            audio_dropped = stats.audio_dropped,
+            bulk_dropped = stats.bulk_dropped,
+            clipboard_failed = stats.clipboard_failed,
+            input_records = stats.input_records,
+            microphone_dropped = stats.microphone_dropped,
+            "lane relay ended"
+        );
+    }
+}
+
+/// Hands an agent message to the lane relay; returns it when it belongs on
+/// the control lane (or when the transport has no lanes).
+fn route_to_deck(
+    relay: Option<&mut arcen_transport::quic::PierLaneRelay>,
+    message: Message,
+) -> Option<Message> {
+    let Some(relay) = relay else {
+        return Some(message);
+    };
+    let record = crate::resume::message_to_record(message)?;
+    match relay.route_to_deck(record) {
+        arcen_transport::quic::RelayRoute::Control(record) => {
+            Some(crate::resume::record_to_message(record))
+        }
+        arcen_transport::quic::RelayRoute::Queued(_)
+        | arcen_transport::quic::RelayRoute::Dropped(_) => None,
     }
 }
 
@@ -10560,6 +10700,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 30,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -11484,6 +11625,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -11530,6 +11672,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -11594,6 +11737,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -12381,6 +12525,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -12614,6 +12759,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
@@ -14186,4 +14332,255 @@ fn negotiate_client_transport(
     }
     let sanitized = sanitize_transport_capabilities(client_capabilities);
     negotiate_transport(&sanitized, &[active_transport]).map(str::to_string)
+}
+
+#[cfg(test)]
+mod held_input_release_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_relay_release_releases_everything() {
+        let relay = KeyResetModifiersMsg {
+            reason: arcen_transport::quic::RELAY_INPUT_RELEASE_REASON.to_owned(),
+            ..KeyResetModifiersMsg::default()
+        };
+        assert!(releases_all_held_input(&relay));
+        let deck = KeyResetModifiersMsg {
+            reason: "focus_lost".to_owned(),
+            ..KeyResetModifiersMsg::default()
+        };
+        assert!(!releases_all_held_input(&deck));
+        assert!(!releases_all_held_input(&KeyResetModifiersMsg::default()));
+    }
+}
+
+#[cfg(test)]
+mod lane_relay_tests {
+    //! The broker relay on isolated lanes (ADR 0014): the grant precedes the
+    //! agent's first message, Deck input reaches the agent on its own lane,
+    //! audio keeps arriving while the Deck never reads video, and a dropped
+    //! video frame asks the agent for a keyframe.
+
+    use super::*;
+    use arcen_protocol::lanes::{LaneEndpoint, LaneRole, SessionRecord};
+    use arcen_transport::quic::{
+        accept_attachment, accept_session_lanes, connect_session_lanes, session_record_bytes,
+        DirectQuicDialParams, LaneRuntimeConfig, PeerLaneEvent, PeerLaneReader, SessionLane,
+        SessionLaneSocket,
+    };
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    fn configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        server.alpn_protocols = vec![arcen_transport::quic::DIRECT_QUIC_ALPN_PROTOCOL.to_vec()];
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server).unwrap(),
+        ));
+        server.transport_config(arcen_transport::quic::lane_transport_config_arc(
+            &arcen_transport::BoundedTransportPolicy::default(),
+            LaneEndpoint::Pier,
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![arcen_transport::quic::DIRECT_QUIC_ALPN_PROTOCOL.to_vec()];
+        let mut client = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client).unwrap(),
+        ));
+        client.transport_config(arcen_transport::quic::lane_transport_config_arc(
+            &arcen_transport::BoundedTransportPolicy::default(),
+            LaneEndpoint::Deck,
+        ));
+        (server, client)
+    }
+
+    fn video(keyframe: bool) -> Vec<u8> {
+        let mut frame = encode_video_header(VideoHeader {
+            frame_type: FrameType::VideoH265,
+            codec: VideoCodec::H265,
+            chroma: ChromaSubsampling::Yuv420,
+            flags: if keyframe {
+                arcen_protocol::wire::VIDEO_KEYFRAME_FLAG
+            } else {
+                0
+            },
+            timestamp_ms: 0,
+            monitor_id: 0,
+            topology_generation: 0,
+            stream_epoch: 0,
+        });
+        frame.resize(frame.len() + 256 * 1024, 0x42);
+        frame
+    }
+
+    async fn deck_text(control: &mut SessionLane) -> String {
+        match tokio::time::timeout(STEP, control.reader.next_record())
+            .await
+            .expect("in time")
+            .expect("record")
+        {
+            SessionRecord::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_broker_relay_puts_each_role_on_its_lane_and_audio_outruns_a_stalled_video_lane() {
+        let (server_config, client_config) = configs();
+        let server =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let accepting = server.clone();
+        let accept = tokio::spawn(async move {
+            let connection = accepting.accept().await.unwrap().await.unwrap();
+            accept_session_lanes(connection, LaneRuntimeConfig::new(LaneEndpoint::Pier), STEP)
+                .await
+                .unwrap()
+        });
+        let (deck, mut deck_control) = connect_session_lanes(
+            DirectQuicDialParams {
+                endpoint: client.clone(),
+                client_config,
+                remote_addr: address,
+                server_name: "localhost",
+            },
+            LaneRuntimeConfig::new(LaneEndpoint::Deck),
+        )
+        .await
+        .unwrap();
+        let (pier, pier_control) = accept.await.unwrap();
+        let mut socket =
+            crate::resume::DirectSessionSocket::quic(SessionLaneSocket::new(pier, pier_control));
+        let lanes = socket.lanes();
+
+        let (broker_end, agent_end) = tokio::io::duplex(64 * 1024);
+        let mut agent = WebSocketStream::from_raw_socket(agent_end, Role::Server, None).await;
+        let relay = tokio::spawn(async move {
+            let mut broker = WebSocketStream::from_raw_socket(broker_end, Role::Client, None).await;
+            let (_controls_tx, mut controls) = watch::channel(AgentControl::new(
+                1,
+                arcen_telemetry::OperationalProfile::Info,
+                arcen_telemetry::QosTargets::default(),
+                false,
+                0,
+            ));
+            let (_shutdown_tx, mut shutdown) = watch::channel(false);
+            let identity = WindowsSessionIdentity {
+                session_id: 7,
+                user_sid: "S-1-5-21-1000".to_string(),
+                user: "artist".to_string(),
+                domain: "STUDIO".to_string(),
+                state: "active".to_string(),
+                launch_backend: "wts".to_string(),
+            };
+            let outcome = relay_one_attachment(
+                &mut socket,
+                &mut broker,
+                &identity,
+                "S-1-5-21-1000",
+                &mut controls,
+                None,
+                &mut shutdown,
+                lanes,
+                None,
+            )
+            .await;
+            matches!(outcome, RelayOutcome::ExplicitClose)
+        });
+
+        // The grant precedes everything the agent says for this attachment.
+        agent
+            .send(Message::Text(r#"{"type":"server_hello"}"#.into()))
+            .await
+            .unwrap();
+        let grant = deck_text(&mut deck_control).await;
+        assert!(grant.contains("lane_attachment"), "{grant}");
+        accept_attachment(&deck, &serde_json::from_str(&grant).unwrap()).unwrap();
+        assert!(deck_text(&mut deck_control).await.contains("server_hello"));
+
+        // Deck input reaches the agent on its own lane.
+        let input =
+            SessionLane::split(deck.open_lane(LaneRole::InputCursor).await.unwrap()).unwrap();
+        input
+            .sender
+            .send(session_record_bytes(&SessionRecord::Text(
+                r#"{"type":"key_event","key":4,"down":true}"#.to_owned(),
+            )))
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(STEP, agent.next())
+            .await
+            .expect("in time")
+            .expect("message")
+            .expect("valid");
+        assert!(matches!(&delivered, Message::Text(text) if text.contains("key_event")));
+
+        // The Deck never reads video; audio still arrives, frame after frame.
+        let mut audio = PeerLaneReader::new(&deck, LaneRole::AudioOutput);
+        agent.send(Message::Binary(video(true))).await.unwrap();
+        for index in 0..120_u32 {
+            agent.send(Message::Binary(video(false))).await.unwrap();
+            if index % 6 == 0 {
+                let mut frame = encode_audio_header(AudioHeader {
+                    codec: AudioCodec::Opus,
+                    timestamp_ms: index,
+                })
+                .to_vec();
+                frame.extend_from_slice(&[7; 60]);
+                agent.send(Message::Binary(frame)).await.unwrap();
+                let frame = loop {
+                    match tokio::time::timeout(Duration::from_secs(1), audio.next())
+                        .await
+                        .expect("audio is not held behind video")
+                        .expect("audio lane")
+                    {
+                        PeerLaneEvent::Frame(frame) => break frame,
+                        PeerLaneEvent::Opened { .. } | PeerLaneEvent::Lost { .. } => {}
+                    }
+                };
+                assert!(arcen_protocol::wire::is_audio_frame(&frame));
+            }
+        }
+        let mut asked = false;
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_millis(500), agent.next()).await
+        {
+            if matches!(&message, Message::Text(text) if text.contains(REQUEST_FULL_FRAME)) {
+                asked = true;
+                break;
+            }
+        }
+        assert!(
+            asked,
+            "a dropped video frame must ask the agent for a keyframe"
+        );
+
+        // A close from the Deck ends the attachment explicitly.
+        deck_control
+            .sender
+            .send(session_record_bytes(&SessionRecord::Close(None)))
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(STEP, relay).await.unwrap().unwrap());
+    }
 }

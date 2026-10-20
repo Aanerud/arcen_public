@@ -1,0 +1,59 @@
+Sink Input #0
+	Driver: protocol-native.c
+	Owner Module: 9
+	Client: 2
+	Sink: 1
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "48000"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 2000000 usec
+	Sink Latency: 650656 usec
+	Resample method: n/a
+	Properties:
+		media.format = "WAV (Microsoft)"
+		application.name = "paplay"
+		media.name = "/home/arcenlab/tone.wav"
+		native-protocol.peer = "UNIX socket client"
+		native-protocol.version = "35"
+		application.process.id = "466699"
+		application.process.user = "arcenlab"
+		application.process.host = "pier.example.internal"
+		application.process.binary = "pacat"
+		application.language = "C"
+		application.process.machine_id = "00000000000000000000000000000000"
+		application.process.session_id = "1087"
+		module-stream-restore.id = "sink-input-by-application-name:paplay"
+
+Sink Input #1
+	Driver: protocol-native.c
+	Owner Module: 9
+	Client: 3
+	Sink: 1
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "48000"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 2000000 usec
+	Sink Latency: 650604 usec
+	Resample method: n/a
+	Properties:
+		media.format = "WAV (Microsoft)"
+		application.name = "paplay"
+		media.name = "/home/arcenlab/tone.wav"
+		native-protocol.peer = "UNIX socket client"
+		native-protocol.version = "35"
+		application.process.id = "466698"
+		application.process.user = "arcenlab"
+		application.process.host = "pier.example.internal"
+		application.process.binary = "pacat"
+		application.language = "C"
+		application.process.machine_id = "00000000000000000000000000000000"
+		application.process.session_id = "1087"
+		module-stream-restore.id = "sink-input-by-application-name:paplay"

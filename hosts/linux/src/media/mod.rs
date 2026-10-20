@@ -5,7 +5,10 @@ pub mod annexb;
 pub mod audio;
 pub mod capenc;
 pub mod encoder_admission;
+pub mod local_playback;
 pub mod multi_capenc;
+pub mod pipewire_bridge;
+pub mod wayland_cursor;
 
 use arcen_protocol::wire::{
     encode_audio_header, encode_video_header, AudioCodec, AudioHeader, BitDepth, ChromaSubsampling,

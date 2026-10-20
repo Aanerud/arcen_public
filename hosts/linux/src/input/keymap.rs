@@ -9,6 +9,26 @@ pub const MOD_KEYPAD: u32 = 0x10;
 pub const MODIFIER_CODES: [u16; 8] = [42, 54, 29, 97, 56, 100, 125, 126];
 pub const LOCK_CODES: [u16; 3] = [58, 69, 70];
 
+/// `KEY_SYSRQ`, the PrintScreen/SysRq key.
+pub const KEY_SYSRQ: u16 = 99;
+/// `KEY_PRINT`, which X and Wayland keymaps also map to `Print`.
+pub const KEY_PRINT: u16 = 210;
+
+/// The evdev code a kernel virtual keyboard may emit for `code`.
+///
+/// A uinput keyboard is an ordinary kernel keyboard: the kernel's SysRq
+/// filter reads it on every virtual terminal, whatever X server owns the
+/// screen, so a remote Alt+PrintScreen+key would run a SysRq action on the
+/// host. PrintScreen is therefore sent as `KEY_PRINT`, which the kernel never
+/// treats as SysRq.
+pub const fn kernel_safe_key(code: u16) -> u16 {
+    if code == KEY_SYSRQ {
+        KEY_PRINT
+    } else {
+        code
+    }
+}
+
 pub fn qt_key_to_evdev(qt_key: u32, modifiers: u32) -> Option<u16> {
     if modifiers & MOD_KEYPAD != 0 {
         if let Some(code) = keypad_key(qt_key) {
@@ -137,6 +157,24 @@ fn keypad_key(qt_key: u32) -> Option<u16> {
 mod tests {
     use super::*;
 
+    /// A remote session must never be able to press the host's power,
+    /// sleep, suspend or wake keys: a settings daemon in the session (or
+    /// logind) would act on the host.
+    #[test]
+    fn no_deck_key_reaches_a_host_power_key() {
+        const HOST_POWER_KEYS: [u16; 5] = [116, 142, 143, 205, 356];
+        for qt_key in (0..0x1_0000_u32).chain(0x0100_0000..0x0101_0000) {
+            for modifiers in [0, MOD_KEYPAD, MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_META] {
+                if let Some(code) = qt_key_to_evdev(qt_key, modifiers) {
+                    assert!(
+                        !HOST_POWER_KEYS.contains(&code),
+                        "Qt key {qt_key:#x} maps to host power key {code}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn maps_established_qt_codes_to_evdev() {
         assert_eq!(qt_key_to_evdev(0x41, 0), Some(30));
@@ -184,6 +222,28 @@ mod tests {
                 "unmapped Qt key {key:#x}"
             );
         }
+    }
+
+    #[test]
+    fn print_screen_never_reaches_a_kernel_keyboard_as_sysrq() {
+        let print = qt_key_to_evdev(0x0100_0009, 0).unwrap();
+        assert_eq!(kernel_safe_key(print), KEY_PRINT);
+        assert_eq!(kernel_safe_key(print), 210);
+        for modifiers in [
+            0,
+            MOD_ALT,
+            MOD_CTRL | MOD_ALT,
+            MOD_SHIFT | MOD_ALT,
+            MOD_KEYPAD,
+        ] {
+            for qt_key in (0..0x200).chain(0x0100_0000..0x0100_0200) {
+                if let Some(code) = qt_key_to_evdev(qt_key, modifiers) {
+                    assert_ne!(kernel_safe_key(code), KEY_SYSRQ, "Qt key {qt_key:#x}");
+                }
+            }
+        }
+        assert_eq!(kernel_safe_key(30), 30);
+        assert_eq!(kernel_safe_key(119), 119);
     }
 
     #[test]

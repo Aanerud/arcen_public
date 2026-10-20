@@ -1,0 +1,20 @@
+; SPDX-License-Identifier: AGPL-3.0-only
+;
+; Arcen Pier SELinux policy module (CIL). Installed by install-arcen-pier
+; with `semodule -i arcen.cil` only on a host with SELinux enabled; removed
+; with `semodule -r arcen` on uninstall. Rationale and review notes:
+; docs/security/linux-selinux.md.
+;
+; The packaged Pier is a systemd service, so it and its session launcher run
+; as unconfined_service_t. The launcher opens each desktop through the PAM
+; `login` stack, whose `pam_selinux open` assigns the session user's default
+; context (unconfined_u:unconfined_r:unconfined_t for the default login
+; mapping). The launcher applies that context only to the session user's
+; first process, as a display manager's session worker does; the targeted
+; policy lets display managers (xdm_t), sshd and init make that transition,
+; but not unconfined_service_t. This is the one rule that adds.
+;
+; It grants no access the source domain lacks: unconfined_service_t is
+; already unconfined. Confined SELinux users (user_u, staff_u, ...) are not
+; added; their sessions are refused by the launcher with a clear error.
+(allow unconfined_service_t unconfined_t (process (transition)))

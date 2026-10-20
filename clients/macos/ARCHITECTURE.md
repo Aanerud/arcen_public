@@ -134,7 +134,7 @@ needs to negotiate.
 - `tablet/` — the default, non-experimental typed-pen capture path: `monitor.rs`
   (main-thread AppKit `NSEvent` tabletPoint/tabletProximity local-monitor RAII
   guard), `mapper.rs` (pure native-sample → `arcen_input::PenEvent` mapper),
-  `dispatch.rs` (edge-preserving/motion-coalescing bounded dispatch), `presence.rs` +
+  `presence.rs` +
   `hid_inventory.rs` (vendor-neutral tablet presence from I/O Registry report
   descriptors), `probe.rs` (empirical axis-capability probe), `sample.rs`, `runtime.rs`
   (`TabletRuntime` RAII), `mod.rs`. See
@@ -324,9 +324,10 @@ typed `tabletPoint`/`tabletProximity` samples; a pure mapper
 (`tablet/mapper.rs`) converts them to `arcen_input::PenEvent`, mapping window
 points through the current video `image_rect` (accounting for AppKit's
 bottom-left origin, backing scale, letterboxing, and fullscreen transitions);
-a bounded, edge-preserving dispatcher (`tablet/dispatch.rs`) forwards
-`arcen_protocol::messages::PenEventMsg` once the host negotiates input
-protocol v3 and pen capability. No vendor SDK or vendor HID report parsing is
+`ui/pen_input.rs` sends each sample from the monitor callback as AppKit
+dispatches it (never on the next UI pass), classified by the shared,
+edge-preserving `arcen_input::PenForwardingDispatcher`, once the host
+negotiates input protocol v3 and pen capability. No vendor SDK or vendor HID report parsing is
 used — the tablet's own driver remains the local decoder, already installed on
 this Mac, and axis conversion is the shared `arcen_input::pen_axes`. Any pen
 tablet qualifies: presence is decided from HID report descriptors

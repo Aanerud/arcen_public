@@ -94,6 +94,22 @@ grep -c 'launchctl enable' postinstall
 
 This takes fifteen seconds and has caught real omissions.
 
+The licence and third-party notices are part of the payload too:
+`Arcen Pier.app/Contents/Resources/LICENSE` and `THIRD_PARTY_NOTICES.md`,
+byte-identical to `LICENSE` and `legal/THIRD_PARTY_NOTICES.md`. The package
+build refuses a payload without them; check a built package with
+`ARCEN_PIER_PKG=/path/to/ArcenPier-<version>.pkg python3 -m unittest discover -s packaging/macos/tests`.
+
+Neither the payload nor the scripts archive may hold AppleDouble (`._`)
+entries. On macOS 26 every file the build writes carries
+`com.apple.provenance`, which `xattr` cannot remove, and `pkgbuild` turns it
+into a `._` companion for every file and directory. `strip_appledouble.py`
+drops companions that hold only that attribute (and refuses any other),
+rebuilds the Bom to match, and `build-pier-pkg.sh` runs
+`strip_appledouble.py --check` on the finished package. The Deck release zip
+is written by `zip-app.sh` (`ditto --norsrc --noextattr --noqtn`) for the
+same reason.
+
 ## The three install-time traps
 
 Each of these produced the same symptom — an install that reported success,

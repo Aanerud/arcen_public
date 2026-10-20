@@ -7,7 +7,8 @@
 
 use crate::messages::{ClipboardContentKind, ClipboardDataMsg, CLIPBOARD_DATA};
 use crate::wire::{
-    encode_clipboard_chunk, ClipboardChunkHeader, CHUNK_BYTES, HARD_MAX_CLIPBOARD_BYTES,
+    encode_clipboard_chunk, ClipboardChunkHeader, CHUNK_BYTES, CLIPBOARD_CHUNK_PAYLOAD_BYTES,
+    HARD_MAX_CLIPBOARD_BYTES,
 };
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -217,6 +218,27 @@ impl ClipboardReassembler {
         }
     }
 
+    /// Sequence of the partial item being reassembled, if any.
+    #[must_use]
+    pub fn in_flight_sequence(&self) -> Option<u64> {
+        self.in_flight.as_ref().map(|in_flight| in_flight.sequence)
+    }
+
+    /// The host abandoned transfer `sequence` (`clipboard_transfer_failed`).
+    /// Scrubs it only if it is the partial item in flight, and raises the
+    /// accepted sequence to it, so a late offer for it is refused as stale.
+    /// A newer transfer is never touched: the notice travels on the control
+    /// lane, which has no order with the bulk lane carrying offers and
+    /// chunks. Returns whether partial data was discarded.
+    pub fn abandon(&mut self, sequence: u64) -> bool {
+        self.latest_sequence = self.latest_sequence.max(sequence);
+        if self.in_flight_sequence() == Some(sequence) {
+            self.abort();
+            return true;
+        }
+        false
+    }
+
     /// Scrubs an item after five seconds without accepted progress.
     #[must_use]
     pub fn expire(&mut self, now: Instant) -> bool {
@@ -326,6 +348,54 @@ mod tests {
                 bytes: b"abcd".to_vec(),
                 truncated: false
             })
+        );
+    }
+
+    #[test]
+    fn a_late_failure_notice_never_aborts_a_newer_transfer() {
+        let now = Instant::now();
+        let mut reassembler = ClipboardReassembler::new(32).unwrap();
+        // Offer N arrived on the bulk lane before the notice for M < N.
+        reassembler.begin_at(offer(6, 4), now).unwrap();
+        reassembler.push_at(header(6, 4, 0), b"ab", now).unwrap();
+        assert!(!reassembler.abandon(5));
+        assert_eq!(reassembler.in_flight_sequence(), Some(6));
+        assert_eq!(
+            reassembler
+                .push_at(header(6, 4, 2), b"cd", now)
+                .unwrap()
+                .map(|done| done.sequence),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn a_notice_ahead_of_its_offer_makes_the_late_offer_stale() {
+        let now = Instant::now();
+        let mut reassembler = ClipboardReassembler::new(32).unwrap();
+        // The notice for M arrived before M's offer.
+        assert!(!reassembler.abandon(7));
+        assert_eq!(
+            reassembler.begin_at(offer(7, 4), now),
+            Err(ClipboardReassemblyError::StaleSequence)
+        );
+        assert_eq!(reassembler.buffered_len(), 0);
+        // A newer transfer still starts.
+        reassembler.begin_at(offer(8, 4), now).unwrap();
+    }
+
+    #[test]
+    fn a_notice_for_the_transfer_in_flight_scrubs_it() {
+        let now = Instant::now();
+        let mut reassembler = ClipboardReassembler::new(32).unwrap();
+        reassembler.begin_at(offer(9, 4), now).unwrap();
+        reassembler.push_at(header(9, 4, 0), b"ab", now).unwrap();
+        assert!(reassembler.abandon(9));
+        assert_eq!(reassembler.in_flight_sequence(), None);
+        assert_eq!(reassembler.buffered_len(), 0);
+        assert_eq!(
+            reassembler.push_at(header(9, 4, 2), b"cd", now),
+            Err(ClipboardReassemblyError::MissingOffer)
         );
     }
 
@@ -480,7 +550,7 @@ impl ClipboardCursor {
         }
         let end = self
             .offset
-            .saturating_add(CHUNK_BYTES)
+            .saturating_add(CLIPBOARD_CHUNK_PAYLOAD_BYTES)
             .min(self.transfer.bytes.len());
         let frame = encode_clipboard_chunk(
             ClipboardChunkHeader {
@@ -644,7 +714,9 @@ impl ClipboardTransfer {
         let mut frames = Vec::new();
         let mut offset = 0_usize;
         loop {
-            let end = offset.saturating_add(CHUNK_BYTES).min(self.bytes.len());
+            let end = offset
+                .saturating_add(CLIPBOARD_CHUNK_PAYLOAD_BYTES)
+                .min(self.bytes.len());
             let chunk_offset =
                 u32::try_from(offset).map_err(|_| ClipboardFramingError::PayloadTooLarge)?;
             let frame = encode_clipboard_chunk(
@@ -670,7 +742,7 @@ impl ClipboardTransfer {
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
-    use crate::wire::decode_clipboard_chunk;
+    use crate::wire::{decode_clipboard_chunk, CLIPBOARD_HEADER_SIZE};
 
     #[test]
     fn the_cursor_sends_the_offer_before_any_chunk() {
@@ -744,7 +816,7 @@ mod transfer_tests {
 
     #[test]
     fn a_payload_larger_than_one_chunk_is_split_and_the_offsets_are_contiguous() {
-        let bytes = vec![7_u8; CHUNK_BYTES * 2 + 5];
+        let bytes = vec![7_u8; CLIPBOARD_CHUNK_PAYLOAD_BYTES * 2 + 5];
         let transfer =
             ClipboardTransfer::new(9, ClipboardContentKind::TextUtf8, bytes.clone()).expect("new");
         let frames = transfer.chunks().expect("frames");
@@ -767,9 +839,65 @@ mod transfer_tests {
 
     #[test]
     fn a_payload_exactly_one_chunk_long_is_not_split() {
-        let bytes = vec![3_u8; CHUNK_BYTES];
+        let bytes = vec![3_u8; CLIPBOARD_CHUNK_PAYLOAD_BYTES];
         let transfer =
             ClipboardTransfer::new(2, ClipboardContentKind::TextUtf8, bytes).expect("new");
         assert_eq!(transfer.chunks().expect("frames").len(), 1);
+    }
+
+    #[test]
+    fn every_chunk_fits_one_bulk_lane_record() {
+        // Both lane ends refuse a bulk record over 1 MiB. Chunks filled to
+        // CHUNK_BYTES were 25 bytes over it, so a 1 MiB clipboard item never
+        // left the sender.
+        let bytes = vec![9_u8; CHUNK_BYTES * 3 + 11];
+        let transfer =
+            ClipboardTransfer::new(3, ClipboardContentKind::TextUtf8, bytes).expect("new");
+        let frames = transfer.chunks().expect("frames");
+        assert_eq!(frames.len(), 4);
+        for frame in frames {
+            let record = crate::lanes::SessionRecord::Binary(frame).encode();
+            assert!(record.len() <= CHUNK_BYTES, "{}", record.len());
+        }
+        assert_eq!(
+            crate::lanes::SessionRecord::Binary(vec![
+                0;
+                CLIPBOARD_HEADER_SIZE
+                    + CLIPBOARD_CHUNK_PAYLOAD_BYTES
+            ])
+            .encode()
+            .len(),
+            CHUNK_BYTES
+        );
+    }
+
+    #[test]
+    fn a_full_size_chunk_from_an_older_sender_is_still_accepted() {
+        let bytes = vec![4_u8; CHUNK_BYTES + 1];
+        let mut reassembler = ClipboardReassembler::new(bytes.len()).expect("reassembler");
+        let transfer =
+            ClipboardTransfer::new(8, ClipboardContentKind::TextUtf8, bytes.clone()).expect("new");
+        reassembler.begin(transfer.offer()).expect("begin");
+        for (offset, payload) in [
+            (0, &bytes[..CHUNK_BYTES]),
+            (CHUNK_BYTES, &bytes[CHUNK_BYTES..]),
+        ] {
+            let frame = encode_clipboard_chunk(
+                ClipboardChunkHeader {
+                    kind: ClipboardContentKind::TextUtf8,
+                    sequence: 8,
+                    total_size: u32::try_from(bytes.len()).expect("size"),
+                    offset: u32::try_from(offset).expect("offset"),
+                },
+                payload,
+            )
+            .expect("encode");
+            let (header, payload) = decode_clipboard_chunk(&frame).expect("decode");
+            if let Some(mut done) = reassembler.push(header, payload).expect("push") {
+                assert_eq!(done.take_bytes(), bytes);
+                return;
+            }
+        }
+        panic!("the transfer did not complete");
     }
 }

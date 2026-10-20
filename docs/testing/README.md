@@ -1,5 +1,8 @@
 # Colour probe matrix: running it end to end
 
+> Measuring feel and latency with the real Deck window instead? See
+> [`realscreen.md`](realscreen.md).
+
 Operator runbook for the grader/VFX colour work on
 `feat/color-fidelity-10bit-444` (4:4:4 chroma, 10-bit depth, full-range
 colour, negotiated end to end). Read
@@ -89,6 +92,30 @@ Do not replace the explicit trust option with
 `media-smoke --video-only` skips only the completion requirement for an audio
 packet. Use it when validating video on a deliberately silent source; it does
 not disable host audio and must not be used as evidence that audio passed.
+
+`input-smoke --text STRING` (repeatable) sends each string as committed text
+(`text_commit`), the way the Deck sends its input method's commits, after
+checking that the host advertises `text_commit`. It prints the host's
+`text_commit_unicode` truth, the `host_keymap` it reports (layouts, active
+layout, number of positions), and every `text_commit_result` with the refused
+characters as code points (never the text itself). Pair it with an
+application in the session that logs what it receives to prove delivery.
+The Linux Pier's `ei_text` client has its own proof against libei's
+`eis-demo-server` (libei ≥ 1.6, which prints each `utf8` it receives): start
+the server with `--socketpath=PATH`, then run
+`ARCEN_EIS_DEMO_SOCKET=PATH cargo test -p arcen-pier-linux --features
+wayland-provider --lib -- --ignored libei_demo_server`.
+
+`media-smoke` can drive the clipboard:
+
+- `ARCEN_MEDIA_SMOKE_CLIPBOARD_SEND=a.txt,b.png` offers each file as the
+  Deck's clipboard once video decodes, one every
+  `ARCEN_MEDIA_SMOKE_CLIPBOARD_EVERY` seconds (default 3). A `.png` file is
+  sent as an image; any other file as UTF-8 text.
+- Each host item that arrives is printed as
+  `clipboard-received sequence=… kind=… bytes=… matches=<file>|none`.
+  `matches` names the `ARCEN_MEDIA_SMOKE_CLIPBOARD_EXPECT` file it equals.
+  Content is never printed.
 
 ## 3. Prerequisites
 

@@ -34,6 +34,10 @@ const NO_AUTH_REFUSED: &str = "refusing to disable authentication: this build ha
      `insecure-lab-no-auth` Cargo feature, which is never enabled in a release \
      artifact.";
 
+/// Highest refresh a dedicated Xorg desktop's head is created at (the
+/// launcher's own bound on a served display).
+const MAX_XORG_HEAD_REFRESH_HZ: u32 = 240;
+
 static IGNORED_HELPER_PATH_WARNINGS: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> =
     OnceLock::new();
 
@@ -158,6 +162,22 @@ pub struct Config {
     /// Exact auth-time request retained for the post-hello consistency echo.
     pub auth_video_request: Option<InitialVideoRequestMsg>,
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
+    /// This sign-in's headless Wayland desktop serves a committed
+    /// multi-monitor topology: the record's wide-composition proof is a
+    /// single-output one, so Grading and HDR are served as Auto
+    /// (`fidelity_multi_output_unqualified`).
+    pub wayland_multi_output: bool,
+    /// `video.x11_desktop_depth`: the depth a new Xorg desktop is created
+    /// at. Fixed for that desktop's whole life.
+    pub x11_desktop_depth: arcen_media::video::DesktopDepthPolicy,
+    /// The verified depth of the Xorg desktop this sign-in attached to, once
+    /// known: a ten-bit request on an eight-bit desktop is served visibly as
+    /// Auto. `None` before attachment and for every Wayland desktop.
+    pub attached_desktop_depth: Option<arcen_media::video::DesktopDepth>,
+    /// This sign-in asked for more bits than its attached desktop has and is
+    /// served visibly as Auto (`eight_bit_source`); the Deck is told how to
+    /// get a ten-bit desktop.
+    pub desktop_depth_downgraded: bool,
     pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
     /// 1-based monitor index (runtime convention); `output_index` subtracts 1.
@@ -186,6 +206,46 @@ pub struct Config {
     pub session_launcher_bin: Option<PathBuf>,
     /// GNOME session token passed to `/usr/bin/gnome-session`.
     pub desktop_session: String,
+    /// `capture.provider`: `auto` (from host facts) unless an operator
+    /// override names a provider.
+    pub provider_preference: arcen_session::desktop_provider::ProviderPreference,
+    /// The desktop provider start-up selection resolved from the
+    /// preference and host facts; dedicated Xorg until it has run.
+    pub desktop_provider: arcen_session::desktop_provider::DesktopProvider,
+    /// `capture.wayland_qualification_record`: the qualification record this
+    /// Pier reads (and `wayland qualify --config` writes); the production
+    /// record unless a development Pier names its own.
+    pub wayland_qualification_target: arcen_session::wayland_qualification::QualificationTarget,
+    /// `wayland.first_login_setup`: whether GNOME's first-login assistant
+    /// and welcome tour run in a headless Wayland desktop.
+    pub first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup,
+    /// `wayland.lab_seat_pen` (lab, default off): a virtual tablet on a
+    /// private udev seat for a headless compositor with the lab input patch.
+    pub wayland_lab_seat_pen: bool,
+    /// `wayland.session_mode`: native desktops on their own seat (real
+    /// pen), headless ones, or native when the host proved it (`auto`).
+    pub wayland_session_mode: arcen_session::native_seat::SessionMode,
+    /// `capture.wayland_auto_requalify` (default on): at start, re-qualify
+    /// a record an update made stale instead of only refusing.
+    pub wayland_auto_requalify: bool,
+    /// `capture.wayland_compositor_prefix`: the side-by-side prefix the
+    /// headless Wayland compositor runs from; `None` is the distribution's
+    /// `/usr`. Syntax is checked here; ownership when the Pier or `wayland
+    /// qualify` applies it (`session::wayland::apply_configured_compositor_prefix`).
+    pub wayland_compositor_prefix: Option<String>,
+    /// The host's validated Wayland qualification record, set at start when
+    /// Wayland was selected. Its measured source rates are the only
+    /// `capture-rate` evidence a Wayland Speed request is admitted on.
+    pub wayland_qualification: Option<Arc<arcen_session::wayland_qualification::QualifiedHost>>,
+    /// The headless Wayland session's output refresh rate, set per
+    /// attachment: Speed's qualified rate is per size *and* refresh.
+    pub wayland_output_refresh_hz: Option<u32>,
+    /// `platform.session.wayland_x11_apps`: whether Wayland sessions run the
+    /// compositor's Xwayland for X11 applications.
+    pub wayland_x11_apps: arcen_session::wayland_x11::X11AppsSetting,
+    /// What start-up decided from that setting, the installed Xwayland and
+    /// the qualification record; `None` until Wayland was selected.
+    pub wayland_x11_plan: Option<arcen_session::wayland_x11::X11AppsPlan>,
     /// Dedicated X display created for PAM sessions.
     pub session_display: String,
     /// Physical NVIDIA head assigned to the dedicated X server.
@@ -196,6 +256,9 @@ pub struct Config {
     pub input_mode: InputMode,
     pub audio_enabled: bool,
     pub audio_compressed: bool,
+    /// Whether the host's own speakers stay audible during a session
+    /// (`audio.local_playback`, default `muted`).
+    pub local_playback: arcen_session::pier_config::LocalPlayback,
     /// Retained only to accept and warn about legacy external-helper settings.
     pub audiocap_bin: Option<PathBuf>,
     pub audio_user_mode: AudioUserMode,
@@ -346,11 +409,13 @@ impl Config {
         width: u32,
         height: u32,
     ) -> CapencConfig {
+        let capture_rates_by_codec =
+            self.wayland_speed_capture_rates(execution.as_ref(), width, height);
         CapencConfig {
             binary,
             output_index: self.output_index(),
             codec: self.codec.clone(),
-            encoder: self.encoder,
+            encoder: self.session_encoder(),
             fps: self.fps,
             yuv444: self.wire_yuv444(),
             // No client has been heard from yet at this call site (it runs
@@ -390,6 +455,12 @@ impl Config {
             width,
             height,
             cursor_mode,
+            capture_rate: None,
+            capture_rate_evidence: arcen_media::video::CaptureRateEvidence::Measured,
+            capture_rates_by_codec,
+            speed_runtime_shortfall: false,
+            gpu_import_verified: self.wayland_gpu_import_verified(),
+            wayland_fidelity_args: self.wayland_fidelity_args(),
             display: Some(self.display.clone()),
             xauthority: match execution.as_ref() {
                 Some(user) => user.environment.get("XAUTHORITY").map(str::to_string),
@@ -398,6 +469,589 @@ impl Config {
             execution,
             session_log_id,
         }
+    }
+
+    /// Whether this Pier's Wayland sessions run the compositor's Xwayland:
+    /// only what start-up resolved, never the raw setting.
+    pub fn wayland_x11_apps_enabled(&self) -> bool {
+        self.wayland_x11_plan
+            .is_some_and(arcen_session::wayland_x11::X11AppsPlan::enabled)
+    }
+
+    /// The Wayland Speed decision for a stream of `width`x`height` with
+    /// `codec`, on this host's record: measured on exactly this output, or
+    /// inferred from a larger qualifying one (see
+    /// `arcen_session::wayland_qualification::resolve_speed`). `refreshes`
+    /// are the output refresh rates the session may run at.
+    #[must_use]
+    pub fn wayland_speed_decision(
+        &self,
+        width: u32,
+        height: u32,
+        codec: &str,
+        refreshes: &[u32],
+    ) -> Option<arcen_session::wayland_qualification::SpeedDecision> {
+        use arcen_media::video::{pipeline_contract, PipelineId};
+        let qualified = self.wayland_qualification.as_ref()?;
+        let ceiling_fps = pipeline_contract(PipelineId::Speed).max_fps;
+        qualified.speed_decision(&arcen_session::wayland_qualification::SpeedRequest {
+            width,
+            height,
+            codec,
+            route: qualified.serving_route(),
+            candidate_refreshes: refreshes,
+            ceiling_fps,
+            minimum_fps: arcen_session::wayland_qualification::speed_minimum_fps(ceiling_fps),
+        })
+    }
+
+    /// The Speed decision for the session's stream size (the capture
+    /// hand-off's, else `width`×`height`) at its output refresh rate. An
+    /// unknown refresh decides nothing. capenc ignores the rate outside a
+    /// Wayland session.
+    pub fn wayland_speed_capture_decision(
+        &self,
+        execution: Option<&UserExecution>,
+        width: u32,
+        height: u32,
+    ) -> Option<arcen_session::wayland_qualification::SpeedDecision> {
+        self.wayland_speed_capture_decision_for(execution, width, height, &self.codec)
+    }
+
+    /// [`Self::wayland_speed_capture_decision`] for `codec`.
+    pub fn wayland_speed_capture_decision_for(
+        &self,
+        execution: Option<&UserExecution>,
+        width: u32,
+        height: u32,
+        codec: &str,
+    ) -> Option<arcen_session::wayland_qualification::SpeedDecision> {
+        let refresh_hz = self.wayland_output_refresh_hz?;
+        let (width, height) = execution
+            .and_then(|execution| {
+                arcen_media::video::capture_handoff::PipeWireCaptureHandoff::from_env(|name| {
+                    execution.environment.get(name).map(str::to_owned)
+                })
+                .ok()
+                .flatten()
+            })
+            .map_or((width, height), |handoff| handoff.size());
+        self.wayland_speed_decision(width, height, codec, &[refresh_hz])
+    }
+
+    /// The Wayland Speed evidence for the session's stream at its output
+    /// refresh, per codec a session may end up encoding with (the Deck's
+    /// request decides the codec after this configuration is built). An
+    /// inferred rate is logged as such.
+    pub fn wayland_speed_capture_rates(
+        &self,
+        execution: Option<&UserExecution>,
+        width: u32,
+        height: u32,
+    ) -> Vec<(String, u32, arcen_media::video::CaptureRateEvidence)> {
+        ["h265", "h264", "av1"]
+            .into_iter()
+            .filter_map(|codec| {
+                let decision =
+                    self.wayland_speed_capture_decision_for(execution, width, height, codec)?;
+                let evidence = match decision.evidence {
+                    arcen_session::wayland_qualification::RateEvidence::Inferred {
+                        anchor_width,
+                        anchor_height,
+                    } => {
+                        tracing::info!(
+                            target: crate::logging::target::MEDIA,
+                            width,
+                            height,
+                            codec,
+                            output_refresh_hz = decision.output_refresh_hz,
+                            capture_rate = decision.capture_rate,
+                            measured_fps = decision.measured_fps,
+                            evidence = %decision.evidence,
+                            "Wayland Speed rate is inferred from a larger qualified output"
+                        );
+                        arcen_media::video::CaptureRateEvidence::Inferred {
+                            width: anchor_width,
+                            height: anchor_height,
+                        }
+                    }
+                    arcen_session::wayland_qualification::RateEvidence::Measured => {
+                        arcen_media::video::CaptureRateEvidence::Measured
+                    }
+                };
+                Some((codec.to_owned(), decision.capture_rate, evidence))
+            })
+            .collect()
+    }
+
+    /// The qualified Wayland source rate (`capture-rate=`) a Speed request
+    /// is admitted on at the session's output; see
+    /// [`Self::wayland_speed_capture_decision`].
+    pub fn wayland_speed_capture_rate(
+        &self,
+        execution: Option<&UserExecution>,
+        width: u32,
+        height: u32,
+    ) -> Option<u32> {
+        self.wayland_speed_capture_decision(execution, width, height)
+            .map(|decision| decision.capture_rate)
+    }
+
+    /// The refresh rate a headless Wayland session's virtual output is
+    /// created at for a display of `display_refresh_hz` at `width`x`height`.
+    ///
+    /// A session whose authenticated request resolved to Speed gets the
+    /// lowest refresh the host's record qualifies Speed at for this size
+    /// (measured or inferred, for the session's codec, else any measured
+    /// codec): the display's own when that holds Speed (Mutter 49's
+    /// `RecordVirtual` outputs do), the shared `paced_output_refresh_hz`
+    /// (120 Hz for a 60 Hz display) when only that does. Every other
+    /// request, provider or host keeps the display's rate. The output is
+    /// created once per session; a later Speed request on it is admitted
+    /// only on evidence for that refresh.
+    pub fn wayland_session_refresh_hz(
+        &self,
+        width: u32,
+        height: u32,
+        display_refresh_hz: u32,
+    ) -> u32 {
+        let Some(refreshes) = self.wayland_speed_refreshes(display_refresh_hz) else {
+            return display_refresh_hz;
+        };
+        std::iter::once(self.codec.as_str())
+            .chain(arcen_session::wayland_qualification::QUALIFY_CODECS)
+            .find_map(|codec| self.wayland_speed_decision(width, height, codec, &refreshes))
+            .map_or(display_refresh_hz, |decision| decision.output_refresh_hz)
+    }
+
+    /// The output refreshes a Speed session on a `display_refresh_hz`
+    /// display may run at, or `None` when the session is not a Wayland Speed
+    /// session: the display's own, then the shared paced refresh.
+    fn wayland_speed_refreshes(&self, display_refresh_hz: u32) -> Option<[u32; 2]> {
+        use arcen_media::video::{paced_output_refresh_hz, pipeline_contract, PipelineId};
+        use arcen_session::desktop_provider::DesktopProvider;
+        if self.desktop_provider != DesktopProvider::Wayland
+            || self.requested_pipeline != Some(PipelineId::Speed)
+        {
+            return None;
+        }
+        let paced = paced_output_refresh_hz(
+            display_refresh_hz,
+            pipeline_contract(PipelineId::Speed).max_fps,
+        )
+        .min(arcen_session::wayland_session::MAX_VIRTUAL_OUTPUT_REFRESH_HZ);
+        Some([display_refresh_hz, paced])
+    }
+
+    /// The refresh a dedicated Xorg desktop's head is created at for a
+    /// display of `display_refresh_hz` at `width`x`height`.
+    ///
+    /// NvFBC and the compositor deliver on the head's refresh clock. A head
+    /// refreshing at exactly the served rate lets arrival jitter put two
+    /// frames into one encoder interval (measured: a 60 Hz head serving Speed
+    /// encoded 40 of its 60 frames a second), so the head gets the same
+    /// interval of headroom a headless Wayland output gets, from the shared
+    /// `paced_output_refresh_hz` for the requested preset's rate: 120 Hz for
+    /// Speed on a 60 Hz display, 60 Hz for a 30 fps preset on a 30 Hz one.
+    /// The display's own rate is kept when it is already high enough, when
+    /// an EDID cannot describe the paced timing at this size, for a request
+    /// that names no preset, and for Wayland sessions (see
+    /// [`Self::wayland_session_refresh_hz`]). A desktop keeps the refresh it
+    /// was created at across reattachments.
+    pub fn xorg_session_refresh_hz(&self, width: u32, height: u32, display_refresh_hz: u32) -> u32 {
+        use arcen_media::video::{paced_output_refresh_hz, pipeline_contract};
+        use arcen_session::desktop_provider::DesktopProvider;
+        if self.desktop_provider != DesktopProvider::Xorg {
+            return display_refresh_hz;
+        }
+        let Some(pipeline) = self.requested_pipeline else {
+            return display_refresh_hz;
+        };
+        let paced =
+            paced_output_refresh_hz(display_refresh_hz, pipeline_contract(pipeline).max_fps)
+                .min(MAX_XORG_HEAD_REFRESH_HZ);
+        if paced > display_refresh_hz
+            && arcen_outputs::edid::cvt_reduced_blanking(width, height, paced).is_ok()
+        {
+            paced
+        } else {
+            display_refresh_hz
+        }
+    }
+
+    /// Whether this is a Wayland Speed session the host's record has no
+    /// measured or inferred rate for with any codec it may encode with: the
+    /// display a qualification should measure next.
+    #[must_use]
+    pub fn wayland_speed_unqualified(
+        &self,
+        width: u32,
+        height: u32,
+        display_refresh_hz: u32,
+    ) -> bool {
+        self.wayland_qualification.is_some()
+            && self
+                .wayland_speed_refreshes(display_refresh_hz)
+                .is_some_and(|refreshes| {
+                    std::iter::once(self.codec.as_str())
+                        .chain(arcen_session::wayland_qualification::QUALIFY_CODECS)
+                        .all(|codec| {
+                            self.wayland_speed_decision(width, height, codec, &refreshes)
+                                .is_none()
+                        })
+                })
+    }
+
+    /// Whether every headless Wayland session on this host is served by the
+    /// software encoder, which is known before a session exists: the
+    /// operator pinned `software-h264`, or `auto` on a host whose
+    /// qualification record proves no native encoder opened (an Intel or
+    /// AMD host, a GPU without an encoder). An `nvenc` pin stays native and
+    /// fails visibly, as on Xorg. Always false for Xorg sessions, whose
+    /// display is fitted before its modeset instead.
+    pub fn wayland_software_sessions(&self) -> bool {
+        use arcen_session::desktop_provider::{CapabilityFact, DesktopProvider};
+        if self.desktop_provider != DesktopProvider::Wayland {
+            return false;
+        }
+        match self.encoder {
+            EncoderSelection::SoftwareH264 => true,
+            EncoderSelection::Auto => self.wayland_qualification.as_ref().is_some_and(|host| {
+                host.record().proven_native_encoder() == CapabilityFact::Missing
+            }),
+            _ => false,
+        }
+    }
+
+    /// The encoder every capenc of this host's sessions is asked for: the
+    /// configured one, except that a Wayland host without a native encoder
+    /// asks for software directly instead of failing each native attempt.
+    pub fn session_encoder(&self) -> EncoderSelection {
+        if self.wayland_software_sessions() {
+            EncoderSelection::SoftwareH264
+        } else {
+            self.encoder
+        }
+    }
+
+    /// The size a headless Wayland session's output is created at for a
+    /// served display of `width`x`height`: the display's own, fitted to the
+    /// software encoder's limits when software serves every session here
+    /// (a Wayland output is created once, before any encoder exists).
+    pub fn wayland_session_size(&self, width: u32, height: u32) -> (u32, u32) {
+        if self.wayland_software_sessions() {
+            crate::media::capenc::fit_to_encoder_limits(
+                EncoderSelection::SoftwareH264,
+                width,
+                height,
+            )
+        } else {
+            (width, height)
+        }
+    }
+
+    /// Whether the host's qualification record proves capenc's GPU import
+    /// (a `gpu-convert` route whose frames matched the host-copy reference
+    /// and were encoded). capenc ignores it outside a Wayland session.
+    pub fn wayland_gpu_import_verified(&self) -> bool {
+        self.wayland_qualification
+            .as_ref()
+            .is_some_and(|qualified| {
+                qualified.record().proven_gpu_import()
+                    == arcen_session::desktop_provider::CapabilityFact::Available
+            })
+    }
+
+    /// Whether the host's qualification record proves cursor metadata (a
+    /// sprite bitmap on a `metadata` cursor-mode stream), which a desktop
+    /// needs before it records its cursor for the Deck to draw.
+    pub fn wayland_cursor_metadata_proven(&self) -> bool {
+        self.wayland_qualification
+            .as_ref()
+            .is_some_and(|qualified| {
+                qualified.record().proven_cursor_metadata()
+                    == arcen_session::desktop_provider::CapabilityFact::Available
+            })
+    }
+
+    /// How a headless Wayland desktop opened for `response` records its
+    /// cursor (`resolve_stream_cursor_mode`), logged with its reasons.
+    pub fn wayland_stream_cursor_mode(
+        &self,
+        response: &arcen_protocol::messages::AuthResponse,
+    ) -> crate::session::wayland::StreamCursorMode {
+        let proven = self.wayland_cursor_metadata_proven();
+        let mode = arcen_media::video::capture_handoff::resolve_stream_cursor_mode(
+            response.cursor_preference,
+            response.cursor_image_v1,
+            proven,
+        );
+        let mode =
+            crate::session::wayland::StreamCursorMode::from_screencast(mode).unwrap_or_default();
+        if self.desktop_provider == arcen_session::desktop_provider::DesktopProvider::Wayland {
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                cursor_preference = ?response.cursor_preference,
+                deck_cursor_images = response.cursor_image_v1,
+                cursor_metadata_proven = proven,
+                stream_cursor_mode = mode.token(),
+                "cursor mode for a Wayland desktop this connection opens (a reattached desktop keeps its own)"
+            );
+        }
+        mode
+    }
+
+    /// The host's wide-composition proof, on a Wayland host whose record
+    /// carries one.
+    fn wayland_fidelity_proof(
+        &self,
+    ) -> Option<&arcen_session::wayland_qualification::FidelityProof> {
+        use arcen_session::desktop_provider::DesktopProvider;
+        if self.desktop_provider != DesktopProvider::Wayland {
+            return None;
+        }
+        self.wayland_qualification
+            .as_ref()
+            .and_then(|qualified| qualified.record().fidelity())
+    }
+
+    /// How a new Wayland desktop gets its seat (`wayland.session_mode` and
+    /// the record's native-seat proof). An Xorg desktop is never native.
+    #[must_use]
+    pub fn desktop_seat_plan(&self) -> arcen_session::native_seat::DesktopSeatPlan {
+        use arcen_session::native_seat::{plan_desktop_seat, DesktopSeatPlan};
+        if self.desktop_provider != arcen_session::desktop_provider::DesktopProvider::Wayland {
+            return DesktopSeatPlan::Headless { fallback: None };
+        }
+        plan_desktop_seat(
+            self.wayland_session_mode,
+            self.wayland_qualification
+                .as_deref()
+                .and_then(arcen_session::wayland_qualification::QualifiedHost::native_seat),
+        )
+    }
+
+    /// The route to a wide composition a new headless Wayland session
+    /// starts with: only when the authenticated request resolved to Grading
+    /// or HDR and the host's record proves that preset on this route
+    /// (`force-hdr` on Mutter 50 and later). Every other session keeps the
+    /// compositor's default colour state, so Auto and Speed are untouched.
+    pub fn wayland_fidelity_route(&self) -> Option<&str> {
+        use arcen_media::video::PipelineId;
+        use arcen_session::desktop_provider::CapabilityFact;
+        let facts = &self.wayland_qualification.as_ref()?.record().facts;
+        let proven = match self.requested_pipeline? {
+            PipelineId::Grading => facts.grading,
+            PipelineId::Hdr => facts.hdr,
+            _ => return None,
+        };
+        // `requested_pipeline` is what `wayland_fidelity_fallback` left: an
+        // eight-bit pin was already served as Auto there.
+        (proven == CapabilityFact::Available)
+            .then(|| self.wayland_fidelity_proof()?.route.as_deref())
+            .flatten()
+    }
+
+    /// The capenc tokens that carry the record's wide-composition proof to
+    /// a ten-bit Wayland epoch (`fidelity-route=`, `wide-proven=`,
+    /// `sdr-white=`): nothing the record does not prove.
+    pub fn wayland_fidelity_args(&self) -> Vec<String> {
+        let Some(proof) = self.wayland_fidelity_proof() else {
+            return Vec::new();
+        };
+        let mut args = Vec::new();
+        if let Some(route) = proof.route.as_deref() {
+            args.push(format!("fidelity-route={route}"));
+        }
+        // Format and memory together: capenc offers only these formats and
+        // trusts a frame's precision only for its own pair.
+        let mut pairs = Vec::new();
+        for ramp in proof.proven() {
+            let pair = format!("{}@{}", ramp.format, ramp.memory);
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+        if !pairs.is_empty() {
+            args.push(format!("wide-proven={}", pairs.join(",")));
+        }
+        if let Some(nits) = proof.sdr_white_nits {
+            args.push(format!("sdr-white={nits}"));
+        }
+        args
+    }
+
+    /// A headless Wayland session serves Grading and HDR only when the
+    /// host's qualification record proves them (a wide composition route,
+    /// a ramp read back with native-wide precision through the wide
+    /// capture, SDR white at 203 nits). Otherwise the request is served as
+    /// the best proven contract, visibly — HDR as Grading when only Grading
+    /// is proven, else Auto — with the record's reason (for example
+    /// `compositor_lacks_hdr_screencast` on Mutter 49, which has no HDR
+    /// screen sharing), never failing the session.
+    fn wayland_fidelity_fallback(
+        &self,
+        resolved: arcen_media::video::ResolvedHostInitialVideo,
+    ) -> arcen_media::video::ResolvedHostInitialVideo {
+        use arcen_media::video::{pipeline_contract, PipelineId};
+        use arcen_session::desktop_provider::{CapabilityFact, DesktopProvider};
+        if self.desktop_provider != DesktopProvider::Wayland {
+            return resolved;
+        }
+        // An administrator's pinned eight-bit variant cannot be served as a
+        // ten-bit contract: no wide route, no PQ desktop, the pin kept and
+        // the session visibly Auto.
+        if matches!(
+            resolved.pipeline,
+            Some(PipelineId::Grading | PipelineId::Hdr)
+        ) && resolved.video.bit_depth != arcen_media::BitDepth::Ten
+        {
+            tracing::info!(
+                target: crate::logging::target::MEDIA,
+                requested = resolved.pipeline.map_or("none", PipelineId::token),
+                served = PipelineId::Auto.token(),
+                decision = "downgrade",
+                reason = "variant_pinned_eight_bit",
+                pinned_variant = %arcen_media::video::VideoVariant::new(resolved.video).id(),
+                "the administrator's pinned eight-bit variant keeps this Wayland session out of the ten-bit Grading and HDR contracts; served visibly as Auto"
+            );
+            return arcen_media::video::ResolvedHostInitialVideo {
+                pipeline: Some(PipelineId::Auto),
+                ..resolved
+            };
+        }
+        let facts = self
+            .wayland_qualification
+            .as_ref()
+            .map(|qualified| &qualified.record().facts);
+        // A fact without the proof's route (a record written without the
+        // fidelity section) satisfies nothing.
+        let routed = self
+            .wayland_fidelity_proof()
+            .is_some_and(|proof| proof.route.is_some());
+        let proven =
+            |fact: Option<CapabilityFact>| routed && fact == Some(CapabilityFact::Available);
+        let gap = self
+            .wayland_fidelity_proof()
+            .and_then(|proof| proof.gap.clone());
+        let (requested, served_pipeline, reason) = match resolved.pipeline {
+            // The proof covers one output; nothing proves several at once.
+            Some(pipeline @ (PipelineId::Grading | PipelineId::Hdr))
+                if self.wayland_multi_output =>
+            {
+                (
+                    pipeline,
+                    PipelineId::Auto,
+                    "fidelity_multi_output_unqualified".to_owned(),
+                )
+            }
+            Some(PipelineId::Grading) if !proven(facts.map(|facts| facts.grading)) => (
+                PipelineId::Grading,
+                PipelineId::Auto,
+                gap.unwrap_or_else(|| "eight_bit_source".to_owned()),
+            ),
+            Some(PipelineId::Hdr) if !proven(facts.map(|facts| facts.hdr)) => {
+                if proven(facts.map(|facts| facts.grading)) {
+                    (
+                        PipelineId::Hdr,
+                        PipelineId::Grading,
+                        "hdr_output_not_proven".to_owned(),
+                    )
+                } else {
+                    (
+                        PipelineId::Hdr,
+                        PipelineId::Auto,
+                        gap.unwrap_or_else(|| "hdr_on_eight_bit_source".to_owned()),
+                    )
+                }
+            }
+            _ => return resolved,
+        };
+        let contract = pipeline_contract(served_pipeline);
+        let served = arcen_media::video::ResolvedHostInitialVideo {
+            video: arcen_media::VideoConfiguration {
+                codec: resolved.video.codec,
+                ..contract.colour
+            },
+            selection: contract.selection,
+            pipeline: Some(served_pipeline),
+            encode_intent: contract.intent,
+            max_fps: resolved.max_fps.min(contract.max_fps),
+        };
+        tracing::warn!(
+            target: crate::logging::target::MEDIA,
+            requested = requested.token(),
+            served = served_pipeline.token(),
+            decision = "downgrade",
+            reason = %reason,
+            detail = self
+                .wayland_fidelity_proof()
+                .and_then(|proof| proof.detail.as_deref())
+                .unwrap_or("the host's qualification record proves no Wayland wide composition"),
+            requested_variant = %arcen_media::video::VideoVariant::new(resolved.video).id(),
+            served_variant = %arcen_media::video::VideoVariant::new(served.video).id(),
+            fps = served.max_fps,
+            "the headless Wayland session cannot serve the requested preset; served visibly as another"
+        );
+        served
+    }
+
+    /// A ten-bit plan on an attached eight-bit Xorg desktop is served
+    /// visibly as Auto: the desktop's depth is fixed for its life, and its
+    /// samples cannot honestly fill a ten-bit stream.
+    fn fixed_desktop_depth_fallback(
+        &self,
+        resolved: arcen_media::video::ResolvedHostInitialVideo,
+    ) -> (arcen_media::video::ResolvedHostInitialVideo, bool) {
+        let Some(depth) = self.attached_desktop_depth else {
+            return (resolved, false);
+        };
+        match arcen_media::video::serve_on_fixed_depth(depth, resolved) {
+            arcen_media::video::FixedDepthOutcome::Served(resolved) => (resolved, false),
+            arcen_media::video::FixedDepthOutcome::Downgraded {
+                served,
+                requested,
+                reason,
+            } => {
+                tracing::warn!(
+                    target: crate::logging::target::MEDIA,
+                    requested = requested.map_or("custom", arcen_media::video::PipelineId::token),
+                    served = arcen_media::video::PipelineId::Auto.token(),
+                    decision = "downgrade",
+                    reason = reason.token(),
+                    desktop_depth = depth.x11_depth(),
+                    requested_variant = %arcen_media::video::VideoVariant::new(resolved.video).id(),
+                    served_variant = %arcen_media::video::VideoVariant::new(served.video).id(),
+                    remedy = "sign out of the remote desktop and reconnect with Grading or HDR, or set video.x11_desktop_depth to 30",
+                    "this persistent Xorg desktop was started at eight bits and cannot serve a ten-bit preset; served visibly as Auto"
+                );
+                (served, true)
+            }
+        }
+    }
+
+    /// The depth a new Xorg desktop created by this sign-in starts at, from
+    /// the plan it resolved (`apply_initial_video_request` first).
+    #[must_use]
+    pub fn new_x11_desktop_depth(&self) -> arcen_media::video::DepthDecision {
+        arcen_media::video::choose_desktop_depth(
+            self.x11_desktop_depth,
+            self.session_bit_depth(),
+            self.desktop_encoding,
+        )
+    }
+
+    /// Whether this sign-in, attached to a desktop of `depth`, resolved a
+    /// plan that desktop cannot serve.
+    #[must_use]
+    pub fn exceeds_desktop_depth(&self, depth: arcen_media::video::DesktopDepth) -> bool {
+        self.session_bit_depth() > depth.max_bit_depth()
+    }
+
+    /// The component depth this sign-in's first capture is started at: the
+    /// same resolution `capenc_config` applies.
+    fn session_bit_depth(&self) -> arcen_media::BitDepth {
+        self.color_policy.resolve_bit_depth(self.bit_depth, None)
     }
 
     /// Resolve the Deck's auth-time video intent before display mutation or
@@ -430,12 +1084,19 @@ impl Config {
             },
         )
         .map_err(|error| format!("initial video request: {error}"))?;
+        let resolved = self.wayland_fidelity_fallback(resolved);
+        let (resolved, desktop_depth_downgraded) = self.fixed_desktop_depth_fallback(resolved);
+        self.desktop_depth_downgraded = desktop_depth_downgraded;
         self.auth_video_request = Some(request.clone());
         self.requested_pipeline = resolved.pipeline;
         // The lab pipe carries compositor-tagged PQ, so it vouches for itself,
         // but only PQ sessions read it; every other session reads Xorg.
-        let desktop = if experimental_rgb10_pipe().is_some()
-            && resolved.video.transfer == arcen_media::TransferCharacteristics::Pq
+        // A Grading or HDR session on a qualified Wayland host is composed by
+        // the compositor in BT.2100 and screencast as tagged PQ / BT.2020:
+        // HDR keeps PQ, Grading is converted to BT.709 by capenc.
+        let desktop = if (experimental_rgb10_pipe().is_some()
+            && resolved.video.transfer == arcen_media::TransferCharacteristics::Pq)
+            || self.wayland_fidelity_route().is_some()
         {
             arcen_media::video::DesktopSignalEncoding::Rec2100Pq
         } else {
@@ -484,6 +1145,29 @@ impl Config {
         Ok(())
     }
 
+    /// What a Pier serving headless Wayland sessions can serve as virtual
+    /// outputs, from the compositor version and the concurrent outputs its
+    /// valid qualification record proved; `None` on an Xorg Pier or without
+    /// a record.
+    #[must_use]
+    pub fn multi_monitor_virtual_outputs(
+        &self,
+    ) -> Option<crate::session::multi_monitor::VirtualOutputGate> {
+        if self.desktop_provider != arcen_session::desktop_provider::DesktopProvider::Wayland {
+            return None;
+        }
+        let host = self.wayland_qualification.as_ref()?;
+        let mode = arcen_session::wayland_outputs::VirtualOutputMode::for_compositor_major(
+            arcen_session::wayland_outputs::parse_compositor_major(
+                &host.record().host.stack.compositor_version,
+            ),
+        );
+        Some(crate::session::multi_monitor::VirtualOutputGate::new(
+            mode,
+            host.max_concurrent_outputs(),
+        ))
+    }
+
     pub fn resolve_session_agent_binary(&self) -> Option<PathBuf> {
         crate::current_pier_exe()
     }
@@ -497,6 +1181,9 @@ impl Config {
     }
 
     pub fn resolved_multi_monitor_encoder(&self) -> EncoderSelection {
+        if self.multi_monitor_virtual_outputs().is_some() {
+            return self.wayland_multi_monitor_encoder();
+        }
         if self.multi_monitor.advertise_enabled
             && self.encoder == EncoderSelection::Auto
             && !self.multi_monitor.heads.is_empty()
@@ -504,6 +1191,23 @@ impl Config {
             EncoderSelection::NativeNvenc
         } else {
             self.encoder
+        }
+    }
+
+    /// The concrete encoder a Wayland multi-monitor roster is planned with:
+    /// the operator's pin, or for `auto` the encoder this host's Wayland
+    /// sessions encode with ([`Self::session_encoder`]: software when the
+    /// qualification record proves no native encoder, native NVENC
+    /// otherwise). Every multi-monitor plan needs a concrete encoder (`auto`
+    /// could fall back per monitor); the capacity and admission seam
+    /// (`media::encoder_admission`, with the software rules
+    /// `session::multi_monitor` applies to `SoftwareH264`) takes whatever
+    /// this returns.
+    #[must_use]
+    pub fn wayland_multi_monitor_encoder(&self) -> EncoderSelection {
+        match self.session_encoder() {
+            EncoderSelection::Auto => EncoderSelection::NativeNvenc,
+            concrete => concrete,
         }
     }
 }
@@ -536,6 +1240,10 @@ impl Default for Config {
             variant_pinned: false,
             auth_video_request: None,
             requested_pipeline: None,
+            wayland_multi_output: false,
+            x11_desktop_depth: arcen_media::video::DesktopDepthPolicy::default(),
+            attached_desktop_depth: None,
+            desktop_depth_downgraded: false,
             active_pipeline: None,
             fps: 60,
             monitor: 1,
@@ -554,6 +1262,19 @@ impl Default for Config {
             session_agent_bin: None,
             session_launcher_bin: None,
             desktop_session: "gnome".to_string(),
+            provider_preference: arcen_session::desktop_provider::ProviderPreference::Auto,
+            desktop_provider: arcen_session::desktop_provider::DesktopProvider::Xorg,
+            wayland_qualification_target:
+                arcen_session::wayland_qualification::QualificationTarget::production(),
+            first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Run,
+            wayland_lab_seat_pen: false,
+            wayland_session_mode: arcen_session::native_seat::SessionMode::Auto,
+            wayland_auto_requalify: true,
+            wayland_compositor_prefix: None,
+            wayland_qualification: None,
+            wayland_output_refresh_hz: None,
+            wayland_x11_apps: arcen_session::wayland_x11::X11AppsSetting::Auto,
+            wayland_x11_plan: None,
             session_display: ":10".to_string(),
             session_gpu_head: "DFP-1".to_string(),
             xorg_bin: PathBuf::from("/usr/libexec/Xorg"),
@@ -562,6 +1283,7 @@ impl Default for Config {
             input_mode: InputMode::None,
             audio_enabled: false,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::default(),
             audiocap_bin: None,
             audio_user_mode: AudioUserMode::Session,
             microphone_input_enabled: false,
@@ -1224,6 +1946,26 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     cfg.tls_expected_sans = file.tls.expected_sans;
     validate_expected_sans(&cfg.tls_expected_sans)?;
 
+    cfg.provider_preference = file
+        .capture
+        .desktop_provider_for(arcen_session::desktop_provider::PierPlatform::Linux {
+            wayland_adapter_built: crate::session::wayland::WAYLAND_ADAPTER_BUILT,
+        })
+        .map_err(|error| format!("Pier config: {error}"))?;
+    cfg.wayland_qualification_target =
+        arcen_session::wayland_qualification::QualificationTarget::from_config(
+            file.capture.wayland_qualification_record.as_deref(),
+        )
+        .map_err(|error| format!("Pier config capture.wayland_qualification_record: {error}"))?;
+    cfg.first_login_setup = file.wayland.first_login_setup;
+    cfg.wayland_lab_seat_pen = file.wayland.lab_seat_pen;
+    cfg.wayland_session_mode = file.wayland.session_mode;
+    cfg.wayland_auto_requalify = file.capture.wayland_auto_requalify.unwrap_or(true);
+    if let Some(prefix) = file.capture.wayland_compositor_prefix.as_deref() {
+        arcen_session::compositor_prefix::CompositorPrefix::parse(prefix)
+            .map_err(|error| format!("Pier config capture.wayland_compositor_prefix: {error}"))?;
+    }
+    cfg.wayland_compositor_prefix = file.capture.wayland_compositor_prefix;
     if file.capture.binary.is_some() {
         warn_ignored_helper_path("capture.binary");
     }
@@ -1271,6 +2013,16 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
                     format!("Pier config video.desktop_encoding {value:?}: expected one of {known}")
                 })?;
     }
+    if let Some(value) = file.video.x11_desktop_depth {
+        cfg.x11_desktop_depth =
+            arcen_media::video::DesktopDepthPolicy::from_token(&value.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    let known = arcen_media::video::DesktopDepthPolicy::TOKENS.join(", ");
+                    format!(
+                        "Pier config video.x11_desktop_depth {value:?}: expected one of {known}"
+                    )
+                })?;
+    }
     if let Some(value) = file.video.variant {
         apply_variant(cfg, &value)
             .map_err(|error| format!("Pier config video.variant: {error}"))?;
@@ -1280,6 +2032,7 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     cfg.audio_enabled = file.audio.enabled;
     cfg.audio_compressed = file.audio.compressed;
+    cfg.local_playback = file.audio.local_playback;
     cfg.microphone_input_enabled = file.microphone_input.enabled;
 
     if let Some(value) = file.clipboard.direction {
@@ -1356,6 +2109,9 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     if let Some(value) = platform.session.xorg_bin {
         cfg.xorg_bin = PathBuf::from(value);
+    }
+    if let Some(value) = platform.session.wayland_x11_apps {
+        cfg.wayland_x11_apps = value;
     }
     if let Some(value) = platform.session.xorg_config_template {
         cfg.xorg_config_template = PathBuf::from(value);
@@ -1699,6 +2455,531 @@ fn last_boolean_override(args: &[String], enabled: &str, disabled: &str) -> Opti
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_wayland_speed_decision_rests_on_measured_or_inferred_evidence() {
+        use arcen_session::desktop_provider::CapabilityFact;
+        use arcen_session::wayland_qualification::{
+            CaptureRoute, GpuDriver, HostIdentity, OsRelease, PierBuild, QualifiedFacts,
+            RateEvidence, SourceRateMeasurement, StackVersions, WaylandQualificationRecord,
+            SCHEMA_VERSION,
+        };
+        let rate = |width, height, refresh_hz, fps| SourceRateMeasurement {
+            width,
+            height,
+            display_refresh_hz: 60,
+            refresh_hz,
+            codec: "h265".into(),
+            route: CaptureRoute::HostCopy,
+            sustained_source_fps: Some(fps),
+            seconds: 8,
+            evidence: RateEvidence::Measured,
+        };
+        let host = HostIdentity {
+            pier: PierBuild {
+                version: "0.17.0".into(),
+                revision: "test".into(),
+                executable_sha256: "ab".repeat(32),
+            },
+            stack: StackVersions {
+                compositor: arcen_session::wayland_session::HeadlessCompositor::GnomeShell,
+                compositor_version: "49.4".into(),
+                compositor_prefix: None,
+                pipewire_version: "1.4.11".into(),
+                gpu_driver: Some(GpuDriver {
+                    vendor: "nvidia".into(),
+                    version: "580.105.08".into(),
+                    drm: true,
+                    modeset: Some(true),
+                }),
+            },
+        };
+        let record = WaylandQualificationRecord {
+            schema_version: SCHEMA_VERSION,
+            qualified_at_unix_s: 0,
+            host: host.clone(),
+            os: OsRelease {
+                id: "test".into(),
+                version_id: "1".into(),
+                kernel: "6".into(),
+            },
+            facts: QualifiedFacts {
+                capture_route: None,
+                input: None,
+                source_rates: vec![rate(1920, 1080, 120, 59), rate(2560, 1600, 60, 60)],
+                audio_monitor: CapabilityFact::Unknown,
+                grading: CapabilityFact::Missing,
+                hdr: CapabilityFact::Missing,
+                x11_apps: None,
+                cursor_metadata: CapabilityFact::Unknown,
+                native_seat: None,
+                multi_output: None,
+                fidelity: None,
+                encoder: None,
+            },
+        };
+        {
+            use crate::session::wayland::StreamCursorMode;
+            use arcen_protocol::messages::{AuthResponse, CursorMode};
+            let mut proven = record.clone();
+            proven.facts.cursor_metadata = CapabilityFact::Available;
+            let wayland = |record: &WaylandQualificationRecord| Config {
+                wayland_qualification: Some(Arc::new(record.clone().validate(&host).unwrap())),
+                desktop_provider: arcen_session::desktop_provider::DesktopProvider::Wayland,
+                ..Config::default()
+            };
+            let deck = AuthResponse::none().with_cursor_image_v1(true);
+            assert!(wayland(&proven).wayland_cursor_metadata_proven());
+            assert_eq!(
+                wayland(&proven).wayland_stream_cursor_mode(&deck),
+                StreamCursorMode::Metadata
+            );
+            assert_eq!(
+                wayland(&record).wayland_stream_cursor_mode(&deck),
+                StreamCursorMode::Hidden,
+                "unproven metadata leaves the cursor to the Deck, out of the video"
+            );
+            assert_eq!(
+                wayland(&proven).wayland_stream_cursor_mode(&AuthResponse::none()),
+                StreamCursorMode::Hidden,
+                "a Deck without cursor images draws its own, never a second in the video"
+            );
+            assert_eq!(
+                wayland(&proven).wayland_stream_cursor_mode(
+                    &deck.clone().with_cursor_preference(CursorMode::Host)
+                ),
+                StreamCursorMode::Embedded
+            );
+        }
+        let config = |refresh_hz: Option<u32>| Config {
+            wayland_qualification: Some(Arc::new(record.clone().validate(&host).unwrap())),
+            wayland_output_refresh_hz: refresh_hz,
+            codec: "h265".into(),
+            ..Config::default()
+        };
+        // 59 holds Speed's floor: the contract's 60 fps is admitted.
+        assert_eq!(
+            config(Some(120)).wayland_speed_capture_rate(None, 1920, 1080),
+            Some(60)
+        );
+        // At 60 Hz this size was not measured; the larger 2560x1600 output
+        // was, at 60 Hz, so it is inferred and says so.
+        let inferred = config(Some(60))
+            .wayland_speed_capture_decision(None, 1920, 1080)
+            .unwrap();
+        assert_eq!(inferred.evidence.token(), "inferred:2560x1600");
+        // Never inferred upward or for another codec.
+        assert_eq!(
+            config(Some(60)).wayland_speed_capture_rate(None, 3840, 2160),
+            None
+        );
+        assert_eq!(
+            Config {
+                codec: "h264".into(),
+                ..config(Some(60))
+            }
+            .wayland_speed_capture_rate(None, 1920, 1080),
+            None
+        );
+        // Without the session's refresh nothing qualifies.
+        assert_eq!(
+            config(None).wayland_speed_capture_rate(None, 1920, 1080),
+            None
+        );
+
+        // The session's output: the lowest refresh with evidence, for a
+        // Speed request on Wayland; a measurement beats an inference.
+        use arcen_media::video::PipelineId;
+        use arcen_session::desktop_provider::DesktopProvider;
+        let session = |provider, pipeline| Config {
+            desktop_provider: provider,
+            requested_pipeline: pipeline,
+            ..config(None)
+        };
+        let speed = session(DesktopProvider::Wayland, Some(PipelineId::Speed));
+        assert_eq!(speed.wayland_session_refresh_hz(1920, 1080, 60), 120);
+        assert_eq!(speed.wayland_session_refresh_hz(1800, 1130, 60), 60);
+        assert_eq!(speed.wayland_session_refresh_hz(1920, 1080, 144), 144);
+        // No evidence at this size: the display's rate, and it is the
+        // display the next qualification measures.
+        assert_eq!(speed.wayland_session_refresh_hz(3840, 2160, 60), 60);
+        assert!(speed.wayland_speed_unqualified(3840, 2160, 60));
+        assert!(!speed.wayland_speed_unqualified(1800, 1130, 60));
+        assert!(!session(DesktopProvider::Wayland, Some(PipelineId::Auto))
+            .wayland_speed_unqualified(3840, 2160, 60));
+        for (provider, pipeline) in [
+            (DesktopProvider::Wayland, Some(PipelineId::Auto)),
+            (DesktopProvider::Wayland, None),
+            (DesktopProvider::Xorg, Some(PipelineId::Speed)),
+        ] {
+            assert_eq!(
+                session(provider, pipeline).wayland_session_refresh_hz(1920, 1080, 60),
+                60,
+                "{provider:?} {pipeline:?}"
+            );
+        }
+        let unqualified = Config {
+            wayland_qualification: None,
+            ..speed
+        };
+        assert_eq!(unqualified.wayland_session_refresh_hz(1920, 1080, 60), 60);
+        // GPU import is proven only by a verified GPU route.
+        assert!(!config(None).wayland_gpu_import_verified());
+
+        // A record that proves no native encoder: every Wayland session is
+        // software, its output fitted to OpenH264 before it exists.
+        let mut software_record = record.clone();
+        software_record.facts.encoder = Some(arcen_session::wayland_qualification::EncoderProof {
+            native: CapabilityFact::Missing,
+            capture_route_encoder: Some("openh264-sw-h264".into()),
+        });
+        let software_host = Config {
+            desktop_provider: DesktopProvider::Wayland,
+            wayland_qualification: Some(Arc::new(software_record.validate(&host).unwrap())),
+            ..Config::default()
+        };
+        assert_eq!(software_host.encoder, EncoderSelection::Auto);
+        assert!(software_host.wayland_software_sessions());
+        assert_eq!(
+            software_host.session_encoder(),
+            EncoderSelection::SoftwareH264
+        );
+        assert_eq!(software_host.wayland_session_size(2560, 1600), (1920, 1200));
+        assert_eq!(software_host.wayland_session_size(1800, 1130), (1800, 1130));
+        // Its multi-monitor roster is planned on the same encoder.
+        assert_eq!(
+            software_host.wayland_multi_monitor_encoder(),
+            EncoderSelection::SoftwareH264
+        );
+        assert_eq!(
+            config(None).wayland_multi_monitor_encoder(),
+            EncoderSelection::NativeNvenc
+        );
+        // An nvenc pin stays native (and fails visibly), as on Xorg.
+        let pinned = Config {
+            encoder: EncoderSelection::NativeNvenc,
+            ..software_host.clone()
+        };
+        assert!(!pinned.wayland_software_sessions());
+        assert_eq!(
+            pinned.wayland_multi_monitor_encoder(),
+            EncoderSelection::NativeNvenc
+        );
+        assert_eq!(pinned.wayland_session_size(2560, 1600), (2560, 1600));
+        // A software pin on Wayland fits too; on Xorg nothing changes here.
+        let wayland_pin = Config {
+            encoder: EncoderSelection::SoftwareH264,
+            desktop_provider: DesktopProvider::Wayland,
+            ..Config::default()
+        };
+        assert!(wayland_pin.wayland_software_sessions());
+        let xorg_pin = Config {
+            encoder: EncoderSelection::SoftwareH264,
+            desktop_provider: DesktopProvider::Xorg,
+            ..Config::default()
+        };
+        assert!(!xorg_pin.wayland_software_sessions());
+        assert_eq!(xorg_pin.wayland_session_size(2560, 1600), (2560, 1600));
+        assert_eq!(xorg_pin.session_encoder(), EncoderSelection::SoftwareH264);
+        // A record with a native encoder, or none read yet, stays native.
+        let native = Config {
+            desktop_provider: DesktopProvider::Wayland,
+            ..config(None)
+        };
+        assert!(!native.wayland_software_sessions());
+        assert_eq!(native.session_encoder(), EncoderSelection::Auto);
+    }
+
+    #[test]
+    fn a_new_xorg_head_runs_at_the_paced_refresh_for_the_requested_preset() {
+        use arcen_media::video::PipelineId;
+        use arcen_session::desktop_provider::DesktopProvider;
+        let session = |provider, pipeline| Config {
+            desktop_provider: provider,
+            requested_pipeline: pipeline,
+            ..Config::default()
+        };
+        let speed = session(DesktopProvider::Xorg, Some(PipelineId::Speed));
+        assert_eq!(speed.xorg_session_refresh_hz(1800, 1168, 60), 120);
+        assert_eq!(speed.xorg_session_refresh_hz(2560, 1440, 30), 120);
+        // Already fast enough: the display's own.
+        assert_eq!(speed.xorg_session_refresh_hz(1920, 1080, 144), 144);
+        // An EDID cannot describe 4K at 120 Hz: the display's rate.
+        assert_eq!(speed.xorg_session_refresh_hz(3840, 2160, 60), 60);
+        // A 30 fps preset on a 30 Hz display gets 60 Hz; on 60 Hz, 60.
+        for pipeline in [PipelineId::Auto, PipelineId::Grading] {
+            let session = session(DesktopProvider::Xorg, Some(pipeline));
+            assert_eq!(session.xorg_session_refresh_hz(2560, 1440, 30), 60);
+            assert_eq!(session.xorg_session_refresh_hz(1800, 1168, 60), 60);
+        }
+        // No preset named, or a Wayland session: the display's rate.
+        assert_eq!(
+            session(DesktopProvider::Xorg, None).xorg_session_refresh_hz(1800, 1168, 60),
+            60
+        );
+        assert_eq!(
+            session(DesktopProvider::Wayland, Some(PipelineId::Speed))
+                .xorg_session_refresh_hz(1800, 1168, 60),
+            60
+        );
+    }
+
+    #[test]
+    fn a_wayland_session_serves_grading_and_hdr_as_auto() {
+        use arcen_media::video::{pipeline_contract, PipelineId, ResolvedHostInitialVideo};
+        let requested = |pipeline: PipelineId| ResolvedHostInitialVideo {
+            video: pipeline_contract(pipeline).colour,
+            selection: pipeline_contract(pipeline).selection,
+            pipeline: Some(pipeline),
+            encode_intent: pipeline_contract(pipeline).intent,
+            max_fps: pipeline_contract(pipeline).max_fps,
+        };
+        let xorg = Config::default();
+        let wayland = Config {
+            desktop_provider: arcen_session::desktop_provider::DesktopProvider::Wayland,
+            ..Config::default()
+        };
+        let auto = pipeline_contract(PipelineId::Auto);
+        for pipeline in [PipelineId::Grading, PipelineId::Hdr] {
+            let served = wayland.wayland_fidelity_fallback(requested(pipeline));
+            assert_eq!(served.pipeline, Some(PipelineId::Auto), "{pipeline:?}");
+            assert_eq!(served.video.bit_depth, auto.colour.bit_depth);
+            assert_eq!(served.video.transfer, auto.colour.transfer);
+            assert_eq!(served.video.chroma, auto.colour.chroma);
+            assert_eq!(served.video.codec, requested(pipeline).video.codec);
+            assert!(served.max_fps <= auto.max_fps);
+            // Xorg keeps its own Grading and HDR paths.
+            assert_eq!(
+                xorg.wayland_fidelity_fallback(requested(pipeline)),
+                requested(pipeline)
+            );
+        }
+        for pipeline in [PipelineId::Auto, PipelineId::Speed] {
+            assert_eq!(
+                wayland.wayland_fidelity_fallback(requested(pipeline)),
+                requested(pipeline)
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_wayland_host_serves_grading_and_hdr_on_its_route() {
+        use arcen_media::video::{pipeline_contract, PipelineId, ResolvedHostInitialVideo};
+        use arcen_session::desktop_provider::{CapabilityFact, DesktopProvider};
+        use arcen_session::wayland_qualification::{
+            FidelityProof, HostIdentity, OsRelease, PierBuild, QualifiedFacts, RampProof,
+            StackVersions, WaylandQualificationRecord, SCHEMA_VERSION,
+        };
+        let host = HostIdentity {
+            pier: PierBuild {
+                version: "0.17.0".into(),
+                revision: "test".into(),
+                executable_sha256: "ab".repeat(32),
+            },
+            stack: StackVersions {
+                compositor: arcen_session::wayland_session::HeadlessCompositor::GnomeShell,
+                compositor_version: "50.6".into(),
+                compositor_prefix: None,
+                pipewire_version: "1.6.2".into(),
+                gpu_driver: None,
+            },
+        };
+        let record = |grading, hdr, fidelity| WaylandQualificationRecord {
+            schema_version: SCHEMA_VERSION,
+            qualified_at_unix_s: 0,
+            host: host.clone(),
+            os: OsRelease {
+                id: "test".into(),
+                version_id: "1".into(),
+                kernel: "6".into(),
+            },
+            facts: QualifiedFacts {
+                capture_route: None,
+                input: None,
+                source_rates: Vec::new(),
+                audio_monitor: CapabilityFact::Unknown,
+                grading,
+                hdr,
+                fidelity,
+                multi_output: None,
+                x11_apps: None,
+                encoder: None,
+                cursor_metadata: CapabilityFact::Unknown,
+                native_seat: None,
+            },
+        };
+        let proof = FidelityProof {
+            route: Some("force-hdr".into()),
+            gap: None,
+            detail: None,
+            ramps: vec![
+                RampProof {
+                    format: "xbgr2101010".into(),
+                    memory: "dmabuf".into(),
+                    expected_codes: 1024,
+                    distinct_codes: 1024,
+                    max_error_codes: 0,
+                    native_wide: true,
+                    channels_verified: true,
+                },
+                RampProof {
+                    format: "rgba-f16".into(),
+                    memory: "dmabuf".into(),
+                    expected_codes: 1024,
+                    distinct_codes: 986,
+                    max_error_codes: 1,
+                    native_wide: true,
+                    channels_verified: true,
+                },
+                // Measured but not proven: never offered or trusted.
+                RampProof {
+                    format: "xrgb2101010".into(),
+                    memory: "host-shared".into(),
+                    expected_codes: 1024,
+                    distinct_codes: 256,
+                    max_error_codes: 3,
+                    native_wide: false,
+                    channels_verified: false,
+                },
+            ],
+            sdr_white_nits: Some(203),
+        };
+        let session = |record: WaylandQualificationRecord, pipeline| Config {
+            desktop_provider: DesktopProvider::Wayland,
+            wayland_qualification: Some(Arc::new(record.validate(&host).unwrap())),
+            requested_pipeline: Some(pipeline),
+            ..Config::default()
+        };
+        let requested = |pipeline: PipelineId| ResolvedHostInitialVideo {
+            video: pipeline_contract(pipeline).colour,
+            selection: pipeline_contract(pipeline).selection,
+            pipeline: Some(pipeline),
+            encode_intent: pipeline_contract(pipeline).intent,
+            max_fps: pipeline_contract(pipeline).max_fps,
+        };
+        let proven = record(
+            CapabilityFact::Available,
+            CapabilityFact::Available,
+            Some(proof.clone()),
+        );
+        for pipeline in [PipelineId::Grading, PipelineId::Hdr] {
+            let config = session(proven.clone(), pipeline);
+            assert_eq!(
+                config.wayland_fidelity_fallback(requested(pipeline)),
+                requested(pipeline)
+            );
+            assert_eq!(config.wayland_fidelity_route(), Some("force-hdr"));
+            assert_eq!(
+                config.wayland_fidelity_args(),
+                [
+                    "fidelity-route=force-hdr",
+                    "wide-proven=xbgr2101010@dmabuf,rgba-f16@dmabuf",
+                    "sdr-white=203"
+                ]
+            );
+        }
+        // Auto and Speed sessions keep the compositor's default colour state.
+        for pipeline in [PipelineId::Auto, PipelineId::Speed] {
+            assert_eq!(
+                session(proven.clone(), pipeline).wayland_fidelity_route(),
+                None
+            );
+        }
+        // The proof covers one output: a multi-monitor desktop serves
+        // Grading and HDR as Auto, eight-bit.
+        for pipeline in [PipelineId::Grading, PipelineId::Hdr] {
+            let multi = Config {
+                wayland_multi_output: true,
+                ..session(proven.clone(), pipeline)
+            };
+            let served = multi.wayland_fidelity_fallback(requested(pipeline));
+            assert_eq!(served.pipeline, Some(PipelineId::Auto), "{pipeline:?}");
+            assert_eq!(
+                served.video.bit_depth,
+                pipeline_contract(PipelineId::Auto).colour.bit_depth
+            );
+        }
+        // Only Grading proven: HDR is served as Grading on the same route.
+        let grading_only = record(
+            CapabilityFact::Available,
+            CapabilityFact::Missing,
+            Some(proof.clone()),
+        );
+        let served = session(grading_only.clone(), PipelineId::Hdr)
+            .wayland_fidelity_fallback(requested(PipelineId::Hdr));
+        assert_eq!(served.pipeline, Some(PipelineId::Grading));
+        assert_eq!(
+            session(grading_only, PipelineId::Grading).wayland_fidelity_route(),
+            Some("force-hdr")
+        );
+        // An administrator's pinned eight-bit variant on a proven host: the
+        // Grading or HDR request is served visibly as Auto on the pin, with no
+        // route and no PQ desktop, and the session is not refused.
+        for pipeline in [
+            arcen_protocol::messages::StreamPipeline::Grading,
+            arcen_protocol::messages::StreamPipeline::Hdr,
+        ] {
+            let mut pinned = Config {
+                variant_pinned: true,
+                codec_pinned: true,
+                codec: "h265".into(),
+                chroma: "yuv420".into(),
+                bit_depth: arcen_media::BitDepth::Eight,
+                ..session(proven.clone(), PipelineId::Auto)
+            };
+            pinned.requested_pipeline = None;
+            let mut request = initial_video(
+                VideoSelectionIntent::ColorFidelity,
+                "h265",
+                "yuv444",
+                "10",
+                "full",
+            );
+            request.pipeline = Some(pipeline);
+            pinned
+                .apply_initial_video_request(&request)
+                .expect("an eight-bit pin does not refuse the session");
+            assert_eq!(pinned.requested_pipeline, Some(PipelineId::Auto));
+            assert_eq!(pinned.wayland_fidelity_route(), None);
+            assert_eq!(pinned.bit_depth, arcen_media::BitDepth::Eight);
+            assert_eq!(
+                pinned.desktop_encoding,
+                arcen_media::video::DesktopSignalEncoding::Sdr
+            );
+        }
+        // Facts without the fidelity section prove nothing.
+        let unproven = record(CapabilityFact::Available, CapabilityFact::Available, None);
+        for pipeline in [PipelineId::Grading, PipelineId::Hdr] {
+            let config = session(unproven.clone(), pipeline);
+            assert_eq!(
+                config
+                    .wayland_fidelity_fallback(requested(pipeline))
+                    .pipeline,
+                Some(PipelineId::Auto)
+            );
+            assert_eq!(config.wayland_fidelity_route(), None);
+        }
+        // Mutter 49: no route, the gap travels as the reason, Auto is served.
+        let gap = FidelityProof {
+            route: None,
+            gap: Some("compositor_lacks_hdr_screencast".into()),
+            detail: Some("Mutter 49.4 has no HDR screen sharing".into()),
+            ramps: Vec::new(),
+            sdr_white_nits: None,
+        };
+        let refused = session(
+            record(CapabilityFact::Missing, CapabilityFact::Missing, Some(gap)),
+            PipelineId::Hdr,
+        );
+        assert_eq!(
+            refused
+                .wayland_fidelity_fallback(requested(PipelineId::Hdr))
+                .pipeline,
+            Some(PipelineId::Auto)
+        );
+        assert_eq!(refused.wayland_fidelity_route(), None);
+        assert!(refused.wayland_fidelity_args().is_empty());
+    }
+
     fn parse(args: &[String]) -> Result<Config, String> {
         let mut isolated = Vec::with_capacity(args.len() + 1);
         if !args
@@ -1875,6 +3156,128 @@ mod tests {
     }
 
     #[test]
+    fn a_ten_bit_request_on_an_eight_bit_desktop_is_served_visibly_as_auto() {
+        use arcen_media::video::{DepthReason, DesktopDepth, PipelineId};
+        let grading = initial_video(
+            VideoSelectionIntent::ColorFidelity,
+            "h265",
+            "yuv444",
+            "10",
+            "full",
+        );
+        let host = Config {
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            chroma: "yuv444".to_string(),
+            ..Config::default()
+        };
+
+        // A sign-in that creates the desktop: ten bits for Grading.
+        let mut created = host.clone();
+        created.apply_initial_video_request(&grading).unwrap();
+        assert_eq!(created.requested_pipeline, Some(PipelineId::Grading));
+        assert!(!created.desktop_depth_downgraded);
+        let decision = created.new_x11_desktop_depth();
+        assert_eq!(decision.depth, DesktopDepth::Ten);
+        assert_eq!(decision.reason, DepthReason::TenBitSession);
+        assert!(!created.exceeds_desktop_depth(DesktopDepth::Ten));
+        assert!(created.exceeds_desktop_depth(DesktopDepth::Eight));
+
+        // Reattaching to a ten-bit desktop changes nothing.
+        let mut on_ten = Config {
+            attached_desktop_depth: Some(DesktopDepth::Ten),
+            ..host.clone()
+        };
+        on_ten.apply_initial_video_request(&grading).unwrap();
+        assert_eq!(on_ten.requested_pipeline, Some(PipelineId::Grading));
+        assert_eq!(on_ten.bit_depth, arcen_media::BitDepth::Ten);
+        assert!(!on_ten.desktop_depth_downgraded);
+
+        // Reattaching to an eight-bit desktop: Auto, eight bits, flagged.
+        let mut on_eight = Config {
+            attached_desktop_depth: Some(DesktopDepth::Eight),
+            ..host.clone()
+        };
+        on_eight.apply_initial_video_request(&grading).unwrap();
+        assert_eq!(on_eight.requested_pipeline, Some(PipelineId::Auto));
+        assert_eq!(on_eight.bit_depth, arcen_media::BitDepth::Eight);
+        assert_eq!(
+            on_eight.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Auto)
+        );
+        assert!(on_eight.desktop_depth_downgraded);
+        assert!(!on_eight.exceeds_desktop_depth(DesktopDepth::Eight));
+
+        // An eight-bit request is never touched by the desktop's depth.
+        let auto = initial_video(
+            VideoSelectionIntent::AdaptivePerformance,
+            "h265",
+            "yuv420",
+            "8",
+            "limited",
+        );
+        let mut auto_on_eight = Config {
+            attached_desktop_depth: Some(DesktopDepth::Eight),
+            ..host.clone()
+        };
+        auto_on_eight.apply_initial_video_request(&auto).unwrap();
+        assert!(!auto_on_eight.desktop_depth_downgraded);
+        let mut auto_created = host;
+        auto_created.apply_initial_video_request(&auto).unwrap();
+        assert_eq!(
+            auto_created.new_x11_desktop_depth().depth,
+            DesktopDepth::Eight
+        );
+    }
+
+    #[test]
+    fn x11_desktop_depth_is_read_from_the_pier_file_and_unknown_tokens_fail() {
+        use arcen_media::video::{DesktopDepth, DesktopDepthPolicy};
+        let file_with = |token: &str| -> crate::config::PierFileConfig {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "video":{{"x11_desktop_depth":"{token}"}},
+                    "platform": {{}}
+                }}"#
+            ))
+            .expect("config")
+        };
+        assert_eq!(
+            Config::default().x11_desktop_depth,
+            DesktopDepthPolicy::Auto
+        );
+        for (token, policy) in [
+            ("auto", DesktopDepthPolicy::Auto),
+            ("AUTO", DesktopDepthPolicy::Auto),
+            ("24", DesktopDepthPolicy::Pinned(DesktopDepth::Eight)),
+            ("30", DesktopDepthPolicy::Pinned(DesktopDepth::Ten)),
+        ] {
+            let mut cfg = Config::default();
+            apply_file_config(&mut cfg, file_with(token)).expect("apply file config");
+            assert_eq!(cfg.x11_desktop_depth, policy, "{token}");
+        }
+        let error = apply_file_config(&mut Config::default(), file_with("10"))
+            .expect_err("unknown token must fail");
+        assert!(error.contains("video.x11_desktop_depth"), "{error}");
+        assert!(error.contains("auto, 24, 30"), "{error}");
+
+        // A pin of 30 gives every new desktop ten bits, even for Auto.
+        let pinned = Config {
+            x11_desktop_depth: DesktopDepthPolicy::Pinned(DesktopDepth::Ten),
+            ..Config::default()
+        };
+        assert_eq!(pinned.new_x11_desktop_depth().depth, DesktopDepth::Ten);
+        // A declared PQ desktop is ten-bit under `auto`.
+        let pq = Config {
+            desktop_encoding: arcen_media::video::DesktopSignalEncoding::Rec2100Pq,
+            ..Config::default()
+        };
+        assert_eq!(pq.new_x11_desktop_depth().depth, DesktopDepth::Ten);
+    }
+
+    #[test]
     fn xorg_downgrades_hdr_transfer_but_keeps_the_ten_bit_grading_path() {
         let mut hdr = initial_video(
             VideoSelectionIntent::ColorFidelity,
@@ -2030,6 +3433,126 @@ mod tests {
             !argv.iter().any(|arg| arg.starts_with("desktop-encoding=")),
             "{argv:?}"
         );
+    }
+
+    #[test]
+    fn the_wayland_qualification_record_is_read_from_the_pier_file() {
+        let file_with = |capture: &str| -> crate::config::PierFileConfig {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "capture":{capture},
+                    "platform": {{}}
+                }}"#
+            ))
+            .expect("config")
+        };
+        let mut cfg = Config::default();
+        assert!(cfg.wayland_qualification_target.is_production());
+        apply_file_config(&mut cfg, file_with("{}")).expect("apply file config");
+        assert!(cfg.wayland_qualification_target.is_production());
+        apply_file_config(
+            &mut cfg,
+            file_with(r#"{"wayland_qualification_record":"/var/lib/arcen-dev/speed/q.json"}"#),
+        )
+        .expect("apply file config");
+        assert_eq!(
+            cfg.wayland_qualification_target.record_path(),
+            "/var/lib/arcen-dev/speed/q.json"
+        );
+        assert_ne!(
+            cfg.wayland_qualification_target.temporary_user(),
+            arcen_session::wayland_qualification::QUALIFY_TEMPORARY_USER
+        );
+        let error = apply_file_config(
+            &mut Config::default(),
+            file_with(r#"{"wayland_qualification_record":"relative.json"}"#),
+        )
+        .expect_err("a relative record path must fail");
+        assert!(
+            error.contains("capture.wayland_qualification_record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_compositor_prefix_defaults_to_the_system_and_is_validated() {
+        let file_with = |capture: &str| -> crate::config::PierFileConfig {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "capture":{capture},
+                    "platform": {{}}
+                }}"#
+            ))
+            .expect("config")
+        };
+        let mut cfg = Config::default();
+        apply_file_config(&mut cfg, file_with("{}")).expect("apply file config");
+        assert_eq!(cfg.wayland_compositor_prefix, None);
+        apply_file_config(
+            &mut cfg,
+            file_with(r#"{"wayland_compositor_prefix":"/opt/arcen-gnome/51"}"#),
+        )
+        .expect("apply file config");
+        assert_eq!(
+            cfg.wayland_compositor_prefix.as_deref(),
+            Some("/opt/arcen-gnome/51")
+        );
+        for refused in [
+            r#""opt/gnome""#,
+            r#""/opt/../tmp""#,
+            r#""/""#,
+            r#""/opt/a:b""#,
+        ] {
+            let error = apply_file_config(
+                &mut Config::default(),
+                file_with(&format!(r#"{{"wayland_compositor_prefix":{refused}}}"#)),
+            )
+            .expect_err("a malformed prefix must fail");
+            assert!(
+                error.contains("capture.wayland_compositor_prefix"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn x11_apps_in_wayland_sessions_default_to_auto_and_follow_only_the_resolved_plan() {
+        use arcen_session::wayland_x11::{X11AppsDisabledReason, X11AppsPlan, X11AppsSetting};
+        let file_with = |session: &str| {
+            serde_json::from_str::<crate::config::PierFileConfig>(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "platform":{{"session":{session}}}
+                }}"#
+            ))
+        };
+        let mut cfg = Config::default();
+        apply_file_config(&mut cfg, file_with("{}").expect("config")).expect("apply");
+        assert_eq!(cfg.wayland_x11_apps, X11AppsSetting::Auto);
+        assert!(!cfg.wayland_x11_apps_enabled());
+        for (token, setting) in [
+            ("on", X11AppsSetting::On),
+            ("off", X11AppsSetting::Off),
+            ("auto", X11AppsSetting::Auto),
+        ] {
+            let mut cfg = Config::default();
+            apply_file_config(
+                &mut cfg,
+                file_with(&format!(r#"{{"wayland_x11_apps":"{token}"}}"#)).expect("config"),
+            )
+            .expect("apply");
+            assert_eq!(cfg.wayland_x11_apps, setting);
+        }
+        assert!(file_with(r#"{"wayland_x11_apps":"yes"}"#).is_err());
+        cfg.wayland_x11_plan = Some(X11AppsPlan::Disabled(X11AppsDisabledReason::NotQualified));
+        assert!(!cfg.wayland_x11_apps_enabled());
+        cfg.wayland_x11_plan = Some(X11AppsPlan::Enabled);
+        assert!(cfg.wayland_x11_apps_enabled());
     }
 
     #[test]

@@ -312,8 +312,8 @@ use objc2_metal::{
     MTLTexture,
 };
 use objc2_quartz_core::{
-    kCAFilterLinear, kCAFilterTrilinear, kCAGravityResize, CAEDRMetadata, CAMetalDrawable,
-    CAMetalLayer, CATransaction,
+    kCAFilterLinear, kCAFilterNearest, kCAFilterTrilinear, kCAGravityResize, CAEDRMetadata,
+    CAMetalDrawable, CAMetalLayer, CATransaction,
 };
 
 use super::video_render::{
@@ -379,6 +379,24 @@ fn log_window_presenter_state(
         refresh_hz = ?refresh_period.map(|period| 1.0 / period.as_secs_f64()),
         "dedicated video presenter window state",
     );
+}
+
+/// The presenter window facts worth a log line when they change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowStateKey {
+    rect: CGRect,
+    contents_scale: f64,
+    display_id: Option<CGDirectDisplayID>,
+    visible: bool,
+}
+
+/// Records `key` and says whether it differs from the last one logged.
+fn window_state_changed(last: &mut Option<WindowStateKey>, key: WindowStateKey) -> bool {
+    if *last == Some(key) {
+        return false;
+    }
+    *last = Some(key);
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -491,6 +509,78 @@ fn apply_dedicated_layer_source_drawable_size(
     layer.set_source_drawable_size(drawable_size);
     layer.commit_drawable_transaction();
     layer.flush_drawable_transaction();
+}
+
+/// How Core Animation should magnify the source-sized drawable into the
+/// layer's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerScaling {
+    /// The frame is an exact whole multiple of the drawable on both axes
+    /// (a pinned 1800x1168 stream in 1800x1168 points at Retina 2x): each
+    /// stream pixel becomes a crisp NxN block of backing pixels, so text
+    /// stays pixel-exact instead of being blurred by bilinear magnification.
+    Exact,
+    /// Any other ratio (aspect-fit, windowed): filtered resampling.
+    Resampled,
+}
+
+/// Decides [`LayerScaling`] from the layer frame in points, its contents
+/// scale and the drawable size in pixels.
+fn layer_scaling(frame: CGSize, contents_scale: f64, drawable: CGSize) -> LayerScaling {
+    const TOLERANCE_PX: f64 = 0.01;
+    if drawable.width < 1.0 || drawable.height < 1.0 {
+        return LayerScaling::Resampled;
+    }
+    let backing_width = frame.width * normalized_contents_scale(contents_scale);
+    let backing_height = frame.height * normalized_contents_scale(contents_scale);
+    let factor = (backing_width / drawable.width).round();
+    let exact = factor >= 1.0
+        && (backing_width - factor * drawable.width).abs() <= TOLERANCE_PX
+        && (backing_height - factor * drawable.height).abs() <= TOLERANCE_PX;
+    if exact {
+        LayerScaling::Exact
+    } else {
+        LayerScaling::Resampled
+    }
+}
+
+/// Keeps the drawable at the source size and the magnification filter
+/// matched to the scale, touching Core Animation only when either changes:
+/// a transaction flush per frame costs presenter-thread time for nothing.
+fn sync_source_drawable_and_scaling(
+    layer: &CAMetalLayer,
+    drawable: CGSize,
+    applied: &mut Option<(CGSize, CGSize, LayerScaling)>,
+) {
+    if layer.drawableSize() != drawable {
+        apply_dedicated_layer_source_drawable_size(layer, drawable);
+    }
+    let frame = layer.frame().size;
+    let scaling = layer_scaling(frame, layer.contentsScale(), drawable);
+    if applied.is_some_and(|(last_frame, last_drawable, last_scaling)| {
+        last_frame == frame && last_drawable == drawable && last_scaling == scaling
+    }) {
+        return;
+    }
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    // SAFETY: immutable QuartzCore constants with static lifetime.
+    layer.setMagnificationFilter(unsafe {
+        match scaling {
+            LayerScaling::Exact => kCAFilterNearest,
+            LayerScaling::Resampled => kCAFilterLinear,
+        }
+    });
+    CATransaction::commit();
+    tracing::info!(
+        target: crate::logging::target::VIDEO,
+        frame = ?(frame.width, frame.height),
+        contents_scale = layer.contentsScale(),
+        drawable = ?(drawable.width, drawable.height),
+        ?scaling,
+        "dedicated video layer scaling"
+    );
+    *applied = Some((frame, drawable, scaling));
 }
 
 fn configure_dedicated_layer_scaling(layer: &CAMetalLayer) {
@@ -869,6 +959,8 @@ pub struct DedicatedVideoLayer {
     pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     texture_cache: apple_cf::cv::CVMetalTextureCache,
     last_colorspace: Option<PresentationColorSpace>,
+    /// Frame, drawable and filter last applied by `sync_source_drawable_and_scaling`.
+    applied_scaling: Option<(CGSize, CGSize, LayerScaling)>,
     in_flight: Arc<Mutex<LayerInFlightGate>>,
     /// When the decoded planes were last sampled for the log.
     plane_statistics_logged_at: Option<std::time::Instant>,
@@ -933,6 +1025,7 @@ impl DedicatedVideoLayer {
             pipeline_state,
             texture_cache,
             last_colorspace: None,
+            applied_scaling: None,
             in_flight: Arc::new(Mutex::new(LayerInFlightGate::default())),
             plane_statistics_logged_at: None,
         })
@@ -1306,9 +1399,10 @@ impl DedicatedVideoLayer {
         let luma_height = pixel_buffer.height_of_plane(0);
         let chroma_width = pixel_buffer.width_of_plane(1);
         let chroma_height = pixel_buffer.height_of_plane(1);
-        apply_dedicated_layer_source_drawable_size(
-            &*self.layer,
+        sync_source_drawable_and_scaling(
+            &self.layer,
             source_drawable_size(luma_width, luma_height),
+            &mut self.applied_scaling,
         );
 
         let Some((luma_cv, luma_ptr)) =
@@ -1397,7 +1491,13 @@ impl DedicatedVideoLayer {
             present_minimum_duration_s(refresh_period),
         );
         telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
-        install_presented_handler(drawable_for_present, telemetry, Arc::clone(&in_flight));
+        install_presented_handler(
+            drawable_for_present,
+            telemetry,
+            Arc::clone(&in_flight),
+            frame.arrival_host_time,
+            target_host_time,
+        );
         let retained_frame = TenBitInFlightFrame {
             _pixel_buffer: pixel_buffer.clone(),
             _luma_cv: luma_cv,
@@ -1575,6 +1675,8 @@ pub struct DedicatedEightBitVideoLayer {
     pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     texture_cache: apple_cf::cv::CVMetalTextureCache,
     last_colorspace: Option<PresentationColorSpace>,
+    /// Frame, drawable and filter last applied by `sync_source_drawable_and_scaling`.
+    applied_scaling: Option<(CGSize, CGSize, LayerScaling)>,
     in_flight: Arc<Mutex<LayerInFlightGate>>,
 }
 
@@ -1650,6 +1752,7 @@ impl DedicatedEightBitVideoLayer {
             pipeline_state,
             texture_cache,
             last_colorspace: None,
+            applied_scaling: None,
             in_flight: Arc::new(Mutex::new(LayerInFlightGate::default())),
         })
     }
@@ -1778,9 +1881,10 @@ impl DedicatedEightBitVideoLayer {
         let luma_height = pixel_buffer.height_of_plane(0);
         let chroma_width = pixel_buffer.width_of_plane(1);
         let chroma_height = pixel_buffer.height_of_plane(1);
-        apply_dedicated_layer_source_drawable_size(
-            &*self.layer,
+        sync_source_drawable_and_scaling(
+            &self.layer,
             source_drawable_size(luma_width, luma_height),
+            &mut self.applied_scaling,
         );
 
         let Some((luma_cv, luma_ptr)) =
@@ -1868,7 +1972,13 @@ impl DedicatedEightBitVideoLayer {
             present_minimum_duration_s(refresh_period),
         );
         telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
-        install_presented_handler(drawable_for_present, telemetry, Arc::clone(&in_flight));
+        install_presented_handler(
+            drawable_for_present,
+            telemetry,
+            Arc::clone(&in_flight),
+            frame.arrival_host_time,
+            target_host_time,
+        );
         let retained_frame = EightBitInFlightFrame {
             _pixel_buffer: pixel_buffer.clone(),
             _luma_cv: luma_cv,
@@ -1911,6 +2021,9 @@ pub struct DedicatedEightBitVideoPresenter {
     last_rect: Option<CGRect>,
     presentation_status: DedicatedEightBitPresentationStatus,
     surface_visible: bool,
+    /// What the last "dedicated video presenter window state" line said, so
+    /// the per-egui-pass sync logs a change once instead of every pass.
+    logged_window_state: Option<WindowStateKey>,
 }
 
 // SAFETY: all cross-thread rendering is guarded by the presenter's external
@@ -2077,6 +2190,11 @@ struct DedicatedPresenterTelemetry {
     interval_3x_plus: AtomicU64,
     latency_sample_count: AtomicU64,
     latency_us: Mutex<Vec<u64>>,
+    /// Frame arrival to the drawable's real `presentedTime`.
+    on_glass_latency_us: Mutex<Vec<u64>>,
+    /// Real `presentedTime` minus the refresh the frame was submitted for:
+    /// zero when the frame made its target vsync.
+    presented_after_target_us: Mutex<Vec<u64>>,
     submitted_presented_at: Mutex<Vec<std::time::Instant>>,
     confirmed_presented_at: Mutex<Vec<std::time::Instant>>,
     last_submitted_host_time_us: AtomicU64,
@@ -2108,6 +2226,10 @@ pub(crate) struct DedicatedPresenterTelemetryDelta {
     pub(crate) interval_3x_plus: u64,
     pub(crate) latency_p50_us: Option<u64>,
     pub(crate) latency_p99_us: Option<u64>,
+    /// Frame arrival to the drawable's confirmed on-glass time.
+    pub(crate) on_glass_latency_p50_us: Option<u64>,
+    pub(crate) on_glass_latency_p99_us: Option<u64>,
+    pub(crate) presented_after_target_p50_us: Option<u64>,
     pub(crate) submitted_presented_at: Vec<std::time::Instant>,
     pub(crate) confirmed_presented_at: Vec<std::time::Instant>,
     pub(crate) refresh_period_us: Option<u64>,
@@ -2209,6 +2331,28 @@ impl DedicatedPresenterTelemetry {
             .push(std::time::Instant::now());
     }
 
+    /// Records the real on-glass time of a frame that arrived at
+    /// `arrival_host_time` and was submitted for `target_host_time`. All three
+    /// are host (mach) time.
+    fn record_on_glass(
+        &self,
+        presented_host_time: Duration,
+        arrival_host_time: Duration,
+        target_host_time: Duration,
+    ) {
+        if let Some(latency) = presented_host_time.checked_sub(arrival_host_time) {
+            self.on_glass_latency_us
+                .lock()
+                .expect("on-glass telemetry poisoned")
+                .push(duration_micros(latency));
+        }
+        let late = presented_host_time.saturating_sub(target_host_time);
+        self.presented_after_target_us
+            .lock()
+            .expect("on-glass telemetry poisoned")
+            .push(duration_micros(late));
+    }
+
     fn record_confirmed(&self) {
         self.frames_confirmed.fetch_add(1, Ordering::Relaxed);
         self.confirmed_presented_at
@@ -2223,6 +2367,24 @@ impl DedicatedPresenterTelemetry {
         let latency_p50_us = percentile(&samples, 50);
         let latency_p99_us = percentile(&samples, 99);
         samples.clear();
+        drop(samples);
+        let mut on_glass = self
+            .on_glass_latency_us
+            .lock()
+            .expect("on-glass telemetry poisoned");
+        on_glass.sort_unstable();
+        let on_glass_latency_p50_us = percentile(&on_glass, 50);
+        let on_glass_latency_p99_us = percentile(&on_glass, 99);
+        on_glass.clear();
+        drop(on_glass);
+        let mut after_target = self
+            .presented_after_target_us
+            .lock()
+            .expect("on-glass telemetry poisoned");
+        after_target.sort_unstable();
+        let presented_after_target_p50_us = percentile(&after_target, 50);
+        after_target.clear();
+        drop(after_target);
         let submitted_presented_at = self
             .submitted_presented_at
             .lock()
@@ -2260,6 +2422,9 @@ impl DedicatedPresenterTelemetry {
             interval_3x_plus: self.interval_3x_plus.swap(0, Ordering::Relaxed),
             latency_p50_us,
             latency_p99_us,
+            on_glass_latency_p50_us,
+            on_glass_latency_p99_us,
+            presented_after_target_p50_us,
             submitted_presented_at,
             confirmed_presented_at,
             refresh_period_us,
@@ -2293,6 +2458,8 @@ fn install_presented_handler(
     drawable: &ProtocolObject<dyn MTLDrawable>,
     telemetry: Arc<DedicatedPresenterTelemetry>,
     in_flight: Arc<Mutex<LayerInFlightGate>>,
+    arrival_host_time: Duration,
+    target_host_time: Duration,
 ) {
     let handler = RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
         // SAFETY: Metal invokes the block with the drawable being presented.
@@ -2302,12 +2469,13 @@ fn install_presented_handler(
             telemetry.record_presented_time_unconfirmed();
         } else {
             telemetry.record_confirmed();
+            telemetry.record_on_glass(presented, arrival_host_time, target_host_time);
         }
         in_flight
             .lock()
             .expect("in-flight gate poisoned")
             .completed();
-        tracing::debug!(
+        tracing::trace!(
             target: crate::logging::target::VIDEO,
             presented_time_s = presented.as_secs_f64(),
             confirmed = !presented.is_zero(),
@@ -2912,7 +3080,7 @@ where
             arrival_host_time,
             replayed_after_restore: false,
         });
-        tracing::debug!(
+        tracing::trace!(
             target: crate::logging::target::VIDEO,
             arrival_host_time_us = duration_micros(arrival_host_time),
             queue_depth = state.pacer.queue_depth(),
@@ -3102,7 +3270,6 @@ impl DedicatedEightBitVideoPresenter {
             return self.record_outcome(DedicatedLayerOutcome::NoContentView);
         };
         let display_id = display_id_for_window(&window);
-        log_window_presenter_state(&window, display_id, None, "attach_or_resize_8bit");
         let bounds = view.bounds();
         let content_rect = CGRect {
             origin: CGPoint {
@@ -3114,7 +3281,17 @@ impl DedicatedEightBitVideoPresenter {
                 height: f64::from(rect.height()),
             },
         };
-        self.attach_or_resize_on_display(content_rect, window.backingScaleFactor(), display_id)
+        let contents_scale = window.backingScaleFactor();
+        let key = WindowStateKey {
+            rect: content_rect,
+            contents_scale,
+            display_id,
+            visible,
+        };
+        if window_state_changed(&mut self.logged_window_state, key) {
+            log_window_presenter_state(&window, display_id, None, "attach_or_resize_8bit");
+        }
+        self.attach_or_resize_on_display(content_rect, contents_scale, display_id)
     }
 
     fn attach_or_resize_on_display(
@@ -3235,6 +3412,7 @@ impl DedicatedEightBitVideoPresenter {
     pub fn teardown(&mut self) {
         self.thread.teardown();
         self.last_rect = None;
+        self.logged_window_state = None;
         self.presentation_status = DedicatedEightBitPresentationStatus::Inactive;
     }
 }
@@ -3253,6 +3431,9 @@ pub struct DedicatedVideoPresenter {
     last_rect: Option<CGRect>,
     presentation_status: DedicatedPresentationStatus,
     surface_visible: bool,
+    /// What the last "dedicated video presenter window state" line said, so
+    /// the per-egui-pass sync logs a change once instead of every pass.
+    logged_window_state: Option<WindowStateKey>,
 }
 
 // SAFETY: all cross-thread rendering is guarded by the presenter's external
@@ -3282,7 +3463,6 @@ impl DedicatedVideoPresenter {
             return self.record_outcome(DedicatedLayerOutcome::NoContentView);
         };
         let display_id = display_id_for_window(&window);
-        log_window_presenter_state(&window, display_id, None, "attach_or_resize_10bit");
         let bounds = view.bounds();
         let content_rect = CGRect {
             origin: CGPoint {
@@ -3294,7 +3474,17 @@ impl DedicatedVideoPresenter {
                 height: f64::from(rect.height()),
             },
         };
-        self.attach_or_resize_on_display(content_rect, window.backingScaleFactor(), display_id)
+        let contents_scale = window.backingScaleFactor();
+        let key = WindowStateKey {
+            rect: content_rect,
+            contents_scale,
+            display_id,
+            visible,
+        };
+        if window_state_changed(&mut self.logged_window_state, key) {
+            log_window_presenter_state(&window, display_id, None, "attach_or_resize_10bit");
+        }
+        self.attach_or_resize_on_display(content_rect, contents_scale, display_id)
     }
 
     fn attach_or_resize_on_display(
@@ -3399,6 +3589,7 @@ impl DedicatedVideoPresenter {
     pub fn teardown(&mut self) {
         self.thread.teardown();
         self.last_rect = None;
+        self.logged_window_state = None;
         self.presentation_status = DedicatedPresentationStatus::Inactive;
     }
 }
@@ -3955,6 +4146,23 @@ mod tests {
     }
 
     #[test]
+    fn on_glass_latency_runs_from_arrival_to_the_real_presented_time() {
+        let telemetry = DedicatedPresenterTelemetry::default();
+        let ms = Duration::from_millis;
+        // Two frames that made their target vsync, one that was a refresh late.
+        telemetry.record_on_glass(ms(1_066), ms(1_000), ms(1_066));
+        telemetry.record_on_glass(ms(2_050), ms(2_000), ms(2_050));
+        telemetry.record_on_glass(ms(3_100), ms(3_000), ms(3_066));
+        let delta = telemetry.drain();
+        assert_eq!(delta.on_glass_latency_p50_us, Some(66_000));
+        assert_eq!(delta.on_glass_latency_p99_us, Some(66_000));
+        assert_eq!(delta.presented_after_target_p50_us, Some(0));
+        let empty = telemetry.drain();
+        assert_eq!(empty.on_glass_latency_p50_us, None);
+        assert_eq!(empty.presented_after_target_p50_us, None);
+    }
+
+    #[test]
     fn rgb10a2unorm_is_90_not_the_552_the_task_brief_cited() {
         // Verified directly against `objc2-metal-0.3.2/src/generated/MTLPixelFormat.rs`:
         // `MTLPixelFormatRGB10A2Unorm` is `90`. `552` (this task's own brief
@@ -4233,5 +4441,766 @@ mod tests {
         // on a decode thread and hand it to the main thread for rendering.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DedicatedLayerFrame>();
+    }
+}
+
+/// Runs `video_metal_layer.metal` on the real Metal device: the production
+/// pipeline state, plane textures in the production pixel formats, and the
+/// production uniform bytes, read back and compared with the CPU reference.
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+    use arcen_media::{BitDepth, ChromaSubsampling, ColorMatrix, ColorRange};
+    use objc2_metal::{
+        MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureDescriptor,
+        MTLTextureUsage,
+    };
+
+    struct Picture {
+        width: usize,
+        height: usize,
+        luma: Vec<u16>,
+        chroma_width: usize,
+        chroma_height: usize,
+        /// `(Cb, Cr)` per chroma texel.
+        chroma: Vec<[u16; 2]>,
+    }
+
+    fn region(width: usize, height: usize) -> MTLRegion {
+        MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width,
+                height,
+                depth: 1,
+            },
+        }
+    }
+
+    fn plane_bytes(codes: &[u16], depth: BitDepth) -> Vec<u8> {
+        match depth {
+            BitDepth::Eight => codes.iter().map(|&code| code as u8).collect(),
+            BitDepth::Ten => codes
+                .iter()
+                .flat_map(|&code| (code << 6).to_le_bytes())
+                .collect(),
+            BitDepth::Twelve => codes
+                .iter()
+                .flat_map(|&code| (code << 4).to_le_bytes())
+                .collect(),
+        }
+    }
+
+    fn texture(
+        device: &ProtocolObject<dyn MTLDevice>,
+        format: MTLPixelFormat,
+        width: usize,
+        height: usize,
+        usage: MTLTextureUsage,
+    ) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        // SAFETY: plain descriptor construction with a valid format and size.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                format, width, height, false,
+            )
+        };
+        descriptor.setUsage(usage);
+        descriptor.setStorageMode(MTLStorageMode::Managed);
+        device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("texture allocation")
+    }
+
+    /// Renders `picture` through `fs_convert` and returns BGRA8 pixels, or
+    /// `None` when this machine has no Metal device.
+    fn render(picture: &Picture, contract: VideoColorContract) -> Option<Vec<[u8; 4]>> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue().expect("command queue");
+        let pipeline =
+            build_pipeline_state(&device, MTLPixelFormat::BGRA8Unorm).expect("shader compiles");
+        let plan = plane_pixel_formats(contract.depth);
+        let sample_bytes = if contract.depth == BitDepth::Eight {
+            1
+        } else {
+            2
+        };
+
+        let luma = texture(
+            &device,
+            plan.luma_format,
+            picture.width,
+            picture.height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let luma_bytes = plane_bytes(&picture.luma, contract.depth);
+        let chroma = texture(
+            &device,
+            plan.chroma_format,
+            picture.chroma_width,
+            picture.chroma_height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let chroma_codes: Vec<u16> = picture.chroma.iter().flatten().copied().collect();
+        let chroma_bytes = plane_bytes(&chroma_codes, contract.depth);
+        // SAFETY: each byte vector holds exactly `region` at the stated row
+        // pitch and outlives the synchronous copy.
+        unsafe {
+            luma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(picture.width, picture.height),
+                0,
+                NonNull::new(luma_bytes.as_ptr() as *mut c_void).expect("non-empty"),
+                picture.width * sample_bytes,
+            );
+            chroma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(picture.chroma_width, picture.chroma_height),
+                0,
+                NonNull::new(chroma_bytes.as_ptr() as *mut c_void).expect("non-empty"),
+                picture.chroma_width * sample_bytes * 2,
+            );
+        }
+        let target = texture(
+            &device,
+            MTLPixelFormat::BGRA8Unorm,
+            picture.width,
+            picture.height,
+            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+        );
+
+        let uniform = MetalVideoUniform::from_contract(
+            contract,
+            (picture.width as u32, picture.height as u32),
+            (picture.chroma_width as u32, picture.chroma_height as u32),
+            plan.code_unnormalize_scale,
+        )
+        .to_bytes();
+        // SAFETY: the byte slice is live for the call and Metal copies it.
+        let uniform_buffer = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(uniform.as_ptr() as *mut c_void).expect("non-empty"),
+                uniform.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("uniform buffer");
+
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        // SAFETY: colour attachment 0 is valid on every render pass.
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&*target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let command_buffer = queue.commandBuffer().expect("command buffer");
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("render encoder");
+        encoder.setRenderPipelineState(&pipeline);
+        // SAFETY: the encoder is live; indices match the shader bindings.
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&*luma), 0);
+            encoder.setFragmentTexture_atIndex(Some(&*chroma), 1);
+            encoder.setFragmentBuffer_offset_atIndex(Some(&*uniform_buffer), 0, 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+        let blit = command_buffer.blitCommandEncoder().expect("blit encoder");
+        blit.synchronizeResource(ProtocolObject::from_ref(&*target));
+        blit.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        let mut out = vec![0_u8; picture.width * picture.height * 4];
+        // SAFETY: `out` holds exactly the region at the stated row pitch.
+        unsafe {
+            target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(out.as_mut_ptr().cast()).expect("non-empty"),
+                picture.width * 4,
+                region(picture.width, picture.height),
+                0,
+            );
+        }
+        Some(
+            out.chunks_exact(4)
+                .map(|px| [px[0], px[1], px[2], px[3]])
+                .collect(),
+        )
+    }
+
+    fn contract(
+        chroma: ChromaSubsampling,
+        depth: BitDepth,
+        range: ColorRange,
+    ) -> VideoColorContract {
+        VideoColorContract {
+            chroma,
+            range,
+            depth,
+            matrix: ColorMatrix::Bt709,
+            primaries: arcen_media::ColorPrimaries::Bt709,
+            transfer: arcen_media::TransferCharacteristics::Bt709,
+        }
+    }
+
+    /// A grey-on-dark "glyph" with ClearType-like coloured fringes: luma steps
+    /// sharply while chroma swings from blue to red across the stroke.
+    fn fringed_text(chroma_kind: ChromaSubsampling, depth: BitDepth) -> Picture {
+        let (width, height) = (16, 8);
+        let max = (1_u16 << depth.bits()) - 1;
+        let centre = 1_u16 << (depth.bits() - 1);
+        let luma = (0..height)
+            .flat_map(|_| {
+                (0..width).map(move |x| {
+                    if (5..11).contains(&x) {
+                        max * 3 / 4
+                    } else {
+                        max / 10
+                    }
+                })
+            })
+            .collect();
+        let (chroma_width, chroma_height) = match chroma_kind {
+            ChromaSubsampling::Yuv420 => (width / 2, height / 2),
+            ChromaSubsampling::Yuv422 => (width / 2, height),
+            ChromaSubsampling::Yuv444 => (width, height),
+        };
+        let swing = max / 5;
+        let chroma = (0..chroma_height)
+            .flat_map(|y| {
+                (0..chroma_width).map(move |x| {
+                    let column = x * width / chroma_width;
+                    let wobble = (y as u16) * (max / 64);
+                    match column {
+                        0..=4 => [centre + swing, centre - swing + wobble],
+                        5..=10 => [centre, centre],
+                        _ => [centre - swing, centre + swing - wobble],
+                    }
+                })
+            })
+            .collect();
+        Picture {
+            width,
+            height,
+            luma,
+            chroma_width,
+            chroma_height,
+            chroma,
+        }
+    }
+
+    fn reference(
+        picture: &Picture,
+        contract: VideoColorContract,
+        interpolate: bool,
+    ) -> Vec<[u8; 4]> {
+        let uniform = VideoUniform::from_contract(
+            contract,
+            (picture.width as u32, picture.height as u32),
+            (picture.chroma_width as u32, picture.chroma_height as u32),
+        );
+        let fetch = |x: u32, y: u32| {
+            let [cb, cr] = picture.chroma[y as usize * picture.chroma_width + x as usize];
+            [f32::from(cb), f32::from(cr)]
+        };
+        let luma_at =
+            |x: u32, y: u32| f32::from(picture.luma[y as usize * picture.width + x as usize]);
+        let mut out = Vec::with_capacity(picture.width * picture.height);
+        for y in 0..picture.height {
+            for x in 0..picture.width {
+                let uv = [
+                    (x as f32 + 0.5) / picture.width as f32,
+                    (y as f32 + 0.5) / picture.height as f32,
+                ];
+                let [cb, cr] = if interpolate {
+                    uniform.chroma_reference_codes(uv, luma_at(x as u32, y as u32), luma_at, fetch)
+                } else {
+                    fetch(
+                        (uv[0] * picture.chroma_width as f32) as u32,
+                        (uv[1] * picture.chroma_height as f32) as u32,
+                    )
+                };
+                let luma = f32::from(picture.luma[y * picture.width + x]);
+                let [r, g, b] = uniform.reference_rgb(luma, cb, cr);
+                let quantise = |v: f32| (v * 255.0).round() as u8;
+                out.push([quantise(b), quantise(g), quantise(r), 255]);
+            }
+        }
+        out
+    }
+
+    fn max_difference(a: &[[u8; 4]], b: &[[u8; 4]]) -> u8 {
+        a.iter()
+            .zip(b)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn check(chroma: ChromaSubsampling, depth: BitDepth, range: ColorRange) {
+        let contract = contract(chroma, depth, range);
+        let picture = fringed_text(chroma, depth);
+        let Some(gpu) = render(&picture, contract) else {
+            eprintln!("no Metal device; shader test skipped");
+            return;
+        };
+        let expected = reference(&picture, contract, true);
+        assert!(
+            max_difference(&gpu, &expected) <= 1,
+            "{chroma:?} {depth:?} {range:?}: GPU output must match the CPU reference within one code"
+        );
+        let nearest = reference(&picture, contract, false);
+        if chroma == ChromaSubsampling::Yuv444 {
+            assert_eq!(
+                expected, nearest,
+                "4:4:4 keeps the exact texel, so it is unchanged by reconstruction"
+            );
+        } else {
+            assert!(
+                max_difference(&gpu, &nearest) > 8,
+                "{chroma:?}: subsampled chroma must be reconstructed, not repeated per block"
+            );
+        }
+    }
+
+    #[test]
+    fn eight_bit_four_two_zero_chroma_is_reconstructed_on_the_gpu() {
+        check(
+            ChromaSubsampling::Yuv420,
+            BitDepth::Eight,
+            ColorRange::Limited,
+        );
+    }
+
+    #[test]
+    fn ten_bit_four_two_zero_chroma_is_reconstructed_on_the_gpu() {
+        check(ChromaSubsampling::Yuv420, BitDepth::Ten, ColorRange::Full);
+    }
+
+    #[test]
+    fn four_two_two_chroma_is_reconstructed_horizontally_on_the_gpu() {
+        check(
+            ChromaSubsampling::Yuv422,
+            BitDepth::Eight,
+            ColorRange::Limited,
+        );
+    }
+
+    /// Pseudo-random luma and chroma whose rows differ sharply: every row's
+    /// chroma swings to the opposite extreme of its neighbours', so any tap
+    /// borrowed from an adjacent row on a full-resolution axis shows up.
+    fn row_varying_noise(chroma_kind: ChromaSubsampling, depth: BitDepth) -> Picture {
+        let (width, height) = (24_usize, 12_usize);
+        let max = u32::from((1_u16 << depth.bits()) - 1);
+        let hash = |x: usize, y: usize, salt: usize| -> u32 {
+            let mut v = (x * 73_856_093 ^ y * 19_349_663 ^ salt * 83_492_791) as u32;
+            v ^= v >> 13;
+            v = v.wrapping_mul(0x5bd1_e995);
+            v ^ (v >> 15)
+        };
+        let luma = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (hash(x, y, 1) % (max + 1)) as u16))
+            .collect();
+        let (chroma_width, chroma_height) = match chroma_kind {
+            ChromaSubsampling::Yuv420 => (width / 2, height / 2),
+            ChromaSubsampling::Yuv422 => (width / 2, height),
+            ChromaSubsampling::Yuv444 => (width, height),
+        };
+        let chroma = (0..chroma_height)
+            .flat_map(|y| {
+                (0..chroma_width).map(move |x| {
+                    let spread = hash(x, y, 2) % (max / 8 + 1);
+                    let (low, high) = (spread, max - spread);
+                    if y % 2 == 0 {
+                        [low as u16, high as u16]
+                    } else {
+                        [high as u16, low as u16]
+                    }
+                })
+            })
+            .collect();
+        Picture {
+            width,
+            height,
+            luma,
+            chroma_width,
+            chroma_height,
+            chroma,
+        }
+    }
+
+    fn check_matches_reference(picture: &Picture, contract: VideoColorContract) {
+        let Some(gpu) = render(picture, contract) else {
+            eprintln!("no Metal device; shader test skipped");
+            return;
+        };
+        let expected = reference(picture, contract, true);
+        let worst = max_difference(&gpu, &expected);
+        assert!(
+            worst <= 1,
+            "{:?} {:?}: GPU differs from the CPU reference by {worst} codes",
+            contract.chroma,
+            contract.depth
+        );
+    }
+
+    #[test]
+    fn four_two_two_rows_never_borrow_chroma_from_the_next_row() {
+        for (depth, range) in [
+            (BitDepth::Eight, ColorRange::Limited),
+            (BitDepth::Ten, ColorRange::Full),
+        ] {
+            let contract = contract(ChromaSubsampling::Yuv422, depth, range);
+            check_matches_reference(
+                &row_varying_noise(ChromaSubsampling::Yuv422, depth),
+                contract,
+            );
+        }
+    }
+
+    #[test]
+    fn four_two_zero_with_sharp_vertical_chroma_variation_matches_the_reference() {
+        for (depth, range) in [
+            (BitDepth::Eight, ColorRange::Limited),
+            (BitDepth::Ten, ColorRange::Full),
+        ] {
+            let contract = contract(ChromaSubsampling::Yuv420, depth, range);
+            check_matches_reference(
+                &row_varying_noise(ChromaSubsampling::Yuv420, depth),
+                contract,
+            );
+        }
+    }
+
+    #[test]
+    fn eight_bit_four_four_four_is_unchanged_on_the_gpu() {
+        check(
+            ChromaSubsampling::Yuv444,
+            BitDepth::Eight,
+            ColorRange::Limited,
+        );
+    }
+
+    #[test]
+    fn ten_bit_four_four_four_is_unchanged_on_the_gpu() {
+        check(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorRange::Full);
+    }
+
+    /// Red "text" on a dark background, encoded exactly as a Pier does
+    /// (`arcen_media` BT.709 limited, 2x2 box-filtered chroma), then decoded
+    /// by the production shader: every stroke edge lands mid-block.
+    fn host_encoded_coloured_text() -> (Picture, Vec<[u8; 3]>) {
+        let (width, height) = (32_usize, 8_usize);
+        let background = [24_u8, 24, 27];
+        let stroke = [239_u8, 68, 68];
+        let rgb: Vec<[u8; 3]> = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let column = (x + y / 3) % 8;
+                    if (1..=2).contains(&column) || column == 5 {
+                        stroke
+                    } else {
+                        background
+                    }
+                })
+            })
+            .collect();
+        let transform = arcen_media::video::ColorTransform::new(
+            ColorMatrix::Bt709,
+            ColorRange::Limited,
+            BitDepth::Eight,
+        );
+        let luma = rgb
+            .iter()
+            .map(|&[r, g, b]| transform.luma(b, g, r) as u16)
+            .collect();
+        let (chroma_width, chroma_height) = (width / 2, height / 2);
+        let mut chroma = Vec::with_capacity(chroma_width * chroma_height);
+        for cy in 0..chroma_height {
+            for cx in 0..chroma_width {
+                let at = |dx: usize, dy: usize| rgb[(cy * 2 + dy) * width + cx * 2 + dx];
+                let block = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                let mean =
+                    |i: usize| ((block.iter().map(|px| i32::from(px[i])).sum::<i32>()) >> 2) as u8;
+                let (r, g, b) = (mean(0), mean(1), mean(2));
+                chroma.push([transform.cb(b, g, r) as u16, transform.cr(b, g, r) as u16]);
+            }
+        }
+        (
+            Picture {
+                width,
+                height,
+                luma,
+                chroma_width,
+                chroma_height,
+                chroma,
+            },
+            rgb,
+        )
+    }
+
+    fn error_against(source: &[[u8; 3]], bgra: &[[u8; 4]]) -> u64 {
+        source
+            .iter()
+            .zip(bgra)
+            .map(|(&[r, g, b], px)| {
+                u64::from(px[2].abs_diff(r))
+                    + u64::from(px[1].abs_diff(g))
+                    + u64::from(px[0].abs_diff(b))
+            })
+            .sum()
+    }
+
+    /// GPU time of one `fs_convert` pass over a Retina-sized 8-bit 4:2:0
+    /// frame. Run with `--ignored --nocapture`; it reports, it does not judge.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_fs_convert_gpu_time_at_1800x1168() {
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
+            return;
+        };
+        let (width, height) = (1800_usize, 1168_usize);
+        let contract = contract(
+            ChromaSubsampling::Yuv420,
+            BitDepth::Eight,
+            ColorRange::Limited,
+        );
+        let plan = plane_pixel_formats(contract.depth);
+        let queue = device.newCommandQueue().expect("queue");
+        let pipeline = build_pipeline_state(&device, MTLPixelFormat::BGRA8Unorm).expect("shader");
+        let luma = texture(
+            &device,
+            plan.luma_format,
+            width,
+            height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let chroma = texture(
+            &device,
+            plan.chroma_format,
+            width / 2,
+            height / 2,
+            MTLTextureUsage::ShaderRead,
+        );
+        // ARCEN_BENCH_CONTENT=desktop: flat panels with a text-like edge every
+        // 12 columns; anything else: per-pixel noise, the worst case.
+        let content = std::env::var("ARCEN_BENCH_CONTENT").unwrap_or_default();
+        let desktop = content == "desktop";
+        let flat = content == "flat";
+        let luma_bytes: Vec<u8> = (0..width * height)
+            .map(|i| {
+                if desktop {
+                    if (i % width) % 12 < 2 && (i / width) % 24 < 14 {
+                        200
+                    } else {
+                        40
+                    }
+                } else {
+                    (16 + (i * 7919) % 220) as u8
+                }
+            })
+            .collect();
+        let chroma_bytes: Vec<u8> = (0..width * height / 2)
+            .map(|i| {
+                if flat {
+                    128
+                } else if desktop {
+                    let column = (i % width) / 2;
+                    if column % 6 == 0 && (i / width) % 12 < 7 {
+                        90
+                    } else {
+                        128
+                    }
+                } else {
+                    (16 + (i * 104_729) % 224) as u8
+                }
+            })
+            .collect();
+        // SAFETY: the vectors hold exactly the regions at the stated pitch.
+        unsafe {
+            luma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(width, height),
+                0,
+                NonNull::new(luma_bytes.as_ptr() as *mut c_void).expect("bytes"),
+                width,
+            );
+            chroma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(width / 2, height / 2),
+                0,
+                NonNull::new(chroma_bytes.as_ptr() as *mut c_void).expect("bytes"),
+                width,
+            );
+        }
+        let target = texture(
+            &device,
+            MTLPixelFormat::BGRA8Unorm,
+            width,
+            height,
+            MTLTextureUsage::RenderTarget,
+        );
+        let uniform = MetalVideoUniform::from_contract(
+            contract,
+            (width as u32, height as u32),
+            ((width / 2) as u32, (height / 2) as u32),
+            plan.code_unnormalize_scale,
+        )
+        .to_bytes();
+        // SAFETY: Metal copies the live byte slice.
+        let uniform_buffer = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(uniform.as_ptr() as *mut c_void).expect("bytes"),
+                uniform.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("uniform");
+        let mut gpu_ms = Vec::new();
+        for _ in 0..240 {
+            let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+            // SAFETY: colour attachment 0 is valid on every render pass.
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            attachment.setTexture(Some(&*target));
+            attachment.setLoadAction(MTLLoadAction::DontCare);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            let command_buffer = queue.commandBuffer().expect("command buffer");
+            let encoder = command_buffer
+                .renderCommandEncoderWithDescriptor(&pass)
+                .expect("encoder");
+            encoder.setRenderPipelineState(&pipeline);
+            // SAFETY: the encoder is live; indices match the shader bindings.
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(&*luma), 0);
+                encoder.setFragmentTexture_atIndex(Some(&*chroma), 1);
+                encoder.setFragmentBuffer_offset_atIndex(Some(&*uniform_buffer), 0, 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            gpu_ms.push((command_buffer.GPUEndTime() - command_buffer.GPUStartTime()) * 1_000.0);
+        }
+        gpu_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "fs_convert 1800x1168 8-bit 4:2:0 GPU ms: p50 {:.3} p90 {:.3} max {:.3} ({})",
+            gpu_ms[gpu_ms.len() / 2],
+            gpu_ms[gpu_ms.len() * 9 / 10],
+            gpu_ms[gpu_ms.len() - 1],
+            device.name()
+        );
+    }
+
+    #[test]
+    fn host_encoded_coloured_text_is_rebuilt_closer_to_its_source_than_block_repetition() {
+        let contract = contract(
+            ChromaSubsampling::Yuv420,
+            BitDepth::Eight,
+            ColorRange::Limited,
+        );
+        let (picture, source) = host_encoded_coloured_text();
+        let Some(gpu) = render(&picture, contract) else {
+            eprintln!("no Metal device; shader test skipped");
+            return;
+        };
+        assert!(max_difference(&gpu, &reference(&picture, contract, true)) <= 1);
+        let reconstructed = error_against(&source, &gpu);
+        let repeated = error_against(&source, &reference(&picture, contract, false));
+        eprintln!("colour error vs source: luma-guided {reconstructed}, nearest {repeated}");
+        assert!(
+            reconstructed * 3 < repeated * 2,
+            "luma-guided reconstruction ({reconstructed}) must cut the nearest-fetch error \
+             ({repeated}) on two-colour text by at least a third"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scaling_tests {
+    use super::*;
+
+    fn size(width: f64, height: f64) -> CGSize {
+        CGSize { width, height }
+    }
+
+    #[test]
+    fn a_pinned_stream_at_retina_two_x_is_magnified_pixel_exactly() {
+        assert_eq!(
+            layer_scaling(size(1800.0, 1168.0), 2.0, size(1800.0, 1168.0)),
+            LayerScaling::Exact
+        );
+        assert_eq!(
+            layer_scaling(size(1800.0, 1168.0), 1.0, size(1800.0, 1168.0)),
+            LayerScaling::Exact,
+            "1:1 on a non-Retina display"
+        );
+        assert_eq!(
+            layer_scaling(size(1800.0, 1168.0), 2.0, size(3600.0, 2336.0)),
+            LayerScaling::Exact,
+            "a HiDPI stream lands 1:1 on backing pixels"
+        );
+    }
+
+    #[test]
+    fn any_fractional_or_non_uniform_fit_is_resampled() {
+        // Aspect-fit into the notch-safe area: 1168 -> 1131 points.
+        assert_eq!(
+            layer_scaling(size(1741.6, 1131.0), 2.0, size(1800.0, 1168.0)),
+            LayerScaling::Resampled
+        );
+        // A coded-size buffer (1824x1184) shown in a 1800x1168 rect.
+        assert_eq!(
+            layer_scaling(size(1800.0, 1168.0), 2.0, size(1824.0, 1184.0)),
+            LayerScaling::Resampled
+        );
+        // Different whole factors per axis would distort.
+        assert_eq!(
+            layer_scaling(size(1800.0, 2336.0), 2.0, size(1800.0, 1168.0)),
+            LayerScaling::Resampled
+        );
+        assert_eq!(
+            layer_scaling(size(900.0, 584.0), 1.0, size(1800.0, 1168.0)),
+            LayerScaling::Resampled,
+            "minification is never exact"
+        );
+        assert_eq!(
+            layer_scaling(size(10.0, 10.0), 2.0, size(0.0, 0.0)),
+            LayerScaling::Resampled
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_state_log_tests {
+    use super::*;
+
+    fn key(width: f64, visible: bool) -> WindowStateKey {
+        WindowStateKey {
+            rect: CGRect {
+                origin: CGPoint { x: 0.0, y: 1.0 },
+                size: CGSize {
+                    width,
+                    height: 1168.0,
+                },
+            },
+            contents_scale: 2.0,
+            display_id: Some(1),
+            visible,
+        }
+    }
+
+    #[test]
+    fn repeated_identical_syncs_log_the_window_state_once() {
+        let mut last = None;
+        assert!(window_state_changed(&mut last, key(1800.0, true)));
+        for _ in 0..120 {
+            assert!(
+                !window_state_changed(&mut last, key(1800.0, true)),
+                "an egui pass that changes nothing must not log"
+            );
+        }
+        assert!(
+            window_state_changed(&mut last, key(1800.0, false)),
+            "visibility change logs"
+        );
+        assert!(
+            window_state_changed(&mut last, key(1120.0, false)),
+            "geometry change logs"
+        );
     }
 }

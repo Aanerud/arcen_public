@@ -207,11 +207,15 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
 
     // Stream concurrency: one bidi for either the direct product carrier or
     // the advanced binding handshake, plus the advanced `QuicPeer` adapter's
-    // exactly one persistent uni stream per direction. This is the live
-    // config; it intentionally does not raise the uni-stream limit for the
-    // additive, not-yet-product-selected direct-monitor stream foundation —
-    // see `monitor_carrier_transport_config` for that separate, unwired,
-    // test-only config.
+    // exactly one persistent uni stream per direction. This is the config of
+    // today's single-stream product carrier; it intentionally does not raise
+    // the uni-stream limit for the additive, not-yet-product-selected
+    // direct-monitor stream foundation — see
+    // `monitor_carrier_transport_config` for that separate, unwired,
+    // test-only config. The lane carrier uses `lane_transport_config`, which
+    // grants the contract-derived counts; it replaces this one when a product
+    // switches to `LaneConnection`, so no endpoint grants streams that nothing
+    // accepts.
     config.max_concurrent_bidi_streams(VarInt::from_u32(1));
     config.max_concurrent_uni_streams(VarInt::from_u32(1));
 
@@ -337,6 +341,53 @@ pub fn recommended_transport_config_arc(
     Arc::new(recommended_transport_config(policy))
 }
 
+/// Transport config for the lane carrier ([`super::LaneConnection`]):
+/// [`recommended_transport_config`] with the concurrent-stream limits
+/// `local` grants its peer under ADR 0014 —
+/// [`crate::lanes::PIER_LANE_STREAM_LIMITS`] (4 bidi, 2 uni) on a Pier and
+/// [`crate::lanes::DECK_LANE_STREAM_LIMITS`] (0 bidi, 3 uni) on a Deck: the
+/// lanes the peer opens plus one replacement stream of headroom per shape.
+///
+/// Liveness is the lane carrier's own ([`crate::liveness`]): a keep-alive
+/// every [`crate::liveness::LANE_KEEPALIVE_INTERVAL`] and an idle timeout of
+/// [`crate::liveness::LANE_IDLE_TIMEOUT`], so a Deck that vanished without
+/// closing frees the Pier's session within seconds and a same-user
+/// reattachment can prove it silent.
+///
+/// Every other parameter — flow-control windows, fairness, MTU, ACK
+/// frequency — is unchanged, and the Pier still runs
+/// [`keep_send_window_interactive`]. The per-stream receive window stays well
+/// below the connection window, so one lane the application stops reading
+/// (a stalled video decoder) cannot consume the connection's credit and
+/// block the other lanes.
+#[must_use]
+pub fn lane_transport_config(
+    policy: &BoundedTransportPolicy,
+    local: arcen_protocol::lanes::LaneEndpoint,
+) -> quinn::TransportConfig {
+    let limits = crate::lanes::LaneStreamLimits::granted_by(local);
+    let mut config = recommended_transport_config(policy);
+    config.max_concurrent_bidi_streams(VarInt::from_u32(limits.max_concurrent_bidi_streams));
+    config.max_concurrent_uni_streams(VarInt::from_u32(limits.max_concurrent_uni_streams));
+    config.keep_alive_interval(Some(crate::liveness::LANE_KEEPALIVE_INTERVAL));
+    config.max_idle_timeout(Some(lane_idle_timeout()));
+    config
+}
+
+fn lane_idle_timeout() -> quinn::IdleTimeout {
+    let millis = u32::try_from(crate::liveness::LANE_IDLE_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
+    quinn::IdleTimeout::from(VarInt::from_u32(millis))
+}
+
+/// `Arc`-wraps [`lane_transport_config`].
+#[must_use]
+pub fn lane_transport_config_arc(
+    policy: &BoundedTransportPolicy,
+    local: arcen_protocol::lanes::LaneEndpoint,
+) -> Arc<quinn::TransportConfig> {
+    Arc::new(lane_transport_config(policy, local))
+}
+
 /// Returns [`recommended_transport_config`] with its concurrent
 /// unidirectional stream limit raised to the exact
 /// [`MAX_MONITOR_STREAMS_PER_CONNECTION`] (4) the additive direct-monitor
@@ -426,6 +477,27 @@ mod interactive_window_tests {
             interactive_send_window(bdp_bytes) >= needed_window,
             "cwnd-following window app-limits the open path"
         );
+    }
+}
+
+#[cfg(test)]
+mod lane_window_tests {
+    use super::{ARCEN_QUIC_CONN_RECV_WINDOW, ARCEN_QUIC_STREAM_RECV_WINDOW};
+    use crate::lanes::{DECK_LANE_STREAM_LIMITS, PIER_LANE_STREAM_LIMITS};
+
+    #[test]
+    fn stalled_lanes_cannot_exhaust_the_connection_receive_window() {
+        // Every lane a peer may open, all stalled at a full stream window,
+        // still leaves at least half the connection window for the others.
+        for limits in [PIER_LANE_STREAM_LIMITS, DECK_LANE_STREAM_LIMITS] {
+            let streams =
+                u64::from(limits.max_concurrent_bidi_streams + limits.max_concurrent_uni_streams);
+            let stalled = streams * u64::from(ARCEN_QUIC_STREAM_RECV_WINDOW);
+            assert!(
+                stalled * 2 <= u64::from(ARCEN_QUIC_CONN_RECV_WINDOW),
+                "{limits:?}"
+            );
+        }
     }
 }
 

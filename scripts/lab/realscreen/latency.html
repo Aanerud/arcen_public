@@ -1,0 +1,105 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!--
+  Arcen real-screen latency page. Opened in a real browser inside the host's
+  desktop session (see docs/testing/realscreen.md). It:
+  - logs every pointer sample (coalesced included) with the browser's event
+    timestamp and performance.now(), pointer type and id, pressure, tilt and
+    the size of the coalesced batch it came in, plus pointerover/pointerout
+    (pen proximity), and posts the log to page_server.py;
+  - draws ink immediately in the event handler;
+  - paints a code strip (top-left) on every animation frame encoding the
+    frame counter and the last pointer position, so a capture of the Deck
+    window can tell which input a displayed frame reflects;
+  - toggles a moving "stress" band with the S key (or ?stress=1).
+  Nothing here is black or white except the strip and the cursor, so a
+  capture can find the cursor by its black/white pixels.
+-->
+<html><head><meta charset="utf-8"><title>arcen-realscreen</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#606060;cursor:default}
+canvas{position:absolute;left:0;top:0}
+#status{position:absolute;left:12px;bottom:10px;font:16px monospace;color:#d0c060}
+.b{position:absolute;width:9vw;height:9vh;border-radius:10px;animation:m 2.2s linear infinite alternate}
+@keyframes m{from{transform:translate(0,0) rotate(0)}to{transform:translate(24vw,70vh) rotate(360deg)}}
+#stress{position:absolute;left:66vw;top:8vh;width:33vw;height:90vh;overflow:hidden;display:none}
+</style></head><body>
+<canvas id="ink"></canvas><canvas id="strip"></canvas>
+<div id="stress"></div><div id="status"></div>
+<script>
+'use strict';
+const params=new URLSearchParams(location.search);
+const CELL=Number(params.get('cell')||16), BITS=25, COLS=BITS+2;
+const ink=document.getElementById('ink'), g=ink.getContext('2d');
+const strip=document.getElementById('strip'), sg=strip.getContext('2d');
+strip.width=COLS*CELL; strip.height=2*CELL;
+function fit(){ink.width=innerWidth;ink.height=innerHeight;}
+fit(); addEventListener('resize',fit);
+const stress=document.getElementById('stress');
+const colours=['#c03030','#30a030','#3050c0','#c0a020','#a030a0','#20a0a0','#d07020','#2070d0'];
+for(let i=0;i<10;i++){const d=document.createElement('div');d.className='b';d.style.background=colours[i%8];
+ d.style.left=(i*3)%10+'vw';d.style.top=(i*7)%20+'vh';d.style.animationDuration=(1.3+i%5*0.3)+'s';
+ d.style.animationDelay=(-i*0.27)+'s';stress.appendChild(d);}
+let stressOn=false;
+function setStress(on){stressOn=on;stress.style.display=on?'block':'none';}
+setStress(params.get('stress')==='1');
+addEventListener('keydown',e=>{if(e.key==='s'||e.key==='S')setStress(!stressOn);});
+
+let lastX=0,lastY=0,last=null,frame=0,events=[],frames=[];
+const origin=performance.timeOrigin;
+function record(e,kind,batch){
+  events.push([kind,e.pointerType,Math.round(e.clientX),Math.round(e.clientY),
+    +e.pressure.toFixed(3),e.buttons,+e.timeStamp.toFixed(3),+performance.now().toFixed(3),
+    e.tiltX||0,e.tiltY||0,batch||1,e.pointerId]);
+}
+function draw(e){
+  const w=e.pointerType==='pen'?2+10*e.pressure:6;
+  g.strokeStyle='#00ff40';g.lineWidth=w;g.lineCap='round';
+  g.beginPath();g.moveTo(last[0],last[1]);g.lineTo(e.clientX,e.clientY);g.stroke();
+  last=[e.clientX,e.clientY];
+}
+addEventListener('pointerdown',e=>{record(e,'down');g.clearRect(0,0,ink.width,ink.height);
+  last=[e.clientX,e.clientY];lastX=Math.round(e.clientX);lastY=Math.round(e.clientY);});
+addEventListener('pointerup',e=>{record(e,'up');last=null;});
+addEventListener('pointermove',e=>{
+  const list=e.getCoalescedEvents?e.getCoalescedEvents():[];
+  const batch=list.length?list:[e];
+  for(const c of batch){record(c,'move',batch.length);if(last&&(c.buttons&1))draw(c);}
+  lastX=Math.round(e.clientX);lastY=Math.round(e.clientY);
+});
+addEventListener('pointerover',e=>record(e,'over'));
+addEventListener('pointerout',e=>record(e,'out'));
+addEventListener('pointercancel',e=>record(e,'cancel'));
+addEventListener('contextmenu',e=>e.preventDefault());
+
+function cell(col,row,colour){sg.fillStyle=colour;sg.fillRect(col*CELL,row*CELL,CELL,CELL);}
+function paintStrip(){
+  const f=frame&0xffff,x=Math.max(0,Math.min(8191,lastX)),y=Math.max(0,Math.min(8191,lastY));
+  const chk=(f+x*3+y*7)&0xff;
+  const bits=[];
+  for(let i=15;i>=0;i--)bits.push((f>>i)&1);
+  for(let i=12;i>=0;i--)bits.push((x>>i)&1);
+  for(let i=12;i>=0;i--)bits.push((y>>i)&1);
+  for(let i=7;i>=0;i--)bits.push((chk>>i)&1);
+  for(let r=0;r<2;r++){
+    cell(0,r,'#ff00ff');cell(COLS-1,r,'#ff00ff');
+    for(let c=0;c<BITS;c++)cell(c+1,r,bits[r*BITS+c]?'#ffffff':'#000000');
+  }
+}
+let fpsMark=performance.now(),fpsCount=0,fps=0;
+function tick(now){
+  frame++;paintStrip();frames.push([frame,+now.toFixed(3),lastX,lastY,stressOn?1:0,+performance.now().toFixed(3)]);
+  fpsCount++;if(now-fpsMark>=1000){fps=fpsCount*1000/(now-fpsMark);fpsCount=0;fpsMark=now;
+    document.getElementById('status').textContent='page '+fps.toFixed(0)+' fps · events '+events.length;}
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+function flush(){
+  if(!events.length&&!frames.length)return;
+  const body=JSON.stringify({origin,ua:navigator.userAgent,dpr:devicePixelRatio,
+    screen:[screen.width,screen.height],inner:[innerWidth,innerHeight],events,frames});
+  events=[];frames=[];
+  fetch('/log',{method:'POST',body,keepalive:true}).catch(()=>{});
+}
+setInterval(flush,250);
+</script></body></html>

@@ -1,0 +1,19 @@
+0	module-device-restore		
+1	module-stream-restore		
+2	module-card-restore		
+3	module-augment-properties		
+4	module-switch-on-port-available		
+5	module-udev-detect		
+6	module-bluetooth-policy		
+7	module-bluetooth-discover		
+8	module-bluez5-discover		
+9	module-native-protocol-unix		
+10	module-default-device-restore		
+11	module-always-sink		
+13	module-intended-roles		
+14	module-systemd-login		
+15	module-position-event-sounds		
+16	module-role-cork		
+17	module-filter-heuristics		
+18	module-filter-apply		
+19	module-null-sink	sink_name=lab_speaker sink_properties=device.description=Lab_Speaker	

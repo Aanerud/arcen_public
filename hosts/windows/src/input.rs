@@ -209,6 +209,23 @@ fn relative_move_plan(message: &MouseMoveRelativeMsg) -> RelativeMovePlan {
     }
 }
 
+/// The input that wakes a console display Windows has powered off for idle.
+///
+/// `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` (capenc's keep-awake) only
+/// keeps a display on; it does not turn one back on, and while it is off DWM
+/// composes rarely, so a session that starts then captures 4–8 fps until the
+/// Deck's first input. Input does wake it. A relative move of zero pixels is
+/// input to the power manager but leaves the pointer exactly where it was.
+const fn display_wake_plan() -> RelativeMovePlan {
+    RelativeMovePlan {
+        dx: 0,
+        dy: 0,
+        move_flag: true,
+        absolute_flag: false,
+        virtual_desktop_flag: false,
+    }
+}
+
 const fn prepends_absolute_position(mode: PointerMotionMode) -> bool {
     matches!(mode, PointerMotionMode::Absolute)
 }
@@ -372,7 +389,8 @@ impl PenPointerState {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    set_dpi_awareness as initialize_process_dpi_awareness, Injector, PenInjector,
+    set_dpi_awareness as initialize_process_dpi_awareness, wake_console_display, Injector,
+    PenInjector,
 };
 
 #[cfg(not(windows))]
@@ -554,6 +572,19 @@ mod windows_impl {
         Err(DxgiGeometryError::Unavailable(
             "DXGI did not expose the requested desktop-attached output".to_string(),
         ))
+    }
+
+    /// Sends `display_wake_plan` on this session's input desktop. It carries
+    /// the Arcen injection marker, so armed deskside hooks pass it as remote
+    /// input rather than treating it as someone at the console. Returns the
+    /// number of events Windows accepted (0 on a desktop that refuses input,
+    /// such as a locked console's secure desktop).
+    pub fn wake_console_display() -> u32 {
+        let plan = super::display_wake_plan();
+        debug_assert!(plan.move_flag && !plan.absolute_flag && !plan.virtual_desktop_flag);
+        let input = Injector::mouse_input(plan.dx, plan.dy, 0, MOUSEEVENTF_MOVE);
+        // SAFETY: one correctly-initialised INPUT; cbsize matches its size.
+        unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) }
     }
 
     pub struct Injector {
@@ -1401,6 +1432,11 @@ mod windows_impl {
 // ─────────────────────────────── non-Windows ───────────────────────────────
 
 #[cfg(not(windows))]
+pub fn wake_console_display() -> u32 {
+    0
+}
+
+#[cfg(not(windows))]
 pub struct Injector;
 
 #[cfg(not(windows))]
@@ -1451,12 +1487,12 @@ impl PenInjector {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_identity_dxgi_rotation, modifier_targets, norm_to_abs, pen_pixel_location,
-        pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows, pen_tool_flags,
-        prepends_absolute_position, qt_key_to_vk, qt_key_to_windows, relative_move_plan,
-        selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect, PenPointerEdge,
-        PenPointerState, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT, VK_LCONTROL, VK_LMENU,
-        VK_LSHIFT, VK_LWIN,
+        display_wake_plan, is_identity_dxgi_rotation, modifier_targets, norm_to_abs,
+        pen_pixel_location, pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows,
+        pen_tool_flags, prepends_absolute_position, qt_key_to_vk, qt_key_to_windows,
+        relative_move_plan, selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect,
+        PenPointerEdge, PenPointerState, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT, VK_LCONTROL,
+        VK_LMENU, VK_LSHIFT, VK_LWIN,
     };
     use arcen_protocol::messages::{
         MouseMoveRelativeMsg, PenToolMsg, PointerMotionMode, ScrollUnitMsg,
@@ -1473,6 +1509,15 @@ mod tests {
     fn norm_clamps_out_of_range() {
         assert_eq!(norm_to_abs(-0.5), 0);
         assert_eq!(norm_to_abs(2.0), 65535);
+    }
+
+    #[test]
+    fn display_wake_is_a_relative_move_of_zero_pixels() {
+        let plan = display_wake_plan();
+        assert_eq!((plan.dx, plan.dy), (0, 0));
+        assert!(plan.move_flag);
+        assert!(!plan.absolute_flag);
+        assert!(!plan.virtual_desktop_flag);
     }
 
     #[test]

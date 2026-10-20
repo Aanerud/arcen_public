@@ -12,6 +12,7 @@ mod damage;
 mod external;
 mod grid;
 mod hash;
+mod pacing;
 
 pub mod scenario;
 
@@ -27,3 +28,4 @@ pub use external::{
 };
 pub use grid::{BLOCK_SIZE, BgraFrame, BlockBounds, BlockGrid, KeelError};
 pub use hash::{HashKernel, KernelPreference};
+pub use pacing::ArrivalPacer;

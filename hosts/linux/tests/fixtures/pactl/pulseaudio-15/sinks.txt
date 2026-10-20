@@ -1,0 +1,21 @@
+Sink #1
+	State: RUNNING
+	Name: lab_speaker
+	Description: Lab_Speaker
+	Driver: module-null-sink.c
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Owner Module: 19
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Base Volume: 65536 / 100% / 0.00 dB
+	Monitor Source: lab_speaker.monitor
+	Latency: 656143 usec, configured 1960000 usec
+	Flags: DECIBEL_VOLUME LATENCY SET_FORMATS 
+	Properties:
+		device.description = "Lab_Speaker"
+		device.class = "abstract"
+		device.icon_name = "audio-card"
+	Formats:
+		pcm

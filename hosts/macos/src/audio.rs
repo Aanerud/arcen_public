@@ -95,25 +95,9 @@ pub struct TapFormat {
     pub float: bool,
 }
 
-/// What a mute lease did, for the record.
-///
-/// Three separate facts, because collapsing them produces a field that reads
-/// as "mute was applied" while reporting that it deliberately was not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct MuteEvidence {
-    /// Whether the host configuration asked for local playback to be silenced.
-    pub requested: bool,
-    /// What Core Audio reports the tapped output is actually doing.
-    ///
-    /// `None` when the property could not be read, which is not the same as
-    /// audible and must not be treated as either answer.
-    pub observed_muted: Option<bool>,
-    /// Whether the observed state matches what was requested.
-    ///
-    /// This is the field a session decides on. A requested mute that is not
-    /// honoured must refuse the session.
-    pub honoured: bool,
-}
+/// What a mute lease did, for the record. Shared with every Pier, which
+/// all decide admission on it through [`arcen_session::local_playback::admit`].
+pub use arcen_session::local_playback::MuteEvidence;
 
 #[cfg(target_os = "macos")]
 mod native {

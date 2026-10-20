@@ -1,0 +1,15 @@
+Server String: /run/user/1000/pulse/native
+Library Protocol Version: 35
+Server Protocol Version: 35
+Is Local: yes
+Client Index: 5
+Tile Size: 65472
+User Name: arcenlab
+Host Name: pier.example.internal
+Server Name: pulseaudio
+Server Version: 15.0
+Default Sample Specification: s16le 2ch 44100Hz
+Default Channel Map: front-left,front-right
+Default Sink: lab_speaker
+Default Source: lab_speaker.monitor
+Cookie: 0000:0000

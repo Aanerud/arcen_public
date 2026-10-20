@@ -86,6 +86,21 @@ pub struct RateControlPolicy {
     pub min_change: f64,
     /// How clear-path probe steps are sized for this pipeline.
     pub probe_step: ProbeStep,
+    /// Above this target, probing needs proof: the path must be clear *and*
+    /// the busiest pipeline must have delivered at least 90% of the current
+    /// target, so the encoder is really spending what it has. Probes below
+    /// it are unchanged, and a probe never steps past it unproven. `None`
+    /// (every legacy policy) gates nothing.
+    pub evidence_gate_bps: Option<u64>,
+    /// Sent packets a loss rate must be measured over before it counts.
+    /// Quieter intervals pool their packets until they reach this, so one
+    /// lost packet in a second of a 0.3 Mbps stream is not read as 3 %
+    /// congestion.
+    pub min_loss_sample_packets: u64,
+    /// Intervals a quiet stream may pool before the pool is judged anyway
+    /// (with at least a quarter of [`Self::min_loss_sample_packets`]) or
+    /// discarded as no evidence.
+    pub max_loss_sample_intervals: u32,
 }
 
 impl RateControlPolicy {
@@ -155,6 +170,9 @@ impl RateControlPolicy {
             severe_queue_delay_factor: 3,
             min_change: 0.03,
             probe_step,
+            evidence_gate_bps: None,
+            min_loss_sample_packets: 200,
+            max_loss_sample_intervals: 10,
         };
         if matches!(probe_step, ProbeStep::EvidenceGatedTargetRelative) {
             policy.increase_factor = 1.25;
@@ -162,6 +180,19 @@ impl RateControlPolicy {
             policy.min_change = 0.01;
         }
         policy
+    }
+
+    /// Lets a clear, proven path climb above `gate_bps` -- normally the
+    /// shape budget -- towards this policy's ceiling. Below the gate the
+    /// policy behaves exactly as before: probe steps stay sized against the
+    /// gate, not the higher ceiling, and stop at the gate. At or above it
+    /// every probe needs delivery evidence and grows relative to the
+    /// current target.
+    #[must_use]
+    pub fn with_evidence_gate(mut self, gate_bps: u64) -> Self {
+        let gate = gate_bps.clamp(self.start_bps, self.ceiling_bps);
+        self.evidence_gate_bps = (gate < self.ceiling_bps).then_some(gate);
+        self
     }
 }
 
@@ -191,6 +222,71 @@ pub struct RateSample {
     pub pipeline_count: u32,
     /// Transport path truth for this interval.
     pub path: Option<PathSignal>,
+}
+
+/// Facts about an interval only some hosts can supply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateHints {
+    /// Bytes of keyframes or recovery points among the interval's delivered
+    /// bytes. A keyframe is several times the size of the frames around it,
+    /// and the queue it builds drains on its own; on its own interval it is
+    /// not evidence that the path is filling.
+    pub keyframe_bytes: u64,
+}
+
+/// The loss a controller acted on: measured over at least
+/// [`RateControlPolicy::min_loss_sample_packets`] sent packets, possibly
+/// pooled across quiet intervals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LossEvidence {
+    /// Lost share of the pooled packets.
+    pub rate: f64,
+    /// Packets the rate was measured over.
+    pub sent_packets: u64,
+    /// Intervals pooled into it.
+    pub intervals: u32,
+    /// QUIC congestion events in those intervals.
+    pub congestion_events: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LossPool {
+    sent: u64,
+    lost: u64,
+    congestion_events: u64,
+    intervals: u32,
+}
+
+/// Why a Detail stream runs at the frame rate [`RateController::detail_framerate`] chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailFramerateReason {
+    /// The target leaves enough bits per frame for the contract's rate.
+    Contract,
+    /// The target would shed frames, but the stream delivers well below it:
+    /// it is limited by its content, and fewer frames would save nothing.
+    AppLimited,
+    /// The stream spends its whole target, and the target is below the
+    /// bits-per-frame knee, so frames are shed to keep each one's detail.
+    BitsPerFrame,
+}
+
+impl DetailFramerateReason {
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Contract => "contract",
+            Self::AppLimited => "app_limited",
+            Self::BitsPerFrame => "bits_per_frame",
+        }
+    }
+}
+
+/// A Detail stream's frame rate and the reason for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailFramerate {
+    pub fps: u32,
+    pub reason: DetailFramerateReason,
 }
 
 /// Why the controller changed the target.
@@ -248,7 +344,19 @@ pub struct RateController {
     knee_age: Duration,
     knee_repeats: u32,
     clear_intervals: u32,
+    loss_pool: LossPool,
+    interval_loss: Option<LossEvidence>,
+    /// This interval's loss is still pooling and the pool already holds lost
+    /// packets: neither clear nor congested until the pool is judged.
+    loss_unresolved: bool,
+    bitrate_bound: bool,
 }
+
+/// Delivered share of the target at which a stream counts as spending it.
+const BITRATE_BOUND_SHARE: f64 = 0.9;
+/// Delivered share of the target below which a bound stream is content
+/// limited again. The gap keeps the frame rate from flapping.
+const APP_LIMITED_SHARE: f64 = 0.6;
 
 impl RateController {
     /// Starts at the safe shared cap, not at the unconstrained shape budget.
@@ -270,6 +378,57 @@ impl RateController {
             knee_age: Duration::ZERO,
             knee_repeats: 0,
             clear_intervals: 0,
+            loss_pool: LossPool {
+                sent: 0,
+                lost: 0,
+                congestion_events: 0,
+                intervals: 0,
+            },
+            interval_loss: None,
+            loss_unresolved: false,
+            bitrate_bound: false,
+        }
+    }
+
+    /// The loss evidence the last interval acted on; `None` while a quiet
+    /// stream is still pooling packets.
+    #[must_use]
+    pub const fn last_loss_evidence(&self) -> Option<LossEvidence> {
+        self.interval_loss
+    }
+
+    /// Whether the stream spent (most of) its target in the recent intervals.
+    #[must_use]
+    pub const fn bitrate_bound(&self) -> bool {
+        self.bitrate_bound
+    }
+
+    /// The frame rate a Detail stream runs at for the current target.
+    ///
+    /// Bits go before frames: the contract's rate holds until the target is
+    /// below [`DETAIL_BITS_BEFORE_FRAMES`] of the start, and frames are shed
+    /// only while the stream really spends its target. A content-limited
+    /// stream keeps the contract's rate whatever the target, because shedding
+    /// frames it barely fills saves nothing and costs the user motion.
+    #[must_use]
+    pub fn detail_framerate(&self, max_fps: u32) -> DetailFramerate {
+        let max_fps = max_fps.max(1);
+        let shed = detail_framerate(max_fps, self.policy.start_bps, self.target_bps);
+        if shed >= max_fps {
+            DetailFramerate {
+                fps: max_fps,
+                reason: DetailFramerateReason::Contract,
+            }
+        } else if !self.bitrate_bound {
+            DetailFramerate {
+                fps: max_fps,
+                reason: DetailFramerateReason::AppLimited,
+            }
+        } else {
+            DetailFramerate {
+                fps: shed,
+                reason: DetailFramerateReason::BitsPerFrame,
+            }
         }
     }
 
@@ -282,13 +441,19 @@ impl RateController {
     /// Takes one interval's measurements; returns a change when the encoder
     /// should be reconfigured.
     pub fn observe(&mut self, sample: RateSample) -> Option<RateChange> {
+        self.observe_with(sample, RateHints::default())
+    }
+
+    /// [`Self::observe`] with the facts only some hosts know.
+    pub fn observe_with(&mut self, sample: RateSample, hints: RateHints) -> Option<RateChange> {
         if sample.elapsed.is_zero() {
             return None;
         }
         let in_cut_cooldown = self.cut_cooldown_remaining > 0;
         let previous = self.target_bps;
+        self.note_spend(sample, previous);
         let mut reason = None;
-        if let Some(event) = self.congestion_event(sample) {
+        if let Some(event) = self.congestion_event(sample, hints) {
             if let Some(target) = self.cooldown_cut_target(sample, previous, event) {
                 self.remember_knee(previous);
                 self.target_bps = target;
@@ -403,23 +568,44 @@ impl RateController {
         if self.near_remembered_knee(previous) {
             return (previous as f64 * self.policy.knee_increase_factor).round() as u64;
         }
+        let gated = self.above_evidence_gate(previous);
         let additive = match self.policy.probe_step {
-            ProbeStep::CeilingFraction => {
-                (self.policy.ceiling_bps as f64 * self.policy.additive_increase).max(250_000.0)
+            ProbeStep::CeilingFraction if !gated => {
+                // Sized against the gate, so raising the ceiling above it
+                // does not change how fast the ordinary range is probed.
+                let span = self
+                    .policy
+                    .evidence_gate_bps
+                    .unwrap_or(self.policy.ceiling_bps);
+                (span as f64 * self.policy.additive_increase).max(250_000.0)
             }
-            ProbeStep::TargetRelative | ProbeStep::EvidenceGatedTargetRelative => {
+            ProbeStep::CeilingFraction
+            | ProbeStep::TargetRelative
+            | ProbeStep::EvidenceGatedTargetRelative => {
                 previous as f64 * (self.policy.increase_factor - 1.0)
             }
         };
         let multiplicative = previous as f64 * self.policy.increase_factor;
-        multiplicative.max(previous as f64 + additive).round() as u64
+        let increased = multiplicative.max(previous as f64 + additive).round() as u64;
+        match self.policy.evidence_gate_bps {
+            // An unproven probe stops at the gate; crossing it takes evidence.
+            Some(gate) if previous < gate => increased.min(gate),
+            _ => increased,
+        }
+    }
+
+    fn above_evidence_gate(&self, target: u64) -> bool {
+        self.policy
+            .evidence_gate_bps
+            .is_some_and(|gate| target >= gate)
     }
 
     fn may_probe_up(&self, sample: RateSample, previous: u64) -> bool {
         if !matches!(
             self.policy.probe_step,
             ProbeStep::EvidenceGatedTargetRelative
-        ) {
+        ) && !self.above_evidence_gate(previous)
+        {
             return true;
         }
         if sample.path.is_none() || sample.frames == 0 {
@@ -440,9 +626,65 @@ impl RateController {
         })
     }
 
-    fn congestion_event(&mut self, sample: RateSample) -> Option<CongestionEvent> {
+    /// Tracks whether the stream spends its target, with hysteresis.
+    fn note_spend(&mut self, sample: RateSample, target: u64) {
+        if sample.frames == 0 {
+            return;
+        }
+        let delivered = peak_pipeline_bps(sample);
+        if !delivered.is_finite() {
+            return;
+        }
+        if delivered >= target as f64 * BITRATE_BOUND_SHARE {
+            self.bitrate_bound = true;
+        } else if delivered < target as f64 * APP_LIMITED_SHARE {
+            self.bitrate_bound = false;
+        }
+    }
+
+    /// Pools this interval's packets and returns loss evidence once the pool
+    /// is large enough to mean something.
+    fn pool_loss(&mut self, path: PathSignal) -> Option<LossEvidence> {
+        let pool = &mut self.loss_pool;
+        pool.sent = pool.sent.saturating_add(path.sent_packets_delta);
+        pool.lost = pool.lost.saturating_add(path.lost_packets_delta);
+        pool.congestion_events = pool
+            .congestion_events
+            .saturating_add(path.congestion_events_delta);
+        pool.intervals = pool.intervals.saturating_add(1);
+        let enough = pool.sent >= self.policy.min_loss_sample_packets;
+        let stale = pool.intervals >= self.policy.max_loss_sample_intervals.max(1);
+        if !enough && !stale {
+            return None;
+        }
+        let pooled = std::mem::take(pool);
+        let judged = enough || pooled.sent >= self.policy.min_loss_sample_packets / 4;
+        (judged && pooled.sent > 0).then(|| LossEvidence {
+            rate: pooled.lost as f64 / pooled.sent as f64,
+            sent_packets: pooled.sent,
+            intervals: pooled.intervals,
+            congestion_events: pooled.congestion_events,
+        })
+    }
+
+    fn interval_loss_rate(&self) -> f64 {
+        self.interval_loss.map_or(0.0, |loss| loss.rate)
+    }
+
+    fn congestion_event(
+        &mut self,
+        sample: RateSample,
+        hints: RateHints,
+    ) -> Option<CongestionEvent> {
+        let keyframe_burst = hints.keyframe_bytes != 0;
+        self.interval_loss = None;
+        self.loss_unresolved = false;
         if let Some(path) = sample.path {
-            let loss_rate = path.loss_rate();
+            let loss = self.pool_loss(path);
+            self.interval_loss = loss;
+            self.loss_unresolved = loss.is_none() && self.loss_pool.lost != 0;
+            let loss_rate = loss.map_or(0.0, |loss| loss.rate);
+            let congestion_events = loss.map_or(0, |loss| loss.congestion_events);
             let queue_delay = path.queue_delay();
             // Growth, not jitter: a millisecond of RTT noise beside a lost
             // packet is not a queue building.
@@ -456,11 +698,14 @@ impl RateController {
             } else if queue_delay <= self.policy.clear_queue_delay {
                 self.queue_delay_streak = 0;
             }
-            let severe_queue_delay = queue_delay
-                >= self
-                    .policy
-                    .congested_queue_delay
-                    .saturating_mul(self.policy.severe_queue_delay_factor);
+            // A keyframe's own interval may queue; only a queue that is still
+            // there an interval later is the path filling.
+            let severe_queue_delay = !keyframe_burst
+                && queue_delay
+                    >= self
+                        .policy
+                        .congested_queue_delay
+                        .saturating_mul(self.policy.severe_queue_delay_factor);
             let severe_loss = loss_rate >= self.policy.congested_loss_rate * 2.0;
             if loss_rate >= self.policy.congested_loss_rate {
                 return Some(CongestionEvent {
@@ -482,14 +727,18 @@ impl RateController {
             // and QUIC reacts to every such loss with a congestion event. A
             // single lossy interval is therefore not congestion; loss has to
             // persist, or come with a queue that is actually growing.
-            let lossy =
-                path.congestion_events_delta != 0 && loss_rate >= self.policy.event_loss_rate;
-            self.loss_streak = if lossy {
-                self.loss_streak.saturating_add(1)
-            } else {
-                0
-            };
-            if path.congestion_events_delta != 0
+            // Only evidenced intervals move the streak; a quiet stream that is
+            // still pooling neither confirms nor clears it.
+            if loss.is_some() {
+                let lossy = congestion_events != 0 && loss_rate >= self.policy.event_loss_rate;
+                self.loss_streak = if lossy {
+                    self.loss_streak.saturating_add(1)
+                } else {
+                    0
+                };
+            }
+            if loss.is_some()
+                && congestion_events != 0
                 && (self.loss_streak >= self.policy.queue_delay_samples
                     || (loss_rate >= self.policy.event_loss_rate && rising_queue))
             {
@@ -514,12 +763,11 @@ impl RateController {
                     .policy
                     .congested_frame_wait
                     .saturating_mul(self.policy.severe_queue_delay_factor);
-                if sample.mean_frame_wait >= severe_wait
-                    || self.frame_wait_streak >= self.policy.queue_delay_samples
-                {
+                let severe = !keyframe_burst && sample.mean_frame_wait >= severe_wait;
+                if severe || self.frame_wait_streak >= self.policy.queue_delay_samples {
                     return Some(CongestionEvent {
                         reason: RateChangeReason::FrameWait,
-                        severe: sample.mean_frame_wait >= severe_wait,
+                        severe,
                     });
                 }
             } else if sample.mean_frame_wait <= self.policy.clear_frame_wait || frame_wait_falling {
@@ -530,8 +778,13 @@ impl RateController {
     }
 
     fn path_is_clear(&self, sample: RateSample) -> bool {
+        let loss_rate = self.interval_loss_rate();
+        // Losses that are still pooling are not yet evidence of congestion,
+        // but neither is the interval clear: probing up or resetting the knee
+        // on it would undo a cut the pool is about to confirm.
         let transport_clear = sample.path.is_none_or(|path| {
-            path.loss_rate() < self.policy.congested_loss_rate
+            !self.loss_unresolved
+                && loss_rate < self.policy.congested_loss_rate
                 && path.queue_delay() <= self.policy.congested_queue_delay
         });
         let frames_clear =
@@ -540,8 +793,10 @@ impl RateController {
     }
 
     fn path_resets_knee(&self, sample: RateSample) -> bool {
+        let loss_rate = self.interval_loss_rate();
         sample.path.is_none_or(|path| {
-            path.loss_rate() < self.policy.event_loss_rate
+            !self.loss_unresolved
+                && loss_rate < self.policy.event_loss_rate
                 && path.queue_delay() <= self.policy.clear_queue_delay
         })
     }
@@ -574,15 +829,17 @@ impl RateController {
                         .saturating_mul(self.policy.severe_queue_delay_factor)
                     || self.queue_delay_streak >= self.policy.queue_delay_samples
             }
-            (RateChangeReason::LossOrCongestion, Some(path)) => {
-                path.loss_rate() >= self.policy.congested_loss_rate
+            (RateChangeReason::LossOrCongestion, Some(_)) => {
+                self.interval_loss_rate() >= self.policy.congested_loss_rate
             }
             _ => false,
         }
     }
 
     fn at_bound(&self) -> bool {
-        self.target_bps == self.policy.floor_bps || self.target_bps == self.policy.ceiling_bps
+        self.target_bps == self.policy.floor_bps
+            || self.target_bps == self.policy.ceiling_bps
+            || self.policy.evidence_gate_bps == Some(self.target_bps)
     }
 }
 
@@ -592,22 +849,36 @@ struct CongestionEvent {
     severe: bool,
 }
 
-/// The frame rate a Detail session runs at for a bitrate target: frames are
-/// shed in step with bits so each frame keeps its detail. Never above the
-/// session's own rate, never below 8 fps (or the session rate, if lower).
+/// Share of the start bitrate a Detail stream gives up in bits per frame
+/// before it sheds any frame.
+pub const DETAIL_BITS_BEFORE_FRAMES: f64 = 0.5;
+
+/// The lowest frame rate a Detail stream sheds to.
+pub const DETAIL_MIN_FPS: u32 = 8;
+
+/// The frame rate a Detail session's bitrate target allows, bits first: the
+/// session's own rate holds down to [`DETAIL_BITS_BEFORE_FRAMES`] of the start
+/// bitrate, and below that knee frames are shed in step with bits so each
+/// frame keeps its detail. Never above the session's own rate, never below
+/// [`DETAIL_MIN_FPS`] (or the session rate, if lower).
+///
+/// This is the bits-per-frame mapping alone. A host with a
+/// [`RateController`] asks [`RateController::detail_framerate`], which also
+/// keeps the contract's rate while the stream is content-limited.
 #[must_use]
 pub fn detail_framerate(max_fps: u32, start_bps: u64, target_bps: u64) -> u32 {
     let max_fps = max_fps.max(1);
     if start_bps == 0 {
         return max_fps;
     }
-    let fps = (f64::from(max_fps) * target_bps as f64 / start_bps as f64).round();
+    let knee = start_bps as f64 * DETAIL_BITS_BEFORE_FRAMES;
+    let fps = (f64::from(max_fps) * target_bps as f64 / knee).round();
     let fps = if fps.is_finite() && fps > 0.0 {
         fps.min(f64::from(u32::MAX)) as u32
     } else {
         0
     };
-    fps.clamp(8.min(max_fps), max_fps)
+    fps.clamp(DETAIL_MIN_FPS.min(max_fps), max_fps)
 }
 
 /// What each encoder pipeline has actually accepted, so a controller target
@@ -709,7 +980,8 @@ mod tests {
     #[test]
     fn detail_framerate_keeps_bits_per_frame_within_bounds() {
         assert_eq!(detail_framerate(30, 4_000_000, 4_000_000), 30);
-        assert_eq!(detail_framerate(30, 4_000_000, 2_000_000), 15);
+        assert_eq!(detail_framerate(30, 4_000_000, 2_000_000), 30);
+        assert_eq!(detail_framerate(30, 4_000_000, 1_000_000), 15);
         assert_eq!(detail_framerate(30, 4_000_000, 100), 8);
         assert_eq!(detail_framerate(30, 4_000_000, 40_000_000), 30);
         assert_eq!(detail_framerate(5, 4_000_000, 100), 5);
@@ -968,25 +1240,115 @@ mod tests {
     }
 
     #[test]
-    fn speed_motion_policy_reaches_the_sixty_fps_ceiling_on_a_clean_path() {
+    fn speed_motion_policy_reaches_the_sixty_fps_shape_budget_on_a_clean_path() {
         let contract = crate::video::pipeline_contract(crate::video::PipelineId::Speed);
-        let (start, ceiling) = contract.bitrate_bounds(
+        let shape = (
             1920,
             1080,
             contract.max_fps,
             contract.colour.chroma,
             contract.colour.bit_depth,
         );
-        let mut rate = RateController::new(RateControlPolicy::for_bounds_and_priority(
-            u64::from(start),
-            u64::from(ceiling),
-            contract.priority,
-        ));
+        let (start, _) = contract.bitrate_bounds(shape.0, shape.1, shape.2, shape.3, shape.4);
+        let budget = crate::video::average_bitrate_bps(shape.0, shape.1, shape.2, shape.3, shape.4);
+        let mut rate = RateController::new(
+            contract.rate_control_policy(shape.0, shape.1, shape.2, shape.3, shape.4),
+        );
         assert_eq!(rate.target_bps(), u64::from(start));
-        for _ in 0..12 {
-            let _ = rate.observe(sample(1000.0, 1, path(1, 1, 0, 0)));
+        // A clear path whose encoder spends little: the shape budget, as before,
+        // and not a bit more without evidence.
+        for _ in 0..40 {
+            let _ = rate.observe(sample(1.0, 1, path(1, 1, 0, 0)));
+        }
+        assert_eq!(rate.target_bps(), u64::from(budget));
+    }
+
+    #[test]
+    fn a_proven_path_climbs_past_the_shape_budget_to_the_proven_ceiling() {
+        let contract = crate::video::pipeline_contract(crate::video::PipelineId::Speed);
+        let shape = (
+            1800,
+            1168,
+            60,
+            contract.colour.chroma,
+            contract.colour.bit_depth,
+        );
+        let (_, ceiling) = contract.bitrate_bounds(shape.0, shape.1, shape.2, shape.3, shape.4);
+        let budget = crate::video::average_bitrate_bps(shape.0, shape.1, shape.2, shape.3, shape.4);
+        assert_eq!(ceiling, budget * crate::video::PROVEN_PATH_HEADROOM);
+        let mut rate = RateController::new(
+            contract.rate_control_policy(shape.0, shape.1, shape.2, shape.3, shape.4),
+        );
+        // A LAN: no queueing, no loss, and the encoder spends every bit it is
+        // given, so each interval proves the next step.
+        for _ in 0..60 {
+            let target = rate.target_bps() as f64 / 1_000_000.0;
+            let _ = rate.observe(sample(target, 1, path(2, 2, 0, 0)));
         }
         assert_eq!(rate.target_bps(), u64::from(ceiling));
+    }
+
+    #[test]
+    fn a_path_that_cannot_carry_more_never_leaves_the_shape_budget() {
+        let contract = crate::video::pipeline_contract(crate::video::PipelineId::Speed);
+        let shape = (
+            1800,
+            1168,
+            60,
+            contract.colour.chroma,
+            contract.colour.bit_depth,
+        );
+        let budget = u64::from(crate::video::average_bitrate_bps(
+            shape.0, shape.1, shape.2, shape.3, shape.4,
+        ));
+        let mut rate = RateController::new(
+            contract.rate_control_policy(shape.0, shape.1, shape.2, shape.3, shape.4),
+        );
+        // Clear RTT, but the path delivers only ~80% of the target each
+        // interval: no evidence, so no probe above the budget.
+        for _ in 0..60 {
+            let delivered = rate.target_bps() as f64 * 0.8 / 1_000_000.0;
+            let _ = rate.observe(sample(delivered, 1, path(30, 30, 0, 0)));
+        }
+        assert_eq!(rate.target_bps(), budget);
+        // And when a probe above it does build a queue, the controller cuts.
+        let mut proven = RateController::new(
+            contract.rate_control_policy(shape.0, shape.1, shape.2, shape.3, shape.4),
+        );
+        for _ in 0..30 {
+            let target = proven.target_bps() as f64 / 1_000_000.0;
+            let _ = proven.observe(sample(target, 1, path(30, 30, 0, 0)));
+        }
+        let above = proven.target_bps();
+        assert!(above > budget);
+        let mut cut = None;
+        for _ in 0..4 {
+            let target = proven.target_bps() as f64 / 1_000_000.0;
+            cut = cut.or(proven.observe(sample(target, 1, path(90, 30, 0, 0))));
+        }
+        let cut = cut.expect("queueing above the budget cuts");
+        assert_eq!(cut.reason, RateChangeReason::QueueDelay);
+        assert!(proven.target_bps() < above);
+    }
+
+    #[test]
+    fn the_gate_leaves_ordinary_range_probing_exactly_as_it_was() {
+        // Below the gate, a gated policy with a 4x ceiling must take the same
+        // steps as the old policy whose ceiling was the gate itself.
+        let gated = RateControlPolicy::for_bounds(START, CEILING * 4).with_evidence_gate(CEILING);
+        let legacy = RateControlPolicy::for_bounds(START, CEILING);
+        let (mut a, mut b) = (RateController::new(gated), RateController::new(legacy));
+        for _ in 0..20 {
+            let x = a
+                .observe(sample(1.0, 1, path(1, 1, 0, 0)))
+                .map(|c| c.target_bps);
+            let y = b
+                .observe(sample(1.0, 1, path(1, 1, 0, 0)))
+                .map(|c| c.target_bps);
+            assert_eq!(x, y);
+            assert_eq!(a.target_bps(), b.target_bps());
+        }
+        assert_eq!(a.target_bps(), CEILING);
     }
 
     #[test]
@@ -1602,5 +1964,181 @@ mod tests {
             let _ = rate.observe(sample(1000.0, 1, path(1, 1, 0, 0)));
         }
         assert_eq!(rate.target_bps(), policy.ceiling_bps);
+    }
+
+    fn grading_controller() -> RateController {
+        RateController::new(RateControlPolicy::for_bounds_priority_probe_step(
+            START,
+            250_000_000,
+            MotionPriority::Detail,
+            ProbeStep::TargetRelative,
+        ))
+    }
+
+    /// Dev Pier on the Xorg lab host over the Norway-to-London VPN (2026-10-18, run 2): a
+    /// Grading stream of 0.3-1 Mbps sends about 40 packets a second, so one
+    /// lost packet read as 2.5-47 % "congestion" and held the encoder at
+    /// 8-14 fps for about 50 s. Pooled to 200 packets, the same losses are a
+    /// few tenths of a percent and change nothing.
+    #[test]
+    fn sparse_sample_loss_does_not_cut_frames_or_bits() {
+        let mut rate = grading_controller();
+        // Read alone, one of these seconds is 2.5 % loss: above
+        // `congested_loss_rate`, an immediate cut before pooling existed.
+        let lone = path_with_packets(34, 33, 1, 1, 40);
+        assert!(lone.loss_rate() >= rate.policy.congested_loss_rate);
+        for second in 0..40_u64 {
+            let lost = u64::from(second % 10 == 3);
+            let path = path_with_packets(34, 33, lost, lost, 40);
+            if let Some(change) = rate.observe(sample(0.4, 1, path)) {
+                assert_ne!(
+                    change.reason,
+                    RateChangeReason::LossOrCongestion,
+                    "second {second}: one lost packet in a quiet second cut the target"
+                );
+            }
+            assert_eq!(rate.detail_framerate(30).fps, 30, "second {second}");
+        }
+        let evidence = rate.last_loss_evidence();
+        assert!(evidence.is_none_or(|loss| loss.sent_packets >= 200));
+    }
+
+    #[test]
+    fn heavy_pooled_loss_on_a_quiet_stream_cuts_bits_and_keeps_frames() {
+        let mut rate = grading_controller();
+        let mut cut = None;
+        for _ in 0..20 {
+            // 3 of 50 packets every second: 6 %, sustained.
+            let path = path_with_packets(34, 33, 1, 3, 50);
+            if let Some(change) = rate.observe(sample(0.5, 1, path)) {
+                if change.reason == RateChangeReason::LossOrCongestion {
+                    cut.get_or_insert(change);
+                }
+            }
+        }
+        let cut = cut.expect("sustained evidenced loss still backs off");
+        assert!(cut.target_bps < cut.previous_bps);
+        let framerate = rate.detail_framerate(30);
+        assert_eq!(framerate.fps, 30);
+        assert_eq!(framerate.reason, DetailFramerateReason::AppLimited);
+    }
+
+    /// Run 2 again: the first IDR over the VPN showed 113 ms of queue delay
+    /// in its own second and nothing the next, and the controller halved the
+    /// target twice. A keyframe interval's queue must persist to count.
+    #[test]
+    fn a_keyframe_spike_alone_does_not_cut() {
+        let keyframe = RateHints {
+            keyframe_bytes: 180_000,
+        };
+        let mut rate = grading_controller();
+        let spike = rate.observe_with(sample(1.4, 2, path(146, 33, 0, 0)), keyframe);
+        assert!(spike.is_none_or(|change| change.target_bps >= change.previous_bps));
+        let calm = rate.observe(sample(0.4, 1, path(33, 33, 0, 0)));
+        assert!(calm.is_none_or(|change| change.target_bps >= change.previous_bps));
+        assert!(rate.target_bps() >= START);
+        assert_eq!(rate.detail_framerate(30).fps, 30);
+
+        let mut without_hint = grading_controller();
+        let change = without_hint
+            .observe(sample(1.4, 2, path(146, 33, 0, 0)))
+            .expect("a severe queue without a keyframe still cuts at once");
+        assert_eq!(change.reason, RateChangeReason::QueueDelay);
+    }
+
+    #[test]
+    fn a_keyframe_spike_that_persists_still_cuts() {
+        let keyframe = RateHints {
+            keyframe_bytes: 180_000,
+        };
+        let mut rate = grading_controller();
+        let _ = rate.observe_with(sample(4.6, 2, path(146, 33, 0, 0)), keyframe);
+        let change = rate
+            .observe(sample(4.6, 2, path(140, 33, 0, 0)))
+            .expect("a queue that outlives the keyframe is congestion");
+        assert_eq!(change.reason, RateChangeReason::QueueDelay);
+        assert!(change.target_bps < change.previous_bps);
+    }
+
+    #[test]
+    fn sustained_loss_on_a_spending_stream_sheds_bits_before_frames() {
+        let mut rate = grading_controller();
+        let mut first_cut_fps = None;
+        let mut shed = None;
+        for _ in 0..30 {
+            let spend = rate.target_bps() as f64 / 1_000_000.0;
+            let path = path_with_packets(34, 33, 1, 30, 1_000);
+            if let Some(change) = rate.observe(sample(spend, 2, path)) {
+                if change.reason == RateChangeReason::LossOrCongestion {
+                    first_cut_fps.get_or_insert(rate.detail_framerate(30));
+                }
+            }
+            let framerate = rate.detail_framerate(30);
+            if framerate.fps < 30 {
+                shed.get_or_insert((rate.target_bps(), framerate));
+            }
+            assert!(framerate.fps >= DETAIL_MIN_FPS);
+        }
+        let first = first_cut_fps.expect("3 % sustained loss cuts");
+        assert_eq!(first.fps, 30, "the first cut must take bits, not frames");
+        let (target, framerate) = shed.expect("a deep enough cut sheds frames");
+        assert!(
+            (target as f64) < START as f64 * DETAIL_BITS_BEFORE_FRAMES,
+            "frames shed at {target} bps, above the bits-first knee"
+        );
+        assert_eq!(framerate.reason, DetailFramerateReason::BitsPerFrame);
+    }
+
+    /// A quiet stream with real sustained loss (a Grading stream of about 40
+    /// packets a second losing 6 %): the pool is judged every five seconds
+    /// and cuts, and the intervals between judgments, which hold lost packets
+    /// not yet judged, must not probe the target back up or reset the knee.
+    #[test]
+    fn pooled_sustained_loss_never_probes_up_between_judgments() {
+        let mut rate = grading_controller();
+        let mut previous = rate.target_bps();
+        let mut cuts = 0;
+        for second in 0..60_u64 {
+            let lost = if second % 2 == 0 { 3 } else { 2 };
+            let path = path_with_packets(34, 33, 1, lost, 40);
+            if let Some(change) = rate.observe(sample(0.5, 1, path)) {
+                assert_ne!(
+                    change.reason,
+                    RateChangeReason::ProbeIncrease,
+                    "second {second}: probed up while real loss was still pooling"
+                );
+                if change.reason == RateChangeReason::LossOrCongestion {
+                    cuts += 1;
+                }
+            }
+            assert!(
+                rate.target_bps() <= previous,
+                "second {second}: target rose {previous} -> {}",
+                rate.target_bps()
+            );
+            previous = rate.target_bps();
+        }
+        assert!(cuts > 0, "sustained pooled loss must still back off");
+        assert_eq!(rate.target_bps(), rate.policy.floor_bps);
+        assert_eq!(
+            rate.detail_framerate(30).reason,
+            DetailFramerateReason::AppLimited
+        );
+    }
+
+    #[test]
+    fn a_pool_without_losses_is_clear_and_still_probes() {
+        let mut rate = grading_controller();
+        let mut probed = false;
+        for _ in 0..4 {
+            let path = path_with_packets(34, 33, 0, 0, 40);
+            if let Some(change) = rate.observe(sample(4.0, 1, path)) {
+                probed |= change.reason == RateChangeReason::ProbeIncrease;
+            }
+        }
+        assert!(
+            probed,
+            "a quiet loss-free stream keeps probing while pooling"
+        );
     }
 }

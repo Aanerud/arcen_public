@@ -32,10 +32,14 @@ mod feedback;
 mod framing;
 mod handshake;
 mod identity;
+mod lane_relay;
+mod lane_runtime;
+mod liveness;
 mod monitor;
 mod monitor_registry;
 mod peer;
 mod priority;
+mod session_lanes;
 
 pub use carrier_bench::{
     ALLOWED_MONITOR_COUNTS, ActivePattern, AggregateMetrics, BENCH_COMPLETION_DRAIN_ALLOWANCE,
@@ -54,8 +58,9 @@ pub use config::{
     ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW, ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
     CongestionControl, SEND_WINDOW_RESIZE_INTERVAL, apply_direct_server_limits,
     apply_migration_stub_server_limits, interactive_send_window, keep_send_window_interactive,
-    monitor_carrier_transport_config, monitor_carrier_transport_config_arc,
-    recommended_transport_config, recommended_transport_config_arc,
+    lane_transport_config, lane_transport_config_arc, monitor_carrier_transport_config,
+    monitor_carrier_transport_config_arc, recommended_transport_config,
+    recommended_transport_config_arc,
 };
 pub use direct::{DirectQuicDialParams, DirectQuicStream, accept_direct, connect_direct};
 pub use error::QuicTransportError;
@@ -67,6 +72,23 @@ pub use handshake::{
 };
 pub use identity::{
     IdentityAuthorizationError, PeerIdentityAuthorizer, PeerIdentityClaim, QuicRole,
+};
+pub use lane_relay::{
+    LaneRelayEvent, LaneRelayStats, PierLaneRelay, RELAY_AUDIO_BACKLOG, RELAY_BULK_BACKLOG,
+    RELAY_BULK_INBOUND_BACKLOG, RELAY_BULK_WRITE_TIMEOUT, RELAY_INPUT_BACKLOG,
+    RELAY_INPUT_RELEASE_REASON, RELAY_MICROPHONE_BACKLOG, RELAY_VIDEO_BACKLOG, RelayRoute,
+};
+pub use lane_runtime::{
+    DEFAULT_LANE_PREFACE_TIMEOUT, INTERACTIVE_LANE_BURST_BYTES, INTERACTIVE_LANE_BURST_WINDOW,
+    LANE_TELEMETRY_BURST, LANE_TELEMETRY_PER_SECOND, LOW_PRIORITY_WRITE_CHUNK_BYTES, Lane,
+    LaneConnection, LaneDropCounts, LaneDuplex, LaneExit, LaneOpenFailure, LaneQueueBounds,
+    LaneReceiver, LaneRoleStatus, LaneRuntimeConfig, LaneSendError, LaneSender, LaneStatusSnapshot,
+    LaneTelemetrySink, LaneWaitError, MAX_CONCURRENT_PREFACE_READS, ObservabilityLaneSink,
+    classify_peer_close,
+};
+pub use liveness::{
+    IncumbentAttachment, IncumbentOutcome, IncumbentRegistration, PEER_SILENT_CLOSE_CODE,
+    PEER_SILENT_CLOSE_REASON, prove_peer_liveness,
 };
 pub use monitor::{
     MAX_MONITOR_STREAM_PREFACE_BYTES, MAX_MONITOR_STREAM_SESSION_ID_BYTES,
@@ -80,6 +102,13 @@ pub use priority::{
     AUDIO_PRIORITY_STREAM_PRIORITY, PriorityAudio, PriorityAudioSend, PriorityStreamError,
     accept_audio_priority_stream, open_audio_priority_stream, read_priority_frame,
     write_priority_frame,
+};
+pub use session_lanes::{
+    LaneGrantError, LaneRecoveryStep, LaneSenderSlot, LaneTerminal, LaneWriteOutcome,
+    LocalLaneWriter, PeerLaneEvent, PeerLaneReader, SESSION_CONTROL_LINGER, SessionLane,
+    SessionLaneReader, SessionLaneSetupError, SessionLaneSocket, accept_attachment,
+    accept_session_lanes, closed_in_order, connect_session_lanes, follow_lane_exit,
+    grant_attachment, next_attachment_generation, session_record_bytes,
 };
 
 use std::net::SocketAddr;

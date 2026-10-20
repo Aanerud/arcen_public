@@ -1,0 +1,2 @@
+Failure: No such entity
+move-bad rc=1

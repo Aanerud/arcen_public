@@ -58,6 +58,10 @@ roster (per-monitor DXGI/WGC capture -> NVENC/OpenH264 -> region-video ->
 macOS Deck presentation): the primary monitor may stay on hardware, but any
 software secondary makes the session-wide hello and served-pipeline correction
 report the software fallback.
+A `served_pipeline` message names its downgrade with a stable `reason` token
+and may add `detail`, one sentence the Deck shows the user when there is
+something they can do (the Linux Pier's ten-bit request on a desktop started at
+eight bits: `eight_bit_source` with `EIGHT_BIT_DESKTOP_DETAIL`).
 Operational encoder/rate-control policy is selected from that served truth, not
 from the original request. A request for HDR that is served as Grading runs the
 Grading bitrate/priority/intent contract; Software runs the Software contract;

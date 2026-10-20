@@ -130,6 +130,18 @@ pub enum LifecycleEventKind {
     PermissionPending = 1903,
     /// Encoder admission reduced the requested frame-rate ceiling.
     EncoderAdmissionFpsReduced = 1904,
+    /// A QUIC lane was refused before any payload reached a worker.
+    LaneRefused = 2000,
+    /// An admitted QUIC lane failed; the lane-scoped recovery is recorded.
+    LaneFailed = 2001,
+    /// A lane's writer or reader waited beyond its role's bound.
+    LaneStarved = 2002,
+    /// A preset was admitted, downgraded or found unavailable for a source.
+    PresetAdmissionDecided = 2003,
+    /// The Linux desktop provider was selected.
+    DesktopProviderSelected = 2004,
+    /// The explicitly requested Linux desktop provider is unavailable.
+    DesktopProviderUnavailable = 2005,
 }
 
 impl LifecycleEventKind {
@@ -203,6 +215,12 @@ impl LifecycleEventKind {
             Self::PermissionRevoked => &LIFECYCLE_EVENT_DEFINITIONS[48],
             Self::PermissionPending => &LIFECYCLE_EVENT_DEFINITIONS[49],
             Self::EncoderAdmissionFpsReduced => &LIFECYCLE_EVENT_DEFINITIONS[50],
+            Self::LaneRefused => &LIFECYCLE_EVENT_DEFINITIONS[51],
+            Self::LaneFailed => &LIFECYCLE_EVENT_DEFINITIONS[52],
+            Self::LaneStarved => &LIFECYCLE_EVENT_DEFINITIONS[53],
+            Self::PresetAdmissionDecided => &LIFECYCLE_EVENT_DEFINITIONS[54],
+            Self::DesktopProviderSelected => &LIFECYCLE_EVENT_DEFINITIONS[55],
+            Self::DesktopProviderUnavailable => &LIFECYCLE_EVENT_DEFINITIONS[56],
         }
     }
 }
@@ -351,6 +369,10 @@ const SESSION_END_FIELDS: &[LifecycleFieldSpec] = &[
     required("duration_ms", LifecycleFieldType::Integer),
     optional("frames_sent", LifecycleFieldType::Integer),
     optional("frames_dropped", LifecycleFieldType::Integer),
+    optional("client_network_kind", LifecycleFieldType::String),
+    optional("client_network_scope", LifecycleFieldType::String),
+    optional("client_link_mbps", LifecycleFieldType::Integer),
+    optional("client_mtu", LifecycleFieldType::Integer),
 ];
 /// Which capture backend served the session, and at what cost.
 ///
@@ -365,6 +387,15 @@ const CAPTURE_PATH_SELECTED_FIELDS: &[LifecycleFieldSpec] = &[
     // What was attempted before this backend won, when anything was.
     optional("fallback_from", LifecycleFieldType::String),
     optional("reason", LifecycleFieldType::String),
+    // Per-path source/import/copy truth (shared `capture_surface` tokens).
+    optional("copy_path", LifecycleFieldType::String),
+    optional("memory", LifecycleFieldType::String),
+    optional("modifier_class", LifecycleFieldType::String),
+    optional("gpu_match", LifecycleFieldType::String),
+    optional("source_transfer", LifecycleFieldType::String),
+    optional("source_primaries", LifecycleFieldType::String),
+    optional("sample_precision", LifecycleFieldType::String),
+    optional("cursor", LifecycleFieldType::String),
 ];
 const ENCODER_CONFIGURED_FIELDS: &[LifecycleFieldSpec] = &[
     required("encoder", LifecycleFieldType::String),
@@ -392,12 +423,55 @@ const ENCODER_ADMISSION_FPS_REDUCED_FIELDS: &[LifecycleFieldSpec] = &[
     optional("candidate", LifecycleFieldType::Integer),
     optional("monitor_count", LifecycleFieldType::Integer),
 ];
+const LANE_REFUSED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("role", LifecycleFieldType::String),
+    required("reason", LifecycleFieldType::String),
+    optional("lane_generation", LifecycleFieldType::Integer),
+];
+const LANE_FAILED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("role", LifecycleFieldType::String),
+    required("failure", LifecycleFieldType::String),
+    required("recovery", LifecycleFieldType::String),
+    optional("lane_generation", LifecycleFieldType::Integer),
+    optional("reset_stream", LifecycleFieldType::Boolean),
+];
+const LANE_STARVED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("role", LifecycleFieldType::String),
+    required("waited_ms", LifecycleFieldType::Integer),
+    optional("queued_frames", LifecycleFieldType::Integer),
+    optional("queued_bytes", LifecycleFieldType::Integer),
+    optional("cause", LifecycleFieldType::String),
+];
+const PRESET_ADMISSION_DECIDED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("requested_pipeline", LifecycleFieldType::String),
+    required("decision", LifecycleFieldType::String),
+    optional("served_pipeline", LifecycleFieldType::String),
+    optional("reason", LifecycleFieldType::String),
+    optional("fallback_reason", LifecycleFieldType::String),
+    optional("transform", LifecycleFieldType::String),
+    optional("copy_path", LifecycleFieldType::String),
+    optional("fps_ceiling", LifecycleFieldType::Integer),
+    optional("colour_assumed", LifecycleFieldType::Boolean),
+];
+const DESKTOP_PROVIDER_SELECTED_FIELDS: &[LifecycleFieldSpec] = &[
+    required("provider", LifecycleFieldType::String),
+    required("requested", LifecycleFieldType::String),
+    optional("wayland_blockers", LifecycleFieldType::String),
+];
+const DESKTOP_PROVIDER_UNAVAILABLE_FIELDS: &[LifecycleFieldSpec] = &[
+    required("requested", LifecycleFieldType::String),
+    required("blockers", LifecycleFieldType::String),
+];
 const SESSION_INTERRUPTED_FIELDS: &[LifecycleFieldSpec] = &[
     required("stage", LifecycleFieldType::String),
     required("reason_class", LifecycleFieldType::String),
     optional("duration_ms", LifecycleFieldType::Integer),
     optional("frames_sent", LifecycleFieldType::Integer),
     optional("frames_dropped", LifecycleFieldType::Integer),
+    optional("client_network_kind", LifecycleFieldType::String),
+    optional("client_network_scope", LifecycleFieldType::String),
+    optional("client_link_mbps", LifecycleFieldType::Integer),
+    optional("client_mtu", LifecycleFieldType::Integer),
 ];
 const DISPLAY_ARMED_FIELDS: &[LifecycleFieldSpec] = &[
     required("display_backend", LifecycleFieldType::String),
@@ -465,6 +539,13 @@ const CLIENT_START_FIELDS: &[LifecycleFieldSpec] = &[
     required("version", LifecycleFieldType::String),
     required("os", LifecycleFieldType::String),
     required("arch", LifecycleFieldType::String),
+    // Which build is running: the app bundle's own version strings, the
+    // build stamp embedded at compile time, and where the bundle lives.
+    optional("bundle_short_version", LifecycleFieldType::String),
+    optional("bundle_version", LifecycleFieldType::String),
+    optional("build_id", LifecycleFieldType::String),
+    optional("source_revision", LifecycleFieldType::String),
+    optional("bundle_path", LifecycleFieldType::String),
 ];
 const CLIENT_STOP_FIELDS: &[LifecycleFieldSpec] = &[
     required("uptime_ms", LifecycleFieldType::Integer),
@@ -568,6 +649,10 @@ const HEALTH_SNAPSHOT_FIELDS: &[LifecycleFieldSpec] = &[
     optional("rtt_ms", LifecycleFieldType::Integer),
     optional("drop_basis_points", LifecycleFieldType::Integer),
     optional("heartbeat_misses", LifecycleFieldType::Integer),
+    optional("client_network_kind", LifecycleFieldType::String),
+    optional("client_network_scope", LifecycleFieldType::String),
+    optional("client_link_mbps", LifecycleFieldType::Integer),
+    optional("client_mtu", LifecycleFieldType::Integer),
 ];
 const PERMISSION_FIELDS: &[LifecycleFieldSpec] = &[
     required("permission", LifecycleFieldType::String),
@@ -575,7 +660,7 @@ const PERMISSION_FIELDS: &[LifecycleFieldSpec] = &[
 ];
 
 /// Append-only v1 lifecycle event definitions, sorted by numeric identifier.
-pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 51] = &[
+pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 57] = &[
     LifecycleEventDefinition {
         kind: LifecycleEventKind::ServiceStart,
         name: "SERVICE_START",
@@ -1035,6 +1120,60 @@ pub static LIFECYCLE_EVENT_DEFINITIONS: &[LifecycleEventDefinition; 51] = &[
         minimum_profile: OperationalProfile::Info,
         fields: ENCODER_ADMISSION_FPS_REDUCED_FIELDS,
     },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::LaneRefused,
+        name: "LANE_REFUSED",
+        category: LifecycleCategory::Connection,
+        outcome: EventOutcome::Failed,
+        severity: LifecycleSeverity::Warning,
+        minimum_profile: OperationalProfile::Error,
+        fields: LANE_REFUSED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::LaneFailed,
+        name: "LANE_FAILED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Failed,
+        severity: LifecycleSeverity::Warning,
+        minimum_profile: OperationalProfile::Error,
+        fields: LANE_FAILED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::LaneStarved,
+        name: "LANE_STARVED",
+        category: LifecycleCategory::Streaming,
+        outcome: EventOutcome::Failed,
+        severity: LifecycleSeverity::Warning,
+        minimum_profile: OperationalProfile::Info,
+        fields: LANE_STARVED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::PresetAdmissionDecided,
+        name: "PRESET_ADMISSION_DECIDED",
+        category: LifecycleCategory::Negotiation,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Info,
+        fields: PRESET_ADMISSION_DECIDED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::DesktopProviderSelected,
+        name: "DESKTOP_PROVIDER_SELECTED",
+        category: LifecycleCategory::Negotiation,
+        outcome: EventOutcome::Succeeded,
+        severity: LifecycleSeverity::Information,
+        minimum_profile: OperationalProfile::Critical,
+        fields: DESKTOP_PROVIDER_SELECTED_FIELDS,
+    },
+    LifecycleEventDefinition {
+        kind: LifecycleEventKind::DesktopProviderUnavailable,
+        name: "DESKTOP_PROVIDER_UNAVAILABLE",
+        category: LifecycleCategory::Negotiation,
+        outcome: EventOutcome::Failed,
+        severity: LifecycleSeverity::Error,
+        minimum_profile: OperationalProfile::Critical,
+        fields: DESKTOP_PROVIDER_UNAVAILABLE_FIELDS,
+    },
 ];
 
 /// Returns the definition for a stable numeric identifier.
@@ -1092,6 +1231,12 @@ pub const fn lifecycle_event_definition(id: u32) -> Option<&'static LifecycleEve
         1902 => Some(&LIFECYCLE_EVENT_DEFINITIONS[48]),
         1903 => Some(&LIFECYCLE_EVENT_DEFINITIONS[49]),
         1904 => Some(&LIFECYCLE_EVENT_DEFINITIONS[50]),
+        2000 => Some(&LIFECYCLE_EVENT_DEFINITIONS[51]),
+        2001 => Some(&LIFECYCLE_EVENT_DEFINITIONS[52]),
+        2002 => Some(&LIFECYCLE_EVENT_DEFINITIONS[53]),
+        2003 => Some(&LIFECYCLE_EVENT_DEFINITIONS[54]),
+        2004 => Some(&LIFECYCLE_EVENT_DEFINITIONS[55]),
+        2005 => Some(&LIFECYCLE_EVENT_DEFINITIONS[56]),
         _ => None,
     }
 }
@@ -1288,6 +1433,12 @@ mod tests {
         (1902, "PERMISSION_REVOKED"),
         (1903, "PERMISSION_PENDING"),
         (1904, "ENCODER_ADMISSION_FPS_REDUCED"),
+        (2000, "LANE_REFUSED"),
+        (2001, "LANE_FAILED"),
+        (2002, "LANE_STARVED"),
+        (2003, "PRESET_ADMISSION_DECIDED"),
+        (2004, "DESKTOP_PROVIDER_SELECTED"),
+        (2005, "DESKTOP_PROVIDER_UNAVAILABLE"),
     ];
 
     fn correlation_id() -> CorrelationId {
@@ -1387,6 +1538,34 @@ mod tests {
                 "unexpected".to_owned()
             ))
         );
+    }
+
+    /// The Linux Pier adds the Deck's network snapshot to its session-end,
+    /// interruption and proof-of-life records; undeclared, they made those
+    /// records fail validation and vanish whenever the Deck had reported
+    /// its network.
+    #[test]
+    fn session_and_snapshot_records_accept_the_client_network_fields() {
+        for kind in [
+            LifecycleEventKind::SessionEnd,
+            LifecycleEventKind::SessionInterrupted,
+            LifecycleEventKind::HealthSnapshot,
+        ] {
+            let mut fields = valid_fields(kind.definition());
+            for (name, value) in [
+                ("client_network_kind", FieldValue::String("wifi".to_owned())),
+                ("client_network_scope", FieldValue::String("lan".to_owned())),
+                ("client_link_mbps", FieldValue::Integer(866)),
+                ("client_mtu", FieldValue::Integer(1500)),
+            ] {
+                fields.insert(name, value).expect("valid field");
+            }
+            assert!(
+                ValidatedLifecycleEvent::new(kind, correlation_id(), fields).is_ok(),
+                "{}",
+                kind.definition().name
+            );
+        }
     }
 
     #[test]

@@ -28,8 +28,11 @@ pub(crate) fn build_quic_server_config(
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .map_err(|error| format!("build QUIC crypto config: {error}"))?;
 
-    let transport = arcen_transport::quic::recommended_transport_config_arc(
+    // Grants the Deck the lanes it opens (control, input/cursor, bulk,
+    // microphone) plus one replacement of each shape (ADR 0014).
+    let transport = arcen_transport::quic::lane_transport_config_arc(
         &arcen_transport::BoundedTransportPolicy::default(),
+        arcen_protocol::lanes::LaneEndpoint::Pier,
     );
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     config.transport_config(transport);

@@ -322,6 +322,7 @@ pub fn default_config() -> PierFileConfig {
         auth: arcen_session::pier_config::AuthConfig::default(),
         redirection: arcen_session::pier_config::RedirectionConfig::default(),
         logging: arcen_session::pier_config::LoggingConfig::default(),
+        wayland: arcen_session::pier_config::WaylandConfig::default(),
         platform: MacOsPlatformConfig::default(),
     }
 }
@@ -386,6 +387,13 @@ pub fn parse_config(bytes: &[u8], path: &Path) -> Result<PierFileConfig, ConfigE
         path: path.to_path_buf(),
         message,
     })?;
+    config
+        .capture
+        .desktop_provider_for(arcen_session::desktop_provider::PierPlatform::Macos)
+        .map_err(|error| ConfigError::Policy {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
     if let Some(qp_map) = config.video.qp_map.as_ref() {
         qp_map
             .effective_token("auto")
@@ -724,6 +732,18 @@ mod tests {
             let bytes = valid_config(&format!(r#"{{"level":{level}}}"#));
             let config = parse_config(bytes.as_bytes(), Path::new("test.json")).unwrap();
             assert_eq!(config.logging.resolved_profile().unwrap().profile, expected);
+        }
+    }
+
+    #[test]
+    fn capture_provider_is_refused_on_the_macos_pier() {
+        for provider in ["xorg", "wayland"] {
+            let bytes = format!(
+                r#"{{"audio":{{"enabled":false,"compressed":true}},"microphone_input":{{"enabled":false}},"capture":{{"provider":"{provider}"}},"platform":{{}}}}"#
+            );
+            let error = parse_config(bytes.as_bytes(), Path::new("test.json"))
+                .expect_err("capture.provider is Linux-only");
+            assert!(error.to_string().contains("only to the Linux Pier"));
         }
     }
 

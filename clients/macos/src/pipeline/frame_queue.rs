@@ -91,6 +91,7 @@ pub fn parse_media_packet(data: &[u8]) -> Result<Option<MediaPacket>, ProtocolEr
         | FrameType::UsbBridgeUrbSubmit
         | FrameType::UsbBridgeUrbCancel
         | FrameType::UsbBridgeUrbComplete
+        | FrameType::CursorUpdate
         | FrameType::AudioUpstream => Err(ProtocolError::UnknownFrameType(frame_type)),
     }
 }
@@ -146,10 +147,12 @@ pub struct IncomingMediaEnqueue {
 #[derive(Clone)]
 pub struct IncomingMediaSender {
     shared: Arc<SharedInbox>,
+    audio_lane: crate::pipeline::audio_lane::AudioLaneSender,
 }
 
 pub struct IncomingMediaReceiver {
     shared: Arc<SharedInbox>,
+    audio_lane: crate::pipeline::audio_lane::AudioLaneReceiver,
 }
 
 struct SharedInbox {
@@ -260,15 +263,26 @@ pub fn incoming_media_inbox_with_limits(
             current_audio_burst_packets: 0,
         }),
     });
+    let (audio_sender, audio_receiver) = crate::pipeline::audio_lane::audio_lane_queue();
     (
         IncomingMediaSender {
             shared: Arc::clone(&shared),
+            audio_lane: audio_sender,
         },
-        IncomingMediaReceiver { shared },
+        IncomingMediaReceiver {
+            shared,
+            audio_lane: audio_receiver,
+        },
     )
 }
 
 impl IncomingMediaSender {
+    /// The audio-output lane's own queue, drained by the audio worker, never
+    /// by the video decoder (ADR 0014).
+    pub fn audio_lane(&self) -> &crate::pipeline::audio_lane::AudioLaneSender {
+        &self.audio_lane
+    }
+
     pub fn set_limits(&self, limits: IncomingMediaLimits) {
         let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
         inner.limits = IncomingMediaLimits {
@@ -348,6 +362,11 @@ impl IncomingMediaSender {
 }
 
 impl IncomingMediaReceiver {
+    /// The audio worker's side of the audio-output lane queue.
+    pub fn audio_lane(&self) -> &crate::pipeline::audio_lane::AudioLaneReceiver {
+        &self.audio_lane
+    }
+
     pub fn take_batch(&self) -> IncomingMediaBatch {
         let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
         let video = inner.video.drain(..).collect();

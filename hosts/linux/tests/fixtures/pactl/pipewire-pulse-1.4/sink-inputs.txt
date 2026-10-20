@@ -1,0 +1,151 @@
+Sink Input #58
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 55
+	Sink: 49
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "48000"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 0 usec
+	Sink Latency: 0 usec
+	Resample method: PipeWire
+	Properties:
+		client.api = "pipewire-pulse"
+		pulse.server.type = "unix"
+		media.format = "WAV (Microsoft)"
+		application.name = "paplay"
+		media.name = "/home/arcenlab/tone.wav"
+		application.process.id = "495797"
+		application.process.user = "arcenlab"
+		application.process.host = "pier.example.internal"
+		application.process.binary = "pacat"
+		application.language = "C"
+		application.process.machine_id = "00000000000000000000000000000000"
+		application.process.session_id = "1529"
+		pulse.corked = "false"
+		node.rate = "1/48000"
+		node.latency = "8192/48000"
+		target.object = "lab_speaker"
+		stream.is-live = "true"
+		node.name = "paplay"
+		node.want-driver = "true"
+		node.autoconnect = "true"
+		media.class = "Stream/Output/Audio"
+		port.group = "stream.0"
+		adapt.follower.spa-node = ""
+		object.register = "false"
+		factory.id = "7"
+		clock.quantum-limit = "8192"
+		node.loop.name = "data-loop.0"
+		library.name = "audioconvert/libspa-audioconvert"
+		client.id = "53"
+		object.id = "56"
+		object.serial = "58"
+		node.driver-id = "49"
+		pulse.attr.maxlength = "4194304"
+		pulse.attr.tlength = "384000"
+		pulse.attr.prebuf = "380164"
+		pulse.attr.minreq = "3840"
+		module-stream-restore.id = "sink-input-by-application-name:paplay"
+
+Sink Input #59
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 57
+	Sink: 49
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "48000"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 0 usec
+	Sink Latency: 0 usec
+	Resample method: PipeWire
+	Properties:
+		application.name = "pw-play"
+		node.name = "pw-play"
+		media.format = "WAV (Microsoft)"
+		node.rate = "1/48000"
+		node.latency = "4800/48000"
+		media.type = "Audio"
+		media.category = "Playback"
+		media.role = "music"
+		media.filename = "/home/arcenlab/tone.wav"
+		media.name = "/home/arcenlab/tone.wav"
+		stream.is-live = "true"
+		node.want-driver = "true"
+		node.autoconnect = "true"
+		node.loop.class = "main"
+		node.async = "true"
+		media.class = "Stream/Output/Audio"
+		port.group = "stream.0"
+		adapt.follower.spa-node = ""
+		object.register = "false"
+		factory.id = "9"
+		clock.quantum-limit = "8192"
+		node.loop.name = "main-loop"
+		library.name = "audioconvert/libspa-audioconvert"
+		client.id = "55"
+		object.id = "57"
+		object.serial = "59"
+		node.driver-id = "49"
+		module-stream-restore.id = "sink-input-by-media-role:music"
+
+Sink Input #60
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 56
+	Sink: 49
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "48000"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 0 usec
+	Sink Latency: 0 usec
+	Resample method: PipeWire
+	Properties:
+		client.api = "pipewire-pulse"
+		pulse.server.type = "unix"
+		media.format = "WAV (Microsoft)"
+		application.name = "paplay"
+		media.name = "/home/arcenlab/tone.wav"
+		application.process.id = "495796"
+		application.process.user = "arcenlab"
+		application.process.host = "pier.example.internal"
+		application.process.binary = "pacat"
+		application.language = "C"
+		application.process.machine_id = "00000000000000000000000000000000"
+		application.process.session_id = "1529"
+		pulse.corked = "false"
+		node.rate = "1/48000"
+		node.latency = "8192/48000"
+		stream.is-live = "true"
+		node.name = "paplay"
+		node.want-driver = "true"
+		node.autoconnect = "true"
+		media.class = "Stream/Output/Audio"
+		port.group = "stream.0"
+		adapt.follower.spa-node = ""
+		object.register = "false"
+		factory.id = "7"
+		clock.quantum-limit = "8192"
+		node.loop.name = "data-loop.0"
+		library.name = "audioconvert/libspa-audioconvert"
+		client.id = "54"
+		object.id = "58"
+		object.serial = "60"
+		node.driver-id = "49"
+		pulse.attr.maxlength = "4194304"
+		pulse.attr.tlength = "384000"
+		pulse.attr.prebuf = "380164"
+		pulse.attr.minreq = "3840"
+		module-stream-restore.id = "sink-input-by-application-name:paplay"

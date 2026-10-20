@@ -9,11 +9,12 @@
 //! normalisation. No vendor SDK, vendor id or vendor report parsing is used;
 //! tablet presence comes from HID report descriptors ([`presence`]).
 //!
-//! [`dispatch::TabletEventDispatcher`] then folds a drained sample batch
-//! into an edge-preserving, motion-coalesced output ready to send, and
-//! `ui/app.rs` owns the [`runtime::TabletRuntime`] RAII guard, negotiates
-//! typed pen with the host over `arcen_protocol::messages::PenEventMsg`,
-//! maps window points through the current video `image_rect`, and
+//! The monitor hands each sample to `ui::pen_input::PenInput` as AppKit
+//! dispatches it, so a pen sample is mapped, classified by the shared
+//! [`arcen_input::PenForwardingDispatcher`] and sent to the input lane at
+//! once instead of waiting for the next UI pass. `ui/app.rs` owns the
+//! [`runtime::TabletRuntime`] RAII guard, negotiates typed pen with the host,
+//! publishes the current video `image_rect` and routing once per pass, and
 //! suppresses the egui mouse-emulation duplicates while a real pen has
 //! authority.
 //!
@@ -22,7 +23,6 @@
 //! `tablet` module level without also — unoverridably — forbidding the
 //! legitimate, safety-commented AppKit and I/O Registry FFI those two need).
 
-pub mod dispatch;
 pub mod hid_inventory;
 pub mod mapper;
 #[cfg(target_os = "macos")]
@@ -32,16 +32,15 @@ pub mod probe;
 pub mod runtime;
 pub mod sample;
 
-pub use dispatch::{TabletDispatchOverflow, TabletEventDispatcher};
 pub use mapper::{TabletMapper, ViewSize};
 pub use presence::{
     attached_pen_tablets, note_pen_observed, tablet_presence, typed_pen_capability,
 };
 pub use probe::TabletCapabilityProbe;
-pub use runtime::TabletRuntime;
+pub use runtime::{MouseCoalescing, TabletRuntime};
 pub use sample::{
-    BoundedSampleQueue, NativeTabletPoint, NativeTabletProximity, NativeTabletTool,
-    RawTabletSample, TabletButtonMask,
+    BoundedSampleQueue, DispatchAgeStats, DispatchAgeSummary, NativeTabletPoint,
+    NativeTabletProximity, NativeTabletTool, RawTabletSample, TabletButtonMask, TabletMonitorEvent,
 };
 
 #[cfg(target_os = "macos")]

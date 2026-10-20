@@ -504,6 +504,62 @@ impl Debug for DirectResumeSlotResult {
     }
 }
 
+/// Whether a desktop session is attached to a Deck or detached and waiting
+/// for one to resume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAttachment {
+    /// A Deck is attached.
+    Attached,
+    /// No Deck is attached; the session waits within its reconnect window.
+    Detached,
+}
+
+/// What a fresh sign-in that passed full authentication may do to the
+/// desktop session that holds a capacity-one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshSignIn {
+    /// The session's own user, the session detached: take it over now.
+    /// The newcomer reattaches to the same desktop; the old Deck's resume
+    /// grant is invalidated.
+    TakeOverDetached,
+    /// The session's own user, a Deck attached: the attached Deck keeps the
+    /// session unless its peer is proven silent.
+    ProveIncumbentSilent,
+    /// Another user: refused; the session is untouched.
+    Refuse,
+}
+
+/// An account as the operating system resolved it after authentication:
+/// its canonical name and numeric id (a Linux `pw_name` and uid), never a
+/// name as the Deck typed it, which may be an alias (`Alice`,
+/// `alice@corp.example`, `CORP\alice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountPrincipal<'a> {
+    /// Canonical account name.
+    pub name: &'a str,
+    /// Numeric account id.
+    pub id: u64,
+}
+
+/// Decides what a fresh, fully authenticated sign-in as `signed_in` does to
+/// a session owned by `owner` in state `attachment`. Only the same account
+/// — canonical name and numeric id both equal — may ever affect the
+/// session; an attached session is never taken over by a sign-in alone.
+#[must_use]
+pub fn fresh_sign_in(
+    owner: AccountPrincipal<'_>,
+    signed_in: AccountPrincipal<'_>,
+    attachment: SessionAttachment,
+) -> FreshSignIn {
+    if owner.name.is_empty() || owner != signed_in {
+        return FreshSignIn::Refuse;
+    }
+    match attachment {
+        SessionAttachment::Detached => FreshSignIn::TakeOverDetached,
+        SessionAttachment::Attached => FreshSignIn::ProveIncumbentSilent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +818,48 @@ mod tests {
         assert_eq!(
             slot.compare_and_rotate(8, &[2; 32], [3; 32]),
             DirectResumeSlotResult::Replayed
+        );
+    }
+
+    #[test]
+    fn only_the_same_account_takes_over_and_only_a_detached_session() {
+        use super::{AccountPrincipal, FreshSignIn, SessionAttachment, fresh_sign_in};
+        let alice = AccountPrincipal {
+            name: "alice",
+            id: 1001,
+        };
+        assert_eq!(
+            fresh_sign_in(alice, alice, SessionAttachment::Detached),
+            FreshSignIn::TakeOverDetached
+        );
+        assert_eq!(
+            fresh_sign_in(alice, alice, SessionAttachment::Attached),
+            FreshSignIn::ProveIncumbentSilent
+        );
+        let mallory = AccountPrincipal {
+            name: "mallory",
+            id: 1002,
+        };
+        assert_eq!(
+            fresh_sign_in(alice, mallory, SessionAttachment::Detached),
+            FreshSignIn::Refuse
+        );
+        // A name alone is not the account: same name, another id.
+        assert_eq!(
+            fresh_sign_in(
+                alice,
+                AccountPrincipal {
+                    name: "alice",
+                    id: 2001
+                },
+                SessionAttachment::Detached
+            ),
+            FreshSignIn::Refuse
+        );
+        let nobody = AccountPrincipal { name: "", id: 0 };
+        assert_eq!(
+            fresh_sign_in(nobody, nobody, SessionAttachment::Detached),
+            FreshSignIn::Refuse
         );
     }
 }

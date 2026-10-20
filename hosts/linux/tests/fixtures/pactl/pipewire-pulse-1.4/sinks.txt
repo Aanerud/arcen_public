@@ -1,0 +1,70 @@
+Sink #31
+	State: SUSPENDED
+	Name: arcen_session_sink
+	Description: Arcen session audio
+	Driver: PipeWire
+	Sample Specification: float32le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Owner Module: 4294967295
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Base Volume: 65536 / 100% / 0.00 dB
+	Monitor Source: arcen_session_sink.monitor
+	Latency: 0 usec, configured 0 usec
+	Flags: HARDWARE DECIBEL_VOLUME LATENCY 
+	Properties:
+		factory.name = "support.null-audio-sink"
+		node.name = "arcen_session_sink"
+		device.description = "Arcen session audio"
+		media.class = "Audio/Sink"
+		audio.position = "[ FL FR ]"
+		audio.rate = "48000"
+		priority.session = "2000"
+		factory.id = "19"
+		clock.quantum-limit = "8192"
+		node.driver = "true"
+		port.group = "stream.0"
+		node.loop.name = "data-loop.0"
+		library.name = "audioconvert/libspa-audioconvert"
+		object.id = "31"
+		object.serial = "31"
+	Formats:
+		pcm
+
+Sink #49
+	State: RUNNING
+	Name: lab_speaker
+	Description: Lab_Speaker
+	Driver: PipeWire
+	Sample Specification: float32le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Owner Module: 536870916
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Base Volume: 65536 / 100% / 0.00 dB
+	Monitor Source: lab_speaker.monitor
+	Latency: 0 usec, configured 0 usec
+	Flags: HARDWARE DECIBEL_VOLUME LATENCY 
+	Properties:
+		node.name = "lab_speaker"
+		device.description = "Lab_Speaker"
+		audio.channels = "2"
+		audio.position = "[ FL, FR ]"
+		media.class = "Audio/Sink"
+		factory.name = "support.null-audio-sink"
+		monitor.channel-volumes = "true"
+		monitor.passthrough = "true"
+		pulse.module.id = "536870916"
+		factory.id = "19"
+		clock.quantum-limit = "8192"
+		client.id = "48"
+		node.driver = "true"
+		port.group = "stream.0"
+		node.loop.name = "data-loop.0"
+		library.name = "audioconvert/libspa-audioconvert"
+		object.id = "49"
+		object.serial = "49"
+	Formats:
+		pcm

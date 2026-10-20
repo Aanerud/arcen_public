@@ -5,6 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use arcen_session::install_provider::{InstallPlan, plan_install_provider, summary_lines};
+use arcen_session::wayland_qualification::{
+    QUALIFY_TEMPORARY_USER, QUALIFY_TEMPORARY_USER_GECOS, QualificationTarget, RECORD_PATH,
+};
 use arcen_transport::cert_marker::{self, OwnershipMarker};
 use arcen_transport::cert_provisioning::{
     MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRefusal, ProvisioningRequest,
@@ -27,6 +31,12 @@ const SOURCE_OFFER: &str = "Arcen is free software under the GNU AGPL-3.0. It co
 #[path = "../../../quic_config_migration.rs"]
 mod quic_config_migration;
 
+/// Desktop-provider facts, the embedded Pier's runtime check, the Wayland
+/// qualification run and the install log.
+mod desktop;
+/// The display manager beside native Wayland desktops: explained, and
+/// disabled only on request (`--disable-gdm`, undone by `--restore-gdm`).
+mod display_manager;
 /// The Pier's sysfs PCI reader, compiled here too so the installer and the
 /// Pier reach the same answer about which GPU Xorg must use. It depends only
 /// on `std` and `arcen-outputs`, which owns the decision itself.
@@ -91,6 +101,18 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../../../legal/THIRD_PARTY_NO
 /// The administration guide, placed on the host so a sysadmin can tune the
 /// Pier without going back to the repository.
 const ADMIN_GUIDE: &str = include_str!("../../../../docs/operations/pier-administration.md");
+/// Arcen's SELinux policy module: one rule that lets the Pier's session
+/// launcher (a systemd service, `unconfined_service_t`) start the session
+/// user's first process in the context `pam_selinux` assigned
+/// (`docs/security/linux-selinux.md`). Kept on disk so an operator who
+/// enables SELinux later can load it without the installer.
+const SELINUX_MODULE: &str = include_str!("../../selinux/arcen.cil");
+const SELINUX_MODULE_NAME: &str = "arcen";
+const SELINUX_DIR: &str = "/usr/share/arcen/selinux";
+const SELINUX_MODULE_PATH: &str = "/usr/share/arcen/selinux/arcen.cil";
+const SEMODULE: &str = "/usr/sbin/semodule";
+/// Present exactly when SELinux is enabled (enforcing or permissive).
+const SELINUXFS_ENFORCE: &str = "/sys/fs/selinux/enforce";
 
 /// Runtime commands the Pier invokes. Checked before anything is written, so a
 /// host missing a dependency is told up front rather than after a half
@@ -101,28 +123,51 @@ const REQUIRED_COMMANDS: &[(&str, &str)] = &[
         "openssl, used to generate the TLS host certificate",
     ),
     (
-        "/usr/bin/xauth",
-        "xauth, used to authorise the dedicated X server",
-    ),
-    (
         "/usr/bin/systemctl",
         "systemd, used to register and run the service",
+    ),
+];
+
+/// Required only where the Pier serves the dedicated X11 desktop.
+const X11_REQUIRED_COMMANDS: &[(&str, &str)] = &[(
+    "/usr/bin/xauth",
+    "xauth, used to authorise the dedicated X server",
+)];
+
+/// Required only where the Pier serves a headless Wayland desktop: the
+/// qualification run creates, uses and removes a temporary local account
+/// and runs outside the operator's login session. The Wayland session stack
+/// itself (compositor, D-Bus, PipeWire, WirePlumber, DRM) is part of the
+/// provider plan.
+const WAYLAND_REQUIRED_COMMANDS: &[(&str, &str)] = &[
+    (
+        "/usr/sbin/useradd",
+        "useradd, for the temporary qualification account",
+    ),
+    ("/usr/sbin/userdel", "userdel, to remove that account"),
+    (
+        "/usr/sbin/chpasswd",
+        "chpasswd, to give it a one-time password",
+    ),
+    ("/usr/bin/loginctl", "loginctl, to end its logind session"),
+    (
+        "/usr/bin/systemd-run",
+        "systemd-run, to qualify outside the installing login session",
     ),
 ];
 
 /// Optional at install time, but the Pier cannot serve a session without them.
 /// Reported as warnings so an operator can fix the host afterwards rather than
 /// being blocked.
-const RECOMMENDED_COMMANDS: &[(&str, &str)] = &[
-    (
-        "/usr/libexec/Xorg",
-        "Xorg, required for the dedicated session display",
-    ),
-    (
-        "/usr/bin/pactl",
-        "PulseAudio client tools, required for audio capture",
-    ),
-];
+const RECOMMENDED_COMMANDS: &[(&str, &str)] = &[(
+    "/usr/bin/pactl",
+    "PulseAudio client tools, required for audio capture",
+)];
+
+/// Records that this installer opened UDP 18444 (`firewalld` or `ufw`), so
+/// uninstall closes exactly what install opened and nothing an
+/// administrator opened.
+const FIREWALL_MARKER: &str = "/var/lib/arcen/installer-opened-firewall";
 
 #[derive(Debug)]
 struct Options {
@@ -138,6 +183,18 @@ struct Options {
     /// effect immediately. Off by default because a restart drops every live
     /// remote session on the host.
     restart: bool,
+    /// Print what this host has and which desktop the installer would
+    /// choose, then exit without writing anything.
+    check: bool,
+    /// Display sizes to qualify Speed for on a Wayland host
+    /// (`WIDTHxHEIGHT@HZ`, passed to `wayland qualify --output`).
+    qualify_outputs: Vec<String>,
+    /// Disable the display manager (recorded; undone by `--restore-gdm` and
+    /// `--uninstall`) so it can never put a login screen on a native
+    /// desktop's seat.
+    disable_gdm: bool,
+    /// Put back what `--disable-gdm` changed, then exit.
+    restore_gdm: bool,
     /// Extra names or addresses to place in the generated TLS certificate.
     ///
     /// The certificate is otherwise built from what the machine can see of
@@ -159,8 +216,19 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let options = parse_args()?;
+    if options.check {
+        return check(&options);
+    }
     if current_euid()? != 0 {
         return Err("must run as root".to_string());
+    }
+    if options.restore_gdm && !options.uninstall {
+        let mut log = desktop::InstallLog::default();
+        return display_manager::restore(
+            options.dry_run,
+            display_manager::RestoreMode::Standalone,
+            &mut log,
+        );
     }
     if options.uninstall {
         uninstall(&options)
@@ -178,6 +246,10 @@ fn parse_args() -> Result<Options, String> {
         force: false,
         no_service: false,
         restart: false,
+        check: false,
+        qualify_outputs: Vec::new(),
+        disable_gdm: false,
+        restore_gdm: false,
         extra_sans: Vec::new(),
     };
     let mut args = env::args().skip(1);
@@ -195,6 +267,20 @@ fn parse_args() -> Result<Options, String> {
             "--force" => options.force = true,
             "--no-service" => options.no_service = true,
             "--restart" => options.restart = true,
+            "--check" => options.check = true,
+            "--disable-gdm" => options.disable_gdm = true,
+            "--restore-gdm" => options.restore_gdm = true,
+            "--qualify-output" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--qualify-output requires WIDTHxHEIGHT@HZ".to_string())?;
+                if !desktop::valid_qualify_output(&value) {
+                    return Err(format!("--qualify-output {value:?} is not WIDTHxHEIGHT@HZ"));
+                }
+                if !options.qualify_outputs.contains(&value) {
+                    options.qualify_outputs.push(value);
+                }
+            }
             "--extra-san" => {
                 let value = args
                     .next()
@@ -216,7 +302,31 @@ fn parse_args() -> Result<Options, String> {
                 println!(
                     "Usage: install-arcen-pier [--prefix DIR] [--dry-run] [--force] [--restart]\n\
                      \x20                        [--no-service] [--uninstall] [--purge] [--version]\n\
-                     \x20                        [--extra-san NAME-OR-IP]\n\
+                     \x20                        [--extra-san NAME-OR-IP] [--check]\n\
+                     \x20                        [--qualify-output WIDTHxHEIGHT@HZ]\n\
+                     \x20                        [--disable-gdm | --restore-gdm]\n\
+                     \n\
+                     The installer chooses the desktop from what this host has: an\n\
+                     installed Xorg server keeps the dedicated X11 desktop; without one,\n\
+                     a headless GNOME stack with a DRM render node is qualified for\n\
+                     Wayland (`arcen-pier wayland qualify --write`) and the service\n\
+                     starts only if that passes. It prints what it found and why.\n\
+                     \n\
+                     --check      Print what this host has and which desktop would be\n\
+                     \x20            chosen, then exit; writes nothing and needs no root.\n\
+                     \x20            Exit status 1 when the installer would stop.\n\
+                     --qualify-output  An extra Deck display size to qualify Speed for on\n\
+                     \x20            a Wayland host (repeatable). Rarely needed: every\n\
+                     \x20            qualification measures the previous record's displays,\n\
+                     \x20            those Decks asked Speed for, and 1920x1080, 2560x1600\n\
+                     \x20            and 3840x2160 at 60 Hz; smaller displays are covered.\n\
+                     \n\
+                     --disable-gdm  Disable and stop the display manager before qualifying,\n\
+                     \x20            so it can never put a login screen on a native Wayland\n\
+                     \x20            desktop's seat (wayland.session_mode). Its state is recorded\n\
+                     \x20            in /var/lib/arcen/display-manager-disabled.json.\n\
+                     --restore-gdm  Put the display manager back as it was, then exit.\n\
+                     \x20            --uninstall does this too.\n\
                      \n\
                      --extra-san  Add a DNS name or IP address to the generated TLS\n\
                      \x20            certificate. Repeatable, or comma-separated. Use this when\n\
@@ -263,28 +373,197 @@ fn migrate_existing_config(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-fn preflight(options: &Options) -> Result<(), String> {
+/// Commands this host lacks for `plan`: `(required, recommended)`, each as
+/// `path  (why)`. Without a plan (a staging prefix) only the common ones.
+fn missing_commands(plan: Option<InstallPlan>) -> (Vec<String>, Vec<String>) {
+    let provider: &[(&str, &str)] = match plan {
+        Some(InstallPlan::Wayland { .. }) => WAYLAND_REQUIRED_COMMANDS,
+        Some(InstallPlan::Xorg { .. }) => X11_REQUIRED_COMMANDS,
+        None => &[],
+    };
+    let absent = |commands: &[(&str, &str)]| {
+        commands
+            .iter()
+            .filter(|(path, _)| !Path::new(path).exists())
+            .map(|(path, why)| format!("{path}  ({why})"))
+            .collect::<Vec<_>>()
+    };
+    let selinux: &[(&str, &str)] = if Path::new(SELINUXFS_ENFORCE).exists() {
+        &[(
+            SEMODULE,
+            "semodule (policycoreutils): SELinux is enabled, and without Arcen's policy \
+             module every session would be refused",
+        )]
+    } else {
+        &[]
+    };
+    let required = REQUIRED_COMMANDS
+        .iter()
+        .chain(provider)
+        .chain(selinux)
+        .copied()
+        .collect::<Vec<_>>();
+    (absent(&required), absent(RECOMMENDED_COMMANDS))
+}
+
+fn preflight(options: &Options, plan: Option<InstallPlan>) -> Result<(), String> {
     if !is_root_prefix(&options.prefix) {
         return Ok(());
     }
-    let mut missing = Vec::new();
-    for (path, why) in REQUIRED_COMMANDS {
-        if !Path::new(path).exists() {
-            missing.push(format!("  {path}  ({why})"));
-        }
-    }
+    let (missing, recommended) = missing_commands(plan);
     if !missing.is_empty() {
         return Err(format!(
-            "this host is missing required commands:\n{}\n\nInstall them and run the installer again.",
-            missing.join("\n")
+            "this host is missing required commands:\n  {}\n\nInstall them and run the installer again.",
+            missing.join("\n  ")
         ));
     }
-    for (path, why) in RECOMMENDED_COMMANDS {
-        if !Path::new(path).exists() {
-            println!("warning: {path} is absent ({why}); sessions will fail until it is installed");
-        }
+    for absent in recommended {
+        println!("warning: {absent} is absent; sessions will fail until it is installed");
     }
     Ok(())
+}
+
+/// Decides the desktop from this machine's facts before anything is
+/// written, printing and logging what was found and why. `None` for a
+/// staging prefix, which describes another machine.
+///
+/// # Errors
+///
+/// The embedded Pier cannot start here, or the host can serve no desktop:
+/// the installer stops with the explanation.
+fn detect_desktop(
+    options: &Options,
+    log: &mut desktop::InstallLog,
+) -> Result<Option<InstallPlan>, String> {
+    if !is_root_prefix(&options.prefix) {
+        println!("staging prefix: skipped desktop provider detection");
+        return Ok(None);
+    }
+    let runtime = desktop::check_pier_runtime(PIER);
+    let wayland_built = match &runtime {
+        desktop::PierRuntime::Runs { wayland_built } => *wayland_built,
+        // Release builds contain the provider; the qualification run proves
+        // it either way.
+        desktop::PierRuntime::LoaderRefused(_) | desktop::PierRuntime::Unchecked(_) => true,
+    };
+    let existing = existing_config(options, log);
+    // The Pier refuses to start with a prefix it may not execute from; the
+    // installer reports it and runs nothing from it.
+    if let Some(refusal) = desktop::compositor_prefix_refusal(&existing) {
+        log.note(format!("  {:<18}REFUSED: {refusal}", "Compositor prefix:"));
+        log.record("decision: refused (compositor_prefix)");
+        return Err(format!(
+            "{refusal}\nFix the prefix's ownership (root-owned, writable by no one else) or \
+             remove capture.wayland_compositor_prefix, then run the installer again."
+        ));
+    }
+    let facts = desktop::gather_host_facts(&existing, wayland_built);
+    let decision = plan_install_provider(&facts);
+    let mut lines = summary_lines(&facts, &decision);
+    let decision_line = lines.pop();
+    lines.push(format!(
+        "  {:<18}{}",
+        "SELinux:",
+        desktop::selinux_summary()
+    ));
+    lines.push(format!(
+        "  {:<18}{}",
+        "Pier runtime:",
+        match &runtime {
+            desktop::PierRuntime::Runs {
+                wayland_built: true,
+            } => "starts on this host; X11 and Wayland providers built in".to_owned(),
+            desktop::PierRuntime::Runs {
+                wayland_built: false,
+            } => "starts on this host; X11 provider only".to_owned(),
+            desktop::PierRuntime::Unchecked(reason) => {
+                format!("not test-run before installing ({reason})")
+            }
+            desktop::PierRuntime::LoaderRefused(missing) => {
+                format!(
+                    "CANNOT START on this host: {} not found",
+                    missing.join(", ")
+                )
+            }
+        }
+    ));
+    lines.extend(decision_line);
+    for line in lines {
+        log.note(line);
+    }
+    if let desktop::PierRuntime::LoaderRefused(missing) = &runtime {
+        log.record("decision: refused (pier_runtime)");
+        return Err(desktop::loader_refusal_message(missing));
+    }
+    log.record(format!(
+        "decision: {}",
+        match &decision {
+            Ok(plan) => format!("{} ({})", plan.provider_token(), plan.reason().token()),
+            Err(refusal) => format!("refused ({})", refusal.token()),
+        }
+    ));
+    decision.map(Some).map_err(|refusal| refusal.to_string())
+}
+
+/// `capture.provider` and `xorg_bin` the installed Pier will run with: the
+/// existing configuration, which an upgrade keeps, unless `--force` is about
+/// to replace it with the packaged default.
+fn existing_config(options: &Options, log: &mut desktop::InstallLog) -> desktop::ExistingConfig {
+    let path = map_path(&options.prefix, "/etc/arcen/pier.json");
+    if options.force {
+        return desktop::ExistingConfig::default();
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => desktop::parse_existing_config(&text).unwrap_or_else(|error| {
+            log.note(format!(
+                "warning: {}: {error}; deciding as for capture.provider = \"auto\"",
+                path.display()
+            ));
+            desktop::ExistingConfig::default()
+        }),
+        Err(_) => desktop::ExistingConfig::default(),
+    }
+}
+
+/// `--check`: what this host has and what the installer would do. Writes
+/// nothing, starts nothing, needs no root.
+fn check(options: &Options) -> Result<(), String> {
+    if !is_root_prefix(&options.prefix) {
+        return Err("--check describes this machine and takes no --prefix".to_string());
+    }
+    let mut log = desktop::InstallLog::default();
+    let plan = detect_desktop(options, &mut log)?;
+    let (missing, recommended) = missing_commands(plan);
+    for absent in &missing {
+        println!("missing (required): {absent}");
+    }
+    for absent in &recommended {
+        println!("missing (recommended): {absent}");
+    }
+    println!();
+    match plan {
+        Some(InstallPlan::Xorg { .. }) => println!(
+            "The installer would install the Pier for the dedicated X11 desktop: write \
+             {XORG_CONFIG_PATH} if absent and name this machine's NVIDIA GPU in it, then enable \
+             and start arcen-pier.service."
+        ),
+        Some(InstallPlan::Wayland { .. }) => println!(
+            "The installer would install the Pier, run `{PIER_PATH} wayland qualify --write` (a \
+             short real session \
+             as the temporary local account {QUALIFY_TEMPORARY_USER}), and enable and start \
+             arcen-pier.service only if that passes."
+        ),
+        None => {}
+    }
+    if missing.is_empty() {
+        println!("Nothing was written.");
+        Ok(())
+    } else {
+        Err(
+            "the installer would stop: required commands are missing (nothing was written)"
+                .to_string(),
+        )
+    }
 }
 
 /// Open the Pier's listening port where a recognised firewall is running.
@@ -313,6 +592,8 @@ fn open_firewall(options: &Options) {
             );
             return;
         }
+        let already_open = firewalld_port_open();
+        let runtime_was_open = firewalld_runtime_port_open();
         let quic = Command::new("/usr/bin/firewall-cmd")
             .args(["--permanent", "--add-port=18444/udp"])
             .status();
@@ -325,6 +606,12 @@ fn open_firewall(options: &Options) {
         if matches!(quic, Ok(status) if status.success())
             && matches!(reload, Ok(status) if status.success())
         {
+            if !already_open {
+                record_firewall_owner(&FirewallMarker {
+                    owner: FirewallOwner::Firewalld,
+                    runtime_was_open,
+                });
+            }
             println!("firewalld: opened 18444/udp and removed legacy 18443/tcp");
             return;
         }
@@ -334,6 +621,7 @@ fn open_firewall(options: &Options) {
         return;
     }
     if Path::new("/usr/sbin/ufw").exists() {
+        let already_open = ufw_rule_present();
         let quic = Command::new("/usr/sbin/ufw")
             .args(["allow", "18444/udp"])
             .status();
@@ -341,6 +629,12 @@ fn open_firewall(options: &Options) {
             .args(["delete", "allow", "18443/tcp"])
             .status();
         if matches!(quic, Ok(status) if status.success()) {
+            if !already_open {
+                record_firewall_owner(&FirewallMarker {
+                    owner: FirewallOwner::Ufw,
+                    runtime_was_open: false,
+                });
+            }
             println!("ufw: opened 18444/udp and removed legacy 18443/tcp");
             return;
         }
@@ -354,6 +648,257 @@ fn open_firewall(options: &Options) {
     );
 }
 
+fn firewalld_running() -> bool {
+    Command::new("/usr/bin/firewall-cmd")
+        .arg("--state")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the permanent firewalld configuration already allows 18444/udp.
+fn firewalld_port_open() -> bool {
+    Command::new("/usr/bin/firewall-cmd")
+        .args(["--permanent", "--query-port=18444/udp"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the running firewalld already allows 18444/udp (perhaps only
+/// until its next reload).
+fn firewalld_runtime_port_open() -> bool {
+    Command::new("/usr/bin/firewall-cmd")
+        .arg("--query-port=18444/udp")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Which firewall the installer opened 18444/udp in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirewallOwner {
+    Firewalld,
+    Ufw,
+}
+
+/// What [`FIREWALL_MARKER`] records: where the installer opened the port,
+/// and whether the running firewalld already allowed it (someone else's
+/// runtime rule, which uninstall must leave in place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirewallMarker {
+    owner: FirewallOwner,
+    runtime_was_open: bool,
+}
+
+impl FirewallMarker {
+    const RUNTIME_WAS_OPEN: &'static str = "runtime-was-open";
+
+    fn render(self) -> String {
+        let owner = match self.owner {
+            FirewallOwner::Firewalld => "firewalld",
+            FirewallOwner::Ufw => "ufw",
+        };
+        if self.runtime_was_open {
+            format!("{owner}\n{}\n", Self::RUNTIME_WAS_OPEN)
+        } else {
+            format!("{owner}\n")
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let owner = match lines.next()? {
+            "firewalld" => FirewallOwner::Firewalld,
+            "ufw" => FirewallOwner::Ufw,
+            _ => return None,
+        };
+        Some(Self {
+            owner,
+            runtime_was_open: lines.any(|line| line == Self::RUNTIME_WAS_OPEN),
+        })
+    }
+}
+
+/// Whether ufw already has the rule.
+fn ufw_rule_present() -> bool {
+    Command::new("/usr/sbin/ufw")
+        .args(["show", "added"])
+        .output()
+        .is_ok_and(|output| ufw_lists_quic_rule(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Whether `ufw show added` lists the Pier's rule.
+fn ufw_lists_quic_rule(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.trim() == "ufw allow 18444/udp")
+}
+
+/// Remember that this installer, not an administrator, opened 18444/udp.
+fn record_firewall_owner(record: &FirewallMarker) {
+    let marker = Path::new(FIREWALL_MARKER);
+    let written = marker
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(marker, record.render()));
+    if let Err(error) = written {
+        println!(
+            "warning: could not record that the installer opened 18444/udp ({error}); \
+             uninstall will leave the port open"
+        );
+    }
+}
+
+/// Close 18444/udp on uninstall, exactly when this installer opened it.
+fn close_firewall(options: &Options) {
+    let marker = map_path(&options.prefix, FIREWALL_MARKER);
+    if options.dry_run {
+        println!(
+            "dry-run: would close 18444/udp if {} says the installer opened it",
+            marker.display()
+        );
+        return;
+    }
+    if !is_root_prefix(&options.prefix) {
+        let _ = fs::remove_file(&marker);
+        return;
+    }
+    let text = match fs::read_to_string(&marker) {
+        Ok(text) => text,
+        Err(_) => {
+            if Path::new("/usr/bin/firewall-cmd").exists() && firewall_port_left_open() {
+                println!(
+                    "firewalld: 18444/udp stays open: this installer did not record opening it \
+                     (an earlier installer or an administrator did). Close it if nothing else \
+                     uses it: firewall-cmd --permanent --remove-port=18444/udp && \
+                     firewall-cmd --reload"
+                );
+            }
+            return;
+        }
+    };
+    match FirewallMarker::parse(&text) {
+        // No reload: it would also drop other runtime-only rules.
+        Some(FirewallMarker {
+            owner: FirewallOwner::Firewalld,
+            runtime_was_open,
+        }) => {
+            let firewall_cmd = |args: &[&str]| {
+                Command::new("/usr/bin/firewall-cmd")
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            let closed = if firewalld_running() {
+                firewall_cmd(&["--permanent", "--remove-port=18444/udp"])
+                    && (runtime_was_open || firewall_cmd(&["--remove-port=18444/udp"]))
+            } else {
+                Command::new("/usr/bin/firewall-offline-cmd")
+                    .arg("--remove-port=18444/udp")
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            if closed {
+                println!(
+                    "firewalld: closed 18444/udp, which the installer had opened{}",
+                    if runtime_was_open {
+                        " (the runtime rule that was there before is kept)"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                println!(
+                    "warning: firewalld: could not close 18444/udp; run \
+                     `firewall-cmd --permanent --remove-port=18444/udp && firewall-cmd --reload`"
+                );
+            }
+        }
+        Some(FirewallMarker {
+            owner: FirewallOwner::Ufw,
+            ..
+        }) => {
+            if Command::new("/usr/sbin/ufw")
+                .args(["delete", "allow", "18444/udp"])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                println!("ufw: closed 18444/udp, which the installer had opened");
+            } else {
+                println!(
+                    "warning: ufw: could not close 18444/udp; run `ufw delete allow 18444/udp`"
+                );
+            }
+        }
+        None => println!(
+            "warning: {} names no known firewall; 18444/udp left as it is",
+            marker.display()
+        ),
+    }
+    let _ = fs::remove_file(&marker);
+}
+
+fn firewall_port_left_open() -> bool {
+    firewalld_running() && firewalld_port_open()
+}
+
+/// Remove the qualification's temporary account if an interrupted run left
+/// it. Only the account the Pier creates (recognised by its `GECOS`) is
+/// ever removed; an `arcen-wlq` someone else made is left alone.
+fn remove_qualification_user(options: &Options) {
+    if !is_root_prefix(&options.prefix) {
+        return;
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    match desktop::local_account_gecos(&passwd, QUALIFY_TEMPORARY_USER) {
+        None => {}
+        Some(gecos) if gecos != QUALIFY_TEMPORARY_USER_GECOS => println!(
+            "kept local account {QUALIFY_TEMPORARY_USER}: it is not the qualification's \
+             temporary account"
+        ),
+        Some(_) if options.dry_run => println!(
+            "dry-run: would remove the leftover temporary account {QUALIFY_TEMPORARY_USER}"
+        ),
+        Some(_) => {
+            let _ = Command::new("/usr/bin/loginctl")
+                .args(["terminate-user", QUALIFY_TEMPORARY_USER])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            for _ in 0..80 {
+                let known = Command::new("/usr/bin/loginctl")
+                    .args(["show-user", QUALIFY_TEMPORARY_USER])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !known {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let removed = Command::new("/usr/sbin/userdel")
+                .args(["--remove", QUALIFY_TEMPORARY_USER])
+                .status()
+                .is_ok_and(|status| status.success());
+            if removed {
+                println!("removed the leftover temporary account {QUALIFY_TEMPORARY_USER}");
+            } else {
+                println!(
+                    "warning: could not remove the temporary account {QUALIFY_TEMPORARY_USER}; \
+                     run `userdel --remove {QUALIFY_TEMPORARY_USER}`"
+                );
+            }
+        }
+    }
+}
+
 /// What bringing the unit up achieved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServiceOutcome {
@@ -363,6 +908,9 @@ enum ServiceOutcome {
     Running,
     /// systemd settled on anything else.
     NotRunning(String),
+    /// Installed, deliberately not started: the Pier would refuse to start
+    /// on this host (a Wayland host that did not qualify).
+    HeldBack(String),
 }
 
 /// Carries the unit's outcome through the shared installer transaction, whose
@@ -373,7 +921,9 @@ fn finish_install(
 ) -> Result<(), String> {
     use arcen_session::install_lifecycle::InstallEvent;
     let events: &[InstallEvent] = match outcome {
-        ServiceOutcome::NotRequested => &[InstallEvent::ServiceNotRequested],
+        ServiceOutcome::NotRequested | ServiceOutcome::HeldBack(_) => {
+            &[InstallEvent::ServiceNotRequested]
+        }
         ServiceOutcome::Running => &[
             InstallEvent::ServiceQuiesced,
             InstallEvent::ActivationCommitted,
@@ -390,22 +940,40 @@ fn finish_install(
             .apply(*event)
             .map_err(|error| format!("installer transaction: {error}"))?;
     }
-    transaction
-        .finish()
-        .map(|_| ())
-        .map_err(|error| match outcome {
-            ServiceOutcome::NotRunning(state) => format!(
-                "{error}: arcen-pier.service is {state:?}, not active. The files are installed; \
+    let finished = transaction.finish().map(|_| ());
+    if let (Ok(()), ServiceOutcome::HeldBack(reason)) = (&finished, outcome) {
+        return Err(format!(
+            "the Pier is installed, but arcen-pier.service was not started: {reason}"
+        ));
+    }
+    finished.map_err(|error| match outcome {
+        ServiceOutcome::NotRunning(state) => format!(
+            "{error}: arcen-pier.service is {state:?}, not active. The files are installed; \
              see `journalctl -u arcen-pier` for why the service stopped"
-            ),
-            _ => error.to_string(),
-        })
+        ),
+        _ => error.to_string(),
+    })
 }
 
 fn install(options: &Options) -> Result<(), String> {
+    let mut log = desktop::InstallLog::default();
+    let result = install_logged(options, &mut log);
+    if let Err(error) = &result {
+        log.record(format!("install-arcen-pier: {error}"));
+    }
+    if is_root_prefix(&options.prefix) && !options.dry_run {
+        if let Err(error) = log.append_to(Path::new(desktop::INSTALL_LOG), "install") {
+            eprintln!("warning: install log: {error}");
+        }
+    }
+    result
+}
+
+fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<(), String> {
     use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
     let mut transaction = InstallTransaction::new();
-    preflight(options)?;
+    let plan = detect_desktop(options, log)?;
+    preflight(options, plan)?;
     transaction
         .apply(InstallEvent::PreflightPassed)
         .map_err(|error| format!("installer transaction: {error}"))?;
@@ -463,8 +1031,17 @@ fn install(options: &Options) -> Result<(), String> {
         0o644,
         options.force,
     )?;
-    configure_xorg_gpu(options, xorg_written);
+    if let Some(InstallPlan::Wayland { .. }) = plan {
+        println!(
+            "xorg: not used by this host's Wayland desktop; {XORG_CONFIG_PATH} names no GPU \
+             (run the installer again if you install an Xorg server)"
+        );
+    } else {
+        configure_xorg_gpu(options, xorg_written);
+    }
     ensure_cert(options)?;
+    install_selinux_module(options)?;
+    install_polkit_rule(options);
     if options.dry_run {
         println!("dry-run: would run systemctl daemon-reload when installing to /");
     } else if is_root_prefix(&options.prefix) {
@@ -476,13 +1053,412 @@ fn install(options: &Options) -> Result<(), String> {
         .apply(InstallEvent::PayloadStaged)
         .map_err(|error| format!("installer transaction: {error}"))?;
     open_firewall(options);
-    let outcome = enable_and_start(options)?;
-    report_pending_restart(options);
+    if options.disable_gdm && is_root_prefix(&options.prefix) {
+        display_manager::disable(options.dry_run, log)?;
+    }
+    let outcome = if let Some(InstallPlan::Wayland { .. }) = plan {
+        activate_wayland(options, log)?
+    } else {
+        let outcome = enable_and_start(options)?;
+        report_pending_restart(options);
+        outcome
+    };
+    if let Some(plan) = plan {
+        log.note(format!(
+            "Desktop provider: {}{}",
+            match plan {
+                InstallPlan::Xorg { .. } => "X11",
+                InstallPlan::Wayland { .. } => "Wayland",
+            },
+            match &outcome {
+                ServiceOutcome::HeldBack(_) => ", NOT serving: the service was not started",
+                ServiceOutcome::NotRequested if options.dry_run => ", dry run: nothing changed",
+                ServiceOutcome::NotRequested => ", service not started",
+                ServiceOutcome::Running => ", service running",
+                ServiceOutcome::NotRunning(_) => ", service not running",
+            }
+        ));
+    }
     if is_root_prefix(&options.prefix) && !options.dry_run {
         println!();
         println!("Administration guide: /usr/share/doc/arcen/pier-administration.md");
     }
     finish_install(transaction, &outcome)
+}
+
+/// Qualify a Wayland host with the Pier just installed, then start it only
+/// if that passed.
+///
+/// A Pier on an unqualified Wayland host refuses to start, so starting it
+/// anyway would only spend systemd's restart budget and leave a failed
+/// unit. Instead a failed qualification leaves the Pier installed, the
+/// unit not started, and the operator told exactly what failed and what to
+/// run once it is fixed. Qualification cannot run beside a running Pier
+/// (they would compete for the encoder), so an upgrade under a running
+/// service qualifies only with `--restart`.
+fn activate_wayland(
+    options: &Options,
+    log: &mut desktop::InstallLog,
+) -> Result<ServiceOutcome, String> {
+    if options.dry_run {
+        println!(
+            "dry-run: would run `{PIER_PATH} wayland qualify --write`, then enable and start \
+             arcen-pier.service only if it passes"
+        );
+        return Ok(ServiceOutcome::NotRequested);
+    }
+    if !is_root_prefix(&options.prefix) {
+        return Ok(ServiceOutcome::NotRequested);
+    }
+    if options.no_service {
+        log.note(format!(
+            "--no-service: the Wayland qualification was not run and the unit was not enabled. \
+             Before starting the service run `{PIER_PATH} wayland qualify --write`, then \
+             `systemctl enable --now arcen-pier.service`."
+        ));
+        return Ok(ServiceOutcome::NotRequested);
+    }
+    let active = service_active();
+    if active && !options.restart {
+        let outcome = enable_and_start(options)?;
+        if record_matches_installed_pier() {
+            report_pending_restart(options);
+        } else {
+            report_pending_wayland_qualification(log);
+        }
+        return Ok(outcome);
+    }
+    if active {
+        log.note("restarting arcen-pier: stopping the previous Pier to qualify this build");
+        run_systemctl(&["stop", "arcen-pier.service"])?;
+    }
+    log.note(
+        "Wayland: qualifying this host with the installed Pier: a short real session as the \
+         temporary local account arcen-wlq, removed afterwards (about a minute per display size: \
+         those the previous record measured, those Decks asked Speed for, and the default \
+         1920x1080, 2560x1600 and 3840x2160 at 60 Hz)",
+    );
+    let run = desktop::run_qualification(Path::new(PIER_PATH), &options.qualify_outputs, log)?;
+    if run.passed {
+        log.note(format!(
+            "Wayland qualification passed; recorded in {RECORD_PATH}"
+        ));
+        explain_native_desktops(log);
+        return enable_and_start(options);
+    }
+    let enabled = Command::new("/usr/bin/systemctl")
+        .args(["is-enabled", "arcen-pier.service"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    let status = run.exit_code.map_or_else(
+        || "it was killed".to_string(),
+        |code| format!("exit status {code}"),
+    );
+    log.note("");
+    log.note("=====================================================================");
+    log.note(format!(
+        " The Pier is installed but NOT started: the Wayland qualification failed ({status})."
+    ));
+    log.note("");
+    if run.failures.is_empty() {
+        log.note(" What failed: see the qualification output above.");
+    } else {
+        log.note(" What failed:");
+        for failure in &run.failures {
+            log.note(format!("   {failure}"));
+        }
+    }
+    log.note("");
+    log.note(" The Pier refuses to start on a Wayland host that has not qualified, so");
+    log.note(" arcen-pier.service was not started. Fix what is named above, then run");
+    log.note(" (it measures every display size already known; nothing needs repeating):");
+    log.note("");
+    log.note(format!("   sudo {PIER_PATH} wayland qualify --write"));
+    log.note("   sudo systemctl enable --now arcen-pier.service");
+    log.note("");
+    log.note(" or run this installer again.");
+    if enabled == "enabled" {
+        log.note(" (The unit is still enabled from an earlier install; until a qualification");
+        log.note("  passes it will refuse to start at boot.)");
+    }
+    log.note(format!(" Full output: {}", desktop::INSTALL_LOG));
+    log.note("=====================================================================");
+    Ok(ServiceOutcome::HeldBack(format!(
+        "the Wayland qualification failed ({status})"
+    )))
+}
+
+/// What the record says about native desktops, and the display manager
+/// beside them.
+fn explain_native_desktops(log: &mut desktop::InstallLog) {
+    let proof = fs::read_to_string(RECORD_PATH)
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<
+                    arcen_session::wayland_qualification::WaylandQualificationRecord,
+                >(&text)
+                .ok()
+        })
+        .and_then(|record| record.facts.native_seat);
+    match proof {
+        Some(proof) if proof.proven() => {
+            log.note(
+                "Wayland: native desktops proven: a desktop runs on its own seat with a real pen \
+                 (one per host; wayland.session_mode = auto)",
+            );
+            if let Some(manager) = display_manager::current().filter(|manager| manager.active) {
+                for line in display_manager::explanation(&manager.unit) {
+                    log.note(line);
+                }
+            }
+        }
+        Some(proof) => {
+            let reason = proof
+                .unavailable
+                .unwrap_or(arcen_session::native_seat::NativeSeatUnavailable::QualificationFailed);
+            log.note(format!(
+                "Wayland: desktops are headless ({}): {}",
+                reason.token(),
+                reason.explanation()
+            ));
+        }
+        None => {}
+    }
+}
+
+fn service_active() -> bool {
+    Command::new("/usr/bin/systemctl")
+        .args(["is-active", "--quiet", "arcen-pier.service"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the qualification record on disk was written by exactly the Pier
+/// now installed (its `host.pier.executable_sha256`).
+fn record_matches_installed_pier() -> bool {
+    let Ok(record) = fs::read_to_string(RECORD_PATH) else {
+        return false;
+    };
+    let Some(recorded) = serde_json::from_str::<serde_json::Value>(&record)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/host/pier/executable_sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+    else {
+        return false;
+    };
+    openssl_stdout(&["dgst", "-sha256", "-r", PIER_PATH], None).is_ok_and(|output| {
+        String::from_utf8_lossy(&output)
+            .split_whitespace()
+            .next()
+            .is_some_and(|digest| digest.eq_ignore_ascii_case(&recorded))
+    })
+}
+
+/// An upgrade under a running Wayland Pier: the new build needs its own
+/// qualification, which cannot run beside the old one.
+fn report_pending_wayland_qualification(log: &mut desktop::InstallLog) {
+    for line in [
+        "",
+        "=====================================================================",
+        " NOTE: the running service is still the PREVIOUS Pier, and this host",
+        " serves Wayland: its qualification record belongs to that build.",
+        "",
+        " The new Pier qualifies this host itself when the service next starts",
+        " (a restart or reboot; a few minutes before it listens, each step in",
+        " the log), keeping every display size already known. To do it now",
+        " and watch it (this disconnects every live session):",
+        "",
+        "   sudo systemctl stop arcen-pier.service",
+        &format!("   sudo {PIER_PATH} wayland qualify --write"),
+        "   sudo systemctl start arcen-pier.service",
+        "",
+        " or re-run this installer with --restart. If capture.wayland_auto_requalify",
+        " is false, the service refuses to start until you do.",
+        "=====================================================================",
+    ] {
+        log.note(line);
+    }
+}
+
+/// Load Arcen's SELinux policy module where SELinux is enabled.
+///
+/// Without it an enforcing host refuses every session: the targeted policy
+/// does not let `unconfined_service_t` enter the user's PAM-assigned context,
+/// and the launcher will not run the user's desktop in the service's domain
+/// instead. `semodule -i` replaces an older copy of the module in place.
+fn install_selinux_module(options: &Options) -> Result<(), String> {
+    write_atomic(
+        options,
+        SELINUX_MODULE_PATH,
+        SELINUX_MODULE.as_bytes(),
+        0o644,
+        true,
+    )?;
+    if !is_root_prefix(&options.prefix) {
+        println!("staging prefix: skipped loading the SELinux policy module");
+        return Ok(());
+    }
+    if !Path::new(SELINUXFS_ENFORCE).exists() {
+        println!(
+            "SELinux is not enabled; the Arcen policy module was not loaded \
+             (it is kept at {SELINUX_MODULE_PATH})"
+        );
+        return Ok(());
+    }
+    if options.dry_run {
+        println!("dry-run: would run {SEMODULE} -i {SELINUX_MODULE_PATH}");
+        return Ok(());
+    }
+    // Preflight refused a host with SELinux enabled and no semodule.
+    let status = Command::new(SEMODULE)
+        .args(["-i", SELINUX_MODULE_PATH])
+        .status()
+        .map_err(|error| format!("start {SEMODULE} -i: {error}"))?;
+    if !status.success() || !selinux_module_loaded(Path::new(SEMODULE))? {
+        return Err(format!(
+            "{SEMODULE} -i {SELINUX_MODULE_PATH} failed; sessions on this SELinux host would \
+             be refused (see /usr/share/doc/arcen/pier-administration.md, SELinux)"
+        ));
+    }
+    println!("SELinux: loaded policy module {SELINUX_MODULE_NAME}");
+    Ok(())
+}
+
+/// Arcen's polkit rule: a remote desktop with a seat (every X11 desktop) is
+/// remote to polkit only with it, and the Pier refuses such desktops while it
+/// is missing. The Pier writes it from the actions installed now
+/// (`polkit-rule install`) and rewrites it at every start, so a failure here
+/// is reported, not fatal.
+fn install_polkit_rule(options: &Options) {
+    use arcen_session::polkit_remote::RULE_PATH;
+    if !is_root_prefix(&options.prefix) {
+        println!("staging prefix: skipped the polkit rule ({RULE_PATH})");
+        return;
+    }
+    if options.dry_run {
+        println!("dry-run: would run `{PIER_PATH} polkit-rule install` ({RULE_PATH})");
+        return;
+    }
+    match Command::new(PIER_PATH)
+        .args(["polkit-rule", "install"])
+        .output()
+    {
+        Ok(output) => {
+            for line in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&output.stderr).lines())
+            {
+                println!("{line}");
+            }
+            if !output.status.success() {
+                println!(
+                    "warning: the polkit rule is not installed (see \
+                     /usr/share/doc/arcen/pier-administration.md, polkit)"
+                );
+            }
+        }
+        Err(error) => println!(
+            "warning: {PIER_PATH} polkit-rule install did not run ({error}); the Pier writes \
+             the rule at start"
+        ),
+    }
+}
+
+/// Removes Arcen's polkit rules (this build's and earlier builds'), never a
+/// file at those paths that Arcen did not write.
+fn remove_polkit_rules(options: &Options) -> Result<(), String> {
+    use arcen_session::polkit_remote::{LEGACY_RULE_PATHS, RULE_PATH, is_arcen_rule};
+    for path in std::iter::once(RULE_PATH).chain(LEGACY_RULE_PATHS.iter().copied()) {
+        if fs::read_to_string(map_path(&options.prefix, path))
+            .is_ok_and(|text| is_arcen_rule(&text))
+        {
+            remove_file(options, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Unload the module and remove its source, so an uninstalled host carries
+/// no Arcen policy.
+///
+/// Runs before any payload is removed and never fails the uninstall: a
+/// `semodule` that cannot list or remove the module is reported with the
+/// command that finishes the job, and the rest of the uninstall (unit,
+/// `daemon-reload`) still happens. `semodule` is consulted only where the
+/// module can be loaded: SELinux is enabled, or this installer left the
+/// module's source on the host.
+fn remove_selinux_module(options: &Options) -> Result<(), String> {
+    if options.dry_run {
+        println!("dry-run: would run {SEMODULE} -r {SELINUX_MODULE_NAME} if it is loaded");
+    } else if is_root_prefix(&options.prefix) {
+        let may_be_loaded = Path::new(SELINUXFS_ENFORCE).exists()
+            || map_path(&options.prefix, SELINUX_MODULE_PATH).exists();
+        if let Some(warning) = unload_selinux_module(Path::new(SEMODULE), may_be_loaded) {
+            println!("warning: {warning}");
+        }
+    }
+    remove_file(options, SELINUX_MODULE_PATH)?;
+    remove_dir_if_empty(options, SELINUX_DIR);
+    remove_dir_if_empty(options, "/usr/share/arcen");
+    Ok(())
+}
+
+/// Removes the `arcen` module through `semodule`. `None` when it is gone
+/// (or could not have been loaded); otherwise the warning to print.
+fn unload_selinux_module(semodule: &Path, may_be_loaded: bool) -> Option<String> {
+    if !may_be_loaded || !semodule.exists() {
+        return None;
+    }
+    let manual = format!(
+        "if `{} -l` lists {SELINUX_MODULE_NAME}, remove it with `{} -r {SELINUX_MODULE_NAME}`",
+        semodule.display(),
+        semodule.display()
+    );
+    match selinux_module_loaded(semodule) {
+        Err(error) => return Some(format!("{error}; {manual}")),
+        Ok(false) => return None,
+        Ok(true) => {}
+    }
+    let removed = Command::new(semodule)
+        .args(["-r", SELINUX_MODULE_NAME])
+        .status()
+        .is_ok_and(|status| status.success());
+    match (removed, selinux_module_loaded(semodule)) {
+        (true, Ok(false)) => {
+            println!("SELinux: removed policy module {SELINUX_MODULE_NAME}");
+            None
+        }
+        _ => Some(format!(
+            "the SELinux policy module {SELINUX_MODULE_NAME} could not be removed; {manual}"
+        )),
+    }
+}
+
+fn selinux_module_loaded(semodule: &Path) -> Result<bool, String> {
+    let output = Command::new(semodule)
+        .arg("-l")
+        .output()
+        .map_err(|error| format!("start {} -l: {error}", semodule.display()))?;
+    if !output.status.success() {
+        return Err(format!("{} -l failed", semodule.display()));
+    }
+    Ok(module_listed(
+        &String::from_utf8_lossy(&output.stdout),
+        SELINUX_MODULE_NAME,
+    ))
+}
+
+/// Whether `semodule -l` output lists `name` as a module of its own.
+fn module_listed(listing: &str, name: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(name))
 }
 
 /// Name this machine's NVIDIA GPU in `/etc/arcen/xorg.conf`.
@@ -918,7 +1894,12 @@ fn running_pier_executable() -> Option<PathBuf> {
 fn uninstall(options: &Options) -> Result<(), String> {
     if options.dry_run {
         println!("dry-run: would uninstall arcen-pier service and binary");
-    } else if is_root_prefix(&options.prefix) {
+    } else if is_root_prefix(&options.prefix)
+        && map_path(&options.prefix, "/etc/systemd/system/arcen-pier.service").exists()
+    {
+        // Only a unit that is installed is stopped: on a host that was
+        // already uninstalled, systemctl would print "Failed to stop" and
+        // "Failed to disable" for a unit it does not know.
         let _ = Command::new("systemctl")
             .args(["stop", "arcen-pier.service"])
             .status();
@@ -926,6 +1907,8 @@ fn uninstall(options: &Options) -> Result<(), String> {
             .args(["disable", "arcen-pier.service"])
             .status();
     }
+    remove_selinux_module(options)?;
+    remove_polkit_rules(options)?;
     remove_file(options, PIER_PATH)?;
     remove_symlink_if_ours(options);
     remove_file(options, LEGACY_PIER_PATH)?;
@@ -937,20 +1920,59 @@ fn uninstall(options: &Options) -> Result<(), String> {
     remove_dir_if_empty(options, LEGACY_PIER_DIR);
     remove_dir_if_empty(options, "/usr/share/doc/arcen");
     remove_file(options, "/etc/systemd/system/arcen-pier.service")?;
+    // What the Wayland path and the firewall step added. The record names
+    // this build and is meaningless without it; the account exists only if
+    // a qualification was interrupted.
+    remove_qualification_user(options);
+    if is_root_prefix(&options.prefix) {
+        let mut log = desktop::InstallLog::default();
+        if let Err(error) = display_manager::restore(
+            options.dry_run,
+            display_manager::RestoreMode::Uninstall,
+            &mut log,
+        ) {
+            eprintln!("warning: display manager not restored: {error}");
+        }
+    }
+    remove_file(options, RECORD_PATH)?;
+    remove_file(
+        options,
+        &QualificationTarget::production().requested_outputs_path(),
+    )?;
+    remove_file(
+        options,
+        &QualificationTarget::production().requalify_marker_path(),
+    )?;
+    close_firewall(options);
+    remove_dir_if_empty(options, "/var/lib/arcen");
+    remove_dir_if_empty(options, "/run/arcen/sessions");
+    remove_dir_if_empty(options, "/run/arcen");
     if options.purge {
         preserve_config_before_purge(options)?;
         remove_dir_all(options, "/etc/arcen")?;
         remove_dir_all(options, "/var/lib/arcen")?;
         remove_dir_all(options, "/var/log/arcen")?;
+        // Runtime state the stopped service left in tmpfs (the NVIDIA
+        // discovery cache under sessions/), which the message below says
+        // was removed.
+        remove_dir_all(options, "/run/arcen")?;
     }
     if !options.dry_run && is_root_prefix(&options.prefix) {
         run_systemctl(&["daemon-reload"])?;
+        if !options.purge {
+            let mut log = desktop::InstallLog::default();
+            log.record("uninstalled; configuration and logs kept (--purge removes them)");
+            if let Err(error) = log.append_to(Path::new(desktop::INSTALL_LOG), "uninstall") {
+                eprintln!("warning: install log: {error}");
+            }
+        }
     }
     if options.purge {
         println!("uninstall complete; configuration, runtime state and logs were removed");
     } else {
         println!(
-            "uninstall complete; /etc/arcen, /var/lib/arcen and /var/log/arcen were kept (use --purge to remove them)"
+            "uninstall complete; the configuration (/etc/arcen), the logs (/var/log/arcen) and any other \
+             state in /var/lib/arcen were kept (use --purge to remove them)"
         );
     }
     Ok(())
@@ -2206,6 +3228,188 @@ mod tests {
     }
 
     #[test]
+    fn the_firewall_marker_records_only_what_the_installer_changed() {
+        for marker in [
+            FirewallMarker {
+                owner: FirewallOwner::Firewalld,
+                runtime_was_open: false,
+            },
+            FirewallMarker {
+                owner: FirewallOwner::Firewalld,
+                runtime_was_open: true,
+            },
+            FirewallMarker {
+                owner: FirewallOwner::Ufw,
+                runtime_was_open: false,
+            },
+        ] {
+            assert_eq!(FirewallMarker::parse(&marker.render()), Some(marker));
+        }
+        // Markers written before the runtime flag existed.
+        assert_eq!(
+            FirewallMarker::parse("firewalld\n"),
+            Some(FirewallMarker {
+                owner: FirewallOwner::Firewalld,
+                runtime_was_open: false,
+            })
+        );
+        assert_eq!(FirewallMarker::parse("nftables\n"), None);
+        assert_eq!(FirewallMarker::parse(""), None);
+        assert!(ufw_lists_quic_rule(
+            "ufw allow 22/tcp\nufw allow 18444/udp\n"
+        ));
+        assert!(!ufw_lists_quic_rule("ufw allow 18443/tcp\n"));
+    }
+
+    #[test]
+    fn selinux_module_listing_matches_only_the_arcen_module() {
+        assert!(module_listed("abrt\narcen\nzabbix\n", "arcen"));
+        assert!(!module_listed("arcen_extra\nmyarcen\n", "arcen"));
+        assert!(!module_listed("", "arcen"));
+    }
+
+    #[test]
+    fn the_shipped_selinux_module_adds_only_the_session_transition() {
+        let rules: Vec<&str> = SELINUX_MODULE
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with(';'))
+            .collect();
+        assert_eq!(
+            rules,
+            ["(allow unconfined_service_t unconfined_t (process (transition)))"],
+            "any widening of the SELinux module needs Release/Security review"
+        );
+    }
+
+    #[test]
+    fn staging_install_and_uninstall_of_the_selinux_module_are_symmetric() {
+        let prefix = test_prefix("selinux");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: false,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            extra_sans: Vec::new(),
+        };
+        install_selinux_module(&options).expect("stage the module");
+        let staged = prefix.join("usr/share/arcen/selinux/arcen.cil");
+        assert_eq!(
+            fs::read_to_string(&staged).expect("staged module"),
+            SELINUX_MODULE
+        );
+        remove_selinux_module(&options).expect("remove the module");
+        assert!(!staged.exists());
+        assert!(!prefix.join("usr/share/arcen").exists());
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn uninstall_removes_arcen_polkit_rules_and_keeps_foreign_ones() {
+        use arcen_session::polkit_remote::{CatPath, LEGACY_RULE_PATHS, RULE_PATH, rule_text};
+        let prefix = test_prefix("polkit");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: true,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            extra_sans: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+        };
+        let ours = map_path(&prefix, RULE_PATH);
+        let legacy = map_path(&prefix, LEGACY_RULE_PATHS[0]);
+        let foreign = ours.with_file_name("04-site.rules");
+        fs::create_dir_all(ours.parent().expect("rules dir")).expect("rules dir");
+        fs::write(&ours, rule_text(&[], CatPath::UsrBin)).expect("our rule");
+        fs::write(
+            &legacy,
+            "// Arcen native-seat polkit rule (generated by arcen-pier; do not edit).\n",
+        )
+        .expect("legacy rule");
+        fs::write(&foreign, "polkit.addRule(function () { return null; });\n")
+            .expect("foreign rule");
+        remove_polkit_rules(&options).expect("remove rules");
+        assert!(!ours.exists());
+        assert!(!legacy.exists());
+        assert!(foreign.exists(), "a rule Arcen did not write stays");
+        fs::write(&ours, "// someone else's rule at Arcen's path\n").expect("squatter");
+        remove_polkit_rules(&options).expect("remove rules");
+        assert!(
+            ours.exists(),
+            "a file at Arcen's path that Arcen did not write stays"
+        );
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    /// A stand-in `semodule`: `-l` lists `arcen` while `state` exists and
+    /// fails when `list-fails` exists; `-r` removes `state` unless
+    /// `remove-fails` exists.
+    fn fake_semodule(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(directory).expect("fake semodule directory");
+        let script = directory.join("semodule");
+        let dir = directory.display();
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 -l) [ -e '{dir}'/list-fails ] && exit 1; echo base; [ -e '{dir}'/state ] && echo arcen; exit 0;;\n\
+                 -r) [ -e '{dir}'/remove-fails ] && exit 1; rm -f '{dir}'/state; exit 0;;\n\
+                 esac\nexit 2\n"
+            ),
+        )
+        .expect("write fake semodule");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
+    #[test]
+    fn selinux_module_removal_never_aborts_and_says_how_to_finish() {
+        let directory = test_prefix("semodule");
+        let semodule = fake_semodule(&directory);
+        let mark = |name: &str| fs::write(directory.join(name), b"").expect("mark");
+
+        // Not loadable here (SELinux off, no module source): semodule is
+        // not consulted at all, even one that would fail.
+        mark("list-fails");
+        assert_eq!(unload_selinux_module(&semodule, false), None);
+        // A semodule that cannot list is a warning naming the manual step.
+        let warning = unload_selinux_module(&semodule, true).expect("listing failure warns");
+        assert!(warning.contains("-r arcen"), "{warning}");
+        fs::remove_file(directory.join("list-fails")).expect("unmark");
+
+        // Not loaded: nothing to do.
+        assert_eq!(unload_selinux_module(&semodule, true), None);
+        // Loaded and removable: removed.
+        mark("state");
+        assert_eq!(unload_selinux_module(&semodule, true), None);
+        assert!(!directory.join("state").exists());
+        // Loaded but removal fails: a warning, not an error.
+        mark("state");
+        mark("remove-fails");
+        let warning = unload_selinux_module(&semodule, true).expect("removal failure warns");
+        assert!(warning.contains("could not be removed"), "{warning}");
+        assert!(warning.contains("-r arcen"), "{warning}");
+        // No semodule at all: nothing to run.
+        assert_eq!(unload_selinux_module(&directory.join("absent"), true), None);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn the_install_succeeds_only_when_the_service_is_proven_running() {
         assert_eq!(finish_install(staged(), &ServiceOutcome::Running), Ok(()));
         assert_eq!(
@@ -2234,6 +3438,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
 
@@ -2271,6 +3479,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
 
@@ -2301,6 +3513,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
 
@@ -2335,6 +3551,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options));
@@ -2367,6 +3587,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options));
@@ -2399,6 +3623,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: vec!["alias.example.internal".to_string()],
         };
 
@@ -2445,6 +3673,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
 
@@ -2477,6 +3709,10 @@ mod tests {
                     force: false,
                     no_service: true,
                     restart: false,
+                    check: false,
+                    qualify_outputs: Vec::new(),
+                    disable_gdm: false,
+                    restore_gdm: false,
                     extra_sans: Vec::new(),
                 };
                 let paths = TlsPaths::from_options(&options);
@@ -2531,6 +3767,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
 
@@ -2557,6 +3797,10 @@ mod tests {
             force: false,
             no_service: true,
             restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
             extra_sans: Vec::new(),
         };
         let paths = TlsPaths::from_options(&options);
@@ -2682,6 +3926,31 @@ mod tests {
         ("0000:00:10.0", "0x10de", "0x030000", Some("nvidia"));
     const VIRTIO_VGA: (&str, &str, &str, Option<&str>) =
         ("0000:00:01.0", "0x1af4", "0x030000", Some("virtio-pci"));
+
+    /// systemd counts a SIGHUP death as clean; the shipped unit restarts
+    /// after one, and logrotate's reload reaches only the Pier, which
+    /// handles SIGHUP from the start of start-up.
+    #[test]
+    fn the_unit_restarts_after_an_accidental_hangup_and_logrotate_only_reloads() {
+        let directive = |name: &str| {
+            SERVICE_TEMPLATE
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+                .map(str::trim)
+        };
+        assert_eq!(directive("Restart"), Some("on-failure"));
+        let forced = directive("RestartForceExitStatus").unwrap_or_default();
+        assert!(forced.split_whitespace().any(|status| status == "SIGHUP"));
+        assert!(!forced.split_whitespace().any(|status| status == "SIGTERM"));
+        assert!(
+            directive("StartLimitBurst").is_some() && directive("StartLimitIntervalSec").is_some()
+        );
+        assert_eq!(directive("ExecReload"), Some("/bin/kill -HUP $MAINPID"));
+        assert!(
+            LOGROTATE_CONF.contains("systemctl kill --kill-who=main -s HUP arcen-pier.service")
+        );
+        assert!(!LOGROTATE_CONF.contains("copytruncate"));
+    }
 
     #[test]
     fn the_stock_template_names_no_machines_gpu() {

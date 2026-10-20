@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use arcen_keel::{ActivityHint, BgraFrame, EmitMode, IdleCadence};
 use arcen_media::video::{
-    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_packed_rgb10_to_bgra8,
-    pipeline_contract, EncoderBackend, I420Frame, I420FrameMut, PackedRgb10Layout, PipelineId,
-    ResolvedMediaPlan, SoftwareH264Config, SoftwareH264Encoder,
+    changed_bounds, convert_packed_rgb10_to_bgra8, union_regions, CaptureDamage, CaptureRegion,
+    EncoderBackend, FrameRegion, LiveChange, PackedRgb10Layout, RegionPolicy, ResolvedMediaPlan,
+    SoftwareH264Session, SoftwareSessionConfig, StageDamage,
 };
 use arcen_media::ForcedKeyframe;
 use x11rb::connection::Connection as _;
@@ -311,7 +311,17 @@ pub(crate) struct X11Capture {
     pixel_format: X11PixelFormat,
     purpose: CapturePurpose,
     damage: Option<damage::Damage>,
+    /// What changed since the last picture, in output pixels. Cell because
+    /// event polling reads through `&self`.
+    pending: std::cell::Cell<CaptureDamage>,
     transfer: Transfer,
+    /// A second MIT-SHM segment for [`Self::capture_wide_diffed`], so the
+    /// last whole frame stays readable while the next one is read.
+    spare: Option<(shm::Seg, MmapRegion)>,
+    /// Which segment (0 the main one, 1 the spare) holds the last whole
+    /// frame read by [`Self::capture_wide_diffed`]; `None` once a region read
+    /// or anything else overwrote it.
+    latest_whole: Option<usize>,
 }
 
 impl X11Capture {
@@ -432,7 +442,13 @@ impl X11Capture {
             pixel_format,
             purpose,
             damage,
+            pending: std::cell::Cell::new(CaptureDamage::new(
+                usize::from(rect.width),
+                usize::from(rect.height),
+            )),
             transfer,
+            spare: None,
+            latest_whole: None,
         })
     }
 
@@ -472,6 +488,15 @@ impl X11Capture {
                     if result != Activity::Modeset {
                         result = Activity::Damage;
                     }
+                    // `area` is the damage's bounding box on the root window.
+                    let mut pending = self.pending.get();
+                    pending.note_rect(
+                        i64::from(event.area.x) - i64::from(self.rect.x),
+                        i64::from(event.area.y) - i64::from(self.rect.y),
+                        u64::from(event.area.width),
+                        u64::from(event.area.height),
+                    );
+                    self.pending.set(pending);
                     if let Some(damage) = self.damage {
                         self.connection
                             .damage_subtract(damage, 0u32, 0u32)
@@ -490,6 +515,9 @@ impl X11Capture {
     }
 
     fn capture_bytes(&mut self) -> Result<&[u8], String> {
+        if self.latest_whole == Some(0) {
+            self.latest_whole = None;
+        }
         let bytes = match &mut self.transfer {
             Transfer::Shm { segment, mapping } => {
                 let reply = self
@@ -542,6 +570,188 @@ impl X11Capture {
             }
         };
         Ok(bytes)
+    }
+
+    /// Whether this capture can read a rectangle on its own: only through
+    /// MIT-SHM. The bounded `XGetImage` fallback reads whole frames.
+    pub(crate) fn supports_regions(&self) -> bool {
+        transfer_supports_regions(&self.transfer)
+    }
+
+    /// Whether XDamage reported anything (or a whole frame is owed) since the
+    /// last [`Self::take_capture_region`].
+    pub(crate) fn has_pending_damage(&self) -> bool {
+        self.pending.get().is_pending()
+    }
+
+    /// What the next picture has to read. Without XDamage nothing is vouched
+    /// for, so every picture reads the whole frame.
+    pub(crate) fn take_capture_region(&self, policy: RegionPolicy) -> CaptureRegion {
+        let mut pending = self.pending.get();
+        if self.damage.is_none() {
+            pending.note_full();
+        }
+        let region = pending.take(policy);
+        self.pending.set(pending);
+        region
+    }
+
+    /// Reads only `region` of the output into the start of the shared
+    /// segment, packed (`region.width * 4` bytes a row), as the region
+    /// conversion expects it.
+    pub(crate) fn capture_wide_region(
+        &mut self,
+        region: FrameRegion,
+    ) -> Result<WideX11Frame<'_>, String> {
+        let X11PixelFormat::Rgb10(layout) = self.pixel_format else {
+            return Err(format!(
+                "wide capture expected RGB10, got {}",
+                self.pixel_format.token()
+            ));
+        };
+        let (x, y, width, height) = region_on_root(self.rect, region)?;
+        let stride = usize::from(width) * 4;
+        let byte_len = stride * usize::from(height);
+        let Transfer::Shm { segment, mapping } = &mut self.transfer else {
+            return Err("region capture needs MIT-SHM".to_string());
+        };
+        // The staged frame now holds pixels no whole frame read had, so a
+        // later difference against that frame could miss a change.
+        self.latest_whole = None;
+        let reply = self
+            .connection
+            .shm_get_image(
+                self.root,
+                x,
+                y,
+                width,
+                height,
+                u32::MAX,
+                u8::from(ImageFormat::Z_PIXMAP),
+                *segment,
+                0,
+            )
+            .map_err(|error| format!("request region XShmGetImage: {error}"))?
+            .reply()
+            .map_err(|error| format!("region XShmGetImage: {error}"))?;
+        validate_image_reply(
+            reply.depth,
+            reply.visual,
+            usize::try_from(reply.size).map_err(|_| "XShm image size overflow".to_string())?,
+            PixelLayout {
+                byte_len,
+                stride,
+                ..self.layout
+            },
+        )?;
+        Ok(WideX11Frame {
+            bytes: &mapping.bytes()[..byte_len],
+            width: region.width,
+            height: region.height,
+            stride,
+            layout,
+        })
+    }
+
+    /// Adds the second MIT-SHM segment [`Self::capture_wide_diffed`] reads
+    /// into. Returns whether whole-frame differencing is available.
+    pub(crate) fn enable_frame_diff(&mut self) -> bool {
+        if self.spare.is_some() {
+            return true;
+        }
+        if !matches!(self.transfer, Transfer::Shm { .. }) {
+            return false;
+        }
+        match install_shm(&self.connection, self.layout.byte_len) {
+            Ok(Transfer::Shm { segment, mapping }) => {
+                self.spare = Some((segment, mapping));
+                true
+            }
+            Ok(Transfer::GetImage { .. }) => false,
+            Err(error) => {
+                crate::log(&format!(
+                    "WARNING: no second MIT-SHM segment ({error}); whole frames are converted whole"
+                ));
+                false
+            }
+        }
+    }
+
+    /// Reads the whole output into the segment that does not hold the last
+    /// whole frame and, with `compare`, bounds what differs from that frame.
+    /// The bound is `None` when there is no earlier whole frame to compare
+    /// with or `compare` is off (convert everything), `Some(None)` when nothing changed, and `Some(Some(r))`
+    /// when only `r` changed.
+    pub(crate) fn capture_wide_diffed(
+        &mut self,
+        compare: bool,
+    ) -> Result<(WideX11Frame<'_>, Option<Option<FrameRegion>>), String> {
+        let X11PixelFormat::Rgb10(layout) = self.pixel_format else {
+            return Err(format!(
+                "wide capture expected RGB10, got {}",
+                self.pixel_format.token()
+            ));
+        };
+        let (Transfer::Shm { segment, mapping }, Some((spare_segment, spare_mapping))) =
+            (&mut self.transfer, self.spare.as_mut())
+        else {
+            return Err("whole-frame differencing needs two MIT-SHM segments".to_string());
+        };
+        let width = usize::from(self.rect.width);
+        let height = usize::from(self.rect.height);
+        let stride = self.layout.stride;
+        let target = if self.latest_whole == Some(1) { 0 } else { 1 };
+        let (read_segment, read_mapping, other_mapping) = if target == 0 {
+            (*segment, mapping, spare_mapping)
+        } else {
+            (*spare_segment, spare_mapping, mapping)
+        };
+        let reply = self
+            .connection
+            .shm_get_image(
+                self.root,
+                self.rect.x,
+                self.rect.y,
+                self.rect.width,
+                self.rect.height,
+                u32::MAX,
+                u8::from(ImageFormat::Z_PIXMAP),
+                read_segment,
+                0,
+            )
+            .map_err(|error| format!("request XShmGetImage: {error}"))?
+            .reply()
+            .map_err(|error| format!("XShmGetImage: {error}"))?;
+        validate_image_reply(
+            reply.depth,
+            reply.visual,
+            usize::try_from(reply.size).map_err(|_| "XShm image size overflow".to_string())?,
+            self.layout,
+        )?;
+        let previous_valid = self.latest_whole == Some(1 - target);
+        self.latest_whole = Some(target);
+        let current = read_mapping.bytes();
+        let bound = if compare && previous_valid {
+            Some(changed_bounds_banded(
+                other_mapping.bytes(),
+                current,
+                stride,
+                width,
+                height,
+            )?)
+        } else {
+            None
+        };
+        Ok((
+            WideX11Frame {
+                bytes: current,
+                width,
+                height,
+                stride,
+                layout,
+            },
+            bound,
+        ))
     }
 
     pub(crate) fn capture_wide(&mut self) -> Result<WideX11Frame<'_>, String> {
@@ -616,6 +826,9 @@ impl Drop for X11Capture {
             let _ = self.connection.damage_destroy(damage);
         }
         if let Transfer::Shm { segment, .. } = &self.transfer {
+            let _ = self.connection.shm_detach(*segment);
+        }
+        if let Some((segment, _)) = &self.spare {
             let _ = self.connection.shm_detach(*segment);
         }
         let _ = self.connection.flush();
@@ -752,6 +965,92 @@ fn validate_recreated_rect(expected: CaptureRect, actual: CaptureRect) -> Result
     Ok(())
 }
 
+fn transfer_supports_regions(transfer: &Transfer) -> bool {
+    matches!(transfer, Transfer::Shm { .. })
+}
+
+/// Most row bands compared at once. Comparing two 1440p frames is about
+/// 30 MB of reads; four threads took about 2.5 ms on the Xorg lab host.
+const MAX_DIFF_BANDS: usize = 12;
+
+/// [`changed_bounds`] over row bands in parallel, unioned.
+fn changed_bounds_banded(
+    previous: &[u8],
+    current: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<Option<FrameRegion>, String> {
+    let bands = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_DIFF_BANDS)
+        .min(height.max(1));
+    let rows_per_band = height.div_ceil(bands);
+    std::thread::scope(|scope| {
+        let handles = (0..bands)
+            .map(|band| {
+                let top = band * rows_per_band;
+                let rows = rows_per_band.min(height.saturating_sub(top));
+                scope.spawn(move || {
+                    if rows == 0 {
+                        return Ok(None);
+                    }
+                    let start = top * stride;
+                    changed_bounds(
+                        &previous[start..],
+                        &current[start..],
+                        stride,
+                        width,
+                        rows,
+                        4,
+                    )
+                    .map(|bound| {
+                        bound.map(|region| FrameRegion {
+                            y: region.y + top,
+                            ..region
+                        })
+                    })
+                    .map_err(|error| format!("compare X11 frames: {error}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        handles.into_iter().try_fold(None, |union, handle| {
+            let bound = handle
+                .join()
+                .map_err(|_| "X11 frame comparison panicked".to_string())??;
+            Ok(union_regions(union, bound))
+        })
+    })
+}
+
+/// `region` (output pixels) as root-window `GetImage` arguments, refusing
+/// anything outside the output.
+fn region_on_root(
+    output: CaptureRect,
+    region: FrameRegion,
+) -> Result<(i16, i16, u16, u16), String> {
+    let inside = region.width > 0
+        && region.height > 0
+        && region.x + region.width <= usize::from(output.width)
+        && region.y + region.height <= usize::from(output.height);
+    if !inside {
+        return Err(format!(
+            "capture region {}x{}+{}+{} leaves the {}x{} output",
+            region.width, region.height, region.x, region.y, output.width, output.height
+        ));
+    }
+    let offset = |origin: i16, delta: usize| {
+        i16::try_from(i64::from(origin) + i64::try_from(delta).unwrap_or(i64::MAX))
+            .map_err(|_| "capture region origin overflow".to_string())
+    };
+    Ok((
+        offset(output.x, region.x)?,
+        offset(output.y, region.y)?,
+        u16::try_from(region.width).map_err(|_| "capture region width overflow".to_string())?,
+        u16::try_from(region.height).map_err(|_| "capture region height overflow".to_string())?,
+    ))
+}
+
 fn validate_image_reply(
     depth: u8,
     visual: Visualid,
@@ -848,26 +1147,6 @@ fn allocate_zeroed(len: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-struct I420Storage {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-}
-
-fn allocate_i420(width: usize, height: usize) -> Result<I420Storage, String> {
-    let y_len = width
-        .checked_mul(height)
-        .ok_or_else(|| "I420 luma geometry overflow".to_string())?;
-    let chroma_len = y_len
-        .checked_div(4)
-        .ok_or_else(|| "I420 chroma geometry overflow".to_string())?;
-    Ok(I420Storage {
-        y: allocate_zeroed(y_len)?,
-        u: allocate_zeroed(chroma_len)?,
-        v: allocate_zeroed(chroma_len)?,
-    })
-}
-
 fn failure_code(message: &str, code: i32) -> i32 {
     crate::log(&format!("ERROR: {message}"));
     code
@@ -895,21 +1174,6 @@ pub(crate) fn run_with_args(args: Vec<String>) -> ! {
     std::process::exit(run_inner(args))
 }
 
-fn software_bitrate_bounds(
-    width: u32,
-    height: u32,
-    fps: u32,
-    color: crate::ColorSpec,
-) -> (u32, u32) {
-    pipeline_contract(PipelineId::Software).bitrate_bounds(
-        width,
-        height,
-        fps,
-        color.chroma,
-        color.bit_depth,
-    )
-}
-
 fn run_admission_probe(
     capture: X11Capture,
     fps: u32,
@@ -927,85 +1191,15 @@ fn run_admission_probe(
             2,
         );
     }
-    let width_usize = usize::from(capture.rect.width);
-    let height_usize = usize::from(capture.rect.height);
-    let mut storage = match allocate_i420(width_usize, height_usize) {
-        Ok(storage) => storage,
-        Err(error) => return failure_code(&error, 3),
-    };
-    storage.y.fill(16);
-    storage.u.fill(128);
-    storage.v.fill(128);
-    let threads = std::thread::available_parallelism()
-        .map(|count| count.get().min(64))
-        .unwrap_or(1);
-    let threads = u16::try_from(threads).unwrap_or(1);
-    let (start_bps, _) = software_bitrate_bounds(width, height, fps, color);
-    let mut encoder = match SoftwareH264Encoder::new(SoftwareH264Config {
-        width,
-        height,
+    // The geometry is proven; the probe itself needs no capture, which is
+    // held until it ends, as before.
+    let code = crate::admission_probe::run_software_probe(
+        color.video(arcen_media::VideoCodec::H264),
         fps,
-        bitrate_bps: start_bps,
-        num_threads: threads,
-        range: color.range,
-        matrix: color.matrix,
-        primaries: color.primaries,
-        transfer: color.transfer,
-        keyframe: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
-    }) {
-        Ok(encoder) => encoder,
-        Err(error) => {
-            return failure_code(&format!("OpenH264 admission init failed: {error}"), 4);
-        }
-    };
-    let mut frame = 0u8;
-    let result =
-        crate::admission_probe::run_probe_loop(options, std::io::stdout().lock(), |input| {
-            frame = frame.wrapping_add(1);
-            let changed_luma = if input.kind == arcen_media::RepresentativeFrameKind::FullMotion {
-                storage.y.len()
-            } else {
-                storage
-                    .y
-                    .len()
-                    .saturating_mul(usize::from(input.dirty_ratio.basis_points()))
-                    .div_ceil(10_000)
-                    .max(1)
-            };
-            storage.y[..changed_luma].fill(frame);
-            if input.kind == arcen_media::RepresentativeFrameKind::FullMotion {
-                storage.u.fill(frame.wrapping_add(64));
-                storage.v.fill(frame.wrapping_add(128));
-            }
-            if input.force_idr {
-                encoder.force_idr();
-            }
-            let frame = I420Frame::new(
-                width,
-                height,
-                &storage.y,
-                width_usize,
-                &storage.u,
-                width_usize / 2,
-                &storage.v,
-                width_usize / 2,
-            )
-            .map_err(|error| format!("OpenH264 admission frame: {error}"))?;
-            let started = Instant::now();
-            let output = encoder
-                .encode(frame)
-                .map_err(|error| format!("OpenH264 admission encode: {error}"))?;
-            Ok(crate::admission_probe::ProbeEncodeResult {
-                encode_latency: started.elapsed(),
-                delivered: output.is_some(),
-            })
-        });
-    drop(encoder);
+        options,
+    );
     drop(capture);
-    match result {
-        Ok(()) => 0,
-        Err(error) => failure_code(&error, 5),
-    }
+    code
 }
 
 fn run_inner(args: Vec<String>) -> i32 {
@@ -1085,35 +1279,20 @@ fn run_inner(args: Vec<String>) -> i32 {
     let height = u32::from(capture.rect.height);
     let width_usize = usize::from(capture.rect.width);
     let height_usize = usize::from(capture.rect.height);
-    // The BGRA -> I420 conversion below must apply the same colour contract
+    // The session's BGRA -> I420 conversion applies the same colour contract
     // `software_plan` announces in the READY line, not an implicit default.
-    let transform = color.transform();
-    let mut i420 = match allocate_i420(width_usize, height_usize) {
-        Ok(storage) => storage,
-        Err(error) => return failure_code(&error, 3),
-    };
-    let threads = std::thread::available_parallelism()
-        .map(|count| count.get().min(64))
-        .unwrap_or(1);
-    let threads = u16::try_from(threads).unwrap_or(1);
-    let (start_bps, ceiling_bps) = software_bitrate_bounds(width, height, fps, color);
-    let mut encoder = match SoftwareH264Encoder::new(SoftwareH264Config {
+    let mut session = match SoftwareH264Session::new(SoftwareSessionConfig::for_stream(
         width,
         height,
         fps,
-        bitrate_bps: start_bps,
-        num_threads: threads,
-        range: color.range,
-        matrix: color.matrix,
-        primaries: color.primaries,
-        transfer: color.transfer,
-        keyframe: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
-    }) {
-        Ok(encoder) => encoder,
+        color.video(arcen_media::VideoCodec::H264),
+    )) {
+        Ok(session) => session,
         Err(error) => {
             return failure_code(&format!("OpenH264 initialization failed: {error}"), 4);
         }
     };
+    let (start_bps, ceiling_bps) = session.bitrate_bounds();
     let plan = match software_plan(width, height, fps, cursor, color) {
         Ok(plan) => plan,
         Err(error) => return failure_code(&error, 2),
@@ -1172,7 +1351,7 @@ fn run_inner(args: Vec<String>) -> i32 {
                 };
                 cadence.reset();
                 cadence.note_frame();
-                encoder.force_idr();
+                session.force_idr();
                 modeset_idr = true;
                 // Modeset invalidates the previous frame buffer and every
                 // activity/deadline observation derived from it.
@@ -1188,34 +1367,29 @@ fn run_inner(args: Vec<String>) -> i32 {
 
         let now = Instant::now();
         if let Some(fps) = control.take_framerate_fps() {
-            let fps = fps.clamp(1, MAX_FPS);
-            if fps != encoder.config().fps {
-                match encoder.reconfigure_framerate(fps) {
-                    Ok(()) => {
-                        interval = crate::frame_interval_from_fps(fps);
-                        if live_framerate_reconfigure_policy().force_idr {
-                            encoder.force_idr();
-                        }
-                        crate::log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
+            match session.reconfigure_framerate(fps) {
+                Ok(LiveChange::Applied(fps)) => {
+                    interval = crate::frame_interval_from_fps(fps);
+                    if live_framerate_reconfigure_policy().force_idr {
+                        session.force_idr();
                     }
-                    Err(error) => crate::log(&format!(
-                        "OpenH264 live framerate reconfigure failed: {error}"
-                    )),
+                    crate::log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
                 }
+                Ok(LiveChange::Unchanged) => {}
+                Err(error) => crate::log(&format!(
+                    "OpenH264 live framerate reconfigure failed: {error}"
+                )),
             }
         }
         if let Some(bps) = control.take_bitrate_bps() {
-            let bps = bps.clamp(u64::from(start_bps / 4), u64::from(ceiling_bps));
-            let bps = u32::try_from(bps).unwrap_or(u32::MAX);
-            if bps != encoder.config().bitrate_bps {
-                match encoder.reconfigure_bitrate(bps) {
-                    Ok(()) => crate::log(&format!(
-                        "OpenH264 live bitrate reconfigured: target={bps}bps"
-                    )),
-                    Err(error) => crate::log(&format!(
-                        "OpenH264 live bitrate reconfigure failed: {error}"
-                    )),
-                }
+            match session.reconfigure_bitrate(bps) {
+                Ok(LiveChange::Applied(bps)) => crate::log(&format!(
+                    "OpenH264 live bitrate reconfigured: target={bps}bps"
+                )),
+                Ok(LiveChange::Unchanged) => {}
+                Err(error) => crate::log(&format!(
+                    "OpenH264 live bitrate reconfigure failed: {error}"
+                )),
             }
         }
         if now >= next_tick {
@@ -1223,7 +1397,7 @@ fn run_inner(args: Vec<String>) -> i32 {
             let decision = cadence.decision(idr_requested || modeset_idr, last_emit.elapsed());
             if let Some(mode) = decision {
                 if matches!(mode, EmitMode::Idr) || idr_requested || modeset_idr {
-                    encoder.force_idr();
+                    session.force_idr();
                 }
                 let mut service_attempted = false;
                 let encoded = {
@@ -1254,70 +1428,28 @@ fn run_inner(args: Vec<String>) -> i32 {
                     );
                     if service.serve {
                         service_attempted = true;
-                        let mut destination = match I420FrameMut::new(
-                            width,
-                            height,
-                            &mut i420.y,
-                            width_usize,
-                            &mut i420.u,
-                            width_usize / 2,
-                            &mut i420.v,
-                            width_usize / 2,
-                        ) {
-                            Ok(destination) => destination,
-                            Err(error) => {
-                                return failure_code(&format!("construct I420 frame: {error}"), 3);
-                            }
-                        };
                         if service.keyframe {
-                            encoder.force_idr();
+                            session.force_idr();
                         }
                         let summary = service.summary;
-                        if service.keyframe || summary.is_full_damage() {
-                            // Baseline, recovery, and full-damage frames always
-                            // rebuild every plane.
-                            if let Err(error) =
-                                convert_bgra_to_i420(source, &mut destination, transform)
-                            {
-                                return failure_code(
-                                    &format!("convert BGRA to I420 (full): {error}"),
-                                    3,
-                                );
-                            }
-                        } else if !summary.is_clean() {
-                            match schedule.damage_map() {
-                                // Selective: convert only dirty block-row bands.
-                                Some(map) => {
-                                    for rows in map.dirty_block_rows() {
-                                        if let Err(error) = convert_bgra_to_i420_rows(
-                                            source,
-                                            &mut destination,
-                                            rows,
-                                            transform,
-                                        ) {
-                                            return failure_code(
-                                                &format!("convert BGRA to I420 (rows): {error}"),
-                                                3,
-                                            );
-                                        }
-                                    }
-                                }
-                                // Degraded scheduler: no map, convert fully.
-                                None => {
-                                    if let Err(error) =
-                                        convert_bgra_to_i420(source, &mut destination, transform)
-                                    {
-                                        return failure_code(
-                                            &format!("convert BGRA to I420 (degraded): {error}"),
-                                            3,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        // Baseline, recovery and full-damage frames rebuild
+                        // every plane; otherwise only dirty block-row bands
+                        // (a degraded scheduler has no map: convert fully).
                         // A clean mandatory refresh re-encodes the retained
                         // planes; nothing changed to convert.
-                        match encoder.encode(destination.as_frame()) {
+                        let damage = if service.keyframe || summary.is_full_damage() {
+                            StageDamage::Full
+                        } else if summary.is_clean() {
+                            StageDamage::Clean
+                        } else {
+                            schedule
+                                .damage_map()
+                                .map_or(StageDamage::Full, StageDamage::Rows)
+                        };
+                        if let Err(error) = session.stage(source, damage) {
+                            return failure_code(&format!("stage BGRA into I420: {error}"), 3);
+                        }
+                        match session.encode() {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 return failure_code(
@@ -1586,6 +1718,44 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_get_image_fallback_never_reads_regions() {
+        assert!(!transfer_supports_regions(&Transfer::GetImage {
+            storage: Vec::new()
+        }));
+    }
+
+    #[test]
+    fn a_capture_region_maps_onto_the_root_and_never_leaves_the_output() {
+        let output = CaptureRect {
+            x: 2560,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let region = |x, y, width, height| FrameRegion {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(
+            region_on_root(output, region(10, 20, 64, 32)),
+            Ok((2570, 20, 64, 32))
+        );
+        assert_eq!(
+            region_on_root(output, region(1856, 1048, 64, 32)),
+            Ok((4416, 1048, 64, 32))
+        );
+        for outside in [
+            region(1857, 0, 64, 32),
+            region(0, 1049, 64, 32),
+            region(0, 0, 0, 32),
+        ] {
+            assert!(region_on_root(output, outside).is_err(), "{outside:?}");
+        }
     }
 
     #[test]

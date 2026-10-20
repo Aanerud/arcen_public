@@ -109,6 +109,8 @@ pub struct AgentConfig {
     #[serde(default)]
     timezone_redirection: bool,
     #[serde(default)]
+    font_smoothing: crate::font_smoothing::FontSmoothingPolicy,
+    #[serde(default)]
     qos_targets: arcen_telemetry::QosTargets,
     #[serde(default)]
     debug_diagnostics: bool,
@@ -175,6 +177,7 @@ impl AgentConfig {
             microphone_input_enabled: config.microphone_input_enabled,
             clipboard_policy: config.clipboard_policy,
             timezone_redirection: config.timezone_redirection,
+            font_smoothing: config.font_smoothing,
             qos_targets: config.qos_targets,
             debug_diagnostics: config.debug_diagnostics,
             deskside: config.deskside.clone(),
@@ -285,6 +288,7 @@ impl AgentConfig {
             microphone_input_enabled: self.microphone_input_enabled,
             clipboard_policy: self.clipboard_policy,
             timezone_redirection: self.timezone_redirection,
+            font_smoothing: self.font_smoothing,
             reconnect_window_secs: 0,
             qos_targets: self.qos_targets,
             debug_diagnostics: self.debug_diagnostics,
@@ -2528,6 +2532,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
@@ -3603,6 +3608,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
@@ -3638,6 +3644,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
@@ -3673,6 +3680,7 @@ mod tests {
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
+            font_smoothing: Default::default(),
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),

@@ -24,21 +24,19 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::accept_hdr_async_with_config;
 #[cfg(feature = "wss-compat")]
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, trace, warn, Instrument};
 
 use crate::cli::{AudioUserMode, AuthMode, Config, InputMode};
 use crate::clipboard::{
-    spawn_clipboard_agent, ClipboardAgentIo, ClipboardItem, ClipboardNegotiation,
-    ClipboardWriterQueue,
+    spawn_clipboard_agent, ClipboardItem, ClipboardNegotiation, ClipboardWriterQueue,
 };
 use crate::display::nvctrl::{self, MetaModeGuard, NvControl};
 use crate::display::topology::LinuxTopologyPlan;
 use crate::eventlog;
 use crate::input::region_adapter::RegionInputAdapter;
-use crate::input::{InputController, InputError, InputStats};
+use crate::input::{InputBackendChoice, InputController, InputError, InputStats, PierInput};
 #[cfg(feature = "wss-compat")]
 use crate::logging::target::TLS;
 use crate::logging::target::{AUDIO, AUTH, CAPENC, DISPLAY, HEALTH, INPUT, MEDIA, NET, SESSION};
@@ -67,7 +65,9 @@ use crate::session::resume::{
     self, DirectSessionSocket, OwnerCommand, ResumeBindings, TopologyBinding,
 };
 use crate::session::timezone::validate_zoneinfo_timezone;
-use crate::session_admission::{SessionAdmissionLease, SessionAdmissionRuntime};
+use crate::session_admission::{
+    SessionAdmissionError, SessionAdmissionLease, SessionAdmissionRuntime,
+};
 use crate::LifecycleEmitter;
 use arcen_identity::{
     ActiveHostSessionId, DisclaimerAcceptance, HostIdentity, LogindSessionId, NativePrincipal,
@@ -93,28 +93,27 @@ use arcen_media::{
     TransferCharacteristics, VideoCodec, VideoConfiguration,
 };
 use arcen_protocol::messages::{
-    msg_type, supports_region_input_v1, AuthRequest, AuthResponse, AuthResult, ClientHelloMsg,
-    ClipboardDataMsg, CursorMode, CursorModeReason, CursorModeResultMsg, DisplayUpdateMsg,
-    DisplayUpdateResultMsg, HealthPingMsg, HealthPongMsg, InputCapabilityAvailability, KeyEventMsg,
-    KeyResetModifiersMsg, MicrophoneStreamStopMsg, MouseButtonMsg, MouseMoveMsg,
-    MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, QualitySettings, RegionInputValidationError,
-    RegionPenEventMsg, RegionPointerButtonMsg, RegionPointerEnterMsg, RegionPointerLeaveMsg,
-    RegionPointerMotionMsg, RegionPointerScrollMsg, RequestFullFrameMsg, ResumeErrorCode,
-    ServerMultiMonitorMsg, TabletModeCapabilitiesMsg, TabletModeMsg, TabletModeReason,
-    TabletModeResultMsg, AUTH_METHOD_RESUME, AUTH_REQUEST, AUTH_RESULT, CLIENT_HELLO,
-    CLIPBOARD_DATA, DISPLAY_UPDATE, HEALTH_PING, HEALTH_PONG, KEY_RESET_MODIFIERS,
-    MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL, PEN_EVENT,
-    REGION_INPUT_PROTOCOL_VERSION, REGION_PEN_EVENT, REGION_POINTER_BUTTON, REGION_POINTER_ENTER,
-    REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL, REQUEST_FULL_FRAME,
+    msg_type, supports_region_input_v1, supports_text_commit_v1, AuthRequest, AuthResponse,
+    AuthResult, ClientHelloMsg, ClipboardDataMsg, CursorMode, CursorModeReason,
+    CursorModeResultMsg, DisplayUpdateMsg, DisplayUpdateResultMsg, HealthPingMsg, HealthPongMsg,
+    InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg, MicrophoneStreamStopMsg,
+    MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg,
+    QualitySettings, RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg,
+    RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
+    RequestFullFrameMsg, ResumeErrorCode, ServerMultiMonitorMsg, TabletModeCapabilitiesMsg,
+    TabletModeMsg, TabletModeReason, TabletModeResultMsg, TextCommitMsg, AUTH_METHOD_RESUME,
+    AUTH_REQUEST, AUTH_RESULT, CLIENT_HELLO, CLIPBOARD_DATA, DISPLAY_UPDATE, HEALTH_PING,
+    HEALTH_PONG, KEY_RESET_MODIFIERS, MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL,
+    PEN_EVENT, REGION_INPUT_PROTOCOL_VERSION, REGION_PEN_EVENT, REGION_POINTER_BUTTON,
+    REGION_POINTER_ENTER, REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL,
+    REQUEST_FULL_FRAME, TEXT_COMMIT,
 };
-use arcen_protocol::{
-    decode_clipboard_chunk, decode_microphone_frame, encode_clipboard_chunk, AudioCodec,
-    ClipboardChunkHeader, FrameType,
-};
+use arcen_protocol::{decode_clipboard_chunk, decode_microphone_frame, AudioCodec, FrameType};
 use arcen_session::direct_reconnect::{
     DirectReconnect, MonotonicMillis, ReconnectEvent, ReconnectPolicy, ReconnectState,
 };
 use arcen_session::restore_lease::IanaTimeZone;
+use arcen_session::session_admission::DetachedTakeoverRefusal;
 use arcen_telemetry::{
     CorrelationId, FieldValue, LifecycleEventKind, OperationalProfile, QosSample, QosTargets,
     StructuredFields, TelemetryTarget,
@@ -122,9 +121,12 @@ use arcen_telemetry::{
 
 const CAPTURE_ENCODER_INIT_FAILED: &str = "capture/encoder initialization failed";
 use serde::de::DeserializeOwned;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::tls;
+
+#[path = "lane_workers.rs"]
+mod lane_workers;
 
 fn microphone_generation_from_entropy(bytes: [u8; 4]) -> Option<u32> {
     let generation = u32::from_ne_bytes(bytes);
@@ -399,6 +401,9 @@ const PAM_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAM_OPERATION_CAPACITY: usize = 4;
 const PREAUTH_CAPACITY: usize = 16;
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bulk-lane messages (clipboard, USB) waiting for the dispatcher. The bulk
+/// reader waits for room, so back-pressure stays on the bulk lane.
+const BULK_FORWARD_CAPACITY: usize = 8;
 const READ_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 // Deadline for the initial client_hello / quality_settings handshake
 // receives. Kept as a named constant (rather than inline) so tests can pass
@@ -506,6 +511,520 @@ where
     send_critical_control_with_timeout(sink, message, kind, CRITICAL_CONTROL_TIMEOUT).await
 }
 
+/// A headless Wayland session's outputs as the agent reports them now, or
+/// its start facts when its outputs are fixed (they never change). `None`
+/// for an Xorg session.
+///
+/// # Errors
+///
+/// A Deck-facing reason when a reconfigurable session's agent does not
+/// answer: its outputs may have changed since it started, so its start
+/// facts are never assumed.
+/// The size a display update is served at: refused (`None`) unless the
+/// width is a multiple of four and the height even; on the software encoder
+/// a Wayland output is fitted to OpenH264's limits (aspect kept, width a
+/// multiple of four), while an Xorg MetaMode keeps its 1920x1080 ceiling.
+fn resize_target(width: u32, height: u32, software: bool, wayland: bool) -> Option<(u32, u32)> {
+    if width % 4 != 0 || height % 2 != 0 {
+        return None;
+    }
+    match (software, wayland) {
+        (false, _) => Some((width, height)),
+        (true, true) => {
+            let (fitted_width, fitted_height) =
+                capenc::fit_to_encoder_limits(EncoderRequest::SoftwareH264, width, height);
+            let fitted = (fitted_width & !3, fitted_height & !1);
+            (fitted.0 > 0 && fitted.1 > 0).then_some(fitted)
+        }
+        (true, false) => (width <= 1920 && height <= 1080).then_some((width, height)),
+    }
+}
+
+/// The size a software host's single resizable Wayland output must be
+/// changed to before capture, when it is larger than OpenH264 encodes.
+fn wayland_software_refit(
+    cfg: &Config,
+    ready: &crate::session::wayland::WaylandAgentReady,
+) -> Option<(u32, u32)> {
+    if ready.output_socket.is_none() || ready.outputs.len() != 1 {
+        return None;
+    }
+    let output = ready.outputs.first()?;
+    let (width, height) = cfg.wayland_session_size(output.width, output.height);
+    let fitted = (width & !3, height & !1);
+    (fitted != (output.width, output.height) && fitted.0 > 0 && fitted.1 > 0).then_some(fitted)
+}
+
+async fn current_wayland_session(
+    lease: &SessionLease,
+) -> Result<Option<crate::session::wayland::WaylandAgentReady>, &'static str> {
+    let Some(ready) = lease.metadata.wayland.as_ref() else {
+        return Ok(None);
+    };
+    if ready.output_socket.is_none() {
+        return Ok(Some(ready.clone()));
+    }
+    crate::session::wayland::output_client::current(
+        ready,
+        lease.metadata.uid,
+        lease.metadata.agent_pid,
+    )
+    .await
+    .map(|reply| Some(ready.with_outputs(&reply)))
+    .map_err(|error| {
+        warn!(target: DISPLAY, %error, "Wayland session outputs could not be read");
+        "the desktop's displays could not be read on the host"
+    })
+}
+
+/// Moves a reconfigurable headless Wayland desktop to the outputs its
+/// latest sign-in asked for (`SessionMetadata::requested_outputs`) before
+/// the attachment's first capture epoch (not on a resume of the same lease,
+/// [`aligns_outputs_at_attach`]): one output transaction to the next
+/// generation. Sizes and places are compared, not refresh rates (a stream's
+/// refresh follows its consumer). A refused or failed transaction keeps the
+/// live outputs, which the attachment then serves; a committed multi-monitor
+/// topology that the live outputs do not match is refused when its capture
+/// is bound.
+async fn align_wayland_outputs(
+    lease: &SessionLease,
+    ready: crate::session::wayland::WaylandAgentReady,
+) -> crate::session::wayland::WaylandAgentReady {
+    let Some(requested) = lease.metadata.requested_outputs.as_ref() else {
+        return ready;
+    };
+    if ready.output_socket.is_none() || !ready.output_mode.reconfigurable() {
+        return ready;
+    }
+    let matches = ready.streams.len() == requested.len()
+        && ready.streams.iter().zip(requested).all(|(stream, placed)| {
+            (stream.x, stream.y, stream.width, stream.height)
+                == (
+                    placed.x,
+                    placed.y,
+                    placed.request.width(),
+                    placed.request.height(),
+                )
+        });
+    if matches {
+        return ready;
+    }
+    let generation = ready.generation.saturating_add(1);
+    info!(
+        target: DISPLAY,
+        from_outputs = ready.streams.len(),
+        to_outputs = requested.len(),
+        generation,
+        "attach-time Wayland output transaction begin"
+    );
+    let placements = requested
+        .iter()
+        .map(crate::session::wayland::OutputPlacement::from_placed)
+        .collect();
+    match crate::session::wayland::output_client::configure(
+        &ready,
+        lease.metadata.uid,
+        lease.metadata.agent_pid,
+        generation,
+        placements,
+    )
+    .await
+    {
+        Ok(reply) => {
+            info!(
+                target: DISPLAY,
+                generation = reply.generation,
+                outputs = reply.outputs.len(),
+                "attach-time Wayland output transaction committed"
+            );
+            ready.with_outputs(&reply)
+        }
+        Err(crate::session::wayland::output_client::OutputClientError::Refused {
+            reason,
+            live,
+        }) => {
+            warn!(target: DISPLAY, %reason, generation = live.generation, "attach-time Wayland output transaction refused; the live outputs are kept");
+            ready.with_outputs(&live)
+        }
+        Err(error) => {
+            warn!(target: DISPLAY, %error, "attach-time Wayland output transaction failed; reading the live outputs");
+            crate::session::wayland::output_client::current(
+                &ready,
+                lease.metadata.uid,
+                lease.metadata.agent_pid,
+            )
+            .await
+            .map_or(ready.clone(), |live| ready.with_outputs(&live))
+        }
+    }
+}
+
+/// Where a replacement capture epoch of a Wayland session captures: the
+/// agent's current outputs (its stream may have been replaced), or, for a
+/// fixed-output session, the same stream while the agent still runs.
+///
+/// # Errors
+///
+/// A Deck-facing reason when the desktop has ended.
+async fn wayland_capture_source(
+    ready: &crate::session::wayland::WaylandAgentReady,
+    lease: &SessionLease,
+) -> Result<crate::session::wayland::WaylandAgentReady, &'static str> {
+    const ENDED: &str = "the desktop session on the host ended";
+    if ready.output_socket.is_some() {
+        return crate::session::wayland::output_client::current(
+            ready,
+            lease.metadata.uid,
+            lease.metadata.agent_pid,
+        )
+        .await
+        .map(|reply| ready.with_outputs(&reply))
+        .map_err(|_| ENDED);
+    }
+    if std::path::Path::new(&format!("/proc/{}", lease.metadata.agent_pid)).exists() {
+        Ok(ready.clone())
+    } else {
+        Err(ENDED)
+    }
+}
+
+/// The output's wide-capture streams for a Grading or HDR (ten-bit) epoch of
+/// a Wayland session whose compositor composes in a wide colour state.
+/// `None` for an eight-bit epoch, a fixed-output session, or a session that
+/// refuses (composed in SDR): the wide composition then finds no wide format
+/// on the ordinary stream and says so.
+async fn wayland_wide_streams(
+    ten_bit: bool,
+    ready: &crate::session::wayland::WaylandAgentReady,
+    lease: &SessionLease,
+) -> Option<Vec<crate::session::wayland::ReadyStream>> {
+    if !ten_bit || ready.output_socket.is_none() {
+        return None;
+    }
+    match crate::session::wayland::output_client::wide_streams(
+        ready,
+        lease.metadata.uid,
+        lease.metadata.agent_pid,
+        ready.generation,
+    )
+    .await
+    {
+        Ok(reply) => Some(reply.streams),
+        Err(error) => {
+            warn!(
+                target: CAPENC,
+                %error,
+                "the Wayland session records no wide stream for this ten-bit epoch"
+            );
+            None
+        }
+    }
+}
+
+/// Points a capture child's environment at `ready`'s primary stream and
+/// output generation, and at that output's wide stream when `wide` names
+/// one.
+fn follow_wayland_outputs(
+    execution: &mut crate::session::identity::UserExecution,
+    ready: &crate::session::wayland::WaylandAgentReady,
+    wide: Option<&[crate::session::wayland::ReadyStream]>,
+) {
+    let handoff = ready.primary_handoff().and_then(|handoff| {
+        let node = wide.and_then(|streams| {
+            streams
+                .iter()
+                .find(|stream| stream.connector == handoff.output().as_str())
+                .map(|stream| stream.node_id)
+        });
+        handoff.with_wide_node(node)
+    });
+    match handoff {
+        Ok(handoff) => {
+            execution.environment = execution
+                .environment
+                .clone()
+                .with_wayland_session(ready, &handoff);
+        }
+        Err(error) => warn!(
+            target: CAPENC,
+            %error,
+            "Wayland capture hand-off for the current outputs is invalid"
+        ),
+    }
+}
+
+/// One capture binding per monitor of a virtual-output topology: the
+/// session's current stream at exactly that monitor's place and size, its
+/// own hand-off in a copy of the session user's execution context, and the
+/// import route the qualification record proves. No Speed evidence: the
+/// record's rates are single-output ones, several outputs at once are
+/// unguarded at runtime, and the multi-output runs prove Auto rates only, so
+/// each output's capture serves a Speed request visibly as Auto
+/// (`copy_path_not_rate_qualified`) until a concurrent Speed proof exists
+/// ([`multi_output_speed_evidence`]). Empty for a dedicated-Xorg topology.
+///
+/// # Errors
+///
+/// A Deck-facing reason when the session has no outputs to read or a
+/// monitor has no stream: never a partial topology.
+fn wayland_capture_bindings(
+    cfg: &Config,
+    plan: &LinuxTopologyPlan,
+    ready: Option<&crate::session::wayland::WaylandAgentReady>,
+    execution: Option<&crate::session::identity::UserExecution>,
+) -> Result<Vec<multi_capenc::MonitorCaptureBinding>, &'static str> {
+    const MISMATCH: &str = "the desktop's displays do not match this layout on the host";
+    if plan.backend != crate::display::topology::LinuxTopologyBackend::VirtualOutputs {
+        return Ok(Vec::new());
+    }
+    let (Some(ready), Some(execution)) = (ready, execution) else {
+        return Err(MISMATCH);
+    };
+    plan.monitors
+        .iter()
+        .map(|monitor| {
+            let stream = ready
+                .streams
+                .iter()
+                .find(|stream| {
+                    (stream.x, stream.y, stream.width, stream.height)
+                        == (monitor.x, monitor.y, monitor.width, monitor.height)
+                })
+                .ok_or(MISMATCH)?;
+            let handoff = ready
+                .stream_handoff(stream, ready.generation)
+                .map_err(|_| MISMATCH)?;
+            let mut execution = execution.clone();
+            execution.environment = execution
+                .environment
+                .clone()
+                .with_wayland_session(ready, &handoff);
+            Ok(multi_capenc::MonitorCaptureBinding {
+                session_monitor_id: monitor.session_monitor_id,
+                connector: stream.connector.clone(),
+                capture_rates_by_codec: multi_output_speed_evidence(cfg),
+                gpu_import_verified: cfg.wayland_gpu_import_verified(),
+                execution,
+            })
+        })
+        .collect()
+}
+
+/// The Speed evidence an output of a concurrent multi-output capture is
+/// given: none yet. Single-output rates (measured or inferred) do not hold
+/// for several outputs encoding at once, the per-session runtime guard
+/// watches one capture only, and `facts.multi_output` measures Auto rates;
+/// a Speed request is therefore served as Auto, visibly, and logged here.
+fn multi_output_speed_evidence(
+    cfg: &Config,
+) -> Vec<(String, u32, arcen_media::video::CaptureRateEvidence)> {
+    if cfg.requested_pipeline == Some(arcen_media::video::PipelineId::Speed) {
+        info!(
+            target: MEDIA,
+            reason = "speed_multi_output_unqualified",
+            "multi-monitor Speed is served as Auto: no concurrent Speed proof for these outputs"
+        );
+    }
+    Vec::new()
+}
+
+/// Resolves when `incumbent` is marked displaced; never without one.
+async fn wait_displaced(incumbent: Option<&arcen_transport::quic::IncumbentRegistration>) {
+    match incumbent {
+        Some(incumbent) => incumbent.wait_displaced().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// For a fresh sign-in that passed full authentication as `claimant` while
+/// the session is detached: asks the detached owner to hand the desktop over
+/// (same user only, `arcen_session::direct_reconnect::fresh_sign_in`).
+/// `true` when it did, or when the session is no longer detached (resumed or
+/// ended meanwhile: the ordinary admission decides); `false` when it refused
+/// or did not answer.
+async fn take_over_detached_session(
+    session_registry: &SessionRegistry,
+    claimant: &crate::session::identity::UserIdentity,
+) -> Result<(), DetachedTakeoverRefusal> {
+    let Some(answer) = session_registry
+        .resume()
+        .request_takeover(&claimant.username, claimant.uid)
+    else {
+        return Ok(());
+    };
+    let outcome = tokio::time::timeout(TAKEOVER_ANSWER_TIMEOUT, answer)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let result = takeover_result(outcome);
+    match result {
+        Ok(()) => info!(target: SESSION, "fresh sign-in took over the user's detached session"),
+        Err(refusal) => warn!(
+            target: SESSION,
+            refusal = refusal.token(),
+            "fresh sign-in refused: the detached session cannot be taken over"
+        ),
+    }
+    result
+}
+
+/// What a fresh sign-in is told when the detached session's owner answered
+/// its takeover request with `outcome` (`None`: no answer in time).
+fn takeover_result(
+    outcome: Option<resume::TakeoverOutcome>,
+) -> Result<(), DetachedTakeoverRefusal> {
+    match outcome {
+        Some(resume::TakeoverOutcome::HandedOver) => Ok(()),
+        Some(resume::TakeoverOutcome::Refused) => Err(DetachedTakeoverRefusal::AnotherUsersDesktop),
+        None => Err(DetachedTakeoverRefusal::OwnerDidNotAnswer),
+    }
+}
+
+/// The shared principal of a resolved Linux account.
+fn account_principal(
+    username: &str,
+    uid: u32,
+) -> arcen_session::direct_reconnect::AccountPrincipal<'_> {
+    arcen_session::direct_reconnect::AccountPrincipal {
+        name: username,
+        id: u64::from(uid),
+    }
+}
+
+/// The incumbent-record key of a resolved account: uid and canonical name.
+fn account_key(identity: &crate::session::identity::UserIdentity) -> String {
+    format!("{}#{}", identity.uid, identity.username)
+}
+
+/// How long the detached owner may take to hand its desktop over.
+const TAKEOVER_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hands a detached session's desktop over to a successor of the same user:
+/// takes back its held display and releases it with the resume slot (see
+/// [`hand_over_displaced_session`]), then disconnects the lease, which keeps
+/// the desktop for the successor's reattachment.
+async fn hand_over_detached_session(
+    session_registry: &SessionRegistry,
+    lease: SessionLease,
+    active_session_id: &ActiveHostSessionId,
+) {
+    let held = session_registry
+        .take_held_display(lease.metadata.generation, &lease.metadata.username)
+        .map_err(|error| {
+            warn!(target: SESSION, ?error, "detached session holds no display to release");
+        })
+        .ok();
+    hand_over_displaced_session(session_registry.resume(), active_session_id, held).await;
+    log_lifecycle(
+        &lease.metadata.session_id,
+        "ended",
+        LIFECYCLES.ended(&lease.metadata.session_id),
+    );
+    lease.disconnect();
+}
+
+/// Releases a displaced attachment's hold on the desktop: drains its resume
+/// slot so no grant can resume it, and restores its display resources,
+/// which returns the session slot. The desktop itself stays for the
+/// newcomer (the caller disconnects the lease rather than terminating it).
+async fn hand_over_displaced_session(
+    resume: &crate::session::resume::ResumeRegistry,
+    active_session_id: &ActiveHostSessionId,
+    display: Option<HeldDisplayResources>,
+) {
+    if let Err(error) = resume.retire_for_successor(active_session_id) {
+        tracing::error!(target: SESSION, ?error, "displaced resume slot drain failed");
+    }
+    if let Some(mut display) = display {
+        display.restore().await;
+    }
+    if let Err(error) = resume.complete_drain(active_session_id) {
+        tracing::error!(target: SESSION, ?error, "displaced resume slot drain completion failed");
+    }
+}
+
+/// Why a newcomer was refused while another attachment holds the desktop.
+const SESSION_BUSY_REASON: &str =
+    "shared display is busy: another Deck is attached to this desktop";
+
+/// Takes the capacity-one session slot for an authenticated newcomer.
+///
+/// A free slot is taken at once. A held slot is not refused outright: for
+/// the same user, the incumbent connection's peer is proven alive or silent
+/// (`arcen_transport::liveness`), a silent one is closed as lost, and the
+/// newcomer then waits up to `ATTACHMENT_HANDOVER_WAIT` for the old
+/// attachment to tear down. A live incumbent, or another user's, keeps the
+/// desktop and the newcomer is refused.
+async fn acquire_session_slot(
+    session_slot: &Arc<Semaphore>,
+    incumbent: &arcen_transport::quic::IncumbentAttachment,
+    claimant: Option<&str>,
+    resume_in_progress: bool,
+) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = Arc::clone(session_slot).try_acquire_owned() {
+        return Some(permit);
+    }
+    let claimant = claimant?;
+    // A resume is moving the session to its Deck's new connection: the old
+    // connection is about to be replaced, never judged.
+    if resume_in_progress {
+        info!(target: SESSION, "session slot held by a resume in progress");
+        return None;
+    }
+    let outcome = incumbent
+        .displace_if_silent(claimant, arcen_transport::liveness::PEER_SILENCE_PROOF)
+        .await;
+    match outcome {
+        arcen_transport::quic::IncumbentOutcome::Displaced { silent_for } => warn!(
+            target: SESSION,
+            silent_ms = u64::try_from(silent_for.as_millis()).unwrap_or(u64::MAX),
+            "session slot held by a silent Deck of the same user; its connection was closed as lost"
+        ),
+        other => info!(
+            target: SESSION,
+            incumbent = other.token(),
+            "session slot held; incumbent liveness checked"
+        ),
+    }
+    if !outcome.slot_may_free() {
+        return Arc::clone(session_slot).try_acquire_owned().ok();
+    }
+    tokio::time::timeout(
+        arcen_transport::liveness::ATTACHMENT_HANDOVER_WAIT,
+        Arc::clone(session_slot).acquire_owned(),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
+/// How long a newcomer that already holds the session slot waits for the
+/// previous attachment to complete its admission lease. The slot is released
+/// with the display during that attachment's teardown, a moment before its
+/// admission guard; nothing else holds admission while the slot is free.
+const ADMISSION_HANDOVER_WAIT: Duration = Duration::from_secs(2);
+
+/// Pause before a capture replacement that follows a failed one: long
+/// enough for a Wayland agent to replace a closed stream or finish tearing
+/// a dead desktop down, short against the restart budget's window.
+const CAPTURE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+async fn admit_after_slot(
+    admission_runtime: &SessionAdmissionRuntime,
+) -> Result<SessionAdmissionLease, SessionAdmissionError> {
+    let deadline = tokio::time::Instant::now() + ADMISSION_HANDOVER_WAIT;
+    loop {
+        match admission_runtime.admit_new() {
+            Err(SessionAdmissionError::SessionAlreadyActive)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Close frame carrying a human-readable reason so the client can surface WHY
 /// the host aborted (a bare `Close(None)` reads as a cryptic protocol error).
 fn close_with_reason(reason: &str) -> Message {
@@ -595,6 +1114,60 @@ where
     R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     tokio::time::timeout(timeout, stream.next()).await
+}
+
+/// The next Deck message for the dispatcher: from the control lane, or
+/// forwarded from the bulk lane. Tagged with the lane it arrived on. Ends
+/// when the control lane ends; a closed bulk forwarder is simply dropped.
+async fn next_deck_message<R>(
+    stream: &mut R,
+    bulk: &mut Option<mpsc::Receiver<Message>>,
+    timeout: Duration,
+) -> Result<
+    Option<(
+        arcen_protocol::lanes::LaneRole,
+        Result<Message, tokio_tungstenite::tungstenite::Error>,
+    )>,
+    tokio::time::error::Elapsed,
+>
+where
+    R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            tokio::select! {
+                biased;
+                message = stream.next() => {
+                    return message.map(|message| (arcen_protocol::lanes::LaneRole::Control, message));
+                }
+                message = async {
+                    match bulk.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match message {
+                    Some(message) => {
+                        return Some((arcen_protocol::lanes::LaneRole::BulkAux, Ok(message)));
+                    }
+                    None => *bulk = None,
+                },
+            }
+        }
+    })
+    .await
+}
+
+/// The lane a Deck message belongs on, or `None` for transport-level
+/// messages (ping, pong, close) that belong to whichever lane carries them.
+fn deck_message_lane(message: &Message) -> Option<arcen_protocol::lanes::LaneRole> {
+    match message {
+        Message::Text(text) => Some(arcen_protocol::lanes::lane_for_session_text(text)),
+        Message::Binary(bytes) => Some(
+            arcen_protocol::lanes::lane_for_binary_message(bytes)
+                .unwrap_or(arcen_protocol::lanes::LaneRole::Control),
+        ),
+        Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_) => None,
+    }
 }
 
 async fn send_auth_result<S>(sink: &mut S, success: bool, message: &str) -> bool
@@ -775,6 +1348,33 @@ fn build_auth_request(
 /// defensively (fully disabled, logged once) rather than panicking, in case
 /// a future hot-reload path ever bypasses that earlier validation.
 fn multi_monitor_gate(cfg: &Config) -> multi_monitor::MultiMonitorGate {
+    if cfg.desktop_provider == arcen_session::desktop_provider::DesktopProvider::Wayland {
+        let virtual_outputs = cfg.multi_monitor_virtual_outputs();
+        let gate = multi_monitor::MultiMonitorGate::wayland(
+            &cfg.multi_monitor,
+            cfg.resolved_multi_monitor_encoder(),
+            virtual_outputs,
+        );
+        info!(
+            target: SESSION,
+            advertise_enabled = cfg.multi_monitor.advertise_enabled,
+            backend = "virtual_outputs",
+            output_mode = virtual_outputs.map_or("unqualified", |gate| gate.mode.token()),
+            effective_max_monitors = virtual_outputs.map_or(0, |gate| gate.max_outputs),
+            nvenc_session_limit = ?cfg.multi_monitor.nvenc_session_limit,
+            allow_software_fallback = cfg.multi_monitor.allow_software_fallback,
+            multi_monitor_encoder = ?cfg.resolved_multi_monitor_encoder(),
+            reason = match virtual_outputs {
+                None => "no valid Wayland qualification record",
+                Some(gate) if !gate.serves_several() => {
+                    "the qualification record proves one output; run `arcen-pier wayland qualify --write` to prove several"
+                }
+                Some(_) => "served",
+            },
+            "effective Linux multi-monitor admission policy"
+        );
+        return gate;
+    }
     let gate = multi_monitor::MultiMonitorGate::from_config(
         &cfg.multi_monitor,
         cfg.resolved_multi_monitor_encoder(),
@@ -825,6 +1425,47 @@ fn config_with_initial_video_request(
         resolved.apply_initial_video_request(request)?;
     }
     Ok(resolved)
+}
+
+/// The session configuration of a sign-in attached to a dedicated Xorg
+/// desktop of `depth`, resolved again from its request: a plan deeper than
+/// the desktop is served visibly as Auto.
+fn config_on_attached_desktop(
+    config: &Config,
+    response: &AuthResponse,
+    depth: arcen_media::video::DesktopDepth,
+) -> Result<Config, String> {
+    let mut attached = config.clone();
+    attached.attached_desktop_depth = Some(depth);
+    config_with_initial_video_request(&attached, response)
+}
+
+/// The session configuration a sign-in whose Wayland multi-monitor
+/// topology was planned resolves to when it asked for a wide contract
+/// (Grading or HDR): resolved again with [`Config::wayland_multi_output`],
+/// which serves it as Auto. `None` when nothing changes.
+fn wayland_multi_output_config(
+    config: &Config,
+    response: &AuthResponse,
+    outcome: &multi_monitor::MultiMonitorOutcome,
+) -> Option<Result<Config, String>> {
+    let multi_output = matches!(
+        outcome,
+        multi_monitor::MultiMonitorOutcome::Planned { plan, .. }
+            if plan.backend == crate::display::topology::LinuxTopologyBackend::VirtualOutputs
+    );
+    let wide = multi_output
+        && config_with_initial_video_request(config, response).is_ok_and(|resolved| {
+            matches!(
+                resolved.requested_pipeline,
+                Some(arcen_media::video::PipelineId::Grading | arcen_media::video::PipelineId::Hdr)
+            )
+        });
+    wide.then(|| {
+        let mut multi = config.clone();
+        multi.wayland_multi_output = true;
+        config_with_initial_video_request(&multi, response)
+    })
 }
 
 #[derive(Debug)]
@@ -935,6 +1576,27 @@ fn emit_session_auth_ok(
     );
 }
 
+/// The connecting Deck's build, as its hello advertises it, for the log.
+fn peer_deck_build(hello: &ClientHelloMsg) -> String {
+    match hello.build_identity() {
+        Ok(Some(identity)) => format!(
+            "{} {} build {} rev {} ({}, {}, {})",
+            identity.product,
+            identity.version,
+            identity.build_id,
+            identity.source_revision,
+            identity.build_profile,
+            identity.feature_profile,
+            identity
+                .signing_state
+                .as_deref()
+                .unwrap_or("signing unknown"),
+        ),
+        Ok(None) => "not advertised".to_string(),
+        Err(_) => "malformed build identity".to_string(),
+    }
+}
+
 /// Safe, closed reason-class mapping for [`LauncherError`]. Never carries
 /// its `Display` text (which may include raw PAM/child diagnostics) into a
 /// native lifecycle event.
@@ -956,8 +1618,16 @@ fn launcher_error_reason_class(error: &LauncherError) -> &'static str {
         LauncherError::XorgVerify => "xorg_verify_failed",
         LauncherError::XorgRelease => "xorg_release_failed",
         LauncherError::LogindActivation => "logind_activation_failed",
+        LauncherError::SeatOccupied => "seat_occupied",
         LauncherError::LogindUnlock => "logind_unlock_failed",
         LauncherError::Deskside => "deskside_refused",
+        LauncherError::WaylandUnavailable => "wayland_unavailable",
+        LauncherError::WaylandStart => "wayland_start_failed",
+        LauncherError::LocalPlaybackRefused => "local_playback_refused",
+        LauncherError::WaylandRelease => "wayland_release_failed",
+        LauncherError::SelinuxContext => "selinux_context_refused",
+        LauncherError::PolkitUnprotected(reason) => reason.token(),
+        LauncherError::NativeSeatUnavailable(_) => "native_seat_unavailable",
     }
 }
 
@@ -1013,8 +1683,9 @@ where
                 "timeout",
             );
         })?;
+    // The auth response carries the password: wipe the frame once parsed.
     let text = match incoming {
-        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Text(text))) => Zeroizing::new(text),
         Some(Ok(_)) => {
             warn!(target: AUTH, "expected text auth_response");
             send_auth_result(socket, false, "Authentication failed").await;
@@ -1051,7 +1722,7 @@ where
         }
     };
 
-    let response = match serde_json::from_str::<AuthResponse>(&text) {
+    let mut response = match serde_json::from_str::<AuthResponse>(&text) {
         Ok(response) => response,
         Err(error) => {
             warn!(target: AUTH, %error, "invalid auth_response");
@@ -1066,17 +1737,22 @@ where
             return Err(());
         }
     };
-    let (session_log_id, replaced) = resolve_session_log_id(response.session_log_id.as_deref())
-        .map_err(|error| {
-            warn!(target: SESSION, %error, "failed to resolve session log id");
-            emit_session_auth_fail(
-                emitter,
-                eventlog::random_correlation_id(),
-                Some(remote_host),
-                "resolve_session_log_id",
-                "internal_error",
-            );
-        })?;
+    let (session_log_id, replaced) =
+        match resolve_session_log_id(response.session_log_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(target: SESSION, %error, "failed to resolve session log id");
+                emit_session_auth_fail(
+                    emitter,
+                    eventlog::random_correlation_id(),
+                    Some(remote_host),
+                    "resolve_session_log_id",
+                    "internal_error",
+                );
+                clear_resume_secrets(&mut response);
+                return Err(());
+            }
+        };
     if replaced {
         warn!(
             target: SESSION,
@@ -1086,6 +1762,12 @@ where
     }
     drop(text);
     Ok((response, session_log_id))
+}
+
+/// Moves the sign-in password out of `response` into a buffer wiped on drop,
+/// leaving the response without it.
+fn take_pam_credential(response: &mut AuthResponse) -> Zeroizing<String> {
+    Zeroizing::new(std::mem::take(&mut response.credential))
 }
 
 async fn authenticate_pam_response<S>(
@@ -1101,6 +1783,9 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    // First: every refusal below drops the response, and the password must
+    // not outlive it unwiped.
+    let password = take_pam_credential(&mut response);
     let acknowledged_disclaimer =
         match validate_disclaimer_acknowledgment(cfg.disclaimer.clone(), &response) {
             Ok(acknowledged) => acknowledged,
@@ -1117,7 +1802,7 @@ where
                 return Err(());
             }
         };
-    if let Err(error) = auth::validate_pam_response(&response) {
+    if let Err(error) = auth::validate_pam_request(&response, &password) {
         warn!(target: AUTH, %error, "rejected invalid PAM auth_response");
         send_auth_result(sink, false, "Authentication failed").await;
         emit_session_auth_fail(
@@ -1190,6 +1875,18 @@ where
         multi_monitor_offer.as_ref(),
         response.multi_monitor_v1.as_ref(),
     );
+    // A Grading or HDR request on a multi-monitor Wayland desktop: the
+    // record's wide proof is a single-output one, so the session is resolved
+    // again and served visibly as Auto.
+    let session_config = match wayland_multi_output_config(cfg, &response, &multi_monitor_outcome) {
+        Some(Ok(config)) => config,
+        Some(Err(error)) => {
+            warn!(target: AUTH, %error, "auth-time video request rejected for a multi-monitor Wayland desktop");
+            send_auth_result(sink, false, &format!("Video request rejected: {error}")).await;
+            return Err(());
+        }
+        None => session_config,
+    };
     if let multi_monitor::MultiMonitorOutcome::Planned { plan, .. } = &multi_monitor_outcome {
         if let Err(error) = multi_capenc::validate_monitor_resource_policy(
             plan,
@@ -1205,7 +1902,6 @@ where
     }
 
     let username = response.username.clone();
-    let password = std::mem::take(&mut response.credential);
     let pam_permit = match tokio::time::timeout(PAM_QUEUE_TIMEOUT, pam_slots.acquire_owned()).await
     {
         Ok(Ok(permit)) => permit,
@@ -1275,6 +1971,13 @@ where
         agent_binary,
         desktop: cfg.desktop_session.clone(),
         deskside: cfg.deskside.clone(),
+        provider: cfg.desktop_provider,
+        x11_apps: cfg.wayland_x11_apps_enabled(),
+        audio: crate::session::agent::AgentAudioArguments {
+            local_playback: cfg.local_playback,
+            pactl: cfg.pactl_bin.clone(),
+        },
+        first_login_setup: cfg.first_login_setup,
     };
     let launcher_result = tokio::time::timeout(
         PAM_OPERATION_TIMEOUT,
@@ -1406,6 +2109,9 @@ enum SessionEndReason {
     HostShutdown,
     /// Attached grant generation or signing failed and requires terminal drain.
     ResumeAuthorityFailure,
+    /// The session-bound input injector was lost for good (superseded, or
+    /// its session could not be reached again).
+    InputLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,6 +2160,7 @@ impl SessionEndReason {
             Self::WriterEnded => "writer",
             Self::HostShutdown => "host_shutdown",
             Self::ResumeAuthorityFailure => "resume_authority",
+            Self::InputLost => "input",
         }
     }
 
@@ -1467,6 +2174,7 @@ impl SessionEndReason {
             Self::WriterEnded => "writer_failed",
             Self::HostShutdown => "host_shutdown",
             Self::ResumeAuthorityFailure => "resume_authority_failure",
+            Self::InputLost => "input_lost",
         }
     }
 }
@@ -1510,15 +2218,113 @@ fn served_stream_pipeline_for_backend(
     )
 }
 
+/// What the Deck is told when its ten-bit request reattached to an
+/// eight-bit Xorg desktop: Auto, the stable `eight_bit_source` token, and
+/// the two things the user can do about it.
+fn desktop_depth_served_pipeline(
+    cfg: &Config,
+) -> Option<arcen_protocol::messages::ServedPipelineMsg> {
+    cfg.desktop_depth_downgraded.then(|| {
+        arcen_protocol::messages::ServedPipelineMsg::new(
+            arcen_protocol::messages::ServedStreamPipeline::Auto,
+            "hardware",
+            Some(
+                arcen_media::video::AdmissionReason::EightBitSource
+                    .token()
+                    .to_owned(),
+            ),
+        )
+        .with_detail(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL)
+    })
+}
+
+/// The served-pipeline label: an admitted capture's served contract when
+/// the source stated one, otherwise the request-and-plan resolution.
+fn served_pipeline_from_admission(
+    admitted: Option<arcen_media::video::AdmittedEpoch>,
+    resolve: impl FnOnce() -> arcen_protocol::messages::ServedStreamPipeline,
+) -> arcen_protocol::messages::ServedStreamPipeline {
+    admitted.map_or_else(resolve, |epoch| epoch.pipeline.served_wire())
+}
+
+/// The runtime guard of an admitted Wayland Speed epoch, and the epoch's
+/// own once-a-second delivered/encoded counts it reads.
+struct SpeedGuardWatch {
+    guard: arcen_media::video::SpeedRuntimeGuard,
+    stats: tokio::sync::watch::Receiver<Option<capenc::PipelineStatsSample>>,
+}
+
+/// A guard for `handle` when it is a single capture whose source admitted
+/// Speed on a copying route (a Wayland session), and the attachment has not
+/// already fallen back to Auto. Zero-copy and Xorg epochs make no admission
+/// of their own and are not guarded.
+fn speed_guard_for(
+    handle: Option<&CapencHandle>,
+    config: &capenc::CapencConfig,
+) -> Option<SpeedGuardWatch> {
+    use arcen_media::video::{pipeline_contract, PipelineId};
+    let Some(CapencHandle::Single(session)) = handle else {
+        return None;
+    };
+    if config.speed_runtime_shortfall {
+        return None;
+    }
+    let notice = session.capture_admission()?;
+    let served = notice.served()?;
+    if served.pipeline != PipelineId::Speed || notice.copy_path.zero_copy() {
+        return None;
+    }
+    let floor = arcen_session::wayland_qualification::speed_minimum_fps(
+        pipeline_contract(PipelineId::Speed).max_fps,
+    );
+    Some(SpeedGuardWatch {
+        guard: arcen_media::video::SpeedRuntimeGuard::new(floor),
+        stats: session.pipeline_stats(),
+    })
+}
+
+/// The guard's verdict, once the epoch's counts give one; pending without a
+/// guard or once the epoch stops reporting.
+async fn next_speed_guard_verdict(
+    watch: &mut Option<SpeedGuardWatch>,
+) -> arcen_media::video::SpeedGuardVerdict {
+    let Some(watch) = watch.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        if watch.stats.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let Some(sample) = *watch.stats.borrow_and_update() else {
+            continue;
+        };
+        if let Some(verdict) = watch.guard.observe(sample.encoded, sample.source) {
+            return verdict;
+        }
+    }
+}
+
+/// What the stream-start event names as served.
+struct ServedStreamLabels {
+    pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
+    /// `nvctrl` for the dedicated Xorg display, `wayland` for a headless
+    /// Wayland session's compositor-owned output.
+    display_backend: &'static str,
+}
+
 fn emit_session_stream_start(
     emitter: &LifecycleEmitter,
     session_log_id: CorrelationId,
     media_plan: &ResolvedMediaPlan,
     aggregate_backend: Option<arcen_media::video::AcceleratorClass>,
-    pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
+    labels: ServedStreamLabels,
     user: Option<&str>,
     peer_addr: Option<&str>,
 ) {
+    let ServedStreamLabels {
+        pipeline,
+        display_backend,
+    } = labels;
     let mut fields = StructuredFields::default();
     let _ = fields.insert(
         "encoder",
@@ -1541,7 +2347,10 @@ fn emit_session_stream_start(
     if let Some(pipeline) = pipeline {
         let _ = fields.insert("pipeline", FieldValue::String(pipeline.token().to_string()));
     }
-    let _ = fields.insert("display_backend", FieldValue::String("nvctrl".to_string()));
+    let _ = fields.insert(
+        "display_backend",
+        FieldValue::String(display_backend.to_string()),
+    );
     insert_color_identity(&mut fields, media_plan);
     let context = emitter.session_context(
         session_log_id,
@@ -2072,25 +2881,20 @@ async fn accept_compatibility(
 }
 
 /// Build TLS before binding, then serve QUIC connections until SIGINT/SIGTERM.
+///
+/// `signals` were installed before start-up (`ServiceSignals::install`), so a
+/// stop requested while the Pier was still starting is honoured here at once.
 pub async fn serve(
     cfg: Arc<Config>,
     log_controller: Arc<LogController>,
     admission_runtime: Arc<SessionAdmissionRuntime>,
+    mut signals: crate::service_signals::ServiceSignals,
 ) -> std::io::Result<()> {
     let started_at = Instant::now();
     let emitter =
         eventlog::LifecycleEmitter::new(log_controller.handle(), eventlog::local_hostname());
     #[cfg(target_os = "linux")]
-    let sighup = {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::hangup()) {
-            Ok(signal) => Some(signal),
-            Err(error) => {
-                warn!(target: NET, %error, "SIGHUP reload is unavailable");
-                None
-            }
-        }
-    };
+    let sighup = signals.take_hangup();
     let quic_port = cfg.direct_quic_port();
     let addr = format!("{}:{quic_port}", cfg.host);
     if cfg.unsafe_remote_no_auth() {
@@ -2164,7 +2968,7 @@ pub async fn serve(
         ),
     }
 
-    let shutdown = shutdown_signal();
+    let shutdown = signals.stopped();
     tokio::pin!(shutdown);
     let session_slot = Arc::new(Semaphore::new(1));
     let session_registry = SessionRegistry::new(cfg.disconnected_idle_lifetime)
@@ -2190,6 +2994,7 @@ pub async fn serve(
         service_health: Arc::clone(&service_health),
         qos_targets: Arc::clone(&qos_targets),
         admission_runtime: Arc::clone(&admission_runtime),
+        incumbent: Arc::new(arcen_transport::quic::IncumbentAttachment::new()),
     };
     let mut connections = JoinSet::new();
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
@@ -2255,8 +3060,8 @@ pub async fn serve(
                 emit_service_health_snapshot(&emitter, &service_health);
                 emit_service_loss_notices(&emitter);
             }
-            _ = &mut shutdown => {
-                info!(target: NET, "shutdown signal received — stopping accept loop");
+            signal = &mut shutdown => {
+                info!(target: NET, signal, "shutdown signal received — stopping accept loop");
                 break;
             }
         }
@@ -2487,37 +3292,6 @@ async fn drain_connections_and_display_with_timeout(
     }
 }
 
-/// Resolves when the process should shut down (SIGINT/SIGTERM on Unix, Ctrl-C
-/// elsewhere).
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        let mut int = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
 fn ws_config() -> WebSocketConfig {
     WebSocketConfig {
         max_message_size: Some(MAX_INBOUND_WS_MESSAGE),
@@ -2567,6 +3341,9 @@ struct ServerState {
     /// Capacity-one local session admission gate. Consulted on every
     /// new-session admission (see `run_ws`) and held through reconnect.
     admission_runtime: Arc<SessionAdmissionRuntime>,
+    /// The connection holding the session slot, so a same-user newcomer can
+    /// prove a vanished Deck silent (`arcen_transport::liveness`).
+    incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
 }
 
 /// Extracts a peer's `SocketAddrV6` zone/scope id, if any, before it is
@@ -2640,6 +3417,8 @@ async fn handle_connection(
         Arc::clone(&state.service_health),
         Arc::clone(&state.qos_targets),
         Arc::clone(&state.admission_runtime),
+        Arc::clone(&state.incumbent),
+        None,
     )
     .instrument(span)
     .await;
@@ -2674,19 +3453,60 @@ async fn handle_quic_connection(
         connection.close(0_u32.into(), b"TLS host identity changed during handshake");
         return Err("TLS host identity changed during QUIC handshake".into());
     }
-    // Keep the video backlog out of QUIC for this Deck's whole connection
-    // (resumes arrive on new connections and pass here too); the task ends
-    // when the connection closes.
-    tokio::spawn(arcen_transport::quic::keep_send_window_interactive(
-        connection.clone(),
-    ));
-    let stream = tokio::time::timeout(
+    // The shared lane adapter keeps the video backlog out of QUIC for this
+    // Deck's whole connection (`keep_send_window_interactive`; resumes arrive
+    // on new connections and pass here too) and waits for the Deck's control
+    // lane. A pre-lane Deck is closed by the lane runtime with the
+    // version-mismatch code before that.
+    let probe = connection.clone();
+    // Lane refusals, failures and starvation are reported under a
+    // connection-scoped id until authentication binds the session's own.
+    let lane_sink = fallback_session_log_id().ok().and_then(|connection_id| {
+        state.emitter.lane_sink(state.emitter.session_context(
+            connection_id,
+            None,
+            Some(peer.ip().to_string()),
+            None,
+        ))
+    });
+    let mut lane_config =
+        arcen_transport::quic::LaneRuntimeConfig::new(arcen_protocol::lanes::LaneEndpoint::Pier);
+    if let Some(sink) = &lane_sink {
+        lane_config = lane_config
+            .with_telemetry(Arc::clone(sink) as Arc<dyn arcen_transport::quic::LaneTelemetrySink>);
+    }
+    let (lanes, control) = match arcen_transport::quic::accept_session_lanes(
+        connection,
+        lane_config,
         WEBSOCKET_HANDSHAKE_TIMEOUT,
-        arcen_transport::quic::accept_direct(connection),
     )
     .await
-    .map_err(|_| "QUIC direct stream timed out")??;
-    let feedback = stream.feedback_snapshot();
+    {
+        Ok(accepted) => accepted,
+        Err(arcen_transport::quic::SessionLaneSetupError::Mismatch(mismatch)) => {
+            // The lane runtime told the Deck why (a pre-lane Deck reads it
+            // as a WebSocket close reason) and closed with
+            // `LANE_VERSION_MISMATCH_CLOSE_CODE`.
+            warn!(
+                target: NET,
+                %peer,
+                reason = %mismatch,
+                "refused a Deck running an incompatible Arcen release"
+            );
+            return Err(format!("QUIC control lane: {mismatch}").into());
+        }
+        Err(error) => {
+            info!(
+                target: NET,
+                %peer,
+                %error,
+                close = ?probe.close_reason(),
+                "QUIC connection ended before its control lane"
+            );
+            return Err(format!("QUIC control lane: {error}").into());
+        }
+    };
+    let feedback = arcen_transport::quic::FeedbackSnapshot::from_connection(lanes.connection());
     debug!(
         target: NET,
         %peer,
@@ -2695,7 +3515,7 @@ async fn handle_quic_connection(
         congestion_window_bytes = feedback.congestion_window,
         "QUIC path established"
     );
-    let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config())).await;
+    let ws = arcen_transport::quic::SessionLaneSocket::new(lanes, control);
     info!(target: NET, %peer, "client connected (QUIC+TLS)");
     let span = tracing::info_span!("linux_connection", sid = tracing::field::Empty);
     let remote_scope_id = peer_scope_id(peer);
@@ -2714,6 +3534,8 @@ async fn handle_quic_connection(
         Arc::clone(&state.service_health),
         Arc::clone(&state.qos_targets),
         Arc::clone(&state.admission_runtime),
+        Arc::clone(&state.incumbent),
+        lane_sink,
     )
     .instrument(span)
     .await;
@@ -2756,6 +3578,8 @@ async fn run_ws(
     service_health: Arc<AtomicU8>,
     qos_targets: Arc<RwLock<QosTargets>>,
     admission_runtime: Arc<SessionAdmissionRuntime>,
+    incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
+    lane_sink: Option<Arc<arcen_transport::quic::ObservabilityLaneSink>>,
 ) {
     let (authenticated, session_log_id) = if cfg.auth_mode == AuthMode::None {
         let session_log_id = match fallback_session_log_id() {
@@ -2834,7 +3658,11 @@ async fn run_ws(
             }
             return;
         }
-        if detached_resume {
+        // A detached session may be taken over by a fresh sign-in of its own
+        // user (after full authentication, below). With a sign-in disclaimer
+        // configured the detached request carried none to acknowledge, so
+        // only a resume may continue such a session.
+        if detached_resume && cfg.disclaimer.is_some() {
             clear_resume_secrets(&mut response);
             send_resume_rejection(
                 &mut ws,
@@ -2858,24 +3686,73 @@ async fn run_ws(
             Ok(value) => value,
             Err(()) => return,
         };
+        if detached_resume {
+            // The password was right: say why the desktop is not available
+            // rather than failing the sign-in.
+            if let Err(refusal) =
+                take_over_detached_session(&session_registry, &authenticated.launcher.identity)
+                    .await
+            {
+                send_critical_control(
+                    &mut ws,
+                    close_with_reason(refusal.deck_reason()),
+                    "detached_takeover_refused_close",
+                )
+                .await;
+                return;
+            }
+        }
         (Some(authenticated), session_log_id)
     };
     tracing::Span::current().record("sid", tracing::field::display(&session_log_id));
     info!(target: SESSION, "session log correlation bound");
+    if let Some(sink) = &lane_sink {
+        sink.bind(
+            emitter.session_context(
+                session_log_id.clone(),
+                authenticated
+                    .as_ref()
+                    .map(|authenticated| authenticated.launcher.identity.username.clone()),
+                Some(remote_host.clone()),
+                None,
+            ),
+        );
+    }
     drop(preauth_permit);
-    let mut session_permit = match session_slot.try_acquire_owned() {
-        Ok(permit) => Some(permit),
-        Err(_) => {
+    // The incumbent is keyed by the account the operating system resolved,
+    // never by the name the Deck typed (which may be an alias).
+    let claimant = authenticated
+        .as_ref()
+        .map(|authenticated| account_key(&authenticated.launcher.identity));
+    let mut session_permit = match acquire_session_slot(
+        &session_slot,
+        &incumbent,
+        claimant.as_deref(),
+        session_registry.resume().resuming(),
+    )
+    .await
+    {
+        Some(permit) => Some(permit),
+        None => {
             warn!(target: SESSION, "rejecting authenticated client: shared display is busy");
-            send_critical_control(&mut ws, Message::Close(None), "session_busy_close").await;
+            send_critical_control(
+                &mut ws,
+                close_with_reason(SESSION_BUSY_REASON),
+                "session_busy_close",
+            )
+            .await;
             return;
         }
+    };
+    let incumbent_registration = match (claimant.as_deref(), ws.path_signal_connection()) {
+        (Some(owner), Some(connection)) => Some(incumbent.register(owner, connection)),
+        _ => None,
     };
     // Capacity-one local session admission: a new authenticated session must
     // hold a non-cloneable admission lease for the physical desktop it owns.
     // Denial only means another session already owns the host display/input
     // plane, so reject with the same closed posture as `session_busy_close`.
-    let admission_lease = match admission_runtime.admit_new() {
+    let admission_lease = match admit_after_slot(&admission_runtime).await {
         Ok(lease) => lease,
         Err(error) => {
             warn!(
@@ -2965,10 +3842,46 @@ async fn run_ws(
                     response,
                     mut launcher,
                     multi_monitor_outcome,
-                    session_config: authenticated_config,
+                    session_config: mut authenticated_config,
                     display_plan,
                     ..
                 } = authenticated;
+                launcher.set_stream_cursor_mode(
+                    authenticated_config.wayland_stream_cursor_mode(&response),
+                );
+                // A headless Wayland session opened for Grading or HDR on a
+                // host whose record proves a wide composition starts its
+                // compositor in that colour state; every other session keeps
+                // the compositor's default.
+                launcher.set_wayland_fidelity_route(authenticated_config.wayland_fidelity_route());
+                // Lab (`wayland.lab_seat_pen`): a headless Wayland desktop
+                // this sign-in creates gets its own pen on its own seat.
+                launcher.set_lab_seat_pen(
+                    authenticated_config.wayland_lab_seat_pen
+                        && authenticated_config.desktop_provider
+                            == arcen_session::desktop_provider::DesktopProvider::Wayland,
+                );
+                // `wayland.session_mode`: a Wayland desktop runs natively on
+                // its own seat (real pen) when the host proved it, one per
+                // host; otherwise it is headless and says why.
+                launcher.set_desktop_seat_plan(authenticated_config.desktop_seat_plan());
+                // A dedicated Xorg desktop this sign-in creates gets its
+                // depth now, for its whole life: ten bits only for ten-bit
+                // work, so every other desktop's applications keep the GPU.
+                if authenticated_config.desktop_provider
+                    != arcen_session::desktop_provider::DesktopProvider::Wayland
+                {
+                    let decision = authenticated_config.new_x11_desktop_depth();
+                    info!(
+                        target: SESSION,
+                        username = %response.username,
+                        depth = decision.depth.x11_depth(),
+                        reason = decision.reason.token(),
+                        policy = authenticated_config.x11_desktop_depth.token(),
+                        "a new Xorg desktop for this sign-in is created at this depth (a reattachment keeps its own)"
+                    );
+                    launcher.set_x11_desktop_depth(decision.depth);
+                }
                 // A single-head session's head takes the served Deck
                 // display's EDID; a multi-head plan keeps its own heads.
                 if !matches!(
@@ -2978,12 +3891,68 @@ async fn run_ws(
                     let served = display_plan
                         .served_monitor_id
                         .and_then(|id| response.monitors.iter().find(|monitor| monitor.id == id));
+                    // A Wayland host that serves software only creates the
+                    // output at a size OpenH264 encodes; the Deck is told the
+                    // served size like any fitted session.
+                    let (session_width, session_height) = authenticated_config
+                        .wayland_session_size(display_plan.width, display_plan.height);
+                    if (session_width, session_height) != (display_plan.width, display_plan.height)
+                    {
+                        info!(
+                            target: CAPENC,
+                            requested_w = display_plan.width,
+                            requested_h = display_plan.height,
+                            session_w = session_width,
+                            session_h = session_height,
+                            "Wayland session output fitted to the software encoder's limits"
+                        );
+                    }
                     launcher.set_session_display(served.map(|monitor| {
-                        crate::session::launcher::SessionDisplayMsg::served(
+                        let served_display = crate::session::launcher::SessionDisplayMsg::served(
                             monitor,
+                            session_width,
+                            session_height,
+                        );
+                        // A headless Wayland session created for Speed runs
+                        // its output at the paced refresh the host's record
+                        // qualified; anything else keeps the display's rate.
+                        let refresh_hz = authenticated_config.wayland_session_refresh_hz(
+                            session_width,
+                            session_height,
+                            served_display.refresh_hz(),
+                        );
+                        // A dedicated Xorg head runs at the shared paced
+                        // refresh for the requested preset's rate.
+                        let refresh_hz = authenticated_config.xorg_session_refresh_hz(
+                            session_width,
+                            session_height,
+                            refresh_hz,
+                        );
+                        if authenticated_config.wayland_speed_unqualified(
                             display_plan.width,
                             display_plan.height,
-                        )
+                            served_display.refresh_hz(),
+                        ) {
+                            crate::session::wayland::note_unqualified_speed_display(
+                                &authenticated_config.wayland_qualification_target,
+                                display_plan.width,
+                                display_plan.height,
+                                served_display.refresh_hz(),
+                                arcen_session::wayland_qualification::QUALIFY_CODECS[0],
+                            );
+                        }
+                        if refresh_hz != served_display.refresh_hz() {
+                            info!(
+                                target: SESSION,
+                                display_refresh_hz = served_display.refresh_hz(),
+                                refresh_hz,
+                                width = session_width,
+                                height = session_height,
+                                provider = authenticated_config.desktop_provider.token(),
+                                "a new desktop's head runs at the paced refresh for the requested preset (a reattachment keeps its own)"
+                            );
+                        }
+                        served_display.with_refresh_hz(refresh_hz)
                     }));
                 }
                 let admitted_monitor_count = match &multi_monitor_outcome {
@@ -3014,6 +3983,52 @@ async fn run_ws(
                                 "another session owns this desktop; retry after it disconnects",
                             ),
                             "persistent_session_busy_close",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(LifecycleError::Launcher(LauncherError::LocalPlaybackRefused)) => {
+                        warn!(
+                            target: SESSION,
+                            username = %response.username,
+                            local_playback = cfg.local_playback.token(),
+                            "the host could not prove its own speakers silent; the session is refused (audio.local_playback)"
+                        );
+                        send_critical_control(
+                            &mut ws,
+                            close_with_reason(arcen_session::local_playback::DECK_REASON_NOT_MUTED),
+                            "local_playback_refused_close",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(LifecycleError::Launcher(LauncherError::PolkitUnprotected(reason))) => {
+                        warn!(
+                            target: SESSION,
+                            username = %response.username,
+                            reason = reason.token(),
+                            "polkit would give this remote desktop the console's rights; the sign-in is refused"
+                        );
+                        send_critical_control(
+                            &mut ws,
+                            close_with_reason(
+                                arcen_session::polkit_remote::DECK_REASON_POLKIT_UNPROTECTED,
+                            ),
+                            "polkit_unprotected_close",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(LifecycleError::Launcher(LauncherError::SeatOccupied)) => {
+                        warn!(
+                            target: SESSION,
+                            username = %response.username,
+                            "another remote desktop holds this host's X11 seat; one X11 desktop per host, so the sign-in is refused"
+                        );
+                        send_critical_control(
+                            &mut ws,
+                            close_with_reason(arcen_session::x11_seat::DECK_REASON_SEAT_OCCUPIED),
+                            "seat_occupied_close",
                         )
                         .await;
                         return;
@@ -3053,6 +4068,39 @@ async fn run_ws(
                     )
                     .await;
                     return;
+                }
+                // The desktop's depth is fixed: a ten-bit request reattaching
+                // to an eight-bit desktop is resolved again and served
+                // visibly as Auto, before any display or encoder exists.
+                authenticated_config.attached_desktop_depth = lease.metadata.x11_desktop_depth;
+                if let Some(depth) = lease.metadata.x11_desktop_depth {
+                    info!(
+                        target: SESSION,
+                        username = %response.username,
+                        session_id = %lease.metadata.session_id,
+                        reconnected = lease.metadata.reconnected,
+                        desktop_depth = depth.x11_depth(),
+                        "attached to a dedicated Xorg desktop"
+                    );
+                    if authenticated_config.exceeds_desktop_depth(depth) {
+                        match config_on_attached_desktop(&cfg, &response, depth) {
+                            Ok(config) => authenticated_config = config,
+                            Err(error) => {
+                                warn!(
+                                    target: AUTH,
+                                    %error,
+                                    "the video request could not be resolved for this eight-bit desktop"
+                                );
+                                send_critical_control(
+                                    &mut ws,
+                                    close_with_reason(&format!("Video request rejected: {error}")),
+                                    "desktop_depth_resolution_close",
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
                 }
                 if let Err(error) = unlock_logind_session_id(&lease.metadata.session_id).await {
                     warn!(
@@ -3122,10 +4170,32 @@ async fn run_ws(
             .and_then(|lease| lease.metadata.multi_monitor_plan.as_ref()),
     );
     let mut display_guard = None;
+    // A headless Wayland session's virtual output was created at the served
+    // display's size when the session started; there is no X screen to
+    // resize, and the stream it captures has exactly the output's size.
+    let wayland_stream_size = session_lease
+        .as_ref()
+        .and_then(|lease| lease.metadata.wayland.as_ref())
+        .and_then(|ready| {
+            let stream = ready.streams.first()?;
+            let output = ready.outputs.first()?;
+            Some((stream.width, stream.height, output.refresh_hz))
+        });
     if multi_monitor_plan_committed {
         // Intentionally empty: see comment above. No MetaMode resize, no
         // `session_permit` consumption — it is carried through unchanged
         // into `HeldDisplayResources::new` below.
+    } else if let Some((width, height, refresh_hz)) = wayland_stream_size {
+        info!(
+            target: DISPLAY,
+            width,
+            height,
+            refresh_hz,
+            "Wayland session: the virtual output already has the served size; no display resize"
+        );
+        session_config.width = width;
+        session_config.height = height;
+        session_config.wayland_output_refresh_hz = Some(refresh_hz);
     } else if let Some(display_plan) = negotiated_display_plan {
         match nvctrl::requested_resolution(display_plan.width, display_plan.height) {
             Ok(Some(mut resolution)) => {
@@ -3372,6 +4442,7 @@ async fn run_ws(
             remote_scope_id,
             Arc::clone(&service_health),
             Arc::clone(&qos_targets),
+            incumbent_registration.as_ref(),
         )
         .await;
     } else {
@@ -3518,6 +4589,11 @@ fn resumable_transport_loss(reason: SessionEndReason) -> bool {
 /// the existing `disconnect` (persist desktop for reconnect) behavior,
 /// regardless of `reached_usable` or `ever_usable`.
 ///
+/// A virtual-output plan (a reconfigurable headless Wayland desktop) never
+/// poisons its desktop either: the next sign-in moves the outputs to its own
+/// topology in place before its first capture epoch, so terminating would
+/// only cost the user their applications.
+///
 /// Extracted to exactly the three pieces of state the decision depends on
 /// so it is directly unit-testable without a live session/lease.
 fn multi_monitor_attachment_must_terminate_desktop(
@@ -3525,11 +4601,23 @@ fn multi_monitor_attachment_must_terminate_desktop(
     ever_usable: bool,
     committed_multi_monitor_plan: Option<&LinuxTopologyPlan>,
 ) -> bool {
-    !reached_usable && !ever_usable && committed_multi_monitor_plan.is_some()
+    !reached_usable
+        && !ever_usable
+        && committed_multi_monitor_plan.is_some_and(|plan| {
+            plan.backend == crate::display::topology::LinuxTopologyBackend::DedicatedXorg
+        })
 }
 
 fn attachment_requires_fresh_idr(resumed: bool) -> bool {
     resumed
+}
+
+/// Whether an attachment moves a headless Wayland desktop to its sign-in's
+/// requested outputs first. A resume of the same lease after transport loss
+/// does not: the live outputs (a mid-session resize included) are what the
+/// resumed client was already being served.
+fn aligns_outputs_at_attach(resumed: bool) -> bool {
+    !resumed
 }
 
 /// Resolves the fixed raster the shared uinput absolute pointer/pen device
@@ -3672,6 +4760,7 @@ async fn run_resumable_session(
     remote_scope_id: Option<u32>,
     service_health: Arc<AtomicU8>,
     qos_targets: Arc<RwLock<QosTargets>>,
+    incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
 ) {
     let active_session_id = match active_session_id(&lease.metadata) {
         Ok(value) => value,
@@ -3709,6 +4798,32 @@ async fn run_resumable_session(
             Arc::clone(&qos_targets),
         )
         .await;
+        if incumbent.is_some_and(arcen_transport::quic::IncumbentRegistration::displaced) {
+            // A same-user newcomer proved this Deck silent and closed its
+            // connection: no resume will come. Hand the desktop over instead
+            // of holding it (and the session slot) for the reconnect window.
+            tracing::info!(
+                target: SESSION,
+                "a same-user reattachment displaced this silent attachment; handing the desktop over"
+            );
+            let _ = reconnect.apply(
+                ReconnectEvent::ExplicitDisconnect,
+                session_registry.resume().monotonic_now(),
+            );
+            hand_over_displaced_session(
+                session_registry.resume(),
+                &active_session_id,
+                display_resources.take(),
+            )
+            .await;
+            log_lifecycle(
+                &lease.metadata.session_id,
+                "ended",
+                LIFECYCLES.ended(&lease.metadata.session_id),
+            );
+            lease.disconnect();
+            return;
+        }
         if !resumable_transport_loss(end.reason) {
             let event = if end.reason == SessionEndReason::ClientClosed {
                 ReconnectEvent::ExplicitDisconnect
@@ -3780,6 +4895,23 @@ async fn run_resumable_session(
             let mut monitor = tokio::time::interval(Duration::from_secs(2));
             monitor.tick().await;
             tokio::select! {
+                biased;
+                // A same-user newcomer proved this detached Deck gone (its
+                // connection had already timed out): hand the desktop over
+                // now, so the newcomer is admitted instead of waiting out
+                // the reconnect window.
+                () = wait_displaced(incumbent) => {
+                    tracing::info!(
+                        target: SESSION,
+                        "a same-user reattachment displaced this detached attachment; handing the desktop over"
+                    );
+                    let _ = reconnect.apply(
+                        ReconnectEvent::ExplicitDisconnect,
+                        session_registry.resume().monotonic_now(),
+                    );
+                    hand_over_detached_session(&session_registry, lease, &active_session_id).await;
+                    return;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
                     let timer_now = session_registry.resume().monotonic_now();
                     let _ = reconnect.apply(ReconnectEvent::DeadlineReached { timer_generation }, timer_now);
@@ -3872,6 +5004,11 @@ async fn run_resumable_session(
                             LIFECYCLES.authenticated(&lease.metadata.session_id),
                         );
                         ws = handoff.socket;
+                        if let (Some(incumbent), Some(connection)) =
+                            (incumbent, ws.path_signal_connection())
+                        {
+                            incumbent.replace_connection(connection);
+                        }
                         if let Err(error) =
                             session_registry.resume().mark_attached(&active_session_id)
                         {
@@ -3888,6 +5025,32 @@ async fn run_resumable_session(
                         );
                         force_fresh_idr = true;
                         continue 'session;
+                    }
+                    Some(OwnerCommand::TakeOver { claimant, claimant_uid, reply }) => {
+                        match arcen_session::direct_reconnect::fresh_sign_in(
+                            account_principal(&lease.metadata.username, lease.metadata.uid),
+                            account_principal(&claimant, claimant_uid),
+                            arcen_session::direct_reconnect::SessionAttachment::Detached,
+                        ) {
+                            arcen_session::direct_reconnect::FreshSignIn::TakeOverDetached => {
+                                tracing::info!(
+                                    target: SESSION,
+                                    "a fresh sign-in of the same user took over this detached session; handing the desktop over"
+                                );
+                                let _ = reconnect.apply(
+                                    ReconnectEvent::ExplicitDisconnect,
+                                    session_registry.resume().monotonic_now(),
+                                );
+                                hand_over_detached_session(&session_registry, lease, &active_session_id)
+                                    .await;
+                                let _ = reply.send(resume::TakeoverOutcome::HandedOver);
+                                return;
+                            }
+                            arcen_session::direct_reconnect::FreshSignIn::Refuse
+                            | arcen_session::direct_reconnect::FreshSignIn::ProveIncumbentSilent => {
+                                let _ = reply.send(resume::TakeoverOutcome::Refused);
+                            }
+                        }
                     }
                     Some(OwnerCommand::Terminal) => {
                         let _ = reconnect.apply(
@@ -4031,15 +5194,108 @@ async fn run_attachment(
         Some(resumable) => (Some(resumable.owner_commands), Some(resumable.refresh)),
         None => (None, None),
     };
+    // A headless Wayland session's outputs as they are now: the agent's
+    // output socket is authoritative (an earlier attachment may have resized
+    // them); a fixed-output session is as it started.
+    let wayland_outputs_read = match session_lease {
+        Some(lease) => match current_wayland_session(lease).await {
+            Ok(Some(ready)) if aligns_outputs_at_attach(force_fresh_idr) => {
+                Ok(Some(align_wayland_outputs(lease, ready).await))
+            }
+            other => other,
+        },
+        None => Ok(None),
+    };
+    let mut wayland_now = wayland_outputs_read.clone().unwrap_or(None);
+    // A software host's output must be one OpenH264 encodes. An output an
+    // earlier attachment (or a native-encoder epoch) left larger is fitted
+    // here, before any capture of this attachment exists, rather than
+    // refusing this and every later attachment.
+    if let (Some(ready), Some(lease)) = (wayland_now.clone(), session_lease) {
+        if let Some((width, height)) = wayland_software_refit(&cfg, &ready) {
+            let refresh_hz = ready.outputs.first().map_or(60, |output| output.refresh_hz);
+            let software_density = lease
+                .metadata
+                .requested_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.first())
+                .map(|placed| placed.density)
+                .unwrap_or_default();
+            info!(
+                target: DISPLAY,
+                from_w = ready.outputs.first().map_or(0, |output| output.width),
+                from_h = ready.outputs.first().map_or(0, |output| output.height),
+                width,
+                height,
+                "Wayland output fitted to the software encoder's limits before capture"
+            );
+            match crate::session::wayland::output_client::configure(
+                &ready,
+                lease.metadata.uid,
+                lease.metadata.agent_pid,
+                ready.generation.saturating_add(1),
+                vec![crate::session::wayland::OutputPlacement {
+                    width,
+                    height,
+                    refresh_hz,
+                    x: 0,
+                    y: 0,
+                    // The client display's millimetres keep its UI scale
+                    // request; the fitted size has no logical width.
+                    width_mm: software_density.width_mm,
+                    height_mm: software_density.height_mm,
+                    logical_width: 0,
+                }],
+            )
+            .await
+            {
+                Ok(reply) => wayland_now = Some(ready.with_outputs(&reply)),
+                Err(error) => {
+                    // The software fallback then refuses the oversize output
+                    // by name; read what is live rather than assume.
+                    warn!(target: DISPLAY, %error, "fitting the Wayland output for software encode failed");
+                    if let Ok(Some(live)) = current_wayland_session(lease).await {
+                        wayland_now = Some(live);
+                    }
+                }
+            }
+        }
+    }
     // Mid-session stream resize is offered only for Windowed sessions that hold
-    // a display guard they can retarget.
-    let resize_supported = display
+    // a display guard they can retarget, or a single-output Wayland session
+    // whose compositor resizes its output in place.
+    let wayland_resizable = wayland_now
+        .as_ref()
+        .is_some_and(|ready| ready.output_socket.is_some() && ready.outputs.len() == 1);
+    let resize_supported = (display
         .as_ref()
         .is_some_and(|resources| resources.can_reassign())
+        || wayland_resizable)
         && display_mode.allows_live_resize();
     let path_signal_connection = ws.path_signal_connection();
-    let priority_audio = ws.priority_audio();
+    // Every role but control runs on its own lane and worker (ADR 0014).
+    // A transport without lanes cannot carry a session of this protocol.
+    let Some(lanes) = ws.lanes() else {
+        warn!(target: NET, "session transport has no lanes — closing connection");
+        let (mut sink, _stream) = ws.split();
+        send_critical_control(
+            &mut sink,
+            close_with_reason("this Pier requires the QUIC lane transport"),
+            "lanes_missing_close",
+        )
+        .await;
+        return AttachmentEnd::terminal(SessionEndReason::ProtocolError);
+    };
     let (mut sink, mut stream) = ws.split();
+    if let Err(reason) = wayland_outputs_read {
+        send_critical_control(
+            &mut sink,
+            close_with_reason(reason),
+            "wayland_outputs_unreadable_close",
+        )
+        .await;
+        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+    }
     // Recovery is tied to the authenticated user environment, not to current
     // microphone negotiation or media startup.
     let session_agent_binary = cfg.resolve_session_agent_binary();
@@ -4076,9 +5332,21 @@ async fn run_attachment(
             return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
         }
     };
-    let user_execution = session_lease.map(|lease| lease.execution.clone());
+    let initial_wide = match (wayland_now.as_ref(), session_lease) {
+        (Some(ready), Some(lease)) => {
+            wayland_wide_streams(cfg.bit_depth == arcen_media::BitDepth::Ten, ready, lease).await
+        }
+        _ => None,
+    };
+    let user_execution = session_lease.map(|lease| {
+        let mut execution = lease.execution.clone();
+        if let Some(ready) = wayland_now.as_ref() {
+            follow_wayland_outputs(&mut execution, ready, initial_wide.as_deref());
+        }
+        execution
+    });
     let authoritative_timezone = session_lease.and_then(SessionLease::timezone).cloned();
-    let initial_capenc = match display
+    let mut initial_capenc = match display
         .as_ref()
         .and_then(|resources| resources.resolution())
     {
@@ -4097,6 +5365,10 @@ async fn run_attachment(
             cursor_preference,
         ),
     };
+    if let Some(stream) = wayland_now.as_ref().and_then(|ready| ready.streams.first()) {
+        initial_capenc.width = stream.width;
+        initial_capenc.height = stream.height;
+    }
     // Committed at admission (`session::multi_monitor::admit_requested_topology`)
     // and persisted onto this session's lease (`session::lifecycle`); fixed
     // for this session's lifetime — a reconnect reuses the exact same plan,
@@ -4120,6 +5392,28 @@ async fn run_attachment(
     let mut applied_multi_monitor_capability: Option<ServerMultiMonitorMsg> = None;
     let (capenc, media_plan): (CapencHandle, ResolvedMediaPlan) = match multi_monitor_committed {
         Some((plan, carrier)) => {
+            let capture_bindings = match wayland_capture_bindings(
+                &cfg,
+                plan,
+                wayland_now.as_ref(),
+                session_lease.map(|lease| &lease.execution),
+            ) {
+                Ok(bindings) => bindings,
+                Err(reason) => {
+                    warn!(
+                        target: CAPENC,
+                        reason,
+                        "multi-monitor virtual outputs do not match the committed topology — closing connection"
+                    );
+                    send_critical_control(
+                        &mut sink,
+                        close_with_reason(reason),
+                        "multi_monitor_outputs_mismatch_close",
+                    )
+                    .await;
+                    return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                }
+            };
             let template = MonitorPipelineTemplate {
                 binary: initial_capenc.binary.clone(),
                 codec: initial_capenc.codec.clone(),
@@ -4147,6 +5441,7 @@ async fn run_attachment(
                 xauthority: initial_capenc.xauthority.clone(),
                 execution: initial_capenc.execution.clone(),
                 session_log_id: initial_capenc.session_log_id.clone(),
+                capture_bindings,
             };
             let encoder_plan = match encoder_admission::plan_encoder_sets(
                 plan,
@@ -4390,87 +5685,215 @@ async fn run_attachment(
             }
         },
     };
-    let (input_controller, input_stats): (Option<InputController>, Option<Arc<InputStats>>) = if cfg
-        .input_mode
-        == InputMode::Uinput
-    {
-        // The ABS range stays aligned to the fixed X11 raster. ViewPortIn
-        // changes capture scaling, not the pointer's normalized X space.
-        //
-        // A committed multi-monitor plan takes priority: its dedicated
-        // `DedicatedXorg` never holds a `MetaModeGuard` (multi-monitor
-        // sessions are always fixed-topology, never live-resized), so
-        // `display.raster_size()` is always `None` there, and
-        // `media_plan` alone only reflects the *primary* monitor's own
-        // footprint. The global absolute pointer/pen device must instead
-        // span the whole RandR-verified combined desktop
-        // (`plan.virtual_width`/`virtual_height`). Region-local logical
-        // coordinates stay in the shared region domain until
-        // `input::region_adapter` maps them into this final combined
-        // raster. Relative motion is unaffected: it uses the separate
-        // relative device, never this absolute-device sizing.
-        let (device_w, device_h) = resolve_input_raster(
-            multi_monitor_committed
-                .map(|(plan, _carrier)| (plan.virtual_width, plan.virtual_height)),
-            display.as_ref().and_then(|r| r.raster_size()),
-            (media_plan.width, media_plan.height),
-        );
-        let region_input = match multi_monitor_committed
-            .map(|(plan, _carrier)| RegionInputAdapter::from_plan(plan))
-            .transpose()
-        {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                warn!(target: INPUT, %error, "shared Linux region input adapter setup failed");
-                send_critical_control(&mut sink, Message::Close(None), "region_input_setup_close")
-                    .await;
+    // The injector is chosen once per attachment from the session's facts.
+    // Inside a headless Wayland session only that session's own input
+    // socket may inject: uinput would reach the physical seat instead.
+    let current_metadata = session_lease.map(|lease| {
+        let mut metadata = lease.metadata.clone();
+        if wayland_now.is_some() {
+            metadata.wayland.clone_from(&wayland_now);
+        }
+        metadata
+    });
+    let input_choice = crate::input::choose_input_backend(
+        cfg.input_mode == InputMode::Uinput,
+        current_metadata.as_ref(),
+    );
+    let mut wayland_retarget = None;
+    let (input_controller, input_stats): (Option<PierInput>, Option<Arc<InputStats>>) =
+        match input_choice {
+            InputBackendChoice::Disabled => (None, None),
+            InputBackendChoice::Refused(reason) => {
+                warn!(
+                    target: INPUT,
+                    reason,
+                    "session input injector refused; a Wayland session never falls back to uinput"
+                );
+                send_critical_control(
+                    &mut sink,
+                    close_with_reason("session input is unavailable"),
+                    "input_setup_close",
+                )
+                .await;
                 capenc.shutdown().await;
                 return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+            }
+            InputBackendChoice::Wayland(target) => {
+                match crate::input::wayland::WaylandInjector::connect(target).await {
+                    Ok((mut injector, stats)) => {
+                        // A committed topology's regions land on the outputs
+                        // that show them.
+                        if let Some((plan, _carrier)) = multi_monitor_committed {
+                            match RegionInputAdapter::from_plan(plan) {
+                                Ok(adapter) => injector.set_region_input(adapter),
+                                Err(error) => {
+                                    warn!(target: INPUT, %error, "shared Wayland region input adapter setup failed");
+                                    send_critical_control(
+                                        &mut sink,
+                                        close_with_reason("session input is unavailable"),
+                                        "region_input_setup_close",
+                                    )
+                                    .await;
+                                    capenc.shutdown().await;
+                                    return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                                }
+                            }
+                        }
+                        // Only the pen of the desktop this attachment
+                        // serves, which exists only when its grant to that
+                        // desktop's user succeeded.
+                        #[cfg(target_os = "linux")]
+                        if let Some(pen) = session_lease.and_then(SessionLease::seat_pen) {
+                            warn!(
+                                target: INPUT,
+                                seat = %pen.seat(),
+                                uid = pen.uid(),
+                                "LAB: pen samples go to this desktop's private-seat tablet"
+                            );
+                            injector.use_seat_pen(pen);
+                        }
+                        let proof = injector.proof();
+                        let capabilities = proof.capabilities();
+                        info!(
+                            target: INPUT,
+                            connection = proof.facts().connection,
+                            generation = proof.facts().generation,
+                            device_types = proof.facts().device_types,
+                            keyboard = ?capabilities.keyboard,
+                            pointer = ?capabilities.pointer,
+                            touch = ?capabilities.touch,
+                            pen = ?capabilities.pen,
+                            eis_offered = ?proof.facts().eis_offered,
+                            text = ?proof.facts().text,
+                            facts = ?proof.proven_facts(Default::default()),
+                            "session-bound Wayland input injector proven"
+                        );
+                        wayland_retarget = Some(injector.retarget_handle());
+                        (Some(PierInput::Wayland(injector)), Some(stats))
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: INPUT,
+                            %error,
+                            "session-bound Wayland input injector could not be proven; refusing the attachment"
+                        );
+                        send_critical_control(
+                            &mut sink,
+                            close_with_reason("session input is unavailable"),
+                            "input_setup_close",
+                        )
+                        .await;
+                        capenc.shutdown().await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
+                }
+            }
+            InputBackendChoice::Uinput => {
+                // The ABS range stays aligned to the fixed X11 raster. ViewPortIn
+                // changes capture scaling, not the pointer's normalized X space.
+                //
+                // A committed multi-monitor plan takes priority: its dedicated
+                // `DedicatedXorg` never holds a `MetaModeGuard` (multi-monitor
+                // sessions are always fixed-topology, never live-resized), so
+                // `display.raster_size()` is always `None` there, and
+                // `media_plan` alone only reflects the *primary* monitor's own
+                // footprint. The global absolute pointer/pen device must instead
+                // span the whole RandR-verified combined desktop
+                // (`plan.virtual_width`/`virtual_height`). Region-local logical
+                // coordinates stay in the shared region domain until
+                // `input::region_adapter` maps them into this final combined
+                // raster. Relative motion is unaffected: it uses the separate
+                // relative device, never this absolute-device sizing.
+                let (device_w, device_h) = resolve_input_raster(
+                    multi_monitor_committed
+                        .map(|(plan, _carrier)| (plan.virtual_width, plan.virtual_height)),
+                    display.as_ref().and_then(|r| r.raster_size()),
+                    (media_plan.width, media_plan.height),
+                );
+                let region_input = match multi_monitor_committed
+                    .map(|(plan, _carrier)| RegionInputAdapter::from_plan(plan))
+                    .transpose()
+                {
+                    Ok(adapter) => adapter,
+                    Err(error) => {
+                        warn!(target: INPUT, %error, "shared Linux region input adapter setup failed");
+                        send_critical_control(
+                            &mut sink,
+                            Message::Close(None),
+                            "region_input_setup_close",
+                        )
+                        .await;
+                        capenc.shutdown().await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
+                };
+                // The devices are named for the dedicated X server this
+                // attachment drives; that server admits nothing else.
+                let input_display = current_metadata
+                    .as_ref()
+                    .map_or(cfg.session_display.as_str(), |metadata| {
+                        metadata.display.as_str()
+                    });
+                let identity = match crate::input::session_input_identity(input_display) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(target: INPUT, %error, "native uinput refused: no dedicated X display to bind the devices to");
+                        send_critical_control(&mut sink, Message::Close(None), "input_setup_close")
+                            .await;
+                        capenc.shutdown().await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
+                };
+                match InputController::new(device_w, device_h, region_input, identity) {
+                    Ok((controller, stats)) => {
+                        info!(
+                            target: INPUT,
+                            device_w, device_h,
+                            pen_available = controller.pen_available(),
+                            session_input = %identity.session_token(),
+                            "native uinput device created"
+                        );
+                        // Give Xorg/libinput time to process the udev hotplug and
+                        // create the tablet tool virtual subdevice before the client
+                        // connects and starts sending pen events. Without this wait,
+                        // early pen events arrive while libinput has not yet opened
+                        // the evdev fd — those events are silently dropped by the
+                        // kernel's evdev ring (no fd = no reader). ~1 s is needed
+                        // in practice for a libinput tablet "Pen (0)" subdevice to
+                        // appear; 1.5 s gives comfortable margin.
+                        if controller.pen_available() {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                        }
+                        (Some(PierInput::Uinput(controller)), Some(stats))
+                    }
+                    Err(error) => {
+                        warn!(target: INPUT, %error, "native uinput setup failed");
+                        send_critical_control(&mut sink, Message::Close(None), "input_setup_close")
+                            .await;
+                        capenc.shutdown().await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
+                }
             }
         };
-        match InputController::new(device_w, device_h, region_input) {
-            Ok((controller, stats)) => {
-                info!(
-                    target: INPUT,
-                    device_w, device_h,
-                    pen_available = controller.pen_available(),
-                    "native uinput device created"
-                );
-                // Give Xorg/libinput time to process the udev hotplug and
-                // create the tablet tool virtual subdevice before the client
-                // connects and starts sending pen events. Without this wait,
-                // early pen events arrive while libinput has not yet opened
-                // the evdev fd — those events are silently dropped by the
-                // kernel's evdev ring (no fd = no reader). ~1 s is needed
-                // in practice for a libinput tablet "Pen (0)" subdevice to
-                // appear; 1.5 s gives comfortable margin.
-                if controller.pen_available() {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                }
-                (Some(controller), Some(stats))
-            }
-            Err(error) => {
-                warn!(target: INPUT, %error, "native uinput setup failed");
-                send_critical_control(&mut sink, Message::Close(None), "input_setup_close").await;
-                capenc.shutdown().await;
-                return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
-            }
-        }
-    } else {
-        (None, None)
-    };
     // Runtime-established truth only, probed/created above before this
     // `ServerHello` is built: `false` whenever the tablet-tool uinput device
     // was not actually created, including when the input backend is off.
     // Pen failure alone must never fail this match arm or disable
     // mouse/keyboard, which is why it is read from the already-constructed
     // controller rather than gating construction above.
-    let pen_available = input_controller
+    let pen_capabilities = input_controller.as_ref().map_or(
+        crate::session::handshake::PenCapabilityTruth::UNAVAILABLE,
+        PierInput::pen_capabilities,
+    );
+    let pen_available = pen_capabilities.pen_available();
+    // Why a Wayland session has no pen, with the evidence the Deck is shown.
+    let pen_unavailable = input_controller
         .as_ref()
-        .is_some_and(InputController::pen_available);
+        .and_then(PierInput::pen_unavailable);
     let region_input_available = input_controller
         .as_ref()
-        .is_some_and(InputController::region_input_available);
+        .is_some_and(PierInput::region_input_available);
 
     // The child has initialized its real capture+encoder path. Only now can the
     // host advertise the active backend and format truthfully.
@@ -4510,10 +5933,29 @@ async fn run_attachment(
         session_lease.map(|lease| &lease.metadata),
         resize_supported,
         microphone_backend_available,
-        pen_available,
+        pen_capabilities,
         region_input_available,
     );
+    // The hello names what is served: a capture source that decided
+    // admission itself (the Wayland provider) serves its admitted contract,
+    // so a Speed request served as Auto is announced as Auto.
+    hello.active_pipeline = hello
+        .active_pipeline
+        .map(|by_request| served_pipeline_from_admission(capenc.admitted_epoch(), || by_request));
     hello.negotiated_transport = Some(active_transport.to_string());
+    // Committed text: only a Wayland session whose agent types it says so,
+    // and characters beyond its layout only with an input-method route.
+    if let Some(unicode) = input_controller
+        .as_ref()
+        .and_then(PierInput::text_capability)
+    {
+        hello.input_capabilities.text_commit = InputCapabilityAvailability::Available;
+        hello.input_capabilities.text_commit_unicode = if unicode {
+            InputCapabilityAvailability::Available
+        } else {
+            InputCapabilityAvailability::Unavailable
+        };
+    }
     if let Some(capability) = applied_multi_monitor_capability.as_ref() {
         hello = match hello.with_multi_monitor_v1(capability) {
             Ok(hello) => hello,
@@ -4527,6 +5969,28 @@ async fn run_attachment(
                 return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
             }
         };
+    }
+    // Authorize this attachment's lanes before the hello: the Deck learns
+    // the binding first, and the Pier opens video and audio only after it
+    // sent the grant.
+    let lane_grant = match arcen_transport::quic::grant_attachment(
+        &lanes,
+        arcen_transport::quic::next_attachment_generation(),
+        arcen_protocol::lanes::LaneRoleSet::all(),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|grant| serde_json::to_string(&grant).map_err(|error| error.to_string()))
+    {
+        Ok(json) => json,
+        Err(error) => {
+            warn!(target: SESSION, %error, "lane attachment grant failed — closing connection");
+            capenc.shutdown().await;
+            return AttachmentEnd::terminal(SessionEndReason::ProtocolError);
+        }
+    };
+    if !send_critical_control(&mut sink, Message::Text(lane_grant), "lane_attachment").await {
+        capenc.shutdown().await;
+        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
     }
     match serde_json::to_string(&hello) {
         Ok(json) => {
@@ -4543,7 +6007,14 @@ async fn run_attachment(
     }
     debug!(target: SESSION, "server_hello sent");
     let client_hello = match receive_client_hello(&mut stream, HANDSHAKE_RECEIVE_TIMEOUT).await {
-        Ok(hello) => hello,
+        Ok(hello) => {
+            info!(
+                target: SESSION,
+                peer_build = %peer_deck_build(&hello),
+                "peer Deck build"
+            );
+            hello
+        }
         Err(error) => {
             warn!(target: SESSION, %error, "client hello rejected");
             send_critical_control(
@@ -4556,9 +6027,6 @@ async fn run_attachment(
             return handshake_receive_attachment_end(&error, refresh.as_ref());
         }
     };
-    // Audio moves to its own priority stream only when the Deck says it reads
-    // one; otherwise it stays on the session stream.
-    let priority_audio = priority_audio.filter(|_| client_hello.audio_priority_stream_v1);
     if let Some(initial) = cfg.auth_video_request.as_ref() {
         let echoed =
             arcen_protocol::messages::ClientVideoCapabilitiesMsg::from_client_hello(&client_hello);
@@ -4940,7 +6408,59 @@ async fn run_attachment(
                         initial_capenc.desktop_encoding,
                     )
                     .err();
-                    if let Some(error) = desktop_refusal {
+                    // A source that states its own admission (the Wayland
+                    // provider) has only eight-bit SDR compositions: a later
+                    // Grading/HDR-shaped request keeps the admitted Auto plan
+                    // the hello already announced instead of respawning into
+                    // a refusal and a codec fallback the Deck was not told.
+                    let eight_bit_sdr = VideoConfiguration {
+                        codec: candidate_video.codec,
+                        ..arcen_media::video::pipeline_contract(
+                            arcen_media::video::PipelineId::Auto,
+                        )
+                        .colour
+                    };
+                    // A fixed eight-bit Xorg desktop has no ten-bit samples
+                    // to give; its depth cannot change while it runs.
+                    let desktop_depth_refusal = cfg
+                        .attached_desktop_depth
+                        .filter(|depth| resolved_bit_depth > depth.max_bit_depth());
+                    if session.capture_admission().is_some() && candidate_video != eight_bit_sdr {
+                        warn!(
+                            target: SESSION,
+                            want_chroma = initial_quality.chroma.as_str(),
+                            want_bit_depth = resolved_bit_depth.token(),
+                            want_color_range = resolved_color_range.token(),
+                            want_transfer = candidate_video.transfer.token(),
+                            host_codec = media_plan.codec_token(),
+                            host_chroma = media_plan.chroma_token(),
+                            "this capture serves eight-bit SDR only — keeping the admitted plan"
+                        );
+                        (CapencHandle::Single(session), media_plan)
+                    } else if cfg.desktop_depth_downgraded && candidate_video != eight_bit_sdr {
+                        // The Deck's settings still describe the ten-bit
+                        // preset it asked for; this attachment was resolved
+                        // to Auto on an eight-bit desktop and stays there.
+                        warn!(
+                            target: SESSION,
+                            want_chroma = initial_quality.chroma.as_str(),
+                            want_bit_depth = resolved_bit_depth.token(),
+                            host_codec = media_plan.codec_token(),
+                            host_chroma = media_plan.chroma_token(),
+                            reason = arcen_media::video::AdmissionReason::EightBitSource.token(),
+                            "this attachment is served as Auto on an eight-bit Xorg desktop — keeping the Auto plan"
+                        );
+                        (CapencHandle::Single(session), media_plan)
+                    } else if let Some(depth) = desktop_depth_refusal {
+                        warn!(
+                            target: SESSION,
+                            want_bit_depth = resolved_bit_depth.token(),
+                            desktop_depth = depth.x11_depth(),
+                            reason = arcen_media::video::AdmissionReason::EightBitSource.token(),
+                            "client quality_settings ask for more bits than this persistent Xorg desktop was started with — keeping host plan"
+                        );
+                        (CapencHandle::Single(session), media_plan)
+                    } else if let Some(error) = desktop_refusal {
                         warn!(
                             target: SESSION,
                             %error,
@@ -5045,6 +6565,14 @@ async fn run_attachment(
             }
         }
     };
+    // A capture source that decided admission itself (the Wayland provider)
+    // states the contract it serves; that, not the request, sets priority,
+    // intent and the served-pipeline label.
+    let admitted_epoch = capenc.admitted_epoch();
+    if let Some(epoch) = admitted_epoch {
+        active_encode_intent = epoch.intent;
+        active_motion_priority = epoch.priority;
+    }
     let active_encoder = concrete_encoder_for(media_plan).unwrap_or(initial_capenc.encoder);
     let mut active_capenc_config = initial_capenc.clone().pinned_to_active_plan(
         &media_plan,
@@ -5068,39 +6596,79 @@ async fn run_attachment(
             "ClientHello timezone differs from authoritative desktop decision"
         );
     }
-    let clipboard_eligible = session_lease.is_some_and(|lease| {
-        cfg.auth_mode == AuthMode::Pam
-            && lease.metadata.session_type == "x11"
-            && lease.metadata.display == cfg.session_display
-            && lease.metadata.uid != 0
-    });
-    let clipboard_negotiation =
-        ClipboardNegotiation::from_client(cfg.clipboard_policy, clipboard_eligible, &client_hello);
-    let (mut clipboard_process, clipboard_agent) =
-        if let (Some(negotiation), Some(lease)) = (clipboard_negotiation, session_lease) {
-            let Some(binary) = session_agent_binary.clone() else {
-                warn!(target: SESSION, "clipboard agent binary unavailable");
-                capenc.shutdown().await;
-                return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
-            };
-            match spawn_clipboard_agent(
-                &binary,
-                &lease.execution,
-                negotiation.policy(),
-                &session_log_id,
-            )
-            .await
-            {
-                Ok((process, websocket)) => (Some(process), Some(websocket)),
-                Err(error) => {
-                    warn!(target: SESSION, %error, "clipboard agent startup failed");
+    let clipboard_bridge =
+        crate::clipboard::eligibility(&cfg, session_lease.map(|lease| &lease.metadata));
+    let clipboard_negotiation = crate::clipboard::negotiate(
+        cfg.clipboard_policy,
+        clipboard_bridge.is_ok(),
+        &client_hello,
+    );
+    let mut clipboard_process = None;
+    let mut clipboard_agent = None;
+    if let (Some(negotiation), Some(lease), Ok(bridge)) =
+        (clipboard_negotiation, session_lease, clipboard_bridge)
+    {
+        match bridge {
+            crate::clipboard::ClipboardBridgeKind::X11Child => {
+                let Some(binary) = session_agent_binary.clone() else {
+                    warn!(target: SESSION, "clipboard agent binary unavailable");
                     capenc.shutdown().await;
                     return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                };
+                match spawn_clipboard_agent(&binary, &lease.execution, negotiation, &session_log_id)
+                    .await
+                {
+                    Ok((process, websocket)) => {
+                        clipboard_process = Some(process);
+                        clipboard_agent = Some(crate::clipboard::ClipboardBridgeLink::new(
+                            websocket,
+                            crate::clipboard::ClipboardBridgeKind::X11Child,
+                        ));
+                    }
+                    Err(error) => {
+                        warn!(target: SESSION, %error, "clipboard agent startup failed");
+                        capenc.shutdown().await;
+                        return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
+                    }
                 }
             }
-        } else {
-            (None, None)
-        };
+            crate::clipboard::ClipboardBridgeKind::WaylandSession => {
+                // The clipboard is an auxiliary channel: a bridge that cannot
+                // be proven turns the clipboard off for this attachment and
+                // the session goes on (ADR 0014, disabled bulk lane).
+                match crate::clipboard::connect_wayland_clipboard(&lease.metadata, negotiation)
+                    .await
+                {
+                    Ok(websocket) => {
+                        info!(
+                            target: SESSION,
+                            event = "clipboard_bridge_ready",
+                            backend = "wayland_session",
+                            "clipboard bridge connected to the session agent"
+                        );
+                        clipboard_agent = Some(crate::clipboard::ClipboardBridgeLink::new(
+                            websocket,
+                            crate::clipboard::ClipboardBridgeKind::WaylandSession,
+                        ));
+                    }
+                    Err(error) => warn!(
+                        target: SESSION,
+                        event = "clipboard_bridge_unavailable",
+                        backend = "wayland_session",
+                        %error,
+                        "clipboard bridge unavailable; clipboard off for this attachment"
+                    ),
+                }
+            }
+        }
+    } else if let Err(reason) = clipboard_bridge {
+        debug!(
+            target: SESSION,
+            reason = reason.token(),
+            "clipboard not eligible for this session"
+        );
+    }
+    let clipboard_bridge_kind = clipboard_bridge.ok();
     let microphone_policy = MicrophonePolicy {
         operator_enabled: cfg.microphone_input_enabled,
         backend_available: microphone_backend_available,
@@ -5148,13 +6716,14 @@ async fn run_attachment(
             .await
             {
                 Ok(agent) => Some(agent),
-                Err(_) => {
+                Err(error) => {
                     warn!(
                         target: AUDIO,
                         event = "mic_linux_helper_failure",
                         sid = %session_log_id,
                         backend = "pulseaudio_pipe_source",
                         reason = "startup_failed",
+                        %error,
                         "session-user microphone agent startup failed"
                     );
                     microphone_stream = arcen_media::audio::ResolvedMicrophoneStream::disabled(
@@ -5208,13 +6777,43 @@ async fn run_attachment(
         capenc.shutdown().await;
         return AttachmentEnd::terminal(SessionEndReason::WriterEnded);
     }
+    // A headless Wayland desktop chose how its streams report the cursor
+    // when it opened; a later attachment is told the truth, not switched.
+    let wayland_stream_cursor = session_lease
+        .and_then(|lease| lease.metadata.wayland.as_ref())
+        .map(|ready| (ready.cursor_mode, ready.runtime_dir.clone()));
+    let wayland_cursor_hub = match &wayland_stream_cursor {
+        Some((crate::session::wayland::StreamCursorMode::Metadata, runtime_dir))
+            if media_plan.cursor_mode == CursorMode::Local =>
+        {
+            Some(crate::media::wayland_cursor::hub(runtime_dir))
+        }
+        _ => None,
+    };
+    let deck_cursor_images = client_hello.cursor_image_v1;
     let cursor_result = CursorModeResultMsg {
         requested: cursor_preference,
         active: media_plan.cursor_mode,
         accepted: cursor_preference == media_plan.cursor_mode,
-        reason: CursorModeReason::default(),
+        reason: wayland_cursor_reason(
+            cursor_preference,
+            media_plan.cursor_mode,
+            wayland_stream_cursor.as_ref().map(|(mode, _)| *mode),
+        ),
+        cursor_images: wayland_cursor_hub.is_some() && deck_cursor_images,
         ..CursorModeResultMsg::default()
     };
+    if let Some((mode, _)) = &wayland_stream_cursor {
+        info!(
+            target: INPUT,
+            stream_cursor_mode = mode.token(),
+            requested = ?cursor_preference,
+            active = ?media_plan.cursor_mode,
+            deck_cursor_images,
+            cursor_images = cursor_result.cursor_images,
+            "Wayland cursor authority for this attachment"
+        );
+    }
     let cursor_result =
         serde_json::to_string(&cursor_result).expect("CursorModeResultMsg must serialize");
     if !send_critical_control(
@@ -5236,7 +6835,11 @@ async fn run_attachment(
     // exists, and checked again against the device once it is attached.
     let usb_hard_authorization =
         crate::usb_bridge::authorize_device(client_hello.usb_hard_device.as_ref());
+    // A seatless (Wayland) session is refused first: the bridged device
+    // would reach the machine's physical seat, not the session the Deck sees.
+    let usb_hard_session = crate::usb_bridge::session_admission(current_metadata.as_ref());
     let usb_hard_available = client_hello.usb_hard_v1
+        && usb_hard_session.is_ok()
         && usb_hard_authorization.is_ok()
         && crate::usb_bridge::runtime_available();
     info!(
@@ -5250,6 +6853,7 @@ async fn run_attachment(
         client_bridge_capability = ?client_tablet_capabilities.usb_tablet_bridge,
         tablet_pressure_levels = usb_hard_authorization.as_ref().ok().and_then(|tablet| tablet.profile.capabilities.pressure_levels()),
         tablet_refusal = usb_hard_authorization.as_ref().err().map(String::as_str),
+        session_refusal = usb_hard_session.err().map(|denial| denial.reason()),
         usb_hard_available,
         "Hard USB negotiation inputs"
     );
@@ -5272,11 +6876,34 @@ async fn run_attachment(
         client_tablet_capabilities,
         host_tablet_capabilities,
     );
+    // A Wayland session without a stylus says why, with its evidence, rather
+    // than blaming a pen backend that never applied to it.
+    if let Some(why) = pen_unavailable {
+        if client_hello.tablet_mode_requested == TabletModeMsg::LocalTermination
+            && !tablet_mode_result.accepted
+            && client_tablet_capabilities.local_termination
+                == InputCapabilityAvailability::Available
+        {
+            tablet_mode_result.reason =
+                TabletModeReason::try_from(why.reason().to_owned()).unwrap_or_default();
+        }
+    }
+    // A refused session says why, whatever else is missing: no backend or
+    // device can make Hard USB reach a seatless session.
+    if let Err(denial) = usb_hard_session {
+        if client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
+            && !tablet_mode_result.accepted
+        {
+            tablet_mode_result.reason =
+                TabletModeReason::try_from(denial.reason().to_owned()).unwrap_or_default();
+        }
+    }
     // When the backend exists but the device itself was refused, say why
     // rather than blaming a missing backend.
     if let Err(refusal) = &usb_hard_authorization {
         if client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
             && !tablet_mode_result.accepted
+            && usb_hard_session.is_ok()
             && client_hello.usb_hard_v1
             && crate::usb_bridge::runtime_available()
         {
@@ -5366,6 +6993,31 @@ async fn run_attachment(
             }
         }
     }
+    // What the Deck is told if Hard USB has to stop mid-session because the
+    // bulk lane became unavailable (ADR 0014).
+    let usb_stopped_notice = (tablet_mode_result.accepted
+        && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge)
+        .then(|| {
+            let mut stopped = tablet_mode_result.clone();
+            stopped.accepted = false;
+            stopped.active = TabletModeMsg::DisabledMouseCompat;
+            stopped.reason = TabletModeReason::try_from(
+                "Hard USB stopped: the bulk stream is unavailable; mouse compatibility remains active"
+                    .to_owned(),
+            )
+            .unwrap_or_default();
+            serde_json::to_string(&stopped).ok()
+        })
+        .flatten();
+    info!(
+        target: NET,
+        requested = ?tablet_mode_result.requested,
+        active = ?tablet_mode_result.active,
+        accepted = tablet_mode_result.accepted,
+        reason = tablet_mode_result.reason.as_str(),
+        pen_unavailable = ?pen_unavailable,
+        "tablet mode result"
+    );
     let tablet_mode_result =
         serde_json::to_string(&tablet_mode_result).expect("TabletModeResultMsg must serialize");
     if !send_critical_control(
@@ -5386,14 +7038,39 @@ async fn run_attachment(
     // runs in a dedicated OS thread and sends CursorShapeMsg JSON strings
     // whenever the X11 cursor changes. Old clients that don't understand the
     // message type ignore it.
-    #[cfg(target_os = "linux")]
-    let cursor_shape_rx = if media_plan.cursor_mode == CursorMode::Local {
-        crate::cursor_watcher::spawn(cfg.session_display.clone(), cfg.xauthority.clone())
+    //
+    // A headless Wayland session has no X display: the XFixes watcher would
+    // watch whatever X server the configuration names, not this session.
+    // Its cursor belongs to the capture provider: a desktop that records
+    // its cursor as metadata reports it through capenc to the desktop's
+    // cursor hub, which the input lane follows.
+    let wayland_session = session_lease.is_some_and(|lease| {
+        lease.metadata.wayland.is_some() || lease.metadata.session_type == "wayland"
+    });
+    let cursor_feed = if let Some(hub) = wayland_cursor_hub.as_ref() {
+        Some(lane_workers::CursorFeed::Images {
+            facts: hub.subscribe(),
+            deck_draws_images: deck_cursor_images,
+        })
+    } else if media_plan.cursor_mode == CursorMode::Local && !wayland_session {
+        #[cfg(target_os = "linux")]
+        {
+            crate::cursor_watcher::spawn(cfg.session_display.clone(), cfg.xauthority.clone())
+                .map(lane_workers::CursorFeed::Shapes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     } else {
+        if wayland_session && media_plan.cursor_mode == CursorMode::Local {
+            info!(
+                target: INPUT,
+                "Wayland session without cursor metadata: cursor shapes are not streamed"
+            );
+        }
         None
     };
-    #[cfg(not(target_os = "linux"))]
-    let cursor_shape_rx: Option<tokio::sync::mpsc::Receiver<String>> = None;
 
     let mut all_monitor_bitrates: Vec<BitrateRequester> = Vec::new();
     let idr = match &capenc {
@@ -5436,8 +7113,12 @@ async fn run_attachment(
     if cfg.audio_enabled && audio_binary.is_none() {
         warn!(target: AUDIO, "native audiocap binary not found; continuing without audio");
     }
+    let session_audio = session_lease.and_then(|lease| lease.metadata.audio.clone());
     let audio_config = audio_binary.map(|binary| AudioConfig {
         binary,
+        source: session_audio
+            .as_ref()
+            .and_then(|audio| audio.capture_source.clone()),
         execution: if cfg.audio_user_mode == AudioUserMode::Session {
             user_execution.clone()
         } else {
@@ -5585,12 +7266,14 @@ async fn run_attachment(
     );
     let audio_runtime = Arc::new(tokio::sync::Mutex::new(audio_session.take()));
 
-    let active_served_pipeline = served_stream_pipeline_for_backend(
-        &cfg,
-        &media_plan,
-        active_motion_priority,
-        active_aggregate_backend,
-    );
+    let active_served_pipeline = served_pipeline_from_admission(admitted_epoch, || {
+        served_stream_pipeline_for_backend(
+            &cfg,
+            &media_plan,
+            active_motion_priority,
+            active_aggregate_backend,
+        )
+    });
     let effective_qp_map = active_capenc_config.qp_map;
     if let Some(served_policy) = cfg
         .qp_map_config
@@ -5622,7 +7305,17 @@ async fn run_attachment(
         session_log_id.clone(),
         &media_plan,
         active_aggregate_backend,
-        Some(active_served_pipeline.clone()),
+        ServedStreamLabels {
+            pipeline: Some(active_served_pipeline.clone()),
+            // The dedicated Xorg display is driven through NV-CONTROL; a
+            // headless Wayland session's output belongs to its compositor.
+            display_backend: if session_lease.is_some_and(|lease| lease.metadata.wayland.is_some())
+            {
+                "wayland"
+            } else {
+                "nvctrl"
+            },
+        },
         session_user.as_deref(),
         Some(remote_host),
     );
@@ -5723,6 +7416,19 @@ async fn run_attachment(
         clipboard_queue.close();
     }
     let (ctrl_tx, ctrl_rx) = ControlSender::channel(CONTROL_CHANNEL_CAPACITY);
+    if let Some(message) = desktop_depth_served_pipeline(&cfg) {
+        match serde_json::to_string(&message) {
+            Ok(text) => {
+                if !ctrl_tx
+                    .send_required(Message::Text(text), "served_pipeline")
+                    .await
+                {
+                    warn!(target: MEDIA, "the Deck could not be told this desktop serves eight bits only");
+                }
+            }
+            Err(error) => warn!(target: MEDIA, %error, "served_pipeline could not be encoded"),
+        }
+    }
 
     // Carrier A tags every wire frame with its owning session monitor id;
     // the plan's primary monitor id (or the legacy `0` for a single-monitor
@@ -5855,7 +7561,7 @@ async fn run_attachment(
     // to notice `pump` completed and falls through to the shared post-loop
     // teardown code. That hook runs from inside this pump's own completing
     // task body (see `spawn_frame_pump`): the `JoinHandle` this function
-    // returns cannot resolve `Ready` for any consumer (`sender_loop`
+    // returns cannot resolve `Ready` for any consumer (the video lane writer
     // included) until that call has already finished running, since it is
     // sequenced before this same task's return.
     let mut pump = spawn_frame_pump(
@@ -5879,37 +7585,106 @@ async fn run_attachment(
         .as_ref()
         .map(|refresh| resumable_write_timeout(refresh.window_secs))
         .unwrap_or(WS_SEND_TIMEOUT);
-    let mut sender = tokio::spawn(
-        sender_loop(
-            sink,
-            video_source,
-            sender_audio,
-            sender_clipboard,
-            ctrl_rx,
-            sender_audio_control,
-            refresh,
-            write_timeout,
-            priority_audio,
-            Arc::clone(&video_write_wait_micros),
-        )
-        .instrument(tracing::Span::current()),
-    );
-    let mut microphone_frames = microphone_agent
-        .as_ref()
-        .map(crate::microphone_input::MicrophoneAgent::frame_sender);
+    // 3b. Lane writers: video, audio, control and bulk each own a task and a
+    // lane (ADR 0014); none awaits another role's lane.
+    let input_slot =
+        arcen_transport::quic::LaneSenderSlot::new(arcen_protocol::lanes::LaneRole::InputCursor);
+    let bulk_slot =
+        arcen_transport::quic::LaneSenderSlot::new(arcen_protocol::lanes::LaneRole::BulkAux);
+    let mut sender = lane_workers::spawn_lane_writers(lane_workers::LaneWriters {
+        lanes: lanes.clone(),
+        control_sink: sink,
+        control: ctrl_rx,
+        refresh,
+        write_timeout,
+        video: video_source,
+        video_write_wait_micros: Arc::clone(&video_write_wait_micros),
+        idrs: all_monitor_idrs.clone(),
+        audio: sender_audio,
+        audio_control: sender_audio_control,
+        audio_failure: audio_failure_tx.clone(),
+        clipboard: sender_clipboard,
+        clipboard_notices: ctrl_tx.clone(),
+        input_slot: input_slot.clone(),
+        bulk_slot: bulk_slot.clone(),
+    });
+    let microphone_state = Arc::new(Mutex::new(lane_workers::MicrophoneIngressState::new(
+        microphone_agent
+            .as_ref()
+            .map(crate::microphone_input::MicrophoneAgent::frame_sender),
+        microphone_stream
+            .codec
+            .map(|codec| MicrophoneIngressValidator::new(codec, microphone_generation)),
+    )));
     let mut microphone_events = microphone_agent
         .as_ref()
         .map(crate::microphone_input::MicrophoneAgent::events);
-    let mut microphone_ingress = microphone_stream
-        .codec
-        .map(|codec| MicrophoneIngressValidator::new(codec, microphone_generation));
     let microphone_transport_started_at = Instant::now();
     let microphone_transport_stats = Arc::new(Mutex::new(MicrophoneStatsTracker::default()));
     let microphone_transport_summary_reported = Arc::new(AtomicBool::new(false));
     let microphone_transport_telemetry =
         spawn_linux_transport_telemetry(session_log_id.clone(), microphone_generation);
+    // Text results and the session's layout go to a Deck that advertised
+    // committed text, on its input lane.
+    let mut input_controller = input_controller;
+    let text_notices = if supports_text_commit_v1(client_hello.input_capabilities) {
+        input_controller
+            .as_mut()
+            .and_then(PierInput::take_text_notices)
+    } else {
+        None
+    };
+    let input_controller = Arc::new(Mutex::new(input_controller));
 
-    // 3c. Dispatcher: inbound control messages.
+    // 3c. Lane readers for the lanes the Deck opens: input/cursor (injection
+    // and the host cursor shape), microphone, and bulk (forwarded to the
+    // dispatcher, which owns clipboard and USB state).
+    let (bulk_tx, bulk_rx) = mpsc::channel::<Message>(BULK_FORWARD_CAPACITY);
+    let (bulk_unavailable_tx, bulk_unavailable_rx) = mpsc::channel::<()>(4);
+    let (usb_out_tx, usb_out_rx) = mpsc::channel::<Vec<u8>>(lane_workers::USB_BULK_BACKLOG);
+    let lane_readers = [
+        tokio::spawn(
+            lane_workers::input_lane_worker(
+                lanes.clone(),
+                Arc::clone(&input_controller),
+                cursor_feed,
+                text_notices,
+                input_slot,
+            )
+            .instrument(tracing::Span::current()),
+        ),
+        tokio::spawn(
+            lane_workers::microphone_lane_worker(
+                lanes.clone(),
+                Arc::clone(&microphone_state),
+                Arc::clone(&microphone_transport_stats),
+                ctrl_tx.clone(),
+                microphone_generation,
+                session_log_id.clone(),
+            )
+            .instrument(tracing::Span::current()),
+        ),
+        tokio::spawn(
+            lane_workers::bulk_lane_reader(
+                lanes.clone(),
+                bulk_slot.clone(),
+                bulk_tx,
+                bulk_unavailable_tx.clone(),
+            )
+            .instrument(tracing::Span::current()),
+        ),
+        tokio::spawn(
+            lane_workers::usb_bulk_writer(
+                usb_out_rx,
+                bulk_slot.clone(),
+                CRITICAL_CONTROL_TIMEOUT,
+                bulk_unavailable_tx,
+            )
+            .instrument(tracing::Span::current()),
+        ),
+    ];
+
+    // 3d. Dispatcher: inbound control (and forwarded bulk) messages.
     //
     // Carrier A: `all_monitor_idrs` holds every applied monitor's own
     // `IdrRequester` (primary + every secondary); a legacy single-monitor
@@ -5932,8 +7707,7 @@ async fn run_attachment(
     let disp_audio_runtime = Arc::clone(&audio_runtime);
     let disp_audio_stats = Arc::clone(&audio_stats);
     let disp_audio_failure_tx = audio_failure_tx;
-    let input_controller = Arc::new(Mutex::new(input_controller));
-    let disp_input = Arc::clone(&input_controller);
+    let disp_microphone_state = Arc::clone(&microphone_state);
     let disp_resize_tx = resize_tx;
     let disp_microphone_stats = Arc::clone(&microphone_transport_stats);
     let disp_microphone_summary_reported = Arc::clone(&microphone_transport_summary_reported);
@@ -5944,11 +7718,13 @@ async fn run_attachment(
     // opt-in AND the connecting client must have explicitly asserted the
     // capability in ClientHello. An old/unknown client (field absent, so
     // `false`) or a host without its own opt-in never activates this,
-    // regardless of what the other side claims.
+    // regardless of what the other side claims. A uhid device reaches the
+    // machine's seat exactly as a bridged USB device does, so a seatless
+    // (Wayland) session never activates it either.
     #[cfg(all(target_os = "linux", feature = "experimental-raw-hid"))]
-    let disp_raw_hid_permitted =
-        client_hello.experimental_raw_hid && crate::input::experimental_raw_hid_runtime_enabled();
-    let disp_cursor_shape_rx = cursor_shape_rx;
+    let disp_raw_hid_permitted = client_hello.experimental_raw_hid
+        && crate::input::experimental_raw_hid_runtime_enabled()
+        && usb_hard_session.is_ok();
     let dispatcher_span = tracing::Span::current();
     let mut dispatcher = tokio::spawn(
         async move {
@@ -5979,14 +7755,7 @@ async fn run_attachment(
             microphone_stats_tick
                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             microphone_stats_tick.tick().await;
-            let mut microphone_order_warning =
-                crate::microphone_input::RateLimitedMicrophoneWarning::default();
-            let mut microphone_protocol_warning =
-                crate::microphone_input::RateLimitedMicrophoneWarning::default();
-            let mut microphone_codec_warning =
-                crate::microphone_input::RateLimitedMicrophoneWarning::default();
-            let mut microphone_authorization_warning =
-                crate::microphone_input::RateLimitedMicrophoneWarning::default();
+            let mut bulk_rx = Some(bulk_rx);
             // Experimental raw-HID passthrough (quarantined): virtual devices
             // keyed by the client-assigned device_id. Only compiled in with
             // `experimental-raw-hid`; still requires `disp_raw_hid_permitted`
@@ -6000,7 +7769,8 @@ async fn run_attachment(
             let mut hid_admission =
                 arcen_usb_bridge::RawHidAdmission::new(MAX_EXPERIMENTAL_RAW_HID_DEVICES);
             let mut usb_bridge = disp_usb_bridge;
-            let mut cursor_shape_rx = disp_cursor_shape_rx;
+            let mut bulk_unavailable_rx = bulk_unavailable_rx;
+            let usb_out = usb_out_tx;
             let reason = loop {
                 tokio::select! {
                     _ = clipboard_expiry.tick() => {
@@ -6016,21 +7786,9 @@ async fn run_attachment(
                             request_full_frame_idr(&disp_idrs);
                         }
                     }
-                    cursor_json = async { cursor_shape_rx.as_mut()?.recv().await },
-                        if cursor_shape_rx.is_some() =>
+                    _ = microphone_stats_tick.tick(),
+                        if lock_recover(&disp_microphone_state).ingress.is_some() =>
                     {
-                        match cursor_json {
-                            Some(json) => {
-                                disp_ctrl.send_best_effort(Message::Text(json), "cursor_shape");
-                            }
-                            None => {
-                                // Watcher thread exited (X11 connection dropped or
-                                // session ended) — stop polling.
-                                cursor_shape_rx = None;
-                            }
-                        }
-                    }
-                    _ = microphone_stats_tick.tick(), if microphone_ingress.is_some() => {
                         let stats = lock_recover(&disp_microphone_stats).take_interval();
                         disp_microphone_telemetry.try_snapshot(
                             stats,
@@ -6039,22 +7797,79 @@ async fn run_attachment(
                             "running",
                         );
                     }
-                    agent_message = next_clipboard_agent_message(&mut clipboard_agent) => {
-                        match agent_message {
-                            Some(Ok(message)) => handle_agent_clipboard_message(
-                                message,
-                                clipboard_negotiation,
-                                agent_reassembler.as_mut(),
-                                &disp_clipboard_queue,
-                            ),
-                            Some(Err(error)) => {
+                    bridge_event = next_clipboard_bridge_event(&mut clipboard_agent) => {
+                        let agent_message = match bridge_event {
+                            crate::clipboard::ClipboardBridgeEvent::Message(message) => message,
+                            crate::clipboard::ClipboardBridgeEvent::Failure(failure) => {
+                                match failure {
+                                    crate::clipboard::ClipboardBridgeFailure::Stalled { sequence }
+                                        if !clipboard_bridge_survivable(clipboard_bridge_kind) =>
+                                    {
+                                        // The Xorg child stopped taking this item; it is
+                                        // dropped and the next one is tried. The
+                                        // attachment never waits on the child.
+                                        warn!(
+                                            target: SESSION,
+                                            event = "clipboard_transfer_abandoned",
+                                            direction = "client_to_host",
+                                            backend = "x11_child",
+                                            sequence,
+                                            "clipboard item not taken by the session helper in time; abandoned"
+                                        );
+                                    }
+                                    crate::clipboard::ClipboardBridgeFailure::Closed(error)
+                                        if !clipboard_bridge_survivable(clipboard_bridge_kind) =>
+                                    {
+                                        warn!(target: SESSION, %error, "clipboard agent injection IPC failed");
+                                        break SessionEndReason::TransportError;
+                                    }
+                                    failure => {
+                                        let error = match failure {
+                                            crate::clipboard::ClipboardBridgeFailure::Stalled { sequence } => {
+                                                format!("the session agent took nothing for clipboard item {sequence} in time")
+                                            }
+                                            crate::clipboard::ClipboardBridgeFailure::Closed(error) => error,
+                                        };
+                                        disable_clipboard_bridge(
+                                            &mut clipboard_agent,
+                                            &disp_clipboard_queue,
+                                            &mut deck_reassembler,
+                                            &mut agent_reassembler,
+                                            &error,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+                        let lost = match agent_message {
+                            Some(Ok(message)) => {
+                                handle_agent_clipboard_message(
+                                    message,
+                                    clipboard_negotiation,
+                                    agent_reassembler.as_mut(),
+                                    &disp_clipboard_queue,
+                                );
+                                None
+                            }
+                            Some(Err(error)) => Some(error.to_string()),
+                            None if clipboard_agent.is_some() => {
+                                Some("clipboard bridge closed".to_string())
+                            }
+                            None => None,
+                        };
+                        if let Some(error) = lost {
+                            if !clipboard_bridge_survivable(clipboard_bridge_kind) {
                                 warn!(target: SESSION, %error, "clipboard agent IPC failed");
                                 break SessionEndReason::TransportError;
                             }
-                            None if clipboard_agent.is_some() => {
-                                break SessionEndReason::TransportError;
-                            }
-                            None => {}
+                            disable_clipboard_bridge(
+                                &mut clipboard_agent,
+                                &disp_clipboard_queue,
+                                &mut deck_reassembler,
+                                &mut agent_reassembler,
+                                &error,
+                            );
                         }
                     }
                     codec_failure = audio_failure_rx.recv() => {
@@ -6075,9 +7890,15 @@ async fn run_attachment(
                         match microphone_event {
                             Some(crate::microphone_input::MicrophoneAgentEvent::Failed) => {
                                 microphone_events = None;
-                                microphone_ingress = None;
-                                if let Some(frames) = microphone_frames.take() {
-                                    frames.stop();
+                                let already_ended = {
+                                    let mut state = lock_recover(&disp_microphone_state);
+                                    let ended = state.terminated;
+                                    state.stop();
+                                    state.terminated = true;
+                                    ended
+                                };
+                                if already_ended {
+                                    continue;
                                 }
                                 warn!(target: AUDIO, "microphone helper exited unexpectedly");
                                 if !send_microphone_failure(&disp_ctrl, microphone_generation).await {
@@ -6086,27 +7907,44 @@ async fn run_attachment(
                             }
                             Some(crate::microphone_input::MicrophoneAgentEvent::Stopped) => {
                                 microphone_events = None;
-                                microphone_ingress = None;
-                                microphone_frames = None;
+                                let mut state = lock_recover(&disp_microphone_state);
+                                state.ingress = None;
+                                state.frames = None;
+                                state.terminated = true;
                             }
                             _ => {}
                         }
                     }
-                    usb_frame = async {
-                        match usb_bridge.as_mut() {
-                            Some(bridge) => Some(bridge.next_frame().await),
-                            None => None,
-                        }
-                    }, if usb_bridge.is_some() => {
-                        match usb_frame {
-                            Some(Ok(frame)) => {
-                                if !disp_ctrl
-                                    .send_required(Message::Binary(frame), "usb_bridge_urb")
-                                    .await
-                                {
-                                    break SessionEndReason::WriterEnded;
-                                }
+                    Some(()) = bulk_unavailable_rx.recv() => {
+                        // Clipboard and Hard USB are off for the session; the
+                        // session itself goes on.
+                        if let Some(bridge) = usb_bridge.take() {
+                            warn!(
+                                target: NET,
+                                "bulk lane unavailable; Hard USB stopped for this session"
+                            );
+                            bridge.shutdown().await;
+                            if let Some(notice) = usb_stopped_notice.clone() {
+                                disp_ctrl.send_best_effort(
+                                    Message::Text(notice),
+                                    arcen_protocol::messages::TABLET_MODE_RESULT,
+                                );
                             }
+                        }
+                    }
+                    // A frame is taken from the helper only when the USB
+                    // writer has room, so a congested bulk lane slows the
+                    // helper, never this dispatcher.
+                    usb_frame = async {
+                        let permit = usb_out.clone().reserve_owned().await.ok()?;
+                        let bridge = usb_bridge.as_mut()?;
+                        Some((permit, bridge.next_frame().await))
+                    }, if usb_bridge.is_some() => {
+                        let usb_frame = usb_frame.map(|(permit, frame)| {
+                            frame.map(|frame| permit.send(frame))
+                        });
+                        match usb_frame {
+                            Some(Ok(_)) => {}
                             Some(Err(error)) => {
                                 let diagnostic = usb_bridge
                                     .as_mut()
@@ -6126,8 +7964,8 @@ async fn run_attachment(
                             None => {}
                         }
                     }
-                    deck_message = next_with_liveness(&mut stream, READ_LIVENESS_TIMEOUT) => {
-                        let msg = match deck_message {
+                    deck_message = next_deck_message(&mut stream, &mut bulk_rx, READ_LIVENESS_TIMEOUT) => {
+                        let (source_lane, msg) = match deck_message {
                             Ok(Some(message)) => message,
                             Ok(None) => break SessionEndReason::TransportError,
                             Err(_) => {
@@ -6135,6 +7973,19 @@ async fn run_attachment(
                                 break SessionEndReason::ReadLivenessTimeout;
                             }
                         };
+                        if let Ok(message) = &msg {
+                            if let Some(lane) = deck_message_lane(message) {
+                                if lane != source_lane {
+                                    warn!(
+                                        target: NET,
+                                        received_on = %source_lane,
+                                        belongs_on = %lane,
+                                        "Deck message on the wrong lane dropped"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         match msg {
                     Ok(Message::Text(text)) => {
                         let microphone_stop = serde_json::from_str::<serde_json::Value>(&text)
@@ -6148,10 +7999,7 @@ async fn run_attachment(
                                     if stop.is_valid()
                                         && stop.generation == microphone_generation =>
                                 {
-                                    if let Some(frames) = microphone_frames.take() {
-                                        frames.stop();
-                                    }
-                                    microphone_ingress = None;
+                                    lock_recover(&disp_microphone_state).stop();
                                     info!(
                                         target: AUDIO,
                                         reason = ?stop.reason,
@@ -6209,7 +8057,8 @@ async fn run_attachment(
                                     }
                                 }
                             }
-                            let mut input = lock_recover(&disp_input);
+                            // Input arrives on the input lane only; the
+                            // lane check above already dropped it here.
                             handle_control_json(
                                 &text,
                                 &disp_idrs,
@@ -6217,7 +8066,7 @@ async fn run_attachment(
                                 &disp_plan,
                                 &disp_session_log_id,
                                 disp_timezone.as_ref(),
-                                input.as_mut(),
+                                None,
                                 &mut full_frame_requests,
                                 &mut input_sequence,
                                 disp_plan.cursor_mode,
@@ -6228,159 +8077,16 @@ async fn run_attachment(
                     }
                     Ok(Message::Binary(bytes)) => {
                         match bytes.first().copied().and_then(|b| FrameType::try_from(b).ok()) {
-                            Some(FrameType::AudioUpstream) => {
-                                lock_recover(&disp_microphone_stats).record_received(bytes.len());
-                                let wire_bytes = bytes.len();
-                                if let (Some(frames), Some(ingress)) =
-                                    (microphone_frames.as_ref(), microphone_ingress.as_mut())
-                                {
-                                    match ingress.validate(&bytes) {
-                                        Ok(()) => match frames.try_send(bytes) {
-                                            Ok(()) => {
-                                                lock_recover(&disp_microphone_stats).record_ingest(
-                                                    MicrophoneIngestOutcome::Accepted,
-                                                    wire_bytes,
-                                                );
-                                            }
-                                            Err(crate::microphone_input::MicrophoneSendError::Full) => {
-                                                lock_recover(&disp_microphone_stats)
-                                                    .record_transport_backpressure_drop();
-                                            }
-                                            Err(crate::microphone_input::MicrophoneSendError::Closed) => {
-                                                lock_recover(&disp_microphone_stats)
-                                                    .record_backend_underrun();
-                                                microphone_ingress = None;
-                                                if let Some(frames) = microphone_frames.take() {
-                                                    frames.stop();
-                                                }
-                                                warn!(
-                                                    target: AUDIO,
-                                                    event = "mic_linux_helper_failure",
-                                                    sid = %disp_session_log_id,
-                                                    backend = "pulseaudio_pipe_source",
-                                                    reason = "ipc_closed",
-                                                    "microphone helper IPC closed"
-                                                );
-                                                if !send_microphone_failure(
-                                                    &disp_ctrl,
-                                                    microphone_generation,
-                                                )
-                                                .await
-                                                {
-                                                    break SessionEndReason::WriterEnded;
-                                                }
-                                            }
-                                        },
-                                        Err(rejection) => {
-                                            let terminate_stream = rejection.terminates_stream();
-                                            match rejection {
-                                                MicrophoneIngressRejection::Sequence(
-                                                    MicrophoneFrameDecision::Duplicate,
-                                                ) => lock_recover(&disp_microphone_stats)
-                                                    .record_ingest(
-                                                    MicrophoneIngestOutcome::DroppedDuplicate,
-                                                    0,
-                                                ),
-                                                MicrophoneIngressRejection::Sequence(
-                                                    MicrophoneFrameDecision::Late,
-                                                ) => lock_recover(&disp_microphone_stats)
-                                                    .record_ingest(
-                                                    MicrophoneIngestOutcome::DroppedLate,
-                                                    0,
-                                                ),
-                                                MicrophoneIngressRejection::Sequence(
-                                                    MicrophoneFrameDecision::WrongGeneration,
-                                                ) => lock_recover(&disp_microphone_stats)
-                                                    .record_ingest(
-                                                    MicrophoneIngestOutcome::DroppedWrongGeneration,
-                                                    0,
-                                                ),
-                                                MicrophoneIngressRejection::Sequence(
-                                                    MicrophoneFrameDecision::Discontinuity,
-                                                ) => lock_recover(&disp_microphone_stats)
-                                                    .record_ingest(
-                                                    MicrophoneIngestOutcome::RejectedDiscontinuity,
-                                                    0,
-                                                ),
-                                                MicrophoneIngressRejection::Malformed
-                                                | MicrophoneIngressRejection::Codec
-                                                | MicrophoneIngressRejection::Sequence(
-                                                    MicrophoneFrameDecision::First
-                                                    | MicrophoneFrameDecision::OnTime
-                                                    | MicrophoneFrameDecision::Gap { .. },
-                                                ) => lock_recover(&disp_microphone_stats)
-                                                    .record_decoder_error(),
-                                            }
-                                            let warning = match rejection {
-                                                MicrophoneIngressRejection::Malformed => {
-                                                    &mut microphone_protocol_warning
-                                                }
-                                                MicrophoneIngressRejection::Codec => {
-                                                    &mut microphone_codec_warning
-                                                }
-                                                MicrophoneIngressRejection::Sequence(_) => {
-                                                    &mut microphone_order_warning
-                                                }
-                                            };
-                                            if let Some(suppressed) = warning.observe() {
-                                                warn!(
-                                                    target: AUDIO,
-                                                    event = "mic_frame_rejected",
-                                                    sid = %disp_session_log_id,
-                                                    generation = microphone_generation,
-                                                    reason = ?rejection,
-                                                    suppressed_since_last = suppressed,
-                                                    "Linux microphone frame rejected"
-                                                );
-                                            }
-                                            if terminate_stream {
-                                                microphone_ingress = None;
-                                                microphone_events = None;
-                                                if let Some(frames) = microphone_frames.take() {
-                                                    frames.stop();
-                                                }
-                                                warn!(
-                                                    target: AUDIO,
-                                                    "microphone ordering discontinuity terminated the negotiated stream"
-                                                );
-                                                if !send_microphone_failure(
-                                                    &disp_ctrl,
-                                                    microphone_generation,
-                                                )
-                                                .await
-                                                {
-                                                    break SessionEndReason::WriterEnded;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    if let Some(suppressed) =
-                                        microphone_authorization_warning.observe()
-                                    {
-                                        warn!(
-                                            target: AUDIO,
-                                            event = "mic_frame_rejected",
-                                            sid = %disp_session_log_id,
-                                            generation = microphone_generation,
-                                            reason = "not_negotiated",
-                                            suppressed_since_last = suppressed,
-                                            "unauthorized microphone frame dropped"
-                                        );
-                                    }
-                                }
-                            }
                             Some(FrameType::Clipboard) => {
                                 if let Some(item) = handle_deck_clipboard_binary(
                                     &bytes,
                                     clipboard_negotiation,
                                     deck_reassembler.as_mut(),
                                 ) {
-                                    if let Some(agent) = clipboard_agent.as_mut() {
-                                        if let Err(error) = send_clipboard_item(agent, item).await {
-                                            warn!(target: SESSION, %error, "clipboard agent injection IPC failed");
-                                            break SessionEndReason::TransportError;
-                                        }
+                                    // Handed to the bridge's own writer:
+                                    // this loop never waits on the helper.
+                                    if let Some(agent) = clipboard_agent.as_ref() {
+                                        agent.offer(item);
                                     }
                                 }
                             }
@@ -6559,9 +8265,17 @@ async fn run_attachment(
             let session_frames = |queues: &[Arc<FrameQueue>]| {
                 queues.iter().map(|queue| queue.frames_sent()).sum::<u64>()
             };
+            let session_keyframe_bytes = |queues: &[Arc<FrameQueue>]| {
+                queues
+                    .iter()
+                    .map(|queue| queue.keyframe_bytes_sent())
+                    .sum::<u64>()
+            };
             let mut last_bytes = session_bytes(&rate_queues);
             let mut last_frames = session_frames(&rate_queues);
+            let mut last_keyframe_bytes = session_keyframe_bytes(&rate_queues);
             let mut last_pipeline_bytes = pipeline_bytes(&rate_queues);
+            let mut last_detail_framerate = None;
             loop {
                 ticker.tick().await;
                 if connection.close_reason().is_some() {
@@ -6569,6 +8283,7 @@ async fn run_attachment(
                 }
                 let bytes = session_bytes(&rate_queues);
                 let frames = session_frames(&rate_queues);
+                let keyframe_bytes = session_keyframe_bytes(&rate_queues);
                 let pipeline_bytes_now = pipeline_bytes(&rate_queues);
                 let peak_pipeline_delivered_bytes = pipeline_bytes_now
                     .iter()
@@ -6599,18 +8314,20 @@ async fn run_attachment(
                         &connection,
                     )),
                 };
+                let hints = arcen_media::rate_control::RateHints {
+                    keyframe_bytes: keyframe_bytes.saturating_sub(last_keyframe_bytes),
+                };
                 last_bytes = bytes;
                 last_frames = frames;
+                last_keyframe_bytes = keyframe_bytes;
                 last_pipeline_bytes = pipeline_bytes_now;
                 if rate_control_enabled {
-                    let change = controller.observe(sample);
+                    let change = controller.observe_with(sample, hints);
                     let want_bps = controller.target_bps();
-                    let want_fps = (motion_priority == arcen_media::video::MotionPriority::Detail)
-                        .then(|| {
-                            arcen_media::rate_control::detail_framerate(
-                                plan.fps, start_bps, want_bps,
-                            )
-                        });
+                    let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
+                        .then(|| controller.detail_framerate(plan.fps));
+                    let want_fps = detail.map(|detail| detail.fps);
+                    let loss = controller.last_loss_evidence();
                     // Every tick, not only on a change: a pipeline whose
                     // mailbox was full catches up with the latest target.
                     let outcome = pipeline_sync.sync(
@@ -6628,13 +8345,34 @@ async fn run_attachment(
                             pipelines = bitrate_senders.len(),
                             pipelines_pending = outcome.pending,
                             fps = want_fps,
+                            fps_reason = detail.map(|detail| detail.reason.token()),
+                            bitrate_bound = controller.bitrate_bound(),
+                            delivered_bps = sample.delivered_bytes.saturating_mul(8),
+                            keyframe_bytes = hints.keyframe_bytes,
                             rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
                             queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
-                            loss_rate_permille = sample
-                                .path
-                                .map(|path| (path.loss_rate() * 1000.0).round() as u64),
+                            loss_rate_permille =
+                                loss.map(|loss| (loss.rate * 1000.0).round() as u64),
+                            loss_sample_packets = loss.map(|loss| loss.sent_packets),
                             "encoder bitrate follows QUIC path"
                         );
+                    }
+                    // A frame rate below the contract is never silent: every
+                    // change of the Detail decision is logged with its reason.
+                    if detail != last_detail_framerate {
+                        if let Some(detail) = detail {
+                            tracing::info!(
+                                target: CAPENC,
+                                fps = detail.fps,
+                                contract_fps = plan.fps,
+                                fps_reason = detail.reason.token(),
+                                target_bps = want_bps,
+                                start_bps,
+                                bitrate_bound = controller.bitrate_bound(),
+                                "encoder frame rate follows bitrate"
+                            );
+                        }
+                        last_detail_framerate = detail;
                     }
                 }
             }
@@ -6920,14 +8658,283 @@ async fn run_attachment(
     // then tear down cleanly. A resize is always a `continue`; only the four
     // original completion branches (plus a failed respawn) reach teardown.
     let mut capenc = Some(capenc);
+    // A Wayland Speed epoch on a copying route is judged on the host's own
+    // delivered and encoded rates; a shortfall serves the rest of the
+    // attachment as Auto, saying so.
+    let mut speed_guard = speed_guard_for(capenc.as_ref(), &active_capenc_config);
+    let mut capture_restarts = arcen_media::video::CaptureRestartBudget::new();
+    let attachment_clock = Instant::now();
     let mut current_plan = media_plan.clone();
     let mut last_resize_apply: Option<Instant> = None;
     let mut resize_open = true;
+    let mut input_status = lock_recover(&input_controller)
+        .as_ref()
+        .and_then(PierInput::wayland_status);
     let end_reason = loop {
         tokio::select! {
+            loss = wait_for_input_loss(&mut input_status) => {
+                // Input that can no longer reach the session would leave the
+                // Deck typing into nothing; end the attachment and say why.
+                warn!(target: INPUT, reason = %loss, "session input lost; ending the attachment");
+                let reason = match loss {
+                    crate::input::wayland::InjectorLoss::Superseded => {
+                        "session input was taken by another connection"
+                    }
+                    _ => "session input could not be restored",
+                };
+                if ctrl_tx
+                    .send_required(close_with_reason(reason), "input_lost_close")
+                    .await
+                {
+                    let _ = ctrl_tx.barrier().await;
+                }
+                break SessionEndReason::InputLost;
+            }
             r = &mut pump => {
-                debug!(target: MEDIA, "pump completed → teardown");
-                break r.unwrap_or(SessionEndReason::MediaEnded);
+                let reason = r.unwrap_or(SessionEndReason::MediaEnded);
+                // A single capture epoch that ended on its own (capture
+                // process died, its source was replaced) is restarted inside
+                // this attachment, keyframe first; audio, microphone and input
+                // keep running. A capture that keeps failing ends it.
+                if reason != SessionEndReason::MediaEnded
+                    || !matches!(capenc, Some(CapencHandle::Single(_)))
+                {
+                    debug!(target: MEDIA, "pump completed → teardown");
+                    break reason;
+                }
+                queue.begin_generation();
+                if let Some(session) = capenc.take() {
+                    session.shutdown().await;
+                }
+                // Each try consumes one restart of the shared budget: a
+                // replacement that fails to start or to deliver a keyframe
+                // (a Wayland agent that has not yet replaced a closed stream,
+                // or one still tearing down) is retried, not fatal, until
+                // the budget is spent.
+                let mut tries = 0_u32;
+                let replaced = loop {
+                    let attempt = match capture_restarts.on_epoch_ended(attachment_clock.elapsed()) {
+                        arcen_media::video::CaptureRestartDecision::Restart { attempt } => attempt,
+                        arcen_media::video::CaptureRestartDecision::Exhausted => {
+                            // A desktop that ended meanwhile is reported as
+                            // such, not as a failing capture.
+                            let reason = match (wayland_now.as_ref(), session_lease) {
+                                (Some(ready), Some(lease)) => wayland_capture_source(ready, lease)
+                                    .await
+                                    .err()
+                                    .unwrap_or("video capture keeps failing on the host"),
+                                _ => "video capture keeps failing on the host",
+                            };
+                            warn!(target: MEDIA, reason, "video capture could not be replaced; ending the attachment");
+                            break Err(reason);
+                        }
+                    };
+                    if tries > 0 {
+                        tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
+                    }
+                    tries += 1;
+                    warn!(target: MEDIA, attempt, "video capture epoch ended; starting a replacement");
+                    // A Wayland session's stream may have been replaced (new
+                    // node, next generation); a desktop whose agent is gone
+                    // has ended.
+                    let epoch_ready = match (wayland_now.as_ref(), session_lease) {
+                        (Some(ready), Some(lease)) => match wayland_capture_source(ready, lease).await {
+                            Ok(current) => Some(current),
+                            Err(reason) => {
+                                warn!(target: MEDIA, reason, "Wayland desktop gone; ending the attachment");
+                                break Err(reason);
+                            }
+                        },
+                        _ => None,
+                    };
+                    let mut epoch_config = active_capenc_config.clone();
+                    if let Some(ready) = epoch_ready.as_ref() {
+                        let wide = match session_lease {
+                            Some(lease) => {
+                                wayland_wide_streams(
+                                    epoch_config.bit_depth == arcen_media::BitDepth::Ten,
+                                    ready,
+                                    lease,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        if let Some(execution) = epoch_config.execution.as_mut() {
+                            follow_wayland_outputs(execution, ready, wide.as_deref());
+                        }
+                    }
+                    let (mut session, plan) = match capenc::spawn(epoch_config.clone()).await {
+                        Ok(spawned) => spawned,
+                        Err(error) => {
+                            warn!(target: CAPENC, %error, attempt, "replacement capture epoch failed to start");
+                            continue;
+                        }
+                    };
+                    if plan.width != current_plan.width
+                        || plan.height != current_plan.height
+                        || !resize_contract_matches(current_plan, plan)
+                    {
+                        session.shutdown().await;
+                        warn!(target: CAPENC, attempt, "replacement capture epoch changed geometry or media contract");
+                        continue;
+                    }
+                    match pump_replacement_epoch(&mut session, plan, &queue, mux_handle.clone(), &idr).await {
+                        Ok(replacement_pump) => {
+                            break Ok((session, replacement_pump, epoch_ready, epoch_config, attempt));
+                        }
+                        Err(()) => {
+                            session.shutdown().await;
+                        }
+                    }
+                };
+                let (session, replacement_pump, epoch_ready, epoch_config, attempt) = match replaced {
+                    Ok(replaced) => replaced,
+                    Err(reason) => {
+                        if ctrl_tx
+                            .send_required(close_with_reason(reason), "capture_replacement_close")
+                            .await
+                        {
+                            let _ = ctrl_tx.barrier().await;
+                        }
+                        break SessionEndReason::MediaEnded;
+                    }
+                };
+                pump = replacement_pump;
+                capenc = Some(CapencHandle::Single(session));
+                speed_guard = speed_guard_for(capenc.as_ref(), &epoch_config);
+                if let (Some(ready), Some(previous), Some(lease), Some(retarget)) = (
+                    epoch_ready.as_ref(),
+                    wayland_now.as_ref(),
+                    session_lease,
+                    wayland_retarget.as_ref(),
+                ) {
+                    if ready.generation != previous.generation {
+                        let followed = crate::input::wayland::WaylandInputTarget::from_session(
+                            ready,
+                            lease.metadata.uid,
+                            &lease.metadata.session_id,
+                            lease.metadata.agent_pid,
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|target| retarget.retarget(target).map_err(|error| error.to_string()));
+                        if let Err(error) = followed {
+                            warn!(target: INPUT, %error, "Wayland input could not follow the replaced stream");
+                        }
+                    }
+                }
+                if epoch_ready.is_some() {
+                    wayland_now = epoch_ready;
+                }
+                active_capenc_config = epoch_config;
+                if !queue.activate_generation() {
+                    tracing::error!(target: MEDIA, "replacement generation lost its pinned recovery AU");
+                    break SessionEndReason::MediaEnded;
+                }
+                info!(
+                    target: MEDIA,
+                    attempt,
+                    generation = wayland_now.as_ref().map(|ready| ready.generation),
+                    "video capture epoch replaced; streaming resumed with a keyframe"
+                );
+                continue;
+            }
+            verdict = next_speed_guard_verdict(&mut speed_guard), if speed_guard.is_some() => {
+                speed_guard = None;
+                let arcen_media::video::SpeedGuardVerdict::BelowFloor { encoded_fps, source_fps } = verdict else {
+                    info!(
+                        target: MEDIA,
+                        "Speed held its floor on this host (runtime guard): delivered and encoded \
+                         at Speed's rate while the content moved"
+                    );
+                    continue;
+                };
+                warn!(
+                    target: MEDIA,
+                    encoded_fps,
+                    source_fps,
+                    reason = arcen_media::video::AdmissionReason::SpeedRuntimeBelowFloor.token(),
+                    "Speed encoded below its floor while the source delivered at Speed's rate; \
+                     serving this attachment as Auto"
+                );
+                // Retire the Speed generation completely (as a resize does)
+                // so no access unit of the old chain follows the Auto IDR.
+                queue.begin_generation();
+                pump.abort();
+                let _ = (&mut pump).await;
+                if !ctrl_tx.barrier().await {
+                    break SessionEndReason::WriterEnded;
+                }
+                if let Some(session) = capenc.take() {
+                    session.shutdown().await;
+                }
+                let mut epoch_config = active_capenc_config.clone();
+                epoch_config.speed_runtime_shortfall = true;
+                let replaced = match capenc::spawn(epoch_config.clone()).await {
+                    Ok((mut session, plan)) => {
+                        if plan.width != current_plan.width || plan.height != current_plan.height {
+                            session.shutdown().await;
+                            Err("the Auto capture changed geometry")
+                        } else {
+                            match pump_replacement_epoch(&mut session, plan, &queue, mux_handle.clone(), &idr).await {
+                                Ok(replacement_pump) => Ok((session, plan, replacement_pump)),
+                                Err(()) => {
+                                    session.shutdown().await;
+                                    Err("the Auto capture delivered no keyframe")
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(target: CAPENC, %error, "the Auto capture after a Speed shortfall failed to start");
+                        Err("the Auto capture failed to start")
+                    }
+                };
+                let (session, plan, replacement_pump) = match replaced {
+                    Ok(replaced) => replaced,
+                    Err(reason) => {
+                        warn!(target: MEDIA, reason, "Speed could not be replaced by Auto; ending the attachment");
+                        if ctrl_tx
+                            .send_required(close_with_reason("video capture could not continue after Speed fell below its floor"), "speed_guard_close")
+                            .await
+                        {
+                            let _ = ctrl_tx.barrier().await;
+                        }
+                        break SessionEndReason::MediaEnded;
+                    }
+                };
+                pump = replacement_pump;
+                let served = served_pipeline_from_admission(session.capture_admission().and_then(|notice| notice.served()?.epoch()), || {
+                    arcen_protocol::messages::ServedStreamPipeline::Auto
+                });
+                capenc = Some(CapencHandle::Single(session));
+                current_plan = plan;
+                active_capenc_config = epoch_config;
+                if !queue.activate_generation() {
+                    tracing::error!(target: MEDIA, "the Auto generation lost its pinned recovery AU");
+                    break SessionEndReason::MediaEnded;
+                }
+                let message = arcen_protocol::messages::ServedPipelineMsg::new(
+                    served.clone(),
+                    "hardware",
+                    Some(arcen_media::video::AdmissionReason::SpeedRuntimeBelowFloor.token().to_owned()),
+                );
+                match serde_json::to_string(&message) {
+                    Ok(text) => {
+                        if !ctrl_tx.send_required(Message::Text(text.into()), "served_pipeline").await {
+                            warn!(target: MEDIA, "the Deck could not be told Speed is now served as Auto");
+                        }
+                    }
+                    Err(error) => warn!(target: MEDIA, %error, "served_pipeline could not be encoded"),
+                }
+                info!(
+                    target: MEDIA,
+                    served = served.token(),
+                    fps = current_plan.fps,
+                    reason = arcen_media::video::AdmissionReason::SpeedRuntimeBelowFloor.token(),
+                    "Speed is served as Auto for the rest of this attachment; streaming resumed with a keyframe"
+                );
+                continue;
             }
             r = &mut sender => {
                 debug!(target: NET, "sender completed → teardown");
@@ -6940,6 +8947,10 @@ async fn run_attachment(
             _ = receive_owner_command(owner_commands.as_deref_mut()) => {
                 debug!(target: SESSION, "resume owner command ended active attachment");
                 break SessionEndReason::HostShutdown;
+            }
+            ended = lanes.wait_ended() => {
+                debug!(target: NET, reason = ended.token(), "lane attachment ended → teardown");
+                break SessionEndReason::TransportError;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -6964,13 +8975,31 @@ async fn run_attachment(
                 }
                 let request = resize_rx.borrow_and_update().clone();
                 let Some(request) = request else { continue };
-                let resolution = match nvctrl::requested_resolution(request.width, request.height) {
-                    Ok(Some(resolution))
-                        if resolution.width % 4 == 0
-                            && resolution.height % 2 == 0
-                            && (current_plan.backend != EncoderBackend::OpenH264
-                                || (resolution.width <= 1920 && resolution.height <= 1080)) =>
-                    {
+                let resolution = match nvctrl::requested_resolution(request.width, request.height)
+                    .ok()
+                    .flatten()
+                    .and_then(|resolution| {
+                        resize_target(
+                            resolution.width,
+                            resolution.height,
+                            current_plan.backend == EncoderBackend::OpenH264,
+                            wayland_resizable,
+                        )
+                    })
+                    .and_then(|(width, height)| nvctrl::Resolution::new(width, height).ok())
+                {
+                    Some(resolution) => {
+                        if (resolution.width, resolution.height) != (request.width, request.height)
+                        {
+                            info!(
+                                target: DISPLAY,
+                                requested_w = request.width,
+                                requested_h = request.height,
+                                served_w = resolution.width,
+                                served_h = resolution.height,
+                                "display_update fitted to the software encoder's limits"
+                            );
+                        }
                         resolution
                     }
                     _ => {
@@ -7004,6 +9033,301 @@ async fn run_attachment(
                     {
                         break SessionEndReason::WriterEnded;
                     }
+                    continue;
+                }
+                if let (true, Some(ready), Some(lease)) =
+                    (wayland_resizable, wayland_now.clone(), session_lease)
+                {
+                    // What the epoch being replaced served: a resize never
+                    // upgrades a served contract (Speed only from evidence
+                    // at session start), and may only downgrade Speed.
+                    let served_before = capenc
+                        .as_ref()
+                        .and_then(CapencHandle::admitted_epoch)
+                        .map(|epoch| epoch.pipeline);
+                    let Some(concrete_encoder) = concrete_encoder_for(current_plan) else {
+                        send_display_update_result(
+                            &ctrl_tx,
+                            request.sequence,
+                            false,
+                            current_plan.width,
+                            current_plan.height,
+                            "active backend cannot be recreated on Linux",
+                        );
+                        continue;
+                    };
+                    let refresh_hz = ready.outputs.first().map_or(60, |output| output.refresh_hz);
+                    let resize_density = lease
+                        .metadata
+                        .requested_outputs
+                        .as_ref()
+                        .and_then(|outputs| outputs.first())
+                        .map(|output| output.density)
+                        .unwrap_or_default();
+                    let next_generation = ready.generation.saturating_add(1);
+                    info!(
+                        target: DISPLAY,
+                        sequence = request.sequence,
+                        width = resolution.width,
+                        height = resolution.height,
+                        refresh_hz,
+                        generation = next_generation,
+                        reason = %request.reason,
+                        "mid-session Wayland output resize begin"
+                    );
+                    // The stream is renegotiated only while no capture epoch
+                    // consumes it: retire the old generation first.
+                    queue.begin_generation();
+                    pump.abort();
+                    let _ = (&mut pump).await;
+                    if !ctrl_tx.barrier().await {
+                        break SessionEndReason::WriterEnded;
+                    }
+                    if let Some(session) = capenc.take() {
+                        session.shutdown().await;
+                    }
+                    let configured = crate::session::wayland::output_client::configure(
+                        &ready,
+                        lease.metadata.uid,
+                        lease.metadata.agent_pid,
+                        next_generation,
+                        vec![crate::session::wayland::OutputPlacement {
+                            width: resolution.width,
+                            height: resolution.height,
+                            refresh_hz,
+                            x: 0,
+                            y: 0,
+                            // The display a window is resized on keeps its
+                            // density (and so the output its UI scale).
+                            width_mm: resize_density.width_mm,
+                            height_mm: resize_density.height_mm,
+                            logical_width: 0,
+                        }],
+                    )
+                    .await;
+                    // A refused transaction left the previous output in
+                    // place; the replacement epoch then captures that one.
+                    // The epoch that follows captures what the agent says is
+                    // live: the resized output, or what a refused transaction
+                    // kept (its reply, or a fresh `hello` when the exchange
+                    // itself failed). Never assume the previous facts.
+                    let (epoch_ready, refusal) = match configured {
+                        Ok(reply) => (ready.with_outputs(&reply), None),
+                        Err(crate::session::wayland::output_client::OutputClientError::Refused {
+                            reason,
+                            live,
+                        }) => {
+                            warn!(target: DISPLAY, %reason, generation = live.generation, "Wayland output resize refused; the live output is kept");
+                            (ready.with_outputs(&live), Some(format!("output resize failed: {reason}")))
+                        }
+                        Err(error) => {
+                            warn!(target: DISPLAY, %error, "Wayland output resize exchange failed; reading the live output");
+                            match crate::session::wayland::output_client::current(
+                                &ready,
+                                lease.metadata.uid,
+                                lease.metadata.agent_pid,
+                            )
+                            .await
+                            {
+                                Ok(live) => (
+                                    ready.with_outputs(&live),
+                                    Some(format!("output resize failed: {error}")),
+                                ),
+                                Err(error) => {
+                                    warn!(target: DISPLAY, %error, "Wayland session outputs unreadable after a resize; ending session media");
+                                    if ctrl_tx
+                                        .send_required(
+                                            close_with_reason("the desktop's displays could not be read on the host"),
+                                            "wayland_outputs_unreadable_close",
+                                        )
+                                        .await
+                                    {
+                                        let _ = ctrl_tx.barrier().await;
+                                    }
+                                    break SessionEndReason::MediaEnded;
+                                }
+                            }
+                        }
+                    };
+                    let Some(stream) = epoch_ready.streams.first().cloned() else {
+                        break SessionEndReason::MediaEnded;
+                    };
+                    let mut resize_config = active_capenc_config.clone();
+                    let wide = wayland_wide_streams(
+                        resize_config.bit_depth == arcen_media::BitDepth::Ten,
+                        &epoch_ready,
+                        lease,
+                    )
+                    .await;
+                    if let Some(execution) = resize_config.execution.as_mut() {
+                        follow_wayland_outputs(execution, &epoch_ready, wide.as_deref());
+                    }
+                    resize_config.width = stream.width;
+                    resize_config.height = stream.height;
+                    resize_config.encoder = concrete_encoder;
+                    // Speed's evidence is per size: never carry the old one,
+                    // and never let it upgrade an epoch served as Auto.
+                    resize_config.capture_rates_by_codec = resize_speed_evidence(
+                        served_before,
+                        cfg.wayland_speed_capture_rates(
+                            resize_config.execution.as_ref(),
+                            resize_config.width,
+                            resize_config.height,
+                        ),
+                    );
+                    let (mut session, plan) = match capenc::spawn(resize_config.clone()).await {
+                        Ok(spawned) => spawned,
+                        Err(error) => {
+                            warn!(
+                                target: CAPENC,
+                                %error,
+                                "capenc after a Wayland output resize failed; ending session media"
+                            );
+                            break SessionEndReason::MediaEnded;
+                        }
+                    };
+                    let served_after = session
+                        .capture_admission()
+                        .and_then(|notice| notice.served()?.epoch())
+                        .map(|epoch| epoch.pipeline);
+                    let downgrade_reason = session.capture_admission().and_then(|notice| {
+                        match notice.admission {
+                            arcen_media::video::PresetAdmission::Downgrade { reason, .. } => {
+                                Some(reason.token())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if plan.width != stream.width
+                        || plan.height != stream.height
+                        || !resize_keeps_contract(current_plan, plan, served_before, served_after)
+                    {
+                        session.shutdown().await;
+                        warn!(
+                            target: CAPENC,
+                            "replacement READY changed geometry or active media contract"
+                        );
+                        break SessionEndReason::MediaEnded;
+                    }
+                    idr.retarget(&session);
+                    let frames = session
+                        .take_frames()
+                        .expect("fresh capenc frames receiver available");
+                    let (keyframe_ready, keyframe_wait) = oneshot::channel();
+                    pump = spawn_frame_pump(
+                        plan,
+                        frames,
+                        queue.clone(),
+                        Some(keyframe_ready),
+                        0,
+                        0,
+                        0,
+                        mux_handle.clone(),
+                    );
+                    idr.request();
+                    if !matches!(
+                        tokio::time::timeout(Duration::from_secs(10), keyframe_wait).await,
+                        Ok(Ok(()))
+                    ) {
+                        session.shutdown().await;
+                        warn!(target: MEDIA, "replacement media generation did not produce an IDR");
+                        break SessionEndReason::MediaEnded;
+                    }
+                    capenc = Some(CapencHandle::Single(session));
+                    speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
+                    if served_before != served_after {
+                        // Speed at a size this host has no evidence for:
+                        // served as Auto from here, and the Deck is told.
+                        let reason = downgrade_reason.unwrap_or("speed_not_qualified_at_size");
+                        warn!(
+                            target: MEDIA,
+                            width = plan.width,
+                            height = plan.height,
+                            reason,
+                            "Speed has no evidence at the resized output; serving this attachment as Auto"
+                        );
+                        crate::session::wayland::note_unqualified_speed_display(
+                            &cfg.wayland_qualification_target,
+                            plan.width,
+                            plan.height,
+                            refresh_hz,
+                            arcen_session::wayland_qualification::QUALIFY_CODECS[0],
+                        );
+                        let message = arcen_protocol::messages::ServedPipelineMsg::new(
+                            arcen_protocol::messages::ServedStreamPipeline::Auto,
+                            "hardware",
+                            Some(reason.to_owned()),
+                        );
+                        if let Ok(text) = serde_json::to_string(&message) {
+                            if !ctrl_tx
+                                .send_required(Message::Text(text.into()), "served_pipeline")
+                                .await
+                            {
+                                break SessionEndReason::WriterEnded;
+                            }
+                        }
+                    }
+                    // Input follows the new generation before the Deck learns
+                    // the new size from the result below.
+                    if epoch_ready.generation != ready.generation {
+                        if let Some(retarget) = wayland_retarget.as_ref() {
+                            let successor = crate::input::wayland::WaylandInputTarget::from_session(
+                                &epoch_ready,
+                                lease.metadata.uid,
+                                &lease.metadata.session_id,
+                                lease.metadata.agent_pid,
+                            );
+                            if let Err(error) = successor.map_err(|error| error.to_string()).and_then(
+                                |successor| retarget.retarget(successor).map_err(|error| error.to_string()),
+                            ) {
+                                warn!(target: INPUT, %error, "Wayland input could not follow the resized output");
+                            }
+                        }
+                    }
+                    let written = match refusal.as_deref() {
+                        None => {
+                            send_authoritative_display_update_result(
+                                &ctrl_tx,
+                                request.sequence,
+                                plan.width,
+                                plan.height,
+                            )
+                            .await
+                        }
+                        Some(reason) => {
+                            send_display_update_result(
+                                &ctrl_tx,
+                                request.sequence,
+                                false,
+                                plan.width,
+                                plan.height,
+                                reason,
+                            );
+                            true
+                        }
+                    };
+                    if !written {
+                        break SessionEndReason::WriterEnded;
+                    }
+                    current_plan = plan;
+                    active_capenc_config = resize_config;
+                    wayland_now = Some(epoch_ready);
+                    if !queue.activate_generation() {
+                        tracing::error!(
+                            target: MEDIA,
+                            "replacement generation lost its pinned recovery AU"
+                        );
+                        break SessionEndReason::MediaEnded;
+                    }
+                    last_resize_apply = Some(Instant::now());
+                    info!(
+                        target: DISPLAY,
+                        width = current_plan.width,
+                        height = current_plan.height,
+                        generation = wayland_now.as_ref().map_or(0, |ready| ready.generation),
+                        accepted = refusal.is_none(),
+                        "mid-session Wayland output resize generation activated"
+                    );
                     continue;
                 }
                 let Some(display_resources) = display.as_mut() else {
@@ -7078,6 +9402,11 @@ async fn run_attachment(
                 resize_config.width = resolution.width;
                 resize_config.height = resolution.height;
                 resize_config.encoder = concrete_encoder;
+                resize_config.capture_rates_by_codec = cfg.wayland_speed_capture_rates(
+                    resize_config.execution.as_ref(),
+                    resize_config.width,
+                    resize_config.height,
+                );
                 let (mut session, plan) = match capenc::spawn(resize_config.clone()).await {
                     Ok(spawned) => spawned,
                     Err(error) => {
@@ -7145,6 +9474,7 @@ async fn run_attachment(
                     break SessionEndReason::MediaEnded;
                 }
                 capenc = Some(CapencHandle::Single(session));
+                speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
 
                 // Keep the replacement IDR paused until the accepted result is
                 // physically written. Deck updates display/input geometry from
@@ -7212,7 +9542,15 @@ async fn run_attachment(
     }
     pump.abort();
     sender.abort();
+    for task in &lane_readers {
+        task.abort();
+    }
     abort_and_reap_if_pending(&mut dispatcher).await;
+    // Held keys, buttons and pen state never outlive the attachment.
+    if let Some(controller) = lock_recover(&input_controller).as_mut() {
+        let _ = controller.reset_held();
+    }
+    lanes.end(arcen_transport::lanes::LaneEndReason::Closed);
     if !microphone_transport_summary_reported.swap(true, Ordering::AcqRel) {
         microphone_transport_telemetry.try_snapshot(
             lock_recover(&microphone_transport_stats).total(),
@@ -7287,6 +9625,9 @@ async fn run_attachment(
         pen_events = input_stats.as_ref().map_or(0, |stats| stats.pen_events()),
         input_resets = input_stats.as_ref().map_or(0, |stats| stats.resets()),
         unmapped_keys = input_stats.as_ref().map_or(0, |stats| stats.unmapped_keys()),
+        input_unavailable_drops = input_stats
+            .as_ref()
+            .map_or(0, |stats| stats.unavailable_drops()),
         "session ended"
     );
     AttachmentEnd {
@@ -7502,6 +9843,44 @@ fn served_pipeline_contract_for_quality(
     })
 }
 
+/// The Speed evidence a resized Wayland epoch may use: none when the epoch
+/// it replaces was served as Auto (a resize never upgrades a contract mid
+/// attachment), the new size's otherwise.
+fn resize_speed_evidence(
+    served_before: Option<arcen_media::video::PipelineId>,
+    rates: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
+) -> Vec<(String, u32, arcen_media::video::CaptureRateEvidence)> {
+    if served_before == Some(arcen_media::video::PipelineId::Auto) {
+        Vec::new()
+    } else {
+        rates
+    }
+}
+
+/// Whether a resized epoch keeps the attachment's contract: only geometry
+/// changes, except that an epoch served as Speed may come back served as
+/// Auto (its frame rate with it) when the new size has no Speed evidence. A
+/// resize never upgrades.
+fn resize_keeps_contract(
+    current: ResolvedMediaPlan,
+    candidate: ResolvedMediaPlan,
+    served_before: Option<arcen_media::video::PipelineId>,
+    served_after: Option<arcen_media::video::PipelineId>,
+) -> bool {
+    use arcen_media::video::PipelineId;
+    match (served_before, served_after) {
+        (before, after) if before == after => resize_contract_matches(current, candidate),
+        (Some(PipelineId::Speed), Some(PipelineId::Auto)) => resize_contract_matches(
+            current,
+            ResolvedMediaPlan {
+                fps: current.fps,
+                ..candidate
+            },
+        ),
+        _ => false,
+    }
+}
+
 fn resize_contract_matches(current: ResolvedMediaPlan, candidate: ResolvedMediaPlan) -> bool {
     current.backend == candidate.backend
         && current.video == candidate.video
@@ -7512,6 +9891,47 @@ fn resize_contract_matches(current: ResolvedMediaPlan, candidate: ResolvedMediaP
         // change what the backend can do. Adding a codec needs no edit here.
         && current.codecs == candidate.codecs
         && current.chroma == candidate.chroma
+}
+
+/// Pumps a replacement single-capture epoch's frames into `queue`, asks it
+/// for a keyframe and waits up to 10 s for that keyframe to be queued.
+///
+/// # Errors
+///
+/// When the epoch delivers no keyframe; the session is shut down.
+async fn pump_replacement_epoch(
+    session: &mut capenc::CapencSession,
+    plan: ResolvedMediaPlan,
+    queue: &Arc<FrameQueue>,
+    mux: Option<Arc<MonitorMux>>,
+    idr: &IdrRequester,
+) -> Result<tokio::task::JoinHandle<SessionEndReason>, ()> {
+    idr.retarget(session);
+    let frames = session
+        .take_frames()
+        .expect("fresh capenc frames receiver available");
+    let (keyframe_ready, keyframe_wait) = oneshot::channel();
+    let pump = spawn_frame_pump(
+        plan,
+        frames,
+        Arc::clone(queue),
+        Some(keyframe_ready),
+        0,
+        0,
+        0,
+        mux,
+    );
+    idr.request();
+    if matches!(
+        tokio::time::timeout(Duration::from_secs(10), keyframe_wait).await,
+        Ok(Ok(()))
+    ) {
+        Ok(pump)
+    } else {
+        pump.abort();
+        warn!(target: MEDIA, "replacement media generation did not produce an IDR");
+        Err(())
+    }
 }
 
 /// Pump capenc access units into the backpressure queue as wire frames.
@@ -7746,11 +10166,52 @@ where
     }
 }
 
-async fn next_clipboard_agent_message(
-    agent: &mut Option<WebSocketStream<ClipboardAgentIo>>,
-) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+/// Whether losing this clipboard bridge leaves the attachment running. The
+/// dedicated-Xorg child is supervised as part of the attachment (unchanged);
+/// a Wayland session's bridge is an auxiliary channel, so losing it turns the
+/// clipboard off and the session goes on.
+const fn clipboard_bridge_survivable(kind: Option<crate::clipboard::ClipboardBridgeKind>) -> bool {
+    matches!(
+        kind,
+        Some(crate::clipboard::ClipboardBridgeKind::WaylandSession)
+    )
+}
+
+/// Turns the clipboard off for the rest of this attachment: no more items
+/// either way, partial transfers scrubbed. There is no wire message that
+/// withdraws a negotiated clipboard, so the Deck is not told; its items are
+/// dropped here.
+fn disable_clipboard_bridge(
+    agent: &mut Option<crate::clipboard::ClipboardBridgeLink>,
+    outbound: &ClipboardWriterQueue,
+    deck_reassembler: &mut Option<arcen_protocol::clipboard::ClipboardReassembler>,
+    agent_reassembler: &mut Option<arcen_protocol::clipboard::ClipboardReassembler>,
+    error: &str,
+) {
+    warn!(
+        target: SESSION,
+        event = "clipboard_bridge_lost",
+        backend = "wayland_session",
+        error,
+        "clipboard bridge lost; clipboard off for the rest of this attachment"
+    );
+    *agent = None;
+    outbound.close();
+    if let Some(reassembler) = deck_reassembler.as_mut() {
+        reassembler.abort();
+    }
+    if let Some(reassembler) = agent_reassembler.as_mut() {
+        reassembler.abort();
+    }
+    *deck_reassembler = None;
+    *agent_reassembler = None;
+}
+
+async fn next_clipboard_bridge_event(
+    agent: &mut Option<crate::clipboard::ClipboardBridgeLink>,
+) -> crate::clipboard::ClipboardBridgeEvent {
     match agent {
-        Some(agent) => agent.next().await,
+        Some(agent) => agent.next_event().await,
         None => std::future::pending().await,
     }
 }
@@ -7774,7 +10235,7 @@ fn handle_deck_clipboard_offer(
         warn!(target: SESSION, reason = "invalid_metadata", "clipboard offer rejected");
         return;
     };
-    if !negotiation.allows(ClipboardFlow::ClientToHost, offer.kind)
+    if !negotiation.allows(ClipboardFlow::ClientToHost, offer.kind.into())
         || negotiation
             .policy()
             .check_size(
@@ -7813,7 +10274,7 @@ fn handle_deck_clipboard_binary(
 ) -> Option<ClipboardItem> {
     let (negotiation, reassembler) = (negotiation?, reassembler?);
     let (header, payload) = decode_clipboard_chunk(bytes).ok()?;
-    if !negotiation.allows(ClipboardFlow::ClientToHost, header.kind)
+    if !negotiation.allows(ClipboardFlow::ClientToHost, header.kind.into())
         || negotiation
             .policy()
             .check_size(
@@ -7850,45 +10311,6 @@ fn handle_deck_clipboard_binary(
     )
 }
 
-async fn send_clipboard_item(
-    agent: &mut WebSocketStream<ClipboardAgentIo>,
-    item: ClipboardItem,
-) -> Result<(), String> {
-    let size = u32::try_from(item.bytes.len())
-        .map_err(|_| "clipboard IPC item size exceeds u32".to_string())?;
-    let offer = ClipboardDataMsg::new(item.sequence, item.kind, size, item.truncated);
-    agent
-        .send(Message::Text(
-            serde_json::to_string(&offer)
-                .map_err(|error| format!("serialize clipboard IPC offer: {error}"))?
-                .into(),
-        ))
-        .await
-        .map_err(|error| format!("send clipboard IPC offer: {error}"))?;
-    for (index, payload) in item.bytes.chunks(arcen_protocol::CHUNK_BYTES).enumerate() {
-        let offset = index
-            .checked_mul(arcen_protocol::CHUNK_BYTES)
-            .and_then(|offset| u32::try_from(offset).ok())
-            .ok_or_else(|| "clipboard IPC offset overflow".to_string())?;
-        let frame = encode_clipboard_chunk(
-            ClipboardChunkHeader {
-                kind: item.kind,
-                sequence: item.sequence,
-                total_size: size,
-                offset,
-            },
-            payload,
-        )
-        .map_err(|error| format!("encode clipboard IPC chunk: {error:?}"))?;
-        agent
-            .send(Message::Binary(frame.into()))
-            .await
-            .map_err(|error| format!("send clipboard IPC chunk: {error}"))?;
-        tokio::task::yield_now().await;
-    }
-    Ok(())
-}
-
 fn handle_agent_clipboard_message(
     message: Message,
     negotiation: Option<ClipboardNegotiation>,
@@ -7906,7 +10328,7 @@ fn handle_agent_clipboard_message(
             let Ok(offer) = serde_json::from_str::<ClipboardDataMsg>(&text) else {
                 return;
             };
-            if negotiation.allows(ClipboardFlow::HostToClient, offer.kind)
+            if negotiation.allows(ClipboardFlow::HostToClient, offer.kind.into())
                 && negotiation
                     .policy()
                     .check_size(
@@ -7924,7 +10346,7 @@ fn handle_agent_clipboard_message(
                 reassembler.abort();
                 return;
             };
-            if !negotiation.allows(ClipboardFlow::HostToClient, header.kind) {
+            if !negotiation.allows(ClipboardFlow::HostToClient, header.kind.into()) {
                 reassembler.abort();
                 return;
             }
@@ -7962,34 +10384,11 @@ fn validate_clipboard_completed(
     kind: arcen_protocol::messages::ClipboardContentKind,
     bytes: &[u8],
 ) -> bool {
-    if policy
-        .check_size(flow, clipboard_kind(kind), bytes.len())
-        .is_err()
-    {
-        return false;
-    }
-    match kind {
-        arcen_protocol::messages::ClipboardContentKind::TextUtf8 => {
-            std::str::from_utf8(bytes).is_ok()
-        }
-        arcen_protocol::messages::ClipboardContentKind::ImagePng => {
-            arcen_media::clipboard::validate_png(
-                bytes,
-                arcen_media::clipboard::ImageLimits {
-                    max_encoded_bytes: policy.max_bytes,
-                    ..arcen_media::clipboard::ImageLimits::default()
-                },
-            )
-            .is_ok()
-        }
-    }
+    arcen_media::clipboard::formats::validate_payload(policy, flow, kind.into(), bytes).is_ok()
 }
 
 fn clipboard_kind(kind: arcen_protocol::messages::ClipboardContentKind) -> ClipboardKind {
-    match kind {
-        arcen_protocol::messages::ClipboardContentKind::TextUtf8 => ClipboardKind::TextUtf8,
-        arcen_protocol::messages::ClipboardContentKind::ImagePng => ClipboardKind::ImagePng,
-    }
+    kind.into()
 }
 
 #[derive(Clone)]
@@ -8207,7 +10606,9 @@ async fn disable_audio_after_codec_failure(
     queue: &Arc<AudioQueue>,
     capture: &Arc<tokio::sync::Mutex<Option<audiocap::AudioSession>>>,
 ) -> bool {
-    audio.record_encode_failure();
+    if reason == arcen_protocol::messages::AudioStreamReason::CodecFailure {
+        audio.record_encode_failure();
+    }
     let stream = ResolvedAudioStream::disabled(audio.stream().mode, reason);
     audio.set_stream(stream);
     encoder
@@ -8221,193 +10622,6 @@ async fn disable_audio_after_codec_failure(
         session.shutdown_preserving_queue().await;
     }
     send_audio_result_required(control, stream).await
-}
-
-/// Sends one audio frame on the Deck's priority stream, logging when the
-/// stream opens and when it fails. Returns whether the frame went; a frame
-/// that did not goes on the session stream.
-async fn send_priority_audio(
-    priority: &mut arcen_transport::quic::PriorityAudio,
-    frame: &[u8],
-) -> bool {
-    let outcome = priority.send(frame).await;
-    match &outcome {
-        arcen_transport::quic::PriorityAudioSend::Opened => {
-            info!(target: SESSION, "audio moved to its own priority stream");
-        }
-        arcen_transport::quic::PriorityAudioSend::OpenFailed(error)
-        | arcen_transport::quic::PriorityAudioSend::WriteFailed(error) => {
-            warn!(
-                target: SESSION,
-                %error,
-                "audio priority stream unavailable; audio stays on the session stream"
-            );
-        }
-        arcen_transport::quic::PriorityAudioSend::Sent
-        | arcen_transport::quic::PriorityAudioSend::Unusable => {}
-    }
-    outcome.delivered()
-}
-
-#[allow(clippy::too_many_arguments)] // Per-connection sender context: mux source plus audio/clipboard/control/resume wiring.
-async fn sender_loop<S>(
-    mut sink: S,
-    video: crate::session::monitor_mux::VideoSource,
-    audio: Arc<AudioQueue>,
-    clipboard: Arc<ClipboardWriterQueue>,
-    mut control: mpsc::Receiver<WriterControl>,
-    audio_control: AudioControl,
-    refresh: Option<ResumeRefreshContext>,
-    write_timeout: Duration,
-    // The Deck's audio priority stream, when it accepted one: audio then
-    // never queues behind video this sink has already accepted.
-    mut priority_audio: Option<arcen_transport::quic::PriorityAudio>,
-    video_write_wait_micros: Arc<AtomicU64>,
-) -> SessionEndReason
-where
-    S: futures_util::Sink<Message> + Unpin,
-    S::Error: std::fmt::Display,
-{
-    let mut refresh_interval = refresh.as_ref().map(|refresh| {
-        let mut interval = tokio::time::interval(resume_refresh_interval(refresh.window_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval
-    });
-    if let Some(interval) = refresh_interval.as_mut() {
-        interval.tick().await;
-    }
-    let mut clipboard_open = true;
-    let mut clipboard_allowed = true;
-    let mut audio_open = true;
-    loop {
-        tokio::select! {
-            biased;
-            _ = async {
-                match refresh_interval.as_mut() {
-                    Some(interval) => {
-                        interval.tick().await;
-                    }
-                    None => std::future::pending().await,
-                }
-            } => {
-                let refresh = refresh.as_ref().expect("refresh interval requires refresh context");
-                let registry = refresh.session_registry.resume();
-                let grant = match registry.refresh_grant(&refresh.active_session_id) {
-                    Ok(grant) => grant,
-                    Err(_) => {
-                        if let Err(error) = registry.begin_drain(&refresh.active_session_id) {
-                            tracing::error!(
-                                target: SESSION,
-                                ?error,
-                                "resume refresh failure could not drain authority"
-                            );
-                        }
-                        return SessionEndReason::ResumeAuthorityFailure;
-                    }
-                };
-                if !send_successor_auth_result_or_drain(
-                    &mut sink,
-                    "Resume grant refreshed",
-                    &grant.grant,
-                    grant.window_secs,
-                    false,
-                    write_timeout,
-                    registry,
-                    &refresh.active_session_id,
-                ).await {
-                    return SessionEndReason::ResumeAuthorityFailure;
-                }
-            },
-            ctrl = control.recv() => match ctrl {
-                Some(WriterControl::Message(msg)) => if !send_ws_with_timeout(
-                    &mut sink,
-                    msg,
-                    "control",
-                    write_timeout,
-                ).await { break; },
-                Some(WriterControl::Barrier(complete)) => {
-                    let _ = complete.send(());
-                }
-                None => break,
-            },
-            message = clipboard.pop(), if clipboard_open && clipboard_allowed => match message {
-                Ok(Some(message)) => {
-                    clipboard_allowed = false;
-                    if !send_ws_with_timeout(
-                        &mut sink,
-                        message,
-                        "clipboard",
-                        write_timeout,
-                    ).await {
-                        break;
-                    }
-                }
-                Ok(None) => clipboard_open = false,
-                Err(error) => {
-                    warn!(target: SESSION, %error, "clipboard writer failed");
-                    break;
-                }
-            },
-            packet = audio.dequeue(), if audio_open => match packet {
-                Some(packet) => {
-                    clipboard_allowed = true;
-                    let stream = audio_control.stream();
-                    if !stream.is_enabled() || stream.codec != Some(packet.codec) {
-                        continue;
-                    }
-                    let payload_bytes = packet.payload.len();
-                    let bytes = media::build_audio_frame(
-                        packet.codec,
-                        &packet.payload,
-                        packet.timestamp_ms,
-                    );
-                    if let Some(priority) = priority_audio.as_mut().filter(|priority| priority.usable()) {
-                        if send_priority_audio(priority, &bytes).await {
-                            audio_control.record_sent(payload_bytes);
-                            continue;
-                        }
-                    }
-                    if !send_ws_with_timeout(
-                        &mut sink,
-                        Message::Binary(bytes),
-                        "audio",
-                        write_timeout,
-                    ).await {
-                        break;
-                    }
-                    audio_control.record_sent(payload_bytes);
-                },
-                None => audio_open = false,
-            },
-            frame = video.dequeue() => match frame {
-                Some(bytes) => {
-                    clipboard_allowed = true;
-                    let write_started = Instant::now();
-                    if !send_ws_with_timeout(
-                        &mut sink,
-                        Message::Binary(bytes),
-                        "video",
-                        write_timeout,
-                    ).await {
-                        break;
-                    }
-                    let micros = u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    video_write_wait_micros.fetch_add(micros, Ordering::Relaxed);
-                },
-                None => break,
-            },
-            () = clipboard_cooldown(), if clipboard_open && !clipboard_allowed => {
-                clipboard_allowed = true;
-            },
-        }
-    }
-
-    async fn clipboard_cooldown() {
-        tokio::task::yield_now().await;
-    }
-    let _ = tokio::time::timeout(write_timeout, sink.close()).await;
-    debug!(target: NET, "sender task ended");
-    SessionEndReason::WriterEnded
 }
 
 /// Dispatch one inbound JSON control message.
@@ -8427,7 +10641,7 @@ fn handle_control_json(
     media_plan: &capenc::ResolvedMediaPlan,
     session_log_id: &CorrelationId,
     authoritative_timezone: Option<&IanaTimeZone>,
-    input: Option<&mut InputController>,
+    input: Option<&mut PierInput>,
     full_frame_requests: &mut arcen_media::video::FullFrameRequestCoalescer,
     input_sequence: &mut InputSequenceTracker,
     active_cursor_mode: CursorMode,
@@ -8442,16 +10656,10 @@ fn handle_control_json(
         }
     };
     let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if is_legacy_region_input_message(msg_type)
-        && input
-            .as_ref()
-            .is_some_and(|controller| controller.region_input_available())
+    if arcen_protocol::lanes::lane_for_message_type(msg_type)
+        == arcen_protocol::lanes::LaneRole::InputCursor
     {
-        warn!(
-            target: INPUT,
-            message_type = msg_type,
-            "legacy input rejected in a region-authoritative session"
-        );
+        handle_input_json(text, input, input_sequence);
         return;
     }
 
@@ -8633,6 +10841,41 @@ fn handle_control_json(
                 ctrl.send_best_effort(Message::Text(j), "health_reply");
             }
         }
+        other => debug!(target: NET, msg_type = other, "unhandled control message (stage 1)"),
+    }
+}
+
+/// Dispatch one inbound input message (the input/cursor lane's JSON).
+/// Region messages carry their topology generation, so the shared region
+/// state refuses a stale one whatever order the control and input lanes
+/// delivered in.
+fn handle_input_json(
+    text: &str,
+    input: Option<&mut PierInput>,
+    input_sequence: &mut InputSequenceTracker,
+) {
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(target: INPUT, error = %e, "ignoring malformed input JSON");
+            return;
+        }
+    };
+    let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if is_legacy_region_input_message(msg_type)
+        && input
+            .as_ref()
+            .is_some_and(|controller| controller.region_input_available())
+    {
+        warn!(
+            target: INPUT,
+            message_type = msg_type,
+            "legacy input rejected in a region-authoritative session"
+        );
+        return;
+    }
+
+    match msg_type {
         "key_event" => {
             let Some(input) = input else {
                 trace!(target: INPUT, "key_event ignored: input backend disabled");
@@ -8641,10 +10884,24 @@ fn handle_control_json(
             match parse_sequenced_input::<KeyEventMsg>(text, input_sequence) {
                 Ok(message) => {
                     if let Err(error) = input.key_event(&message) {
-                        warn!(target: INPUT, %error, "key injection failed");
+                        report_injection_error(&error, "key injection failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid key_event"),
+            }
+        }
+        TEXT_COMMIT => {
+            let Some(input) = input else {
+                trace!(target: INPUT, "text_commit ignored: input backend disabled");
+                return;
+            };
+            match serde_json::from_str::<TextCommitMsg>(text) {
+                Ok(message) => {
+                    if let Err(error) = input.text_commit(&message) {
+                        report_injection_error(&error, "committed text not typed");
+                    }
+                }
+                Err(error) => debug!(target: INPUT, %error, "invalid text_commit"),
             }
         }
         KEY_RESET_MODIFIERS => {
@@ -8655,7 +10912,7 @@ fn handle_control_json(
                 Ok(message) => {
                     debug!(target: INPUT, reason = %message.reason, "releasing held input state");
                     if let Err(error) = input.reset_keyboard_held() {
-                        warn!(target: INPUT, %error, "keyboard reset failed");
+                        report_injection_error(&error, "keyboard reset failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid key_reset_modifiers"),
@@ -8741,7 +10998,7 @@ fn handle_control_json(
             match parse_sequenced_input::<MouseMoveMsg>(text, input_sequence) {
                 Ok(message) => {
                     if let Err(error) = input.mouse_move(&message) {
-                        warn!(target: INPUT, %error, "mouse move injection failed");
+                        report_injection_error(&error, "mouse move injection failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_move"),
@@ -8754,7 +11011,7 @@ fn handle_control_json(
             match parse_sequenced_input::<MouseMoveRelativeMsg>(text, input_sequence) {
                 Ok(message) => {
                     if let Err(error) = input.mouse_move_relative(&message) {
-                        warn!(target: INPUT, %error, "relative mouse move injection failed");
+                        report_injection_error(&error, "relative mouse move injection failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_move_relative"),
@@ -8767,7 +11024,7 @@ fn handle_control_json(
             match parse_sequenced_input::<MouseButtonMsg>(text, input_sequence) {
                 Ok(message) => {
                     if let Err(error) = input.mouse_button(&message) {
-                        warn!(target: INPUT, %error, "mouse button injection failed");
+                        report_injection_error(&error, "mouse button injection failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_button"),
@@ -8780,7 +11037,7 @@ fn handle_control_json(
             match parse_sequenced_input::<MouseScrollMsg>(text, input_sequence) {
                 Ok(message) => {
                     if let Err(error) = input.mouse_scroll(&message) {
-                        warn!(target: INPUT, %error, "mouse scroll injection failed");
+                        report_injection_error(&error, "mouse scroll injection failed");
                     }
                 }
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_scroll"),
@@ -8819,7 +11076,42 @@ fn handle_control_json(
             }
         }
 
-        other => debug!(target: NET, msg_type = other, "unhandled control message (stage 1)"),
+        other => debug!(target: INPUT, msg_type = other, "unhandled input message"),
+    }
+}
+
+/// Resolves when a Wayland injector's input is lost for good; never for
+/// uinput, or once the injector closed with its attachment.
+async fn wait_for_input_loss(
+    status: &mut Option<tokio::sync::watch::Receiver<crate::input::wayland::InjectorStatus>>,
+) -> crate::input::wayland::InjectorLoss {
+    use crate::input::wayland::{InjectorLoss, InjectorStatus};
+    loop {
+        let Some(receiver) = status.as_mut() else {
+            return std::future::pending().await;
+        };
+        if let InjectorStatus::Lost(loss) = &*receiver.borrow_and_update() {
+            if *loss != InjectorLoss::Closed {
+                return loss.clone();
+            }
+        }
+        if receiver.changed().await.is_err() {
+            *status = None;
+        }
+    }
+}
+
+/// Logs an injection failure. A Wayland session input connection that is
+/// down was logged once when it went down; each event refused meanwhile is
+/// counted (`InputStats::unavailable_drops`), not logged at pointer rate.
+fn report_injection_error(error: &InputError, what: &'static str) {
+    match error {
+        InputError::InjectorLost
+        | InputError::InjectorReconnecting
+        | InputError::TextUnavailable => {
+            trace!(target: INPUT, %error, what, "input not delivered");
+        }
+        _ => warn!(target: INPUT, %error, "{what}"),
     }
 }
 
@@ -8996,9 +11288,93 @@ fn now_ms_u32() -> u32 {
     (now_ms_u64() & 0xFFFF_FFFF) as u32
 }
 
+/// Why a Wayland attachment's cursor authority differs from the Deck's
+/// request: its desktop fixed how the cursor is reported when it opened.
+fn wayland_cursor_reason(
+    requested: CursorMode,
+    active: CursorMode,
+    stream: Option<crate::session::wayland::StreamCursorMode>,
+) -> CursorModeReason {
+    use crate::session::wayland::StreamCursorMode;
+    let reason = match (requested, active, stream) {
+        (CursorMode::Host, CursorMode::Local, Some(StreamCursorMode::Metadata)) => {
+            "this desktop reports its cursor separately; start a new desktop to have it drawn into the video"
+        }
+        (CursorMode::Host, CursorMode::Local, Some(StreamCursorMode::Hidden)) => {
+            "this desktop leaves its cursor to the Deck; start a new desktop to have it drawn into the video"
+        }
+        (CursorMode::Local, CursorMode::Host, Some(StreamCursorMode::Embedded)) => {
+            "this desktop draws its cursor into the video; start a new desktop to have the Deck draw it"
+        }
+        _ => return CursorModeReason::default(),
+    };
+    CursorModeReason::try_from(reason.to_owned()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_depth_downgrade_tells_the_deck_how_to_get_a_ten_bit_desktop() {
+        assert!(desktop_depth_served_pipeline(&Config::default()).is_none());
+        let downgraded = Config {
+            desktop_depth_downgraded: true,
+            ..Config::default()
+        };
+        let message = desktop_depth_served_pipeline(&downgraded).expect("the Deck is told");
+        assert_eq!(
+            message.served,
+            arcen_protocol::messages::ServedStreamPipeline::Auto
+        );
+        assert_eq!(message.reason.as_deref(), Some("eight_bit_source"));
+        assert_eq!(
+            message.detail.as_deref(),
+            Some(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL)
+        );
+    }
+
+    #[test]
+    fn wayland_cursor_authority_mismatches_are_explained() {
+        use crate::session::wayland::StreamCursorMode;
+        let reason = wayland_cursor_reason(
+            CursorMode::Host,
+            CursorMode::Local,
+            Some(StreamCursorMode::Metadata),
+        );
+        assert!(reason.as_str().contains("reports its cursor separately"));
+        let reason = wayland_cursor_reason(
+            CursorMode::Local,
+            CursorMode::Host,
+            Some(StreamCursorMode::Embedded),
+        );
+        assert!(reason.as_str().contains("draws its cursor into the video"));
+        let reason = wayland_cursor_reason(
+            CursorMode::Host,
+            CursorMode::Local,
+            Some(StreamCursorMode::Hidden),
+        );
+        assert!(reason.as_str().contains("leaves its cursor to the Deck"));
+        assert!(wayland_cursor_reason(
+            CursorMode::Local,
+            CursorMode::Local,
+            Some(StreamCursorMode::Hidden)
+        )
+        .as_str()
+        .is_empty());
+        assert!(wayland_cursor_reason(
+            CursorMode::Local,
+            CursorMode::Local,
+            Some(StreamCursorMode::Metadata)
+        )
+        .as_str()
+        .is_empty());
+        assert!(
+            wayland_cursor_reason(CursorMode::Host, CursorMode::Local, None)
+                .as_str()
+                .is_empty()
+        );
+    }
     use crate::media::capenc::{test_support::fake_idr, ResolvedMediaPlan};
     use arcen_protocol::messages::{
         ClientQosSampleMsg, ClientTelemetrySnapshotMsg, SampleWindowSecs,
@@ -9203,6 +11579,31 @@ mod tests {
         assert!(!rejected_local.accepted);
         assert_eq!(rejected_local.active, TabletModeMsg::DisabledMouseCompat);
         assert!(rejected_local.reason.as_str().contains("client did not"));
+    }
+
+    /// A right password against another user's waiting desktop is not an
+    /// authentication failure: the Deck is told the desktop is waiting for
+    /// its owner, without naming the owner.
+    #[test]
+    fn a_refused_takeover_says_why_without_blaming_the_sign_in() {
+        assert_eq!(
+            takeover_result(Some(resume::TakeoverOutcome::HandedOver)),
+            Ok(())
+        );
+        let refused = takeover_result(Some(resume::TakeoverOutcome::Refused)).unwrap_err();
+        assert_eq!(refused, DetachedTakeoverRefusal::AnotherUsersDesktop);
+        assert_eq!(
+            takeover_result(None),
+            Err(DetachedTakeoverRefusal::OwnerDidNotAnswer)
+        );
+        let Message::Close(Some(frame)) = close_with_reason(refused.deck_reason()) else {
+            panic!("a close frame");
+        };
+        assert_eq!(
+            frame.reason.as_ref(),
+            "Another user's remote desktop is waiting for its owner to reconnect; try again later."
+        );
+        assert!(!frame.reason.contains("authentication"));
     }
 
     /// Re-review finding #2/#1: reloaded QoS targets must publish whenever
@@ -9692,6 +12093,70 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_may_only_downgrade_wayland_speed_never_upgrade() {
+        use arcen_media::video::{CaptureRateEvidence, PipelineId};
+        let speed = ResolvedMediaPlan {
+            fps: 60,
+            ..resolved_media_plan()
+        };
+        let mut auto_at_bigger = speed;
+        auto_at_bigger.width = 3840;
+        auto_at_bigger.height = 2160;
+        auto_at_bigger.fps = 30;
+        // Speed resized to a size without evidence continues as Auto.
+        assert!(resize_keeps_contract(
+            speed,
+            auto_at_bigger,
+            Some(PipelineId::Speed),
+            Some(PipelineId::Auto)
+        ));
+        // Any other contract change still ends the generation.
+        let mut other = auto_at_bigger;
+        other.backend = EncoderBackend::OpenH264;
+        assert!(!resize_keeps_contract(
+            speed,
+            other,
+            Some(PipelineId::Speed),
+            Some(PipelineId::Auto)
+        ));
+        // Auto never becomes Speed on a resize: its evidence is withheld,
+        // so the smaller qualified size is served as Auto again.
+        let rates = vec![("h265".to_owned(), 60, CaptureRateEvidence::Measured)];
+        assert!(resize_speed_evidence(Some(PipelineId::Auto), rates.clone()).is_empty());
+        assert_eq!(
+            resize_speed_evidence(Some(PipelineId::Speed), rates.clone()),
+            rates
+        );
+        assert_eq!(resize_speed_evidence(None, rates.clone()), rates);
+        let mut auto_smaller = auto_at_bigger;
+        auto_smaller.width = 1600;
+        auto_smaller.height = 1000;
+        assert!(resize_keeps_contract(
+            auto_at_bigger,
+            auto_smaller,
+            Some(PipelineId::Auto),
+            Some(PipelineId::Auto)
+        ));
+        assert!(!resize_keeps_contract(
+            auto_at_bigger,
+            speed,
+            Some(PipelineId::Auto),
+            Some(PipelineId::Speed)
+        ));
+        // Xorg epochs state no admission: geometry only, as before.
+        assert!(resize_keeps_contract(
+            speed,
+            ResolvedMediaPlan {
+                width: 1280,
+                ..speed
+            },
+            None,
+            None
+        ));
+        assert!(!resize_keeps_contract(speed, auto_at_bigger, None, None));
+    }
+
+    #[test]
     fn resize_contract_allows_only_geometry_to_change() {
         let current = resolved_media_plan();
         let mut resized = current;
@@ -9783,6 +12248,16 @@ mod tests {
         assert!(actions.stop_media);
         assert!(actions.revoke_grant);
         assert!(!actions.hold_restore_leases);
+    }
+
+    #[test]
+    fn the_pam_password_leaves_the_response_into_a_wiped_buffer_before_any_check() {
+        let mut response = AuthResponse::pam("artist", "correct horse");
+        let password = take_pam_credential(&mut response);
+        assert!(response.credential.is_empty());
+        assert_eq!(password.as_str(), "correct horse");
+        assert!(auth::validate_pam_request(&response, &password).is_ok());
+        assert!(auth::validate_pam_request(&response, "").is_err());
     }
 
     #[test]
@@ -9894,6 +12369,9 @@ mod tests {
     fn resumed_attachment_forces_fresh_idr_and_only_transport_loss_detaches() {
         assert!(attachment_requires_fresh_idr(true));
         assert!(!attachment_requires_fresh_idr(false));
+        // A resume keeps a mid-session resize; a sign-in aligns.
+        assert!(!aligns_outputs_at_attach(true));
+        assert!(aligns_outputs_at_attach(false));
         assert!(resumable_transport_loss(SessionEndReason::TransportError));
         assert!(resumable_transport_loss(
             SessionEndReason::ReadLivenessTimeout
@@ -9902,6 +12380,18 @@ mod tests {
         assert!(!resumable_transport_loss(SessionEndReason::ClientClosed));
         assert!(!resumable_transport_loss(SessionEndReason::MediaEnded));
         assert!(!resumable_transport_loss(SessionEndReason::HostShutdown));
+    }
+
+    #[test]
+    fn concurrent_outputs_get_no_speed_evidence() {
+        // Even with Speed requested: no output of a multi-monitor capture
+        // may admit Speed on single-output (or inferred) rates.
+        let speed = Config {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            ..Config::default()
+        };
+        assert!(multi_output_speed_evidence(&speed).is_empty());
+        assert!(multi_output_speed_evidence(&Config::default()).is_empty());
     }
 
     #[test]
@@ -9937,6 +12427,9 @@ mod tests {
         use crate::display::topology::LinuxMonitorPlan;
         use arcen_media::{Rotation, TopologyGeneration};
         let head = |session_monitor_id: u16, name: &str, x: i32, primary: bool| LinuxMonitorPlan {
+            refresh_hz: 60,
+            width_mm: 0,
+            height_mm: 0,
             session_monitor_id: SessionMonitorId::new(session_monitor_id)
                 .expect("nonzero session monitor id"),
             client_display_id: name.to_owned(),
@@ -9958,6 +12451,7 @@ mod tests {
             mode_token: "1920x1080".to_owned(),
         };
         LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(1).expect("nonzero generation"),
             virtual_width: 5760,
             virtual_height: 1080,
@@ -10103,6 +12597,15 @@ mod tests {
             false,
             Some(&plan)
         ));
+        // A reconfigurable Wayland desktop is moved to the next sign-in's
+        // outputs instead; it keeps its applications.
+        let mut virtual_outputs = plan;
+        virtual_outputs.backend = crate::display::topology::LinuxTopologyBackend::VirtualOutputs;
+        assert!(!multi_monitor_attachment_must_terminate_desktop(
+            false,
+            false,
+            Some(&virtual_outputs)
+        ));
     }
 
     #[test]
@@ -10183,9 +12686,55 @@ mod tests {
             SessionEndReason::WriterEnded,
             SessionEndReason::HostShutdown,
             SessionEndReason::ResumeAuthorityFailure,
+            SessionEndReason::InputLost,
         ] {
             assert!(!AttachmentEnd::terminal(reason).reached_usable);
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_lasting_input_loss_ends_the_attachment() {
+        use crate::input::wayland::{InjectorLoss, InjectorStatus};
+        let (sender, receiver) =
+            tokio::sync::watch::channel(InjectorStatus::Connected { connection: 1 });
+        let mut status = Some(receiver);
+        let quick = Duration::from_millis(50);
+        sender.send_replace(InjectorStatus::Reconnecting { attempt: 1 });
+        assert!(
+            tokio::time::timeout(quick, wait_for_input_loss(&mut status))
+                .await
+                .is_err(),
+            "reconnecting is not a loss"
+        );
+        sender.send_replace(InjectorStatus::Lost(InjectorLoss::Closed));
+        assert!(
+            tokio::time::timeout(quick, wait_for_input_loss(&mut status))
+                .await
+                .is_err(),
+            "the injector closing with its attachment is not a loss"
+        );
+        sender.send_replace(InjectorStatus::Lost(InjectorLoss::Superseded));
+        assert_eq!(
+            tokio::time::timeout(quick, wait_for_input_loss(&mut status))
+                .await
+                .unwrap(),
+            InjectorLoss::Superseded
+        );
+        drop(sender);
+        let (closed_sender, closed_receiver) =
+            tokio::sync::watch::channel(InjectorStatus::Connected { connection: 1 });
+        drop(closed_sender);
+        let mut gone = Some(closed_receiver);
+        assert!(tokio::time::timeout(quick, wait_for_input_loss(&mut gone))
+            .await
+            .is_err());
+        assert!(gone.is_none(), "a finished injector is no longer watched");
+        let mut uinput = None;
+        assert!(
+            tokio::time::timeout(quick, wait_for_input_loss(&mut uinput))
+                .await
+                .is_err()
+        );
     }
 
     struct NonReadingSink;
@@ -10289,6 +12838,54 @@ mod tests {
                 arcen_media::video::MotionPriority::Motion,
                 aggregate,
             ),
+            arcen_protocol::messages::ServedStreamPipeline::Speed
+        );
+    }
+
+    #[test]
+    fn an_admitted_capture_labels_the_served_pipeline_not_the_request() {
+        // A Speed request the Wayland provider served as Auto: the request
+        // path alone would label it Speed from the requested pipeline and
+        // motion priority.
+        let primary = resolved_media_plan();
+        let cfg = Config {
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            codec_pinned: false,
+            variant_pinned: false,
+            ..Config::default()
+        };
+        let by_request = || {
+            served_stream_pipeline_for_backend(
+                &cfg,
+                &primary,
+                arcen_media::video::MotionPriority::Motion,
+                Some(primary.backend.accelerator_class()),
+            )
+        };
+        assert_eq!(
+            by_request(),
+            arcen_protocol::messages::ServedStreamPipeline::Speed
+        );
+        let (notice, _) = arcen_media::video::CaptureAdmissionNotice::parse(
+            "[capenc] ADMISSION version=1 requested=speed requested_fps=60 \
+             decision=downgrade reason=copy_path_not_rate_qualified served=auto codec=h264 \
+             fps=30 transform=sdr8-rgb colour=assumed cursor_mode=host capture=pipewire \
+             copy_path=host-copy cursor=composited measured_fps=unmeasured node=36 \
+             format=bgrx8 width=1920 height=1080 memory=host-shared",
+        )
+        .unwrap();
+        let epoch = notice.served().and_then(|served| served.epoch());
+        assert_eq!(
+            epoch.map(|epoch| epoch.priority),
+            Some(arcen_media::video::MotionPriority::Detail)
+        );
+        assert_eq!(
+            served_pipeline_from_admission(epoch, by_request),
+            arcen_protocol::messages::ServedStreamPipeline::Auto
+        );
+        // Without an admission (Xorg) the request path is unchanged.
+        assert_eq!(
+            served_pipeline_from_admission(None, by_request),
             arcen_protocol::messages::ServedStreamPipeline::Speed
         );
     }
@@ -10823,6 +13420,17 @@ mod tests {
     }
 
     fn registered_resume() -> (Arc<SessionRegistry>, ResumeBindings, ActiveHostSessionId) {
+        let (session_registry, bindings, active_session_id, _commands) =
+            registered_resume_with_owner();
+        (session_registry, bindings, active_session_id)
+    }
+
+    fn registered_resume_with_owner() -> (
+        Arc<SessionRegistry>,
+        ResumeBindings,
+        ActiveHostSessionId,
+        mpsc::UnboundedReceiver<OwnerCommand>,
+    ) {
         let session_registry = SessionRegistry::new(None).unwrap();
         let mut response = AuthResponse::resume("03".repeat(32), "placeholder");
         response.screen_width = 1_920;
@@ -10841,7 +13449,7 @@ mod tests {
             topology: TopologyBinding::from_response(&response).unwrap(),
         };
         let active_session_id = bindings.active_session_id.clone();
-        let (owner, _commands) = mpsc::unbounded_channel();
+        let (owner, commands) = mpsc::unbounded_channel();
         session_registry
             .resume()
             .issue_initial(
@@ -10851,7 +13459,127 @@ mod tests {
                 &CorrelationId::from_uuid_v4_bytes([1; 16]),
             )
             .unwrap();
-        (session_registry, bindings, active_session_id)
+        (session_registry, bindings, active_session_id, commands)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_same_account_sign_in_takes_over_only_a_detached_session() {
+        let (session_registry, bindings, active_session_id, mut commands) =
+            registered_resume_with_owner();
+        let account = |name: &str, uid: u32| crate::session::identity::UserIdentity {
+            username: name.to_owned(),
+            uid,
+            gid: uid,
+            supplementary_groups: Vec::new(),
+            home: std::path::PathBuf::from("/home/alice"),
+            shell: std::path::PathBuf::from("/bin/bash"),
+        };
+        // Attached: never asked; the liveness proof decides instead.
+        assert!(session_registry
+            .resume()
+            .request_takeover("alice", 1_001)
+            .is_none());
+
+        session_registry
+            .resume()
+            .mark_detached(&active_session_id)
+            .unwrap();
+        // The detached owner (alice, uid 1001) answers with the shared policy
+        // over canonical identities and hands over.
+        let owner = tokio::spawn({
+            let session_registry = Arc::clone(&session_registry);
+            let active_session_id = active_session_id.clone();
+            async move {
+                while let Some(command) = commands.recv().await {
+                    if let OwnerCommand::TakeOver {
+                        claimant,
+                        claimant_uid,
+                        reply,
+                    } = command
+                    {
+                        let outcome = match arcen_session::direct_reconnect::fresh_sign_in(
+                            account_principal("alice", 1_001),
+                            account_principal(&claimant, claimant_uid),
+                            arcen_session::direct_reconnect::SessionAttachment::Detached,
+                        ) {
+                            arcen_session::direct_reconnect::FreshSignIn::TakeOverDetached => {
+                                hand_over_displaced_session(
+                                    session_registry.resume(),
+                                    &active_session_id,
+                                    None,
+                                )
+                                .await;
+                                resume::TakeoverOutcome::HandedOver
+                            }
+                            _ => resume::TakeoverOutcome::Refused,
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            take_over_detached_session(&session_registry, &account("mallory", 1_002)).await,
+            Err(DetachedTakeoverRefusal::AnotherUsersDesktop),
+            "another account is refused"
+        );
+        assert_eq!(
+            take_over_detached_session(&session_registry, &account("alice", 2_001)).await,
+            Err(DetachedTakeoverRefusal::AnotherUsersDesktop),
+            "a name alone is not the account"
+        );
+        assert!(session_registry
+            .resume()
+            .resume_handshake_available()
+            .unwrap());
+        // However the Deck typed it (`Alice`, `alice@corp.example`,
+        // `CORP\alice`), PAM and NSS resolve it to this account; only that
+        // canonical identity reaches the takeover.
+        assert_eq!(
+            take_over_detached_session(&session_registry, &account("alice", 1_001)).await,
+            Ok(())
+        );
+        assert!(!session_registry
+            .resume()
+            .resume_handshake_available()
+            .unwrap());
+        let rejection = session_registry
+            .resume()
+            .superseded_rejection(&bindings.holder_nonce)
+            .expect("the old Deck's grant is refused with a reason");
+        assert_eq!(rejection.message, resume::TAKEN_OVER_REASON);
+        assert!(session_registry
+            .resume()
+            .superseded_rejection(&arcen_identity::DeckHolderNonce::new([9; 32]))
+            .is_none());
+        owner.abort();
+    }
+
+    #[tokio::test]
+    async fn no_incumbent_is_judged_while_a_resume_is_validated() {
+        let permits = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let record = arcen_transport::quic::IncumbentAttachment::new();
+        let started = std::time::Instant::now();
+        assert!(
+            acquire_session_slot(&permits, &record, Some("1001#alice"), true)
+                .await
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn the_incumbent_key_is_the_resolved_account() {
+        let identity = crate::session::identity::UserIdentity {
+            username: "alice".to_owned(),
+            uid: 1_001,
+            gid: 1_001,
+            supplementary_groups: Vec::new(),
+            home: std::path::PathBuf::from("/home/alice"),
+            shell: std::path::PathBuf::from("/bin/bash"),
+        };
+        assert_eq!(account_key(&identity), "1001#alice");
     }
 
     #[tokio::test]
@@ -10941,27 +13669,24 @@ mod tests {
     #[tokio::test]
     async fn refresh_successor_send_failure_returns_authority_failure_and_reopens_after_cleanup() {
         let (session_registry, bindings, active_session_id) = registered_resume();
-        let (idr, _idr_rx) = fake_idr();
-        let video = Arc::new(FrameQueue::new(idr));
-        let audio = Arc::new(AudioQueue::new());
         let (_control_tx, control_rx) = mpsc::channel(1);
         let reason = tokio::time::timeout(
             Duration::from_millis(100),
-            sender_loop(
+            lane_workers::control_lane_writer(
                 NonReadingSink,
-                crate::session::monitor_mux::VideoSource::Single(video),
-                audio,
-                closed_clipboard_queue(),
                 control_rx,
-                test_audio_control(),
                 Some(ResumeRefreshContext {
                     session_registry: Arc::clone(&session_registry),
                     active_session_id: active_session_id.clone(),
                     window_secs: 0,
                 }),
                 Duration::from_millis(5),
-                None,
-                Arc::new(AtomicU64::new(0)),
+                arcen_transport::quic::LaneSenderSlot::new(
+                    arcen_protocol::lanes::LaneRole::InputCursor,
+                ),
+                arcen_transport::quic::LaneSenderSlot::new(
+                    arcen_protocol::lanes::LaneRole::BulkAux,
+                ),
             ),
         )
         .await
@@ -11037,6 +13762,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_displaced_resumable_attachment_hands_the_slot_and_resume_slot_over() {
+        // Resume negotiated (the production Deck always opts in): the
+        // attachment holds the session slot through its display resources
+        // and an attached resume slot. Displacement must release both, so
+        // the same-user newcomer is admitted and later fresh logins are
+        // not told to resume a Deck that is gone.
+        let (session_registry, bindings, active_session_id) = registered_resume();
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let resources = HeldDisplayResources::new(None, Some(permit));
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+
+        hand_over_displaced_session(
+            session_registry.resume(),
+            &active_session_id,
+            Some(resources),
+        )
+        .await;
+
+        assert!(Arc::clone(&permits).try_acquire_owned().is_ok());
+        assert!(!session_registry
+            .resume()
+            .resume_handshake_available()
+            .unwrap());
+        let (owner, _commands) = mpsc::unbounded_channel();
+        assert!(session_registry
+            .resume()
+            .issue_initial(
+                bindings,
+                ReconnectPolicy::new(180).unwrap(),
+                owner,
+                &CorrelationId::from_uuid_v4_bytes([3; 16]),
+            )
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn failed_resume_retains_display_until_idempotent_final_restore() {
         let permits = Arc::new(Semaphore::new(1));
         let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
@@ -11053,103 +13815,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awaiting_idr_does_not_block_control_audio_or_clean_shutdown() {
-        let (idr, _idr_rx) = fake_idr();
-        let video = Arc::new(FrameQueue::new(idr));
-        for value in 0..=crate::session::client::CAPACITY {
-            video.enqueue(vec![value as u8], false);
-        }
-        assert!(video.awaiting_keyframe());
-
-        let audio = Arc::new(AudioQueue::new());
-        audio.enqueue(crate::session::audio::EncodedAudioPacket {
-            codec: AudioCodec::Pcm,
-            payload: vec![7],
-            timestamp_ms: 7,
-        });
+    async fn slow_control_writer_times_out_while_shutdown_remains_bounded() {
         let (control_tx, control_rx) = ControlSender::channel(1);
         assert!(
             control_tx
                 .send_required(Message::Text("health".into()), "test")
                 .await
         );
-        let sent = Arc::new(StdMutex::new(Vec::new()));
-        let writer = tokio::spawn(sender_loop(
-            RecordingSink(Arc::clone(&sent)),
-            crate::session::monitor_mux::VideoSource::Single(Arc::clone(&video)),
-            Arc::clone(&audio),
-            closed_clipboard_queue(),
-            control_rx,
-            test_audio_control(),
-            None,
-            Duration::from_millis(20),
-            None,
-            Arc::new(AtomicU64::new(0)),
-        ));
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if sent.lock().unwrap().len() == 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("control and audio must remain responsive");
-
-        {
-            let sent = sent.lock().unwrap();
-            assert!(sent
-                .iter()
-                .any(|message| matches!(message, Message::Text(_))));
-            assert!(sent.iter().any(
-                |message| matches!(message, Message::Binary(bytes) if bytes[0] == FrameType::Audio as u8)
-            ));
-            assert!(
-                !sent.iter().any(
-                    |message| matches!(message, Message::Binary(bytes) if bytes[0] != FrameType::Audio as u8)
-                ),
-                "no unsafe video may reach the writer before IDR"
-            );
-        }
-
-        video.close();
-        audio.close();
-        drop(control_tx);
-        tokio::time::timeout(Duration::from_millis(100), writer)
-            .await
-            .expect("closed queues must stop the writer")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn slow_writer_times_out_while_recovery_shutdown_remains_bounded() {
-        let (idr, _idr_rx) = fake_idr();
-        let video = Arc::new(FrameQueue::new(idr));
-        assert!(video.enqueue(vec![FrameType::VideoH264 as u8], true));
-        let audio = Arc::new(AudioQueue::new());
-        let (_control_tx, control_rx) = mpsc::channel(1);
-
-        tokio::time::timeout(
+        let reason = tokio::time::timeout(
             Duration::from_millis(50),
-            sender_loop(
+            lane_workers::control_lane_writer(
                 NonReadingSink,
-                crate::session::monitor_mux::VideoSource::Single(Arc::clone(&video)),
-                Arc::clone(&audio),
-                closed_clipboard_queue(),
                 control_rx,
-                test_audio_control(),
                 None,
                 Duration::from_millis(5),
-                None,
-                Arc::new(AtomicU64::new(0)),
+                arcen_transport::quic::LaneSenderSlot::new(
+                    arcen_protocol::lanes::LaneRole::InputCursor,
+                ),
+                arcen_transport::quic::LaneSenderSlot::new(
+                    arcen_protocol::lanes::LaneRole::BulkAux,
+                ),
             ),
         )
         .await
         .expect("slow writer and close paths must both be bounded");
-        video.close();
-        audio.close();
+        assert_eq!(reason, SessionEndReason::WriterEnded);
     }
 
     #[tokio::test]
@@ -12224,7 +14914,10 @@ mod tests {
             test_session_log_id(),
             &plan,
             Some(plan.backend.accelerator_class()),
-            Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
+            ServedStreamLabels {
+                pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
+                display_backend: "nvctrl",
+            },
             Some("alice"),
             Some("198.51.100.7"),
         );
@@ -12261,7 +14954,10 @@ mod tests {
             test_session_log_id(),
             &plan,
             Some(plan.backend.accelerator_class()),
-            Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
+            ServedStreamLabels {
+                pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
+                display_backend: "nvctrl",
+            },
             Some("alice"),
             Some("198.51.100.7"),
         );
@@ -12468,7 +15164,10 @@ mod tests {
             test_session_log_id(),
             &resolved_media_plan(),
             Some(EncoderBackend::NativeNvenc.accelerator_class()),
-            None,
+            ServedStreamLabels {
+                pipeline: None,
+                display_backend: "nvctrl",
+            },
             Some("alice"),
             Some("198.51.100.7"),
         );
@@ -12485,6 +15184,29 @@ mod tests {
         );
         // No panics, no blocking, and nothing above returned early: the
         // caller-visible control flow is entirely unaffected by sink failure.
+    }
+
+    #[test]
+    fn the_peer_deck_build_is_logged_from_its_hello() {
+        let hello = ClientHelloMsg::default();
+        assert_eq!(peer_deck_build(&hello), "not advertised");
+        let identity = arcen_protocol::build_identity::from_environment(
+            "arcen-deck-macos",
+            "0.17.0",
+            arcen_protocol::build_identity::BuildEnvironment {
+                build_id: Some("20261019T2200Z-0.17.0-ed28caf0"),
+                source_revision: Some("ed28caf0"),
+                feature_profile: Some("quic-default"),
+                signing_state: Some("developer-id"),
+                debug: false,
+            },
+            None,
+        );
+        let hello = ClientHelloMsg::default().with_build_identity(identity);
+        assert_eq!(
+            peer_deck_build(&hello),
+            "arcen-deck-macos 0.17.0 build 20261019T2200Z-0.17.0-ed28caf0 rev ed28caf0 (release, quic-default, developer-id)"
+        );
     }
 
     #[test]
@@ -12505,7 +15227,25 @@ mod tests {
             LauncherError::XorgVerify,
             LauncherError::XorgRelease,
             LauncherError::LogindActivation,
+            LauncherError::SeatOccupied,
             LauncherError::LogindUnlock,
+            LauncherError::SelinuxContext,
+            LauncherError::LocalPlaybackRefused,
+            LauncherError::PolkitUnprotected(
+                arcen_session::polkit_remote::PolkitUnprotected::NoRules,
+            ),
+            LauncherError::PolkitUnprotected(
+                arcen_session::polkit_remote::PolkitUnprotected::RuleMissing,
+            ),
+            LauncherError::PolkitUnprotected(
+                arcen_session::polkit_remote::PolkitUnprotected::Granted,
+            ),
+            LauncherError::PolkitUnprotected(
+                arcen_session::polkit_remote::PolkitUnprotected::Unverified,
+            ),
+            LauncherError::NativeSeatUnavailable(
+                arcen_session::native_seat::NativeSeatUnavailable::VkmsInUse,
+            ),
         ];
         for error in samples {
             let reason = launcher_error_reason_class(&error);
@@ -12671,50 +15411,6 @@ mod tests {
         assert_eq!(audio.wire_frames_sent(), 1);
         assert_eq!(audio.wire_bytes_sent(), 42);
         assert_eq!(audio.encode_failures(), 1);
-    }
-
-    #[tokio::test]
-    async fn closed_audio_capture_queue_does_not_end_video_or_control_writer() {
-        let (idr, _idr_rx) = fake_idr();
-        let video = Arc::new(FrameQueue::new(idr));
-        let audio = Arc::new(AudioQueue::new());
-        audio.close();
-        let clipboard = closed_clipboard_queue();
-        let (control_tx, control_rx) = ControlSender::channel(1);
-        assert!(
-            control_tx
-                .send_required(Message::Text("still-streaming".into()), "test")
-                .await
-        );
-        let sent = Arc::new(StdMutex::new(Vec::new()));
-        let mut sender = tokio::spawn(sender_loop(
-            RecordingSink(Arc::clone(&sent)),
-            crate::session::monitor_mux::VideoSource::Single(Arc::clone(&video)),
-            audio,
-            clipboard,
-            control_rx,
-            test_audio_control(),
-            None,
-            Duration::from_millis(100),
-            None,
-            Arc::new(AtomicU64::new(0)),
-        ));
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while sent.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("control must remain writable after audio ends");
-        assert!(!sender.is_finished());
-
-        video.close();
-        drop(control_tx);
-        tokio::time::timeout(Duration::from_millis(100), &mut sender)
-            .await
-            .expect("writer must stop after remaining streams close")
-            .unwrap();
     }
 
     #[test]
@@ -13078,6 +15774,97 @@ mod tests {
             ticks_at_join,
             "no further task activity may occur once abort+await has returned, matching the \
              SESSION_END-adjacent `health.abort(); let _ = health.await;` shutdown ordering"
+        );
+    }
+}
+
+#[cfg(test)]
+mod software_resize_tests {
+    use super::*;
+    use crate::session::wayland::{ReadyOutput, ReadyStream, WaylandAgentReady};
+
+    fn ready(width: u32, height: u32, output_socket: bool) -> WaylandAgentReady {
+        let runtime_dir = std::path::PathBuf::from("/run/user/1001/arcen-wayland-c9");
+        WaylandAgentReady {
+            compositor: "gnome-shell".into(),
+            input_socket: runtime_dir.join("arcen-input.sock"),
+            runtime_dir: runtime_dir.clone(),
+            wayland_display: "wayland-0".into(),
+            outputs: vec![ReadyOutput {
+                connector: "Meta-0".into(),
+                width,
+                height,
+                refresh_hz: 60,
+            }],
+            streams: vec![ReadyStream {
+                connector: "Meta-0".into(),
+                node_id: 41,
+                width,
+                height,
+                x: 0,
+                y: 0,
+            }],
+            input_device_types: 7,
+            generation: 1,
+            compositor_render_node: None,
+            compositor_gpu_pci: None,
+            compositor_gpu_vendor: None,
+            output_mode: arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+            output_socket: output_socket.then(|| runtime_dir.join("arcen-output.sock")),
+            x11: None,
+            cursor_mode: crate::session::wayland::StreamCursorMode::Embedded,
+            clipboard: None,
+        }
+    }
+
+    #[test]
+    fn a_software_wayland_resize_is_fitted_and_xorg_keeps_its_ceiling() {
+        // Hardware: served as asked.
+        assert_eq!(resize_target(2560, 1440, false, true), Some((2560, 1440)));
+        // Software on Wayland: fitted to OpenH264, aspect kept, width % 4.
+        assert_eq!(resize_target(2560, 1440, true, true), Some((1920, 1080)));
+        // The shared resolver keeps the aspect, so this one lands just under.
+        assert_eq!(resize_target(2880, 1800, true, true), Some((1916, 1198)));
+        assert_eq!(resize_target(1800, 1130, true, true), Some((1800, 1130)));
+        let (width, height) = resize_target(3024, 1890, true, true).unwrap();
+        assert!(width <= 1920 && height <= 1200 && width % 4 == 0 && height % 2 == 0);
+        // Software on Xorg: the MetaMode ceiling, unchanged.
+        assert_eq!(resize_target(2560, 1440, true, false), None);
+        assert_eq!(resize_target(1920, 1080, true, false), Some((1920, 1080)));
+        // Malformed geometry is refused either way.
+        assert_eq!(resize_target(1922, 1080, true, true), None);
+        assert_eq!(resize_target(1920, 1081, false, true), None);
+    }
+
+    #[test]
+    fn a_reattach_refits_an_oversize_output_only_on_a_software_host() {
+        use arcen_session::desktop_provider::DesktopProvider;
+        let software = Config {
+            desktop_provider: DesktopProvider::Wayland,
+            encoder: EncoderRequest::SoftwareH264,
+            ..Config::default()
+        };
+        assert_eq!(
+            wayland_software_refit(&software, &ready(2560, 1600, true)),
+            Some((1920, 1200))
+        );
+        // Already within the limits, or a fixed (startup-monitor) output.
+        assert_eq!(
+            wayland_software_refit(&software, &ready(1800, 1130, true)),
+            None
+        );
+        assert_eq!(
+            wayland_software_refit(&software, &ready(2560, 1600, false)),
+            None
+        );
+        // A native host keeps its output.
+        let native = Config {
+            desktop_provider: DesktopProvider::Wayland,
+            ..Config::default()
+        };
+        assert_eq!(
+            wayland_software_refit(&native, &ready(2560, 1600, true)),
+            None
         );
     }
 }

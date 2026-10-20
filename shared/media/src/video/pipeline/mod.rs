@@ -196,7 +196,35 @@ pub enum BitratePolicy {
     SessionBounds,
 }
 
+/// How far above its shape budget an Auto or Speed session may climb once the
+/// path has proved it carries what the encoder spends. The shape budget
+/// (`average_bitrate_bps`, 0.05 bits per sample) is sized for a stream that
+/// has to cross an unknown link; on a link that keeps delivering it with no
+/// queueing or loss -- a LAN -- desktop text needs several times that to stay
+/// sharp. The controller only crosses the shape budget with per-interval
+/// delivery evidence, so a link that cannot carry more never sees it.
+pub const PROVEN_PATH_HEADROOM: u32 = 4;
+
+/// The absolute ceiling of [`PROVEN_PATH_HEADROOM`]: the Grading/HDR fidelity
+/// ceiling, so no 8-bit 4:2:0 session ever outbids a fidelity one.
+pub const PROVEN_PATH_CEILING_BPS: u32 = 250_000_000;
+
+/// The proven-path ceiling for a shape budget.
+#[must_use]
+pub fn proven_path_ceiling_bps(shape_bps: u32) -> u32 {
+    shape_bps
+        .saturating_mul(PROVEN_PATH_HEADROOM)
+        .min(PROVEN_PATH_CEILING_BPS)
+        .max(shape_bps)
+}
+
 impl BitratePolicy {
+    /// `(start, ceiling)` for the shared rate controller.
+    ///
+    /// Auto and Speed (`LinkCappedAverage`, `MotionCappedStartShapeCeiling`)
+    /// start at the link cap and may climb to the shape budget on a clear
+    /// path as before, then to [`proven_path_ceiling_bps`] only with delivery
+    /// evidence (see [`Self::evidence_gate_bps`]).
     #[must_use]
     pub fn bounds(
         self,
@@ -207,12 +235,14 @@ impl BitratePolicy {
         depth: BitDepth,
     ) -> (u32, u32) {
         match self {
-            Self::LinkCappedAverage | Self::MotionCappedStartShapeCeiling | Self::SessionBounds => {
-                (
-                    link_capped_average_bitrate_bps(width, height, fps, chroma, depth),
-                    average_bitrate_bps(width, height, fps, chroma, depth),
-                )
-            }
+            Self::LinkCappedAverage | Self::MotionCappedStartShapeCeiling => (
+                link_capped_average_bitrate_bps(width, height, fps, chroma, depth),
+                proven_path_ceiling_bps(average_bitrate_bps(width, height, fps, chroma, depth)),
+            ),
+            Self::SessionBounds => (
+                link_capped_average_bitrate_bps(width, height, fps, chroma, depth),
+                average_bitrate_bps(width, height, fps, chroma, depth),
+            ),
             Self::SoftwareCpuH264 {
                 start_1080p30_bps,
                 ceiling_1080p30_bps,
@@ -260,6 +290,28 @@ impl BitratePolicy {
             | Self::SessionBounds
             | Self::SoftwareCpuH264 { .. }
             | Self::Fixed { .. } => (start, start),
+        }
+    }
+
+    /// The target above which the controller needs delivery evidence to
+    /// probe: the shape budget for Auto and Speed, nothing for the rest.
+    #[must_use]
+    pub fn evidence_gate_bps(
+        self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        chroma: ChromaSubsampling,
+        depth: BitDepth,
+    ) -> Option<u32> {
+        match self {
+            Self::LinkCappedAverage | Self::MotionCappedStartShapeCeiling => {
+                Some(average_bitrate_bps(width, height, fps, chroma, depth))
+            }
+            Self::LinkCappedWithCeiling { .. }
+            | Self::SoftwareCpuH264 { .. }
+            | Self::Fixed { .. }
+            | Self::SessionBounds => None,
         }
     }
 
@@ -480,12 +532,19 @@ impl PipelineContract {
         depth: BitDepth,
     ) -> RateControlPolicy {
         let (start, ceiling) = self.bitrate_bounds(width, height, fps, chroma, depth);
-        RateControlPolicy::for_bounds_priority_probe_step(
+        let policy = RateControlPolicy::for_bounds_priority_probe_step(
             u64::from(start),
             u64::from(ceiling),
             self.priority,
             self.probe_step,
-        )
+        );
+        match self
+            .bitrate
+            .evidence_gate_bps(width, height, fps, chroma, depth)
+        {
+            Some(gate) => policy.with_evidence_gate(u64::from(gate)),
+            None => policy,
+        }
     }
 }
 
@@ -1337,10 +1396,23 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_bounds_match_today_for_representative_shapes_except_fidelity_ceilings() {
+    fn bitrate_bounds_for_representative_shapes() {
         for id in [PipelineId::Auto, PipelineId::Speed] {
             let c = pipeline_contract(id);
             for (width, height, fps) in [(1800, 1168, 30), (1800, 1168, 60), (3840, 2160, 30)] {
+                let shape =
+                    average_bitrate_bps(width, height, fps, c.colour.chroma, c.colour.bit_depth);
+                assert_eq!(
+                    c.bitrate.evidence_gate_bps(
+                        width,
+                        height,
+                        fps,
+                        c.colour.chroma,
+                        c.colour.bit_depth
+                    ),
+                    Some(shape),
+                    "{id:?}: the shape budget is where proof starts to be needed"
+                );
                 assert_eq!(
                     c.bitrate_bounds(width, height, fps, c.colour.chroma, c.colour.bit_depth),
                     (
@@ -1351,13 +1423,7 @@ mod tests {
                             c.colour.chroma,
                             c.colour.bit_depth
                         ),
-                        average_bitrate_bps(
-                            width,
-                            height,
-                            fps,
-                            c.colour.chroma,
-                            c.colour.bit_depth
-                        )
+                        shape * PROVEN_PATH_HEADROOM
                     ),
                     "{id:?} {width}x{height}@{fps}"
                 );
@@ -1455,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn speed_keeps_the_safe_start_but_ceilings_at_the_sixty_fps_shape() {
+    fn speed_keeps_the_safe_start_and_gates_proof_at_the_sixty_fps_shape() {
         let c = pipeline_contract(PipelineId::Speed);
         let (start, ceiling) =
             c.bitrate_bounds(1920, 1080, 60, c.colour.chroma, c.colour.bit_depth);
@@ -1470,11 +1536,18 @@ mod tests {
             "the safe start is still the 1080p30 bill"
         );
         assert_eq!(
-            ceiling,
-            average_bitrate_bps(1920, 1080, 60, c.colour.chroma, c.colour.bit_depth),
-            "Speed's clean-path ceiling is the true 60 fps shape"
+            c.bitrate
+                .evidence_gate_bps(1920, 1080, 60, c.colour.chroma, c.colour.bit_depth),
+            Some(average_bitrate_bps(
+                1920,
+                1080,
+                60,
+                c.colour.chroma,
+                c.colour.bit_depth
+            )),
+            "Speed's unproven clean-path ceiling is the true 60 fps shape"
         );
-        assert_eq!(ceiling, start * 2);
+        assert_eq!(ceiling, start * 2 * PROVEN_PATH_HEADROOM);
     }
 
     #[test]
@@ -1802,6 +1875,18 @@ mod tests {
             contract.colour.chroma,
             contract.colour.bit_depth,
         );
+        // The origin arithmetic covers the range below the evidence gate;
+        // above it, probing is proof-gated and target-relative by design.
+        let ceiling = contract
+            .bitrate
+            .evidence_gate_bps(
+                width,
+                height,
+                fps,
+                contract.colour.chroma,
+                contract.colour.bit_depth,
+            )
+            .unwrap_or(ceiling);
         let mut controller =
             crate::rate_control::RateController::new(contract.rate_control_policy(
                 width,
@@ -1813,6 +1898,9 @@ mod tests {
         let mut expected = controller.target_bps();
         for _ in 0..32 {
             let previous = expected;
+            if previous >= u64::from(ceiling) {
+                break;
+            }
             let _ = controller.observe(clear_sample(controller.target_bps()));
             expected = origin_probe(previous, u64::from(ceiling)).min(u64::from(ceiling));
             assert_eq!(

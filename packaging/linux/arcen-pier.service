@@ -29,6 +29,12 @@ ExecStart=/opt/arcen/bin/arcen-pier \
 # when nobody is at the machine.
 Restart=on-failure
 RestartSec=10
+# systemd counts death by SIGHUP, SIGINT, SIGTERM or SIGPIPE as a clean exit,
+# which on-failure never restarts. The Pier handles SIGHUP (reload) and
+# SIGTERM/SIGINT (orderly stop, exit 0) from the start of start-up, so dying
+# of SIGHUP or SIGPIPE can only be an accident: restart after it. A stop
+# through systemctl is never restarted.
+RestartForceExitStatus=SIGHUP SIGPIPE
 ExecReload=/bin/kill -HUP $MAINPID
 
 [Install]

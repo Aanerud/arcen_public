@@ -28,6 +28,34 @@ strict Clippy gates. There is no single-platform `--workspace` build.
 - Reconnect creates a fresh decoder/inbox and waits for a fresh keyframe.
   Teardown must discard queued frames rather than let stale data delay resume.
 
+## Input never waits for the UI pass
+
+Pen samples leave from the AppKit monitor callback the moment they are
+dispatched (`ui/pen_input.rs`); the UI pass only publishes routing and drains
+what the monitor had to queue. Keep it that way:
+
+- Do not move pen forwarding back into `App::ui`/`logic`, and do not make pen
+  motion request a repaint (edges only).
+- AppKit mouse coalescing stays off only while a session window is active
+  (`tablet::MouseCoalescing`); restore it on deactivate and quit.
+- The UI never asks for passes faster than the root display refreshes
+  (`paced_ui_poll_interval`): a faster request blocks the main thread in
+  `nextDrawable`, and a blocked main thread cannot dispatch input.
+- Pointer moves and buttons are forwarded in event order, at their own
+  positions (`ordered_pointer_events`), not once per pass.
+- Key, modifier, scroll and mouse-button events raise the pen ordering
+  barrier in the tablet monitor. A key release the input method swallowed
+  keeps pen samples held until text input's release recovery has sent it
+  (`complete_pen_pass_at`, bounded at 250 ms once per pending release; focus
+  loss clears pending recovery). Held pen samples already own
+  the pointer (`PenInput::holds_authority`), so their mouse-emulation
+  duplicates never reach the host.
+- Tests: `pen_samples_at_200_hz_are_forwarded_at_200_hz_while_the_ui_runs_at_30_hz`,
+  `samples_after_a_keyboard_edge_wait_for_the_ui_pass_and_keep_their_order`.
+
+Follow-up: keyboard (and secondary-viewport pointer) input still leaves on the
+UI pass; a keyboard fast path is a separate package.
+
 ## Following a sign-in screen into the desktop
 
 A host that serves its operating system's sign-in screen says so in its hello

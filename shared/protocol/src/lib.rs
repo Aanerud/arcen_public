@@ -13,6 +13,8 @@
 //! - [`messages`] — JSON control messages (hellos, auth, health, input, …).
 //! - [`fsm`]      — client + server session state-machine contract.
 //! - [`auth`]     — SHA-256 challenge/response (`hash_password`, `generate_challenge`).
+//! - [`lanes`]    — QUIC lane roles and the bounded lane preface (lane protocol v1).
+//! - [`cursor`]   — the `CursorUpdate` host cursor image record.
 //!
 //! Byte-compatibility and any change to the wire is governed by `WIRE.md` in this
 //! crate. See it for the authoritative layout + dated changelog.
@@ -22,7 +24,9 @@
 pub mod auth;
 pub mod build_identity;
 pub mod clipboard;
+pub mod cursor;
 pub mod fsm;
+pub mod lanes;
 pub mod messages;
 mod multi_monitor;
 mod region_input;
@@ -37,9 +41,10 @@ pub use wire::{
     encode_usb_urb_submit, encode_video_header, AudioCodec, AudioHeader, ChromaSubsampling,
     ClipboardChunkHeader, FrameType, HidDeviceAddedHeader, MicrophoneHeader, ProtocolError,
     UsbUrbCompletionHeader, UsbUrbSubmitHeader, VideoCodec, VideoHeader, AUDIO_HEADER_SIZE,
-    CHUNK_BYTES, CLIPBOARD_HEADER_SIZE, HARD_MAX_CLIPBOARD_BYTES, HID_DEVICE_ADDED_HEADER_SIZE,
-    HID_MINIMAL_FRAME_SIZE, JPEG_HEADER_SIZE, MAX_MICROPHONE_OPUS_BYTES, MICROPHONE_HEADER_SIZE,
-    MICROPHONE_PCM_BYTES, MICROPHONE_PROTOCOL_VERSION, PNG_MAGIC, PNG_MAX_BYTES, PROTOCOL_VERSION,
+    CHUNK_BYTES, CLIPBOARD_CHUNK_PAYLOAD_BYTES, CLIPBOARD_HEADER_SIZE, HARD_MAX_CLIPBOARD_BYTES,
+    HID_DEVICE_ADDED_HEADER_SIZE, HID_MINIMAL_FRAME_SIZE, JPEG_HEADER_SIZE,
+    MAX_MICROPHONE_OPUS_BYTES, MICROPHONE_HEADER_SIZE, MICROPHONE_PCM_BYTES,
+    MICROPHONE_PROTOCOL_VERSION, PNG_MAGIC, PNG_MAX_BYTES, PROTOCOL_VERSION,
     REGION_VIDEO_HEADER_SIZE, USB_URB_CANCEL_SIZE, USB_URB_COMPLETE_HEADER_SIZE,
     USB_URB_SUBMIT_HEADER_SIZE, VIDEO_HEADER_SIZE, VIDEO_KEYFRAME_FLAG,
 };

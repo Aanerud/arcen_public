@@ -722,6 +722,8 @@ fn log_received_stream_truth(sps: &[u8]) {
             tracing::info!(
                 target: crate::logging::target::SESSION,
                 summary = %truth.summary(),
+                visible = %format_args!("{}x{}", truth.display_width, truth.display_height),
+                coded = %format_args!("{}x{}", truth.width, truth.height),
                 chroma_format_idc = truth.chroma_format_idc,
                 bit_depth = truth.bit_depth_luma,
                 primaries = colour.map(|colour| colour.primaries),

@@ -1219,10 +1219,15 @@ mod imp {
     }
 
     /// Writes the pin files and ownership marker beside the certificate.
-    fn write_pins_and_marker(opts: &Options, tls: &Path) -> Result<(), String> {
-        let bytes = std::fs::read(tls.join("host.crt"))
-            .map_err(|error| format!("read host.crt: {error}"))?;
-        let pins = cert_marker::pins_from_pem(&bytes)
+    /// Pins the certificate just issued. It is taken from memory, not read
+    /// back from `host.crt`, so `--dry-run` (which writes nothing) never
+    /// reads a file it did not write.
+    fn write_pins_and_marker(
+        opts: &Options,
+        tls: &Path,
+        certificate_pem: &[u8],
+    ) -> Result<(), String> {
+        let pins = cert_marker::pins_from_pem(certificate_pem)
             .ok_or_else(|| "cannot pin the generated certificate".to_string())?;
         let marker = OwnershipMarker::new(&pins.certificate, &pins.spki)
             .map_err(|error| format!("ownership marker: {error}"))?;
@@ -1339,7 +1344,8 @@ mod imp {
         let certificate = params
             .self_signed(&keypair)
             .map_err(|e| format!("self-sign TLS cert: {e}"))?;
-        atomic_write(opts, &cert, certificate.pem().as_bytes(), false)?;
+        let certificate_pem = certificate.pem();
+        atomic_write(opts, &cert, certificate_pem.as_bytes(), false)?;
         // Rewriting an unchanged key would churn its ACL and mtime for no
         // reason, and a failure there would destroy material that was fine.
         if preserve_key {
@@ -1357,7 +1363,7 @@ mod imp {
         }
         // The marker is what stops a later run replacing material an operator
         // installed themselves, and the pins are what they compare against.
-        write_pins_and_marker(opts, tls)
+        write_pins_and_marker(opts, tls, certificate_pem.as_bytes())
     }
 
     /// A directory whose contents users must read and execute but never write.

@@ -1,7 +1,8 @@
 //! End-to-end proof that a client can reach the macOS Pier.
 //!
 //! This dials the real listener over QUIC with the real certificate, using the
-//! same `connect_direct` the Deck uses, and completes the real handshake. It
+//! same lane transport the Deck uses (`connect_session_lanes`, one lane per
+//! role), and completes the real handshake. It
 //! is not a mock: the only thing it stands in for is the Deck's user
 //! interface.
 
@@ -14,8 +15,10 @@ use arcen_pier_macos::host_cert::MaterialPaths;
 use arcen_pier_macos::net::Listener;
 use arcen_transport::cert_provisioning::ProvisioningRequest;
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::protocol::{Message, Role};
+use tokio_tungstenite::tungstenite::protocol::Message;
+
+mod lane_client;
+use lane_client::LaneClient;
 
 /// Trusts exactly the certificate the Pier was given, the way a pinned Deck
 /// does. Nothing else is accepted.
@@ -102,7 +105,7 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 /// so it agreed with a matching bug on the host and proved nothing. Building
 /// the message the way the Deck builds it is what makes this a real test.
 async fn hello_and_authenticate(
-    client: &mut WebSocketStream<arcen_transport::quic::DirectQuicStream>,
+    client: &mut LaneClient,
     username: &str,
     password: &str,
 ) -> serde_json::Value {
@@ -179,7 +182,7 @@ async fn hello_only(
 }
 
 /// Client-side half of [`hello_only`].
-async fn client_hello_only(client: &mut WebSocketStream<arcen_transport::quic::DirectQuicStream>) {
+async fn client_hello_only(client: &mut LaneClient) {
     let _hello = tokio::time::timeout(Duration::from_secs(10), client.next())
         .await
         .expect("server_hello in time")
@@ -196,10 +199,7 @@ async fn client_hello_only(client: &mut WebSocketStream<arcen_transport::quic::D
 }
 
 /// Dials the Pier with its own certificate pinned.
-async fn connect_pinned(
-    certificate: &std::path::Path,
-    bound: std::net::SocketAddr,
-) -> WebSocketStream<arcen_transport::quic::DirectQuicStream> {
+async fn connect_pinned(certificate: &std::path::Path, bound: std::net::SocketAddr) -> LaneClient {
     let certificate_pem = std::fs::read(certificate).expect("read certificate");
     let client_config = pinned_client_config(
         &certificate_pem,
@@ -207,16 +207,7 @@ async fn connect_pinned(
     );
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("endpoint");
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("connect");
-    WebSocketStream::from_raw_socket(stream, Role::Client, None).await
+    LaneClient::connect(endpoint, client_config, bound).await
 }
 
 #[tokio::test]
@@ -304,9 +295,15 @@ fn pinned_client_config(certificate_pem: &[u8], alpn: Vec<Vec<u8>>) -> quinn::Cl
         .with_custom_certificate_verifier(Arc::new(PinnedServer { expected }))
         .with_no_client_auth();
     crypto.alpn_protocols = alpn;
-    quinn::ClientConfig::new(Arc::new(
+    let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic crypto"),
-    ))
+    ));
+    // The Deck's lane limits: the Pier opens video and audio lanes.
+    config.transport_config(arcen_transport::quic::lane_transport_config_arc(
+        &arcen_transport::BoundedTransportPolicy::default(),
+        arcen_protocol::lanes::LaneEndpoint::Deck,
+    ));
+    config
 }
 
 /// Awaits the Pier while the client keeps draining its socket.
@@ -320,7 +317,7 @@ fn pinned_client_config(certificate_pem: &[u8], alpn: Vec<Vec<u8>>) -> quinn::Cl
 /// happened to take most of the window.
 async fn finish_while_draining(
     server: tokio::task::JoinHandle<arcen_pier_macos::stream::StreamStats>,
-    client: &mut WebSocketStream<arcen_transport::quic::DirectQuicStream>,
+    client: &mut LaneClient,
     budget: Duration,
 ) -> arcen_pier_macos::stream::StreamStats {
     let drain = async { while client.next().await.is_some() {} };
@@ -397,17 +394,7 @@ async fn a_client_connects_over_quic_and_completes_the_handshake() {
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("client endpoint");
 
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("client connects to the Pier");
-
-    let mut client = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+    let mut client = LaneClient::connect(endpoint, client_config, bound).await;
 
     // The Pier speaks first.
     let hello = tokio::time::timeout(Duration::from_secs(10), client.next())
@@ -511,16 +498,7 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
     );
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("endpoint");
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("connect");
-    let mut client = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+    let mut client = LaneClient::connect(endpoint, client_config, bound).await;
 
     // Hello, then read pictures. The credential gate has its own test.
     client_hello_only(&mut client).await;
@@ -1276,16 +1254,7 @@ async fn a_streamed_session_records_what_it_measured() {
     );
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("endpoint");
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("connect");
-    let mut client = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+    let mut client = LaneClient::connect(endpoint, client_config, bound).await;
     client_hello_only(&mut client).await;
 
     let mut received = 0_u64;
@@ -1775,16 +1744,7 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
     );
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("endpoint");
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("connect");
-    let mut client = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+    let mut client = LaneClient::connect(endpoint, client_config, bound).await;
     client_hello_only(&mut client).await;
 
     // Timed from the first picture, so the measurement is of streaming rather
@@ -1971,16 +1931,7 @@ async fn a_still_desktop_sends_almost_nothing() {
     );
     let endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("address")).expect("endpoint");
-    let stream =
-        arcen_transport::quic::connect_direct(arcen_transport::quic::DirectQuicDialParams {
-            endpoint,
-            client_config,
-            remote_addr: bound,
-            server_name: "localhost",
-        })
-        .await
-        .expect("connect");
-    let mut client = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+    let mut client = LaneClient::connect(endpoint, client_config, bound).await;
     client_hello_only(&mut client).await;
 
     // Count only after the first picture, so the baseline frame every session

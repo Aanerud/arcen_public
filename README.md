@@ -17,7 +17,7 @@ Read this before you invest time.
 
 | | State |
 |---|---|
-| **Linux Pier** (host) | Works. Multi-display is automatic: the service discovers the NVIDIA heads at start. Auto/Speed use the existing NvFBC GPU path; Grading uses a separate depth-30 XShm path for genuine 10-bit SDR. Xorg cannot report HDR, so HDR requests visibly resolve to Grading, unless the operator declares the desktop Rec.2100 PQ (`video.desktop_encoding`, for applications such as Flame's HDR UI) and PQ / BT.2020 is passed through. General desktop HDR awaits a colour-managed Wayland provider. |
+| **Linux Pier** (host) | Works, on **X11** and — new in 0.17.0 — **Wayland** (GNOME Shell/Mutter). The Pier chooses from what the host has, never from the distribution's name: an installed Xorg server keeps the dedicated X11 desktop, and an existing installation never moves; without Xorg, each sign-in gets its own GNOME desktop, which the installer qualifies on the host before the service starts and the service re-qualifies after updates. **X11:** Auto and Speed on the NvFBC GPU path (Speed at 60 fps on a head paced at 120 Hz), Grading on a separate depth-30 XShm path for genuine 10-bit SDR, HDR visibly served as Grading unless the operator declares a Rec.2100 PQ desktop; one X11 desktop per host. **Wayland:** verified end to end on Rocky Linux 10.2 / GNOME 49 with an NVIDIA GRID vGPU (GNOME 40 on Rocky Linux 9 is a tested baseline); other GNOME hosts are admitted only by the same qualification. Auto everywhere, Speed where qualification proves it, Grading and HDR on GNOME/Mutter 50 or newer, and a real pen with pressure and tilt on stock GNOME when the desktop runs natively on its own seat (one per host). Everything Wayland cannot do yet is served visibly lower, with the reason — see [X11 and Wayland compared](#linux-pier-x11-and-wayland-compared) and [How Wayland support works](#how-wayland-support-works). On both, the Pier keeps the host from sleeping while it serves a desktop, and a remote desktop gets polkit's remote answers, never the console's, so its user cannot power off, reboot or suspend the host, change its networking or mount disks without an administrator (fixed in 0.17.0; polkit older than 0.106 cannot be given Arcen's rule, and the Pier logs a `SECURITY:` error there — see [CHANGELOG](CHANGELOG.md)). |
 | **Windows Pier** (host) | Works. Multi-display is automatic: the service picks an eligible NVIDIA adapter at start, and an administrator can reserve a GPU for other work. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB converted to 10-bit BT.709; HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
 | **macOS Deck** (client) | Works. Signed and notarised. On Apple silicon VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. Two apps from one source, both for macOS 12 or later: **Arcen Deck** for Apple silicon and **Arcen Deck Intel** for Intel Macs. AV1 decode needs Apple silicon M3 or later (macOS 14); the Intel app never offers AV1, and on Intel VideoToolbox may decode in software. Native tablet needs macOS 13. |
 | **Linux Deck, Windows Deck** | Do not exist. [Help wanted.](#where-help-is-wanted) |
@@ -34,6 +34,29 @@ compiled:
   V100D-16Q, Active Directory sign-in: the stock installer found the GPU,
   set the Xorg `BusID` itself and said so, and a Deck streamed Auto, Speed,
   Grading and HDR (served as Grading) with sound, on the first connection.
+- **Linux Pier, headless Wayland**, Rocky Linux 10.2 / GNOME 49 with no Xorg,
+  Secure Boot and SELinux enforcing, GRID V100D-16Q (580.105.08,
+  `nvidia-drm modeset=1`) → macOS Deck: qualification, Auto with sound,
+  microphone and input, Grading/HDR served as Auto, resize of a Windowed
+  Deck, capture restart after capenc was killed, and reattachment to the same
+  desktop; Speed qualified with no operator sizes (ladder 1920×1080,
+  2560×1600, 3840×2160, HEVC and H.264, 60 Hz outputs) on the GPU import
+  route, and served to the Deck at its 1800×1130 display.
+- **Linux Pier, headless Wayland with the optional GNOME 51.1 prefix**, same
+  host and GPU (lab build): Grading and HDR qualified (a 1024-code ramp
+  measured with maximum error 0) and served to the real Deck GUI at their
+  30 fps contract; two outputs qualified.
+- **Linux Pier, native Wayland desktop on stock GNOME**, Rocky Linux 10.2 /
+  Mutter 49.4, same GPU (development build of this release): the real Deck
+  GUI at Speed, driven with synthetic tablet events, reached Firefox 140 and
+  Chrome 155 as a pen for every inked sample, with 32 pressure levels and
+  tilt, exactly one cursor in every frame, and capenc serving 60 fps over
+  DMA-BUF.
+- **Linux Pier, X11 and Wayland, real screen**: the real Deck GUI driven by
+  real input against Firefox in an Active Directory user's desktop showed
+  Speed at 60 fps on both providers, one cursor (the Mac's own), and on X11
+  the pen delivering pressure and tilt in Firefox and Chrome, taps and very
+  light strokes included.
 - **Windows Pier**, DaVinci Resolve grading workstation, GRID V100D-16Q →
   macOS Deck: Auto, Speed, Grading, and HDR all completed end to end. Grading
   used WGC FP16 without enabling HDR; HDR used WGC FP16 with verified
@@ -75,16 +98,40 @@ specific to the automatic NVIDIA headless-display path; it does not imply that
 an attached display or the ordinary eight-bit pipeline needs an administrator
 account.
 
+### Linux Pier: X11 and Wayland compared
+
+The same Pier binary serves either desktop; which one a host gets is decided
+at start (`capture.provider`, see [How Wayland support works](#how-wayland-support-works)).
+
+| | X11 (an Xorg server is installed) | Wayland (GNOME Shell/Mutter, no Xorg) |
+|---|---|---|
+| **Desktop** | A dedicated Xorg server on the console seat; one per host | Headless: a seatless GNOME session per sign-in. Native: the same stock compositor on its own logind seat, one per host |
+| **Auto / Speed** | NvFBC → CUDA → NVENC, frame stays on the GPU; Speed at 60 fps on a head paced at 120 Hz | Mutter ScreenCast → PipeWire DMA-BUF → EGL → CUDA → NVENC with explicit sync, where qualification verified the import (otherwise a host copy). Speed only where qualification measured the rate at that display size, on one output; otherwise visibly Auto |
+| **Grading** | Depth-30 Xorg → XShm RGB10 → shared conversion → NVENC 4:4:4 10-bit, BT.709. The desktop must be created at depth 30 (`video.x11_desktop_depth`) | GNOME/Mutter 50 or newer after a per-host precision proof, one output, HEVC 4:4:4 10-bit BT.709. GNOME 49 (Rocky Linux 10) only through the optional [side-by-side GNOME prefix](docs/operations/pier-administration.md#upgrading-the-gnome-session-on-el10); otherwise visibly Auto |
+| **HDR** | Served as Grading, unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`) | Real BT.2020/PQ from the compositor on GNOME/Mutter 50 or newer, same proof and limits as Grading |
+| **No NVENC** | OpenH264, H.264 4:2:0 | OpenH264, H.264 4:2:0, up to 30 fps, outputs fitted to 1920×1200 |
+| **Monitors** | One to four; NVIDIA heads discovered at start | One to four Mutter virtual outputs, Remote UI scale, Windowed resize; Speed, Grading and HDR on one output only |
+| **Cursor** | The Mac's own cursor; the host sends shape changes (XFixes) | The Mac's own cursor drawing the host's cursor images, where qualification proves Mutter's cursor metadata; never a second cursor in the video |
+| **Pen (Tablet support)** | Virtual tablet: pressure, tilt, eraser, barrel buttons | Native desktop: a real pen with pressure and tilt in Wayland and Xwayland applications. Headless desktop: acts as a mouse until GNOME's EIS offers a stylus |
+| **Native tablet (USB bridged)** | Yes, on a LAN | Refused |
+| **Keyboard** | Keys | Keys, plus typed text from the Mac's input method within the session's keyboard layout |
+| **Clipboard** | Both ways, text and PNG | Same, same policy |
+| **Audio and microphone** | An Arcen sink in the user's audio server; every other sink muted for the session | A private PipeWire graph per session with no speaker in it; native PipeWire and PulseAudio applications both heard |
+| **X11 applications** | Native | Through Xwayland, where qualification proves the X11 pointer |
+| **Deskside privacy** | Yes | Not armed: a Wayland desktop never drives the physical console |
+| **Host requirements** | Xorg, NVIDIA driver (NvFBC) | GNOME Shell/Mutter 40 or later, PipeWire, WirePlumber, a DRM render node (for NVIDIA, `nvidia-drm modeset=1`), a qualification record. Native desktops also need an NVIDIA GPU without display connectors, the in-tree `vkms` module and polkit 0.106 or later |
+
 ### What a session carries
 
 | | |
 |---|---|
 | **Video** | Four complete presets: Auto, Speed, Grading, and HDR. They select separate capture/conversion pipelines rather than adding switches to one path. Source-built OpenH264 is the software floor where no supported hardware encoder exists. See [Streaming presets and independent pipelines](#streaming-presets-and-independent-pipelines). |
 | **Multiple monitors** | One to four, negotiated as one topology, and **on by default on every host**. The Deck can match its own display layout. The Linux Pier discovers the GPU's NVIDIA heads when the service starts; the Windows Pier picks an eligible NVIDIA adapter at start (list any GPU you want kept for other work in `excluded_adapters`); the macOS Pier creates one virtual display per Deck display. **Each monitor is its own NVENC session** on Linux and Windows, and that is the real ceiling there: consumer GeForce cards limit how many encode sessions run at once, while RTX Pro, Quadro and GRID do not. Arcen never guesses this from the GPU model — it opens the whole planned encoder set and admits it only if every region meets the quality thresholds. With `allow_software_fallback`, monitors that miss out can drop to OpenH264 — but **4:4:4 monitors cannot**, since OpenH264 is 4:2:0 only. `advertise_enabled: false` turns multi-display off. |
-| **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. By default the host's own speakers go silent for the session (`audio.local_playback`), so nobody beside the machine hears the remote user. On macOS that silence needs **System Audio Recording**, a separate approval from Screen Recording: the helper asks for it when it starts, and until it is given the host refuses a session and tells the Deck why rather than serving it audibly. |
+| **Audio out** | 48 kHz stereo, Opus-compressed by default, or uncompressed PCM if you would rather spend bandwidth than CPU. By default the host's own speakers go silent for the session (`audio.local_playback`), so nobody beside the machine hears the remote user. On macOS that silence needs **System Audio Recording**, a separate approval from Screen Recording: the helper asks for it when it starts, and until it is given the host refuses a session and tells the Deck why rather than serving it audibly. On Linux an X11 session plays into its own Arcen sink while every other sink of the user's audio server is muted, for the whole session; a Wayland session's audio is a private graph with no speaker in it, so native PipeWire and PulseAudio applications are heard by the Deck and not in the room. A Linux host that cannot prove the silence refuses the session; `local_playback: audible` lets the host's speakers play as well. The Windows Pier does not implement `local_playback` yet. |
 | **Microphone in** | **Linux hosts; macOS Pier preview.** Client microphone into the host session, Opus or fixed-rate PCM. Enabled in the host's default configuration, and still opt-in on the Deck every launch — consent is deliberately never restored from settings. Windows needs a signed driver Arcen does not yet ship (see [Where help is wanted](#where-help-is-wanted)). The macOS Pier publishes a virtual microphone and offers it only when that device is present; end-to-end capture is built but not yet qualified. |
 | **Keyboard and pointer** | Absolute and relative motion, and negotiated cursor authority — the host draws the cursor, or the client does, but never both. Trackpad scrolling stays precise end to end (phased deltas on macOS, high-resolution wheel on Linux, fractional and horizontal wheel on Windows). Trackpad gestures — magnify, smart zoom, swipe — are negotiated separately and injected where the host OS allows it (the macOS Pier today). |
-| **Pen and tablet** | Any HID pen tablet, whoever made it: a device counts as a tablet because its HID report descriptor declares a pen, never because of its vendor id. Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own tablet driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no tablet driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux hosts; see below for Windows and macOS)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own driver for that tablet claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
+| **Typed text** | **Linux Wayland hosts.** What the Mac's input method composes (accents and dead keys, Japanese, Chinese, Korean, emoji) and keys the remote layout would type differently arrive as the characters you typed; everything else, shortcuts and games included, still goes as keys (Settings → Input → Typing). The host types only what its session's keyboard layout can type, proven against the compositor's keymap, and tells the Deck which characters it could not type and why. Characters outside the session layout need a compositor with libei `ei_text` (GNOME's is not released yet), so on GNOME 49 they are refused visibly. Xorg, Windows and macOS hosts keep key positions for now. |
+| **Pen and tablet** | Any HID pen tablet, whoever made it: a device counts as a tablet because its HID report descriptor declares a pen, never because of its vendor id. Three modes, chosen per connection, because the choice is really about the network — it decides where the pen is interpreted.<br><br>**Tablet support** *(default, any distance)* — the Mac's own tablet driver reads the pen and Arcen sends finished pen events. Nothing waits for a reply and the host needs no tablet driver. Pressure, tilt, rotation, eraser, proximity and barrel buttons all work; finger touch and the tablet's own buttons stay on the Mac, which keeps working in Mac applications.<br><br>**Native tablet (USB bridged)** *(LAN only, Linux X11 hosts; see below for Windows, macOS and Linux Wayland)* — a privileged helper takes the device from macOS and forwards raw USB, so the host's own driver for that tablet claims it. The whole device works, including finger touch and the tablet's buttons. Every sample makes a full round trip, and Mac applications lose the tablet until you disconnect.<br><br>**Mouse compatibility only** — no redirection; the pen acts as a mouse.<br><br>On Linux Wayland hosts Tablet support gives a real pen (pressure and tilt) on a desktop that runs natively on its own seat (`wayland.session_mode`, one per host); on a headless desktop the pen acts as a mouse until GNOME's EIS offers a stylus. Native tablet is refused on every Wayland desktop. See [How Wayland support works](#how-wayland-support-works). On Windows and macOS the native-tablet mode is refused rather than quietly downgraded, so a Deck that asks for it is told it is unavailable and keeps ordinary mouse control. On macOS the reason is measured: presenting a bridged device needs `IOHIDUserDevice`, which returns nothing without the `com.apple.developer.hid.virtual.device` entitlement — as an ordinary user and as root alike. Apple has now granted it, but nothing on the host consumes bridged tablet traffic yet, so the mode stays refused until that importer exists. |
 | **Clipboard** | Text and images, both directions, or restricted to one, or off. The host decides; the client cannot override it. |
 | **Timezone** | The session follows the client's timezone, so timestamps read the way you expect. Linux sets `TZ` in the remote process tree; Windows temporarily changes the system timezone; the macOS Pier sets `TZ` in the served GUI session, so apps launched during the session see the Deck zone while the menu bar clock and already-running apps stay on the Mac's zone. |
 | **Login banner** | Off by default. A host can require the user to read and accept an operator-written notice *before* the Deck collects any credentials, with the exact text recorded. Useful where a legal warning is mandatory. |
@@ -164,6 +211,28 @@ repository to add, no service file to write.
 sudo ./install-arcen-pier
 ```
 
+The Linux installer chooses the desktop from what the machine has, never from
+the distribution's name, and prints what it found and why (also appended to
+`/var/log/arcen/install.log`). An installed Xorg server keeps the dedicated
+X11 desktop, exactly as before; an existing install never moves. Without
+Xorg, a headless GNOME Shell 40+ with PipeWire, WirePlumber, `dbus-daemon`
+and a DRM render node is qualified for Wayland with a short real session
+(`arcen-pier wayland qualify --write`), and the service starts only if that
+passes; otherwise the Pier stays installed but stopped, with what failed and
+what to run next. A host with neither Xorg nor DRM is refused before
+anything is written, naming the driver to install (for NVIDIA, `nvidia-drm`
+with `modeset=1`). The installer never installs packages or changes driver,
+kernel, device-permission or boot configuration, or the SELinux mode; where
+SELinux is enabled it loads only Arcen's own one-rule policy module (and
+unloads it on uninstall), and where polkit is installed it adds Arcen's
+rule that keeps remote desktops remote (see
+[How Wayland support works](#how-wayland-support-works)). On a host
+whose NVIDIA GPU has no display connectors, qualification also tries a
+native desktop, which gives the pen pressure and tilt; the installer
+explains the display-manager hazard that comes with it and disables the
+display manager only with `--disable-gdm`. `--check` prints the detection
+and decision and writes nothing.
+
 **Windows** — open **PowerShell as Administrator**, then run the installer from
 the folder you downloaded it to:
 
@@ -213,8 +282,9 @@ installed stays invisible until the machine restarts. Skip the reboot and your
 first remote sign-in fails, asking you to install something that is already
 installed.
 
-Useful flags on Linux and Windows: `--dry-run` shows what would happen and changes nothing;
-`--uninstall --purge` removes everything.
+Useful flags on Linux and Windows: `--dry-run` shows what would happen and
+changes nothing; `--uninstall` and `--uninstall --purge` are described under
+[Uninstall](#uninstall).
 
 ### The client (Deck)
 
@@ -224,6 +294,64 @@ app (`Arcen Deck` or `Arcen Deck Intel`) to `/Applications`. Both are signed and
 notarised, so they open normally, and both need macOS 12 or later. Install only
 the one that matches your Mac: the two share one bundle identifier, so they
 share settings and privacy permissions and are not meant to sit side by side.
+
+### Uninstall
+
+Every host uninstaller keeps the host's identity by default — its TLS
+certificate and configuration — so a reinstall presents the same certificate
+and Decks that remember the host keep trusting it. Add `--purge` to remove that
+too; it is a deliberate choice, because Decks must then pin the new
+certificate.
+
+**Linux Pier** — with the installer you installed from:
+
+```sh
+sudo ./install-arcen-pier --uninstall          # keeps /etc/arcen and the logs
+sudo ./install-arcen-pier --uninstall --purge  # removes them as well
+```
+
+It stops and disables the service and removes the binary, the systemd unit,
+the documentation and the log rotation rule, Arcen's SELinux policy module
+where one was loaded, Arcen's polkit rule, the Wayland qualification
+record and any leftover temporary qualification account, and the UDP 18444
+firewall opening if the installer was the one that opened it. A display
+manager that `--disable-gdm` turned off is put back. `--purge` first saves a copy of
+`/etc/arcen/pier.json` as `/etc/arcen-pier.json.purged-<epoch>`.
+
+**Windows Pier** — in **PowerShell as Administrator**, from the folder with the
+installer:
+
+```powershell
+.\install-arcen-pier.exe --uninstall          # keeps C:\ProgramData\Arcen
+.\install-arcen-pier.exe --uninstall --purge  # removes it as well
+```
+
+It removes the service, the binaries, the credential provider registration, the
+event source and the installer's firewall rule. `--purge` first saves
+`pier.json` as `C:\ProgramData\arcen-pier.json.purged-<epoch>`. If it reports
+that the credential provider is still loaded by the sign-in screen, reboot and
+confirm the directory is gone.
+
+**macOS Pier** — the uninstaller ships inside the app, so it cannot go missing:
+
+```sh
+sudo "/Applications/Arcen Pier.app/Contents/Resources/uninstall.sh"          # keeps identity, config and logs
+sudo "/Applications/Arcen Pier.app/Contents/Resources/uninstall.sh" --purge  # removes them as well
+```
+
+It stops the service and the helper in every signed-in session, removes the
+launchd definitions, the PAM policy, the log rotation rule, the virtual
+microphone and both applications, then checks that nothing is left running.
+Without `--purge` it keeps `/Library/Application Support/Arcen` (identity and
+configuration), `/Library/Logs/Arcen/Pier`, the hidden `_arcen` account and the
+Screen Recording and Accessibility approvals; `--purge` removes all of them.
+
+**Deck** — quit it and drag `Arcen Deck` (or `Arcen Deck Intel`) from
+`/Applications` to the Bin. Saved hosts, pinned certificates and settings live in
+`~/Library/Application Support/Arcen` and the login keychain; delete them only
+if you want the Deck to forget every host. If you used Native tablet, check
+that the Arcen USB helper no longer appears under **System Settings → General →
+Login Items & Extensions**.
 
 ---
 
@@ -300,10 +428,15 @@ different labels.
 On **Linux**, Auto and Speed use **NvFBC → CUDA → NVENC**. The frame stays on
 the GPU. Grading cannot use that path because public NvFBC has no ten-bit
 format, so it uses **depth-30 Xorg → MIT-SHM → packed RGB10 conversion → CUDA
-upload → NVENC**. Xorg has no HDR composition contract; an HDR request therefore
+upload → NVENC**. X11 has one depth per server, and at depth 30 browsers lose
+the GPU, so a Linux desktop is ten-bit only when the session that creates it is
+(`video.x11_desktop_depth`). Xorg has no HDR composition contract; an HDR request therefore
 uses that same genuine ten-bit SDR pipeline with an explicit downgrade. A
 machine without usable NVENC takes a third path: checked X11 capture and shared
-conversion into source-built OpenH264.
+conversion into source-built OpenH264. A headless Wayland session without
+usable NVENC takes the same encoder through its own composition: the
+compositor's shared-memory frames, Keel's hash, and the one OpenH264 session
+both providers share.
 
 On **Windows**, Auto and Speed use the 8-bit D3D11 path: Desktop Duplication
 only when it proves real image delivery, otherwise WGC. Grading requires a
@@ -368,6 +501,7 @@ system:
 |---|---|
 | Linux, Auto/Speed (NvFBC) | NvFBC's new-frame flag. The CUDA capture interface has no per-block damage, so this path has frame-level gating only. |
 | Linux, Grading/HDR (XShm) | X Damage events |
+| Linux, Wayland | The compositor's per-buffer damage regions (GNOME 49 and later), which also feed the QP map; GNOME 40 sends none, so every frame there is full damage |
 | Windows, every preset | Desktop Duplication and WGC deliver a frame only when the desktop changed; their dirty/move rectangles and dirty regions feed the QP map |
 | macOS | ScreenCaptureKit dirty rectangles |
 | Software fallback | Keel's own 16×16 block hash, which also skips unchanged rows during colour conversion |
@@ -376,7 +510,8 @@ system:
 (one value, or per preset: `{"auto": "on", "speed": "on"}`), Keel turns the
 same damage into an NVENC QP map so changed blocks get the bits. It engages
 only where damage is free: OS rectangles on Windows, X Damage on Linux
-Grading/HDR. The Linux NvFBC fast path refuses it rather than add a full-frame
+Grading/HDR, compositor damage regions on Wayland. The Linux NvFBC
+fast path refuses it rather than add a full-frame
 GPU readback. Every encoder logs
 `QP map policy=… engaged=… damage_source=…`, so whether it ran is never a
 guess. See [`docs/architecture/qp-maps.md`](docs/architecture/qp-maps.md).
@@ -411,6 +546,82 @@ The Deck logs `dedicated presenter telemetry` every second — received,
 submitted, confirmed, drops by cause, slot waits, and refresh intervals — and
 the host's health check compares decoded against presented frames, so a
 presentation problem shows up even when nobody notices it on screen.
+
+### How Wayland support works
+
+**The Pier picks the desktop from facts, then proves it.** At start
+(`capture.provider`, default `auto`) an installed Xorg server means X11.
+Without one, Wayland needs a GNOME Shell/Mutter that can run headless with
+virtual monitors, systemd-logind, `dbus-daemon`, PipeWire, WirePlumber, a
+DRM render node — and a qualification record. `arcen-pier wayland qualify
+--write`, which the installer runs, signs a temporary account into a real
+desktop and measures what this host can actually do: whether GPU import of
+the compositor's DMA-BUFs is pixel-exact, which display sizes hold Speed's
+rate, whether the compositor's cursor metadata, Xwayland and the precision
+needed for Grading and HDR are there, and whether a native desktop works.
+The service re-qualifies when the Pier, GNOME, PipeWire or the GPU driver
+changes. A capability the record does not prove is never assumed: the
+session is served at the level that was proven and the Deck shows why. The
+lab hosts' evidence is in
+[`docs/architecture/wayland-qualification/`](docs/architecture/wayland-qualification).
+
+**Each sign-in gets a whole GNOME session of its own** — a logind session, a
+private D-Bus bus, PipeWire and WirePlumber, then GNOME Shell with the
+keyring unlocked by the sign-in password, the settings daemons and the
+user's autostart programs. Arcen drives Mutter's own ScreenCast and
+RemoteDesktop D-Bus APIs on that private bus: video arrives as PipeWire
+buffers in the same capenc that serves X11, input goes in through
+RemoteDesktop and its EIS socket, and so does the clipboard. There is no
+portal and no screen-sharing prompt, and the compositor is the
+distribution's own (or, for Grading and HDR where the distribution ships
+GNOME 49 or older, an optional newer GNOME installed beside it).
+
+**Two ways to run that session** (`wayland.session_mode`):
+
+- **Headless** — GNOME Shell with `--headless` and virtual monitors, in a
+  seatless session. It needs no seat and changes nothing on the host. Its
+  limit is the pen: headless Mutter turns libinput off
+  ([`META_SEAT_NATIVE_FLAG_NO_LIBINPUT`](https://gitlab.gnome.org/GNOME/mutter/-/raw/main/src/backends/native/meta-backend-native.c)),
+  so it cannot see a tablet, and the remote-input route meant for one — a
+  stylus over libei — is not there yet: libei's `ei_stylus` is merged
+  ([libei!400](https://gitlab.freedesktop.org/libinput/libei/-/merge_requests/400),
+  [announcement](https://who-t.blogspot.com/2026/07/libei-and-graphics-tablets-stylus.html))
+  but not in a release, and Mutter's EIS server offers no stylus. The Pier
+  probes for one at every sign-in and reports what it found; until a
+  compositor offers one, the pen acts as a mouse. (Enabling libinput in headless
+  Mutter, [mutter!5224](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5224),
+  is still open; Arcen keeps a lab-only route for it, off by default.)
+- **Native** — the same stock compositor, started as a display server on a
+  logind seat of the desktop's own (`seat-arcen-pen-<id>`). Native Mutter
+  runs libinput, so the Deck's pen reaches applications as a real tablet
+  (`zwp_tablet_v2`) with pressure and tilt. Native mode needs a display head
+  with a connector, which a vGPU does not have, so the seat holds three
+  devices: the NVIDIA card node, which renders; the kernel's own virtual KMS
+  driver, `vkms`, as the head; and the desktop's virtual tablet. The Pier
+  puts them there with volatile udev rules under `/run`, logind hands them to
+  the compositor and revokes them when the session ends, and everything is
+  undone at the desktop's end, at Pier stop and at the next start. One
+  native desktop runs per host; the default, `auto`, uses it when
+  qualification proved it and otherwise serves a headless desktop and logs
+  why. A display-manager restart would put a login screen on that seat, so
+  the installer explains it and offers `--disable-gdm`.
+
+**A seat makes polkit treat a session as local**, ignoring that logind
+recorded it as remote. That is true of every X11 desktop too, and before
+0.17.0 it gave remote X11 users the console's rights. The installer now
+writes one rule, `/etc/polkit-1/rules.d/05-arcen-remote-session.rules`,
+that gives remote, Arcen-launched and Arcen-seat sessions polkit's remote
+answers, and the Pier asks polkit (`pkcheck`) about each seated desktop
+before handing it over, refusing it on any grant.
+
+Details: [the Wayland provider](docs/architecture/linux-wayland-provider.md)
+(how each part works, with lab evidence),
+[the administration guide](docs/operations/pier-administration.md#which-desktop-a-linux-pier-serves)
+(choosing, qualifying, native desktops, polkit, the optional GNOME prefix),
+[ADR 0014](docs/adr/0014-quic-lanes-and-capture-contracts.md) (capture
+contracts) and
+[ADR 0015](docs/adr/0015-native-wayland-desktops-on-their-own-seat.md)
+(native desktops).
 
 ### Three ways to run a Pier
 
@@ -705,7 +916,8 @@ is the first one.
   privileged helper — is laid out in
   [`docs/architecture/macos-peripheral-access.md`](docs/architecture/macos-peripheral-access.md),
   along with the measurement that decides it.
-- Wayland capture on Linux, alongside the current Xorg path.
+- A real pen on Linux Wayland: an EIS stylus (`ei_stylus`) in Mutter, or
+  headless libinput (mutter!5224) upstream, and other compositors than GNOME's.
 - Keel refinement: sharpen blocks once they stop changing, and a damage
   source for the Linux NvFBC fast path (the GL interface reports a change map
   that the CUDA interface does not).
@@ -819,7 +1031,7 @@ builds are the contributor's responsibility.
 | [`docs/architecture/`](docs/architecture) | How each part works and why |
 | [`docs/adr/`](docs/adr) | Decisions, including withdrawn ones, with reasons |
 | [`docs/operations/`](docs/operations) | Running and releasing |
-| [`docs/security/`](docs/security) | Trust boundaries, and [why the macOS Pier runs as separate processes](docs/security/macos-pier-process-model.md) |
+| [`docs/security/`](docs/security) | Trust boundaries, [why the macOS Pier runs as separate processes](docs/security/macos-pier-process-model.md), and [the Linux Pier under SELinux](docs/security/linux-selinux.md) |
 | `*/ARCHITECTURE.md` | Component detail, beside the code |
 | `*/AGENTS.md` | Who owns a directory and how to validate it |
 

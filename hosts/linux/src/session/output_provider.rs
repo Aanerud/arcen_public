@@ -200,6 +200,9 @@ mod tests {
 
     fn monitor(index: usize, rotation: Rotation, x: i32) -> LinuxMonitorPlan {
         LinuxMonitorPlan {
+            refresh_hz: 60,
+            width_mm: 0,
+            height_mm: 0,
             session_monitor_id: SessionMonitorId::new(
                 u16::try_from(index + 1).expect("bounded test id"),
             )
@@ -230,6 +233,7 @@ mod tests {
 
     fn rotated_plan(regions: usize, rotation: Rotation) -> LinuxTopologyPlan {
         LinuxTopologyPlan {
+            backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(1).expect("generation"),
             virtual_width: u32::try_from(regions).expect("bounded regions") * 1_920,
             virtual_height: 1_080,

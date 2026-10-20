@@ -323,6 +323,14 @@ of these cost real time:
   `arcen_session::agent_relay` over a local socket. Never give a file to the
   person who ran the installer; `serve` remains the single-process mode for
   tests and hand runs.
+- The network side runs every session on isolated QUIC lanes (ADR 0014,
+  protocol v5). `relay::relay_lanes` is the only code that touches them, for
+  the daemon and for `serve` alike: it grants the attachment after a
+  successful `auth_result` (or before `server_hello`) and hands everything
+  else to the shared `arcen_transport::quic::PierLaneRelay`. The session code
+  still speaks one local WebSocket; the agent's audio goes to the daemon on
+  its own side channel and from there onto the audio lane. Do not route media
+  onto the control lane or reintroduce a single Deck stream.
 
 ## The lab Mac is a delivery target, not a workstation
 

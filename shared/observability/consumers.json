@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-observability",
+  "owner": "Shared/Architecture",
+  "description": "Structured logging that cannot block a video thread.",
+  "validation": [
+    "shared-observability-test",
+    "shared-observability-clippy",
+    "shared-observability-conformance",
+    "workspace-boundaries"
+  ],
+  "consumers": [
+    {
+      "package": "arcen-capenc",
+      "dependency_kind": "normal",
+      "contracts": ["runtime"],
+      "targets": ["cfg(target_os = \"linux\")"],
+      "optional": true,
+      "enabled_by": ["wayland"],
+      "paths": [
+        {
+          "id": "linux-wayland-capture-import",
+          "entry_points": [
+            "hosts/capenc/src/wayland/telemetry.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-capture-import-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-auto",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/auto.rs",
+            "hosts/capenc/src/wayland/pipelines/mod.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs",
+            "hosts/capenc/src/wayland/telemetry.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-auto-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-wayland-speed",
+          "entry_points": [
+            "hosts/capenc/src/wayland/pipelines/speed.rs",
+            "hosts/capenc/src/wayland/pipelines/mod.rs",
+            "hosts/capenc/src/wayland/pipelines/runner.rs",
+            "hosts/capenc/src/wayland/telemetry.rs"
+          ],
+          "build_profiles": ["linux-capenc-wayland"],
+          "validation": ["linux-capenc-wayland-test", "linux-wayland-speed-lab"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-macos",
+      "dependency_kind": "normal",
+      "contracts": ["runtime"],
+      "paths": [
+        {
+          "id": "macos-deck-apple-silicon-sdr",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-app-apple-silicon"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-apple-silicon-10bit",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-app-apple-silicon"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-intel-sdr",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-intel"],
+          "validation": ["macos-deck-build-intel", "macos-deck-app-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-intel-10bit",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-intel"],
+          "validation": ["macos-deck-build-intel", "macos-deck-app-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-audio",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-microphone",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-input",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-clipboard",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-session",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-transport",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-usb-hard-lab",
+          "entry_points": ["clients/macos/src/logging/mod.rs"],
+          "build_profiles": ["macos-deck-usb-hard-lab"],
+          "validation": ["macos-deck-usb-hard-lab-test"],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux",
+      "dependency_kind": "normal",
+      "contracts": ["runtime", "sink"],
+      "paths": [
+        {
+          "id": "linux-xorg-grading",
+          "entry_points": ["hosts/linux/src/session/launcher.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-xorg-hdr",
+          "entry_points": ["hosts/linux/src/session/launcher.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session",
+          "entry_points": ["hosts/linux/src/session/launcher.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-transport",
+          "entry_points": ["hosts/linux/src/net/server.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-macos",
+      "dependency_kind": "normal",
+      "contracts": ["runtime", "sampler"],
+      "paths": [
+        {
+          "id": "macos-pier-session",
+          "entry_points": ["hosts/macos/src/main.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test", "macos-pier-app-build"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-transport",
+          "entry_points": ["hosts/macos/src/main.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test"],
+          "owner": "macOS Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows",
+      "dependency_kind": "normal",
+      "contracts": ["runtime", "sink"],
+      "paths": [
+        {
+          "id": "windows-grading",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-hdr",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-session",
+          "entry_points": ["hosts/windows/src/session.rs", "hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-transport",
+          "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-multi-monitor",
+          "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-linux"],
+      "paths": [
+        {
+          "id": "linux-installer",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/build.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-windows-installer",
+      "dependency_kind": "embedded",
+      "contracts": ["crate"],
+      "via": ["arcen-pier-windows"],
+      "paths": [
+        {
+          "id": "windows-installer",
+          "entry_points": [
+            "packaging/windows/installer/src/main.rs",
+            "packaging/windows/installer/build.rs"
+          ],
+          "build_profiles": ["windows-pier-installer"],
+          "validation": ["windows-pier-installer-build"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-transport",
+      "dependency_kind": "normal",
+      "contracts": ["runtime"],
+      "optional": true,
+      "enabled_by": ["quic"]
+    }
+  ]
+}

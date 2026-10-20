@@ -89,6 +89,14 @@ $SSH "$HOST" 'set -e; cd /root/arcen
   install -m 0644 packaging/linux/arcen-pier.logrotate /etc/logrotate.d/arcen-pier
   install -m 0644 packaging/linux/arcen-pier.service /etc/systemd/system/arcen-pier.service
   install -m 0644 legal/THIRD_PARTY_NOTICES.md /usr/share/doc/arcen/THIRD_PARTY_NOTICES.md
+  # SELinux hosts: the launcher may enter the user'"'"'s PAM context only with
+  # Arcen'"'"'s policy module (docs/security/linux-selinux.md).
+  if [ -e /sys/fs/selinux/enforce ]; then
+    install -d -m 0755 /usr/share/arcen/selinux
+    install -m 0644 packaging/linux/selinux/arcen.cil /usr/share/arcen/selinux/arcen.cil
+    semodule -i /usr/share/arcen/selinux/arcen.cil
+    semodule -l | grep -qx arcen
+  fi
   command -v logrotate >/dev/null
   logrotate --debug /etc/logrotate.d/arcen-pier >/dev/null
   systemctl daemon-reload

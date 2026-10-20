@@ -17,11 +17,11 @@ use arcen_identity::{
 use arcen_identity::{
     validate_direct_resume_grant, DirectResumeValidationContext, LogindSessionId,
 };
+use arcen_protocol::lanes::{SessionClose, SessionRecord};
 use arcen_protocol::messages::{AuthResponse, ResumeErrorCode, AUTH_METHOD_RESUME};
 use arcen_session::direct_reconnect::{
     DirectResumeSlot, DirectResumeSlotResult, MonotonicMillis, ReconnectPolicy,
 };
-use arcen_transport::quic::DirectQuicStream;
 use arcen_transport::{ConnectionId, DirectResumeTransportBinding};
 use futures_util::{Sink, Stream};
 use ring::hmac;
@@ -31,15 +31,16 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 #[cfg(feature = "wss-compat")]
 use tokio_rustls::server::TlsStream;
-use tokio_tungstenite::{
-    tungstenite::{Error as WebSocketError, Message},
-    WebSocketStream,
-};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+#[cfg(feature = "wss-compat")]
+use tokio_tungstenite::WebSocketStream;
 use zeroize::Zeroize;
 
 #[cfg(feature = "wss-compat")]
 type DirectWssSocket = WebSocketStream<TlsStream<TcpStream>>;
-type DirectQuicSocket = WebSocketStream<DirectQuicStream>;
+type DirectQuicSocket = arcen_transport::quic::SessionLaneSocket;
 
 pub(crate) enum DirectSessionSocket {
     #[cfg(feature = "wss-compat")]
@@ -57,15 +58,22 @@ impl DirectSessionSocket {
         Self::Quic(socket)
     }
 
-    /// The Deck's audio priority stream on this connection, not yet opened.
-    /// `None` on a transport without one.
-    pub(crate) fn priority_audio(&self) -> Option<arcen_transport::quic::PriorityAudio> {
+    /// The connection's isolated lanes (ADR 0014). `None` on a transport
+    /// without lanes, which cannot carry a session.
+    pub(crate) fn lanes(&self) -> Option<arcen_transport::quic::LaneConnection> {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(arcen_transport::quic::PriorityAudio::new(
-                socket.get_ref().connection_handle(),
-            )),
+            Self::Quic(socket) => Some(socket.lanes().clone()),
+        }
+    }
+
+    /// The control lane's sender, for writers that encode their own records.
+    pub(crate) fn control_sender(&self) -> Option<arcen_transport::quic::LaneSender> {
+        match self {
+            #[cfg(feature = "wss-compat")]
+            Self::Wss(_) => None,
+            Self::Quic(socket) => Some(socket.control_sender()),
         }
     }
 
@@ -74,7 +82,7 @@ impl DirectSessionSocket {
         match self {
             #[cfg(feature = "wss-compat")]
             Self::Wss(_) => None,
-            Self::Quic(socket) => Some(socket.get_ref().connection_handle()),
+            Self::Quic(socket) => Some(socket.lanes().connection().clone()),
         }
     }
 
@@ -97,7 +105,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_ready(context),
-            Self::Quic(socket) => Pin::new(socket).poll_ready(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_ready(context)
+                .map_err(lane_send_error),
         }
     }
 
@@ -105,7 +115,10 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).start_send(item),
-            Self::Quic(socket) => Pin::new(socket).start_send(item),
+            Self::Quic(socket) => match message_to_record(item) {
+                Some(record) => Pin::new(socket).start_send(record).map_err(lane_send_error),
+                None => Ok(()),
+            },
         }
     }
 
@@ -116,7 +129,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_flush(context),
-            Self::Quic(socket) => Pin::new(socket).poll_flush(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_flush(context)
+                .map_err(lane_send_error),
         }
     }
 
@@ -127,7 +142,9 @@ impl Sink<Message> for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_close(context),
-            Self::Quic(socket) => Pin::new(socket).poll_close(context),
+            Self::Quic(socket) => Pin::new(socket)
+                .poll_close(context)
+                .map_err(lane_send_error),
         }
     }
 }
@@ -139,9 +156,77 @@ impl Stream for DirectSessionSocket {
         match self.get_mut() {
             #[cfg(feature = "wss-compat")]
             Self::Wss(socket) => Pin::new(socket).poll_next(context),
-            Self::Quic(socket) => Pin::new(socket).poll_next(context),
+            Self::Quic(socket) => Pin::new(socket).poll_next(context).map(|item| {
+                item.map(|result| {
+                    result
+                        .map(record_to_message)
+                        .map_err(|exit| lane_exit_error(&exit))
+                })
+            }),
         }
     }
+}
+
+/// Converts a session message to its lane record (ADR 0014). `None` for raw
+/// frames, which the session protocol never sends.
+pub(crate) fn message_to_record(message: Message) -> Option<SessionRecord> {
+    Some(match message {
+        Message::Text(text) => SessionRecord::Text(text),
+        Message::Binary(bytes) => SessionRecord::Binary(bytes),
+        Message::Ping(bytes) => SessionRecord::Ping(bytes),
+        Message::Pong(bytes) => SessionRecord::Pong(bytes),
+        Message::Close(frame) => SessionRecord::Close(frame.map(|frame| SessionClose {
+            code: u16::from(frame.code),
+            reason: frame.reason.into_owned(),
+        })),
+        Message::Frame(_) => return None,
+    })
+}
+
+/// Converts a received lane record to the session message it carries.
+pub(crate) fn record_to_message(record: SessionRecord) -> Message {
+    match record {
+        SessionRecord::Text(text) => Message::Text(text),
+        SessionRecord::Binary(bytes) => Message::Binary(bytes),
+        SessionRecord::Ping(bytes) => Message::Ping(bytes),
+        SessionRecord::Pong(bytes) => Message::Pong(bytes),
+        SessionRecord::Close(close) => Message::Close(close.map(|close| CloseFrame {
+            code: CloseCode::from(close.code),
+            reason: close.reason.into(),
+        })),
+    }
+}
+
+/// Encodes a session message as one lane record.
+pub(crate) fn message_bytes(message: Message) -> Option<bytes::Bytes> {
+    message_to_record(message).map(|record| arcen_transport::quic::session_record_bytes(&record))
+}
+
+fn lane_send_error(error: arcen_transport::quic::LaneSendError) -> WebSocketError {
+    WebSocketError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("control lane: {error}"),
+    ))
+}
+
+fn lane_exit_error(exit: &arcen_transport::quic::LaneExit) -> WebSocketError {
+    let detail = match exit {
+        arcen_transport::quic::LaneExit::ConnectionLost {
+            mismatch: Some(mismatch),
+        } => {
+            tracing::warn!(
+                target: crate::logging::target::NET,
+                reason = %mismatch,
+                "Deck speaks another transport layout"
+            );
+            mismatch.message()
+        }
+        other => format!("control lane ended: {other:?}"),
+    };
+    WebSocketError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        detail,
+    ))
 }
 
 const NO_DISCLAIMER_SHA256: &str =
@@ -364,9 +449,33 @@ impl fmt::Debug for ResumeHandoff {
 #[derive(Debug)]
 pub(crate) enum OwnerCommand {
     Resume(Box<ResumeHandoff>),
+    /// A fresh sign-in that passed full authentication asks the detached
+    /// owner to hand its desktop over (`arcen_session::direct_reconnect::
+    /// fresh_sign_in` decides); the owner answers on `reply`.
+    TakeOver {
+        /// Canonical account name of the authenticated sign-in.
+        claimant: String,
+        /// Its uid.
+        claimant_uid: u32,
+        reply: tokio::sync::oneshot::Sender<TakeoverOutcome>,
+    },
     Terminal,
     PierShutdown,
 }
+
+/// The detached owner's answer to [`OwnerCommand::TakeOver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TakeoverOutcome {
+    /// The desktop was handed over: the session slot is free, the resume
+    /// grant invalidated, the desktop kept for the claimant.
+    HandedOver,
+    /// Another user's session: untouched.
+    Refused,
+}
+
+/// What a resume grant of a session that was handed over is told.
+pub(crate) const TAKEN_OVER_REASON: &str =
+    "this session was taken over by a newer sign-in of the same user";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryState {
@@ -389,6 +498,9 @@ pub(crate) struct ResumeRegistry {
     key: RingResumeKey,
     clock: Arc<dyn ResumeClock>,
     entry: Mutex<Option<RegistryEntry>>,
+    /// Holder of the last grant invalidated by a hand-over, so its Deck is
+    /// told why its resume is refused.
+    superseded: Mutex<Option<DeckHolderNonce>>,
 }
 
 impl fmt::Debug for ResumeRegistry {
@@ -411,6 +523,7 @@ impl ResumeRegistry {
             key: RingResumeKey::generate()?,
             clock,
             entry: Mutex::new(None),
+            superseded: Mutex::new(None),
         }))
     }
 
@@ -452,6 +565,73 @@ impl ResumeRegistry {
             previous_session_log_id: session_log_id.to_string(),
         });
         Ok(token)
+    }
+
+    /// Asks a detached session's owner to hand its desktop over to a fresh
+    /// sign-in of `claimant`. `None` unless the session is detached (an
+    /// attached or resuming session is never taken over this way).
+    pub(crate) fn request_takeover(
+        &self,
+        claimant: &str,
+        claimant_uid: u32,
+    ) -> Option<tokio::sync::oneshot::Receiver<TakeoverOutcome>> {
+        let guard = self.lock_entry().ok()?;
+        let entry = guard.as_ref()?;
+        if entry.state != EntryState::Detached {
+            return None;
+        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        entry
+            .owner
+            .send(OwnerCommand::TakeOver {
+                claimant: claimant.to_owned(),
+                claimant_uid,
+                reply,
+            })
+            .ok()?;
+        Some(answer)
+    }
+
+    /// Whether a resume is being validated: the owner is moving the session
+    /// to a resumed connection, so its old connection must not be judged.
+    pub(crate) fn resuming(&self) -> bool {
+        self.lock_entry()
+            .ok()
+            .and_then(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.state == EntryState::Resuming)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Invalidates the session's resume grant for a successor: records its
+    /// holder so a later resume is told it was taken over, and starts the
+    /// drain.
+    pub(crate) fn retire_for_successor(
+        &self,
+        active_session_id: &ActiveHostSessionId,
+    ) -> Result<(), ResumeRegistryError> {
+        let holder = self
+            .lock_entry()?
+            .as_ref()
+            .filter(|entry| entry.bindings.active_session_id == *active_session_id)
+            .map(|entry| entry.bindings.holder_nonce);
+        if let Some(holder) = holder {
+            *self
+                .superseded
+                .lock()
+                .map_err(|_| ResumeRegistryError::Lock)? = Some(holder);
+        }
+        self.begin_drain(active_session_id)
+    }
+
+    /// The rejection for a resume presented by a holder whose grant a
+    /// hand-over invalidated.
+    pub(crate) fn superseded_rejection(&self, holder: &DeckHolderNonce) -> Option<ResumeRejection> {
+        let superseded = *self.superseded.lock().ok()?;
+        (superseded == Some(*holder))
+            .then(|| ResumeRejection::new(ResumeErrorCode::SessionGone, TAKEN_OVER_REASON, false))
     }
 
     pub(crate) fn mark_detached(
@@ -682,6 +862,9 @@ impl ResumeRegistry {
                     false,
                 )
             })?;
+            if let Some(rejection) = self.superseded_rejection(&holder_nonce) {
+                return Err(rejection);
+            }
             if guard.is_none() {
                 return Err(ResumeRejection::new(
                     ResumeErrorCode::SessionGone,
@@ -1091,6 +1274,26 @@ pub(crate) fn disclaimer_binding(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_messages_round_trip_through_lane_records() {
+        use super::{message_to_record, record_to_message, CloseCode, CloseFrame, Message};
+        let messages = [
+            Message::Text("{\"type\":\"health_ping\"}".to_owned()),
+            Message::Binary(vec![0x20, 1]),
+            Message::Ping(vec![1]),
+            Message::Pong(vec![]),
+            Message::Close(None),
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "refused".into(),
+            })),
+        ];
+        for message in messages {
+            let record = message_to_record(message.clone()).expect("record");
+            assert_eq!(record_to_message(record), message);
+        }
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1146,6 +1349,7 @@ mod tests {
             key,
             clock: FakeClock::new(1_000),
             entry: Mutex::new(None),
+            superseded: Mutex::new(None),
         };
         let debug = format!("{registry:?}");
         assert!(!debug.contains("5a"));

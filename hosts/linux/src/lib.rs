@@ -31,6 +31,7 @@ pub mod microphone_input;
 pub mod net;
 pub mod netinfo;
 pub mod observability;
+pub mod service_signals;
 pub mod session;
 pub mod session_admission;
 pub mod support_bundle;

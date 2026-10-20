@@ -43,14 +43,15 @@ use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
 
+use crate::conversion_pool::ConversionPool;
 use crate::linux::cuda::{self, CUdeviceptr};
 use crate::linux::dl;
 use crate::linux::NativeStartupError;
 use arcen_keel::BgraFrame;
 use arcen_media::video::{
-    convert_bgra_to_i444_p16, convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
-    BackendUnavailableReason, ColorTransform, I444P16FrameMut, MotionPriority, PackedRgb10Layout,
-    Rgb10Signal,
+    convert_bgra_to_i444_p16, convert_packed_rgb10_region_to_i444_p16,
+    convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010, BackendUnavailableReason,
+    ColorTransform, FrameRegion, I444P16FrameMut, MotionPriority, PackedRgb10Layout, Rgb10Signal,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -158,7 +159,12 @@ pub struct Encoder {
     /// slot's device buffer at the end of every `stage_converted` call;
     /// empty (no allocation) for the two zero-copy formats.
     host_dst: Vec<u16>,
+    /// Whether `host_dst` is page-locked (see [`cuda::host_register`]).
+    host_dst_pinned: bool,
     conversion_workers: usize,
+    /// Persistent threads for `conversion_workers` bands; `None` converts on
+    /// scoped threads.
+    conversion_pool: Option<ConversionPool>,
     /// Damage-driven QP biasing, when engaged.
     ///
     /// Only reachable for the two ten-bit formats, and that is a genuine
@@ -171,13 +177,78 @@ pub struct Encoder {
     /// throughput. Refused rather than paid for silently; see
     /// `Encoder::enable_qp_map`.
     qp_state: Option<QpMapState>,
+    wide_stage: WideStageStats,
+    /// The current ten-bit frame on the GPU when region staging is engaged
+    /// (see [`Encoder::enable_wide_regions`]): regions update it, and every
+    /// picture copies it whole into the slot NVENC encodes.
+    wide_master: Option<CUdeviceptr>,
     /// Entries a QP map must have, or `0` when unavailable for this session.
     qp_map_entries: usize,
 }
 
+/// Where a QP map's damage comes from. Mirrors `nvenc.rs`.
+enum QpDamage {
+    /// Keel hashes each staged frame on the CPU (the ten-bit formats only,
+    /// which already copy the frame to the CPU to convert it).
+    CpuHash(arcen_keel::DamageTracker),
+    /// The capture source states what changed (a Wayland compositor's
+    /// `SPA_META_VideoDamage` regions); nothing is read back, so this also
+    /// serves the zero-copy eight-bit formats.
+    External(arcen_keel::PendingExternalDamage),
+}
+
+impl QpDamage {
+    fn damage_map(&self) -> arcen_keel::DamageMap<'_> {
+        match self {
+            Self::CpuHash(tracker) => tracker.damage_map(),
+            Self::External(damage) => damage.damage_map(),
+        }
+    }
+}
+
+/// Per-window timings of [`Encoder::stage_wide_host`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WideStageStats {
+    frames: u32,
+    convert: std::time::Duration,
+    upload: std::time::Duration,
+    upload_bytes: u64,
+}
+
+impl WideStageStats {
+    fn record(
+        &mut self,
+        convert: std::time::Duration,
+        upload: std::time::Duration,
+        upload_bytes: usize,
+    ) {
+        self.frames = self.frames.saturating_add(1);
+        self.convert += convert;
+        self.upload += upload;
+        self.upload_bytes = self
+            .upload_bytes
+            .saturating_add(u64::try_from(upload_bytes).unwrap_or(u64::MAX));
+    }
+
+    /// The ` key=value` suffix for a capenc stats line; empty when nothing was
+    /// staged.
+    pub fn fields(&self) -> String {
+        if self.frames == 0 {
+            return String::new();
+        }
+        let frames = f64::from(self.frames);
+        format!(
+            " avg_convert_ms={:.2} avg_upload_ms={:.2} avg_upload_kib={}",
+            self.convert.as_secs_f64() * 1000.0 / frames,
+            self.upload.as_secs_f64() * 1000.0 / frames,
+            self.upload_bytes / u64::from(self.frames) / 1024,
+        )
+    }
+}
+
 /// Per-session damage tracking and QP-map state. Mirrors `nvenc.rs`.
 struct QpMapState {
-    tracker: arcen_keel::DamageTracker,
+    damage: QpDamage,
     builder: arcen_media::video::QpDeltaMapBuilder,
     bias: arcen_media::video::QpBias,
     policy: arcen_media::video::QpMapPolicy,
@@ -825,6 +896,11 @@ pub(crate) enum WideSource {
     /// writes PQ R'G'B' into it. The same codes as [`Self::ColorManagedPq`],
     /// vouched for by the operator instead of the compositor.
     XorgDeclaredPq,
+    /// A colour-managed compositor's half-float PQ stream already converted
+    /// to ten-bit BT.709 SDR codes by the shared conversion
+    /// (`arcen_media::video::convert_rgba_f16_pq_to_packed_rgb10`): only the
+    /// matrix is left, and only an SDR contract may carry it.
+    NormalisedSdr,
 }
 
 impl WideSource {
@@ -841,7 +917,9 @@ impl WideSource {
     /// What this source's code values mean, for the shared desktop rule.
     const fn signal_encoding(self) -> arcen_media::video::DesktopSignalEncoding {
         match self {
-            Self::XorgDepth30 => arcen_media::video::DesktopSignalEncoding::Sdr,
+            Self::XorgDepth30 | Self::NormalisedSdr => {
+                arcen_media::video::DesktopSignalEncoding::Sdr
+            }
             Self::ColorManagedPq | Self::XorgDeclaredPq => {
                 arcen_media::video::DesktopSignalEncoding::Rec2100Pq
             }
@@ -1386,11 +1464,32 @@ impl Encoder {
         // `stage_converted`. Left empty for the two zero-copy formats — no
         // allocation, no cost, and `stage_converted` is never called for
         // them (see `PixelFormat::needs_own_conversion`).
-        let host_dst = if format.needs_own_conversion() {
+        let mut host_dst = if format.needs_own_conversion() {
             vec![0u16; frame_bytes / std::mem::size_of::<u16>()]
         } else {
             Vec::new()
         };
+        // The ten-bit staging is uploaded whole every picture; from pageable
+        // memory the driver bounces it through its own pinned buffer.
+        // Page-locking it once took 2.4 ms to 1.8 ms per 1440p 4:4:4 frame
+        // on the Xorg lab host. `host_dst` is never resized afterwards.
+        let host_dst_pinned = !host_dst.is_empty()
+            && match cuda::host_register(
+                host_dst.as_mut_ptr().cast(),
+                host_dst.len() * std::mem::size_of::<u16>(),
+            ) {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    crate::log(&format!("ten-bit staging stays pageable: {error}"));
+                    false
+                }
+            };
+        if !host_dst.is_empty() {
+            crate::log(&format!(
+                "ten-bit staging buffer: {} KiB pinned={host_dst_pinned}",
+                host_dst.len() * std::mem::size_of::<u16>() / 1024
+            ));
+        }
         let conversion_workers = if format.needs_own_conversion() {
             std::thread::available_parallelism()
                 .map_or(1, usize::from)
@@ -1399,6 +1498,17 @@ impl Encoder {
         } else {
             1
         };
+        // A pool that cannot start costs nothing but speed: conversion then
+        // spawns scoped threads per frame as it always did.
+        let conversion_pool = (conversion_workers > 1)
+            .then(|| match ConversionPool::new(conversion_workers) {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    crate::log(&format!("ten-bit conversion uses scoped threads: {error}"));
+                    None
+                }
+            })
+            .flatten();
 
         Ok(Self {
             _library: library,
@@ -1426,8 +1536,12 @@ impl Encoder {
             wide_signal,
             host_src: Vec::new(),
             host_dst,
+            host_dst_pinned,
             conversion_workers,
+            conversion_pool,
             qp_state: None,
+            wide_stage: WideStageStats::default(),
+            wide_master: None,
             qp_map_entries,
         })
     }
@@ -1643,15 +1757,18 @@ impl Encoder {
         if let Some(state) = self.qp_state.as_mut() {
             let packed = BgraFrame::new(src, self.width as usize, self.height as usize, src_pitch)
                 .map_err(|error| error.to_string())?;
-            match state.tracker.update(packed) {
-                Ok(_) => state.observed = true,
-                Err(error) => {
-                    state.observed = false;
-                    crate::log(&format!("QP map: RGB10 damage update failed: {error}"));
+            if let QpDamage::CpuHash(tracker) = &mut state.damage {
+                match tracker.update(packed) {
+                    Ok(_) => state.observed = true,
+                    Err(error) => {
+                        state.observed = false;
+                        crate::log(&format!("QP map: RGB10 damage update failed: {error}"));
+                    }
                 }
             }
         }
 
+        let convert_started = std::time::Instant::now();
         match self.pixel_format {
             PixelFormat::Yuv444_10 => {
                 let (y, rest) = self.host_dst.split_at_mut(luma_samples);
@@ -1667,6 +1784,7 @@ impl Encoder {
                     self.wide_transform,
                     self.wide_signal,
                     self.conversion_workers,
+                    self.conversion_pool.as_ref(),
                 )?;
             }
             PixelFormat::Yuv420_10 => {
@@ -1690,11 +1808,287 @@ impl Encoder {
                 unreachable!("non-wide formats were rejected above")
             }
         }
-        cuda::memcpy_htod(
+        let convert = convert_started.elapsed();
+        let upload_started = std::time::Instant::now();
+        self.upload_wide(None)?;
+        self.wide_stage
+            .record(convert, upload_started.elapsed(), self.frame_bytes);
+        Ok(())
+    }
+
+    /// Keep the ten-bit frame on the GPU so later pictures may upload only
+    /// what changed ([`Self::stage_wide_host_region`]). Engages only for the
+    /// planar 4:4:4 ten-bit surface without a CPU-hashed QP map, whose
+    /// damage tracker needs whole frames. Returns whether it engaged.
+    ///
+    /// # Safety
+    ///
+    /// This encoder's CUDA context must be current on the calling thread.
+    pub unsafe fn enable_wide_regions(&mut self) -> Result<bool, String> {
+        if self.wide_master.is_some() {
+            return Ok(true);
+        }
+        let hashed = self
+            .qp_state
+            .as_ref()
+            .is_some_and(|state| matches!(state.damage, QpDamage::CpuHash(_)));
+        if !matches!(self.pixel_format, PixelFormat::Yuv444_10) || hashed {
+            return Ok(false);
+        }
+        self.wide_master = Some(cuda::mem_alloc(self.frame_bytes)?);
+        Ok(true)
+    }
+
+    /// Re-send the retained GPU frame into the current slot without reading
+    /// or converting anything (a pipeline flush with nothing new on screen).
+    ///
+    /// # Errors
+    ///
+    /// When regions are not engaged or the copy fails.
+    ///
+    /// # Safety
+    ///
+    /// This encoder's CUDA context must be current on the calling thread.
+    pub unsafe fn restage_wide(&mut self) -> Result<(), String> {
+        let master = self
+            .wide_master
+            .ok_or_else(|| "wide region staging is not engaged".to_string())?;
+        cuda::memcpy_dtod(
             self.slots[self.write_idx].input_buf,
-            self.host_dst.as_ptr().cast(),
+            master,
             self.frame_bytes,
         )
+    }
+
+    /// Stage a frame of which only `region` changed since the last staged
+    /// one. `src` holds only the region, packed at `src_pitch`, in the
+    /// depth-30 X framebuffer format. The region is converted into the
+    /// retained host planes with the same per-pixel code as a whole frame,
+    /// uploaded into the GPU master frame, and the master is copied whole
+    /// into the current slot.
+    ///
+    /// # Errors
+    ///
+    /// When regions are not engaged, the region leaves the frame, or a CUDA
+    /// copy fails.
+    ///
+    /// # Safety
+    ///
+    /// This encoder's CUDA context must be current on the calling thread.
+    pub unsafe fn stage_wide_host_region(
+        &mut self,
+        src: &[u8],
+        src_pitch: usize,
+        region: FrameRegion,
+        layout: PackedRgb10Layout,
+    ) -> Result<(), String> {
+        if self.wide_master.is_none() {
+            return Err("wide region staging is not engaged".to_string());
+        }
+        let stride = self.pitch as usize / self.pixel_format.bytes_per_sample();
+        let convert_started = std::time::Instant::now();
+        convert_rgb10_region_parallel(
+            src,
+            src_pitch,
+            &mut self.host_dst,
+            stride,
+            (self.width as usize, self.height as usize),
+            region,
+            layout,
+            self.wide_transform,
+            self.wide_signal,
+            self.conversion_workers,
+            self.conversion_pool.as_ref(),
+        )?;
+        let convert = convert_started.elapsed();
+        let upload_started = std::time::Instant::now();
+        self.upload_wide(Some(region))?;
+        self.wide_stage.record(
+            convert,
+            upload_started.elapsed(),
+            region.width * region.height * 3 * std::mem::size_of::<u16>(),
+        );
+        Ok(())
+    }
+
+    /// Host planes to the GPU: straight into the current slot without a
+    /// master frame; otherwise the whole frame or one rectangle of each plane
+    /// into the master, then the master into the slot.
+    unsafe fn upload_wide(&mut self, region: Option<FrameRegion>) -> Result<(), String> {
+        let slot = self.slots[self.write_idx].input_buf;
+        let Some(master) = self.wide_master else {
+            return cuda::memcpy_htod(slot, self.host_dst.as_ptr().cast(), self.frame_bytes);
+        };
+        match region {
+            None => cuda::memcpy_htod(master, self.host_dst.as_ptr().cast(), self.frame_bytes)?,
+            Some(region) => {
+                let pitch = self.pitch as usize;
+                let plane_bytes = pitch * self.height as usize;
+                let sample = std::mem::size_of::<u16>();
+                for plane in 0..3 {
+                    let offset = plane * plane_bytes + region.y * pitch + region.x * sample;
+                    cuda::memcpy_2d_htod(
+                        master + offset as u64,
+                        pitch,
+                        self.host_dst.as_ptr().cast::<u8>().add(offset).cast(),
+                        pitch,
+                        region.width * sample,
+                        region.height,
+                    )?;
+                }
+            }
+        }
+        cuda::memcpy_dtod(slot, master, self.frame_bytes)
+    }
+
+    /// Lab and test check of region staging: converts a whole captured frame
+    /// on its own and compares it with the retained host planes, and reads
+    /// the GPU master back and compares that too. Returns the mismatching
+    /// sample counts `(host, gpu)`; `(0, 0)` means region staging produced
+    /// exactly the frame a whole capture would.
+    ///
+    /// # Safety
+    ///
+    /// This encoder's CUDA context must be current on the calling thread.
+    pub unsafe fn verify_wide_frame(
+        &mut self,
+        src: &[u8],
+        src_pitch: usize,
+        layout: PackedRgb10Layout,
+    ) -> Result<(usize, usize), String> {
+        let stride = self.pitch as usize / self.pixel_format.bytes_per_sample();
+        let luma_samples = stride * self.height as usize;
+        let mut whole = vec![0u16; self.host_dst.len()];
+        {
+            let (y, rest) = whole.split_at_mut(luma_samples);
+            let (u, v) = rest.split_at_mut(luma_samples);
+            convert_packed_rgb10_to_i444_p16_parallel(
+                src,
+                src_pitch,
+                [y, u, v],
+                [stride, stride, stride],
+                self.width as usize,
+                self.height as usize,
+                layout,
+                self.wide_transform,
+                self.wide_signal,
+                self.conversion_workers,
+                self.conversion_pool.as_ref(),
+            )?;
+        }
+        let host = count_visible_mismatches(&whole, &self.host_dst, stride, self.width as usize);
+        let gpu = match self.wide_master {
+            Some(master) => {
+                let mut read_back = vec![0u16; self.host_dst.len()];
+                cuda::memcpy_dtoh(read_back.as_mut_ptr().cast(), master, self.frame_bytes)?;
+                count_visible_mismatches(&whole, &read_back, stride, self.width as usize)
+            }
+            None => 0,
+        };
+        Ok((host, gpu))
+    }
+
+    /// Conversion and upload timings of the ten-bit host staging since the
+    /// last call.
+    pub fn take_wide_stage_stats(&mut self) -> WideStageStats {
+        std::mem::take(&mut self.wide_stage)
+    }
+
+    /// Stage an eight-bit BGRx/BGRA frame that already lives in host memory
+    /// (a `PipeWire` shared-memory buffer on the Wayland provider path).
+    ///
+    /// This is the `host-copy` route: for the zero-conversion `Bgra8` surface
+    /// one 2D host-to-device copy drops row padding into the current slot and
+    /// NVENC performs the same RGB -> YCbCr conversion the NvFBC path uses;
+    /// the ten-bit surfaces reuse [`write_owned_from_bgra`] exactly as
+    /// [`Self::stage_converted`] does. The copy is synchronous, so the caller
+    /// may release the producer buffer once this returns. The padding byte
+    /// of BGRx is ignored by both.
+    ///
+    /// # Errors
+    ///
+    /// When `src` cannot hold the frame at `src_pitch`, for the `Yuv444_8`
+    /// surface (which only NvFBC's own YUV444P conversion feeds), or when the
+    /// CUDA copy fails.
+    ///
+    /// # Safety
+    ///
+    /// This encoder's CUDA context must be current on the calling thread.
+    #[cfg(feature = "wayland")]
+    pub unsafe fn stage_host_bgra(&mut self, src: &[u8], src_pitch: usize) -> Result<(), String> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let row_bytes = width * 4;
+        if src_pitch < row_bytes {
+            return Err(format!(
+                "host BGRA pitch {src_pitch} is shorter than a {width}-pixel row"
+            ));
+        }
+        let needed = src_pitch
+            .checked_mul(height.saturating_sub(1))
+            .and_then(|bytes| bytes.checked_add(row_bytes))
+            .ok_or_else(|| "host BGRA frame size overflow".to_string())?;
+        if src.len() < needed {
+            return Err(format!(
+                "host BGRA frame holds {} bytes; {width}x{height} at pitch {src_pitch} needs {needed}",
+                src.len()
+            ));
+        }
+        match self.pixel_format {
+            PixelFormat::Bgra8 => cuda::memcpy_2d_htod(
+                self.slots[self.write_idx].input_buf,
+                self.pitch as usize,
+                src.as_ptr().cast(),
+                src_pitch,
+                row_bytes,
+                height,
+            ),
+            PixelFormat::Yuv420_10 | PixelFormat::Yuv444_10 => {
+                // `BgraFrame` wants whole padded rows; a producer may omit
+                // the last row's padding, so such a frame is repacked once.
+                let frame_bytes = src_pitch * height;
+                let source: &[u8] = if src.len() >= frame_bytes {
+                    src
+                } else {
+                    self.host_src.clear();
+                    self.host_src.extend_from_slice(&src[..needed]);
+                    self.host_src.resize(frame_bytes, 0);
+                    &self.host_src
+                };
+                let bgra = BgraFrame::new(source, width, height, src_pitch)
+                    .map_err(|error| error.to_string())?;
+                if let Some(state) = self.qp_state.as_mut() {
+                    if let QpDamage::CpuHash(tracker) = &mut state.damage {
+                        match tracker.update(bgra) {
+                            Ok(_) => state.observed = true,
+                            Err(error) => {
+                                state.observed = false;
+                                crate::log(&format!("QP map: damage update failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                write_owned_from_bgra(
+                    self.pixel_format,
+                    self.transform,
+                    bgra,
+                    &mut self.host_dst,
+                    self.pitch,
+                    self.width,
+                    self.height,
+                )?;
+                cuda::memcpy_htod(
+                    self.slots[self.write_idx].input_buf,
+                    self.host_dst.as_ptr().cast(),
+                    self.frame_bytes,
+                )
+            }
+            PixelFormat::Yuv444_8 => Err(
+                "host BGRA staging has no 8-bit 4:4:4 conversion; that surface is fed only by \
+                 NvFBC's own YUV444P capture"
+                    .to_string(),
+            ),
+        }
     }
 
     /// `stage()`'s path for a `PixelFormat` this file converts itself. There
@@ -1727,11 +2121,13 @@ impl Encoder {
         // CPU for its own conversion. Damage is an optimisation, so a tracker
         // failure costs this frame its bias, never the session its encode.
         if let Some(state) = self.qp_state.as_mut() {
-            match state.tracker.update(bgra) {
-                Ok(_) => state.observed = true,
-                Err(error) => {
-                    state.observed = false;
-                    crate::log(&format!("QP map: damage update failed: {error}"));
+            if let QpDamage::CpuHash(tracker) = &mut state.damage {
+                match tracker.update(bgra) {
+                    Ok(_) => state.observed = true,
+                    Err(error) => {
+                        state.observed = false;
+                        crate::log(&format!("QP map: damage update failed: {error}"));
+                    }
                 }
             }
         }
@@ -1766,7 +2162,9 @@ impl Encoder {
     /// the map — tens of megabytes per frame at 4K, on the tier whose whole
     /// point is throughput. That cost would very likely swamp whatever
     /// bitrate the map saved, and would quietly corrupt the benchmark it
-    /// exists to serve. So it is refused and logged rather than paid.
+    /// exists to serve. So it is refused and logged rather than paid. A
+    /// source that states its own damage needs no readback at all; see
+    /// [`Self::enable_external_qp_map`].
     pub fn enable_qp_map(
         &mut self,
         policy: arcen_media::video::QpMapPolicy,
@@ -1786,6 +2184,47 @@ impl Encoder {
             );
             return false;
         }
+        let Ok(tracker) = arcen_keel::DamageTracker::new(
+            self.width as usize,
+            self.height as usize,
+            arcen_keel::KernelPreference::Auto,
+        ) else {
+            return false;
+        };
+        self.engage_qp_map(policy, bias, codec, QpDamage::CpuHash(tracker))
+    }
+
+    /// Turn QP biasing on with damage the capture source states itself
+    /// ([`Self::observe_external_damage`] before each submission), for any
+    /// pixel format: nothing is read back. A submission without a fresh
+    /// observation, or after [`Self::clear_qp_observation`], gets a neutral
+    /// map. Returns whether it engaged (the driver accepted `qpMapMode` and
+    /// the codec has a QP-map geometry).
+    pub fn enable_external_qp_map(
+        &mut self,
+        policy: arcen_media::video::QpMapPolicy,
+        bias: arcen_media::video::QpBias,
+        codec: arcen_media::VideoCodec,
+    ) -> bool {
+        self.qp_state = None;
+        if !policy.submits_map() || self.qp_map_entries == 0 {
+            return false;
+        }
+        let Ok(pending) =
+            arcen_keel::PendingExternalDamage::new(self.width as usize, self.height as usize)
+        else {
+            return false;
+        };
+        self.engage_qp_map(policy, bias, codec, QpDamage::External(pending))
+    }
+
+    fn engage_qp_map(
+        &mut self,
+        policy: arcen_media::video::QpMapPolicy,
+        bias: arcen_media::video::QpBias,
+        codec: arcen_media::VideoCodec,
+        damage: QpDamage,
+    ) -> bool {
         let Ok(builder) =
             arcen_media::video::QpDeltaMapBuilder::new(codec, self.width, self.height)
         else {
@@ -1799,15 +2238,8 @@ impl Encoder {
             ));
             return false;
         }
-        let Ok(tracker) = arcen_keel::DamageTracker::new(
-            self.width as usize,
-            self.height as usize,
-            arcen_keel::KernelPreference::Auto,
-        ) else {
-            return false;
-        };
         self.qp_state = Some(QpMapState {
-            tracker,
+            damage,
             builder,
             bias,
             policy,
@@ -1815,6 +2247,42 @@ impl Encoder {
             stats: arcen_media::video::QpMapStats::default(),
         });
         true
+    }
+
+    /// The source's damage for the next submission, when the session's QP
+    /// map takes external damage; ignored otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The map describes another frame geometry; the submission is then
+    /// neutral.
+    pub fn observe_external_damage(
+        &mut self,
+        damage: arcen_keel::DamageMap<'_>,
+    ) -> Result<(), String> {
+        let Some(state) = self.qp_state.as_mut() else {
+            return Ok(());
+        };
+        let QpDamage::External(external) = &mut state.damage else {
+            return Ok(());
+        };
+        if let Err(error) = external.observe(damage) {
+            state.observed = false;
+            external.discard_pending();
+            return Err(format!("QP map external damage mismatch: {error}"));
+        }
+        state.observed = true;
+        Ok(())
+    }
+
+    /// The next submission has no trustworthy damage: it gets a neutral map.
+    pub fn clear_qp_observation(&mut self) {
+        if let Some(state) = self.qp_state.as_mut() {
+            state.observed = false;
+            if let QpDamage::External(external) = &mut state.damage {
+                external.discard_pending();
+            }
+        }
     }
 
     pub fn take_qp_map_stats(&mut self) -> arcen_media::video::QpMapStats {
@@ -1905,7 +2373,7 @@ impl Encoder {
                 state.stats.record_neutral();
                 Some(state.builder.build_neutral())
             } else {
-                let damage = state.tracker.damage_map();
+                let damage = state.damage.damage_map();
                 let dirty_blocks = damage.dirty_blocks().count();
                 let total_blocks = damage.grid().block_count().max(1);
                 let dirty_fraction = dirty_blocks as f64 / total_blocks as f64;
@@ -1929,6 +2397,10 @@ impl Encoder {
                     pic.qpDeltaMap = entries.as_ptr().cast_mut();
                     pic.qpDeltaMapSize = u32::try_from(entries.len()).unwrap_or(0);
                 }
+            }
+            // This picture consumes whatever the source stated for it.
+            if let QpDamage::External(external) = &mut state.damage {
+                external.mark_submitted();
             }
         }
         pic.outputBitstream = self.slots[slot].bitstream;
@@ -1985,8 +2457,118 @@ impl Drop for Encoder {
             }
             cleanup_slots(&self.fl, self.enc, &mut self.slots);
             destroy_encoder(&self.fl, &mut self.enc);
+            if let Some(master) = self.wide_master.take() {
+                let _ = cuda::mem_free(master);
+            }
+            if self.host_dst_pinned {
+                let _ = cuda::host_unregister(self.host_dst.as_mut_ptr().cast());
+            }
         }
     }
+}
+
+/// Mismatching samples between two sets of planes, ignoring row padding.
+fn count_visible_mismatches(left: &[u16], right: &[u16], stride: usize, width: usize) -> usize {
+    left.chunks(stride)
+        .zip(right.chunks(stride))
+        .map(|(left, right)| {
+            left[..width.min(left.len())]
+                .iter()
+                .zip(&right[..width.min(right.len())])
+                .filter(|(left, right)| left != right)
+                .count()
+        })
+        .sum()
+}
+
+/// Rows of a region below which one thread converts it alone.
+const REGION_ROWS_PER_WORKER: usize = 32;
+
+/// Converts `region` of a packed RGB10 sub-image into the retained I444P16
+/// host planes, split into horizontal bands across workers. Each band is the
+/// shared `convert_packed_rgb10_region_to_i444_p16` on its own rows, so the
+/// result is the same as one call.
+#[allow(clippy::too_many_arguments)]
+fn convert_rgb10_region_parallel(
+    src: &[u8],
+    src_pitch: usize,
+    planes: &mut [u16],
+    stride: usize,
+    (width, height): (usize, usize),
+    region: FrameRegion,
+    layout: PackedRgb10Layout,
+    transform: ColorTransform,
+    signal: Rgb10Signal,
+    workers: usize,
+    pool: Option<&ConversionPool>,
+) -> Result<(), String> {
+    let plane_samples = stride
+        .checked_mul(height)
+        .ok_or_else(|| "ten-bit plane size overflow".to_string())?;
+    if planes.len() < plane_samples * 3
+        || region.width == 0
+        || region.height == 0
+        || region.x + region.width > width
+        || region.y + region.height > height
+        || src.len() < src_pitch * (region.height - 1) + region.width * 4
+    {
+        return Err(format!(
+            "region {}x{}+{}+{} does not fit the {width}x{height} frame or its source",
+            region.width, region.height, region.x, region.y
+        ));
+    }
+    let workers = workers
+        .max(1)
+        .min(region.height.div_ceil(REGION_ROWS_PER_WORKER));
+    let base_rows = region.height / workers;
+    let extra_rows = region.height % workers;
+    let row_counts = (0..workers)
+        .map(|worker| base_rows + usize::from(worker < extra_rows))
+        .collect::<Vec<_>>();
+    fn band_planes<'a>(
+        plane: &'a mut [u16],
+        stride: usize,
+        region: FrameRegion,
+        row_counts: &[usize],
+    ) -> Result<Vec<&'a mut [u16]>, String> {
+        let rows = &mut plane[region.y * stride..(region.y + region.height) * stride];
+        split_p16_plane_rows(rows, stride, row_counts)
+    }
+    let (y_plane, rest) = planes[..plane_samples * 3].split_at_mut(plane_samples);
+    let (u_plane, v_plane) = rest.split_at_mut(plane_samples);
+    let mut jobs = Vec::with_capacity(workers);
+    let mut first_row = 0usize;
+    for (((y, u), v), rows) in band_planes(y_plane, stride, region, &row_counts)?
+        .into_iter()
+        .zip(band_planes(u_plane, stride, region, &row_counts)?)
+        .zip(band_planes(v_plane, stride, region, &row_counts)?)
+        .zip(row_counts.iter().copied())
+    {
+        let source = &src[first_row * src_pitch..];
+        let band = FrameRegion {
+            x: region.x,
+            y: 0,
+            width: region.width,
+            height: rows,
+        };
+        jobs.push(move || -> Result<(), String> {
+            convert_packed_rgb10_region_to_i444_p16(
+                source,
+                src_pitch,
+                [y, u, v],
+                [stride, stride, stride],
+                width,
+                rows,
+                band,
+                layout,
+                transform,
+                signal,
+            )
+            .map_err(|error| error.to_string())
+        });
+        first_row += rows;
+    }
+    run_conversion_jobs(jobs, pool)
 }
 
 fn split_p16_plane_rows<'a>(
@@ -2053,6 +2635,7 @@ fn convert_packed_rgb10_to_i444_p16_parallel(
     transform: ColorTransform,
     signal: Rgb10Signal,
     workers: usize,
+    pool: Option<&ConversionPool>,
 ) -> Result<(), String> {
     let row_bytes = width
         .checked_mul(4)
@@ -2106,31 +2689,69 @@ fn convert_packed_rgb10_to_i444_p16_parallel(
         first_row = last_row;
     }
 
-    if jobs.len() == 1 {
-        return jobs.pop().expect("one conversion job").run();
-    }
+    run_conversion_jobs(
+        jobs.into_iter().map(|job| move || job.run()).collect(),
+        pool,
+    )
+}
 
+/// Runs conversion jobs that write disjoint bands: on the persistent pool
+/// when there is one large enough, otherwise on scoped threads. The first
+/// error wins.
+fn run_conversion_jobs<J>(mut jobs: Vec<J>, pool: Option<&ConversionPool>) -> Result<(), String>
+where
+    J: FnOnce() -> Result<(), String> + Send,
+{
+    if jobs.len() <= 1 {
+        return jobs.pop().map_or(Ok(()), |job| job());
+    }
+    if let Some(pool) = pool.filter(|pool| jobs.len() <= pool.threads()) {
+        let count = jobs.len();
+        let slots: Vec<std::sync::Mutex<Option<J>>> = jobs
+            .into_iter()
+            .map(|job| std::sync::Mutex::new(Some(job)))
+            .collect();
+        let results: Vec<std::sync::Mutex<Result<(), String>>> =
+            (0..count).map(|_| std::sync::Mutex::new(Ok(()))).collect();
+        pool.run(count, &|index| {
+            let job = slots[index]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(job) = job {
+                *results[index]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = job();
+            }
+        })?;
+        return results
+            .into_iter()
+            .map(|result| {
+                result
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+    }
     std::thread::scope(|scope| {
-        let current_job = jobs.pop().expect("at least two conversion jobs");
+        let current = jobs.pop().expect("at least two conversion jobs");
         let handles = jobs
             .into_iter()
             .enumerate()
             .map(|(index, job)| {
                 std::thread::Builder::new()
                     .name(format!("arcen-rgb10-{index}"))
-                    .spawn_scoped(scope, move || job.run())
+                    .spawn_scoped(scope, job)
                     .map_err(|error| format!("could not spawn RGB10 conversion worker: {error}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut result = current_job.run();
+        let mut result = current();
         for handle in handles {
-            match handle.join() {
-                Ok(worker_result) if result.is_ok() => result = worker_result,
-                Ok(_) => {}
-                Err(_) if result.is_ok() => {
-                    result = Err("RGB10 conversion worker panicked".to_string());
-                }
-                Err(_) => {}
+            let joined = handle
+                .join()
+                .unwrap_or_else(|_| Err("RGB10 conversion worker panicked".to_string()));
+            if result.is_ok() {
+                result = joined;
             }
         }
         result
@@ -2381,6 +3002,13 @@ mod pixel_format_tests {
             signal(grading, WideSource::XorgDepth30).ok(),
             Some(Rgb10Signal::Direct)
         );
+        // Half-float PQ already converted to SDR by the shared conversion is
+        // only matrixed, and never carried as HDR.
+        assert_eq!(
+            signal(grading, WideSource::NormalisedSdr).ok(),
+            Some(Rgb10Signal::Direct)
+        );
+        assert!(wide_transform(hdr, WideSource::NormalisedSdr).is_err());
         let wrong_matrix = crate::ColorSpec {
             matrix: ColorMatrix::Bt709,
             ..hdr
@@ -3068,22 +3696,125 @@ mod write_owned_from_bgra_tests {
         )
         .unwrap();
 
-        let (parallel_y, parallel_rest) = parallel.split_at_mut(plane_samples);
-        let (parallel_u, parallel_v) = parallel_rest.split_at_mut(plane_samples);
-        convert_packed_rgb10_to_i444_p16_parallel(
-            &source,
-            source_stride,
-            [parallel_y, parallel_u, parallel_v],
-            [stride, stride, stride],
-            width,
-            height,
+        let pool = ConversionPool::new(4).unwrap();
+        for pool in [None, Some(&pool)] {
+            parallel.fill(0);
+            let (parallel_y, parallel_rest) = parallel.split_at_mut(plane_samples);
+            let (parallel_u, parallel_v) = parallel_rest.split_at_mut(plane_samples);
+            convert_packed_rgb10_to_i444_p16_parallel(
+                &source,
+                source_stride,
+                [parallel_y, parallel_u, parallel_v],
+                [stride, stride, stride],
+                width,
+                height,
+                layout,
+                transform,
+                Rgb10Signal::Direct,
+                4,
+                pool,
+            )
+            .unwrap();
+            assert_eq!(parallel, serial, "pool={}", pool.is_some());
+        }
+    }
+
+    /// Banded region staging writes exactly the planes a whole-frame
+    /// conversion of the new frame writes, for every worker count, with row
+    /// padding in the planes left alone.
+    #[test]
+    fn banded_region_staging_equals_converting_the_whole_new_frame() {
+        let (width, height) = (70usize, 101usize);
+        let stride = width + 6;
+        let plane_samples = stride * height;
+        let word_at = |seed: usize, row: usize, column: usize| -> u32 {
+            let red = u32::try_from((row * 31 + column * 7 + seed) & 0x3ff).unwrap();
+            let green = u32::try_from((row * 13 + column * 17 + seed * 3) & 0x3ff).unwrap();
+            let blue = u32::try_from((row * 5 + column * 29 + seed * 7) & 0x3ff).unwrap();
+            (blue << 20) | (green << 10) | red
+        };
+        let transform = ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(arcen_media::video::WIDE_INPUT_MAX),
+        );
+        let layout = PackedRgb10Layout::XBGR2101010;
+        let whole = |seed_inside: usize, region: FrameRegion| {
+            let mut source = vec![0u8; width * 4 * height];
+            for row in 0..height {
+                for column in 0..width {
+                    let inside = (region.y..region.y + region.height).contains(&row)
+                        && (region.x..region.x + region.width).contains(&column);
+                    let word = word_at(if inside { seed_inside } else { 1 }, row, column);
+                    let offset = (row * width + column) * 4;
+                    source[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            let mut planes = vec![0xBEEFu16; plane_samples * 3];
+            let (y, rest) = planes.split_at_mut(plane_samples);
+            let (u, v) = rest.split_at_mut(plane_samples);
+            convert_packed_rgb10_to_i444_p16(
+                &source,
+                width * 4,
+                [y, u, v],
+                [stride, stride, stride],
+                width,
+                height,
+                layout,
+                transform,
+                Rgb10Signal::Direct,
+            )
+            .unwrap();
+            (source, planes)
+        };
+        let region = FrameRegion {
+            x: 9,
+            y: 17,
+            width: 33,
+            height: 71,
+        };
+        let (_, before) = whole(1, region);
+        let (after_source, after) = whole(9, region);
+        let mut packed = Vec::new();
+        for row in region.y..region.y + region.height {
+            let start = (row * width + region.x) * 4;
+            packed.extend_from_slice(&after_source[start..start + region.width * 4]);
+        }
+        let pool = ConversionPool::new(5).unwrap();
+        for workers in 1..=5 {
+            for pool in [None, Some(&pool)] {
+                let mut planes = before.clone();
+                convert_rgb10_region_parallel(
+                    &packed,
+                    region.width * 4,
+                    &mut planes,
+                    stride,
+                    (width, height),
+                    region,
+                    layout,
+                    transform,
+                    Rgb10Signal::Direct,
+                    workers,
+                    pool,
+                )
+                .unwrap();
+                assert_eq!(planes, after, "{workers} workers pool={}", pool.is_some());
+            }
+        }
+        assert!(convert_rgb10_region_parallel(
+            &packed,
+            region.width * 4,
+            &mut before.clone(),
+            stride,
+            (width, height),
+            FrameRegion { x: 40, ..region },
             layout,
             transform,
             Rgb10Signal::Direct,
-            4,
+            2,
+            None,
         )
-        .unwrap();
-
-        assert_eq!(parallel, serial);
+        .is_err());
     }
 }

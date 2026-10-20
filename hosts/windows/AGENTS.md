@@ -31,12 +31,19 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   (Windows composes SDR there; 240 nits by default) and the shared
   `ScrgbPqTransform::with_sdr_white_nits` rescales in linear light, keeping
   highlights in proportion. The helper logs `HDR SDR white: host N nits ...`.
-- The broker relay moves the agent's audio frames onto the Deck's priority
-  stream (`arcen_transport::quic::PriorityAudio`) once the Deck's
-  `client_hello` opts in, per attachment.
-- Bitrate is the shared `link_capped_average_bitrate_bps` (capenc
+- The broker serves every attachment on isolated QUIC lanes (ADR 0014,
+  protocol v5): it grants the attachment before relaying anything the agent
+  says, keeps control on the control lane and hands every other agent
+  message to the shared `arcen_transport::quic::PierLaneRelay` (video,
+  audio, cursor and bulk each on their own lane; a full video backlog drops
+  and asks the agent for a keyframe; audio never falls back onto another
+  lane). Deck input, microphone and bulk lanes come back to the agent in
+  order. Do not reintroduce a single Deck stream.
+- Bitrate starts at the shared `link_capped_average_bitrate_bps` (capenc
   `rate_control_sizing`); 22.9 Mbps uncapped HDR made sessions sluggish and
-  starved audio on the lab link.
+  starved audio on the lab link. The shared controller then moves it live:
+  Auto/Speed climb to the shape budget on a clear path and past it, up to
+  `PROVEN_PATH_HEADROOM` times, only with per-interval delivery evidence.
 - FP16 scRGB conversion uses up to 16 threads (14.6 ms at 1800x1130 on the
   lab EPYC; 8 threads capped HDR at 22.7 fps). GPU conversion is the durable fix.
 - The HDR EDID carries the Deck display's own gamut and luminance
