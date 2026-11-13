@@ -1,4 +1,7 @@
 @echo off
+REM SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+REM Copyright (C) 2026 TUTTIFRUTTI AS
+
 setlocal EnableExtensions
 rem with-msvc: run a command inside the MSVC x64 build environment.
 rem

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Bridging Keel's damage grid to NVENC's per-block QP delta map.
 //!
 //! Keel ([`arcen_keel`]) owns *what changed*; `arcen_media`'s

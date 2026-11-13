@@ -98,6 +98,25 @@ ARCEN_NOTARY_KEYCHAIN_PROFILE=<NOTARY_KEYCHAIN_PROFILE> \
 
 ## Entitlements and TCC — two different mechanisms
 
+Host versus client, explicitly (the Pier's own reasoning is in
+[`hosts/macos/SIGNING.md`](../../hosts/macos/SIGNING.md)):
+
+| App | Bundle ID | Entitlements file | Restricted entitlements it carries |
+| --- | --- | --- | --- |
+| **Arcen Deck** (client), default build | `deck.arcen.tech` | `packaging/macos/Deck-usb-hard.entitlements` | `com.apple.developer.sustained-execution`, `com.apple.developer.associated-domains`, `com.apple.developer.accessory-access.usb` (Native tablet, Hard USB) |
+| Arcen Deck, `ARCEN_EMBED_USB_HELPER=0` | `deck.arcen.tech` | `packaging/macos/Deck.entitlements` | `com.apple.developer.sustained-execution`, `com.apple.developer.associated-domains` |
+| Deck's embedded USB helper | (nested in the Deck) | none | none |
+| **Arcen Pier** (host) | `pier.arcen.tech` | `packaging/macos/Pier-virtual-hid.entitlements` (`--with-virtual-hid`, every release) | `com.apple.developer.hid.virtual.device` |
+| Arcen Agent Helper (host) | `pier.arcen.tech.agent` | none | none |
+| Arcen Microphone driver (host) | `tech.arcen.microphone.driver` | none | none |
+
+Every file that embeds a provisioning profile also carries
+`com.apple.application-identifier` and `com.apple.developer.team-identifier`,
+which a profile requires and which grant nothing. The Pier's profile also
+authorizes three DriverKit HID entitlements (`Pier.entitlements`,
+`--with-driverkit-hid`) that no release uses. Host details:
+[`hosts/macos/SIGNING.md`](../../hosts/macos/SIGNING.md).
+
 `packaging/macos/Deck.entitlements` requests only:
 - `com.apple.application-identifier` / `com.apple.developer.team-identifier` —
   required whenever a provisioning profile is embedded; not a capability grant.
@@ -123,11 +142,9 @@ external profile does not authorize either:
   code-signing entitlement. Default in-window AppKit tablet events
   (`NSEvent.tabletPoint`/`tabletProximity`) never require it. It would only be
   relevant to the quarantined, non-default experimental raw-HID/global-input
-  path and must not be reintroduced for that path without a dedicated
-  Release/Security review.
+  path.
 
-See `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md` for the full rationale per
-entitlement and for restricted-entitlement requests still pending with Apple.
+See [`ENTITLEMENTS.md`](ENTITLEMENTS.md) for the rationale per entitlement.
 
 ---
 
@@ -145,9 +162,10 @@ Pass the resulting keychain profile name as `ARCEN_NOTARY_KEYCHAIN_PROFILE`.
 Only `--release` notarizes, staples, and validates the staple; `--dev-sign`
 and unsigned assembly never do.
 
-The default Light build uses `packaging/macos/Deck.entitlements`. The
-default-off `usb-hard-lab` physical-claim experiment uses the separately
-reviewed `packaging/macos/Deck-usb-hard.entitlements`:
+A build without the USB helper (`ARCEN_EMBED_USB_HELPER=0`) uses
+`packaging/macos/Deck.entitlements`. Release Decks embed the helper for
+Native tablet (`native-tablet`) and use the separately reviewed
+`packaging/macos/Deck-usb-hard.entitlements`:
 
 ```bash
 ARCEN_ENTITLEMENTS_FILE=packaging/macos/Deck-usb-hard.entitlements \
@@ -158,43 +176,29 @@ That file adds only `com.apple.developer.accessory-access.usb`; it does not
 request the unrelated DriverKit/HID/HLS/network capabilities that the App ID
 may authorize.
 
-The active Developer ID profile is `<Deck trimmed-entitlements provisioning profile>`
-(UUID `bc8a9ef2-a105-4d84-80fe-b9f3c5366c62`). It authorizes only the
-application/team identity, Associated Domains, Sustained Execution, Claim USB
-Accessory, and Apple's automatically generated team keychain-access group.
-The obsolete Network Extension, Personal VPN, App Groups, System Extension,
-Virtualization, DriverKit, HLS, Multipath, App Attest, Data Protection,
-Background GPU Access, and increased-memory capabilities were removed from the
-App ID before this profile was generated.
-
-The previous `<Deck VM USB provisioning profile>` profile is retained only as
-historical evidence. It did **not** contain `com.apple.vm.device-access`.
-Adding that missing restricted entitlement to the executable produced a
-successfully notarized app that macOS killed before `main` with
-`Unsatisfied entitlements: com.apple.vm.device-access` and
-`AppleMobileFileIntegrityError Code=-413 "No matching profile found"`.
-Virtualization therefore does not substitute for the device-access grant.
+The active Developer ID profile authorizes only the application/team
+identity, Associated Domains, Sustained Execution, Claim USB Accessory, and
+Apple's automatically generated team keychain-access group. Every
+entitlement the executable requests must be authorized by that profile:
+notarization does not bypass AMFI, and a binary claiming an unauthorized
+entitlement is killed before `main` (`Unsatisfied entitlements`).
 
 DriverKit USB/HID grants do not appear in a Developer ID application profile;
 they require a separate DriverKit extension identifier/profile. Neither
 Virtualization nor VMNet is requested by Deck's binary.
 
-The root-authorized libusb capture probe does not require any VM entitlement.
-Non-root capture is **not** obtainable through a Developer ID profile at all:
-Apple Developer Technical Support confirmed on 2026-08-20 (Case-ID 21584866)
-that `com.apple.vm.device-access` is reserved for Mac App Store hypervisor apps
-targeting systems before macOS 27, because only those apps cannot escalate
-privileges. Developer ID builds must instead run a small separate helper tool
-as root and reach it over IPC, or use Accessory Access on macOS 27 and later.
-See `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`.
+Device capture needs root, not an entitlement: `com.apple.vm.device-access` is
+reserved for Mac App Store hypervisor apps targeting systems before macOS 27.
+Developer ID builds run a small separate helper tool as root and reach it over
+IPC ([ADR 0011](../../docs/adr/0011-macos-privileged-usb-helper.md)), or use
+Accessory Access on macOS 27 and later. See
+[`ENTITLEMENTS.md`](ENTITLEMENTS.md).
 
 ---
 
-## Restricted entitlements (future — requires Apple approval)
+## Pier entitlements
 
-| Entitlement | For | Status |
-|---|---|---|
-| `com.apple.developer.hid.virtual.device` | macOS Pier — inject virtual Wacom via IOHIDUserDevice | Not yet requested |
-
-See `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md` for the justification document to
-submit when requesting restricted entitlements.
+`com.apple.developer.hid.virtual.device` is granted to the macOS Pier
+(`pier.arcen.tech`) and carried by every release since 0.18.0; the Deck does
+not need it. See [`ENTITLEMENTS.md`](ENTITLEMENTS.md) and
+[`hosts/macos/SIGNING.md`](../../hosts/macos/SIGNING.md).

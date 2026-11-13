@@ -1,18 +1,18 @@
 # ADR 0005: Process-Local Direct-Transport Resume Authority
 
-**Status:** Proposed; implemented in the current draft branch, pending required
-architecture, security, and product-owner review.
+**Status:** Implemented and shipped: credential-free resume of a dropped
+session within `auth.reconnect_window_secs` (default 180 s, at most 7200 s).
+Resume authority is process-local: a Pier restart ends every resume lease.
 
 ## Context
 
-ADR 0003 defines durable atomic replay consumption shared by multiple future
-Gateway instances. The current product is different: one macOS Deck connects
+Durable atomic replay consumption shared by several processes or machines is a
+different problem from the one the product has: one macOS Deck connects
 directly to one Windows or Linux Pier over QUIC, each Pier admits one active
-session, and no Gateway or shared store is live.
+session, and no shared store is live.
 
-Using ADR 0003's durable multi-Gateway replay design here would introduce a
-database and cross-process availability boundary without enabling a supported
-topology. Reusing OIDC, entitlement, TLS session resumption, or a password as a
+A durable, multi-instance replay design here would introduce a database and
+cross-process availability boundary without enabling a supported topology. Reusing OIDC, entitlement, TLS session resumption, or a password as a
 resume authority would also collapse separate trust planes.
 
 ## Decision
@@ -80,12 +80,12 @@ intentional for the one-process, one-session direct topology.
   failures fail closed.
 
 If Arcen supports resume across Pier processes, process restart, host migration,
-multiple hosts, or Arcen Span/Gateway instances, this ADR must be replaced or
-amended after review. That review must define durable atomic replay,
-key rotation/distribution, cross-host identity, availability, revocation, and
-data-store threat boundaries consistent with ADR 0003.
+or multiple hosts, this ADR must be replaced or amended after review. That
+review must define durable atomic replay, key rotation/distribution,
+cross-host identity, availability, revocation, and data-store threat
+boundaries.
 
-This decision does **not** activate or make claims about Gateway/Span, OIDC,
+This decision does **not** activate or make claims about OIDC,
 entitlement/licensing, mTLS, QUIC, QUIC 0-RTT, TLS 0-RTT, or internet exposure.
-It is not a durable version of ADR 0003 and is not a certification or external
+It is not a durable multi-instance design and is not a certification or external
 cryptographic audit.

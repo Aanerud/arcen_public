@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab only: build environment for the Arcen side-by-side GNOME prefix on EL10.
 # Same base as the host, so the prefix links against the host's own system libraries.
 FROM quay.io/rockylinux/rockylinux:10

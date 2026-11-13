@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A PipeWire graph bridged into a PulseAudio server with `PipeWire`'s pulse
 //! tunnel, for hosts whose audio server is PulseAudio itself.
 //!

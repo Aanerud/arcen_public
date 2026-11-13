@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Session-bound Wayland input injector of the Linux Pier.
 //!
 //! A thin adapter. Deck input arrives on the input lane as protocol
@@ -3260,8 +3262,8 @@ mod tests {
                     ..TextCommitMsg::default()
                 })
                 .unwrap();
-            // No keymap in this session: typed by keysym, unverified, which
-            // the Deck is told once for the whole commit.
+            // No keymap in this session: nothing is typed unproven; the
+            // refusal is told to the Deck once for the whole commit.
             let notice = tokio::time::timeout(Duration::from_secs(10), notices.recv())
                 .await
                 .unwrap()

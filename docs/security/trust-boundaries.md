@@ -1,6 +1,6 @@
 # Trust Boundaries
 
-Arcen treats clients, hosts, gateway peers, identity-provider responses,
+Arcen treats clients, hosts, identity-provider responses,
 network metadata, and persisted configuration as distinct trust inputs.
 
 ## Required separations
@@ -81,7 +81,7 @@ Residual, recorded rather than claimed fixed:
 
 - polkit older than 0.106 has no JavaScript rules. There an X11 desktop is
   still served, with a `SECURITY:` error at start and on every sign-in
-  (`polkit_no_rules`); refusing it instead is an owner decision.
+  (`polkit_no_rules`); refusing it instead would end X11 service there.
 - **Later denies are bypassed.** Because the rule answers first, for a
   remote seated desktop a site rule numbered after `05-` (or a `.pkla`
   file) no longer applies to any action whose `allow_any` is `NO` or an
@@ -335,8 +335,31 @@ Residual, recorded rather than claimed fixed:
   and the kernel acts only on SysRq (never sent) and on a secure-attention key
   if the console keymap binds one; if a local administrator switches the
   console to a text VT during a session, remote keystrokes reach that console.
-- A bridged Hard USB tablet and an experimental raw-HID device (both absent
-  from release builds) are not admitted by the dedicated Xorg on X11.
+- An experimental raw-HID device (absent from release builds) is not
+  admitted by the dedicated Xorg on X11.
+- A bridged Hard USB tablet (absent from release builds) reaches only its
+  own desktop. Before its virtual port is connected, the helper installs a
+  volatile udev rule for that port's subtree without `uaccess`, so no logind
+  ACL reaches it. On a native-seat Wayland desktop the rule puts it on that
+  desktop's seat. For a dedicated Xorg desktop it stays on `seat0` (a `seat0`
+  Xorg hot-adds only `seat0` devices), its input nodes are tagged for Xorg
+  (`arcen_bridge`, `arcen_bridge_<display>`), `LIBINPUT_IGNORE_DEVICE` is
+  set and logind's `seat` tag is removed (logind does not track the nodes
+  for a console session to take): the installed `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` makes
+  every X server (GDM's greeter, console sessions, other desktops) ignore
+  `arcen_bridge` before it opens the device. Each desktop's configuration,
+  read after that directory, ends by ignoring every `arcen_bridge` again
+  (its isolation classes admit Arcen's virtual devices by name and vendor
+  id, which a bridged device's descriptors could imitate) and re-admitting
+  only its own tag. Because such a device stays on `seat0`, where the
+  kernel's console keyboard handler binds any device with keyboard keys, a
+  tablet with a keyboard interface or keyboard keys is refused on X11. The Pier
+  refuses to start a bridge unless every running X server is proven to keep
+  it out (loaded that file, or is another desktop that ignores all foreign
+  input) and its desktop re-admits it, and it verifies each node from the
+  udev database. GDM's log does record that it saw and ignored the device.
+  The isolation classes above are unchanged
+  ([ADR 0021](../adr/0021-bridged-usb-devices-on-their-own-seat.md)).
 
 The Wayland provider creates no kernel input devices and is outside this
 boundary.
@@ -360,7 +383,8 @@ Each Pier process alone owns a fresh random 256-bit HMAC-SHA-256 key in
 zeroizing memory. The key, grants, holder nonces, passwords, and credentials
 must not be persisted, logged, formatted, or included in support bundles.
 Typed debug output redacts secrets, received grant/nonce strings are cleared
-after parsing, temporary token bytes and signatures are zeroized, and native
+after parsing, the shared `AuthResponse` wipes its password, holder nonce and
+grant whenever it is dropped (so every early refusal on every Pier wipes them), temporary token bytes and signatures are zeroized, and native
 principal values remain outside safe telemetry. Session Log IDs and
 `previous_sid` are diagnostic chaining only.
 
@@ -420,6 +444,13 @@ own user may continue it without its resume grant, in two cases only:
   datagram for 3 s while the 1 s keep-alive runs); a silent or already
   timed-out attachment is then handed over the same way. Another user's
   attachment is never probed.
+
+The Windows Pier applies the same two rules to its WTS session, keyed by the
+account SID: a detached session is taken over through the resume registry,
+and a held display is proved silent through the shared
+`arcen_transport::quic::IncumbentAttachment`; a displaced attachment drains
+its resume slot and tears down instead of entering the resume hold, and a
+same-user sign-in that finds a live Deck is refused at once.
 
 The trust consequence: knowledge of the user's password now continues the
 user's own detached desktop without the Deck that held it, exactly as it

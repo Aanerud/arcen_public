@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab only, applied on top of GNOME/mutter!5224 in Mutter 51.1:
 # a headless compositor starts libinput only when ARCEN_LAB_HEADLESS_INPUT_SEAT names the
 # udev seat (ID_SEAT) to use; unset keeps stock headless behaviour (no libinput at all).

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 set -euo pipefail
 
 output_dir=${1:-target/supply-chain}
@@ -33,7 +36,8 @@ while IFS= read -r -d '' sbom; do
 done < <(find "$repo_root" -name "$generated_name" -type f -print0)
 
 commit=${GITHUB_SHA:-$(git rev-parse HEAD)}
-repository=${GITHUB_REPOSITORY:-Aanerud/arcen_public}
+canonical_url=https://github.com/Aanerud/arcen_public
+repository=${GITHUB_REPOSITORY:-${canonical_url#https://github.com/}}
 workflow_ref=${GITHUB_WORKFLOW_REF:-local}
 run_id=${GITHUB_RUN_ID:-local}
 lock_digest=$(sha256sum Cargo.lock | cut -d ' ' -f 1)

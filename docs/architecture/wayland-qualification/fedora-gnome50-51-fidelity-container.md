@@ -4,7 +4,7 @@
 2026-10-18. Not a support claim and not a product qualification. The Pier's
 logind session cannot run in a container, so a full `arcen-pier wayland
 qualify` and a Pier→Deck run need a GNOME ≥ 50 host (see
-[the provider document](../linux-wayland-provider.md#wayland-grading-and-hdr-wp-fidelity)).
+[the provider document](../linux-wayland-provider.md#wayland-grading-and-hdr)).
 
 ## Stack
 

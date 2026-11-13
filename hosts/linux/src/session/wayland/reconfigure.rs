@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Mid-session output reconfiguration of a remote-monitor session: resize,
 //! re-placement and topology change as one [`arcen_outputs::OutputTransaction`],
 //! served to the Pier on the session-bound output socket.

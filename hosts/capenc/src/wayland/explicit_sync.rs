@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `PipeWire` explicit synchronisation (`SPA_META_SyncTimeline`) through DRM
 //! timeline syncobjs.
 //!

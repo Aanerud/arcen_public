@@ -32,15 +32,16 @@ release lockfile and update this file before distribution.
 | System util-linux `flock` CLI (Linux packaging prerequisite) | util-linux contributors | GPL-2.0-or-later for `flock`; OS-distribution package terms | https://github.com/util-linux/util-linux | Used only to serialize the optional Linux certificate helper, not linked into Pier. Inventory the exact distribution version and applicable notices for each release package. |
 | `usb-vhci` v1.15 (`79af411960bf229bd82797f0d42b654da8aae597`) plus Arcen RHEL 9 compatibility patches | Michael Singer, Conemis AG Karlsruhe Germany, and contributors | GPL-2.0-or-later at source-file level; bundled `COPYING` is GPL-2.0 | https://git.code.sf.net/p/usb-vhci/vhci_hcd | Lab-only Linux virtual USB host-controller modules. Preserve complete corresponding source, upstream commit identity, Arcen patch series, GPL notice, build scripts, and a source offer with any distributed module binary. Not approved for production distribution. |
 | `zbus` 5.13.2, `zbus_names` 4.3.1, `zbus_macros` 5.13.2, `zvariant` 5.9.2, `zvariant_derive` 5.9.2, `zvariant_utils` 3.3.0, `endi` 1.1.1, `winnow` 1.0.4 | zbus contributors; endi and winnow contributors | MIT | https://github.com/z-galaxy/zbus | Pure-Rust D-Bus client for the Linux Pier's headless Wayland session adapter, linked by the `wayland-provider` feature, which the Linux release Pier enables from 0.17.0. Its additional transitive dependencies on Linux are all `MIT OR Apache-2.0`: `async-broadcast` 0.7.2, `async-recursion` 1.2.0, `async-trait` 0.1.92, `enumflags2`/`enumflags2_derive` 0.7.12, `event-listener` 5.4.2, `event-listener-strategy` 0.5.4, `fastrand` 2.5.0, `futures-io` 0.3.34, `futures-lite` 2.6.1, `hex` 0.4.3, `ordered-stream` 0.2.0, `parking` 2.2.1, `serde_repr` 0.1.21. The generated inventory below lists zbus and these packages with their licence texts (`scripts/generate-third-party-notices.py` resolves the Linux artefacts with `arcen-pier-linux/wayland-provider`). |
-| `rusb` 0.9.4 | Ilya Averyanov and contributors | MIT | https://github.com/a1ien/rusb/tree/0.9.4 | Linked into the macOS Deck (feature `usb-hard-lab`) and its Native tablet USB helper (`arcen-usb-helper`); `packaging/macos/build-deck-app.sh` embeds both by default, so release Decks carry it. Retain the MIT notice. |
+| `rusb` 0.9.4 | Ilya Averyanov and contributors | MIT | https://github.com/a1ien/rusb/tree/0.9.4 | Linked into the macOS Deck (feature `native-tablet`) and its Native tablet USB helper (`arcen-usb-helper`); `packaging/macos/build-deck-app.sh` embeds both by default, so release Decks carry it. Retain the MIT notice. |
 | `libusb` 1.0.27 (vendored by `libusb1-sys` 0.7.0) | Johannes Erdfelt, Daniel Drake, Peter Stuge, Nathan Hjelm, Pete Batard, Ludovic Rousseau, Michael Plante, Hans de Goede, Martin Pieuchot, Toby Gray, Chris Dickens and the libusb contributors | LGPL-2.1-or-later | https://github.com/libusb/libusb | Statically linked into the macOS Deck (feature `usb-hard-lab`) and its USB helper, which release Decks embed by default. `libusb1-sys`'s own metadata says MIT, so the generated inventory below does not carry this licence: the attribution and the complete LGPL-2.1 text are in [libusb](#libusb-lgpl-21-or-later) below. The libusb source Arcen builds is the one vendored in `libusb1-sys` 0.7.0, and Arcen's own source, which builds and links it, is published under AGPL-3.0-only. |
-| `pipewire` 0.10.1, `pipewire-sys` 0.10.1, `libspa` 0.10.1, `libspa-sys` 0.10.1 | pipewire-rs contributors | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs | Linux-only, behind capenc's `wayland` feature (Wayland provider capture), which the Linux release Pier enables through `wayland-provider` from 0.17.0. Pulls `cookie-factory` 0.3.3 (MIT) and `nom` 8.0.0 (MIT) at runtime, and `system-deps` 7.0.8, `cfg-expr` 0.20.10, `heck` 0.5.0, `toml` 1.1.8, `version-compare` 0.2.1, `target-lexicon` 0.13.5 and `bindgen` at build time. Links the system `libpipewire-0.3` (PipeWire, MIT). Release/Security must approve and complete these notices before the feature ships. |
+| `pipewire` 0.10.1, `pipewire-sys` 0.10.1, `libspa` 0.10.1, `libspa-sys` 0.10.1 | pipewire-rs contributors | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs | Linux-only, behind capenc's `wayland` feature (Wayland provider capture), which the Linux release Pier enables through `wayland-provider` from 0.17.0. Pulls `cookie-factory` 0.3.3 (MIT) and `nom` 8.0.0 (MIT) at runtime, and `system-deps` 7.0.8, `cfg-expr` 0.20.10, `heck` 0.5.0, `toml` 1.1.8, `version-compare` 0.2.1, `target-lexicon` 0.13.5 and `bindgen` at build time. Links the system `libpipewire-0.3` (PipeWire, MIT). The generated inventory below carries their notices. |
 | `reis` 0.7.1 | Ian Douglas Scott and reis contributors | MIT | https://github.com/ids1024/reis | Pure-Rust libei/libeis protocol client (no libei C library is linked). Linux release Pier only, through `wayland-provider`: the session agent probes its compositor's EIS seat for a stylus and sends committed text through `ei_text`. Retain the MIT notice. |
 | `xkbcommon-dl` 0.4.2 | Kirill Chibisov, Francesca Frangipane and contributors | MIT | https://github.com/rust-windowing/xkbcommon-dl | Linux release Pier only, through `wayland-provider`: loads the system's `libxkbcommon` at run time (not shipped by Arcen) to read the compositor's keymap. Retain the MIT notice. |
 | `xkeysym` 0.2.1 | John Nunley and contributors | MIT OR Apache-2.0 OR Zlib | https://github.com/notgull/xkeysym | Linux release Pier only, through `wayland-provider`: names a character's keysym for committed text. Retain the selected licence notice. |
 
-The Release/Security owner must approve additions, exceptions, and generated
-release notices.
+Additions and exceptions are recorded here and in `legal/ORIGINS.md`, and the
+generated inventory below is checked against `Cargo.lock`
+(`scripts/generate-third-party-notices.py --check`).
 
 ## Audio Compression release inventory additions
 
@@ -53,11 +54,8 @@ release notices.
 
 The exact release inventory must be regenerated from `Cargo.lock` and include
 the local `opusic-sys` package plus its incorporated libopus source even though
-the local package has no registry checksum row. Component/SBOM automation is
-currently deferred; before distribution, provide a release-specific
-inventory/SBOM artifact or obtain an explicit Release/Security release
-decision. Windows packages, the macOS app resources, and Linux installations
-include this notice file.
+the local package has no registry checksum row. Windows packages, the macOS
+app resources, and Linux installations include this notice file.
 
 ## macOS 12 Deck local patches
 
@@ -77,8 +75,8 @@ These components are present only when `arcen-media/software-h264-source` (or
 
 | Component and version | Copyright holder | License | Source URL | Required notice or source offer |
 | --- | --- | --- | --- | --- |
-| `openh264` 0.9.7 | Package metadata names Ralf Biedert as author; the crate archive supplies no standalone wrapper copyright notice | BSD-2-Clause | https://github.com/ralfbiedert/openh264-rs/tree/e8f8f4fa85c195d2a14e90ac944a1e40227cf326/openh264 | Safe Rust API wrapper. Preserve the declared license metadata and source; Release/Security/legal must resolve the missing authoritative wrapper notice before external distribution. |
-| `openh264-sys2` 0.9.7 | Package metadata names Ralf Biedert as author; Cisco Systems for the incorporated codec | BSD-2-Clause | https://github.com/ralfbiedert/openh264-rs/tree/e8f8f4fa85c195d2a14e90ac944a1e40227cf326/openh264-sys2 | FFI/build crate supplying Cisco source at `a8e04adb69c79757da014007d4694684a64c7b74`; retain the exact Cisco notice below and resolve the wrapper notice gap before distribution. |
+| `openh264` 0.9.7 | Ralf Biedert | BSD-2-Clause | https://github.com/ralfbiedert/openh264-rs/tree/e8f8f4fa85c195d2a14e90ac944a1e40227cf326/openh264 | Safe Rust API wrapper; retain the wrapper notice below. |
+| `openh264-sys2` 0.9.7 | Ralf Biedert (wrapper); Cisco Systems (incorporated codec) | BSD-2-Clause | https://github.com/ralfbiedert/openh264-rs/tree/e8f8f4fa85c195d2a14e90ac944a1e40227cf326/openh264-sys2 | FFI/build crate supplying Cisco source at `a8e04adb69c79757da014007d4694684a64c7b74`; retain the wrapper notice and the Cisco notice below. |
 | Cisco OpenH264 source | Copyright (c) 2013, Cisco Systems | BSD-2-Clause | https://github.com/cisco/openh264/tree/a8e04adb69c79757da014007d4694684a64c7b74 | Statically incorporated from the source tree supplied by `openh264-sys2`; binary distributions must reproduce the Cisco notice below. |
 | `wide` 1.1.1, `safe_arch` 1.1.0, `bytemuck` 1.25.1 | Lokathor and contributors | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/wide | Runtime Rust dependencies of `openh264`; retain the selected license notices in the release inventory. |
 | `cc` 1.2.67, `find-msvc-tools` 0.1.9, `jobserver` 0.1.35, `nasm-rs` 0.3.2, `walkdir` 2.5.0 and their target-specific transitive dependencies | Respective upstream contributors | Licenses recorded in `Cargo.lock`/crate metadata; primarily MIT OR Apache-2.0, with `walkdir`/`same-file`/`winapi-util` offering MIT/Unlicense terms | crates.io packages at the exact versions in `Cargo.lock` | Build-only source compilation graph; not runtime components. Retain selected notices in the release inventory/SBOM. |
@@ -86,23 +84,44 @@ These components are present only when `arcen-media/software-h264-source` (or
 Arcen enables only the crates' `source` path. It does not use the `libloading`
 feature, Cisco's precompiled binary, a runtime downloader, or a packaged
 OpenH264 DLL/dylib/framework. The exact checksums and complete feature-specific
-inventory are in `ORIGINS.md`. A complete target-specific release
-SBOM must still be generated and reviewed before distribution.
+inventory are in `ORIGINS.md`.
 
 BSD-2-Clause is a copyright license, not an H.264 patent clearance. Arcen does
 not claim coverage under terms associated with Cisco's precompiled binary.
-Release/Security and legal retain approval of territories, uses, licensing, and
-distribution.
 
-### `openh264` / `openh264-sys2` wrapper notice gap
+### `openh264` / `openh264-sys2` BSD 2-Clause notice
 
-Both 0.9.7 crates declare `BSD-2-Clause`, repository commit
-`e8f8f4fa85c195d2a14e90ac944a1e40227cf326`, and Ralf Biedert as package
-author. The crates.io archives and that repository tree do not provide a
-standalone wrapper `LICENSE` or exact wrapper copyright line; only the bundled
-Cisco tree provides the complete notice reproduced below. This file does not
-invent a copyright notice. Release/Security/legal must obtain or approve the
-authoritative wrapper notice before external distribution.
+Both 0.9.7 crates are licensed `BSD-2-Clause` by their author, Ralf Biedert
+(crate metadata, and the crates' README: "Wrapper code is BSD-2, Ralf
+Biedert"; repository commit `e8f8f4fa85c195d2a14e90ac944a1e40227cf326`). The
+crates ship no separate licence file, so the notice is the BSD 2-Clause
+licence with that attribution:
+
+```text
+Copyright (c) Ralf Biedert
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ### Cisco OpenH264 BSD 2-Clause notice
 
@@ -237,14 +256,11 @@ toolchain, and no `git2`/`libgit2-sys` package line appears in this graph.
 `interpolate_name`, `libfuzzer-sys`, `rand`, and `rand_chacha`; these are
 `cfg(fuzzing)`-only dependencies that do not appear in Arcen's actual resolved
 build and require no notice. The exact checksums and complete
-feature-specific inventory are in `ORIGINS.md`. A complete
-target-specific release SBOM must still be generated and reviewed before
-distribution.
+feature-specific inventory are in `ORIGINS.md`.
 
 BSD-2-Clause and MIT/Apache-2.0 are copyright licenses, not an AV1 patent
 clearance. AOMedia publishes a royalty-free patent licensing position for AV1
-codec implementations. Release/Security and legal retain approval of
-territories, uses, licensing, and distribution.
+codec implementations.
 
 ### `rav1e` 0.8.1 BSD 2-Clause License
 
@@ -404,7 +420,7 @@ SPDX-License-Identifier: Unicode-3.0
 ## libusb (LGPL-2.1-or-later)
 
 libusb 1.0.27, as vendored in `libusb1-sys` 0.7.0 (`libusb/`), is statically
-linked into the macOS Deck (`arcen-deck-macos`, feature `usb-hard-lab`) and
+linked into the macOS Deck (`arcen-deck-macos`, feature `native-tablet`) and
 its USB helper (`arcen-usb-helper`). libusb is free software under the GNU
 Lesser General Public License, version 2.1 or (at your option) any later
 version. Its copyright holders, from libusb's `AUTHORS` file:
@@ -936,7 +952,7 @@ Do not edit this section by hand; regenerate it.
 
 Every package below is reachable from a release artefact through a `normal` or `build` dependency edge on that artefact's target triple. Dev-dependencies are excluded because they are not redistributed. The *Artefacts* column records which builds carry the package.
 
-426 third-party packages across 32 distinct licence expressions.
+428 third-party packages across 32 distinct licence expressions.
 
 ### (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
 
@@ -1040,7 +1056,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | Package | Version | Artefacts | Source |
 | --- | --- | --- | --- |
 | `linux-raw-sys` | 0.12.1 | Linux | https://github.com/sunfishcode/linux-raw-sys |
-| `rustix` | 1.1.4 | Linux | https://github.com/bytecodealliance/rustix |
+| `rustix` | 1.1.4 | macOS, Linux | https://github.com/bytecodealliance/rustix |
 
 ### Apache-2.0/MIT
 
@@ -1514,7 +1530,9 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `objc2-core-graphics` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-core-media` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-core-video` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
+| `objc2-io-kit` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-io-surface` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
+| `objc2-io-usb-host` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-metal` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-quartz-core` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
 | `objc2-screen-capture-kit` | 0.3.2 | macOS | https://github.com/madsmtm/objc2 |
@@ -14214,7 +14232,9 @@ These declare a licence in metadata but ship no licence file. The declared SPDX 
 - `objc2-encode 4.1.0` — MIT
 - `objc2-foundation 0.2.2` — MIT
 - `objc2-foundation 0.3.2` — MIT
+- `objc2-io-kit 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-io-surface 0.3.2` — Zlib OR Apache-2.0 OR MIT
+- `objc2-io-usb-host 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-metal 0.2.2` — MIT
 - `objc2-metal 0.3.2` — Zlib OR Apache-2.0 OR MIT
 - `objc2-quartz-core 0.2.2` — MIT

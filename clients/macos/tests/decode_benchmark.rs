@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Measures the Deck's real decoder against a real Pier bitstream.
 //!
 //! Encode numbers on their own do not tell anyone whether a desktop is usable.

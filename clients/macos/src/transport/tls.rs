@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_transport::tls::{
     validate_server_certificate_der, CertificateKeyPolicy, PinKind, TlsPin,
 };
@@ -791,6 +794,135 @@ impl ServerCertVerifier for InsecureVerifier {
 
     fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
         self.signature_verifier.root_hint_subjects()
+    }
+}
+
+/// What the connection test learnt about the certificate a Pier presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticCapture {
+    pub info: CertInfo,
+    pub system_trusted: bool,
+    pub leaf_problem: Option<arcen_session::connection_diagnostics::LeafProblem>,
+}
+
+pub type DiagnosticCaptureSlot = Arc<std::sync::Mutex<Option<DiagnosticCapture>>>;
+
+/// TLS client configuration for the connection test (`arcen-deck diagnose`).
+///
+/// It records the presented certificate and what is wrong with it, then
+/// refuses the handshake only when an `expected` pin does not match. Without
+/// a pin it completes the handshake so the test can read the Pier's
+/// pre-sign-in greeting: that connection never carries credentials and is
+/// closed after the greeting, so accepting an unverified identity for it
+/// exposes nothing.
+pub fn diagnostic_quic_rustls_config(
+    expected: Option<TlsPin>,
+    alpn_protocol: &[u8],
+) -> Result<(ClientConfig, DiagnosticCaptureSlot), TlsTrustError> {
+    let slot: DiagnosticCaptureSlot = Arc::new(std::sync::Mutex::new(None));
+    let system_verifier =
+        webpki_verifier(native_roots().unwrap_or_else(|_| RootCertStore::empty()))?;
+    let mut config = custom_verifier_client_config(Arc::new(DiagnosticVerifier {
+        expected,
+        system_verifier,
+        captured: Arc::clone(&slot),
+    }));
+    config.alpn_protocols = vec![alpn_protocol.to_vec()];
+    Ok((config, slot))
+}
+
+#[derive(Debug)]
+struct DiagnosticVerifier {
+    expected: Option<TlsPin>,
+    system_verifier: Arc<dyn ServerCertVerifier>,
+    captured: DiagnosticCaptureSlot,
+}
+
+fn diagnostic_leaf_problem(
+    error: &RustlsError,
+) -> arcen_session::connection_diagnostics::LeafProblem {
+    use arcen_session::connection_diagnostics::LeafProblem;
+    match error {
+        RustlsError::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+        ) => LeafProblem::NameMismatch,
+        RustlsError::InvalidCertificate(
+            CertificateError::Expired | CertificateError::ExpiredContext { .. },
+        ) => LeafProblem::Expired,
+        RustlsError::InvalidCertificate(
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. },
+        ) => LeafProblem::NotYetValid,
+        other => LeafProblem::Unusable {
+            detail: other.to_string(),
+        },
+    }
+}
+
+impl ServerCertVerifier for DiagnosticVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let info = cert_info("", end_entity, server_name)?;
+        let system_trusted = self
+            .system_verifier
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .is_ok();
+        let leaf_problem = verify_tofu_leaf(end_entity, server_name, now)
+            .err()
+            .map(|error| diagnostic_leaf_problem(&error));
+        let mismatch = self.expected.is_some_and(|pin| {
+            let candidate = match pin.kind {
+                PinKind::CertificateSha256 => info.certificate_sha256,
+                PinKind::SubjectPublicKeyInfoSha256 => info.spki_sha256,
+            };
+            !pin.matches(&candidate)
+        });
+        *self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DiagnosticCapture {
+            info,
+            system_trusted,
+            leaf_problem,
+        });
+        if mismatch {
+            Err(RustlsError::General(TOFU_PIN_MISMATCH_ERROR.to_string()))
+        } else {
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.system_verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.system_verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.system_verifier.supported_verify_schemes()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+        self.system_verifier.root_hint_subjects()
     }
 }
 

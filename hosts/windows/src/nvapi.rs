@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Narrow NVAPI display seam.
 //!
 //! ABI declarations and QueryInterface IDs are derived from NVIDIA's public,

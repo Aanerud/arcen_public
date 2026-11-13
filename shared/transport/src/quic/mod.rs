@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Concrete QUIC transport adapter (Quinn 0.11 + rustls 0.23, standardized
 //! QUIC transport crypto only — no custom UDP encryption).
 //!
@@ -35,6 +37,7 @@ mod identity;
 mod lane_relay;
 mod lane_runtime;
 mod liveness;
+mod loss_guard;
 mod monitor;
 mod monitor_registry;
 mod peer;
@@ -56,11 +59,11 @@ pub use carrier_bench::{
 };
 pub use config::{
     ARCEN_QUIC_INTERACTIVE_MAX_SEND_WINDOW, ARCEN_QUIC_INTERACTIVE_MIN_SEND_WINDOW,
-    CongestionControl, SEND_WINDOW_RESIZE_INTERVAL, apply_direct_server_limits,
-    apply_migration_stub_server_limits, interactive_send_window, keep_send_window_interactive,
-    lane_transport_config, lane_transport_config_arc, monitor_carrier_transport_config,
-    monitor_carrier_transport_config_arc, recommended_transport_config,
-    recommended_transport_config_arc,
+    ARCEN_QUIC_MTU_UPPER_BOUND, CongestionControl, MtuDiscovery, SEND_WINDOW_RESIZE_INTERVAL,
+    apply_direct_server_limits, apply_migration_stub_server_limits, interactive_send_window,
+    keep_send_window_interactive, lane_transport_config, lane_transport_config_arc,
+    monitor_carrier_transport_config, monitor_carrier_transport_config_arc,
+    recommended_transport_config, recommended_transport_config_arc,
 };
 pub use direct::{DirectQuicDialParams, DirectQuicStream, accept_direct, connect_direct};
 pub use error::QuicTransportError;
@@ -76,7 +79,8 @@ pub use identity::{
 pub use lane_relay::{
     LaneRelayEvent, LaneRelayStats, PierLaneRelay, RELAY_AUDIO_BACKLOG, RELAY_BULK_BACKLOG,
     RELAY_BULK_INBOUND_BACKLOG, RELAY_BULK_WRITE_TIMEOUT, RELAY_INPUT_BACKLOG,
-    RELAY_INPUT_RELEASE_REASON, RELAY_MICROPHONE_BACKLOG, RELAY_VIDEO_BACKLOG, RelayRoute,
+    RELAY_INPUT_RELEASE_REASON, RELAY_MICROPHONE_BACKLOG, RELAY_USB_BACKLOG, RELAY_VIDEO_BACKLOG,
+    RelayRoute,
 };
 pub use lane_runtime::{
     DEFAULT_LANE_PREFACE_TIMEOUT, INTERACTIVE_LANE_BURST_BYTES, INTERACTIVE_LANE_BURST_WINDOW,
@@ -89,6 +93,11 @@ pub use lane_runtime::{
 pub use liveness::{
     IncumbentAttachment, IncumbentOutcome, IncumbentRegistration, PEER_SILENT_CLOSE_CODE,
     PEER_SILENT_CLOSE_REASON, prove_peer_liveness,
+};
+pub use loss_guard::{
+    CEILING_FLOOR_BYTES, CEILING_RELEASE_PERCENT, LOSS_CEILING_THRESHOLD_PERMILLE,
+    LOSSY_ROUNDS_TO_ENGAGE, LossCeiling, LossGuardedBbr, LossGuardedBbrConfig, MAX_ROUND_RTTS,
+    MIN_ROUND_BYTES, MIN_ROUND_LOST_BYTES,
 };
 pub use monitor::{
     MAX_MONITOR_STREAM_PREFACE_BYTES, MAX_MONITOR_STREAM_SESSION_ID_BYTES,

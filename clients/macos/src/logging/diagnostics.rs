@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! One-shot diagnostic snapshots for support & debugging.
 //!
 //! These answer the first questions a sysadmin asks when a session misbehaves:
@@ -72,7 +74,7 @@ pub fn spawn_connect_diagnostics(ctx: SessionContext) {
                 security_mode = %ctx.security_mode,
                 network_scope = network_scope(&ctx.host),
                 resolved = %resolved,
-                nat = "unknown (no STUN/gateway yet; direct connection)",
+                nat = "unknown (direct connection; no NAT traversal)",
                 "Connecting to host"
             );
             info!(

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,6 +95,13 @@ pub fn parse_media_packet(data: &[u8]) -> Result<Option<MediaPacket>, ProtocolEr
         | FrameType::UsbBridgeUrbCancel
         | FrameType::UsbBridgeUrbComplete
         | FrameType::CursorUpdate
+        | FrameType::CursorPosition
+        // Refinement records are consumed before the frame queue (ADR 0016
+        // R2) and are never granted to this Deck yet.
+        | FrameType::RefineFence
+        | FrameType::RefineTiles
+        | FrameType::RefineDigest
+        | FrameType::RefineBarrier
         | FrameType::AudioUpstream => Err(ProtocolError::UnknownFrameType(frame_type)),
     }
 }

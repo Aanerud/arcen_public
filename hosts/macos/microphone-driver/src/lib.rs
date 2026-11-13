@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Core Audio HAL `AudioServerPlugIn` for the Arcen Deck microphone.
 //!
 //! The plug-in exposes one input-only 48 kHz mono Float32 device named
@@ -1158,7 +1159,7 @@ fn write_plugin_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.17.0", data_size, out_size, out_data)
+            write_cf_string("0.19.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST => {
             write_array::<u8>(&[], data_size, out_size, out_data)
@@ -1252,7 +1253,7 @@ fn write_device_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.17.0", data_size, out_size, out_data)
+            write_cf_string("0.19.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST
         | K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST => {
@@ -1397,7 +1398,7 @@ fn write_stream_property(
         }
         K_AUDIO_OBJECT_PROPERTY_IDENTIFY => write_value(0_u32, data_size, out_size, out_data),
         K_AUDIO_OBJECT_PROPERTY_SERIAL_NUMBER | K_AUDIO_OBJECT_PROPERTY_FIRMWARE_VERSION => {
-            write_cf_string("0.17.0", data_size, out_size, out_data)
+            write_cf_string("0.19.0", data_size, out_size, out_data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST => {
             write_array::<u8>(&[], data_size, out_size, out_data)

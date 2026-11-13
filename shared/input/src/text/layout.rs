@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which layout group of a session keymap is active.
 //!
 //! A compositor's keymap can hold up to four layouts as groups; which one is
@@ -24,6 +26,10 @@ pub enum GroupResolution {
     FromInputSources(u32),
     /// The compositor reported it (an EIS keyboard's modifiers).
     Reported(u32),
+    /// Every group types the same characters with the same keys (GNOME
+    /// appends the locale's layout to the user's, so a `gb` user on a `gb`
+    /// locale gets `gb,gb`): which one is active makes no difference.
+    GroupsAlike,
     /// Not determinable.
     Unknown,
 }
@@ -33,10 +39,22 @@ impl GroupResolution {
     #[must_use]
     pub const fn group(self) -> Option<u32> {
         match self {
-            Self::Single => Some(0),
+            Self::Single | Self::GroupsAlike => Some(0),
             Self::FromInputSources(group) | Self::Reported(group) => Some(group),
             Self::Unknown => None,
         }
+    }
+
+    /// Whether the group is the one the compositor types with **now**:
+    /// a single group, groups that all type alike, or the compositor's own
+    /// report. A group inferred from the desktop's input-source settings is
+    /// not: GNOME does not always update `mru-sources` (no input-method
+    /// framework or one switched off, per-window sources), so it can name a
+    /// group that is no longer live, and a group-specific key would then
+    /// type another character.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Single | Self::GroupsAlike | Self::Reported(_))
     }
 
     /// A short token for logs and diagnostics.
@@ -46,6 +64,7 @@ impl GroupResolution {
             Self::Single => "single_group",
             Self::FromInputSources(_) => "input_sources",
             Self::Reported(_) => "compositor_reported",
+            Self::GroupsAlike => "groups_alike",
             Self::Unknown => "unknown",
         }
     }

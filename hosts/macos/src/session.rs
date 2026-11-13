@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Session handshake for the macOS Pier.
 //!
 //! The order here is not a style choice. The Deck decides how a session works
@@ -24,6 +26,8 @@
 //! than refusing the session.
 
 use std::time::Duration;
+
+use zeroize::Zeroizing;
 
 use crate::net::{self, PierSocket};
 
@@ -87,6 +91,11 @@ pub struct AdvertisedCapabilities {
     pub microphone_policy: arcen_media::audio::MicrophonePolicy,
     /// The pre-auth multi-monitor offer sent on this connection, if any.
     pub multi_monitor_v1: Option<arcen_protocol::messages::AuthMultiMonitorOfferMsg>,
+    /// This session can type committed text: it may post `CGEvent`s (not
+    /// the HID-only login window) and holds the grant keyboard posting needs.
+    pub text_input: bool,
+    /// Whether Native tablet is offered (ADR 0022), or why not.
+    pub native_tablet: Result<(), String>,
 }
 
 /// Encoder claims established before the listener accepts a session.
@@ -648,6 +657,13 @@ pub fn advertise_with_config(
         clipboard_policy: policy.clipboard,
         microphone_policy,
         multi_monitor_v1: offer,
+        // Measured at the handshake, in the process that will post the
+        // events: the same Accessibility grant key events need.
+        text_input: !policy.login_window && crate::input::text_injection_available(),
+        native_tablet: {
+            crate::bridged_tablet::refresh_probe();
+            crate::bridged_tablet::availability(policy.login_window)
+        },
     })
 }
 
@@ -865,6 +881,11 @@ pub fn server_hello_json_for_multi(
     // feature exists offers it to the operator and then does nothing.
     let unavailable = InputCapabilityAvailability::Unavailable;
     let available = InputCapabilityAvailability::Available;
+    let tablet_surface = if capabilities.login_window {
+        unavailable
+    } else {
+        available
+    };
 
     let mut hello = ServerHelloMsg {
         msg_type: SERVER_HELLO.to_owned(),
@@ -873,6 +894,9 @@ pub fn server_hello_json_for_multi(
         os_user: os_user.to_owned(),
         session_id: String::new(),
         session_type: "aqua".to_owned(),
+        platform: arcen_protocol::messages::HostPlatform::MacOs
+            .token()
+            .map(str::to_owned),
         desktop: "aqua".to_owned(),
         // The size the Deck is about to receive, which is not always the size
         // of this host's own screen.
@@ -895,7 +919,9 @@ pub fn server_hello_json_for_multi(
         microphone_input: capabilities.microphone_policy.capabilities(),
         supports_pen: true,
         experimental_raw_hid: false,
-        usb_hard_v1: false,
+        // Only when the adapter can present a bridged tablet here: a Deck
+        // captures its tablet only for a host that says so.
+        usb_hard_v1: capabilities.native_tablet.is_ok(),
         supports_display_update: false,
         // Point-unit, phased scrolling is injected as continuous pixel
         // scroll with its phase, so applications run their own momentum.
@@ -977,44 +1003,49 @@ pub fn server_hello_json_for_multi(
             // the pen and this host injects finished samples as CGEvent
             // tablet events. Every field below is one the injector actually
             // sets, so the claim matches the code rather than the ambition.
+            //
+            // The login window is the exception. There no CGEvent may be
+            // created, so a pen drives the virtual absolute pointer: position,
+            // tip and barrel buttons, and nothing a tablet event would carry.
+            // A virtual HID digitizer would not change that — measured, macOS
+            // delivers its proximity and empties pressure, tilt and rotation.
             pen: available,
-            pen_pressure: available,
-            pen_tilt: available,
-            pen_rotation: available,
-            pen_eraser: available,
-            pen_proximity: available,
+            pen_pressure: tablet_surface,
+            pen_tilt: tablet_surface,
+            pen_rotation: tablet_surface,
+            pen_eraser: tablet_surface,
+            pen_proximity: tablet_surface,
             pen_barrel_buttons: available,
-            // The macOS Pier does not type committed text yet.
-            text_commit: InputCapabilityAvailability::Unavailable,
-            text_commit_unicode: InputCapabilityAvailability::Unavailable,
+            // Committed text is typed as Unicode key events, which carry any
+            // character whatever this Mac's layout, so both or neither.
+            text_commit: if capabilities.text_input {
+                available
+            } else {
+                unavailable
+            },
+            text_commit_unicode: if capabilities.text_input {
+                available
+            } else {
+                unavailable
+            },
+            // A Deck keeps sending a Mac host Option as Option and the ISO
+            // key as before.
+            extended_keys: InputCapabilityAvailability::Unavailable,
+            meta_pointer_mask: InputCapabilityAvailability::Unavailable,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: available,
-            // Measured, not assumed. Native Tablet needs this host to present
-            // the bridged device locally, which on macOS means
-            // `IOHIDUserDevice` and the
-            // com.apple.developer.hid.virtual.device entitlement. Whether a
-            // signature carries that is a property of the machine rather than
-            // of the build, so a constant here would be wrong half the time —
-            // and wrong expensively, because a host advertising a tablet it
-            // cannot deliver takes the Deck's tablet away and gives back
-            // nothing. `probe()` creates a device and tears it down, so the
-            // refusal a Deck sees is one this host actually observed.
-            // Unavailable, and the probe is not what decides it.
-            //
-            // An earlier version advertised the bridge whenever
-            // `virtual_hid::probe()` succeeded, which was the same overclaim
-            // the probe was added to prevent, one step further along:
-            // permission to create a device is not an importer. Nothing yet
-            // consumes the bridged traffic — `stream.rs` still answers HID and
-            // USB frames with `Unsupported` — so an entitled build would have
-            // taken the Deck's tablet away and delivered nothing.
-            //
-            // The probe stays as prerequisite evidence: it is what says
-            // whether the entitlement has arrived, and it is recorded in
-            // diagnostics. It becomes a capability only when there is an
-            // importer behind it.
-            usb_tablet_bridge: unavailable,
+            // Native tablet is offered only when this host can present a
+            // bridged tablet as HID devices (ADR 0022): the adapter is built,
+            // this is not the login window, and a probe child of the entitled
+            // Pier executable created a virtual HID device. Advertising it
+            // otherwise would take the Deck's tablet away and give back
+            // nothing.
+            usb_tablet_bridge: if capabilities.native_tablet.is_ok() {
+                available
+            } else {
+                unavailable
+            },
             disabled_mouse_compat: available,
         },
         clipboard: Some(arcen_media::clipboard::policy_message(
@@ -1026,10 +1057,7 @@ pub fn server_hello_json_for_multi(
         // dialled.
         negotiated_transport: Some(arcen_transport::CAPABILITY_TRANSPORT_QUIC.to_owned()),
     }
-    .with_build_identity(arcen_protocol::build_identity::this_build(
-        "arcen-pier-macos",
-        crate::VERSION,
-    ));
+    .with_build_identity(crate::build_identity());
 
     if let Some(multi_monitor) = multi_monitor {
         hello = match hello.with_multi_monitor_v1(&multi_monitor.server_capability) {
@@ -1118,7 +1146,7 @@ static AUTHENTICATION_SLOT: crate::blocking::BlockingSlot = crate::blocking::Blo
 
 async fn authenticate_credentials(
     username: String,
-    credential: String,
+    credential: Zeroizing<String>,
 ) -> Result<crate::auth::Authenticated, crate::auth::AuthFailure> {
     crate::blocking::run_exclusive(
         "arcen-macos-authentication",
@@ -1145,7 +1173,7 @@ fn authentication_failure(failure: crate::blocking::ExclusiveFailure) -> crate::
 #[cfg(not(test))]
 fn authenticate_blocking(
     username: String,
-    credential: String,
+    credential: Zeroizing<String>,
 ) -> Result<crate::auth::Authenticated, crate::auth::AuthFailure> {
     let result = crate::auth::authenticate(&username, &credential);
     drop((username, credential));
@@ -1155,9 +1183,9 @@ fn authenticate_blocking(
 #[cfg(test)]
 fn authenticate_blocking(
     username: String,
-    credential: String,
+    credential: Zeroizing<String>,
 ) -> Result<crate::auth::Authenticated, crate::auth::AuthFailure> {
-    let valid = credential == "valid";
+    let valid = credential.as_str() == "valid";
     drop(credential);
     if valid {
         let uid = crate::auth::resolve_account(&username).map(|account| account.uid);
@@ -1258,7 +1286,7 @@ async fn perform_application_handshake(
 ) -> Result<Handshake, HandshakeError> {
     // Read the display inventory before speaking, so a host with nothing to
     // serve refuses before asking anyone for a password.
-    let advertised = advertise_with_config(policy)?;
+    let mut advertised = advertise_with_config(policy)?;
 
     // Credentials first. The Deck chooses its authenticated path from this
     // message; greeting first would tell it no credentials are wanted.
@@ -1387,6 +1415,16 @@ async fn perform_application_handshake(
         None => (None, None),
     };
 
+    // Native tablet must work on the first connection (ADR 0022 §8): the
+    // capability probe started before authentication; a probe still running
+    // now (an agent that just started, or a re-probe after a refusal) is
+    // waited for, bounded, rather than answered with "still checking".
+    advertised.native_tablet = crate::bridged_tablet::settled_availability(
+        policy.login_window,
+        crate::bridged_tablet::PROBE_WAIT,
+    )
+    .await;
+
     net::send_json(
         socket,
         server_hello_json_for_multi(
@@ -1444,23 +1482,10 @@ async fn perform_application_handshake(
             "ClientHello timezone differs from authenticated decision; retaining AuthResponse value"
         );
     }
-    let input_mode_results = client_hello.as_ref().map_or_else(
-        || {
-            input_mode_results(
-                cursor_mode,
-                arcen_protocol::messages::TabletModeMsg::LocalTermination,
-                arcen_protocol::messages::TabletModeCapabilitiesMsg::default(),
-                host_tablet_mode_capabilities(),
-            )
-        },
-        |hello| {
-            input_mode_results(
-                cursor_mode,
-                hello.tablet_mode_requested,
-                hello.effective_tablet_mode_capabilities(),
-                host_tablet_mode_capabilities(),
-            )
-        },
+    let input_mode_results = negotiate_input_modes(
+        cursor_mode,
+        client_hello.as_ref(),
+        &advertised.native_tablet,
     );
     let client_audio = client_hello
         .as_ref()
@@ -1519,10 +1544,108 @@ async fn perform_application_handshake(
     })
 }
 
-fn host_tablet_mode_capabilities() -> arcen_protocol::messages::TabletModeCapabilitiesMsg {
+/// Settles the cursor and tablet modes of a session from the Deck's hello,
+/// including Native tablet (`native_tablet` is what this host's hello
+/// offered). Exactly what the handshake runs; public so the end-to-end test
+/// can drive a real client hello through it without the credential gate.
+#[must_use]
+pub fn negotiate_input_modes(
+    cursor_mode: arcen_protocol::messages::CursorMode,
+    client_hello: Option<&arcen_protocol::messages::ClientHelloMsg>,
+    native_tablet: &Result<(), String>,
+) -> crate::stream::InputModeResults {
+    let host = host_tablet_mode_capabilities(native_tablet.is_ok());
+    let mut results = client_hello.map_or_else(
+        || {
+            input_mode_results(
+                cursor_mode,
+                arcen_protocol::messages::TabletModeMsg::LocalTermination,
+                arcen_protocol::messages::TabletModeCapabilitiesMsg::default(),
+                host,
+            )
+        },
+        |hello| {
+            input_mode_results(
+                cursor_mode,
+                hello.tablet_mode_requested,
+                hello.effective_tablet_mode_capabilities(),
+                host,
+            )
+        },
+    );
+    results.native_tablet =
+        negotiate_native_tablet(client_hello, native_tablet, &mut results.tablet);
+    results.cursor.cursor_positions = host_pen_cursor_positions(
+        client_hello.is_some_and(|hello| hello.cursor_position_v1),
+        results.cursor.active,
+        results.native_tablet.as_ref(),
+    );
+    results
+}
+
+/// Whether this session reports host pointer positions: only for a Deck
+/// that draws its cursor at them (`cursor_position_v1`, local cursor), and
+/// only while this host reads a bridged pen itself, the one thing on a
+/// macOS Pier that moves the pointer without the Deck. A Deck without them
+/// keeps its own cursor (the pen still draws).
+fn host_pen_cursor_positions(
+    deck_cursor_positions: bool,
+    active_cursor: arcen_protocol::messages::CursorMode,
+    native_tablet: Option<&crate::bridged_tablet::AuthorizedTablet>,
+) -> bool {
+    deck_cursor_positions
+        && active_cursor == arcen_protocol::messages::CursorMode::Local
+        && native_tablet.is_some()
+}
+
+/// Settles Native tablet for this session (ADR 0022 §5, §8): the Deck's
+/// device is authorized with the shared checks before anything exists, and
+/// the tablet-mode result says exactly why not, or what the Deck will get.
+/// Returns the device to present when Native tablet is active.
+fn negotiate_native_tablet(
+    client_hello: Option<&arcen_protocol::messages::ClientHelloMsg>,
+    offer: &Result<(), String>,
+    tablet: &mut arcen_protocol::messages::TabletModeResultMsg,
+) -> Option<crate::bridged_tablet::AuthorizedTablet> {
+    use arcen_protocol::messages::TabletModeMsg;
+    let requested = tablet.requested == TabletModeMsg::UsbTabletBridge;
+    let device = client_hello.and_then(|hello| hello.usb_hard_device.as_ref());
+    let authorization =
+        (requested && offer.is_ok()).then(|| crate::bridged_tablet::authorize(device));
+    tracing::info!(
+        target: arcen_telemetry::names::target::HID,
+        requested = ?tablet.requested,
+        client_usb_hard_v1 = client_hello.is_some_and(|hello| hello.usb_hard_v1),
+        client_usb_hard_vendor_id = device.map(|device| device.vendor_id),
+        client_usb_hard_product_id = device.map(|device| device.product_id),
+        client_usb_hard_descriptors = device.map_or(0, |device| device.hid_report_descriptors.len()),
+        usb_hard_available = offer.is_ok(),
+        unavailable_reason = offer.as_ref().err().map(String::as_str),
+        tablet_refusal = authorization.as_ref().and_then(|result| result.as_ref().err()).map(String::as_str),
+        tablet_pressure_levels = authorization
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|tablet| tablet.profile.capabilities.pressure_levels()),
+        "Hard USB negotiation inputs"
+    );
+    *tablet = crate::bridged_tablet::tablet_result(tablet.clone(), offer, authorization.as_ref());
+    if tablet.accepted && tablet.active == TabletModeMsg::UsbTabletBridge {
+        authorization.and_then(Result::ok)
+    } else {
+        None
+    }
+}
+
+fn host_tablet_mode_capabilities(
+    native_tablet: bool,
+) -> arcen_protocol::messages::TabletModeCapabilitiesMsg {
     arcen_protocol::messages::TabletModeCapabilitiesMsg {
         local_termination: InputCapabilityAvailability::Available,
-        usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
+        usb_tablet_bridge: if native_tablet {
+            InputCapabilityAvailability::Available
+        } else {
+            InputCapabilityAvailability::Unavailable
+        },
         disabled_mouse_compat: InputCapabilityAvailability::Available,
     }
 }
@@ -1562,6 +1685,7 @@ fn input_mode_results(
             reconnect_required: tablet.reconnect_required,
             ..TabletModeResultMsg::default()
         },
+        native_tablet: None,
     }
 }
 
@@ -1874,6 +1998,8 @@ fn resolve_initial_video(
             TransferCharacteristics::Pq | TransferCharacteristics::Hlg
         ),
     };
+    // A Grading capture holds the desktop's sRGB code values: a Deck that
+    // presents `srgb` is told so, an older one keeps `bt709`.
     let plan = resolve_video_plan(
         &request,
         &HostVideoCapabilities {
@@ -1883,7 +2009,8 @@ fn resolve_initial_video(
             chroma_444: capabilities.chroma_444,
             hdr_output,
         },
-    );
+    )
+    .serving_sdr_desktop(client.capabilities.srgb_transfer);
     let served_pipeline = arcen_media::video::served_pipeline(
         host_resolved.pipeline,
         video_configuration_from_plan(plan),
@@ -1984,13 +2111,15 @@ async fn authenticate(
         .await
         .map_err(HandshakeError::Transport)?;
 
+    // The reply carries the password: wipe the frame once parsed.
     let reply = tokio::time::timeout(AUTH_TIMEOUT, net::receive_json(socket))
         .await
         .map_err(|_| HandshakeError::AuthTimeout)?
         .map_err(HandshakeError::Transport)?
+        .map(Zeroizing::new)
         .ok_or(HandshakeError::PeerClosed)?;
 
-    let response: AuthResponse = serde_json::from_str(&reply).map_err(|_| {
+    let mut response: AuthResponse = serde_json::from_str(&reply).map_err(|_| {
         let kind = serde_json::from_str::<serde_json::Value>(&reply)
             .ok()
             .and_then(|value| {
@@ -2003,7 +2132,9 @@ async fn authenticate(
         HandshakeError::UnexpectedMessage(kind)
     })?;
     if response.msg_type != arcen_protocol::messages::AUTH_RESPONSE {
-        return Err(HandshakeError::UnexpectedMessage(response.msg_type));
+        return Err(HandshakeError::UnexpectedMessage(std::mem::take(
+            &mut response.msg_type,
+        )));
     }
 
     let outcome = match credentials_from(&response) {
@@ -2019,7 +2150,7 @@ async fn authenticate(
                 Err(crate::auth::AuthFailure::TooManyAttempts)
             } else {
                 let username = username.to_owned();
-                let credential = credential.to_owned();
+                let credential = Zeroizing::new(credential.to_owned());
                 let checked = authenticate_credentials(username, credential).await;
                 throttle_record(&keys, &checked);
                 checked
@@ -2072,8 +2203,8 @@ async fn authenticate(
         // from one decision.
         Ok((authenticated, admission)) => Ok((
             authenticated.user,
-            response.initial_video,
-            response.multi_monitor_v1,
+            response.initial_video.take(),
+            response.multi_monitor_v1.take(),
             RequestedDesktop::from_auth(response.screen_width, response.screen_height),
             response
                 .monitors
@@ -2081,7 +2212,7 @@ async fn authenticate(
                 .find(|monitor| monitor.is_primary)
                 .cloned(),
             response.cursor_preference,
-            response.timezone,
+            response.timezone.take(),
             admission,
         )),
         Err(failure) => Err(HandshakeError::Rejected(failure)),
@@ -2092,6 +2223,49 @@ async fn authenticate(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_tablet_is_refused_with_a_reason_and_tablet_support_is_served() {
+        use arcen_protocol::messages::{
+            CursorMode, TabletModeCapabilitiesMsg as Capabilities, TabletModeMsg,
+        };
+        // A Deck that can do everything: the refusal must come from this host.
+        let deck = Capabilities {
+            local_termination: InputCapabilityAvailability::Available,
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
+            disabled_mouse_compat: InputCapabilityAvailability::Available,
+        };
+        let native = input_mode_results(
+            CursorMode::Local,
+            TabletModeMsg::UsbTabletBridge,
+            deck,
+            host_tablet_mode_capabilities(false),
+        )
+        .tablet;
+        assert!(!native.accepted);
+        assert_eq!(native.active, TabletModeMsg::DisabledMouseCompat);
+        assert!(native.reconnect_required);
+        // Carried to the Deck, not dropped for length on the way.
+        assert!(
+            native
+                .reason
+                .as_str()
+                .starts_with("Native tablet (USB bridged) is unavailable"),
+            "{}",
+            native.reason.as_str()
+        );
+
+        let typed = input_mode_results(
+            CursorMode::Local,
+            TabletModeMsg::LocalTermination,
+            deck,
+            host_tablet_mode_capabilities(false),
+        )
+        .tablet;
+        assert!(typed.accepted);
+        assert_eq!(typed.active, TabletModeMsg::LocalTermination);
+        assert!(typed.reason.as_str().is_empty());
+    }
 
     #[test]
     fn an_agent_serves_only_its_own_account() {
@@ -2173,6 +2347,8 @@ mod tests {
             },
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             multi_monitor_v1: None,
+            text_input: false,
+            native_tablet: Err(crate::bridged_tablet::NOT_BUILT.to_owned()),
         }
     }
 
@@ -2413,6 +2589,76 @@ mod tests {
     }
 
     #[test]
+    fn the_login_window_claims_no_tablet_surface_it_cannot_inject() {
+        // At the login window a pen drives the virtual pointer, so a Deck
+        // must not be told pressure or tilt will arrive.
+        let input = |login_window: bool| {
+            serde_json::from_str::<arcen_protocol::messages::ServerHelloMsg>(&server_hello_json(
+                &AdvertisedCapabilities {
+                    login_window,
+                    ..capabilities()
+                },
+                "",
+            ))
+            .expect("Deck must be able to parse this")
+            .input_capabilities
+        };
+        let available = InputCapabilityAvailability::Available;
+        let unavailable = InputCapabilityAvailability::Unavailable;
+        let desktop = input(false);
+        assert_eq!(
+            [
+                desktop.pen_pressure,
+                desktop.pen_tilt,
+                desktop.pen_rotation,
+                desktop.pen_eraser,
+                desktop.pen_proximity,
+            ],
+            [available; 5]
+        );
+        let login = input(true);
+        assert_eq!(login.pen, available, "the pen still points and clicks");
+        assert_eq!(login.pen_barrel_buttons, available);
+        assert_eq!(
+            [
+                login.pen_pressure,
+                login.pen_tilt,
+                login.pen_rotation,
+                login.pen_eraser,
+                login.pen_proximity,
+            ],
+            [unavailable; 5]
+        );
+    }
+
+    #[test]
+    fn committed_text_is_claimed_only_where_it_can_be_typed() {
+        let input = |text_input: bool| {
+            serde_json::from_str::<arcen_protocol::messages::ServerHelloMsg>(&server_hello_json(
+                &AdvertisedCapabilities {
+                    text_input,
+                    ..capabilities()
+                },
+                "",
+            ))
+            .expect("Deck must be able to parse this")
+            .input_capabilities
+        };
+        let typed = input(true);
+        assert!(arcen_protocol::messages::supports_text_commit_v1(typed));
+        assert_eq!(
+            typed.text_commit_unicode,
+            InputCapabilityAvailability::Available
+        );
+        let refused = input(false);
+        assert!(!arcen_protocol::messages::supports_text_commit_v1(refused));
+        assert_eq!(
+            refused.text_commit_unicode,
+            InputCapabilityAvailability::Unavailable
+        );
+    }
+
+    #[test]
     fn codec_claims_travel_to_the_client() {
         let only_h264 = AdvertisedCapabilities {
             hevc: false,
@@ -2649,6 +2895,93 @@ mod tests {
             hello.active_pipeline,
             Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
         );
+    }
+
+    /// A Grading capture holds sRGB code values: a Deck that presents `srgb`
+    /// is told so in the plan, the hello and the served pipeline (still
+    /// Grading, not degraded); an older Deck keeps `bt709`, and Speed is
+    /// untouched.
+    #[test]
+    fn grading_is_stated_as_srgb_only_for_a_deck_that_presents_it() {
+        use arcen_protocol::messages::{
+            ClientVideoCapabilitiesMsg, InitialVideoRequestMsg, QualitySettings, StreamPipeline,
+            VideoSelectionIntent,
+        };
+        let request = |pipeline, srgb_transfer| InitialVideoRequestMsg {
+            quality: QualitySettings {
+                msg_type: "quality_settings".to_owned(),
+                codec: "h265".to_owned(),
+                chroma: "yuv444".to_owned(),
+                bit_depth: "10".to_owned(),
+                max_fps: 30,
+                color_range: "full".to_owned(),
+                video_selection: VideoSelectionIntent::ColorFidelity,
+                ..Default::default()
+            },
+            capabilities: ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                yuv444: true,
+                main10: true,
+                full_range: true,
+                srgb_transfer,
+                ..Default::default()
+            },
+            pipeline: Some(pipeline),
+        };
+        let caps = AdvertisedCapabilities {
+            main10: true,
+            chroma_444: true,
+            ..capabilities()
+        };
+        for (srgb, transfer) in [(true, "srgb"), (false, "bt709")] {
+            let resolved =
+                resolve_initial_video(Some(&request(StreamPipeline::Grading, srgb)), &caps, false)
+                    .expect("Grading");
+            assert_eq!(
+                resolved.plan.tier,
+                arcen_media::session_plan::VideoTier::Grading
+            );
+            assert_eq!(resolved.plan.transfer, transfer);
+            assert!(
+                resolved.plan.is_exact(),
+                "{transfer} serves a bt709 request"
+            );
+            assert_eq!(
+                resolved.active_pipeline,
+                Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+            );
+            let hello: arcen_protocol::messages::ServerHelloMsg =
+                serde_json::from_str(&server_hello_json_for_multi(
+                    &caps,
+                    "alice",
+                    resolved.plan,
+                    resolved.codec,
+                    resolved.active_pipeline,
+                    None,
+                    (1920, 1080),
+                ))
+                .expect("hello");
+            assert_eq!(hello.color_caps.active_transfer, transfer);
+            let capture = crate::capture::CaptureConfig::grading(1, 1920, 1080, 30)
+                .stating_sdr_transfer(resolved.plan.transfer);
+            let colour = crate::encode::colour_for_capture(&capture).expect("tagged");
+            assert_eq!(
+                colour.transfer,
+                if srgb { "IEC_sRGB" } else { "ITU_R_709_2" }
+            );
+        }
+        let mut speed = request(StreamPipeline::Speed, true);
+        speed.quality.bit_depth = "8".to_owned();
+        speed.quality.chroma = "yuv420".to_owned();
+        speed.quality.color_range = "limited".to_owned();
+        speed.quality.video_selection = VideoSelectionIntent::AdaptivePerformance;
+        let speed = resolve_initial_video(Some(&speed), &caps, false).expect("Speed");
+        assert_eq!(
+            speed.plan.tier,
+            arcen_media::session_plan::VideoTier::Standard
+        );
+        assert_eq!(speed.plan.transfer, "bt709", "the fast path is untouched");
     }
 
     #[test]
@@ -2911,11 +3244,160 @@ mod tests {
         assert!(!hello.supports_audio);
         assert!(hello.audio_output.is_none());
         assert!(hello.microphone_input.is_none());
-        // Native Tablet needs a user-mode USB host controller this build
-        // cannot create, so it must stay refused however much Basic Tablet
-        // works.
+        // Native tablet is refused unless the adapter can present the
+        // bridged device here, however much Basic Tablet works.
         assert!(!hello.usb_hard_v1);
         assert!(!hello.experimental_raw_hid);
+    }
+
+    #[test]
+    fn native_tablet_is_advertised_exactly_when_the_adapter_can_present_it() {
+        use arcen_protocol::messages::InputCapabilityAvailability::{Available, Unavailable};
+        let hello = |native_tablet: Result<(), String>| {
+            let offered = AdvertisedCapabilities {
+                native_tablet,
+                ..capabilities()
+            };
+            serde_json::from_str::<arcen_protocol::messages::ServerHelloMsg>(&server_hello_json(
+                &offered, "alice",
+            ))
+            .expect("parse")
+        };
+        let offered = hello(Ok(()));
+        assert!(
+            offered.usb_hard_v1,
+            "a Deck captures its tablet only for this"
+        );
+        assert_eq!(
+            offered.tablet_mode_capabilities.usb_tablet_bridge,
+            Available
+        );
+        let refused = hello(Err(crate::bridged_tablet::LOGIN_WINDOW.to_owned()));
+        assert!(!refused.usb_hard_v1);
+        assert_eq!(
+            refused.tablet_mode_capabilities.usb_tablet_bridge,
+            Unavailable
+        );
+    }
+
+    #[test]
+    fn host_pointer_positions_are_reported_only_for_a_pen_this_host_reads() {
+        use arcen_protocol::messages::{
+            ClientHelloMsg, CursorMode, TabletModeCapabilitiesMsg, TabletModeMsg, UsbHardDeviceMsg,
+            UsbHidReportDescriptorMsg,
+        };
+        let device = |product_id| UsbHardDeviceMsg {
+            vendor_id: 0x056a,
+            product_id,
+            bcd_device: 0x0100,
+            device_class: 0,
+            speed: arcen_usb_bridge::UsbSpeed::Full,
+            hid_report_descriptors: (0..3)
+                .map(|interface| {
+                    UsbHidReportDescriptorMsg::new(
+                        interface,
+                        arcen_usb_bridge::WacomIntuos5::report_descriptor(interface)
+                            .expect("fixture"),
+                    )
+                })
+                .collect(),
+        };
+        let hello = |product_id, positions| ClientHelloMsg {
+            usb_hard_v1: true,
+            usb_hard_device: Some(device(product_id)),
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
+            tablet_mode_capabilities: TabletModeCapabilitiesMsg {
+                usb_tablet_bridge: InputCapabilityAvailability::Available,
+                ..TabletModeCapabilitiesMsg::default()
+            },
+            cursor_position_v1: positions,
+            ..ClientHelloMsg::default()
+        };
+        let settle = |cursor, hello: &ClientHelloMsg| {
+            negotiate_input_modes(cursor, Some(hello), &Ok(())).cursor
+        };
+        // An Intuos5 this host reads, a Deck that follows host positions.
+        let known = hello(0x0317, true);
+        let results = negotiate_input_modes(CursorMode::Local, Some(&known), &Ok(()));
+        assert!(results.tablet.accepted);
+        assert!(results.native_tablet.is_some());
+        assert!(results.cursor.cursor_positions);
+        // A Deck that does not follow them, a host-drawn cursor, an unknown
+        // model (refused: no Native tablet), or no Native tablet at all: none.
+        assert!(!settle(CursorMode::Local, &hello(0x0317, false)).cursor_positions);
+        assert!(!settle(CursorMode::Host, &known).cursor_positions);
+        assert!(!settle(CursorMode::Local, &hello(0x0001, true)).cursor_positions);
+        assert!(
+            !negotiate_input_modes(CursorMode::Local, Some(&known), &Err("off".to_owned()))
+                .cursor
+                .cursor_positions
+        );
+    }
+
+    #[test]
+    fn a_native_tablet_request_is_settled_by_the_device_and_explained() {
+        use arcen_protocol::messages::{
+            ClientHelloMsg, TabletModeCapabilitiesMsg, TabletModeMsg, UsbHardDeviceMsg,
+            UsbHidReportDescriptorMsg,
+        };
+        let intuos5 = UsbHardDeviceMsg {
+            vendor_id: 0x056a,
+            product_id: 0x0317,
+            bcd_device: 0x0100,
+            device_class: 0,
+            speed: arcen_usb_bridge::UsbSpeed::Full,
+            hid_report_descriptors: (0..3)
+                .map(|interface| {
+                    UsbHidReportDescriptorMsg::new(
+                        interface,
+                        arcen_usb_bridge::WacomIntuos5::report_descriptor(interface)
+                            .expect("fixture"),
+                    )
+                })
+                .collect(),
+        };
+        let client = ClientHelloMsg {
+            usb_hard_v1: true,
+            usb_hard_device: Some(intuos5),
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
+            ..ClientHelloMsg::default()
+        };
+        let deck = TabletModeCapabilitiesMsg {
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
+            ..TabletModeCapabilitiesMsg::default()
+        };
+        let settle = |offer: Result<(), String>, client: &ClientHelloMsg| {
+            let mut results = input_mode_results(
+                arcen_protocol::messages::CursorMode::Local,
+                TabletModeMsg::UsbTabletBridge,
+                deck,
+                host_tablet_mode_capabilities(offer.is_ok()),
+            );
+            let tablet = negotiate_native_tablet(Some(client), &offer, &mut results.tablet);
+            (tablet, results.tablet)
+        };
+        let (tablet, result) = settle(Ok(()), &client);
+        assert!(result.accepted);
+        assert_eq!(result.active, TabletModeMsg::UsbTabletBridge);
+        assert_eq!(tablet.expect("presented").report_descriptors.len(), 3);
+        // A device that is not a tablet is refused before anything exists.
+        let mut keyboard = client.clone();
+        keyboard.usb_hard_device = keyboard.usb_hard_device.map(|device| UsbHardDeviceMsg {
+            hid_report_descriptors: vec![UsbHidReportDescriptorMsg::new(
+                0,
+                &[0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0xC0],
+            )],
+            ..device
+        });
+        let (tablet, result) = settle(Ok(()), &keyboard);
+        assert!(tablet.is_none());
+        assert!(!result.accepted);
+        assert!(String::from(result.reason).contains("refused"));
+        // At the login window nothing is authorized at all.
+        let (tablet, result) = settle(Err(crate::bridged_tablet::LOGIN_WINDOW.to_owned()), &client);
+        assert!(tablet.is_none());
+        assert!(!result.accepted);
+        assert!(String::from(result.reason).contains(crate::bridged_tablet::LOGIN_WINDOW));
     }
 
     #[test]
@@ -3030,14 +3512,20 @@ mod tests {
 
     #[tokio::test]
     async fn authentication_uses_supervised_blocking_worker() {
-        let authenticated = super::authenticate_credentials("alice".to_owned(), "valid".to_owned())
-            .await
-            .expect("test authenticator accepts valid credential");
+        let authenticated = super::authenticate_credentials(
+            "alice".to_owned(),
+            zeroize::Zeroizing::new("valid".to_owned()),
+        )
+        .await
+        .expect("test authenticator accepts valid credential");
         assert_eq!(authenticated.user, "alice");
         assert_eq!(
-            super::authenticate_credentials("alice".to_owned(), "bad".to_owned())
-                .await
-                .unwrap_err(),
+            super::authenticate_credentials(
+                "alice".to_owned(),
+                zeroize::Zeroizing::new("bad".to_owned())
+            )
+            .await
+            .unwrap_err(),
             crate::auth::AuthFailure::InvalidCredentials,
         );
     }

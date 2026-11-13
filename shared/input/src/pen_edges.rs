@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Turning a stream of pen samples into the edges a host must inject.
 //!
 //! A pen sample says what the tool *is* doing. A host has to inject what

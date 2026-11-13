@@ -5,8 +5,10 @@ shared vocabulary, wire, colour conversion, encoder signalling, four-preset
 Deck surface, native capture providers, and ten-bit Deck presentation are
 implemented.
 The measured Windows wide path now captures DWM's FP16 scRGB composition
-through WGC for every ten-bit stream. Grading converts that source to BT.709
-10-bit SDR. HDR additionally provisions an HDR10 headless display before
+through WGC for every ten-bit stream. Grading re-encodes that source as 10-bit
+SDR with BT.709 primaries and matrix and the sRGB curve DWM linearised with,
+so a Deck that presents `srgb` (0.18.0) gets the desktop's own code values;
+an older Deck gets the BT.709 curve. HDR additionally provisions an HDR10 headless display before
 capture, enables Advanced Color, proves the output is PQ/BT.2020, converts to
 absolute BT.2020/PQ 10-bit 4:4:4, and presents the native VideoToolbox `xf44`
 result through a dedicated `RGB10A2Unorm` HDR Metal path.
@@ -36,7 +38,7 @@ capture implementation.
 | --- | --- | --- | --- |
 | Auto | DDA after real-frame proof, otherwise WGC BGRA8 → negotiated 8-bit 4:2:0 encode | NvFBC → CUDA → NVENC 8-bit 4:2:0 | Root window: VideoToolbox NV12 IOSurface → `CVMetalTextureCache` planes → dedicated display-synchronised 8-bit `CAMetalLayer`; egui upload fallback. Secondary windows still use the egui path. |
 | Speed | Same 8-bit path at 60 fps | Same NvFBC device-to-device path at 60 fps | Same dedicated root 8-bit layer and secondary-window fallback as Auto |
-| Grading | WGC FP16 scRGB → SDR transfer/matrix → HEVC I444 P16 | Depth-30 Xorg → XShm RGB10 → shared conversion → CUDA upload → HEVC I444 P16 | Native `xf44`, dedicated 10-bit Metal, EDR off |
+| Grading | WGC FP16 scRGB → sRGB re-encode (desktop codes, `srgb`; BT.709 OETF for older Decks) → matrix → HEVC I444 P16 | Depth-30 Xorg → XShm RGB10 (desktop codes untouched, `srgb` to a Deck that presents it) → shared conversion → CUDA upload → HEVC I444 P16 | Native `xf44`, dedicated 10-bit Metal, EDR off |
 | HDR | HDR EDID/topology and exact-target HDR proof → WGC FP16 scRGB → BT.2020/PQ → HEVC I444 P16 | Declared `rec2100-pq` desktop: depth-30 XShm → BT.2020 NCL matrix → NVENC PQ; otherwise resolve to the Grading pipeline and report degradation | Native `xf44`, dedicated 10-bit Metal, PQ/EDR only when the resolved transfer remains PQ |
 
 Software encoding is another separate pipeline. Windows MF consumes WGC BGRA8
@@ -156,9 +158,39 @@ The WGC buffer is linear scRGB, not an already encoded BT.709 or PQ signal.
 Grading and HDR deliberately use separate transforms.
 
 For Grading, Arcen clamps linear components to `0.0..=1.0`, applies the
-negotiated BT.709 or sRGB OETF, forms BT.709 YCbCr, and writes MSB-aligned
-ten-bit samples. Values above reference white are clipped because the requested
+served SDR transfer, forms BT.709 YCbCr, and writes MSB-aligned ten-bit
+samples. Values above reference white are clipped because the requested
 stream is SDR; they are not mislabeled as HDR.
+
+The served transfer is sRGB whenever the Deck can say so. DWM decodes every
+SDR surface with the IEC 61966-2-1 curve into linear scRGB, so re-encoding
+with the same curve returns the desktop's own code values: every eight-bit
+code comes back as its ten-bit equivalent (`code × 1023/255`, within one
+ten-bit code of FP16 rounding) and therefore as exactly the same eight-bit
+code (`every_eight_bit_srgb_code_survives_scrgb_and_the_srgb_transfer`). The
+stream is tagged `srgb` (H.273 transfer 13) and the hello says so; it is still
+Grading (`TransferCharacteristics::serves_request`). Before 0.18.0 the host
+applied the BT.709 OETF instead and tagged `bt709`: the Deck presents every
+SDR transfer as sRGB, so that moved codes by up to 16/255 in the shadows and
+crushed them on screen, which the Deck's Colour check measured on a Windows
+Grading session. A Deck that predates `srgb_transfer` still receives that
+legacy encoding, because it never claimed to present `srgb`.
+
+The Linux Xorg and macOS Pier Grading captures never re-encoded: XShm RGB10
+and the `ScreenCaptureKit` `xf44` surface (captured in `kCGColorSpaceSRGB`)
+already hold the desktop's sRGB codes, and they go to the matrix and the
+encoder untouched. Since 0.19.0 they also say so: `srgb` to a Deck that
+claims `srgb_transfer`, `bt709` otherwise, through the one shared rule
+(`arcen_media::video::serve_sdr_desktop`). A declared Rec.2100 PQ Xorg
+desktop served as Grading is converted on the sRGB curve for such a Deck
+(`Rgb10Signal::PqBt2020ToSdrSrgb`), so an sRGB window composed into PQ keeps
+its codes. Wayland Grading, which takes the compositor's HDR (PQ)
+composition, states `srgb` for such a Deck too (capenc's shared admission
+reads the Pier's `transfer=`), and re-encodes with the inverse of the curve
+the compositor decoded its SDR content with: Mutter decodes sRGB windows
+with a pure 2.2 power, as the Wayland colour-management protocol reads
+`srgb`, so the conversion is `Rgb10Signal::PqBt2020ToSdrGamma22`, not the
+piecewise sRGB curve. An older Deck keeps `bt709` and the BT.709 OETF.
 
 For HDR, the conversion order is load-bearing:
 
@@ -414,7 +446,7 @@ dependency-purity proof still passes with the feature off.
 
 ## Measured on target hardware
 
-Windows NVENC host → M4 Pro Deck, 2026-08-15, commit `276e150`. Full evidence
+Windows NVENC host → M4 Pro Deck, 2026-08-15. Full evidence
 in [`../testing/color-matrix-results.json`](../testing/color-matrix-results.json).
 `err` is the end-to-end grey-ramp round trip, per channel, 0..=255.
 
@@ -442,7 +474,7 @@ documents nowhere — is answered: **yes, and in hardware.**
 
 **The old format was measurably lossy.** `hevc-444-8-limited-bt709`, the format
 the product shipped before this work, is the **only** row that loses two codes.
-That is the empirical version of the argument this branch was built on, now
+That is the empirical version of the argument this work was built on, now
 observed on real silicon rather than derived in a unit test.
 
 **H.264 High 4:4:4 Predictive hardware-decodes on Apple silicon.** This was
@@ -490,11 +522,10 @@ degrades to VideoToolbox's native output — which the copy path already handles
 — instead of losing the session. The retry is logged at warn, because it means
 the negotiated format was not honoured exactly.
 
-The wider lesson is that the failure was in the one step the implementing agent
-explicitly flagged as unverifiable from a non-Apple machine. That flag was
-correct, and it is why hardware testing is a gate rather than a formality.
+The failure was in the one step that cannot be verified from a non-Apple
+machine, which is why hardware testing is a gate rather than a formality.
 
-The hardware retest at `1d202cc` is green: pier-windows-software.example.internal's MF H.264 stream
+The hardware retest is green: pier-windows-software.example.internal's MF H.264 stream
 delivers `420v`, decodes in hardware, and displays in Deck without `-6661`.
 
 That retest found a second regression before declaring success. Both product

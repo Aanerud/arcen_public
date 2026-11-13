@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Bounded incremental line reading for helper-process stdout/stderr pipes.
 //!
 //! `tokio::io::Lines`/`BufReader::lines()`/`next_line()` grows its internal

@@ -20,8 +20,10 @@ Auto / Speed
   Linux:   NvFBC -> CUDA -> NVENC                         [device-to-device]
 
 Grading
-  Windows: WGC FP16 scRGB -> SDR OETF/BT.709 -> I444 P16 -> NVENC
-  Linux:   depth-30 Xorg -> XShm RGB10 -> I444 P16 -> CUDA upload -> NVENC
+  Windows: WGC FP16 scRGB -> sRGB re-encode (desktop codes; `srgb`, or
+           BT.709 OETF for an older Deck) -> BT.709 matrix -> I444 P16 -> NVENC
+  Linux:   depth-30 Xorg -> XShm RGB10 (desktop codes; `srgb` for a capable
+           Deck) -> I444 P16 -> CUDA upload -> NVENC
 
 HDR
   Windows: HDR EDID/topology/exact-target proof -> WGC FP16 scRGB
@@ -151,7 +153,8 @@ the backend advertised in hello and frame headers.
 Capture selection is independently constrained by the resolved colour
 contract. Eight-bit requests may probe DDA and fall back to WGC BGRA8. Every
 ten-bit request requires WGC FP16 scRGB. Grading applies an SDR transform and
-does not enable HDR. HDR first provisions the final sink/topology, enables and
+does not enable HDR; for a Deck that claims `srgb_transfer` it re-encodes with
+the sRGB curve and serves `srgb`, so desktop code values survive. HDR first provisions the final sink/topology, enables and
 verifies HDR on the exact bound target, and then applies the absolute
 BT.2020/PQ transform. FP16 refusal fails closed.
 

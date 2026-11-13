@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! One `OpenH264` session for every Linux software encode path.
 //!
 //! The Xorg path (MIT-SHM capture) and the Wayland path (`PipeWire` shared

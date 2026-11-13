@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(unsafe_code)]
 
 //! Native macOS account authentication.
@@ -160,6 +163,13 @@ pub fn resolve_account(name: &str) -> Option<Account> {
 /// The password, carried only as long as the conversation needs it.
 struct Secret {
     password: CString,
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.password).into_bytes_with_nul();
+        zeroize::Zeroize::zeroize(&mut bytes);
+    }
 }
 
 /// Supplies the password to PAM.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Silencing the host's own speakers for a session, and proving it.
 //!
 //! [`crate::pier_config::LocalPlayback`] is the operator's policy. This

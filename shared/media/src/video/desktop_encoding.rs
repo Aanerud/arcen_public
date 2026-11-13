@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! How the pixels of a captured desktop are encoded, when the platform itself
 //! cannot say.
 //!
@@ -15,6 +17,10 @@
 //! for a session that did not ask for it, and it never lets PQ code values
 //! reach an SDR session unconverted: [`resolve_desktop_plan`] either converts
 //! them or refuses the session.
+//!
+//! What an SDR desktop's code values are is not in doubt on any Pier: they
+//! are sRGB (IEC 61966-2-1). [`sdr_desktop_transfer`] is the one rule every
+//! host follows to say so on the wire, for the clients that can present it.
 
 use super::Rgb10Signal;
 use crate::{BitDepth, ColorMatrix, ColorPrimaries, TransferCharacteristics, VideoConfiguration};
@@ -87,6 +93,98 @@ impl std::fmt::Display for DesktopPlanError {
 
 impl std::error::Error for DesktopPlanError {}
 
+/// The SDR transfer a host serves its desktop with.
+///
+/// Desktop applications draw sRGB code values on every platform Arcen hosts,
+/// and the Deck presents every SDR stream on an sRGB layer without a transfer
+/// conversion. So the exact answer to a `bt709` SDR request is the desktop's
+/// own codes, said to be `srgb` (H.273 13). Each host gets there differently,
+/// and none of them is allowed to re-encode with the BT.709 OETF for a client
+/// that can take `srgb`:
+///
+/// * code-value sources pass the codes through and only the tag changes: a
+///   depth-30 Xorg framebuffer ([`super::Rgb10Signal::Direct`]) and a
+///   `ScreenCaptureKit` `xf44` surface captured in `kCGColorSpaceSRGB`;
+/// * a linear-light source is re-encoded with the curve its compositor
+///   linearised with: Windows FP16 scRGB ([`super::ScrgbSdrTransform`]);
+/// * a Rec.2100 PQ desktop converted to SDR is re-encoded with the sRGB curve
+///   ([`super::Rgb10Signal::PqBt2020ToSdrSrgb`]).
+///
+/// [`TransferCharacteristics::serves_request`] accepts the pair, so the
+/// served pipeline and the Deck's negotiated truth stay Grading. A client
+/// that predates `srgb_transfer` keeps the `bt709` stream it was built
+/// against, and any other request, SDR or HDR, is returned unchanged.
+#[must_use]
+pub const fn sdr_desktop_transfer(
+    requested: TransferCharacteristics,
+    client_accepts_srgb: bool,
+) -> TransferCharacteristics {
+    match requested {
+        TransferCharacteristics::Bt709 if client_accepts_srgb => TransferCharacteristics::Srgb,
+        other => other,
+    }
+}
+
+/// A resolved session contract with its SDR desktop served as
+/// [`sdr_desktop_transfer`] says.
+///
+/// Only fidelity sessions change: a contract above eight bits that no
+/// administrator pinned. Eight-bit sessions, the Auto/Speed fast paths and
+/// their software fallbacks, keep the transfer they always signalled, and an
+/// administrator's pinned variant is served exactly as written.
+#[must_use]
+pub const fn serve_sdr_desktop(
+    mut video: VideoConfiguration,
+    client_accepts_srgb: bool,
+    administrator_pinned: bool,
+) -> VideoConfiguration {
+    video.transfer = fidelity_sdr_transfer(
+        video.transfer,
+        video.bit_depth,
+        client_accepts_srgb,
+        administrator_pinned,
+    );
+    video
+}
+
+/// [`serve_sdr_desktop`] on one transfer axis, for plans that are not a
+/// [`VideoConfiguration`].
+pub(crate) const fn fidelity_sdr_transfer(
+    transfer: TransferCharacteristics,
+    bit_depth: BitDepth,
+    client_accepts_srgb: bool,
+    administrator_pinned: bool,
+) -> TransferCharacteristics {
+    if administrator_pinned || matches!(bit_depth, BitDepth::Eight) {
+        transfer
+    } else {
+        sdr_desktop_transfer(transfer, client_accepts_srgb)
+    }
+}
+
+impl DesktopPlan {
+    /// This plan with its SDR output served as [`serve_sdr_desktop`] says,
+    /// and the conversion that output needs: an SDR desktop's codes still
+    /// pass through, and a PQ desktop's SDR conversion re-encodes with the
+    /// served curve.
+    #[must_use]
+    pub fn serving_sdr_desktop(
+        self,
+        client_accepts_srgb: bool,
+        administrator_pinned: bool,
+    ) -> Self {
+        let video = serve_sdr_desktop(self.video, client_accepts_srgb, administrator_pinned);
+        let conversion =
+            conversion_for_output(self.source, video.transfer, video.primaries, video.matrix)
+                .unwrap_or(self.conversion);
+        Self {
+            video,
+            conversion,
+            ..self
+        }
+    }
+}
+
 /// Resolve a video contract against what the desktop truthfully holds.
 ///
 /// * An SDR desktop has no HDR composition space: PQ and HLG requests become
@@ -95,7 +193,9 @@ impl std::error::Error for DesktopPlanError {}
 ///   BT.2020 NCL, the only honest labelling of its pixels.
 /// * A Rec.2100 PQ desktop serves any other ten-bit request as BT.709 SDR
 ///   and says so: the pixels are converted with
-///   [`Rgb10Signal::PqBt2020ToSdrBt709`], never relabelled.
+///   [`Rgb10Signal::PqBt2020ToSdrBt709`], never relabelled
+///   ([`DesktopPlan::serving_sdr_desktop`] moves a capable client to the
+///   sRGB curve).
 /// * A Rec.2100 PQ desktop refuses eight-bit requests, which have no
 ///   conversion stage.
 ///
@@ -174,7 +274,11 @@ pub fn conversion_for_output(
             {
                 Some(Rgb10Signal::Direct)
             } else if sdr && matrix != ColorMatrix::Bt2020Ncl {
-                Some(Rgb10Signal::PqBt2020ToSdrBt709)
+                Some(if transfer == TransferCharacteristics::Srgb {
+                    Rgb10Signal::PqBt2020ToSdrSrgb
+                } else {
+                    Rgb10Signal::PqBt2020ToSdrBt709
+                })
             } else {
                 None
             }
@@ -287,19 +391,21 @@ mod tests {
                 VideoConfiguration::grading_reference(),
                 VideoConfiguration::legacy_h264(),
             ] {
-                let Ok(resolved) = resolve_desktop_plan(video, *source) else {
+                let Ok(plain) = resolve_desktop_plan(video, *source) else {
                     continue;
                 };
-                assert_eq!(
-                    conversion_for_output(
-                        resolved.source,
-                        resolved.video.transfer,
-                        resolved.video.primaries,
-                        resolved.video.matrix,
-                    ),
-                    Some(resolved.conversion),
-                    "{source:?} {video:?}"
-                );
+                for resolved in [plain, plain.serving_sdr_desktop(true, false)] {
+                    assert_eq!(
+                        conversion_for_output(
+                            resolved.source,
+                            resolved.video.transfer,
+                            resolved.video.primaries,
+                            resolved.video.matrix,
+                        ),
+                        Some(resolved.conversion),
+                        "{source:?} {video:?}"
+                    );
+                }
             }
         }
         assert_eq!(
@@ -312,6 +418,65 @@ mod tests {
             None,
             "an SDR desktop is never encoded as PQ"
         );
+    }
+
+    #[test]
+    fn only_a_capable_client_moves_an_sdr_desktop_to_srgb() {
+        use TransferCharacteristics::{Bt709, Hlg, Pq, Srgb};
+        assert_eq!(sdr_desktop_transfer(Bt709, true), Srgb);
+        assert_eq!(sdr_desktop_transfer(Bt709, false), Bt709);
+        for requested in [Srgb, Pq, Hlg] {
+            for capable in [false, true] {
+                assert_eq!(sdr_desktop_transfer(requested, capable), requested);
+            }
+        }
+        assert!(Srgb.serves_request(Bt709));
+        assert!(!Bt709.serves_request(Srgb));
+        assert!(!Pq.serves_request(Bt709) && !Srgb.serves_request(Pq));
+    }
+
+    #[test]
+    fn only_unpinned_fidelity_sessions_are_served_as_srgb() {
+        let grading = VideoConfiguration::grading_reference();
+        let srgb = TransferCharacteristics::Srgb;
+        assert_eq!(serve_sdr_desktop(grading, true, false).transfer, srgb);
+        assert_eq!(serve_sdr_desktop(grading, false, false), grading);
+        assert_eq!(serve_sdr_desktop(grading, true, true), grading, "pinned");
+        let eight = VideoConfiguration::legacy_h264();
+        assert_eq!(serve_sdr_desktop(eight, true, false), eight, "fast path");
+        assert_eq!(serve_sdr_desktop(hdr_request(), true, false), hdr_request());
+        let served = serve_sdr_desktop(grading, true, false);
+        assert_eq!(
+            VideoConfiguration {
+                transfer: grading.transfer,
+                ..served
+            },
+            grading,
+            "only the transfer changes"
+        );
+    }
+
+    #[test]
+    fn a_capable_client_gets_srgb_codes_from_both_desktops() {
+        let grading = VideoConfiguration::grading_reference();
+        let sdr = plan(grading, DesktopSignalEncoding::Sdr).serving_sdr_desktop(true, false);
+        assert_eq!(sdr.video.transfer, TransferCharacteristics::Srgb);
+        assert_eq!(sdr.conversion, Rgb10Signal::Direct, "codes pass through");
+
+        let pq = plan(grading, DesktopSignalEncoding::Rec2100Pq).serving_sdr_desktop(true, false);
+        assert_eq!(pq.video.transfer, TransferCharacteristics::Srgb);
+        assert_eq!(pq.conversion, Rgb10Signal::PqBt2020ToSdrSrgb);
+        assert_eq!(pq.source, DesktopSignalEncoding::Rec2100Pq);
+
+        let legacy =
+            plan(grading, DesktopSignalEncoding::Rec2100Pq).serving_sdr_desktop(false, false);
+        assert_eq!(legacy.video.transfer, TransferCharacteristics::Bt709);
+        assert_eq!(legacy.conversion, Rgb10Signal::PqBt2020ToSdrBt709);
+
+        let hdr =
+            plan(hdr_request(), DesktopSignalEncoding::Rec2100Pq).serving_sdr_desktop(true, false);
+        assert_eq!(hdr.video.transfer, TransferCharacteristics::Pq);
+        assert_eq!(hdr.conversion, Rgb10Signal::Direct);
     }
 
     #[test]

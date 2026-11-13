@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-pier-macos"
 version.workspace = true
@@ -6,6 +9,7 @@ rust-version.workspace = true
 description = "Arcen Pier (macOS) — native host control plane and shared session policy."
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "arcen_pier_macos"
@@ -14,6 +18,35 @@ path = "src/lib.rs"
 [[bin]]
 name = "arcen-pier-macos"
 path = "src/main.rs"
+
+[features]
+# Lab-only. `probe-pen` posts pen input — clicks, with `--strokes` — under the
+# Accessibility approval of whichever app runs it; inside the installed Agent
+# Helper that is the agent's own. No packaging or release script enables this,
+# so a shipped Pier has no such subcommand
+# (`main::tests::shipped_builds_have_no_pen_injecting_probe`).
+lab-pen-probe = [
+    "objc2-app-kit/block2",
+    "objc2-app-kit/NSEvent",
+    "objc2-foundation/NSDate",
+    "objc2-foundation/NSObjCRuntime",
+    "objc2-foundation/NSRunLoop",
+]
+
+default = ["native-tablet"]
+# Native tablet (ADR 0022): the session enumerates a Deck's bridged tablet
+# over the USB bridge and the entitled `hid-injector` child publishes one
+# IOHIDUserDevice per HID interface; a known model's pen is read by the Pier
+# itself, with pressure (ADR 0022 §14.1).
+# On by default and in release builds; it
+# is offered only when the signed Pier holds the virtual-HID entitlement
+# (`build-pier-pkg.sh --with-virtual-hid`) and its probe passes.
+native-tablet = []
+# Lab-only. `probe-bridged-hid` lists what the HID system sees of a bridged
+# tablet and sends it the Wacom mode switch (a feature report). No packaging
+# or release script enables this, so a shipped Pier has no such subcommand
+# (`main::tests::shipped_builds_have_no_bridged_hid_probe`).
+lab-bridged-hid-probe = ["native-tablet"]
 
 [dependencies]
 arcen-observability.workspace = true
@@ -24,6 +57,7 @@ arcen-outputs.workspace = true
 arcen-protocol = { path = "../../shared/protocol", default-features = false }
 arcen-session.workspace = true
 arcen-telemetry.workspace = true
+arcen-usb-bridge.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom.workspace = true

@@ -1,47 +1,63 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Linux Hard USB bridge adapter.
 //!
-//! The privileged helper owns the virtual-HCD file descriptor. Network,
-//! session policy, and authentication stay in Pier; raw ioctl structs never
-//! cross this module boundary.
+//! The privileged helper owns the virtual host controller port. Network,
+//! session policy, and authentication stay in Pier; the controller's wire
+//! format (USB/IP for the in-tree `vhci-hcd`, ioctls for the lab `usb-vhci`)
+//! never crosses this module boundary ([`backend`]).
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
+pub mod backend;
+pub mod kmod;
+#[cfg_attr(not(feature = "native-tablet"), allow(dead_code))]
+pub mod seat;
+#[cfg(feature = "native-tablet")]
+pub mod tablet_pointer;
+#[cfg(feature = "native-tablet")]
+mod usbip;
+#[cfg(feature = "native-tablet")]
 mod vhci;
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use arcen_protocol::messages::UsbHardDeviceMsg;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use arcen_protocol::{
     decode_usb_urb_complete, encode_usb_urb_cancel, encode_usb_urb_submit, UsbUrbSubmitHeader,
 };
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use arcen_usb_bridge::{
-    AttachmentGeneration, ControlResponse, PenSample, PenSwitch, PenSwitches, SetupPacket,
-    SyntheticTabletDevice, TransferDirection, UrbId, UrbStatus, UsbSpeed,
+    AttachmentGeneration, ControlResponse, PenSample, PenSwitch, PenSwitches,
+    SyntheticTabletDevice, TransferDirection, TransferKind, UrbId, UrbStatus, UsbSpeed,
 };
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
+use backend::{HcdEvent, HcdUrb, VirtualHcd};
+#[cfg(feature = "native-tablet")]
 use std::collections::BTreeMap;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use std::io::{Read, Write};
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use std::num::{NonZeroU32, NonZeroU64};
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use std::path::Path;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use std::process::ExitCode;
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 use std::process::ExitCode;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use std::time::{Duration, Instant};
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-#[cfg(feature = "usb-hard-lab")]
-use vhci::{FetchedWork, PortState, VhciController, VhciUrb};
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 const SELF_TEST_RUNTIME: Duration = Duration::from_secs(8);
-#[cfg(feature = "usb-hard-lab")]
+/// The helper's one stderr line once its port is connected under its seat
+/// rule: `ARCEN_USB_BRIDGE_ATTACHED devpath=<port path> seat=<seat>`.
+#[cfg(feature = "native-tablet")]
+const ATTACHED_LINE: &str = "ARCEN_USB_BRIDGE_ATTACHED";
+#[cfg(feature = "native-tablet")]
 const MAX_HELPER_FRAME_BYTES: usize = arcen_usb_bridge::MAX_TRANSFER_BYTES + 64;
 /// A Hard USB device this host agreed to bridge.
 #[derive(Debug, Clone)]
@@ -73,7 +89,7 @@ pub struct AuthorizedTablet {
 /// # Errors
 ///
 /// Returns a bounded operator-facing reason.
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 pub fn authorize_device(device: Option<&UsbHardDeviceMsg>) -> Result<AuthorizedTablet, String> {
     let device = device.ok_or_else(|| "the Deck did not capture a USB device".to_owned())?;
     let synthetic = device.vendor_id == arcen_usb_bridge::ARCEN_LAB_VENDOR_ID
@@ -99,7 +115,7 @@ pub fn authorize_device(device: Option<&UsbHardDeviceMsg>) -> Result<AuthorizedT
     })
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 impl AuthorizedTablet {
     /// The guard that holds every descriptor the attached device serves to
     /// this authorization.
@@ -109,50 +125,155 @@ impl AuthorizedTablet {
     }
 }
 
-/// Without the lab importer nothing is ever bridged.
+/// Without the Native tablet importer nothing is ever bridged.
 ///
 /// # Errors
 ///
 /// Always.
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 pub fn authorize_device(
     _device: Option<&arcen_protocol::messages::UsbHardDeviceMsg>,
 ) -> Result<AuthorizedTablet, String> {
-    Err("this Pier build does not contain the Hard USB importer".to_owned())
+    Err(NOT_BUILT.to_owned())
 }
 
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 use arcen_usb_bridge::UsbSpeed;
 
-/// Whether this binary contains the lab importer and its device is available.
+/// The administrator's effective Native tablet decision, fixed at Pier start
+/// ([`configure_native_tablet`]); the virtual host controller is loaded once,
+/// then, so a change needs a Pier restart.
+static NATIVE_TABLET: std::sync::OnceLock<arcen_session::pier_config::NativeTabletPolicy> =
+    std::sync::OnceLock::new();
+
+/// Fixes the Native tablet decision from `usb.native_tablet`. Call once,
+/// before [`prepare_backend`].
+pub fn configure_native_tablet(
+    setting: Option<arcen_session::pier_config::NativeTabletSetting>,
+) -> arcen_session::pier_config::NativeTabletPolicy {
+    let policy = arcen_session::pier_config::NativeTabletPolicy::resolve(setting);
+    *NATIVE_TABLET.get_or_init(|| policy)
+}
+
+/// The effective decision; unconfigured processes (tests, helpers) see the
+/// configuration-less default.
+#[must_use]
+pub fn native_tablet_policy() -> arcen_session::pier_config::NativeTabletPolicy {
+    *NATIVE_TABLET.get_or_init(|| arcen_session::pier_config::NativeTabletPolicy::resolve(None))
+}
+
+/// Whether this binary contains Native tablet, the administrator enabled it,
+/// and a virtual host controller is usable: the in-tree `vhci-hcd` (loaded
+/// at Pier start) or, as a development fallback, `/dev/usb-vhci`.
 #[must_use]
 pub fn runtime_available() -> bool {
-    #[cfg(feature = "usb-hard-lab")]
+    runtime_unavailable_reason().is_none()
+}
+
+/// Why [`runtime_available`] is false, for logs, `validate-config` and the
+/// Deck.
+#[must_use]
+pub fn runtime_unavailable_reason() -> Option<String> {
+    #[cfg(feature = "native-tablet")]
     {
-        use std::os::unix::fs::FileTypeExt;
-        std::env::var("ARCEN_USB_HARD_LAB").ok().as_deref() == Some("1")
-            && std::fs::metadata("/dev/usb-vhci")
-                .is_ok_and(|metadata| metadata.file_type().is_char_device())
+        if let Some(reason) = native_tablet_policy().disabled_reason() {
+            return Some(reason.to_owned());
+        }
+        // Cheap and non-blocking: the module was loaded (if it could be) at
+        // Pier start by `prepare_backend`.
+        backend::available_backend().err()
     }
 
-    #[cfg(not(feature = "usb-hard-lab"))]
+    #[cfg(not(feature = "native-tablet"))]
     {
-        false
+        Some(NOT_BUILT.to_owned())
+    }
+}
+
+/// A build without the Native tablet importer (`native-tablet` feature).
+#[cfg_attr(feature = "native-tablet", allow(dead_code))]
+const NOT_BUILT: &str = "this Pier build does not contain Native tablet";
+
+/// Loads Native tablet's virtual host controller once, at Pier start, so
+/// that connections only check sysfs ([`runtime_available`] never blocks).
+/// Nothing is loaded unless the administrator enabled Native tablet.
+pub fn prepare_backend() {
+    #[cfg(feature = "native-tablet")]
+    if native_tablet_policy().enabled {
+        match backend::prepare() {
+            Ok(kind) => tracing::info!(
+                target: "arcen::usb",
+                backend = kind.label(),
+                "Native tablet virtual host controller ready"
+            ),
+            Err(reason) => tracing::warn!(
+                target: "arcen::usb",
+                %reason,
+                "Native tablet virtual host controller unavailable"
+            ),
+        }
+    }
+}
+
+/// One operator line about Native tablet's virtual host controller, for
+/// `validate-config` and Pier start: `None` when this build has no Hard USB
+/// importer.
+#[must_use]
+pub fn native_tablet_status() -> Option<String> {
+    if !cfg!(feature = "native-tablet") {
+        return None;
+    }
+    let policy = native_tablet_policy();
+    if let Some(reason) = policy.disabled_reason() {
+        return Some(format!("Native tablet: off: {reason}"));
+    }
+    Some(native_tablet_line(&kmod::vhci_hcd_facts()))
+}
+
+/// The status line from the controller's facts. The module is loaded only
+/// at Pier start, so "installed but not loaded" says how to load it.
+fn native_tablet_line(facts: &arcen_usb_bridge::VhciHcdFacts) -> String {
+    if facts.loaded {
+        format!(
+            "Native tablet: vhci-hcd is loaded for kernel {}",
+            facts.running_kernel
+        )
+    } else if facts.module_for_running_kernel {
+        format!(
+            "Native tablet: vhci-hcd is installed for kernel {} but not loaded; the Pier loads it \
+             when it starts: restart the Pier, or run `modprobe vhci-hcd`",
+            facts.running_kernel
+        )
+    } else {
+        format!(
+            "Native tablet: unavailable: {}",
+            arcen_usb_bridge::missing_vhci_hcd_reason(facts)
+        )
     }
 }
 
 /// How the attached session receives physical input devices: a headless
-/// Wayland session has no seat, every other session is served on the
-/// machine's seat.
+/// Wayland session has no seat; a dedicated Xorg desktop hot-adds a bridged
+/// device tagged for it alone (every other X server ignores it); without a
+/// session there is only the console seat.
 #[must_use]
 pub fn session_seat(
     session: Option<&crate::session::lifecycle::SessionMetadata>,
 ) -> arcen_usb_bridge::HardUsbSessionSeat {
     match session {
+        // A native Wayland desktop (ADR 0015) owns its logind seat: the
+        // bridged device joins that seat and its compositor hot-adds it.
+        Some(session)
+            if (session.session_type == "wayland" || session.wayland.is_some())
+                && session.native_seat.is_some() =>
+        {
+            arcen_usb_bridge::HardUsbSessionSeat::ArcenSeat
+        }
         Some(session) if session.session_type == "wayland" || session.wayland.is_some() => {
             arcen_usb_bridge::HardUsbSessionSeat::Seatless
         }
-        _ => arcen_usb_bridge::HardUsbSessionSeat::SeatBound,
+        Some(_) => arcen_usb_bridge::HardUsbSessionSeat::X11Desktop,
+        None => arcen_usb_bridge::HardUsbSessionSeat::ConsoleSeat,
     }
 }
 
@@ -169,8 +290,64 @@ pub fn session_admission(
     arcen_usb_bridge::admit_hard_usb_session(session_seat(session))
 }
 
+/// A seat nobody runs, for the helper's self-tests: their synthetic device
+/// reaches no session and no console.
+///
+/// # Errors
+///
+/// When the OS has no randomness.
+#[cfg(feature = "native-tablet")]
+fn self_test_seat() -> std::io::Result<arcen_usb_bridge::BridgeSeat> {
+    let mut bytes = [0_u8; 8];
+    getrandom::getrandom(&mut bytes).map_err(std::io::Error::other)?;
+    let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    arcen_usb_bridge::BridgeSeat::parse(&format!("seat-arcen-pen-selftest-{id}"))
+        .map_err(std::io::Error::other)
+}
+
+/// Whom a bridged device belongs to for `session`: a native Wayland
+/// desktop's own `seat-arcen-pen-<id>` (its compositor hot-adds the device
+/// through logind), otherwise the dedicated Xorg desktop on the session's
+/// display (its server hot-adds the device by its Xorg tag).
+///
+/// # Errors
+///
+/// When the OS has no randomness, the native seat's name is not an Arcen
+/// desktop seat, or the display is not a dedicated desktop's.
+#[cfg(feature = "native-tablet")]
+pub fn bridge_seat_for(
+    session: Option<&crate::session::lifecycle::SessionMetadata>,
+) -> std::io::Result<arcen_usb_bridge::BridgeSeat> {
+    match session.and_then(|session| session.native_seat.as_deref()) {
+        Some(seat) => match arcen_usb_bridge::BridgeSeat::parse(seat) {
+            Ok(native @ arcen_usb_bridge::BridgeSeat::NativeSeat { .. }) => Ok(native),
+            _ => Err(std::io::Error::other(format!(
+                "{seat:?} is not a native desktop seat"
+            ))),
+        },
+        None => {
+            let display = session
+                .and_then(|session| x11_display_number(&session.display))
+                .ok_or_else(|| std::io::Error::other("not a dedicated Xorg desktop display"))?;
+            let mut bytes = [0_u8; 8];
+            getrandom::getrandom(&mut bytes).map_err(std::io::Error::other)?;
+            arcen_usb_bridge::BridgeSeat::x11_session(display, bytes).map_err(std::io::Error::other)
+        }
+    }
+}
+
+/// The display number of a dedicated Xorg desktop (`:1`–`:99`).
+#[must_use]
+pub fn x11_display_number(display: &str) -> Option<u16> {
+    let number = display.strip_prefix(':')?;
+    let value = number.parse::<u16>().ok()?;
+    (number == value.to_string()
+        && (1..=arcen_usb_bridge::bridge_seat::MAX_X11_DISPLAY).contains(&value))
+    .then_some(value)
+}
+
 /// Generates one nonzero attachment generation from OS randomness.
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 pub fn fresh_attachment_generation() -> std::io::Result<AttachmentGeneration> {
     let mut bytes = [0_u8; 8];
     getrandom::getrandom(&mut bytes).map_err(std::io::Error::other)?;
@@ -181,13 +358,13 @@ pub fn fresh_attachment_generation() -> std::io::Result<AttachmentGeneration> {
 /// Entry point for the fused privileged helper.
 #[must_use]
 pub fn helper_main(args: &[String]) -> ExitCode {
-    #[cfg(not(feature = "usb-hard-lab"))]
+    #[cfg(not(feature = "native-tablet"))]
     {
         let _ = args;
-        eprintln!("usb-bridge-helper: this build does not contain usb-hard-lab");
+        eprintln!("usb-bridge-helper: {NOT_BUILT}");
         return ExitCode::FAILURE;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     {
         helper_main_feature(args)
     }
@@ -196,12 +373,12 @@ pub fn helper_main(args: &[String]) -> ExitCode {
 /// Runs the real fused helper through its bounded protocol-frame IPC.
 #[must_use]
 pub fn ipc_self_test_main() -> ExitCode {
-    #[cfg(not(feature = "usb-hard-lab"))]
+    #[cfg(not(feature = "native-tablet"))]
     {
-        eprintln!("usb-bridge-ipc-self-test: this build does not contain usb-hard-lab");
+        eprintln!("usb-bridge-ipc-self-test: {NOT_BUILT}");
         ExitCode::FAILURE
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -226,7 +403,7 @@ pub fn ipc_self_test_main() -> ExitCode {
     }
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 async fn run_ipc_self_test() -> Result<u64, String> {
     let binary = crate::current_pier_exe()
         .ok_or_else(|| "current fused Pier binary is unavailable".to_owned())?;
@@ -242,6 +419,7 @@ async fn run_ipc_self_test() -> Result<u64, String> {
                 descriptor: arcen_usb_bridge::SYNTHETIC_TABLET_REPORT_DESCRIPTOR.to_vec(),
             }],
         ),
+        &self_test_seat().map_err(|error| error.to_string())?,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -336,21 +514,28 @@ async fn run_ipc_self_test() -> Result<u64, String> {
     ))
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn helper_main_feature(args: &[String]) -> ExitCode {
     let result = match args {
         [argument] if argument == "--self-test" => run_self_test(),
-        [argument, generation, speed] if argument == "--bridge" => generation
-            .parse::<u64>()
-            .ok()
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| "bridge generation must be nonzero".to_owned())
-            .and_then(|generation| {
-                parse_speed(speed)
-                    .and_then(|speed| run_bridge(AttachmentGeneration::new(generation), speed))
-            }),
+        [argument, generation, speed, seat_flag, seat]
+            if argument == "--bridge" && seat_flag == "--seat" =>
+        {
+            generation
+                .parse::<u64>()
+                .ok()
+                .and_then(NonZeroU64::new)
+                .ok_or_else(|| "bridge generation must be nonzero".to_owned())
+                .and_then(|generation| {
+                    let seat = arcen_usb_bridge::BridgeSeat::parse(seat)
+                        .map_err(|error| format!("--seat: {error}"))?;
+                    parse_speed(speed).and_then(|speed| {
+                        run_bridge(AttachmentGeneration::new(generation), speed, &seat)
+                    })
+                })
+        }
         _ => Err(
-            "usage: arcen-pier usb-bridge-helper --self-test | --bridge GENERATION low|full|high"
+            "usage: arcen-pier usb-bridge-helper --self-test | --bridge GENERATION low|full|high --seat SEAT"
                 .to_owned(),
         ),
     };
@@ -364,41 +549,349 @@ fn helper_main_feature(args: &[String]) -> ExitCode {
 }
 
 /// Async Pier-side handle for the isolated privileged helper.
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 pub struct BridgeProcess {
-    child: Child,
-    stdin: ChildStdin,
+    /// `None` only once `shutdown` or `Drop` has taken it.
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
     frames: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     reader_task: tokio::task::JoinHandle<()>,
     stderr: BufReader<ChildStderr>,
     /// Checks every device, configuration and report descriptor the device
     /// returns against what was authorized before the device was created.
     guard: arcen_usb_bridge::BridgedDeviceGuard,
+    generation: AttachmentGeneration,
+    /// Helper diagnostics read while waiting for its attached line.
+    early_diagnostic: String,
 }
 
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 pub struct BridgeProcess;
 
-#[cfg(not(feature = "usb-hard-lab"))]
+/// Without the Native tablet importer an attachment never holds a bridge.
+#[cfg(not(feature = "native-tablet"))]
+pub type BridgeAttachment = BridgeProcess;
+/// What one attachment holds of a Hard USB bridge.
+#[cfg(feature = "native-tablet")]
+pub enum BridgeAttachment {
+    /// The attachment's own bridge, which ends with the attachment: the
+    /// desktop's compositor or X server adds and removes the tablet itself.
+    PerAttachment(Box<BridgeProcess>),
+}
+
+#[cfg(feature = "native-tablet")]
+impl BridgeAttachment {
+    /// The next frame for the Deck.
+    ///
+    /// # Errors
+    ///
+    /// When the bridge ended or its device contradicted its authorization.
+    pub async fn next_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::PerAttachment(process) => process.next_frame().await,
+        }
+    }
+
+    /// Passes one Deck frame to the bridge.
+    ///
+    /// # Errors
+    ///
+    /// When the frame is out of bound, refused by the guard, or the bridge
+    /// ended.
+    pub async fn send_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::PerAttachment(process) => process.send_frame(frame).await,
+        }
+    }
+
+    /// The helper's diagnostic.
+    pub async fn diagnostic(&mut self) -> String {
+        match self {
+            Self::PerAttachment(process) => process.diagnostic().await,
+        }
+    }
+
+    /// Ends this attachment and its bridge.
+    pub async fn shutdown(self) {
+        match self {
+            Self::PerAttachment(process) => (*process).shutdown().await,
+        }
+    }
+}
+
+/// Where a bridge's device is: its port and seat, from which its verified
+/// input nodes are found.
+#[cfg(feature = "native-tablet")]
+#[derive(Debug, Clone)]
+pub struct BridgePort {
+    pub prefix: String,
+    pub seat: arcen_usb_bridge::BridgeSeat,
+}
+
+#[cfg(feature = "native-tablet")]
+impl BridgePort {
+    /// Reports the bridged pen's position into `pointer` until the returned
+    /// reader is dropped or the device goes away: the one Linux pen adapter,
+    /// for Xorg and Wayland desktops alike (ADR 0023).
+    #[must_use]
+    pub fn report_pen_position(
+        &self,
+        pointer: std::sync::Arc<crate::media::desktop_pointer::DesktopPointer>,
+    ) -> Option<tablet_pointer::TabletPointerReader> {
+        tablet_pointer::spawn(
+            self.prefix.clone(),
+            self.seat.clone(),
+            DISCOVERY_TIMEOUT,
+            pointer,
+        )
+        .map_err(|error| {
+            tracing::warn!(target: "arcen::usb", %error, "bridged pen position reader failed to start");
+        })
+        .ok()
+    }
+}
+
+/// A bridge for one attachment to a native-seat Wayland desktop, on that
+/// desktop's own seat, with the port it connected once its seat rule is in
+/// force.
+///
+/// # Errors
+///
+/// The reason shown to the Deck.
+#[cfg(feature = "native-tablet")]
+pub async fn attach_native_seat(
+    binary: &Path,
+    session: &crate::session::lifecycle::SessionMetadata,
+    tablet: &AuthorizedTablet,
+) -> Result<(BridgeAttachment, BridgePort), String> {
+    let generation = fresh_attachment_generation().map_err(|error| error.to_string())?;
+    let seat = bridge_seat_for(Some(session)).map_err(|error| error.to_string())?;
+    let mut process = BridgeProcess::spawn(binary, generation, tablet.speed, tablet.guard(), &seat)
+        .await
+        .map_err(|error| format!("Hard USB helper failed to start: {error}"))?;
+    let prefix = match process.wait_attached(ATTACH_TIMEOUT).await {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            process.shutdown().await;
+            return Err(format!("Hard USB bridge failed: {error}"));
+        }
+    };
+    tracing::info!(
+        target: "arcen::usb",
+        bridge = %seat.seat_name(),
+        port = %prefix,
+        vendor_id = tablet.identity.vendor_id,
+        product_id = tablet.identity.product_id,
+        "Hard USB bridge up on this native desktop's own seat"
+    );
+    Ok((
+        BridgeAttachment::PerAttachment(Box::new(process)),
+        BridgePort { prefix, seat },
+    ))
+}
+
+/// How long the helper may take to connect its port under its rule.
+#[cfg(feature = "native-tablet")]
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a new tablet may take to present stable, verified nodes.
+#[cfg(feature = "native-tablet")]
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A bridge for one attachment to a dedicated Xorg desktop (ADR 0021). The
+/// tablet stays on seat0, tagged for this desktop's X server, which hot-adds
+/// it the moment it connects; every other X server ignores it. Before
+/// anything starts, the host must prove that: the desktop's server re-admits
+/// its tag, and every other X server loaded the system-wide ignore class or
+/// ignores every foreign device. The receiver yields once the tablet's nodes
+/// are verified (`Ok`) or refused (`Err(reason)`: the caller then ends the
+/// bridge and tells the Deck).
+///
+/// # Errors
+///
+/// The reason shown to the Deck.
+#[cfg(feature = "native-tablet")]
+pub async fn attach_x11_desktop(
+    binary: &Path,
+    session: &crate::session::lifecycle::SessionMetadata,
+    tablet: &AuthorizedTablet,
+) -> Result<
+    (
+        BridgeAttachment,
+        tokio::sync::mpsc::Receiver<Result<(), String>>,
+        BridgePort,
+    ),
+    String,
+> {
+    use arcen_usb_bridge::HardUsbSessionDenial;
+    let seat = bridge_seat_for(Some(session)).map_err(|error| error.to_string())?;
+    let arcen_usb_bridge::BridgeSeat::X11Session {
+        display: x_display, ..
+    } = seat
+    else {
+        return Err("not a dedicated Xorg desktop".to_owned());
+    };
+    if !seat::wacom_x_driver_installed() {
+        return Err(HardUsbSessionDenial::X11TabletUnsupported
+            .reason()
+            .to_owned());
+    }
+    // On seat0 the kernel's console keyboard handler (text VTs, SysRq) binds
+    // every device with keyboard keys: pens, pads and touch only.
+    if tablet
+        .report_descriptors
+        .iter()
+        .any(|interface| arcen_usb_bridge::bridge_seat::declares_keyboard(&interface.descriptor))
+    {
+        return Err(HardUsbSessionDenial::X11KeyboardInterface
+            .reason()
+            .to_owned());
+    }
+    if let Err(gap) = seat::x11_isolation(x_display) {
+        tracing::warn!(
+            target: "arcen::usb",
+            x_display,
+            ?gap,
+            "Native tablet refused: a bridged tablet would not be confined to this desktop"
+        );
+        return Err(match gap {
+            arcen_usb_bridge::bridge_seat::X11IsolationGap::DesktopPredatesBridgeClass => {
+                HardUsbSessionDenial::X11DesktopPredatesBridge
+            }
+            _ => HardUsbSessionDenial::X11IsolationNotInForce,
+        }
+        .reason()
+        .to_owned());
+    }
+    let generation = fresh_attachment_generation().map_err(|error| error.to_string())?;
+    let mut process = BridgeProcess::spawn(binary, generation, tablet.speed, tablet.guard(), &seat)
+        .await
+        .map_err(|error| format!("Hard USB helper failed to start: {error}"))?;
+    let prefix = match process.wait_attached(ATTACH_TIMEOUT).await {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            process.shutdown().await;
+            return Err(format!("Hard USB bridge failed: {error}"));
+        }
+    };
+    tracing::info!(
+        target: "arcen::usb",
+        bridge = %seat.seat_name(),
+        port = %prefix,
+        x_display,
+        vendor_id = tablet.identity.vendor_id,
+        product_id = tablet.identity.product_id,
+        "Hard USB bridge up for this X11 desktop only (seat0, tagged; every other X server ignores it)"
+    );
+    let port = BridgePort {
+        prefix: prefix.clone(),
+        seat: seat.clone(),
+    };
+    let (verdict, receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "awaited to completion; bounded by DISCOVERY_TIMEOUT plus one udevadm settle"
+        )]
+        let found = tokio::task::spawn_blocking(move || {
+            seat::discover_nodes(&prefix, &seat, DISCOVERY_TIMEOUT).map(|nodes| {
+                let keyboard = nodes.iter().any(seat::reaches_keyboard_handler);
+                (nodes, keyboard)
+            })
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.to_string()));
+        let outcome = match found {
+            Ok((nodes, true)) => {
+                tracing::warn!(
+                    target: "arcen::usb",
+                    x_display,
+                    nodes = ?nodes.iter().map(|node| node.devnode.as_str()).collect::<Vec<_>>(),
+                    "a bridged node has keyboard keys, which the console keyboard handler takes; refused on X11"
+                );
+                Err(HardUsbSessionDenial::X11KeyboardInterface
+                    .reason()
+                    .to_owned())
+            }
+            Ok((nodes, false))
+                if arcen_usb_bridge::bridge_seat::x11_hotplug_capable(
+                    &nodes,
+                    seat::wacom_x_driver_installed(),
+                ) =>
+            {
+                tracing::info!(
+                    target: "arcen::usb",
+                    x_display,
+                    nodes = ?nodes.iter().map(|node| (node.devnode.as_str(), node.name.as_str(), node.kernel_driver.as_str())).collect::<Vec<_>>(),
+                    "bridged tablet nodes verified: tagged for this desktop only, no uaccess, ignored by libinput"
+                );
+                Ok(())
+            }
+            Ok((nodes, false)) => {
+                tracing::warn!(
+                    target: "arcen::usb",
+                    x_display,
+                    drivers = ?nodes.iter().map(|node| node.kernel_driver.as_str()).collect::<Vec<_>>(),
+                    "no pen node of this tablet is served by the kernel wacom driver; refused on X11"
+                );
+                Err(HardUsbSessionDenial::X11TabletUnsupported
+                    .reason()
+                    .to_owned())
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    target: "arcen::usb",
+                    x_display,
+                    %reason,
+                    "bridged tablet nodes failed verification; refused"
+                );
+                Err(HardUsbSessionDenial::X11DeviceNotVerified
+                    .reason()
+                    .to_owned())
+            }
+        };
+        let _ = verdict.send(outcome).await;
+    });
+    Ok((
+        BridgeAttachment::PerAttachment(Box::new(process)),
+        receiver,
+        port,
+    ))
+}
+
+/// Ends every Hard USB bridge at Pier stop, waiting (bounded) for each
+/// helper to disconnect its device and remove its seat rule.
+pub async fn shutdown_bridges() {
+    #[cfg(feature = "native-tablet")]
+    {
+        let killed = drain_dropped_helpers(&DROPPED_HELPERS, Duration::from_secs(10)).await;
+        if killed > 0 {
+            tracing::warn!(
+                target: "arcen::usb",
+                killed,
+                "Hard USB helpers did not end at Pier stop and were killed; their seat rules are removed at the next start"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "native-tablet"))]
 impl BridgeProcess {
     pub async fn next_frame(&mut self) -> std::io::Result<Vec<u8>> {
         std::future::pending().await
     }
 
     pub async fn send_frame(&mut self, _frame: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "this Pier build does not contain usb-hard-lab",
-        ))
+        Err(std::io::Error::other(NOT_BUILT))
     }
 
     pub async fn diagnostic(&mut self) -> String {
-        "this Pier build does not contain usb-hard-lab".to_owned()
+        NOT_BUILT.to_owned()
     }
 
     pub async fn shutdown(self) {}
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 impl BridgeProcess {
     /// Starts one helper bound to an immutable attachment generation.
     ///
@@ -411,16 +904,23 @@ impl BridgeProcess {
         generation: AttachmentGeneration,
         speed: UsbSpeed,
         guard: arcen_usb_bridge::BridgedDeviceGuard,
+        seat: &arcen_usb_bridge::BridgeSeat,
     ) -> std::io::Result<Self> {
         let mut command = crate::command_for_helper(binary, "usb-bridge-helper");
         command
             .arg("--bridge")
             .arg(generation.to_string())
             .arg(speed_label(speed))
+            .arg("--seat")
+            .arg(seat.seat_name())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            // Never SIGKILL a helper: killed between detaching its port and
+            // removing its seat rule, it would leave the rule behind. A
+            // dropped handle closes the helper's input instead, which ends
+            // it cleanly (see `Drop` and `drain_dropped_helpers`).
+            .kill_on_drop(false);
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -437,13 +937,67 @@ impl BridgeProcess {
         let (frame_tx, frames) = tokio::sync::mpsc::channel(128);
         let reader_task = tokio::spawn(read_helper_frames(BufReader::new(stdout), frame_tx));
         Ok(Self {
-            child,
-            stdin,
+            child: Some(child),
+            stdin: Some(stdin),
             frames,
             reader_task,
             stderr: BufReader::new(stderr),
             guard,
+            generation,
+            early_diagnostic: String::new(),
         })
+    }
+
+    /// The generation every URB of this helper carries.
+    #[must_use]
+    pub const fn generation(&self) -> AttachmentGeneration {
+        self.generation
+    }
+
+    /// Waits (bounded) for the helper's attached line and returns the port's
+    /// sysfs path: by then the seat rule is in force and the port connected.
+    ///
+    /// # Errors
+    ///
+    /// When the helper exits, says something else, or times out.
+    pub async fn wait_attached(&mut self, timeout: Duration) -> std::io::Result<String> {
+        use tokio::io::AsyncBufReadExt;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout_at(
+                deadline,
+                (&mut self.stderr).take(4 * 1024).read_line(&mut line),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the Hard USB helper did not connect its port in time",
+                )
+            })??;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the Hard USB helper exited before connecting its port: {}",
+                        self.early_diagnostic.trim()
+                    ),
+                ));
+            }
+            if let Some(rest) = line.trim().strip_prefix(ATTACHED_LINE) {
+                let devpath = rest
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("devpath="))
+                    .ok_or_else(|| std::io::Error::other("attached line without devpath"))?;
+                arcen_usb_bridge::bridge_seat::validate_port_prefix(devpath)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                return Ok(devpath.to_owned());
+            }
+            if self.early_diagnostic.len() < 4 * 1024 {
+                self.early_diagnostic.push_str(&line);
+            }
+        }
     }
 
     /// Reads one exact protocol frame from helper stdout.
@@ -513,14 +1067,18 @@ impl BridgeProcess {
         }
         let length = u32::try_from(frame.len())
             .map_err(|_| std::io::Error::other("Pier helper frame length overflow"))?;
-        self.stdin.write_u32_le(length).await?;
-        self.stdin.write_all(frame).await?;
-        self.stdin.flush().await
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Hard USB helper input closed"))?;
+        stdin.write_u32_le(length).await?;
+        stdin.write_all(frame).await?;
+        stdin.flush().await
     }
 
     /// Reads the bounded helper diagnostic after it exits.
     pub async fn diagnostic(&mut self) -> String {
-        let mut diagnostic = String::new();
+        let mut diagnostic = std::mem::take(&mut self.early_diagnostic);
         let mut limited = (&mut self.stderr).take(4 * 1024);
         let _ = tokio::time::timeout(
             Duration::from_millis(200),
@@ -530,23 +1088,94 @@ impl BridgeProcess {
         diagnostic.trim().to_owned()
     }
 
-    /// Terminates the helper and waits for process cleanup.
+    /// Closes the helper's input and waits for it to disconnect its device
+    /// and remove its seat rule (bounded), then kills it.
     pub async fn shutdown(mut self) {
-        drop(self.stdin);
-        let deadline = tokio::time::Duration::from_secs(2);
-        if tokio::time::timeout(deadline, self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+        drop(self.stdin.take());
+        if let Some(mut child) = self.child.take() {
+            let deadline = tokio::time::Duration::from_secs(8);
+            if tokio::time::timeout(deadline, child.wait()).await.is_err() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
         self.reader_task.abort();
-        let _ = self.reader_task.await;
     }
 }
 
-#[cfg(feature = "usb-hard-lab")]
+/// Helpers whose handle was dropped without `shutdown` (an attachment task
+/// aborted, for instance at Pier stop). Their input is closed, so each ends
+/// on its own after detaching its port and removing its seat rule; they are
+/// reaped here, and Pier stop waits for them.
+#[cfg(feature = "native-tablet")]
+static DROPPED_HELPERS: std::sync::Mutex<Vec<(Child, tokio::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long a dropped helper may take to end before it is killed.
+#[cfg(feature = "native-tablet")]
+const DROPPED_HELPER_GRACE: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "native-tablet")]
+impl Drop for BridgeProcess {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Some(child) = self.child.take() {
+            keep_dropped_helper(&DROPPED_HELPERS, child, DROPPED_HELPER_GRACE);
+        }
+    }
+}
+
+/// Keeps a dropped helper until it has ended, reaping the ones that have and
+/// killing any that overran `grace` (bounded, and a leftover rule is removed
+/// by the next bridge on that port or the next Pier start).
+#[cfg(feature = "native-tablet")]
+fn keep_dropped_helper(
+    list: &std::sync::Mutex<Vec<(Child, tokio::time::Instant)>>,
+    child: Child,
+    grace: Duration,
+) {
+    let Ok(mut helpers) = list.lock() else {
+        return;
+    };
+    helpers.push((child, tokio::time::Instant::now()));
+    helpers.retain_mut(|(child, since)| {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        if since.elapsed() > grace {
+            let _ = child.start_kill();
+        }
+        true
+    });
+}
+
+/// Waits until every dropped helper has ended, killing the ones still
+/// running at `deadline`. Returns how many had to be killed.
+#[cfg(feature = "native-tablet")]
+async fn drain_dropped_helpers(
+    list: &std::sync::Mutex<Vec<(Child, tokio::time::Instant)>>,
+    timeout: Duration,
+) -> usize {
+    let helpers = list
+        .lock()
+        .map(|mut helpers| std::mem::take(&mut *helpers))
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut killed = 0;
+    for (mut child, _) in helpers {
+        if tokio::time::timeout_at(deadline, child.wait())
+            .await
+            .is_err()
+        {
+            killed += 1;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+    killed
+}
+
+#[cfg(feature = "native-tablet")]
 async fn read_helper_frames(
     mut stdout: BufReader<ChildStdout>,
     sender: tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
@@ -571,16 +1200,99 @@ async fn read_helper_frames(
     }
 }
 
-#[cfg(feature = "usb-hard-lab")]
-fn run_bridge(generation: AttachmentGeneration, speed: UsbSpeed) -> Result<(), String> {
+/// `SIGTERM`, `SIGINT` and `SIGHUP` end the helper cleanly: the serve loop
+/// sees them, then the port is detached, the device leaves, and the seat rule
+/// is removed, as on any other exit. The signals are blocked before any
+/// thread starts (threads inherit the mask) and read from a non-blocking
+/// signalfd, so no handler and no unsafe code is involved.
+#[cfg(feature = "native-tablet")]
+struct TerminationWatch {
+    signals: nix::sys::signalfd::SignalFd,
+    requested: bool,
+}
+
+#[cfg(feature = "native-tablet")]
+impl TerminationWatch {
+    fn install() -> Result<Self, String> {
+        use nix::sys::signal::{SigSet, Signal};
+        use nix::sys::signalfd::{SfdFlags, SignalFd};
+        let mut mask = SigSet::empty();
+        for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
+            mask.add(signal);
+        }
+        mask.thread_block()
+            .map_err(|error| format!("block termination signals: {error}"))?;
+        let signals = SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
+            .map_err(|error| format!("signalfd: {error}"))?;
+        Ok(Self {
+            signals,
+            requested: false,
+        })
+    }
+
+    /// Whether a termination signal has arrived (sticky).
+    fn requested(&mut self) -> bool {
+        if !self.requested {
+            if let Ok(Some(info)) = self.signals.read_signal() {
+                eprintln!(
+                    "usb-bridge-helper: signal {} received; detaching",
+                    info.ssi_signo
+                );
+                self.requested = true;
+            }
+        }
+        self.requested
+    }
+}
+
+/// Reserves a port, puts its subtree on `seat` before anything can appear
+/// there, attaches, runs `serve`, then detaches and removes the seat rule
+/// once the device is gone.
+#[cfg(feature = "native-tablet")]
+fn with_attached_port<T>(
+    speed: UsbSpeed,
+    seat: &arcen_usb_bridge::BridgeSeat,
+    termination: &mut TerminationWatch,
+    serve: impl FnOnce(&mut dyn VirtualHcd, &mut TerminationWatch) -> Result<T, String>,
+) -> Result<T, String> {
     if !nix::unistd::geteuid().is_root() {
         return Err("must run as root".to_owned());
     }
-    let mut controller = VhciController::open_and_register(1).map_err(|error| error.to_string())?;
-    controller
-        .connect(1, speed)
-        .map_err(|error| error.to_string())?;
+    let kind = backend::select_backend()?;
+    let mut hcd = backend::open(kind, speed)?;
+    // The port's devices belong to `seat` before the port is connected, so
+    // the device never appears on seat0, not even for one udev event.
+    let prefix = hcd.devpath_prefix().to_owned();
+    let rule = seat::SeatRule::install(&prefix, seat)
+        .map_err(|error| format!("bridge seat rule: {error}"))?;
+    hcd.attach()?;
+    eprintln!(
+        "{ATTACHED_LINE} devpath={prefix} seat={} backend={}",
+        seat.seat_name(),
+        kind.label()
+    );
+    let result = serve(hcd.as_mut(), termination);
+    // Every exit, clean or not, takes the device away before its seat rule:
+    // the port is detached and the controller closed first.
+    let detached = hcd.detach();
+    drop(hcd);
+    if !seat::wait_subtree_gone(&prefix, Duration::from_secs(5)) {
+        eprintln!("usb-bridge-helper: the port's devices outlived the disconnect");
+    }
+    drop(rule);
+    let value = result?;
+    detached?;
+    Ok(value)
+}
 
+#[cfg(feature = "native-tablet")]
+fn run_bridge(
+    generation: AttachmentGeneration,
+    speed: UsbSpeed,
+    seat: &arcen_usb_bridge::BridgeSeat,
+) -> Result<(), String> {
+    // Before the stdin thread exists, so it inherits the blocked signals.
+    let mut termination = TerminationWatch::install()?;
     let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(128);
     std::thread::Builder::new()
         .name("arcen-usb-bridge-stdin".to_owned())
@@ -593,13 +1305,34 @@ fn run_bridge(generation: AttachmentGeneration, speed: UsbSpeed) -> Result<(), S
             }
         })
         .map_err(|error| format!("spawn helper stdin reader: {error}"))?;
+    with_attached_port(speed, seat, &mut termination, |hcd, termination| {
+        serve_bridge(hcd, generation, &completion_rx, termination)
+    })
+}
 
+/// One URB forwarded to the Deck and not yet answered.
+#[cfg(feature = "native-tablet")]
+#[derive(Debug, Clone, Copy)]
+struct ForwardedUrb {
+    handle: u64,
+}
+
+#[cfg(feature = "native-tablet")]
+fn serve_bridge(
+    hcd: &mut dyn VirtualHcd,
+    generation: AttachmentGeneration,
+    completion_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    termination: &mut TerminationWatch,
+) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
     let mut next_urb_id = NonZeroU32::MIN;
-    let mut handles = BTreeMap::<UrbId, u64>::new();
+    let mut forwarded = BTreeMap::<UrbId, ForwardedUrb>::new();
     let mut cancelled = BTreeMap::<UrbId, u8>::new();
     let mut input_closed = false;
     loop {
+        if termination.requested() {
+            break;
+        }
         loop {
             match completion_rx.try_recv() {
                 Ok(frame) => {
@@ -610,7 +1343,7 @@ fn run_bridge(generation: AttachmentGeneration, speed: UsbSpeed) -> Result<(), S
                             "completion generation differs from helper generation".to_owned()
                         );
                     }
-                    let Some(handle) = handles.remove(&completion.urb_id) else {
+                    let Some(urb) = forwarded.remove(&completion.urb_id) else {
                         if let Some(remaining) = cancelled.get_mut(&completion.urb_id) {
                             *remaining = remaining.saturating_sub(1);
                             if *remaining == 0 {
@@ -620,9 +1353,9 @@ fn run_bridge(generation: AttachmentGeneration, speed: UsbSpeed) -> Result<(), S
                         }
                         return Err("completion references unknown URB".to_owned());
                     };
-                    controller
-                        .giveback(handle, status_to_errno(completion.status), payload)
-                        .map_err(|error| error.to_string())?;
+                    let out_actual =
+                        usize::try_from(completion.actual_length).unwrap_or(usize::MAX);
+                    hcd.giveback(urb.handle, completion.status, out_actual, payload)?;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -631,89 +1364,71 @@ fn run_bridge(generation: AttachmentGeneration, speed: UsbSpeed) -> Result<(), S
                 }
             }
         }
+        // The Pier is gone or done with this attachment: no completion can
+        // arrive any more, so detach now rather than serve the kernel on.
+        if input_closed {
+            break;
+        }
 
-        match controller.fetch_work(Duration::from_millis(20)) {
-            Ok(FetchedWork::Port(state)) => {
-                handle_port_state(&mut controller, state).map_err(|error| error.to_string())?;
-            }
-            Ok(FetchedWork::Cancel { handle }) => {
-                if let Some((&urb_id, _)) =
-                    handles.iter().find(|(_, candidate)| **candidate == handle)
+        match hcd.next_event(Duration::from_millis(20))? {
+            Some(HcdEvent::Cancel { handle }) => {
+                if let Some((&urb_id, _)) = forwarded
+                    .iter()
+                    .find(|(_, candidate)| candidate.handle == handle)
                 {
-                    handles.remove(&urb_id);
+                    forwarded.remove(&urb_id);
                     if cancelled.len() >= arcen_usb_bridge::MAX_IN_FLIGHT_URBS {
                         return Err("helper cancellation tombstone limit exceeded".to_owned());
                     }
                     // The submit response and the explicit cancel response can
                     // race. Both are terminal from Deck's perspective; ignore
                     // at most those two stale completions after owning the
-                    // kernel giveback here.
+                    // kernel's answer here.
                     cancelled.insert(urb_id, 2);
                     let frame = encode_usb_urb_cancel(generation, urb_id);
                     write_sync_frame(&mut stdout, &frame)?;
-                    controller
-                        .giveback(handle, -nix::libc::ECONNRESET, &[])
-                        .map_err(|error| error.to_string())?;
                 }
+                hcd.acknowledge_cancel(handle)?;
             }
-            Ok(FetchedWork::Urb(urb)) => {
-                let transfer_kind = urb.transfer_kind().map_err(|error| error.to_string())?;
-                if transfer_kind == arcen_usb_bridge::TransferKind::Interrupt {
-                    std::thread::sleep(urb.interrupt_cadence());
+            Some(HcdEvent::Submit(urb)) => {
+                if urb.kind == TransferKind::Interrupt {
+                    std::thread::sleep(urb.cadence);
                 }
                 let urb_id = UrbId::new(next_urb_id);
                 next_urb_id =
                     NonZeroU32::new(next_urb_id.get().wrapping_add(1)).unwrap_or(NonZeroU32::MIN);
-                if handles.insert(urb_id, urb.handle).is_some() {
+                if forwarded
+                    .insert(urb_id, ForwardedUrb { handle: urb.handle })
+                    .is_some()
+                {
                     return Err("helper generated duplicate URB id".to_owned());
                 }
-                if handles.len() > arcen_usb_bridge::MAX_IN_FLIGHT_URBS {
+                if forwarded.len() > arcen_usb_bridge::MAX_IN_FLIGHT_URBS {
                     return Err("helper in-flight URB limit exceeded".to_owned());
                 }
-                let payload = if urb.direction() == TransferDirection::Out && urb.buffer_length > 0
-                {
-                    controller
-                        .fetch_out_data(urb.handle, urb.buffer_length)
-                        .map_err(|error| error.to_string())?
-                } else {
-                    Vec::new()
-                };
                 let frame = encode_usb_urb_submit(
                     UsbUrbSubmitHeader {
                         generation,
                         urb_id,
-                        endpoint: arcen_usb_bridge::EndpointAddress(urb.endpoint()),
-                        transfer_kind,
+                        endpoint: arcen_usb_bridge::EndpointAddress(urb.endpoint),
+                        transfer_kind: urb.kind,
                         timeout_ms: 1_000,
-                        declared_length: u32::try_from(urb.buffer_length)
+                        declared_length: u32::try_from(urb.length)
                             .map_err(|_| "URB length exceeds u32".to_owned())?,
-                        setup: (transfer_kind == arcen_usb_bridge::TransferKind::Control)
-                            .then_some(SetupPacket {
-                                request_type: urb.setup.request_type,
-                                request: urb.setup.request,
-                                value: urb.setup.value,
-                                index: urb.setup.index,
-                                length: urb.setup.length,
-                            }),
+                        setup: urb.setup,
                     },
-                    &payload,
+                    &urb.out,
                 )
                 .map_err(|error| format!("{error:?}"))?;
                 write_sync_frame(&mut stdout, &frame)?;
             }
-            Err(vhci::VhciError::TimedOut) => {
-                if input_closed {
-                    break;
-                }
-            }
-            Err(error) => return Err(error.to_string()),
+            None => {}
         }
     }
-    let _ = controller.disconnect(1);
     Ok(())
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn read_sync_frame(reader: &mut impl Read) -> Result<Vec<u8>, String> {
     let mut length = [0_u8; 4];
     reader
@@ -731,7 +1446,7 @@ fn read_sync_frame(reader: &mut impl Read) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn write_sync_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), String> {
     if frame.is_empty() || frame.len() > MAX_HELPER_FRAME_BYTES {
         return Err("helper output frame outside bound".to_owned());
@@ -745,20 +1460,7 @@ fn write_sync_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), String>
         .map_err(|error| error.to_string())
 }
 
-#[cfg(feature = "usb-hard-lab")]
-const fn status_to_errno(status: UrbStatus) -> i32 {
-    match status {
-        UrbStatus::Success => 0,
-        UrbStatus::Cancelled => -nix::libc::ECONNRESET,
-        UrbStatus::TimedOut => -nix::libc::ETIMEDOUT,
-        UrbStatus::Stall => -nix::libc::EPIPE,
-        UrbStatus::Disconnected => -nix::libc::ENODEV,
-        UrbStatus::Protocol => -nix::libc::EPROTO,
-        UrbStatus::Io => -nix::libc::EIO,
-    }
-}
-
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 const fn speed_label(speed: UsbSpeed) -> &'static str {
     match speed {
         UsbSpeed::Low => "low",
@@ -767,7 +1469,7 @@ const fn speed_label(speed: UsbSpeed) -> &'static str {
     }
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn parse_speed(value: &str) -> Result<UsbSpeed, String> {
     match value {
         "low" => Ok(UsbSpeed::Low),
@@ -777,107 +1479,76 @@ fn parse_speed(value: &str) -> Result<UsbSpeed, String> {
     }
 }
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn run_self_test() -> Result<(), String> {
-    if !nix::unistd::geteuid().is_root() {
-        return Err("must run as root".to_owned());
-    }
-    let mut controller = VhciController::open_and_register(1).map_err(|error| error.to_string())?;
-    controller
-        .connect(1, UsbSpeed::High)
-        .map_err(|error| error.to_string())?;
-    let mut tablet = SyntheticTabletDevice::default();
-    let deadline = Instant::now() + SELF_TEST_RUNTIME;
-    let mut configured_at = None;
-    let mut completed = 0_u64;
-
-    while Instant::now() < deadline {
-        match controller.fetch_work(Duration::from_millis(200)) {
-            Ok(FetchedWork::Port(state)) => {
-                handle_port_state(&mut controller, state).map_err(|error| error.to_string())?;
-            }
-            Ok(FetchedWork::Cancel { handle }) => {
-                controller
-                    .giveback(handle, -nix::libc::ECONNRESET, &[])
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(FetchedWork::Urb(urb)) => {
-                complete_urb(&mut controller, &mut tablet, urb)
-                    .map_err(|error| error.to_string())?;
-                completed = completed.saturating_add(1);
-                if tablet.configuration() == 1 && configured_at.is_none() {
-                    configured_at = Some(Instant::now());
-                    println!(
-                        "USB_BRIDGE_READY bus={} port=1 product=\"Arcen USB Bridge Lab Tablet\"",
-                        controller.bus_number()
-                    );
+    // Even the self-test's device never reaches seat0.
+    let seat = self_test_seat().map_err(|error| error.to_string())?;
+    let mut termination = TerminationWatch::install()?;
+    with_attached_port(
+        UsbSpeed::High,
+        &seat,
+        &mut termination,
+        |hcd, termination| {
+            let mut tablet = SyntheticTabletDevice::default();
+            let deadline = Instant::now() + SELF_TEST_RUNTIME;
+            let mut configured_at = None;
+            let mut completed = 0_u64;
+            while Instant::now() < deadline && !termination.requested() {
+                match hcd.next_event(Duration::from_millis(200))? {
+                    Some(HcdEvent::Cancel { handle }) => hcd.acknowledge_cancel(handle)?,
+                    Some(HcdEvent::Submit(urb)) => {
+                        complete_urb(hcd, &mut tablet, &urb)?;
+                        completed = completed.saturating_add(1);
+                        if tablet.configuration() == 1 && configured_at.is_none() {
+                            configured_at = Some(Instant::now());
+                            println!(
+                            "USB_BRIDGE_READY devpath={} product=\"Arcen USB Bridge Lab Tablet\"",
+                            hcd.devpath_prefix()
+                        );
+                        }
+                    }
+                    None => {}
+                }
+                if configured_at
+                    .is_some_and(|configured| configured.elapsed() >= Duration::from_secs(2))
+                {
+                    break;
                 }
             }
-            Err(vhci::VhciError::TimedOut) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        if configured_at.is_some_and(|configured| configured.elapsed() >= Duration::from_secs(2)) {
-            break;
-        }
-    }
-
-    controller
-        .disconnect(1)
-        .map_err(|error| error.to_string())?;
-    if configured_at.is_none() {
-        return Err(format!(
-            "kernel did not configure the synthetic tablet; completed_urbs={completed}"
-        ));
-    }
-    println!(
-        "USB_BRIDGE_SELF_TEST_OK bus={} completed_urbs={completed}",
-        controller.bus_number()
-    );
-    Ok(())
+            if configured_at.is_none() {
+                return Err(format!(
+                    "kernel did not configure the synthetic tablet; completed_urbs={completed}"
+                ));
+            }
+            println!(
+                "USB_BRIDGE_SELF_TEST_OK backend={} devpath={} completed_urbs={completed}",
+                hcd.kind().label(),
+                hcd.devpath_prefix()
+            );
+            Ok(())
+        },
+    )
 }
 
-#[cfg(feature = "usb-hard-lab")]
-fn handle_port_state(
-    controller: &mut VhciController,
-    state: PortState,
-) -> Result<(), vhci::VhciError> {
-    if state.reset_requested() {
-        controller.complete_reset(state.index)
-    } else if state.resume_requested() {
-        controller.complete_resume(state.index)
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 fn complete_urb(
-    controller: &mut VhciController,
+    hcd: &mut dyn VirtualHcd,
     tablet: &mut SyntheticTabletDevice,
-    urb: VhciUrb,
-) -> Result<(), vhci::VhciError> {
-    match urb.transfer_kind() {
-        Ok(arcen_usb_bridge::TransferKind::Control) => {
-            let setup = SetupPacket {
-                request_type: urb.setup.request_type,
-                request: urb.setup.request,
-                value: urb.setup.value,
-                index: urb.setup.index,
-                length: urb.setup.length,
-            };
-            if urb.direction() == TransferDirection::Out && urb.buffer_length > 0 {
-                let _ = controller.fetch_out_data(urb.handle, urb.buffer_length)?;
+    urb: &HcdUrb,
+) -> Result<(), String> {
+    match (urb.kind, urb.setup) {
+        (TransferKind::Control, Some(setup)) => match tablet.handle_control(setup) {
+            ControlResponse::Ack => {
+                hcd.giveback(urb.handle, UrbStatus::Success, urb.out.len(), &[])
             }
-            match tablet.handle_control(setup) {
-                ControlResponse::Ack => controller.giveback(urb.handle, 0, &[]),
-                ControlResponse::Data(data) => controller.giveback(urb.handle, 0, &data),
-                ControlResponse::Stall => controller.giveback(urb.handle, -nix::libc::EPIPE, &[]),
+            ControlResponse::Data(data) => {
+                let length = data.len().min(urb.length);
+                hcd.giveback(urb.handle, UrbStatus::Success, 0, &data[..length])
             }
-        }
-        Ok(arcen_usb_bridge::TransferKind::Interrupt)
-            if urb.direction() == TransferDirection::In =>
-        {
-            std::thread::sleep(urb.interrupt_cadence());
+            ControlResponse::Stall => hcd.giveback(urb.handle, UrbStatus::Stall, 0, &[]),
+        },
+        (TransferKind::Interrupt, _) if urb.direction() == TransferDirection::In => {
+            std::thread::sleep(urb.cadence);
             let report = PenSample {
                 x: 0.5,
                 y: 0.5,
@@ -887,15 +1558,17 @@ fn complete_urb(
                 switches: PenSwitches::default().with(PenSwitch::InRange, true),
             }
             .encode_report();
-            controller.giveback(urb.handle, 0, &report)
+            let length = report.len().min(urb.length);
+            hcd.giveback(urb.handle, UrbStatus::Success, 0, &report[..length])
         }
-        _ => controller.giveback(urb.handle, -nix::libc::EPIPE, &[]),
+        _ => hcd.giveback(urb.handle, UrbStatus::Stall, 0, &[]),
     }
 }
 
-#[cfg(all(test, feature = "usb-hard-lab"))]
+#[cfg(all(test, feature = "native-tablet"))]
 mod tests {
     use super::*;
+    use arcen_usb_bridge::SetupPacket;
 
     fn device(vendor_id: u16, device_class: u8, descriptors: &[&[u8]]) -> UsbHardDeviceMsg {
         UsbHardDeviceMsg {
@@ -1134,6 +1807,100 @@ mod tests {
             assert_eq!(parse_speed(speed_label(speed)).unwrap(), speed);
         }
     }
+
+    /// A stand-in helper: `script` runs with piped stdin, like the real one.
+    fn helper_child(script: &str) -> (Child, ChildStdin) {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(false)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        (child, stdin)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_helper_ends_on_its_own_and_pier_stop_waits_for_it() {
+        let list = std::sync::Mutex::new(Vec::new());
+        // Like the real helper: serves until its input closes, then needs a
+        // moment for detach and rule removal.
+        let (child, stdin) = helper_child("cat >/dev/null; sleep 0.3");
+        drop(stdin);
+        keep_dropped_helper(&list, child, Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            drain_dropped_helpers(&list, Duration::from_secs(5)).await,
+            0
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(list.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_does_not_end_is_killed_at_the_stop_deadline() {
+        let list = std::sync::Mutex::new(Vec::new());
+        let (child, stdin) = helper_child("sleep 30");
+        drop(stdin);
+        keep_dropped_helper(&list, child, Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            drain_dropped_helpers(&list, Duration::from_millis(200)).await,
+            1
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn ended_helpers_are_reaped_and_overdue_ones_killed_when_another_is_dropped() {
+        let list = std::sync::Mutex::new(Vec::new());
+        let (ended, stdin) = helper_child("cat >/dev/null");
+        drop(stdin);
+        keep_dropped_helper(&list, ended, Duration::from_secs(30));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (stuck, _stuck_stdin) = helper_child("sleep 30");
+        keep_dropped_helper(&list, stuck, Duration::ZERO);
+        // The ended one is reaped; the overdue one is killed, and kept until
+        // it is reaped.
+        assert_eq!(list.lock().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (next, stdin) = helper_child("cat >/dev/null");
+        drop(stdin);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        keep_dropped_helper(&list, next, Duration::from_secs(30));
+        assert!(list.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_tablet_status_tests {
+    use super::*;
+
+    fn facts(loaded: bool, installed: bool) -> arcen_usb_bridge::VhciHcdFacts {
+        arcen_usb_bridge::VhciHcdFacts {
+            running_kernel: "5.14.0-611.55.1.el9_7.x86_64".into(),
+            loaded,
+            module_for_running_kernel: installed,
+            module_for_other_kernels: Vec::new(),
+            rhel_family: true,
+        }
+    }
+
+    #[test]
+    fn the_status_says_loaded_or_how_to_load_or_what_to_install() {
+        assert!(native_tablet_line(&facts(true, true)).contains("is loaded for kernel"));
+        let unloaded = native_tablet_line(&facts(false, true));
+        assert!(unloaded.contains("installed"), "{unloaded}");
+        assert!(unloaded.contains("restart the Pier"), "{unloaded}");
+        assert!(unloaded.contains("modprobe vhci-hcd"), "{unloaded}");
+        let missing = native_tablet_line(&facts(false, false));
+        assert!(
+            missing.starts_with("Native tablet: unavailable: "),
+            "{missing}"
+        );
+        assert!(missing.contains("kernel-modules-internal"), "{missing}");
+    }
 }
 
 #[cfg(test)]
@@ -1160,6 +1927,7 @@ mod session_admission_tests {
             wayland: None,
             requested_outputs: None,
             x11_desktop_depth: None,
+            native_seat: None,
         }
     }
 
@@ -1176,8 +1944,62 @@ mod session_admission_tests {
     }
 
     #[test]
-    fn xorg_and_console_sessions_keep_hard_usb_admission() {
+    fn an_xorg_desktops_bridge_is_tagged_for_its_own_display() {
+        assert_eq!(x11_display_number(":58"), Some(58));
+        for bad in [":0", ":100", ":058", "58", ":58.0", ""] {
+            assert_eq!(x11_display_number(bad), None, "{bad}");
+        }
+        #[cfg(feature = "native-tablet")]
+        {
+            let mut desktop = session("x11");
+            desktop.display = ":58".to_owned();
+            let seat = bridge_seat_for(Some(&desktop)).expect("x11 bridge");
+            assert!(matches!(
+                seat,
+                arcen_usb_bridge::BridgeSeat::X11Session { display: 58, .. }
+            ));
+            desktop.display = ":0".to_owned();
+            assert!(bridge_seat_for(Some(&desktop)).is_err());
+            assert!(bridge_seat_for(None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_native_seat_wayland_desktop_is_admitted_on_its_own_seat() {
+        let mut native = session("wayland");
+        native.native_seat = Some("seat-arcen-pen-0123456789abcdef".to_owned());
+        assert_eq!(
+            session_seat(Some(&native)),
+            arcen_usb_bridge::HardUsbSessionSeat::ArcenSeat
+        );
+        assert_eq!(session_admission(Some(&native)), Ok(()));
+        #[cfg(feature = "native-tablet")]
+        {
+            assert_eq!(
+                bridge_seat_for(Some(&native)).expect("native seat"),
+                arcen_usb_bridge::BridgeSeat::NativeSeat {
+                    seat: "seat-arcen-pen-0123456789abcdef".to_owned()
+                }
+            );
+            native.native_seat = Some("seat0".to_owned());
+            assert!(bridge_seat_for(Some(&native)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_xorg_desktop_is_admitted_by_its_tag_and_no_session_is_refused() {
+        assert_eq!(
+            session_seat(Some(&session("x11"))),
+            arcen_usb_bridge::HardUsbSessionSeat::X11Desktop
+        );
         assert_eq!(session_admission(Some(&session("x11"))), Ok(()));
-        assert_eq!(session_admission(None), Ok(()));
+        // Without a desktop there is only the console seat: a bridged
+        // device would reach the login screen.
+        let denial = session_admission(None).unwrap_err();
+        assert_eq!(
+            denial,
+            arcen_usb_bridge::HardUsbSessionDenial::ConsoleSeatSession
+        );
+        assert!(TabletModeReason::try_from(denial.reason().to_owned()).is_ok());
     }
 }

@@ -94,10 +94,47 @@ consecutive windows of unhealthy samples before declaring `degraded` or
 `critical` (hysteresis), and two consecutive healthy windows before
 declaring `ok` again — a single bad sample does not flip the state, and a
 single good sample does not clear a degraded/critical state either. Default
-QoS thresholds: frame delivery below 90%/70% of target, RTT above
+QoS thresholds: frame delivery below 90%/70% of the expected rate, RTT above
 60ms/150ms, drop rate above 50/500 basis points, input latency above
 50ms/120ms, or 3 missed heartbeats — first number is the `degraded`
 threshold, second is `critical`.
+
+**Frame rate is judged against the content that changed, not only the
+target.** Every Arcen capture path sends a frame only when the screen changed,
+plus a keepalive at least once a second, so a still desktop legitimately sends
+a few frames a second against a target of 30 or 60. When the capture path can
+prove the source set the pace over the **whole** health window, the expected
+rate is the smaller of the target and that changed-content rate, reported as
+`fps_content` in `HEALTH_SNAPSHOT`:
+
+- macOS: captured, shed and superseded frames, less those Keel skipped as
+  unchanged, and only in a window with positive evidence that the screen did
+  not change — `ScreenCaptureKit` buffers marked `SCFrameStatus::Idle`, or a
+  frame Keel skipped as unchanged. A capture wait that merely timed out is
+  never evidence: `ScreenCaptureKit` falling behind a busy screen just
+  delivers fewer frames. Every frame a Detail stream skipped to hold its
+  interval (paced from the previous sent frame's arrival, with half a frame
+  of margin) counts as content that was not sent.
+- Linux: every capenc stats second in the window classified
+  `fps_limiter=no_damage` or, on the NvFBC loop, had grabs that found the
+  screen unchanged (`capture_old`).
+- Windows (Desktop Duplication, WGC and Media Foundation alike): every capenc
+  stats second in the window had an empty poll or an encode skipped for want
+  of a new frame.
+
+A host that falls behind the changes (an encoder or network backlog, a rate
+cap, frames superseded or shed) is still `degraded`/`critical`, because those
+frames count as content and never as sent; a window that sent nothing at all
+is a stall whatever the content; and a window with any second the capture
+path cannot prove (rate control, a busy pipeline, multi-monitor sessions, the
+X11 OpenH264 fallback) is judged against the target as before. The client side is
+judged the same way against the frames it received: a Deck that presents
+every keepalive of a still desktop is healthy. One decoded frame still in
+flight at a window boundary is not counted as `unpresented`, and
+`unpresented` is judged only on windows of at least ten decoded frames: a
+keepalive a second cannot be superseded, so a shortfall there is accounting
+lag (a client that presents nothing at all is still caught as a frame-rate
+stall).
 
 A `HealthState` field of `null` in a canonical record means the health
 subsystem had no assessment available yet (for example immediately after
@@ -121,7 +158,7 @@ per-platform fork.
 | `sequence` | integer | yes | Monotonic counter, **per process, starting at 1 for the first record emitted after each process start** and incrementing by 1 for every subsequent record from that same process — not a global counter across processes or across restarts. Use `(host, pid-equivalent, sequence)` together, not `sequence` alone, to detect gaps. |
 | `profile_level` / `profile_name` | integer / string | yes | The minimum operational profile required for **this record** to be emitted. For a stable lifecycle event this is fixed per event ID (§3) and can be higher than the event's own severity would suggest. For an ad-hoc diagnostic (no `event_id`) it is derived directly from the emitted severity (`error`→0, `warn`→1, `info`→2, `debug`→3). This field is **not** the process's currently configured profile — use `EFFECTIVE_PROFILE` (§1.2) for that. |
 | `severity` | string | yes | One of `debug`, `info`, `warn`, `error` — the true severity of this specific record, independent of `profile_level`. |
-| `role` | string | yes | `host` (Pier) or `client` (Deck). (`gateway` is a reserved value for a future relay component; nothing emits it today.) |
+| `role` | string | yes | `host` (Pier) or `client` (Deck). |
 | `component` | string | yes | Free-form bounded lowercase identifier (≤32 bytes), not a closed enum. Observed values: `pier` (Linux broker), `pier_broker` / `pier_diagnostic` (Windows broker/diagnostic processes — note the platform-specific string, same schema key), `session_agent` (per-session process, both platforms), `deck` (macOS client). |
 | `platform` | string | yes | `linux`, `windows`, or `macos`. |
 | `target` | string | yes | Canonical subsystem tag, always prefixed `arcen::` (e.g. `arcen::session`, `arcen::net`, `arcen::health`, `arcen::tls`, `arcen::display`, `arcen::media`, `arcen::capenc`, `arcen::hid`/`arcen::input`, `arcen::telemetry`, `arcen::auth`, plus platform-only tags such as `arcen::cppipe` and `arcen::eventlog` on Windows and `arcen::ui`/`arcen::audio` where applicable). |

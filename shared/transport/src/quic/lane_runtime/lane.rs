@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! One admitted or opened lane: its generation, cancellation and the two
 //! stream halves, each of which resets (never finishes) on drop unless the
 //! lane closed cleanly.

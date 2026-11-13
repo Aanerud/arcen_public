@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![deny(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -78,7 +81,33 @@ fn main() -> ExitCode {
     // The virtual HID helper a desktop agent starts. Owns one device and
     // reads reports; nothing else.
     if command == "hid-injector" {
-        return arcen_pier_macos::input::virtual_keyboard::run_injector();
+        return match support_args.first().map(String::as_str) {
+            None => arcen_pier_macos::input::virtual_keyboard::run_injector(),
+            // The same child, owning a bridged tablet's devices (ADR 0022).
+            #[cfg(feature = "native-tablet")]
+            Some("--bridged-usb") if support_args.len() == 1 => {
+                arcen_pier_macos::input::bridged_hid::run_bridged_injector()
+            }
+            #[cfg(not(feature = "native-tablet"))]
+            Some("--bridged-usb") => {
+                eprintln!(
+                    "hid-injector: {}",
+                    arcen_pier_macos::bridged_tablet::NOT_BUILT
+                );
+                ExitCode::FAILURE
+            }
+            Some(other) => {
+                eprintln!("hid-injector: unknown argument: {other}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // What the HID system sees of a bridged tablet (ADR 0022). Lab builds
+    // only: it sends the Wacom mode switch (a feature report) to the device,
+    // so a shipped Pier must not contain it.
+    #[cfg(feature = "lab-bridged-hid-probe")]
+    if command == "probe-bridged-hid" {
+        return arcen_pier_macos::bridged_hid_probe::run(&support_args);
     }
     if command == "virtual-display-child" {
         return match arcen_pier_macos::virtual_display::run_child_stdio() {
@@ -234,6 +263,71 @@ fn main() -> ExitCode {
             println!("{reason}");
         }
         return if support.is_available() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    // What a Deck's Tablet support pen delivers to applications here, posted
+    // through the session input path and read back from AppKit. Hovers only
+    // unless --strokes. Lab builds only: it injects input under the agent's
+    // Accessibility approval, so a shipped Pier must not contain it.
+    #[cfg(feature = "lab-pen-probe")]
+    if command == "probe-pen" {
+        let options = match arcen_pier_macos::pen_probe::parse_options(&support_args) {
+            Ok(options) => options,
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let evidence = arcen_pier_macos::pen_probe::probe(options);
+        match serde_json::to_string_pretty(&evidence) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("probe serialization failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        println!(
+            "pen={}",
+            if evidence.observed() {
+                "observed"
+            } else {
+                "unobserved"
+            }
+        );
+        return if evidence.observed() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    // What a generic virtual pen digitizer delivers to applications here,
+    // read back from the events macOS posts. Hovers only; never presses.
+    if command == "probe-pen-hid" {
+        let evidence = arcen_pier_macos::virtual_hid::probe_pen();
+        match serde_json::to_string_pretty(&evidence) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("probe serialization failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        println!(
+            "pen_hid={} tablet_surface={}",
+            if evidence.observed() {
+                "observed"
+            } else {
+                "unobserved"
+            },
+            if evidence.carries_tablet_surface() {
+                "carried"
+            } else {
+                "empty (Basic Tablet stays on CGEvent)"
+            }
+        );
+        return if evidence.observed() {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -791,6 +885,7 @@ async fn serve_desktop(
                 handshake.fps,
             )
             .showing_cursor(shows_cursor)
+            .stating_sdr_transfer(handshake.plan.transfer)
         }
         // Only resolved when the display being captured reported headroom
         // above SDR white; see the handshake's HDR desktop proof.
@@ -966,6 +1061,7 @@ fn multi_capture_config(
                 monitor.display.pixel_height,
                 fps,
             )
+            .stating_sdr_transfer(plan.transfer)
         }
         arcen_media::session_plan::VideoTier::HighDynamicRange => {
             arcen_pier_macos::capture::CaptureConfig::hdr(
@@ -1198,6 +1294,10 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
     };
     let local_playback = local_playback.unwrap_or(host_setup.file_config.audio.local_playback);
     let (host, port) = listen_address(&host_setup.file_config, port);
+    // One process serves everything here, so the child is this executable.
+    if let Ok(program) = std::env::current_exe() {
+        arcen_pier_macos::bridged_tablet::set_injector_program(program);
+    }
 
     let config = match load_server_config(&directory) {
         Ok(config) => config,
@@ -1374,6 +1474,10 @@ async fn daemon_loop(
             "service start",
         );
     }
+    println!(
+        "{}",
+        arcen_pier_macos::startup_build_line(&arcen_pier_macos::build_identity())
+    );
     match listener.local_addr() {
         Ok(bound) => println!(
             "listening on {bound}/udp; agents on {}",
@@ -1587,6 +1691,8 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         }
     };
     arcen_pier_macos::input::set_input_backend(backend);
+    // Native tablet's devices belong to the installed Pier's entitled child.
+    arcen_pier_macos::bridged_tablet::set_injector_program(program.into());
     // A user's agent serves that user alone. The login window belongs to
     // nobody yet: any account that authenticates may see it and sign in.
     session_policy.serving_uid = (kind == arcen_session::agent_relay::DesktopSessionKind::User)
@@ -2989,6 +3095,10 @@ async fn serve_loop(
             "service start",
         );
     }
+    println!(
+        "{}",
+        arcen_pier_macos::startup_build_line(&arcen_pier_macos::build_identity())
+    );
     match listener.local_addr() {
         Ok(bound) => println!("listening on {bound}/udp"),
         Err(error) => {
@@ -3278,7 +3388,10 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
                 | "virtual-display-child"
                 | "probe-audio"
                 | "register-audio-consent"
-        ) {
+                | "hid-injector"
+        ) || (cfg!(feature = "lab-pen-probe") && command == "probe-pen")
+            || (cfg!(feature = "lab-bridged-hid-probe") && command == "probe-bridged-hid")
+        {
             support_args.extend_from_slice(&args[index..]);
             break;
         }
@@ -3297,6 +3410,9 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             "probe-scroll" => command = "probe-scroll",
             "probe-virtual-display" => command = "probe-virtual-display",
             "probe-virtual-hid" => command = "probe-virtual-hid",
+            #[cfg(feature = "lab-pen-probe")]
+            "probe-pen" => command = "probe-pen",
+            "probe-pen-hid" => command = "probe-pen-hid",
             "probe-virtual-keyboard" => command = "probe-virtual-keyboard",
             "probe-clipboard" => command = "probe-clipboard",
             "probe-keyboard" => command = "probe-keyboard",
@@ -3306,6 +3422,8 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             "agent" => command = "agent",
             "launchd-plist" => command = "launchd-plist",
             "hid-injector" => command = "hid-injector",
+            #[cfg(feature = "lab-bridged-hid-probe")]
+            "probe-bridged-hid" => command = "probe-bridged-hid",
             "virtual-display-child" => command = "virtual-display-child",
             "install-service" => command = "install-service",
             "activate" => command = "activate",
@@ -3359,6 +3477,40 @@ mod tests {
             "a slot comes back"
         );
         drop((second, third));
+    }
+
+    #[test]
+    #[cfg(not(feature = "lab-pen-probe"))]
+    fn shipped_builds_have_no_pen_injecting_probe() {
+        // `probe-pen` posts clicks under the installed agent's Accessibility
+        // approval; any same-user process could start it as a launchd job.
+        for args in [&["probe-pen"][..], &["probe-pen", "--strokes"]] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse_args(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "lab-bridged-hid-probe"))]
+    fn shipped_builds_have_no_bridged_hid_probe() {
+        // `probe-bridged-hid` sends the Wacom mode switch to a bridged
+        // tablet's HID device.
+        for args in [&["probe-bridged-hid"][..], &["probe-bridged-hid", "--json"]] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse_args(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "lab-pen-probe")]
+    fn lab_builds_parse_the_pen_probe_and_its_arguments() {
+        let args: Vec<String> = ["probe-pen", "--area", "1,2,3,4", "--strokes"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect();
+        let (command, _, support) = parse_args(&args).expect("lab build");
+        assert_eq!(command, "probe-pen");
+        assert_eq!(support, args[1..]);
     }
 
     #[test]
@@ -3520,7 +3672,7 @@ mod tests {
             reason: arcen_protocol::messages::AudioStreamReason::Enabled,
         };
 
-        // The macOS Pier encodes Opus itself (48cb523), so an Opus
+        // The macOS Pier encodes Opus itself, so an Opus
         // negotiation needs the same capture a PCM one does.
         assert_eq!(
             audio_startup_kind(opus, arcen_session::pier_config::LocalPlayback::Audible),

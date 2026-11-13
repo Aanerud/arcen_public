@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -18,7 +21,6 @@ case "$target" in
     linux-host) hook=packaging/linux/sign-release.sh ;;
     windows-host | windows-client) hook=packaging/windows/sign-release.sh ;;
     macos-client) hook=packaging/macos/sign-and-notarize-release.sh ;;
-    gateway-service | gateway-relay) hook=packaging/gateway/sign-release.sh ;;
     *)
         echo "unsupported release target: $target" >&2
         exit 2

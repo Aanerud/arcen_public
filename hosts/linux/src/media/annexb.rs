@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Annex-B access-unit metadata helpers.
 //!
 //! Access-unit boundaries come exclusively from capenc's explicit `framed-v1`
@@ -36,6 +38,22 @@ impl NalCodec {
 pub struct AccessUnit {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
+    /// When the Pier read this frame from the encoder. The wire timestamp is
+    /// taken from it, so every host-side wait before the network counts in
+    /// the frame's age.
+    pub read_at: std::time::Instant,
+}
+
+impl AccessUnit {
+    /// A frame read from the encoder now.
+    #[must_use]
+    pub fn new(data: Vec<u8>, is_keyframe: bool) -> Self {
+        Self {
+            data,
+            is_keyframe,
+            read_at: std::time::Instant::now(),
+        }
+    }
 }
 
 const START_CODE_3: [u8; 3] = [0x00, 0x00, 0x01];

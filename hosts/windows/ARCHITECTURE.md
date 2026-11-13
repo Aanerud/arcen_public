@@ -100,7 +100,7 @@ no ffmpeg.
 
 1. Depends on `arcen-capenc`, `arcen-input`, `arcen-media`, `arcen-protocol`,
    and `arcen-telemetry`; spawns `current_exe() capenc` as a subprocess. Never
-   depends on the Linux Pier or the gateway.
+   depends on the Linux Pier.
 2. Windows-only deps (`windows` crate features) behind `cfg(windows)`; protocol/transport
    unit tests still run on the dev box.
 3. `unsafe` allowed (~151 sites: Win32 FFI) but scoped.
@@ -263,6 +263,27 @@ and `SetIsCursorCaptureEnabled(true)` is a strict startup requirement for both
 NVENC/WGC and MF/WGC. Pier confirms Host only after the first encoded frame.
 DDA pointer-shape composition is not implemented or advertised.
 
+## Keyboard and committed text (0.18.0)
+
+Keys arrive as Qt key identifiers naming a key *position*. `input.rs`
+synchronises the modifier mask, then injects the position's PC scan code
+(`KEYEVENTF_SCANCODE`, from the shared `arcen_input::keyboard::scancode`
+table), so the Windows session's own keyboard layout decides the character
+exactly as for a keyboard plugged into the PC. Keypad, lock, Pause and Print
+keys keep their virtual keys. The Pier announces AltGr and the ISO key
+(`input_capabilities.extended_keys`); the Deck's mapping of ⌘ and ⌥ for a
+Windows host is shared policy (`arcen_input::keyboard`). A ⌘-click is masked
+on release with an invisible key so it never opens Start.
+
+The Pier advertises `text_commit`. Committed text (input-method results,
+Characters mode, Paste as Keystrokes) is typed per character by the shared
+`arcen_input::text::route_char` rule: by its key on the foreground window's
+layout when `VkKeyScanExW` finds it at a plain, Shift, `AltGr` or
+Shift+`AltGr` level, `ToUnicodeEx` proves that key types exactly that
+character with the lock keys as they are, no key is held and the layout is
+not an input method's; otherwise as Unicode (`KEYEVENTF_UNICODE`), which is
+also the route when no window has the foreground. The text is never logged.
+
 ## Typed pen/tablet input
 
 Full design: [`../../docs/architecture/pen-tablet-input.md`](../../docs/architecture/pen-tablet-input.md).
@@ -272,7 +293,8 @@ Operator validation: [`../../docs/operations/pen-tablet-input.md`](../../docs/op
 synthetic `PT_PEN` pointer device created with the public
 `CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)` /
 `InjectSyntheticPointerInput` / `DestroySyntheticPointerDevice` API — not
-`SendInput`, and **no Wintab claim is made**. Pressure maps to the
+`SendInput`, and **Wintab is not supported**
+([ADR 0017](../../docs/adr/0017-forward-only-pen-input.md)). Pressure maps to the
 documented `0..=1024` Windows Ink pointer-pressure range
 (`pen_pressure_to_windows`) even when the source tablet reports more levels;
 rotation maps to `0..=359` and tilt to `-90..=90`; eraser/barrel state maps
@@ -371,7 +393,7 @@ mTLS, 0-RTT, and plaintext fallback are outside this boundary.
 reconnect window and defaults to 1200; zero disables advertisement, grant
 issuance, and detached retention, so attachment/final cleanup begins
 immediately. Replacement attachments arrive over QUIC. This adds no
-Gateway/Span, OIDC, entitlement, licensing, mTLS, 0-RTT, network fetch,
+OIDC, entitlement, licensing, mTLS, 0-RTT, network fetch,
 protocol-version bump, or durable resume state.
 
 The broker creates one process-owned, one-session resume registry before TLS
@@ -739,8 +761,8 @@ existed.
   unsigned development artifacts.
 - Wire the EDID-purge restore fallback if not already the default.
 - Native Event Log sink readback and fleet-rule validation on a real host
-  remain pending platform-owner operational review (pure formatters, fake
-  backends, and bounded query tests cover this PR; see "Lifecycle Event Log").
+  are not yet recorded (pure formatters, fake backends, and bounded query
+  tests cover the code; see "Lifecycle Event Log").
 - Forward the live session correlation id into the crash watchdog's command
   line instead of a freshly generated one, if a low-risk seam for that
   appears in a follow-on display-recovery change.
@@ -754,13 +776,13 @@ existed.
   alongside `nvenc`. `--encoder auto` (the default) probes the NVIDIA encode API and falls
   back to source-built OpenH264 on hosts without NVIDIA (VMware SVGA, Intel-only, etc.). Live path
   in `hosts/capenc/src/win_mf.rs` uses WGC exclusively (DDA on VMware SVGA is unreliable).
-- **VMware SVGA live stream** — `development workstation` proved console-only first-party
+- **VMware SVGA live stream** — a VMware test VM proved console-only first-party
   target binding, VMware Tools display negotiation, exact-output WGC capture,
   MF H.264 at 30 fps, mouse/keyboard, audio, and verified restore. Explicit MF
   aligns the desktop to complete 16×16 macroblocks (1800×1168 → 1792×1168)
   instead of cropping encoded pixels. RDP protocol sessions are rejected before
   display mutation. The VMware console viewer mirrors the same Windows session
-  and must keep Autofit disabled during Branch-A testing.
+  and must keep Autofit disabled during testing.
 - **GPU diagnostics** — `arcen-pier diagnose-host [--json]` inventories adapter
   identity/type, D3D11/video capability, outputs/topology, installed encoder
   runtimes, and a same-adapter recommendation without mutating the display.
@@ -801,7 +823,7 @@ conversion.
 | Resolved contract | Capture and conversion | Additional admission |
 | --- | --- | --- |
 | Auto / Speed, 8-bit | Probe Desktop Duplication for a real image; otherwise WGC `B8G8R8A8UIntNormalized`; convert the concrete BGRA8 source to the negotiated encoder format | Host cursor forces WGC |
-| Grading, 10-bit SDR | WGC `R16G16B16A16Float` linear scRGB → clamp to SDR reference range → BT.709 or sRGB OETF → full-range BT.709 I444 P16 → NVENC | FP16 pool is mandatory; HDR state is not enabled |
+| Grading, 10-bit SDR | WGC `R16G16B16A16Float` linear scRGB → clamp to SDR reference range → sRGB curve for a Deck that announced `srgb_transfer` (the desktop's own code values, transfer `srgb`), BT.709 OETF for an older Deck (`linear_sdr_desktop_transfer`; an administrator-pinned variant keeps its pinned transfer) → full-range BT.709 I444 P16 → NVENC | FP16 pool is mandatory; HDR state is not enabled |
 | HDR, 10-bit PQ | Final HDR EDID/topology → exact-target Windows HDR state → WGC `R16G16B16A16Float` → linear BT.709-to-BT.2020 primaries → 80-nit-reference absolute PQ → BT.2020 NCL I444 P16 → NVENC | `activeColorMode=HDR` and DXGI `RGB_FULL_G2084_NONE_P2020` are mandatory |
 
 Desktop Duplication remains an eight-bit API here. Asking
@@ -828,6 +850,11 @@ The HDR chain runs in this order:
 
 `edid::generate_hdr10` emits a 256-byte HDMI/10-bpc EDID with deep colour,
 SCDC, BT.2020, HDR Static Metadata, quantization, and a mastering envelope.
+Its HDMI blocks declare a 550 MHz link, so it refuses a mode whose 10-bit
+TMDS rate (1.25× the pixel clock) exceeds that: Windows offers such a mode
+as SDR only and never activates HDR on it. The session sizes the refresh
+with `edid::hdr10_refresh_hz` first (3600x2260 is created at 30 Hz, the HDR
+stream rate; a multi-monitor request that does not fit is refused).
 Windows 11 uses `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2` and
 `DISPLAYCONFIG_SET_HDR_STATE`; the legacy Advanced Color bit is insufficient
 because it can describe WCG. Windows 10 keeps the older API.

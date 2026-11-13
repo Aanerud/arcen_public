@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Registration of the privileged USB helper as a launchd daemon.
 //!
-//! This is what removes the recurring `sudo`. Apple's guidance (DTS Case-ID
-//! 21584866) is that the *helper* runs as root, not the app — but the user
+//! This is what removes the recurring `sudo`. The *helper* runs as root, not
+//! the app (ADR 0011) — but the user
 //! should never type a password per session. `SMAppService.daemon` installs the
 //! daemon once, launchd starts it as root from then on, and the only user-facing
 //! step is a single approval in System Settings.

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Install the nightly-run git hooks into this clone.
 # Hooks are not versioned by git itself, so this makes the gate reproducible.
 set -euo pipefail

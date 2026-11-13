@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Safe wrapper around source-built `rav1e`, Arcen's software AV1 backend.
 //!
 //! `rav1e` is the only encoder in the product with a twelve-bit path and the

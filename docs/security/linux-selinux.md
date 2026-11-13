@@ -1,7 +1,7 @@
 # Linux Pier under SELinux
 
-**Status:** Linux Pier 0.17.0. Needs Release/Security review (see
-[Review items](#review-items)).
+**Status:** Linux Pier 0.17.0 and later. Known limitations are listed under
+[Scope and limitations](#scope-and-limitations).
 
 A Linux Pier on an SELinux-enforcing host (RHEL, Rocky, Alma and Fedora
 default to it) serves desktops only with Arcen's SELinux policy module
@@ -242,19 +242,16 @@ A launcher started through a `/bin/bash` wrapper runs as `initrc_t`, not
 `unconfined_service_t`; lab runs must exec the binary directly to
 reproduce the packaged domain.
 
-## Review items
+## Scope and limitations
 
-For Release/Security:
-
-1. Ship the `arcen` CIL module with the single rule above (installer
-   `semodule -i` / `semodule -r`, kept at
+1. The installer ships the `arcen` CIL module with the single rule above
+   (`semodule -i` / `semodule -r`, kept at
    `/usr/share/arcen/selinux/arcen.cil`).
-2. Accept that the rule applies to every `unconfined_service_t` process, not
-   only the Pier (precedent: `xrdp-selinux`), or commission a dedicated
-   Pier domain.
+2. The rule applies to every `unconfined_service_t` process, not only the
+   Pier (as `xrdp-selinux` does); a dedicated Pier domain would narrow it.
 3. Confined SELinux users are refused rather than supported.
 4. Sessions run at `s0`, not the user's full MCS range; a
    `range_transition` (or running the Pier at `s0-s0:c0.c1023`) would
    change that.
 5. Whether Pier-spawned user helpers (capenc, audiocap) should also run in
-   the PAM-assigned context.
+   the PAM-assigned context is an open design question.

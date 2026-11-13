@@ -4,8 +4,8 @@
 
 ## Decision
 
-Use one Rust workspace with shared libraries and independent host, client, and
-gateway products. Shared crates must not depend on product crates. Product
+Use one Rust workspace with shared libraries and independent host and client
+products. Shared crates must not depend on product crates. Product
 crates may depend on shared crates but never on another product.
 
 ## Consequences

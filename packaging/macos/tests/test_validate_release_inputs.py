@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 import copy
 import datetime as dt
 import importlib.util
@@ -336,6 +339,61 @@ class ReleaseInputValidationTests(unittest.TestCase):
         self.assertRegex(
             plist, r"<key>CFBundleName</key>\s*<string>Arcen Deck</string>"
         )
+
+
+
+
+class ReleaseFeatureGateTests(unittest.TestCase):
+    """A release Deck must never contain a lab or developer feature."""
+
+    SCRIPT = ROOT / "build-deck-app.sh"
+    FORBIDDEN = ("dev-tools", "usb-emulate-lab", "experimental-raw-hid")
+
+    def test_every_lab_feature_is_forbidden_and_every_marker_is_scanned(self):
+        script = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'RELEASE_FORBIDDEN_FEATURES="dev-tools usb-emulate-lab experimental-raw-hid"',
+            script,
+        )
+        self.assertIn('DO_NOT_SHIP_MARKERS="$DEV_TOOLS_MARKER $USB_EMULATE_MARKER"', script)
+        self.assertIn('for MARKER in $DO_NOT_SHIP_MARKERS; do', script)
+        # The markers the script scans for are the ones the features compile in.
+        deck = ROOT.parents[1] / "clients" / "macos" / "src"
+        for marker, source in (
+            ("ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP", deck / "lib.rs"),
+            ("ARCEN_DECK_USB_EMULATE_FEATURE_MARKER_DO_NOT_SHIP", deck / "usb_emulate.rs"),
+        ):
+            self.assertIn(f'"{marker}"', script)
+            self.assertIn(f'b"{marker}"', source.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "build-deck-app.sh needs plutil")
+    def test_release_refuses_lab_features_before_building(self):
+        with tempfile.TemporaryDirectory(prefix="arcen-deck-gate-") as temporary:
+            for feature in self.FORBIDDEN + ("arcen-deck-macos/usb-emulate-lab",):
+                env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in ("MACOSX_DEPLOYMENT_TARGET", "CARGO_TARGET_DIR")
+                }
+                env.update(
+                    ARCEN_DECK_FEATURES=f"native-tablet,{feature}",
+                    ARCEN_DECK_OUTPUT_DIR=temporary,
+                    CARGO_TARGET_DIR=temporary,
+                )
+                result = subprocess.run(
+                    ["bash", str(self.SCRIPT), "--release", "--arch", "arm64"],
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 2, (feature, result.stderr))
+                self.assertIn(
+                    f"--release must not be built with {feature.split('/')[-1]}",
+                    result.stderr,
+                )
+                self.assertNotIn("==> building", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The session's connection to its compositor's EIS server, for committed
 //! text that the session's keyboard layout cannot type.
 //!

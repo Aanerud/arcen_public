@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Root-owned Linux deskside evidence, evdev grabs, console display plans, and recovery.
 
 use std::collections::HashSet;

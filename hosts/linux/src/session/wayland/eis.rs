@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Probe of the compositor's emulated-input (EIS) seat for a stylus.
 //!
 //! Pen input reaches a headless Wayland session only through an emulated

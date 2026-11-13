@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared-region input adapter for the Linux Xorg virtual raster.
 //!
 //! Validation, wire-to-domain conversion, ordered state, and the region

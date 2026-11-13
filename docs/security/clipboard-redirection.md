@@ -24,8 +24,8 @@ ask for. A Linux host copy larger than the policy is refused (helper diagnostic
 session goes on.
 
 Text is UTF-8. Images are PNG on the wire; DIBV5 and TIFF exist only inside the
-Windows and macOS adapters. Files, HTML, RTF, delayed rendering, and
-Gateway/Span transport are not implemented.
+Windows and macOS adapters. Files, HTML, RTF and delayed rendering
+are not implemented.
 
 On a headless Wayland desktop the Pier reaches the clipboard only through the
 session agent's `arcen-clipboard.sock`. It proves that socket the way it

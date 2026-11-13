@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Wayland cursor images from capture to the input/cursor lane.
 //!
 //! A headless Wayland desktop whose streams report the cursor as metadata
@@ -5,6 +7,14 @@
 //! framed-v2 stdout, each child's reader applies them to the desktop's
 //! [`arcen_input::cursor::DesktopCursor`] here, and every attachment's
 //! input-lane worker follows the result through a `tokio` watch channel.
+//!
+//! The same hub holds the desktop's pointer ([`DesktopPointer`]) for a Deck
+//! that draws its cursor at host-reported positions: capture reports the
+//! compositor's core pointer ([`WaylandCursorHub::apply_position`]). Mutter
+//! gives a tablet tool its own position and reports only the core pointer
+//! in cursor metadata, so a USB-bridged pen's position comes from its own
+//! evdev node through the one Linux pen adapter
+//! (`usb_bridge::tablet_pointer`, ADR 0023), into the same pointer.
 //!
 //! The state lives as long as the desktop, not the attachment, because
 //! Mutter sends a sprite only when it changes: a capture that reconnects to
@@ -17,10 +27,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arcen_input::cursor::{CursorAggregateOutcome, CursorFacts, DesktopCursor};
-use arcen_media::capenc_stream::CapencCursorEvent;
+use arcen_input::host_pointer::DesktopPointerSample;
+use arcen_input::tablet_pointer::PenMapping;
+use arcen_media::capenc_stream::{CapencCursorEvent, CapencCursorPosition};
 use tokio::sync::watch;
 
 use crate::logging::target;
+use crate::media::desktop_pointer::DesktopPointer;
 
 /// Desktops whose cursor state is kept at once.
 pub const MAX_DESKTOPS: usize = 2;
@@ -36,6 +49,11 @@ pub struct WaylandCursorHub {
     runtime_dir: PathBuf,
     desktop: Mutex<DesktopCursor>,
     facts: watch::Sender<Option<CursorFacts>>,
+    /// Where the pointer is: the core pointer from capture, a bridged pen
+    /// from its evdev node. GNOME maps a tablet's whole area to the whole
+    /// output by default (`org.gnome.desktop.peripherals.tablet` `area`,
+    /// `keep-aspect`, `output`; reading a user's remap is a follow-up).
+    pointer: Arc<DesktopPointer>,
 }
 
 impl WaylandCursorHub {
@@ -94,6 +112,53 @@ impl WaylandCursorHub {
         }
     }
 
+    /// Applies one pointer position from the stream of output `connector`,
+    /// whose stream is `stream_size` pixels. Positions are in that stream's
+    /// pixels, so they are published as a desktop of that size: a
+    /// single-output desktop (a multi-output Wayland desktop does not report
+    /// positions yet, see `server.rs`).
+    pub fn apply_position(
+        &self,
+        connector: &str,
+        stream_size: (u32, u32),
+        position: &CapencCursorPosition,
+    ) {
+        if !position.on_output {
+            return;
+        }
+        tracing::trace!(
+            target: target::INPUT,
+            connector,
+            x = position.x,
+            y = position.y,
+            "Wayland pointer position"
+        );
+        self.pointer.platform(DesktopPointerSample {
+            x: position.x,
+            y: position.y,
+            desktop_width: stream_size.0,
+            desktop_height: stream_size.1,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Notes the pixel size of the stream positions are reported in.
+    pub fn note_stream_size(&self, stream_size: (u32, u32)) {
+        self.pointer.set_desktop_size(stream_size.0, stream_size.1);
+    }
+
+    /// The desktop's pointer, for the bridged pen's reader.
+    #[must_use]
+    pub fn desktop_pointer(&self) -> Arc<DesktopPointer> {
+        Arc::clone(&self.pointer)
+    }
+
+    /// Follows the pointer's position.
+    #[must_use]
+    pub fn subscribe_pointer(&self) -> watch::Receiver<Option<DesktopPointerSample>> {
+        self.pointer.subscribe()
+    }
+
     /// Follows the current cursor; the receiver starts with the cursor as
     /// last reported, so a new attachment shows it at once.
     #[must_use]
@@ -130,6 +195,7 @@ impl HubRegistry {
             runtime_dir: runtime_dir.to_path_buf(),
             desktop: Mutex::new(DesktopCursor::default()),
             facts: watch::channel(None).0,
+            pointer: Arc::new(DesktopPointer::new(PenMapping::WholeArea)),
         });
         hubs.push(Arc::clone(&hub));
         while hubs.len() > MAX_DESKTOPS {

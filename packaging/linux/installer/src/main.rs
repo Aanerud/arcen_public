@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -42,6 +45,10 @@ mod display_manager;
 /// on `std` and `arcen-outputs`, which owns the decision itself.
 #[path = "../../../../hosts/linux/src/display/gpu_pci.rs"]
 mod gpu_pci;
+/// Native tablet's virtual USB host controller (`vhci-hcd`): Rocky/RHEL's
+/// `kernel-modules-internal` for the running kernel, recorded and removed
+/// again by `--uninstall`.
+mod native_tablet;
 /// The launcher's rule for trusting the Xorg template, so the installer never
 /// repairs (and so launders) a file the Pier itself would refuse.
 #[path = "../../../../hosts/linux/src/display/xorg_template_trust.rs"]
@@ -92,12 +99,30 @@ const CONFIG_TEMPLATE: &str = include_str!("../../arcen-pier.json");
 const XORG_TEMPLATE: &str = include_str!("../../arcen-xorg.conf");
 const XORG_CONFIG_PATH: &str = "/etc/arcen/xorg.conf";
 const LOGROTATE_CONF: &str = include_str!("../../arcen-pier.logrotate");
+/// Excludes the shared X11/ICE socket directories from systemd's `/tmp`
+/// ageing (`docs/operations/pier-administration.md`, X11 socket directory).
+const TMPFILES_CONF: &str = include_str!("../../arcen-pier.tmpfiles");
+const TMPFILES_PATH: &str = "/etc/tmpfiles.d/arcen-pier.conf";
 /// Third-party notices, shipped with the binary rather than kept only in the
 /// repository. The Pier statically links the Cisco OpenH264 source through
 /// `openh264-sys2`, and BSD-2-Clause requires binary distributions to reproduce
 /// that notice. A single-binary installer that omitted it would be
 /// redistributing the codec without its licence text.
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../../legal/THIRD_PARTY_NOTICES.md");
+/// The licence set shipped beside the binary in `/usr/share/doc/arcen/`: the
+/// AGPL, the store exception, the notice, the trademark policy and the
+/// third-party notices.
+const LEGAL_FILES: [(&str, &str); 5] = [
+    ("LICENSE", include_str!("../../../../LICENSE")),
+    (
+        "LICENSE-EXCEPTION.md",
+        include_str!("../../../../LICENSE-EXCEPTION.md"),
+    ),
+    ("NOTICE", include_str!("../../../../NOTICE")),
+    ("TRADEMARKS.md", include_str!("../../../../TRADEMARKS.md")),
+    ("THIRD_PARTY_NOTICES.md", THIRD_PARTY_NOTICES),
+];
+const LEGAL_DIR: &str = "/usr/share/doc/arcen";
 /// The administration guide, placed on the host so a sysadmin can tune the
 /// Pier without going back to the repository.
 const ADMIN_GUIDE: &str = include_str!("../../../../docs/operations/pier-administration.md");
@@ -195,6 +220,12 @@ struct Options {
     disable_gdm: bool,
     /// Put back what `--disable-gdm` changed, then exit.
     restore_gdm: bool,
+    /// Do not install `kernel-modules-internal` (Native tablet's `vhci-hcd`)
+    /// on a Rocky/RHEL-family host, even with Native tablet enabled.
+    no_native_tablet_modules: bool,
+    /// `--native-tablet` / `--no-native-tablet`: the administrator's
+    /// `usb.native_tablet` choice; `None` keeps the configuration's.
+    native_tablet: Option<native_tablet::Choice>,
     /// Extra names or addresses to place in the generated TLS certificate.
     ///
     /// The certificate is otherwise built from what the machine can see of
@@ -250,6 +281,8 @@ fn parse_args() -> Result<Options, String> {
         qualify_outputs: Vec::new(),
         disable_gdm: false,
         restore_gdm: false,
+        no_native_tablet_modules: false,
+        native_tablet: None,
         extra_sans: Vec::new(),
     };
     let mut args = env::args().skip(1);
@@ -270,6 +303,20 @@ fn parse_args() -> Result<Options, String> {
             "--check" => options.check = true,
             "--disable-gdm" => options.disable_gdm = true,
             "--restore-gdm" => options.restore_gdm = true,
+            "--no-native-tablet-modules" => options.no_native_tablet_modules = true,
+            "--native-tablet" | "--no-native-tablet" => {
+                let choice = if arg == "--native-tablet" {
+                    native_tablet::Choice::Enable
+                } else {
+                    native_tablet::Choice::Disable
+                };
+                if options.native_tablet.is_some_and(|chosen| chosen != choice) {
+                    return Err(
+                        "--native-tablet and --no-native-tablet exclude each other".to_string()
+                    );
+                }
+                options.native_tablet = Some(choice);
+            }
             "--qualify-output" => {
                 let value = args
                     .next()
@@ -305,6 +352,8 @@ fn parse_args() -> Result<Options, String> {
                      \x20                        [--extra-san NAME-OR-IP] [--check]\n\
                      \x20                        [--qualify-output WIDTHxHEIGHT@HZ]\n\
                      \x20                        [--disable-gdm | --restore-gdm]\n\
+                     \x20                        [--native-tablet | --no-native-tablet]\n\
+                     \x20                        [--no-native-tablet-modules]\n\
                      \n\
                      The installer chooses the desktop from what this host has: an\n\
                      installed Xorg server keeps the dedicated X11 desktop; without one,\n\
@@ -327,6 +376,21 @@ fn parse_args() -> Result<Options, String> {
                      \x20            in /var/lib/arcen/display-manager-disabled.json.\n\
                      --restore-gdm  Put the display manager back as it was, then exit.\n\
                      \x20            --uninstall does this too.\n\
+                     \n\
+                     --native-tablet  Enable Native tablet: a Deck's physical pen tablet\n\
+                     \x20            attached to the remote desktop as a virtual USB device\n\
+                     \x20            (sets usb.native_tablet = \"enabled\" in pier.json). On\n\
+                     \x20            Rocky Linux/RHEL the installer then installs\n\
+                     \x20            kernel-modules-internal for the running kernel (devel\n\
+                     \x20            repository, GPG checked), which carries the in-tree USB/IP\n\
+                     \x20            controller vhci-hcd; the Pier loads it when it starts.\n\
+                     \x20            Off unless chosen; an upgrade keeps the current choice.\n\
+                     --no-native-tablet  Disable it (usb.native_tablet = \"disabled\") and\n\
+                     \x20            remove the package if this installer installed it.\n\
+                     --no-native-tablet-modules  Install no kernel package even with\n\
+                     \x20            Native tablet enabled (you provide vhci-hcd yourself).\n\
+                     \x20            --uninstall removes the package only if the installer\n\
+                     \x20            installed it.\n\
                      \n\
                      --extra-san  Add a DNS name or IP address to the generated TLS\n\
                      \x20            certificate. Repeatable, or comma-separated. Use this when\n\
@@ -540,6 +604,7 @@ fn check(options: &Options) -> Result<(), String> {
     for absent in &recommended {
         println!("missing (recommended): {absent}");
     }
+    native_tablet::describe(options.native_tablet, options.no_native_tablet_modules);
     println!();
     match plan {
         Some(InstallPlan::Xorg { .. }) => println!(
@@ -594,25 +659,26 @@ fn open_firewall(options: &Options) {
         }
         let already_open = firewalld_port_open();
         let runtime_was_open = firewalld_runtime_port_open();
-        let quic = Command::new("/usr/bin/firewall-cmd")
-            .args(["--permanent", "--add-port=18444/udp"])
-            .status();
-        let _remove_legacy = Command::new("/usr/bin/firewall-cmd")
-            .args(["--permanent", "--remove-port=18443/tcp"])
-            .status();
-        let reload = Command::new("/usr/bin/firewall-cmd")
-            .arg("--reload")
-            .status();
-        if matches!(quic, Ok(status) if status.success())
-            && matches!(reload, Ok(status) if status.success())
-        {
+        let legacy_open = firewalld_permanent_query("--query-port=18443/tcp");
+        // Only what needs changing is asked for: `--add-port` on an open port
+        // prints firewalld's ALREADY_ENABLED warning, and the operator then
+        // read "opened" beside a warning that it already was.
+        let quic = already_open || firewall_cmd(&["--permanent", "--add-port=18444/udp"]);
+        let legacy_removed =
+            legacy_open && firewall_cmd(&["--permanent", "--remove-port=18443/tcp"]);
+        let reloaded =
+            (already_open && runtime_was_open && !legacy_removed) || firewall_cmd(&["--reload"]);
+        if quic && reloaded {
             if !already_open {
                 record_firewall_owner(&FirewallMarker {
                     owner: FirewallOwner::Firewalld,
                     runtime_was_open,
                 });
             }
-            println!("firewalld: opened 18444/udp and removed legacy 18443/tcp");
+            println!(
+                "{}",
+                firewall_update_message("firewalld", already_open, legacy_removed)
+            );
             return;
         }
         println!(
@@ -621,21 +687,30 @@ fn open_firewall(options: &Options) {
         return;
     }
     if Path::new("/usr/sbin/ufw").exists() {
-        let already_open = ufw_rule_present();
-        let quic = Command::new("/usr/sbin/ufw")
-            .args(["allow", "18444/udp"])
-            .status();
-        let _remove_legacy = Command::new("/usr/sbin/ufw")
-            .args(["delete", "allow", "18443/tcp"])
-            .status();
-        if matches!(quic, Ok(status) if status.success()) {
+        let listing = ufw_added_rules();
+        let already_open = ufw_lists_rule(&listing, "18444/udp");
+        let legacy_open = ufw_lists_rule(&listing, "18443/tcp");
+        let quic = already_open
+            || Command::new("/usr/sbin/ufw")
+                .args(["allow", "18444/udp"])
+                .status()
+                .is_ok_and(|status| status.success());
+        let legacy_removed = legacy_open
+            && Command::new("/usr/sbin/ufw")
+                .args(["delete", "allow", "18443/tcp"])
+                .status()
+                .is_ok_and(|status| status.success());
+        if quic {
             if !already_open {
                 record_firewall_owner(&FirewallMarker {
                     owner: FirewallOwner::Ufw,
                     runtime_was_open: false,
                 });
             }
-            println!("ufw: opened 18444/udp and removed legacy 18443/tcp");
+            println!(
+                "{}",
+                firewall_update_message("ufw", already_open, legacy_removed)
+            );
             return;
         }
         println!(
@@ -659,12 +734,42 @@ fn firewalld_running() -> bool {
 
 /// Whether the permanent firewalld configuration already allows 18444/udp.
 fn firewalld_port_open() -> bool {
+    firewalld_permanent_query("--query-port=18444/udp")
+}
+
+/// One `firewall-cmd --permanent --query-…` answer.
+fn firewalld_permanent_query(query: &str) -> bool {
     Command::new("/usr/bin/firewall-cmd")
-        .args(["--permanent", "--query-port=18444/udp"])
+        .args(["--permanent", query])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Runs one changing `firewall-cmd`; its "success" chatter is dropped, its
+/// warnings and errors are left for the operator.
+fn firewall_cmd(args: &[&str]) -> bool {
+    Command::new("/usr/bin/firewall-cmd")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// What the installer did to a firewall, in one line that never says
+/// "opened" about a port that already was.
+fn firewall_update_message(firewall: &str, already_open: bool, legacy_removed: bool) -> String {
+    let quic = if already_open {
+        "18444/udp was already open"
+    } else {
+        "opened 18444/udp"
+    };
+    if legacy_removed {
+        format!("{firewall}: {quic}; removed legacy 18443/tcp")
+    } else {
+        format!("{firewall}: {quic}")
+    }
 }
 
 /// Whether the running firewalld already allows 18444/udp (perhaps only
@@ -723,19 +828,20 @@ impl FirewallMarker {
     }
 }
 
-/// Whether ufw already has the rule.
-fn ufw_rule_present() -> bool {
+/// `ufw show added`, empty when it cannot be read.
+fn ufw_added_rules() -> String {
     Command::new("/usr/sbin/ufw")
         .args(["show", "added"])
         .output()
-        .is_ok_and(|output| ufw_lists_quic_rule(&String::from_utf8_lossy(&output.stdout)))
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
 }
 
-/// Whether `ufw show added` lists the Pier's rule.
-fn ufw_lists_quic_rule(listing: &str) -> bool {
+/// Whether `ufw show added` lists `ufw allow <port>`.
+fn ufw_lists_rule(listing: &str, port: &str) -> bool {
     listing
         .lines()
-        .any(|line| line.trim() == "ufw allow 18444/udp")
+        .any(|line| line.trim().strip_prefix("ufw allow ") == Some(port))
 }
 
 /// Remember that this installer, not an administrator, opened 18444/udp.
@@ -982,16 +1088,19 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
     create_dir(options, "/var/log/arcen", 0o750)?;
     create_dir(options, "/run/arcen", 0o755)?;
     create_dir(options, "/usr/share/doc/arcen", 0o755)?;
+    let previous = previous_pier(options);
     write_atomic(options, PIER_PATH, PIER, 0o755, true)?;
     retire_legacy_pier(options)?;
     link_pier_onto_path(options)?;
-    write_atomic(
-        options,
-        "/usr/share/doc/arcen/THIRD_PARTY_NOTICES.md",
-        THIRD_PARTY_NOTICES.as_bytes(),
-        0o644,
-        true,
-    )?;
+    for (name, text) in LEGAL_FILES {
+        write_atomic(
+            options,
+            &format!("{LEGAL_DIR}/{name}"),
+            text.as_bytes(),
+            0o644,
+            true,
+        )?;
+    }
     write_atomic(
         options,
         "/usr/share/doc/arcen/pier-administration.md",
@@ -1003,6 +1112,13 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
         options,
         "/etc/logrotate.d/arcen-pier",
         LOGROTATE_CONF.as_bytes(),
+        0o644,
+        true,
+    )?;
+    write_atomic(
+        options,
+        TMPFILES_PATH,
+        TMPFILES_CONF.as_bytes(),
         0o644,
         true,
     )?;
@@ -1042,6 +1158,10 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
     ensure_cert(options)?;
     install_selinux_module(options)?;
     install_polkit_rule(options);
+    install_xorg_bridge_ignore(options, log)?;
+    if native_tablet::apply_choice(options, options.native_tablet, log)? {
+        native_tablet::ensure(options, options.no_native_tablet_modules, log);
+    }
     if options.dry_run {
         println!("dry-run: would run systemctl daemon-reload when installing to /");
     } else if is_root_prefix(&options.prefix) {
@@ -1079,11 +1199,105 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
             }
         ));
     }
+    if muted_default_note_applies(&previous, config_names_local_playback(options)) {
+        for line in MUTED_DEFAULT_NOTE {
+            log.note(line);
+        }
+    }
     if is_root_prefix(&options.prefix) && !options.dry_run {
         println!();
         println!("Administration guide: /usr/share/doc/arcen/pier-administration.md");
     }
     finish_install(transaction, &outcome)
+}
+
+/// The first Linux Pier that honours `audio.local_playback`, whose default
+/// is `muted`.
+const MUTED_DEFAULT_SINCE: (u64, u64, u64) = (0, 17, 0);
+
+const MUTED_DEFAULT_NOTE: [&str; 10] = [
+    "",
+    "=====================================================================",
+    " NOTE: this host's speakers are now muted during sessions.",
+    "",
+    " The Pier this upgrade replaced played a session's sound on the host too.",
+    " This one honours audio.local_playback, whose default is \"muted\", and",
+    " /etc/arcen/pier.json does not name it. To keep the speakers playing, set",
+    " \"local_playback\": \"audible\" in its \"audio\" section, then validate-config",
+    " and restart (Upgrade and rollback, /usr/share/doc/arcen/pier-administration.md).",
+    "=====================================================================",
+];
+
+/// The Pier an install replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviousPier {
+    /// Nothing installed: a fresh install.
+    Absent,
+    /// A Pier whose `--version` did not answer with a version.
+    Unknown,
+    Version(u64, u64, u64),
+}
+
+/// Asks the installed Pier (current or legacy path) for its version before
+/// it is replaced, as `nobody` and bounded. Every Linux Pier has answered
+/// `--version` without starting anything.
+fn previous_pier(options: &Options) -> PreviousPier {
+    if !is_root_prefix(&options.prefix) {
+        return PreviousPier::Absent;
+    }
+    let Some(path) = [PIER_PATH, LEGACY_PIER_PATH]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+    else {
+        return PreviousPier::Absent;
+    };
+    desktop::bounded_stdout_as(
+        path,
+        &["--version"],
+        std::time::Duration::from_secs(5),
+        true,
+    )
+    .and_then(|text| parse_pier_version(&text))
+    .map_or(PreviousPier::Unknown, |(major, minor, patch)| {
+        PreviousPier::Version(major, minor, patch)
+    })
+}
+
+/// `arcen-host 0.16.1` (or any `<name> X.Y.Z[-pre]` first line) as numbers.
+fn parse_pier_version(text: &str) -> Option<(u64, u64, u64)> {
+    let token = text.lines().next()?.split_whitespace().nth(1)?;
+    let core = token.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let version = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
+/// Whether the kept `/etc/arcen/pier.json` names `audio.local_playback`.
+fn config_names_local_playback(options: &Options) -> bool {
+    fs::read(map_path(&options.prefix, "/etc/arcen/pier.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|config| config.pointer("/audio/local_playback").is_some())
+}
+
+/// An upgrade from a Pier that played sound on the host, onto a
+/// configuration that does not choose: the operator is told, once, at the
+/// install, not only in the changelog.
+fn muted_default_note_applies(previous: &PreviousPier, config_names_local_playback: bool) -> bool {
+    if config_names_local_playback {
+        return false;
+    }
+    match previous {
+        PreviousPier::Absent => false,
+        PreviousPier::Unknown => true,
+        PreviousPier::Version(major, minor, patch) => {
+            (*major, *minor, *patch) < MUTED_DEFAULT_SINCE
+        }
+    }
 }
 
 /// Qualify a Wayland host with the Pier just installed, then start it only
@@ -1102,8 +1316,8 @@ fn activate_wayland(
 ) -> Result<ServiceOutcome, String> {
     if options.dry_run {
         println!(
-            "dry-run: would run `{PIER_PATH} wayland qualify --write`, then enable and start \
-             arcen-pier.service only if it passes"
+            "dry-run: would run `{}`, then enable and start arcen-pier.service only if it passes",
+            qualify_command(&options.qualify_outputs)
         );
         return Ok(ServiceOutcome::NotRequested);
     }
@@ -1113,8 +1327,9 @@ fn activate_wayland(
     if options.no_service {
         log.note(format!(
             "--no-service: the Wayland qualification was not run and the unit was not enabled. \
-             Before starting the service run `{PIER_PATH} wayland qualify --write`, then \
-             `systemctl enable --now arcen-pier.service`."
+             Before starting the service run `{}`, then \
+             `systemctl enable --now arcen-pier.service`.",
+            qualify_command(&options.qualify_outputs)
         ));
         return Ok(ServiceOutcome::NotRequested);
     }
@@ -1124,7 +1339,7 @@ fn activate_wayland(
         if record_matches_installed_pier() {
             report_pending_restart(options);
         } else {
-            report_pending_wayland_qualification(log);
+            report_pending_wayland_qualification(&options.qualify_outputs, log);
         }
         return Ok(outcome);
     }
@@ -1175,7 +1390,10 @@ fn activate_wayland(
     log.note(" arcen-pier.service was not started. Fix what is named above, then run");
     log.note(" (it measures every display size already known; nothing needs repeating):");
     log.note("");
-    log.note(format!("   sudo {PIER_PATH} wayland qualify --write"));
+    log.note(format!(
+        "   sudo {}",
+        qualify_command(&options.qualify_outputs)
+    ));
     log.note("   sudo systemctl enable --now arcen-pier.service");
     log.note("");
     log.note(" or run this installer again.");
@@ -1260,30 +1478,73 @@ fn record_matches_installed_pier() -> bool {
     })
 }
 
+/// The qualification command to print, with every size the operator named
+/// on this installer's command line: a printed recipe that dropped them
+/// re-measured only the default sizes.
+fn qualify_command(outputs: &[String]) -> String {
+    let mut command = format!("{PIER_PATH} wayland qualify --write");
+    for output in outputs {
+        command.push_str(" --output ");
+        command.push_str(output);
+    }
+    command
+}
+
 /// An upgrade under a running Wayland Pier: the new build needs its own
 /// qualification, which cannot run beside the old one.
-fn report_pending_wayland_qualification(log: &mut desktop::InstallLog) {
-    for line in [
+fn report_pending_wayland_qualification(outputs: &[String], log: &mut desktop::InstallLog) {
+    for line in pending_wayland_qualification_lines(outputs) {
+        log.note(line);
+    }
+}
+
+fn pending_wayland_qualification_lines(outputs: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = [
         "",
         "=====================================================================",
         " NOTE: the running service is still the PREVIOUS Pier, and this host",
         " serves Wayland: its qualification record belongs to that build.",
         "",
-        " The new Pier qualifies this host itself when the service next starts",
-        " (a restart or reboot; a few minutes before it listens, each step in",
-        " the log), keeping every display size already known. To do it now",
-        " and watch it (this disconnects every live session):",
-        "",
-        "   sudo systemctl stop arcen-pier.service",
-        &format!("   sudo {PIER_PATH} wayland qualify --write"),
-        "   sudo systemctl start arcen-pier.service",
-        "",
-        " or re-run this installer with --restart. If capture.wayland_auto_requalify",
-        " is false, the service refuses to start until you do.",
-        "=====================================================================",
-    ] {
-        log.note(line);
+    ]
+    .map(str::to_string)
+    .to_vec();
+    if outputs.is_empty() {
+        lines.extend(
+            [
+                " The new Pier qualifies this host itself when the service next starts",
+                " (a restart or reboot; a few minutes before it listens, each step in",
+                " the log), keeping every display size already known. To do it now",
+                " and watch it (this disconnects every live session):",
+            ]
+            .map(str::to_string),
+        );
+    } else {
+        lines.extend([
+            format!(
+                " The sizes given with --qualify-output ({}) are",
+                outputs.join(", ")
+            ),
+            " not in the record yet, and the automatic qualification at the next".to_string(),
+            " start measures only the sizes already known. Qualify them now (this".to_string(),
+            " disconnects every live session):".to_string(),
+        ]);
     }
+    let restart_flags: String = outputs
+        .iter()
+        .map(|output| format!(" --qualify-output {output}"))
+        .collect();
+    lines.extend([
+        String::new(),
+        "   sudo systemctl stop arcen-pier.service".to_string(),
+        format!("   sudo {}", qualify_command(outputs)),
+        "   sudo systemctl start arcen-pier.service".to_string(),
+        String::new(),
+        format!(" or re-run this installer with --restart{restart_flags}."),
+        " If capture.wayland_auto_requalify is false, the service refuses to".to_string(),
+        " start until you do.".to_string(),
+        "=====================================================================".to_string(),
+    ]);
+    lines
 }
 
 /// Load Arcen's SELinux policy module where SELinux is enabled.
@@ -1380,6 +1641,88 @@ fn remove_polkit_rules(options: &Options) -> Result<(), String> {
         {
             remove_file(options, path)?;
         }
+    }
+    Ok(())
+}
+
+/// Installs the system-wide Xorg class that makes every X server (the login
+/// screen, console sessions, other desktops) ignore bridged USB devices
+/// (Native tablet, ADR 0021); a dedicated desktop re-admits only its own.
+/// An X server reads it when it starts: one already running (the login
+/// screen) keeps a bridged tablet out only after its next start, and until
+/// then the Pier refuses Native tablet on X11 desktops with that reason.
+fn install_xorg_bridge_ignore(
+    options: &Options,
+    log: &mut desktop::InstallLog,
+) -> Result<(), String> {
+    use arcen_usb_bridge::bridge_seat::{
+        XORG_BRIDGE_IGNORE_CLASS, XORG_BRIDGE_IGNORE_PATH, is_xorg_bridge_ignore_conf,
+        xorg_bridge_ignore_conf,
+    };
+    let existing = fs::read_to_string(map_path(&options.prefix, XORG_BRIDGE_IGNORE_PATH)).ok();
+    match existing.as_deref() {
+        Some(text) if is_xorg_bridge_ignore_conf(text) => return Ok(()),
+        Some(text) if !text.contains(XORG_BRIDGE_IGNORE_CLASS) => {
+            log.note(format!(
+                "warning: {XORG_BRIDGE_IGNORE_PATH} exists and is not Arcen's; kept. Native \
+                 tablet on X11 desktops stays refused until it is Arcen's input isolation"
+            ));
+            return Ok(());
+        }
+        _ => {}
+    }
+    write_atomic(
+        options,
+        XORG_BRIDGE_IGNORE_PATH,
+        xorg_bridge_ignore_conf().as_bytes(),
+        0o644,
+        true,
+    )?;
+    log.note(format!(
+        "Native tablet (X11): installed {XORG_BRIDGE_IGNORE_PATH}, which keeps bridged tablets \
+         out of every X server but their own desktop's. An X server that is already running \
+         (the login screen) reads it only at its next start: restart the display manager \
+         (`systemctl restart gdm` when nobody is signed in at the console) or reboot before \
+         Native tablet is used on an X11 desktop."
+    ));
+    Ok(())
+}
+
+/// Removes the Xorg ignore class for bridged devices, if it is Arcen's.
+fn remove_xorg_bridge_ignore(options: &Options) -> Result<(), String> {
+    use arcen_usb_bridge::bridge_seat::{XORG_BRIDGE_IGNORE_CLASS, XORG_BRIDGE_IGNORE_PATH};
+    if fs::read_to_string(map_path(&options.prefix, XORG_BRIDGE_IGNORE_PATH))
+        .is_ok_and(|text| text.contains(XORG_BRIDGE_IGNORE_CLASS))
+    {
+        remove_file(options, XORG_BRIDGE_IGNORE_PATH)?;
+    }
+    Ok(())
+}
+
+/// Removes the volatile Hard USB seat rules (lab) a Pier's helpers left in
+/// `/run/udev/rules.d`, never a file there that Arcen did not write, and
+/// reloads udev. A stopped Pier's helpers normally remove their own and the
+/// next Pier sweeps the rest; this covers an uninstall or a rollback to a
+/// Pier that predates them.
+fn remove_bridge_seat_rules(options: &Options) -> Result<(), String> {
+    use arcen_usb_bridge::bridge_seat::{RULE_DIRECTORY, is_bridge_rule_text, is_rule_file};
+    let Ok(entries) = fs::read_dir(map_path(&options.prefix, RULE_DIRECTORY)) else {
+        return Ok(());
+    };
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_rule_file(&name)
+            && fs::read_to_string(entry.path()).is_ok_and(|text| is_bridge_rule_text(&text))
+        {
+            remove_file(options, &format!("{RULE_DIRECTORY}/{name}"))?;
+            removed = true;
+        }
+    }
+    if removed && !options.dry_run && is_root_prefix(&options.prefix) {
+        let _ = Command::new("udevadm")
+            .args(["control", "--reload"])
+            .status();
     }
     Ok(())
 }
@@ -1909,12 +2252,19 @@ fn uninstall(options: &Options) -> Result<(), String> {
     }
     remove_selinux_module(options)?;
     remove_polkit_rules(options)?;
+    remove_bridge_seat_rules(options)?;
+    remove_xorg_bridge_ignore(options)?;
+    // Before --purge removes /var/lib/arcen, which holds the record.
+    native_tablet::remove(options);
     remove_file(options, PIER_PATH)?;
     remove_symlink_if_ours(options);
     remove_file(options, LEGACY_PIER_PATH)?;
-    remove_file(options, "/usr/share/doc/arcen/THIRD_PARTY_NOTICES.md")?;
+    for (name, _) in LEGAL_FILES {
+        remove_file(options, &format!("{LEGAL_DIR}/{name}"))?;
+    }
     remove_file(options, "/usr/share/doc/arcen/pier-administration.md")?;
     remove_file(options, "/etc/logrotate.d/arcen-pier")?;
+    remove_file(options, TMPFILES_PATH)?;
     remove_dir_if_empty(options, PIER_DIR);
     remove_dir_if_empty(options, "/opt/arcen");
     remove_dir_if_empty(options, LEGACY_PIER_DIR);
@@ -1934,15 +2284,7 @@ fn uninstall(options: &Options) -> Result<(), String> {
             eprintln!("warning: display manager not restored: {error}");
         }
     }
-    remove_file(options, RECORD_PATH)?;
-    remove_file(
-        options,
-        &QualificationTarget::production().requested_outputs_path(),
-    )?;
-    remove_file(
-        options,
-        &QualificationTarget::production().requalify_marker_path(),
-    )?;
+    remove_qualification_state(options)?;
     close_firewall(options);
     remove_dir_if_empty(options, "/var/lib/arcen");
     remove_dir_if_empty(options, "/run/arcen/sessions");
@@ -2909,6 +3251,21 @@ fn write_atomic(
     fs::rename(&staged, &target).map_err(|error| format!("install {}: {error}", target.display()))
 }
 
+/// The production qualification record and the state kept beside it: the
+/// requested displays and both automatic re-qualification markers.
+fn remove_qualification_state(options: &Options) -> Result<(), String> {
+    let production = QualificationTarget::production();
+    for path in [
+        RECORD_PATH.to_owned(),
+        production.requested_outputs_path(),
+        production.requalify_marker_path(),
+        production.x11_requalify_marker_path(),
+    ] {
+        remove_file(options, &path)?;
+    }
+    Ok(())
+}
+
 fn remove_file(options: &Options, path: &str) -> Result<(), String> {
     let target = map_path(&options.prefix, path);
     if options.dry_run {
@@ -3076,6 +3433,29 @@ mod tests {
     use super::*;
 
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn the_installer_ships_the_whole_licence_set() {
+        let names: Vec<&str> = LEGAL_FILES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "LICENSE",
+                "LICENSE-EXCEPTION.md",
+                "NOTICE",
+                "TRADEMARKS.md",
+                "THIRD_PARTY_NOTICES.md"
+            ]
+        );
+        assert!(
+            LEGAL_FILES[0]
+                .1
+                .contains("GNU AFFERO GENERAL PUBLIC LICENSE")
+        );
+        assert!(LEGAL_FILES[1].1.contains("Store Distribution Exception"));
+        assert!(LEGAL_FILES[2].1.contains("TUTTIFRUTTI AS"));
+        assert!(LEGAL_FILES.iter().all(|(_, text)| !text.trim().is_empty()));
+    }
 
     fn staged() -> arcen_session::install_lifecycle::InstallTransaction {
         use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
@@ -3255,10 +3635,89 @@ mod tests {
         );
         assert_eq!(FirewallMarker::parse("nftables\n"), None);
         assert_eq!(FirewallMarker::parse(""), None);
-        assert!(ufw_lists_quic_rule(
-            "ufw allow 22/tcp\nufw allow 18444/udp\n"
+        assert!(ufw_lists_rule(
+            "ufw allow 22/tcp\nufw allow 18444/udp\n",
+            "18444/udp"
         ));
-        assert!(!ufw_lists_quic_rule("ufw allow 18443/tcp\n"));
+        assert!(!ufw_lists_rule("ufw allow 18443/tcp\n", "18444/udp"));
+        assert!(ufw_lists_rule("ufw allow 18443/tcp\n", "18443/tcp"));
+    }
+
+    #[test]
+    fn the_printed_qualification_keeps_the_sizes_the_operator_named() {
+        let outputs = vec!["1920x1080@120".to_string(), "1800x1130@60".to_string()];
+        assert_eq!(
+            qualify_command(&outputs),
+            format!(
+                "{PIER_PATH} wayland qualify --write --output 1920x1080@120 --output 1800x1130@60"
+            )
+        );
+        assert_eq!(
+            qualify_command(&[]),
+            format!("{PIER_PATH} wayland qualify --write")
+        );
+        let lines = pending_wayland_qualification_lines(&outputs);
+        assert!(lines.contains(&format!(
+            "   sudo {PIER_PATH} wayland qualify --write --output 1920x1080@120 --output 1800x1130@60"
+        )));
+        assert!(lines.iter().any(|line| line
+            == " or re-run this installer with --restart --qualify-output 1920x1080@120 \
+                 --qualify-output 1800x1130@60."));
+        let plain = pending_wayland_qualification_lines(&[]);
+        assert!(plain.contains(&" or re-run this installer with --restart.".to_string()));
+        assert!(!plain.iter().any(|line| line.contains("--qualify-output")));
+    }
+
+    #[test]
+    fn an_upgrade_from_an_audible_pier_says_the_speakers_are_now_muted() {
+        assert_eq!(
+            parse_pier_version("arcen-host 0.16.1\nArcen is free"),
+            Some((0, 16, 1))
+        );
+        assert_eq!(
+            parse_pier_version("arcen-host 0.17.0-rc5\n"),
+            Some((0, 17, 0))
+        );
+        assert_eq!(parse_pier_version("arcen-host\n"), None);
+        assert_eq!(parse_pier_version("arcen-host 0.17\n"), None);
+        assert_eq!(parse_pier_version(""), None);
+
+        let older = PreviousPier::Version(0, 16, 1);
+        assert!(muted_default_note_applies(&older, false));
+        assert!(
+            !muted_default_note_applies(&older, true),
+            "the operator chose"
+        );
+        assert!(muted_default_note_applies(&PreviousPier::Unknown, false));
+        assert!(!muted_default_note_applies(&PreviousPier::Absent, false));
+        assert!(!muted_default_note_applies(
+            &PreviousPier::Version(0, 17, 0),
+            false
+        ));
+        assert!(!muted_default_note_applies(
+            &PreviousPier::Version(0, 18, 0),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_firewall_line_never_says_opened_about_an_open_port() {
+        assert_eq!(
+            firewall_update_message("firewalld", true, false),
+            "firewalld: 18444/udp was already open"
+        );
+        assert_eq!(
+            firewall_update_message("firewalld", false, true),
+            "firewalld: opened 18444/udp; removed legacy 18443/tcp"
+        );
+        assert_eq!(
+            firewall_update_message("ufw", true, true),
+            "ufw: 18444/udp was already open; removed legacy 18443/tcp"
+        );
+        assert_eq!(
+            firewall_update_message("ufw", false, false),
+            "ufw: opened 18444/udp"
+        );
     }
 
     #[test]
@@ -3297,6 +3756,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
         install_selinux_module(&options).expect("stage the module");
@@ -3308,6 +3769,46 @@ mod tests {
         remove_selinux_module(&options).expect("remove the module");
         assert!(!staged.exists());
         assert!(!prefix.join("usr/share/arcen").exists());
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn uninstall_removes_the_record_and_every_file_kept_beside_it() {
+        let prefix = test_prefix("qualification-state");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: true,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            extra_sans: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
+        };
+        let production = QualificationTarget::production();
+        let state = [
+            RECORD_PATH.to_owned(),
+            production.requested_outputs_path(),
+            production.requalify_marker_path(),
+            production.x11_requalify_marker_path(),
+        ]
+        .map(|path| map_path(&prefix, &path));
+        let foreign = map_path(&prefix, "/var/lib/arcen/site-notes.json");
+        fs::create_dir_all(foreign.parent().expect("state dir")).expect("state dir");
+        for path in state.iter().chain([&foreign]) {
+            fs::write(path, b"{}").expect("state file");
+        }
+        remove_qualification_state(&options).expect("remove state");
+        for path in &state {
+            assert!(!path.exists(), "{} left behind", path.display());
+        }
+        assert!(foreign.exists(), "only Arcen's qualification files go");
         let _ = fs::remove_dir_all(&prefix);
     }
 
@@ -3328,6 +3829,8 @@ mod tests {
             extra_sans: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
         };
         let ours = map_path(&prefix, RULE_PATH);
         let legacy = map_path(&prefix, LEGACY_RULE_PATHS[0]);
@@ -3351,6 +3854,89 @@ mod tests {
             ours.exists(),
             "a file at Arcen's path that Arcen did not write stays"
         );
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn uninstall_removes_bridge_seat_rules_and_keeps_foreign_ones() {
+        use arcen_usb_bridge::bridge_seat::{BridgeSeat, RULE_DIRECTORY, udev_rule};
+        let prefix = test_prefix("bridge-seat");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: true,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            extra_sans: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
+        };
+        let dir = map_path(&prefix, RULE_DIRECTORY);
+        fs::create_dir_all(&dir).expect("rules dir");
+        let seat = BridgeSeat::x11_session(58, [3; 8]).expect("seat");
+        let ours = dir.join(seat.rule_file_name());
+        fs::write(
+            &ours,
+            udev_rule("/devices/platform/vhci_hcd.0/usb3/3-1", &seat).expect("rule"),
+        )
+        .expect("our rule");
+        let squatter = dir.join(
+            BridgeSeat::x11_session(58, [4; 8])
+                .expect("seat")
+                .rule_file_name(),
+        );
+        fs::write(&squatter, "# not Arcen's\n").expect("squatter");
+        let foreign = dir.join("61-mutter.rules");
+        fs::write(&foreign, "# site rule\n").expect("foreign");
+        remove_bridge_seat_rules(&options).expect("remove rules");
+        assert!(!ours.exists());
+        assert!(squatter.exists(), "a file Arcen did not write stays");
+        assert!(foreign.exists());
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    /// Requirement (e): the Xorg class that keeps bridged tablets out of
+    /// every other X server is installed, kept when a site owns the path,
+    /// and removed at uninstall only when it is Arcen's.
+    #[test]
+    fn the_xorg_bridge_ignore_class_is_installed_and_removed() {
+        use arcen_usb_bridge::bridge_seat::{XORG_BRIDGE_IGNORE_PATH, xorg_bridge_ignore_conf};
+        let prefix = test_prefix("xorg-bridge-ignore");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: false,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            extra_sans: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
+        };
+        let path = map_path(&prefix, XORG_BRIDGE_IGNORE_PATH);
+        let mut log = desktop::InstallLog::default();
+        install_xorg_bridge_ignore(&options, &mut log).expect("install");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            xorg_bridge_ignore_conf()
+        );
+        remove_xorg_bridge_ignore(&options).expect("remove");
+        assert!(!path.exists());
+        fs::write(&path, "# site\n").unwrap();
+        install_xorg_bridge_ignore(&options, &mut log).expect("install");
+        remove_xorg_bridge_ignore(&options).expect("remove");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# site\n");
         let _ = fs::remove_dir_all(&prefix);
     }
 
@@ -3442,6 +4028,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
 
@@ -3483,6 +4071,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
 
@@ -3517,6 +4107,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
 
@@ -3555,6 +4147,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options));
@@ -3591,6 +4185,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options));
@@ -3627,6 +4223,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: vec!["alias.example.internal".to_string()],
         };
 
@@ -3677,6 +4275,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
 
@@ -3713,6 +4313,8 @@ mod tests {
                     qualify_outputs: Vec::new(),
                     disable_gdm: false,
                     restore_gdm: false,
+                    no_native_tablet_modules: false,
+                    native_tablet: None,
                     extra_sans: Vec::new(),
                 };
                 let paths = TlsPaths::from_options(&options);
@@ -3771,6 +4373,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
 
@@ -3801,6 +4405,8 @@ mod tests {
             qualify_outputs: Vec::new(),
             disable_gdm: false,
             restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
             extra_sans: Vec::new(),
         };
         let paths = TlsPaths::from_options(&options);
@@ -3859,7 +4465,8 @@ mod tests {
     const LAB_BUS_ID_LINE: &str = "    BusID          \"PCI:6:16:0\"\n";
     const DRIVER_LINE: &str = "    Driver         \"nvidia\"\n";
 
-    /// The 0.16.1 template: the stock file with the development lab's GPU.
+    /// The 0.16.1 template: the stock file with a fixed legacy GPU BusID,
+    /// which must be repaired from the host's inventory.
     fn lab_template() -> String {
         XORG_TEMPLATE.replacen(DRIVER_LINE, &format!("{DRIVER_LINE}{LAB_BUS_ID_LINE}"), 1)
     }

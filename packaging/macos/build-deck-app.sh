@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Build the macOS Deck bundle for one architecture.
 #
 # Compiles arcen-deck-macos in release for one target architecture and
@@ -57,6 +59,8 @@ export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
 # and that silently shipped a release whose Input settings read "(not
 # available in this build)" for a mode that was finished and working.
 EMBED_USB_HELPER="${ARCEN_EMBED_USB_HELPER:-1}"
+# The helper's capture backend for Native tablet: IOUSBHost (ADR 0019).
+HELPER_FEATURES="${ARCEN_USB_HELPER_FEATURES:-iousbhost}"
 # Embedding the helper and signing for USB access are the same decision.
 # Choosing them separately produced a bundle carrying a helper it had no
 # entitlement to use.
@@ -153,10 +157,20 @@ feature_list_contains() {
 
 DECK_FEATURES="$(normalize_deck_features "${ARCEN_DECK_FEATURES:-}")"
 DEV_TOOLS_MARKER="ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP"
+USB_EMULATE_MARKER="ARCEN_DECK_USB_EMULATE_FEATURE_MARKER_DO_NOT_SHIP"
+# Lab and developer features a release Deck must never contain.
+RELEASE_FORBIDDEN_FEATURES="dev-tools usb-emulate-lab experimental-raw-hid"
+# Strings those features compile in; a release binary carrying one is refused
+# even when it was assembled with --no-build from a stale local build.
+DO_NOT_SHIP_MARKERS="$DEV_TOOLS_MARKER $USB_EMULATE_MARKER"
 
-if [ "$RELEASE" -eq 1 ] && feature_list_contains "$DECK_FEATURES" "dev-tools"; then
-  echo "error: --release must not be built with dev-tools (ARCEN_DECK_FEATURES)" >&2
-  exit 2
+if [ "$RELEASE" -eq 1 ]; then
+  for FORBIDDEN in $RELEASE_FORBIDDEN_FEATURES; do
+    if feature_list_contains "$DECK_FEATURES" "$FORBIDDEN"; then
+      echo "error: --release must not be built with $FORBIDDEN (ARCEN_DECK_FEATURES)" >&2
+      exit 2
+    fi
+  done
 fi
 
 if [ "$NO_BUILD" -eq 0 ]; then
@@ -218,9 +232,11 @@ if [ "$NO_BUILD" -eq 0 ]; then
     fi
   }
   if [ "$EMBED_USB_HELPER" = "1" ]; then
-    append_deck_feature "usb-hard-lab"
-    echo "==> cargo build --locked --release --target $RUST_TARGET -p arcen-usb-helper"
-    ( cd "$REPO" && "${CARGO[@]}" build --locked --release --target "$RUST_TARGET" -p arcen-usb-helper )
+    append_deck_feature "native-tablet"
+    # Native tablet captures with IOUSBHost (ADR 0019); libusb stays
+    # selectable in the helper with --backend libusb.
+    echo "==> cargo build --locked --release --target $RUST_TARGET -p arcen-usb-helper --features $HELPER_FEATURES"
+    ( cd "$REPO" && "${CARGO[@]}" build --locked --release --target "$RUST_TARGET" -p arcen-usb-helper --features "$HELPER_FEATURES" )
   fi
   CARGO_DECK_ARGS=(build --locked --release --target "$RUST_TARGET" -p arcen-deck-macos)
   if [ -n "$DECK_FEATURES" ]; then
@@ -257,9 +273,13 @@ python3 "$REPO/scripts/verify_quic_product_binary.py" "$BIN"
 DECK_ARCH="$(verify_macho_target "$BIN")"
 [ "$DECK_ARCH" = "$TARGET_ARCH" ] || { echo "error: $BIN is $DECK_ARCH but $TARGET_ARCH was requested" >&2; exit 1; }
 echo "==> arcen-deck: $DECK_ARCH, macOS $MIN_MACOS or later"
-if [ "$RELEASE" -eq 1 ] && strings "$BIN" | grep -F "$DEV_TOOLS_MARKER" >/dev/null; then
-    echo "error: release binary contains dev-tools marker; rebuild without dev-tools in a clean target dir" >&2
-    exit 1
+if [ "$RELEASE" -eq 1 ]; then
+  for MARKER in $DO_NOT_SHIP_MARKERS; do
+    if strings "$BIN" | grep -F "$MARKER" >/dev/null; then
+      echo "error: release binary contains $MARKER; rebuild without lab or developer features in a clean target dir" >&2
+      exit 1
+    fi
+  done
 fi
 
 echo "==> assembling $APP"
@@ -279,6 +299,9 @@ BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")"
 cp "$BIN" "$APP/Contents/MacOS/arcen-deck"
 cp "$REPO/legal/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
 cp "$REPO/LICENSE" "$APP/Contents/Resources/LICENSE"
+cp "$REPO/LICENSE-EXCEPTION.md" "$APP/Contents/Resources/LICENSE-EXCEPTION.md"
+cp "$REPO/NOTICE" "$APP/Contents/Resources/NOTICE"
+cp "$REPO/TRADEMARKS.md" "$APP/Contents/Resources/TRADEMARKS.md"
 # App icon. Generated from the first-party brand mark; regenerate with
 # packaging/macos/build-app-icon.sh if AppIcon.svg changes.
 [ -f "$HERE/AppIcon.icns" ] || { echo "error: app icon not found: $HERE/AppIcon.icns"; exit 1; }
@@ -297,6 +320,10 @@ if [ "$EMBED_USB_HELPER" = "1" ]; then
   [ -f "$HELPER_PLIST" ] || { echo "error: helper LaunchDaemon plist not found: $HELPER_PLIST"; exit 1; }
   HELPER_ARCH="$(verify_macho_target "$HELPER_BIN")"
   [ "$HELPER_ARCH" = "$DECK_ARCH" ] || { echo "error: helper is $HELPER_ARCH but Deck is $DECK_ARCH" >&2; exit 1; }
+  if [ "$RELEASE" -eq 1 ] && ! otool -L "$HELPER_BIN" | grep -F IOUSBHost.framework >/dev/null; then
+    echo "error: release helper does not link IOUSBHost.framework; build it with --features iousbhost" >&2
+    exit 1
+  fi
   mkdir -p "$APP/Contents/Library/LaunchDaemons"
   cp "$HELPER_BIN" "$APP/Contents/MacOS/arcen-usb-helper"
   chmod +x "$APP/Contents/MacOS/arcen-usb-helper"

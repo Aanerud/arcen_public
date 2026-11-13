@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Arcen Deck -- dedicated 10-bit `CAMetalLayer` video shader (MSL).
 //
 // This is the Metal Shading Language twin of `video_render.wgsl`'s
@@ -261,11 +263,11 @@ static float2 chroma_codes(
 // `plane0` is bound with sample access only so `chroma_codes` can take a
 // block mean in one filtered sample. Chroma is reconstructed explicitly by
 // `chroma_codes`, identically to the WGSL twin.
-fragment float4 fs_convert(
-    VsOut in [[stage_in]],
-    texture2d<float, access::sample> plane0 [[texture(0)]],
-    texture2d<float, access::read> plane1 [[texture(1)]],
-    constant VideoUniform& u [[buffer(0)]]
+static float4 convert_codes(
+    VsOut in,
+    texture2d<float, access::sample> plane0,
+    texture2d<float, access::read> plane1,
+    constant VideoUniform& u
 ) {
     uint2 luma_coord = uint2(in.uv * float2(u.luma_width, u.luma_height));
 
@@ -307,4 +309,37 @@ fragment float4 fs_convert(
     float blue = luma_norm + 2.0 * (1.0 - u.kb) * blue_diff;
     float green = (luma_norm - u.kr * red - u.kb * blue) * u.kg_inv;
     return float4(saturate(red), saturate(green), saturate(blue), 1.0);
+}
+
+fragment float4 fs_convert(
+    VsOut in [[stage_in]],
+    texture2d<float, access::sample> plane0 [[texture(0)]],
+    texture2d<float, access::read> plane1 [[texture(1)]],
+    constant VideoUniform& u [[buffer(0)]]
+) {
+    return convert_codes(in, plane0, plane1, u);
+}
+
+// Lossless refinement (ADR 0016 R1), RGB domain: `overlay` is an
+// `RGB10A2Uint` texture at the source's size holding R'G'B' codes and a
+// nonzero alpha where a refined, currently valid block lies. Such a pixel
+// is the source's own code, written directly -- `code / 1023` into the
+// `RGB10A2Unorm` target stores exactly `code` -- and never passes the
+// matrix; every other pixel is `fs_convert`'s. Composited at the source
+// coordinate, before any scaling or display transform.
+fragment float4 fs_convert_refined(
+    VsOut in [[stage_in]],
+    texture2d<float, access::sample> plane0 [[texture(0)]],
+    texture2d<float, access::read> plane1 [[texture(1)]],
+    texture2d<uint, access::read> overlay [[texture(2)]],
+    constant VideoUniform& u [[buffer(0)]]
+) {
+    uint2 luma_coord = uint2(in.uv * float2(u.luma_width, u.luma_height));
+    if (luma_coord.x < overlay.get_width() && luma_coord.y < overlay.get_height()) {
+        uint4 code = overlay.read(luma_coord);
+        if (code.a != 0) {
+            return float4(float3(code.rgb) / 1023.0, 1.0);
+        }
+    }
+    return convert_codes(in, plane0, plane1, u);
 }

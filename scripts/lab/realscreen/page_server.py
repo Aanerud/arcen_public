@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Tiny host-side server for the real-screen latency page.
 
 Serves latency.html on 127.0.0.1 and appends every POST /log batch, stamped
@@ -39,6 +41,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, str(time.time_ns()).encode(), "text/plain")
         elif self.path.startswith("/latency.html") or self.path == "/":
             self._send(200, (HERE / "latency.html").read_bytes(), "text/html; charset=utf-8")
+        elif self.path.startswith("/cursors.html"):
+            self._send(200, (HERE / "cursors.html").read_bytes(), "text/html; charset=utf-8")
         else:
             self._send(404, b"not found", "text/plain")
 

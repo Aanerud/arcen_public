@@ -2,7 +2,6 @@
 
 **Status.** Analysis + contract correction. No Blackwell silicon has been
 tested; none is available to the project yet.
-**Branch.** `feat/nvenc-blackwell-422-uhq`, off hardware-golden `2c8e5c7`.
 
 ---
 
@@ -47,7 +46,7 @@ Precise names, so the update is mechanical rather than exploratory.
 | `NV_ENC_CAPS_SUPPORT_YUV422_ENCODE` | cap enum entry | Runtime 4:2:2 query |
 | `NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY` | tuning enum entry | UHQ |
 
-Two details that will otherwise cost an afternoon each:
+Two details to get right:
 
 - **P210 is MSB-aligned**, exactly like the `YUV444_10BIT` path already proven
   in the colour work. 10-bit white is `0xFFC0`, not `0x03FF`. `ColorTransform::pack_p16`
@@ -65,11 +64,11 @@ fields are clearer and should be adopted once available.
 
 ---
 
-## 3. Governance: this is a third-party intake
+## 3. Provenance: updating the headers
 
-The current bindings are pinned to an older NVIDIA header snapshot. Updating
-them means bringing in a **newer NVIDIA header**, which is a
-fresh third-party intake and therefore **Release/Security review**, not
+The current bindings are pinned to the vendored `nv-codec-headers` snapshot
+(`third_party/nv-codec-headers`, NVENC API 12.1). Updating them means
+vendoring a **newer header**, recorded like every other vendored source, not
 something to do quietly in a feature commit.
 
 The clean, well-precedented route is FFmpeg's **`nv-codec-headers`**
@@ -77,21 +76,21 @@ The clean, well-precedented route is FFmpeg's **`nv-codec-headers`**
 `nvEncodeAPI.h` and is how essentially every open-source project consumes
 NVENC. That avoids the NVIDIA SDK EULA question entirely.
 
-Required before merging any binding update:
+Required with any binding update:
 
-1. Release/Security sign-off on the intake.
-2. An entry in `legal/ORIGINS.md`: source repository path, full
+1. An entry in `legal/ORIGINS.md`: source repository path, full
    source commit, Arcen destination path, treatment, required notices.
-3. MIT notice recorded in the third-party notices file.
+2. MIT notice recorded in the third-party notices file.
+3. The generated bindings, GUIDs and struct versions agreeing with the
+   vendored header (`scripts/ci/check-publication-hygiene.sh` checks this).
 
-**This is the gate. Everything in §4 is downstream of it.**
+The Blackwell features in §2 depend on that update.
 
 ---
 
-## 4. What this branch changes
+## 4. The contract correction
 
-Deliberately small, because the interesting work is gated. What is here is the
-part that is correct to do *now*.
+Deliberately small: the part that is correct before the header update.
 
 ### 4.1 The contract no longer over-claims 4:2:2
 
@@ -145,14 +144,14 @@ already exist in NVENCAPI 12.1.** They need no binding update, no Blackwell,
 and no SDK 13.0. A "grading quality" mode is available on the hardware the
 project already has, and it plausibly delivers more visible benefit to the
 stated audience than 4:2:2 ever will — 4:2:2 is, after all, strictly *less*
-chroma than the 4:4:4 that is already hardware-golden.
+chroma than the 4:4:4 that is already hardware-proven.
 
 Its value is mainly for interchange with 4:2:2-native broadcast and camera
 workflows, and for bandwidth: 4:2:2 sits between 4:2:0 and 4:4:4, so it is a
 meaningful middle rung when 4:4:4 is too expensive for the link. Useful, but
 not the headline.
 
-Plumbing required (not done on this branch — it crosses owners):
+Plumbing it needed (since implemented; see [Encode intent](encode-intent.md)):
 
 `ClientSettings` quality preference → `QualitySettings` on the wire →
 host colour/quality policy config → capenc argument → preset/tuning selection
@@ -167,7 +166,7 @@ colour work targets.
 
 ## 6. Verification
 
-Run on this branch:
+Validation:
 
 ```sh
 cargo test --locked -p arcen-media
@@ -175,9 +174,8 @@ cargo clippy --locked -p arcen-media -- -D warnings
 cargo fmt --all --check
 ```
 
-`arcen-media` is 189 tests here (188 on golden, plus the new contract
-regression). The added probe rows are covered by the existing variant
-round-trip and id-stability tests.
+The contract regression adds one `arcen-media` test. The added probe rows are
+covered by the existing variant round-trip and id-stability tests.
 
 No hardware validation is possible for §2 until Blackwell silicon is
 available. The current test GPU correctly reports `hevc-422-10` as
@@ -195,7 +193,7 @@ with a reason rather than at encoder init.
 - Blackwell does **not** lift the two ceilings that matter most: no 12-bit
   anywhere on NVENC, and no AV1 4:4:4. Grading stays on HEVC 4:4:4; 12-bit
   stays software-only.
-- This branch removes a live over-claim, pins the reason with a test that
+- The contract correction removes a live over-claim, pins the reason with a test that
   nudges the next person, and stages the probe rows.
 - **The highest-value next step is not Blackwell at all** — it is a grading
   quality mode using the HIGH_QUALITY tuning and P5–P7 presets that NVENCAPI

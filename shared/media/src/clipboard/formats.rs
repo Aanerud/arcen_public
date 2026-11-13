@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host clipboard formats: which native names carry Arcen's two wire kinds.
 //!
 //! X11 selection targets and Wayland/Mutter MIME types name the same things

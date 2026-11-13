@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Deterministic, real-Quinn proof that `run_carrier_a`/`run_carrier_b`
 //! leave zero live tasks behind — and leave both connections in a state
 //! that never blocks a subsequent, unrelated run — on every non-success

@@ -8,7 +8,12 @@
     {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
-      "contracts": ["login_window_handover", "network_reachability", "restore_lease"],
+      "contracts": [
+        "connection_diagnostics",
+        "login_window_handover",
+        "network_reachability",
+        "restore_lease"
+      ],
       "paths": [
         {
           "id": "macos-deck-session",
@@ -24,6 +29,20 @@
         {
           "id": "macos-deck-transport",
           "entry_points": ["clients/macos/src/transport/websocket.rs"],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-session-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-connection-test",
+          "entry_points": [
+            "clients/macos/src/transport/diagnose.rs",
+            "clients/macos/src/ui/connection_test.rs"
+          ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -381,7 +400,8 @@
         "host_lifecycle",
         "pier_config",
         "restore_lease",
-        "session_admission"
+        "session_admission",
+        "setup_budget"
       ],
       "production_uses": [
         {
@@ -389,6 +409,18 @@
           "gate": 4,
           "symbol": "SessionLifecycles",
           "reason": "Each Pier reports its session steps to the shared lifecycle, which enforces ordering and readiness evidence the same way on every host."
+        },
+        {
+          "id": "windows-agent-setup-budget",
+          "gate": 4,
+          "symbol": "SetupDeadline",
+          "reason": "The broker's readiness wait and the agent's HDR activation wait come from one shared budget, so the agent refuses with a typed reason before the broker terminates it."
+        },
+        {
+          "id": "agent-video-release",
+          "gate": 6,
+          "symbol": "VideoReleased",
+          "reason": "The service tells its desktop agent which video frames its lane relay released, in the shared broker-agent vocabulary."
         }
       ],
       "paths": [

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! DMA-BUF layout for EGL import and producer synchronisation.
 //!
 //! [`egl_import_attributes_as`] turns a validated DMA-BUF surface into the

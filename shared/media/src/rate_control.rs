@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Live video bitrate control shared by every Pier.
 //!
 //! The encoder starts at the conservative link cap that has protected the WAN
@@ -1076,7 +1078,7 @@ mod tests {
         }
     }
 
-    /// Live Deck-at-home trace (VPN to the lab, 2026-09-27): a path that
+    /// Regression trace from a variable-capacity VPN path: a path that
     /// carries 10 Mbps of paced UDP at 0.065% loss still shows QUIC a few
     /// tenths of a percent of loss, each with a congestion event and RTT
     /// jitter of a millisecond or two. That must not walk the encoder down to

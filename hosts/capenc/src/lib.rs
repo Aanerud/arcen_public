@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // arcen-capenc — fused capture+encode helper.
 //
 // One native process per host that captures the desktop and encodes it on
@@ -62,7 +64,7 @@ mod wgc;
 #[cfg(windows)]
 mod win;
 /// Research diagnostic for genuine >8bpc source capture. See
-/// `docs/internal/ten-bit-source-capture.md`.
+/// `docs/architecture/color-fidelity.md`.
 #[cfg(windows)]
 mod win_color_probe;
 
@@ -123,6 +125,19 @@ use std::io::Write;
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
 ))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+/// Whether the Linux Xorg capture backend selected for `bit_depth` copies and
+/// converts every frame on the CPU (the depth-30 XShm path), and so is bound
+/// by `arcen_media::video::host_converted_capture_fits`. The eight-bit NvFBC
+/// path stays on the GPU and has no such budget.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub const fn linux_capture_is_host_converted(bit_depth: arcen_media::BitDepth) -> bool {
+    matches!(
+        linux_policy::linux_capture_backend(bit_depth),
+        linux_policy::LinuxCaptureBackend::XShm
+    )
+}
 
 /// Whether the Linux capture backend selected for `bit_depth` can composite
 /// the host cursor into captured frames.
@@ -1033,6 +1048,28 @@ pub(crate) fn write_access_unit(
     writer.flush()
 }
 
+/// Writes one access unit in the framing the parent asked for: a framed-v2
+/// `AccessUnit` record whenever `framed-v2` was requested — also when lossless
+/// refinement was refused — otherwise framed-v1 or raw Annex-B.
+#[cfg(any(test, all(target_os = "linux", feature = "nvenc")))]
+pub(crate) fn write_access_unit_as_requested(
+    writer: &mut impl Write,
+    access_unit: &[u8],
+    framed_v1: bool,
+    framed_v2: bool,
+) -> std::io::Result<()> {
+    if framed_v2 {
+        validate_access_unit(access_unit, true)?;
+        arcen_media::capenc_stream::write_record(
+            writer,
+            arcen_media::capenc_stream::CapencRecordKind::AccessUnit,
+            access_unit,
+        )
+    } else {
+        write_access_unit(writer, access_unit, framed_v1)
+    }
+}
+
 #[cfg(any(
     windows,
     all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
@@ -1040,6 +1077,19 @@ pub(crate) fn write_access_unit(
 pub(crate) fn frame_interval_from_fps(fps: u32) -> Duration {
     let fps = fps.clamp(1, 240);
     Duration::from_micros(1_000_000 / u64::from(fps))
+}
+
+/// Exits with status 2 when the dispatched path cannot honour the output
+/// arguments (`framed-v2`, `refine=on`).
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn refuse_unsupported_output(
+    args: &[String],
+    route: arcen_media::capenc_stream::CapencRoute,
+) {
+    if let Err(error) = arcen_media::capenc_stream::check_output_request(args, route) {
+        log(&format!("ERROR: {error}"));
+        std::process::exit(2);
+    }
 }
 
 pub fn run_with_args(args: Vec<String>) {
@@ -1052,7 +1102,10 @@ pub fn run_with_args(args: Vec<String>) {
     let _ = &args;
 
     #[cfg(windows)]
-    win::run_with_args(args);
+    {
+        refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Windows);
+        win::run_with_args(args);
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -1116,6 +1169,7 @@ pub fn run_with_args(args: Vec<String>) {
         // A Wayland session hands capenc its capture stream through the
         // shared hand-off; Xorg sessions never set it. Dispatch once, here.
         if std::env::var_os(arcen_media::video::capture_handoff::CAPTURE_PROVIDER_ENV).is_some() {
+            refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Wayland);
             #[cfg(feature = "wayland")]
             std::process::exit(wayland::pipelines::run(&args));
             #[cfg(not(feature = "wayland"))]
@@ -1144,6 +1198,7 @@ pub fn run_with_args(args: Vec<String>) {
                 );
                 std::process::exit(2);
             }
+            refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::XorgOther);
             #[cfg(feature = "software-h264")]
             linux_x11::run_with_args(args);
             #[cfg(not(feature = "software-h264"))]
@@ -1195,6 +1250,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_v2_access_units_are_records_even_without_refinement() {
+        use arcen_media::capenc_stream::{record_body_length, record_kind, CapencRecordKind};
+        let access_unit = [0_u8, 0, 0, 1, 0x65, 0x88];
+        let mut out = Vec::new();
+        write_access_unit_as_requested(&mut out, &access_unit, false, true).unwrap();
+        let length = record_body_length(out[..4].try_into().unwrap()).unwrap();
+        assert_eq!(
+            record_kind(out[4], length),
+            Ok(CapencRecordKind::AccessUnit)
+        );
+        assert_eq!(&out[5..], &access_unit);
+        let mut v1 = Vec::new();
+        write_access_unit_as_requested(&mut v1, &access_unit, true, false).unwrap();
+        assert_eq!(&v1[..4], &(access_unit.len() as u32).to_be_bytes());
+    }
 
     /// The SPS NVENC wrote for a 640x360 HEVC 4:4:4 10-bit full-range BT.709
     /// self-test on the Linux lab's V100 (ffprobe: Rext, yuv444p10le, pc).

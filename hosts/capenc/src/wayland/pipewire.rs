@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `PipeWire` stream consumer for one compositor output.
 //!
 //! One thread owns the `PipeWire` main loop, context, core and stream; no
@@ -1228,6 +1230,7 @@ fn colour_of(info: &spa::param::video::VideoInfoRaw) -> SourceColour {
             _ => None,
         }),
         sdr_white_nits: SourceFact::Unknown,
+        sdr_content: SourceFact::Unknown,
     }
 }
 

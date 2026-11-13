@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! QUIC lane roles and the bounded lane preface (lane protocol v1).
 //!
 //! One authenticated QUIC connection carries several independent streams
@@ -48,7 +50,7 @@ pub const LANE_ATTACHMENT_BINDING_BYTES: usize = 16;
 pub const LANE_PREFACE_BYTES: usize =
     LANE_PREFACE_HEADER_BYTES + 1 + 1 + 8 + 4 + LANE_ATTACHMENT_BINDING_BYTES;
 /// Number of lane roles in lane protocol v1.
-pub const LANE_ROLE_COUNT: usize = 6;
+pub const LANE_ROLE_COUNT: usize = 7;
 /// The 16-byte preface of the pre-lane single-stream direct carrier
 /// (`arcen-transport` `quic::direct`). Recognised only to report a version
 /// mismatch; it is never accepted as a lane.
@@ -234,6 +236,10 @@ pub enum LaneRole {
     Microphone,
     /// Clipboard payloads and authorized USB/HID transfers.
     BulkAux,
+    /// Lossless refinement tiles and digests (ADR 0016), lowest priority.
+    /// Granted only to a Deck that advertised `lossless_refine_v1`; an older
+    /// Deck refuses an unknown role token in its grant.
+    Refine,
 }
 
 impl LaneRole {
@@ -245,6 +251,7 @@ impl LaneRole {
         Self::InputCursor,
         Self::Microphone,
         Self::BulkAux,
+        Self::Refine,
     ];
 
     /// Wire value.
@@ -257,6 +264,7 @@ impl LaneRole {
             Self::InputCursor => 4,
             Self::Microphone => 5,
             Self::BulkAux => 6,
+            Self::Refine => 7,
         }
     }
 
@@ -270,6 +278,7 @@ impl LaneRole {
             4 => Some(Self::InputCursor),
             5 => Some(Self::Microphone),
             6 => Some(Self::BulkAux),
+            7 => Some(Self::Refine),
             _ => None,
         }
     }
@@ -290,6 +299,7 @@ impl LaneRole {
             Self::InputCursor => "input_cursor",
             Self::Microphone => "microphone",
             Self::BulkAux => "bulk_aux",
+            Self::Refine => "refine",
         }
     }
 
@@ -304,7 +314,9 @@ impl LaneRole {
     pub const fn shape(self) -> LaneShape {
         match self {
             Self::Control | Self::InputCursor | Self::BulkAux => LaneShape::Bidirectional,
-            Self::Video | Self::AudioOutput | Self::Microphone => LaneShape::Unidirectional,
+            Self::Video | Self::AudioOutput | Self::Microphone | Self::Refine => {
+                LaneShape::Unidirectional
+            }
         }
     }
 
@@ -315,7 +327,7 @@ impl LaneRole {
             Self::Control | Self::InputCursor | Self::BulkAux | Self::Microphone => {
                 LaneEndpoint::Deck
             }
-            Self::Video | Self::AudioOutput => LaneEndpoint::Pier,
+            Self::Video | Self::AudioOutput | Self::Refine => LaneEndpoint::Pier,
         }
     }
 
@@ -324,7 +336,7 @@ impl LaneRole {
     pub const fn flow(self) -> LaneFlow {
         match self {
             Self::Control | Self::InputCursor | Self::BulkAux => LaneFlow::Both,
-            Self::Video | Self::AudioOutput => LaneFlow::PierToDeck,
+            Self::Video | Self::AudioOutput | Self::Refine => LaneFlow::PierToDeck,
             Self::Microphone => LaneFlow::DeckToPier,
         }
     }
@@ -350,7 +362,9 @@ impl LaneRole {
     pub const fn framing(self) -> LaneFraming {
         match self {
             Self::Control | Self::InputCursor | Self::BulkAux => LaneFraming::SessionMessages,
-            Self::Video | Self::AudioOutput | Self::Microphone => LaneFraming::LengthPrefixedMedia,
+            Self::Video | Self::AudioOutput | Self::Microphone | Self::Refine => {
+                LaneFraming::LengthPrefixedMedia
+            }
         }
     }
 
@@ -368,7 +382,10 @@ impl LaneRole {
             | FrameType::RegionVideoFull
             | FrameType::RegionVideoH264
             | FrameType::RegionVideoH265
-            | FrameType::RegionVideoAv1 => Self::Video,
+            | FrameType::RegionVideoAv1
+            | FrameType::RefineFence
+            | FrameType::RefineBarrier => Self::Video,
+            FrameType::RefineTiles | FrameType::RefineDigest => Self::Refine,
             FrameType::Audio => Self::AudioOutput,
             FrameType::AudioUpstream => Self::Microphone,
             FrameType::Clipboard
@@ -378,7 +395,7 @@ impl LaneRole {
             | FrameType::UsbBridgeUrbSubmit
             | FrameType::UsbBridgeUrbCancel
             | FrameType::UsbBridgeUrbComplete => Self::BulkAux,
-            FrameType::CursorUpdate => Self::InputCursor,
+            FrameType::CursorUpdate | FrameType::CursorPosition => Self::InputCursor,
         }
     }
 }
@@ -409,10 +426,34 @@ impl LaneRoleSet {
         Self(bits)
     }
 
-    /// Every role.
+    /// Every role, including the capability-gated ones. A Pier never
+    /// grants this set as such: use [`Self::for_grant`].
     #[must_use]
     pub const fn all() -> Self {
         Self::from_roles(&LaneRole::ALL)
+    }
+
+    /// Every role a Pier may grant without an optional capability: what a
+    /// Deck that predates lossless refinement accepts.
+    pub const BASE: Self = Self::from_roles(&[
+        LaneRole::Control,
+        LaneRole::Video,
+        LaneRole::AudioOutput,
+        LaneRole::InputCursor,
+        LaneRole::Microphone,
+        LaneRole::BulkAux,
+    ]);
+
+    /// The roles a Pier grants: [`Self::BASE`], plus [`LaneRole::Refine`]
+    /// only when the Deck advertised `lossless_refine_v1` and the Pier's
+    /// refinement plan is on (ADR 0016 R7).
+    #[must_use]
+    pub const fn for_grant(refine: bool) -> Self {
+        if refine {
+            Self::BASE.with(LaneRole::Refine)
+        } else {
+            Self::BASE
+        }
     }
 
     /// Whether `role` is in the set.
@@ -1342,6 +1383,7 @@ mod tests {
                 LaneFlow::DeckToPier,
             ),
             (LaneRole::BulkAux, Bidirectional, Deck, LaneFlow::Both),
+            (LaneRole::Refine, Unidirectional, Pier, LaneFlow::PierToDeck),
         ];
         for (role, shape, opener, flow) in table {
             assert_eq!(role.shape(), shape, "{role}");
@@ -1352,7 +1394,7 @@ mod tests {
             assert_eq!(LaneRole::ALL[role.index()], role);
         }
         assert!(LaneRole::from_wire(0).is_none());
-        assert!(LaneRole::from_wire(7).is_none());
+        assert!(LaneRole::from_wire(8).is_none());
         // A unidirectional lane only carries payload from its opener.
         for role in LaneRole::ALL {
             if role.shape() == Unidirectional {
@@ -1408,6 +1450,10 @@ mod tests {
         );
         assert_eq!(
             lane_for_binary_message(&[0x50]),
+            Some(LaneRole::InputCursor)
+        );
+        assert_eq!(
+            lane_for_binary_message(&[0x51]),
             Some(LaneRole::InputCursor)
         );
     }
@@ -1837,5 +1883,75 @@ mod tests {
         );
         assert_eq!(lane_for_binary_message(&[0xEE]), None);
         assert_eq!(lane_for_binary_message(&[]), None);
+    }
+
+    /// The grant validator of a Deck that predates lossless refinement:
+    /// six roles, strict tokens (the 0.18.0 `LaneAttachmentMsg::validate`
+    /// role checks).
+    fn pre_refine_deck_accepts(message: &LaneAttachmentMsg) -> bool {
+        const PRE_REFINE_ROLE_COUNT: usize = 6;
+        const PRE_REFINE_TOKENS: [&str; 5] = [
+            "video",
+            "audio_output",
+            "input_cursor",
+            "microphone",
+            "bulk_aux",
+        ];
+        message.roles.len() < PRE_REFINE_ROLE_COUNT
+            && message
+                .roles
+                .iter()
+                .all(|token| PRE_REFINE_TOKENS.contains(&token.as_str()))
+    }
+
+    #[test]
+    fn a_grant_lists_refine_only_for_a_capable_deck_and_old_decks_keep_working() {
+        let base = LaneAttachmentMsg::new(attachment(), LaneRoleSet::for_grant(false));
+        assert!(!base.roles.iter().any(|role| role == "refine"));
+        assert!(pre_refine_deck_accepts(&base));
+        let (_, roles) = base
+            .validate()
+            .expect("current deck accepts the base grant");
+        assert!(!roles.contains(LaneRole::Refine));
+
+        let refine = LaneAttachmentMsg::new(attachment(), LaneRoleSet::for_grant(true));
+        assert_eq!(refine.roles.len(), 6);
+        assert!(
+            !pre_refine_deck_accepts(&refine),
+            "an old deck refuses the refine token, so it must never be sent one"
+        );
+        let (_, roles) = refine.validate().expect("current deck accepts refine");
+        assert!(roles.contains(LaneRole::Refine));
+        assert_eq!(
+            LaneRoleSet::BASE,
+            LaneRoleSet::all()
+                .iter()
+                .filter(|role| *role != LaneRole::Refine)
+                .fold(LaneRoleSet::EMPTY, LaneRoleSet::with)
+        );
+    }
+
+    #[test]
+    fn refine_records_route_fences_with_video_and_tiles_on_the_refine_lane() {
+        assert_eq!(
+            LaneRole::for_frame_type(FrameType::RefineFence),
+            LaneRole::Video
+        );
+        assert_eq!(
+            LaneRole::for_frame_type(FrameType::RefineBarrier),
+            LaneRole::Video
+        );
+        assert_eq!(
+            LaneRole::for_frame_type(FrameType::RefineTiles),
+            LaneRole::Refine
+        );
+        assert_eq!(
+            LaneRole::for_frame_type(FrameType::RefineDigest),
+            LaneRole::Refine
+        );
+        assert_eq!(LaneRole::Refine.opener(), LaneEndpoint::Pier);
+        assert_eq!(LaneRole::Refine.shape(), LaneShape::Unidirectional);
+        assert!(!LaneRole::Refine.may_send(LaneEndpoint::Deck));
+        assert_eq!(LaneRole::from_wire(7), Some(LaneRole::Refine));
     }
 }

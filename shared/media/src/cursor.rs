@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host cursor images.
 //!
 //! A compositor that reports its cursor separately from the video (a
@@ -59,6 +61,23 @@ impl std::fmt::Display for CursorImageError {
 }
 
 impl std::error::Error for CursorImageError {}
+
+/// Bytes in one row of a 1-bit mask plane: rows are padded to 32 bits, as
+/// in a device-independent bitmap.
+#[must_use]
+pub const fn mask_row_bytes(width: u32) -> usize {
+    (width as usize).div_ceil(32) * 4
+}
+
+/// The XOR plane of a mask cursor ([`CursorImage::from_mask_planes`]).
+#[derive(Debug, Clone, Copy)]
+pub enum MaskXorPlane<'a> {
+    /// 1 bit per pixel, most significant bit first, rows of
+    /// [`mask_row_bytes`].
+    Monochrome(&'a [u8]),
+    /// 4 bytes per pixel in B, G, R, unused order, rows top-down.
+    Bgrx(&'a [u8]),
+}
 
 /// A validated straight-alpha cursor image with its hotspot inside it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -151,6 +170,182 @@ impl CursorImage {
             ]);
         }
         Self::from_straight_rgba(width, height, hotspot, rgba)
+    }
+
+    /// Converts X11 `XFixes` cursor pixels: one `u32` per pixel,
+    /// `0xAARRGGBB`, premultiplied, rows top-down.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_straight_rgba`].
+    pub fn from_premultiplied_argb32(
+        width: u32,
+        height: u32,
+        hotspot: (i64, i64),
+        pixels: &[u32],
+    ) -> Result<Self, CursorImageError> {
+        if pixels.len().checked_mul(4) != Some(pixel_bytes(width, height)?) {
+            return Err(CursorImageError::Length);
+        }
+        let mut rgba = Vec::with_capacity(pixels.len() * 4);
+        for pixel in pixels {
+            let [alpha, red, green, blue] = pixel.to_be_bytes();
+            rgba.extend_from_slice(&[
+                unpremultiply(red, alpha),
+                unpremultiply(green, alpha),
+                unpremultiply(blue, alpha),
+                alpha,
+            ]);
+        }
+        Self::from_straight_rgba(width, height, hotspot, rgba)
+    }
+
+    /// Converts straight-alpha pixels in B, G, R, A byte order, rows
+    /// top-down (a Windows 32-bit colour cursor with an alpha channel).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_straight_rgba`].
+    pub fn from_straight_bgra(
+        width: u32,
+        height: u32,
+        hotspot: (i64, i64),
+        pixels: &[u8],
+    ) -> Result<Self, CursorImageError> {
+        if pixels.len() != pixel_bytes(width, height)? {
+            return Err(CursorImageError::Length);
+        }
+        let mut rgba = Vec::with_capacity(pixels.len());
+        for pixel in pixels.chunks_exact(4) {
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        Self::from_straight_rgba(width, height, hotspot, rgba)
+    }
+
+    /// Converts a cursor drawn with an AND mask and an XOR plane, the model
+    /// of Windows cursors without an alpha channel (monochrome cursors and
+    /// old colour ones).
+    ///
+    /// Per pixel: AND 0 draws the XOR value opaquely; AND 1 with a zero XOR
+    /// value is transparent; AND 1 with a nonzero XOR value inverts the
+    /// screen, which a client cursor cannot do. Those pixels become opaque
+    /// black and every transparent pixel touching one becomes opaque white,
+    /// so an inverting cursor (the classic text I-beam) stays visible on
+    /// both light and dark content.
+    ///
+    /// # Errors
+    ///
+    /// [`CursorImageError`] for out-of-range dimensions or planes of the
+    /// wrong length.
+    pub fn from_mask_planes(
+        width: u32,
+        height: u32,
+        hotspot: (i64, i64),
+        and_mask: &[u8],
+        xor: MaskXorPlane<'_>,
+    ) -> Result<Self, CursorImageError> {
+        let total = pixel_bytes(width, height)?;
+        let (w, h) = (width as usize, height as usize);
+        let stride = mask_row_bytes(width);
+        if and_mask.len() != stride * h {
+            return Err(CursorImageError::Length);
+        }
+        match xor {
+            MaskXorPlane::Monochrome(plane) if plane.len() != stride * h => {
+                return Err(CursorImageError::Length);
+            }
+            MaskXorPlane::Bgrx(plane) if plane.len() != total => {
+                return Err(CursorImageError::Length);
+            }
+            _ => {}
+        }
+        let bit =
+            |plane: &[u8], x: usize, y: usize| plane[y * stride + x / 8] & (0x80 >> (x % 8)) != 0;
+        let mut rgba = vec![0u8; total];
+        let mut inverted = vec![false; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let index = y * w + x;
+                let rgb = match xor {
+                    MaskXorPlane::Monochrome(plane) => {
+                        if bit(plane, x, y) {
+                            [255, 255, 255]
+                        } else {
+                            [0, 0, 0]
+                        }
+                    }
+                    MaskXorPlane::Bgrx(plane) => {
+                        let at = index * 4;
+                        [plane[at + 2], plane[at + 1], plane[at]]
+                    }
+                };
+                let out = &mut rgba[index * 4..index * 4 + 4];
+                if !bit(and_mask, x, y) {
+                    out.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                } else if rgb != [0, 0, 0] {
+                    out.copy_from_slice(&[0, 0, 0, 255]);
+                    inverted[index] = true;
+                }
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let index = y * w + x;
+                if rgba[index * 4 + 3] != 0 {
+                    continue;
+                }
+                let touches = (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|ny| {
+                    (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| inverted[ny * w + nx])
+                });
+                if touches {
+                    rgba[index * 4..index * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        Self::from_straight_rgba(width, height, hotspot, rgba)
+    }
+
+    /// Converts the bitmaps of an icon-style cursor: an optional 32-bit
+    /// colour bitmap (B, G, R, A, rows top-down) and its 1-bit mask (rows of
+    /// [`mask_row_bytes`]). Without a colour bitmap the mask holds the AND
+    /// plane above the XOR plane (`2 * height` rows, a monochrome cursor).
+    /// A colour bitmap with any nonzero alpha is used as straight alpha;
+    /// one without alpha is drawn through the mask.
+    ///
+    /// # Errors
+    ///
+    /// [`CursorImageError`] for out-of-range dimensions or bitmaps of the
+    /// wrong length.
+    pub fn from_icon_planes(
+        width: u32,
+        height: u32,
+        hotspot: (i64, i64),
+        colour: Option<&[u8]>,
+        mask: &[u8],
+    ) -> Result<Self, CursorImageError> {
+        let plane = mask_row_bytes(width) * height as usize;
+        match colour {
+            Some(colour) if colour.chunks_exact(4).any(|pixel| pixel[3] != 0) => {
+                Self::from_straight_bgra(width, height, hotspot, colour)
+            }
+            Some(colour) => {
+                Self::from_mask_planes(width, height, hotspot, mask, MaskXorPlane::Bgrx(colour))
+            }
+            None => {
+                pixel_bytes(width, height)?;
+                if mask.len() != plane * 2 {
+                    return Err(CursorImageError::Length);
+                }
+                let (and_mask, xor) = mask.split_at(plane);
+                Self::from_mask_planes(
+                    width,
+                    height,
+                    hotspot,
+                    and_mask,
+                    MaskXorPlane::Monochrome(xor),
+                )
+            }
+        }
     }
 
     /// Width in pixels.
@@ -389,26 +584,46 @@ impl CursorImage {
         )
     }
 
-    /// Prepares the image for a native cursor whose image is
-    /// `points_per_pixel` display points per stream pixel: resampled to that
-    /// size and premultiplied (as `NSBitmapImageRep` expects by default).
+    /// The scale [`Self::present`] applies for `points_per_pixel`: that
+    /// factor, reduced as one factor for both sides when the longer side
+    /// would exceed [`MAX_PRESENTED_CURSOR_SIDE`], so aspect ratio and
+    /// hotspot are kept. An invalid factor reads as one.
     #[must_use]
-    pub fn present(&self, points_per_pixel: f32) -> PresentedCursor {
+    pub fn presentation_factor(&self, points_per_pixel: f32) -> f64 {
         let factor = if points_per_pixel.is_finite() && points_per_pixel > 0.0 {
             f64::from(points_per_pixel)
         } else {
             1.0
         };
+        let longest = f64::from(self.width.max(self.height));
+        factor.min(f64::from(MAX_PRESENTED_CURSOR_SIDE) / longest)
+    }
+
+    /// Whether [`Self::present`] draws the image at exactly
+    /// `points_per_pixel`, without the size cap reducing it.
+    #[must_use]
+    pub fn presents_unreduced(&self, points_per_pixel: f32) -> bool {
+        points_per_pixel.is_finite()
+            && points_per_pixel > 0.0
+            && self.presentation_factor(points_per_pixel) >= f64::from(points_per_pixel)
+    }
+
+    /// Prepares the image for a native cursor whose image is
+    /// `points_per_pixel` display points per stream pixel: resampled to that
+    /// size (reduced by [`Self::presentation_factor`] when it would exceed
+    /// [`MAX_PRESENTED_CURSOR_SIDE`]) and premultiplied (as
+    /// `NSBitmapImageRep` expects by default).
+    #[must_use]
+    pub fn present(&self, points_per_pixel: f32) -> PresentedCursor {
+        let factor = self.presentation_factor(points_per_pixel);
         let size = |value: u32| -> u32 {
             let scaled = (f64::from(value) * factor).round();
             if scaled < 1.0 {
                 1
-            } else if scaled > f64::from(MAX_PRESENTED_CURSOR_SIDE) {
-                MAX_PRESENTED_CURSOR_SIDE
             } else {
-                // Bounded above, so the cast is exact.
+                // At most the largest side (one factor for both sides).
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let scaled = scaled as u32;
+                let scaled = (scaled as u32).min(MAX_PRESENTED_CURSOR_SIDE);
                 scaled
             }
         };
@@ -591,5 +806,141 @@ mod tests {
         );
         let invalid = image.present(f32::NAN);
         assert_eq!((invalid.width, invalid.height), (4, 4));
+    }
+
+    #[test]
+    fn xfixes_pixels_become_straight_rgba() {
+        let pixels = [0xff10_2030, 0x0000_0000, 0x8040_2000, 0x80ff_ffff];
+        let image = CursorImage::from_premultiplied_argb32(2, 2, (1, 1), &pixels).unwrap();
+        assert_eq!(&image.rgba()[0..4], &[0x10, 0x20, 0x30, 255]);
+        assert_eq!(&image.rgba()[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&image.rgba()[8..12], &[128, 64, 0, 128]);
+        // Malformed premultiplication saturates rather than wrapping.
+        assert_eq!(&image.rgba()[12..16], &[255, 255, 255, 128]);
+        assert_eq!(
+            CursorImage::from_premultiplied_argb32(2, 2, (0, 0), &pixels[..3]),
+            Err(CursorImageError::Length)
+        );
+        assert!(CursorImage::from_premultiplied_argb32(0, 0, (0, 0), &[]).is_err());
+    }
+
+    #[test]
+    fn colour_cursors_with_alpha_keep_it() {
+        let bgra = [10, 20, 30, 255, 1, 2, 3, 0];
+        let image = CursorImage::from_icon_planes(2, 1, (0, 0), Some(&bgra), &[0; 4]).unwrap();
+        assert_eq!(image.rgba(), &[30, 20, 10, 255, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn mask_cursors_draw_through_their_mask_and_outline_inversion() {
+        // 4x3 monochrome: row 0 white/black/transparent/invert, rows 1-2
+        // transparent.
+        let stride = mask_row_bytes(4);
+        assert_eq!(stride, 4);
+        let mut mask = vec![0u8; stride * 6];
+        // AND plane.
+        mask[0] = 0b0011_0000;
+        mask[stride] = 0b1111_0000;
+        mask[stride * 2] = 0b1111_0000;
+        // XOR plane.
+        mask[stride * 3] = 0b1001_0000;
+        let image = CursorImage::from_icon_planes(4, 3, (0, 0), None, &mask).unwrap();
+        let px = |x: usize, y: usize| &image.rgba()[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        assert_eq!(px(0, 0), &[255, 255, 255, 255]);
+        assert_eq!(px(1, 0), &[0, 0, 0, 255]);
+        // Transparent but touching the inverted pixel: outlined white.
+        assert_eq!(px(2, 0), &[255, 255, 255, 255]);
+        assert_eq!(px(3, 0), &[0, 0, 0, 255]);
+        assert_eq!(px(3, 1), &[255, 255, 255, 255]);
+        assert_eq!(px(0, 2), &[0, 0, 0, 0]);
+        // A colour cursor without alpha also draws through its mask.
+        let colour = [9, 8, 7, 0, 0, 0, 0, 0];
+        let and_mask = [0b0100_0000, 0, 0, 0];
+        let image = CursorImage::from_icon_planes(2, 1, (0, 0), Some(&colour), &and_mask).unwrap();
+        assert_eq!(image.rgba(), &[7, 8, 9, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn hostile_bitmaps_are_refused_without_panicking() {
+        for (width, height) in [(0, 1), (1, 0), (385, 1), (1, 385), (u32::MAX, u32::MAX)] {
+            assert!(matches!(
+                CursorImage::from_icon_planes(width, height, (0, 0), None, &[]),
+                Err(CursorImageError::Dimensions { .. })
+            ));
+            assert!(CursorImage::from_straight_bgra(width, height, (0, 0), &[]).is_err());
+        }
+        // Planes one byte short or long.
+        let stride = mask_row_bytes(32);
+        assert_eq!(
+            CursorImage::from_icon_planes(32, 32, (0, 0), None, &vec![0; stride * 64 - 1]),
+            Err(CursorImageError::Length)
+        );
+        assert_eq!(
+            CursorImage::from_icon_planes(32, 32, (0, 0), None, &vec![0; stride * 64 + 1]),
+            Err(CursorImageError::Length)
+        );
+        assert_eq!(
+            CursorImage::from_icon_planes(32, 32, (0, 0), Some(&[0; 32 * 32 * 4]), &[0; 3]),
+            Err(CursorImageError::Length)
+        );
+        assert_eq!(
+            CursorImage::from_icon_planes(32, 32, (0, 0), Some(&[0; 5]), &vec![0; stride * 32]),
+            Err(CursorImageError::Length)
+        );
+        // A hotspot far outside is clamped, never trusted.
+        let image =
+            CursorImage::from_straight_bgra(2, 2, (i64::MAX, i64::MIN), &[255; 16]).unwrap();
+        assert_eq!(image.hotspot(), (1, 0));
+    }
+
+    #[test]
+    fn translucent_gradients_survive_the_wire_as_valid_premultiplied_pixels() {
+        // A diagonal orange-to-translucent-blue gradient, as a browser draws
+        // for a custom CSS cursor, through the whole host → Deck path.
+        let side = 128u32;
+        let mut bgra = Vec::new();
+        for y in 0..side {
+            for x in 0..side {
+                let t = (x + y) * 255 / (2 * side - 2);
+                let alpha = 255 - t * 215 / 255;
+                bgra.extend_from_slice(&[
+                    u8::try_from(t).unwrap(),
+                    u8::try_from(128 - t / 2).unwrap(),
+                    u8::try_from(255 - t).unwrap(),
+                    u8::try_from(alpha).unwrap(),
+                ]);
+            }
+        }
+        let image = CursorImage::from_straight_bgra(side, side, (0, 0), &bgra).unwrap();
+        let wire = image.to_wire().unwrap().unwrap();
+        let decoded =
+            CursorImage::from_wire_png(&wire.png, side, side, wire.image.hotspot()).unwrap();
+        assert_eq!(decoded.rgba(), image.rgba());
+        for scale in [0.5, 1.0, 1.5] {
+            let presented = decoded.present(scale);
+            for pixel in presented.rgba_premultiplied.chunks_exact(4) {
+                assert!(pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3]);
+            }
+        }
+    }
+
+    #[test]
+    fn large_cursors_shrink_by_one_factor_keeping_aspect_and_hotspot() {
+        let image =
+            CursorImage::from_straight_rgba(256, 160, (128, 80), [9, 9, 9, 255].repeat(256 * 160))
+                .unwrap();
+        // 2.67 would make 683x427: one factor (2.0) brings the longer side
+        // to the cap instead of clamping each side on its own.
+        assert!(!image.presents_unreduced(2.67));
+        let presented = image.present(2.67);
+        assert_eq!((presented.width, presented.height), (512, 320));
+        assert_eq!(presented.hotspot, (256, 160));
+        assert!(image.presents_unreduced(2.0));
+        assert!(!image.presents_unreduced(f32::NAN));
+        let small = image.present(0.5);
+        assert_eq!(
+            (small.width, small.height, small.hotspot),
+            (128, 80, (64, 40))
+        );
     }
 }

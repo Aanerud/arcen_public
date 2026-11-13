@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Remote-monitor outputs: a session's virtual outputs as Mutter
 //! `ScreenCast.RecordVirtual` monitors (Mutter 49 and later, see
 //! [`arcen_session::wayland_outputs`]).

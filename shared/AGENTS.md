@@ -69,8 +69,38 @@ OpenH264 raw `SetOption` exception in `software_h264.rs`. Shared manifests must
 not reference `hosts/`, `clients/`, or `packaging/`.
 
 Escalate public API, wire compatibility, trust-boundary, cryptography, and new
-third-party dependency changes to Release/Security. Notify every affected
-product owner before changing shared behavior.
+third-party dependency changes to Release/Security. Consult the maintainers
+of affected consumers before changing shared behavior.
+
+## Native tablet: what lives here (reuse before adding)
+
+| Need | Use | Crate |
+| --- | --- | --- |
+| A pen's position from its own reports | `tablet_pointer::{PenSample, EvdevPenFrames, PenPointerLead, PenPointerHub}` | `arcen-input` |
+| Whether a host remapped the tablet, and the scaling | `tablet_pointer::{PenMapping, x11_wacom_mapping, map_to_output}` | `arcen-input` |
+| Telling the Deck where the host pointer is | `host_pointer::{HostPointerFeed, HostPointerReporter, HostPointerLayout}` | `arcen-input` |
+| The Deck's lead decision and the pen dot | `host_pointer::{DeckHostPointer, PointerAuthority, led_pointer_mark}` | `arcen-input` |
+| The wire record and its relay | `cursor_position::{CursorPosition, CursorPositionRelay}` | `arcen-protocol` |
+| Is this device a tablet; may it be bridged | `tablet_claim`, `bridged_device_guard` | `arcen-usb-bridge` |
+| Udev rule and Xorg classes for a bridged device | `bridge_seat` | `arcen-usb-bridge` |
+| Reading a known model's pen (macOS Pier) | `wacom_intuos_pen::{IntuosPenReader, HOST_DECODED_INTUOS_MODELS}` | `arcen-usb-bridge` |
+| The bridge engine | `exporter` (Deck), `hid_host` (macOS Pier) | `arcen-usb-bridge` |
+
+The full map, with the platform adapters, is in
+[`docs/architecture/pen-tablet-input.md`](../docs/architecture/pen-tablet-input.md#native-tablet-where-each-piece-lives).
+
+## Native tablet: one path
+
+`arcen_input::tablet_pointer` is the one pen-position path for every Pier
+(ADR 0023): `PenSample` (what a platform adapter produces), `EvdevPenFrames`
+(evdev → samples, `SYN_DROPPED` resync), `PenPointerLead`/`PenPointerHub`
+(pen leads in proximity under a whole-area mapping, otherwise the
+platform's pointer), `x11_wacom_mapping` (the remap check), and
+`map_to_output` (the X server's and Mutter's scaling). It feeds
+`host_pointer::HostPointerFeed`; the Deck's mark is
+`host_pointer::led_pointer_mark` (a bridged pen always gets the pen dot).
+Platform code only reads devices and publishes; never add mapping or lead
+logic under `hosts/`.
 
 ## Shared consumer register
 

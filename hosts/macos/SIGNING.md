@@ -1,7 +1,8 @@
 # macOS Pier: App ID, signing, notarization and entitlements
 
-This records what the macOS Pier is signed as, how it is notarized, and —
-mostly — which entitlements it deliberately does **not** have.
+This records what the macOS Pier is signed as, how it is notarized, which one
+entitlement it carries, and — mostly — which entitlements it deliberately does
+**not** have.
 
 ## The App ID and bundle identifiers
 
@@ -36,9 +37,14 @@ top-level bundle has no container to be credited to.
 ```sh
 packaging/macos/build-pier-pkg.sh \
   --identity "Developer ID Application: Tuttifrutti AS (NWR7ZH8L7U)" \
+  --with-virtual-hid --provisioning-profile <pier.arcen.tech Developer ID profile> \
   --installer-identity "Developer ID Installer: Tuttifrutti AS (NWR7ZH8L7U)" \
   --notary-profile <notary-keychain-profile-name>
 ```
+
+Releases are built with `--with-virtual-hid` (0.18.0 was). Without it the
+package still installs and serves a signed-in desktop, but the login window
+gets no input and `input_backend: virtual_hid` falls back to `CGEvent`.
 
 Three distinct credentials, and they are not interchangeable:
 
@@ -54,10 +60,10 @@ is launched, so notarizing only the payload leaves a package refused before its
 contents are ever examined.
 
 `build-pier-app.sh` builds the release `arcen-pier-macos` binary before it
-assembles the bundle. That is intentional. An earlier version merely checked
-that `target/release/arcen-pier-macos` existed and packaged it, which produced
-a signed, notarized, successfully installed package containing a binary older
-than the source fix being tested.
+assembles the bundle, so the package always contains the freshly built
+executable. A script that only checked that `target/release/arcen-pier-macos`
+existed could sign, notarize and install a binary older than the source it
+was meant to test.
 
 Signing is inside out and never uses `codesign --deep`: `--deep` re-signs
 nested content with the outer identity, which would give the helper the Pier's
@@ -68,18 +74,33 @@ provisioning profile for `pier.arcen.tech`. It is signing material and is
 never committed — `.gitignore` excludes `*.provisionprofile` repository-wide,
 unanchored so that a profile dropped in a directory nobody anticipated is still
 excluded. Keep it outside the tree (alongside the other Apple credentials) and
-pass its path when it is needed. It is only needed for
-`--with-driverkit-hid`, described below.
+pass its path when it is needed: for `--with-virtual-hid` (every release) and
+`--with-driverkit-hid` (never shipped), both described below.
 
-## Entitlements: none in the shipping build, and that is the correct answer
+## Entitlements: one in the shipping build
 
-The Pier and its helper ship with **no entitlements**. A provisioning profile
-authorizing three DriverKit HID entitlements now exists (see below), and the
-build can embed it on request, but the default build does not, because nothing
-in the Pier uses them yet.
+Which app holds what, explicitly — the Deck's are in
+[`clients/macos/CERTIFICATES.md`](../../clients/macos/CERTIFICATES.md):
 
-This is a deliberate position rather than an omission, and it is worth
-understanding before adding any.
+| Bundle | Signed with | Entitlements |
+| --- | --- | --- |
+| Arcen Pier (`pier.arcen.tech`) | `packaging/macos/Pier-virtual-hid.entitlements` + the embedded `pier.arcen.tech` Developer ID profile | `com.apple.developer.hid.virtual.device`, plus `com.apple.application-identifier` and `com.apple.developer.team-identifier`, which an embedded profile requires |
+| Arcen Agent Helper (`pier.arcen.tech.agent`) | no entitlements file | none |
+| Arcen Microphone (`tech.arcen.microphone.driver`, AudioServerPlugIn) | no entitlements file | none |
+
+`com.apple.developer.hid.virtual.device` is what `IOHIDUserDevice` checks
+before it publishes a device. The Pier uses it for exactly two things: the
+`hid-injector` child's keyboard and absolute pointer (the login window's only
+input, and the keyboard of `input_backend: virtual_hid`), and the
+`probe-virtual-hid` and `probe-pen-hid` probes. It is **not** used for the pen:
+a virtual pen digitizer was measured to reach applications without pressure,
+tilt or rotation (see [`AGENTS.md`](AGENTS.md), "A virtual pen digitizer,
+measured"), so Basic Tablet stays on CoreGraphics. Creating a device also needs
+Accessibility for the app responsible for the creating process — the Agent
+Helper — which is why the helper starts the Pier's executable as its child.
+
+Nothing else is requested, and that is a deliberate position rather than an
+omission, worth understanding before adding any.
 
 On a Developer-ID-distributed, unsandboxed macOS application, the things this
 host does are governed by **TCC consent**, not by entitlements:
@@ -87,16 +108,15 @@ host does are governed by **TCC consent**, not by entitlements:
 | Capability | What actually gates it |
 | --- | --- |
 | Screen capture (ScreenCaptureKit) | Screen Recording consent. No entitlement exists or is needed. |
-| Input injection (CGEvent) | Accessibility consent. No entitlement. |
+| Input injection (CGEvent) | Accessibility consent for the keyboard; pointer and scroll were measured to need none. No entitlement. |
 | Clipboard (NSPasteboard) | Nothing. |
 | System audio capture (Core Audio process taps) | The same Screen & System Audio Recording consent as capture, plus `NSAudioCaptureUsageDescription` in the **Info.plist** — a usage string, not an entitlement. |
 | Local authentication (PAM) | Ordinary process privileges. |
 | QUIC listener | Nothing; the process is not sandboxed. |
 
 Requesting an entitlement the provisioning profile does not authorize is
-actively harmful: AMFI terminates the process before `main`, which the Deck
-already experienced and recorded in
-`clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`. Notarization succeeding does not
+actively harmful: AMFI terminates the process before `main` (see
+`clients/macos/ENTITLEMENTS.md`). Notarization succeeding does not
 prevent it — those are separate gates.
 
 The Hardened Runtime *is* enabled (`codesign --options runtime`), because
@@ -113,11 +133,11 @@ gain.
 
 ### The profile that exists, and what it does not buy
 
-A Developer ID provisioning profile for the App ID `pier.arcen.tech` exists and
-authorizes exactly three entitlements. Two others that appear in Apple's
-documentation — `com.apple.developer.hid.virtual.device` and
-`com.apple.developer.driverkit.transport.usb` — were **not offered in the
-portal** for this App ID, so the profile could not carry them.
+A Developer ID provisioning profile for the App ID `pier.arcen.tech` exists
+(regenerated after Apple granted the virtual HID entitlement; it expires in
+2044) and authorizes `com.apple.developer.hid.virtual.device` plus the three
+DriverKit entitlements below. `com.apple.developer.driverkit.transport.usb` and
+`com.apple.developer.usb.host-controller-interface` are not on it.
 
 | Entitlement | What Apple documents it as | macOS |
 | --- | --- | --- |
@@ -148,7 +168,7 @@ that matters is what the device is attached to:
 
 | Entitlement | Covers | Held |
 | --- | --- | --- |
-| `com.apple.developer.hid.virtual.device` | "the driver **creates a virtual HID device**" | no |
+| `com.apple.developer.hid.virtual.device` | "the driver **creates a virtual HID device**" | **yes** (granted; shipped since 0.18.0) |
 | `com.apple.developer.driverkit.family.hid.virtual.device` | "lets an app **create and manage virtual HID devices**" | no |
 | `com.apple.developer.driverkit.transport.hid` | "permission to **interact with the hardware**" | yes |
 | `com.apple.developer.driverkit.family.hid.device` | the driver **provides a HID service** | yes |
@@ -156,7 +176,7 @@ that matters is what the device is attached to:
 
 `transport.hid` is permission to talk to *hardware*. This host has none — the
 traffic arrives over a QUIC socket. The two entitlements that describe a device
-with nothing behind it are the *virtual* ones, and the profile carries neither.
+with nothing behind it are the *virtual* ones; the profile carries the first.
 
 **The simple path does not need DriverKit at all.** `IOHIDUserDevice` is a
 public, linkable IOKit API for exactly this:
@@ -173,12 +193,13 @@ public, linkable IOKit API for exactly this:
 * It requires `com.apple.developer.hid.virtual.device` **and that alone**,
   which the header itself states at lines 118-121.
 
-So the action is narrow: obtain `com.apple.developer.hid.virtual.device` for
-`NWR7ZH8L7U.pier.arcen.tech` and regenerate the profile. It was not offered in
-the portal for this App ID, which means asking Apple rather than ticking a box.
-Until it exists, the importer cannot be built — not because the code is hard,
-but because AMFI kills a process that requests an unauthorized entitlement
-before `main`.
+That entitlement has been granted for `NWR7ZH8L7U.pier.arcen.tech` and the
+profile regenerated; `probe-virtual-hid` on a signed build reports
+`virtual_hid=available` (macOS 26.7.2). What it buys is a *HID* device. It
+does not by itself make a bridged tablet work: macOS turns a generic digitizer
+into proximity without pressure or tilt, so a bridged Wacom would need the
+tablet maker's driver on the host, and Native Tablet forwards USB, not HID —
+see the next sections.
 
 The DriverKit alternative is strictly worse here: it needs
 `com.apple.developer.driverkit` (which Apple's own page says **must be
@@ -218,19 +239,23 @@ mode-600 profile that the running user cannot read still launches normally. The
 ### Basic Tablet needs none of this
 
 The typed pen sink does not require a driver, a dext, or an entitlement.
-CoreGraphics carries tablet data on ordinary mouse events: the subtypes
-`kCGEventMouseSubtypeTabletPoint` and `kCGEventMouseSubtypeTabletProximity`,
-with `kCGTabletEventPointPressure`, `kCGTabletEventTiltX`/`TiltY`,
-`kCGTabletEventRotation`, `kCGTabletEventTangentialPressure`, and the
-proximity fields including `kCGTabletProximityEventEnterProximity` and
-`kCGTabletProximityEventPointerType`. Apple's own wording is that these values
-are set with `setIntegerValueField(_:value:)`.
+CoreGraphics carries tablet data on ordinary mouse events: the subtype
+`kCGEventMouseSubtypeTabletPoint` with `kCGTabletEventPointPressure`,
+`kCGTabletEventTiltX`/`TiltY` and `kCGTabletEventRotation`, plus
+`kCGMouseEventPressure`, which is the field `-[NSEvent pressure]` actually
+reads; and proximity as its own `kCGEventTabletProximity` event with
+`kCGTabletProximityEventEnterProximity`, `kCGTabletProximityEventPointerType`
+and `kCGTabletProximityEventCapabilityMask`. Apple's own wording is that these
+values are set with `setIntegerValueField(_:value:)`. Measured with an AppKit
+window, this delivers pressure, tilt, rotation, eraser and barrel buttons to
+applications; the virtual HID digitizer that needs the entitlement delivered
+none of the first three.
 
 Native Tablet — where this Mac *publishes* a device so the host's own Wacom
 driver binds it — is the only thing that could need DriverKit. That is the
 opposite operation from the Deck, which *takes* a physical tablet away from
 macOS and forwards its traffic; the Deck's requirements are recorded separately
-in `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md` and do not apply here.
+in `clients/macos/ENTITLEMENTS.md` and do not apply here.
 
 **The open question is now answered, by observation.** An Intuos5 touch L
 (`056a:0317`, reported as `VendorID 1386` / `ProductID 791`) attached to a Mac
@@ -246,22 +271,21 @@ macOS binds the tablet with **Apple's generic USB-HID driver**, in userspace.
 There is no Wacom-specific kernel driver in the chain for base tablet function
 on a Mac without Wacom's driver installed.
 
-That is an observation about how a tablet *plugged into a Mac* enumerates. It
-is **not** a conclusion about Native Tablet, and an earlier version of this
-file drew one anyway: it claimed a virtual HID device would therefore suffice.
-It would not. Native Tablet is defined by what the Deck sends — the Deck's
-helper takes the device away from macOS and forwards its **raw USB traffic**,
-untouched, so that the host's own Wacom driver claims it exactly as if it were
-plugged in there. The mode's whole value is that Arcen never interprets the
-device. A HID-only sink would have to parse USB transfers to recover reports,
-which is interpretation, and it has nowhere to carry the control transfers a
-Wacom tablet needs to leave generic-mouse mode and report full pressure.
+That is an observation about how a tablet *plugged into a Mac* enumerates.
+For Native Tablet the Deck's helper takes the device away from its Mac and
+forwards its raw USB traffic. The macOS Pier receives it as a USB host driver
+would ([ADR 0022](../../docs/adr/0022-macos-pier-native-tablet-hid-adapter.md)):
+an interrupt IN transfer of a HID interface *is* one input report, byte for
+byte (HID 1.11 §8.4), and `IOHIDUserDeviceRegisterSetReportBlock` /
+`IOHIDUserDeviceRegisterGetReportBlock` turn every feature and output report
+into a HID class `SET_REPORT` / `GET_REPORT` control transfer over the
+unchanged bridge. The existing `hid-injector` child (`--bridged-usb`)
+presents a bridged tablet that way with the entitlement this profile already
+carries, and the Pier reads the pen of a model it knows (the Intuos5 touch L)
+to post tablet events with pressure; other models are refused. macOS
+publishes those devices with `Transport` `"Virtual"`.
 
-So the requirement is the one the Deck's own settings state: a host that can
-**present the tablet on a virtual USB controller**. macOS has a public API for
-exactly that, and it is the one this file twice described wrongly.
-
-### `IOUSBHostControllerInterface`, and two corrections
+### `IOUSBHostControllerInterface`
 
 `IOUSBHost.framework` ships `IOUSBHostControllerInterface.h` in the public SDK.
 Apple's own description:
@@ -271,28 +295,10 @@ Apple's own description:
 > devices. The entitlement `com.apple.developer.usb.host-controller-interface`
 > is required to use this class.
 
-"Provide access to remote USB devices" is Native Tablet, stated in Apple's
-words. The mode is available on macOS in principle, and the missing piece is
-one named entitlement rather than an architectural gap.
-
-Two claims in earlier versions of this file were wrong, in opposite directions,
-and both are worth keeping visible because the second was the more damaging:
-
-1. The entitlement identifier was first *asserted* without being checked.
-2. It was then "corrected" to **does not exist**, on the evidence that
-   `developer.apple.com` returns 404 for it. That inference was wrong. The
-   entitlement is real and is named verbatim in Apple's SDK header; it is
-   simply absent from the documentation website.
-
-The lesson is not "check the docs". It is that **absence from the documentation
-website is not evidence of absence**. The SDK headers are authoritative and
-local, and grepping them takes seconds. A missing doc page had been treated as
-proof, and a real capability was written off because of it.
-
-`com.apple.developer.usb.host-controller-interface` is not on this profile and
-was not offered in the portal for this App ID, so it has to be requested from
-Apple. That request is the prerequisite for Native Tablet on macOS — not a
-DriverKit dext, and not any of the HID entitlements the profile carries.
+The entitlement is named in the SDK header but not on Apple's documentation
+website; the SDK headers are authoritative. It is not on this profile and is
+not used: the Pier's Native tablet uses virtual HID devices instead
+([`clients/macos/ENTITLEMENTS.md`](../../clients/macos/ENTITLEMENTS.md#comappledeveloperusbhost-controller-interface)).
 
 Basic Tablet — the mode the Deck recommends for WAN, where this host receives
 finished pen samples and injects them — needs none of this: no driver, no
@@ -317,9 +323,9 @@ its own provisioning profile; the Deck's profile was deliberately trimmed of
 System Extension and DriverKit and that trimming should not be undone here by
 accident.
 
-`com.apple.vm.device-access` is closed to Developer ID distribution; Apple DTS
-confirmed this (Case-ID 21584866, recorded in the Deck's entitlement notes). Do
-not re-request it.
+`com.apple.vm.device-access` is reserved for Mac App Store hypervisor apps and
+does not apply to Developer ID distribution
+([`clients/macos/ENTITLEMENTS.md`](../../clients/macos/ENTITLEMENTS.md)).
 
 ## Permissions have to be asked for, not just checked
 

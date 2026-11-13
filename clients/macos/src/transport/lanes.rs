@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Deck's lane adapter (ADR 0014): the control lane as the session's
 //! message `Sink`/`Stream`, and one worker per other lane.
 //!
@@ -574,6 +576,11 @@ async fn input_lane_worker(
                     if bytes.first() == Some(&(crate::protocol::FrameType::CursorUpdate as u8)) =>
                 {
                     let _ = events.send(SessionEvent::CursorUpdate(bytes));
+                }
+                Ok(SessionRecord::Binary(bytes))
+                    if bytes.first() == Some(&(crate::protocol::FrameType::CursorPosition as u8)) =>
+                {
+                    let _ = events.send(SessionEvent::CursorPosition(bytes));
                 }
                 Ok(_) => {}
                 Err(exit) => match reopen_session_lane(&lanes, LaneRole::InputCursor, &exit).await {

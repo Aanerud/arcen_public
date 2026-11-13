@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Arcen Deck -- primary remote-video surface shader.
 //
 // Replaces the CPU-side "decode -> BGRA -> RGBA `Vec<u8>` -> `egui::ColorImage`"

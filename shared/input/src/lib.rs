@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Transport-independent keyboard, pointer, and pen contracts.
 
 #![forbid(unsafe_code)]
@@ -9,7 +11,10 @@ use std::fmt::{Display, Formatter};
 
 pub mod cursor;
 mod gestures;
+pub mod hid_digitizer;
 pub mod hid_reports;
+pub mod host_pointer;
+pub mod keyboard;
 mod lane_outbox;
 mod negotiation;
 mod output_local;
@@ -23,6 +28,7 @@ mod region_pipeline;
 mod region_state;
 mod region_wire;
 pub mod seat_pen;
+pub mod tablet_pointer;
 pub mod text;
 pub mod virtual_device;
 

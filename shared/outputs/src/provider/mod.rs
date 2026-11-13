@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The frozen output provider lifecycle of ADR 0010.
 //!
 //! One trait, one driver, one capability vocabulary, and one error model

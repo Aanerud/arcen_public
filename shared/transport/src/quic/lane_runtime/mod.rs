@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Isolated QUIC lane runtime: one accept dispatcher per connection, lane
 //! openers, and an independent bounded writer and reader per lane.
 //!
@@ -189,12 +191,18 @@ impl LaneQueueBounds {
                 max_bytes: 8 * 1024 * 1024,
                 starvation_bound: Duration::from_secs(2),
             },
+            // ADR 0016 R6: at most 512 KiB of refinement in flight.
+            LaneRole::Refine => Self {
+                max_records: 8,
+                max_bytes: 512 * 1024,
+                starvation_bound: Duration::from_secs(5),
+            },
         }
     }
 }
 
 const fn is_low_priority(role: LaneRole) -> bool {
-    matches!(role, LaneRole::Video | LaneRole::BulkAux)
+    matches!(role, LaneRole::Video | LaneRole::BulkAux | LaneRole::Refine)
 }
 
 #[cfg(test)]

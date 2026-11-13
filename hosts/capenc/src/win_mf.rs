@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Windows Media-Foundation live encode path (VMware SVGA / no-NVENC hosts).
 //
 // Sibling to `win.rs::run_encode` but wired to the SW H.264 MFT in

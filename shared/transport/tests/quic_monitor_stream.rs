@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Real Quinn loopback tests for the additive direct-monitor QUIC stream
 //! foundation ("Carrier B"): the bounded preface, the server-open/client-accept
 //! helpers, and the pure expected-roster registry. These tests never select

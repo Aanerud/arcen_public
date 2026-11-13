@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `linux-wayland-software`: the Wayland composition for hosts without a
 //! usable NVENC.
 //!
@@ -100,6 +102,7 @@ mod tests {
             width,
             height,
             max_fps: fps,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 

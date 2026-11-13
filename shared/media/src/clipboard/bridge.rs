@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A compositor-neutral bridge between one desktop selection and the client.
 //!
 //! Wayland compositors do not let a client watch or own the clipboard the way

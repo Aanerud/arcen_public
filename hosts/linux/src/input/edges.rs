@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Key, button and scroll planning shared by every Linux injector.
 //!
 //! Both the Xorg uinput devices and the session-bound Wayland injector speak

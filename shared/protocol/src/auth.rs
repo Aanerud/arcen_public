@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Challenge/response authentication primitives.
 //!
 //! Byte-identical to the legacy Python `common/messages.py`:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Displays Decks asked Speed for that no qualification covered.
 //!
 //! When a Speed request finds no measured or inferred rate, the Pier notes

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Pier's side of a remote-monitor session's output socket: the current
 //! outputs, and output transactions (resize, topology change).
 //!

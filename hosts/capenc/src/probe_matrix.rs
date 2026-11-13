@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `capenc probe-matrix` — the host half of the colour-matrix hardware probe.
 //!
 //! Arcen is adding grader/VFX-grade colour (4:4:4, 10-bit, full range). The

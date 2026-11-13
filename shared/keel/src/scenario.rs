@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Deterministic synthetic frames used by Keel correctness tests and benches.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

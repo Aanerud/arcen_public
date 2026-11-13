@@ -171,6 +171,18 @@ touched once per record in lane order and reset when the input lane is
 reopened. Malformed records are dropped and the current cursor kept. Routed
 as `InputLowLatency` (reliable stream, never a datagram).
 
+Sources (ADR 0014 Amendment 17): a Wayland desktop's cursor metadata, an
+Xorg desktop's `XFixes` image, a Windows desktop's cursor bitmaps. The
+fallback byte carries the host's own name for the cursor where it has one
+(X cursor name, Windows `IDC_*`), `default` otherwise. A Pier whose session
+runs in an agent (Windows, macOS) has the agent send every visible record
+with its image inline; the broker's relay
+(`arcen_protocol::cursor::CursorRecordRelay`) renumbers the records for the
+lane and strips images the Deck holds, so the Deck sees exactly the contract
+above. A host adds at most 30 new images per second; known images travel by
+id. The macOS Pier sends no records (no public API reports the desktop's
+cursor image).
+
 ---
 
 ## Control messages
@@ -304,7 +316,7 @@ Both hellos may carry a typed
   "product": "arcen-deck-macos",
   "version": "0.1.0",
   "build_id": "region-20260809T174248Z",
-  "source_revision": "558ead62e6bc+dirty.25e1f2356dd1",
+  "source_revision": "0123456789ab+dirty.abcdef012345",
   "build_profile": "release",
   "feature_profile": "quic-default",
   "artifact_sha256": "...",
@@ -456,12 +468,40 @@ described below — it is never a "non-sensitive facts only" channel.
   logging policy (what gets written, at what level, and where) is entirely
   local per `docs/architecture/ObservabilityStandard.md` and out of scope here.
 
+### Host-measured QUIC path (`HealthStatsMsg.path`, additive)
+
+`HealthStatsMsg.path: Option<PathQualityMsg>` carries the host's own
+measurement of the QUIC connection that sends the Deck its video, sampled
+once per `health_stats` window (two seconds on the Linux and Windows Piers).
+The host is the media sender: only it sees its congestion window, the
+controller pacing it and the packets it had to retransmit, so a Deck shows
+these numbers instead of inferring a path type.
+
+- Fields (all `#[serde(default)]`, integers only): `congestion_control`
+  (token: `bbr`, `cubic`, `newreno`), `rtt_us` (smoothed RTT), `min_rtt_us`
+  (lowest RTT over the recent baseline window; the difference is queueing
+  delay), `cwnd_bytes`, and window deltas `sent_packets`, `lost_packets`
+  (declared lost, therefore retransmitted), `congestion_events` and
+  `wire_bytes` (every UDP byte sent, all lanes and retransmissions), over
+  `window_ms`. Since 0.19.0 also `mtu_bytes` (the UDP payload size the host
+  sends now, its QUIC path MTU; 0 = not reported) and `black_holes` (loss
+  bursts QUIC's path MTU black-hole detector flagged in the window; heavy
+  congestion loss trips it too, so read it beside `lost_packets`).
+- A receiver treats the token as untrusted text:
+  `PathQualityMsg::congestion_control_token` accepts at most
+  `MAX_CONGESTION_CONTROL_TOKEN_BYTES` (16) ASCII alphanumerics, `-` or `_`,
+  and anything else is shown as unknown. `loss_permille` clamps lost to sent
+  and rounds up; `wire_bps` is `None` for a zero window.
+- Compatibility: no version bump. An old Deck ignores the unknown field; an
+  old Pier (and the macOS Pier today) omits it, and the Deck says the path is
+  not reported rather than showing a perfect path.
+
 ### Modeled in Rust today (Tier A)
 `quality_settings`, `auth_request`, `auth_response` (+ `monitors[]` of
 `ClientMonitor`, `displays_mode`, optional `session_log_id`), `auth_result`,
 `client_hello` (optional `session_log_id` consistency echo), `server_hello`
 (+ `color_caps`), `health_pong`, `health_stats`, `mouse_move`, `mouse_move_relative`, `mouse_button`,
-`key_event`, `broker_machine_request`.
+`key_event`.
 
 ### Display colour (additive)
 
@@ -474,6 +514,29 @@ predate it ignore it. Hosts interpret it only through
 `arcen_media::display_color` (stated luminance first, otherwise headroom × 100
 nits) and turn it into EDID bytes only through `arcen_outputs::edid`, so every
 host describes the same display the same way.
+
+### sRGB-coded SDR (additive)
+
+`ClientVideoCapabilitiesMsg.srgb_transfer` (auth-time, `initial_video`) and
+its `ClientHelloMsg.supports_srgb_transfer` mirror say the client presents a
+stream whose transfer is `srgb` (IEC 61966-2-1, H.273 transfer
+characteristics 13) as sRGB, and accepts it as the exact answer to a `bt709`
+SDR request (`TransferCharacteristics::serves_request`). Both default to
+`false` and are omitted when false, so older peers see byte-identical
+messages.
+
+A host whose capture is linear light uses it to keep the desktop's code
+values: the Windows Pier's ten-bit capture is WGC FP16 scRGB, and for a
+capable client it re-encodes with the sRGB curve DWM linearised with, tags the
+VUI 13 and reports `active_transfer: "srgb"` in the hello and READY
+(`arcen_media::video::sdr_desktop_transfer`). The served pipeline is
+still Grading. Without the claim the host keeps the legacy BT.709 OETF and
+`bt709` tag. Since 0.19.0 the Linux Xorg and macOS Pier ten-bit Grading
+captures, which already carry the desktop's sRGB code values (XShm RGB10, an
+sRGB `ScreenCaptureKit` surface), state `srgb` under the same claim without
+touching the codes, and a declared PQ Xorg desktop is converted on the sRGB
+curve. Eight-bit sessions keep their tag. No frame-header field changes;
+transfer travels only in the hello/READY.
 
 ### Tablet mode split (additive, reconnect-scoped)
 
@@ -495,7 +558,7 @@ host describes the same display the same way.
 - Host sends `tablet_mode_result` (`TabletModeResultMsg`) after setup with:
   `requested`, `active`, `accepted`, bounded `reason`, and `reconnect_required`.
 - Old peers remain compatible via serde defaults; missing mode fields imply
-  `local_termination` request with unknown capabilities. A PR #108-era client
+  `local_termination` request with unknown capabilities. An older client
   that proves input-v3 `pen=available` retains local termination even without
   the newer mode-capability field; that compatibility evidence never
   authorizes `wacom_usb_bridge`.
@@ -607,6 +670,59 @@ replaced at the host edge. These optional fields are additive, so
   payloads continue to deserialize as known values.
 
 These fields are additive/optional JSON changes, so `PROTOCOL_VERSION` remains 3.
+
+### Key identifiers, `AltGr` and the ISO key (additive)
+
+`arcen_protocol::keys` names the identifiers products share beyond letters,
+digits and punctuation (which are their ASCII/US character codes):
+`KEY_SHIFT` `0x01000020`, `KEY_CONTROL` `0x01000021`, `KEY_META`
+`0x01000022` (the Windows key, Super, or a Mac host's Command), `KEY_ALT`
+`0x01000023` (left Alt / Option), and two extended keys:
+
+| Identifier | Value | Key | Windows set-1 | Linux evdev |
+| --- | --- | --- | --- | --- |
+| `KEY_ALTGR` | `0x01001103` (`Qt::Key_AltGr`) | right Alt as `AltGr` | `E0 38` | `KEY_RIGHTALT` (100) |
+| `KEY_INTL_BACKSLASH` | `0x01001104` (unassigned in Qt; Arcen's) | ISO key between left Shift and Z (`<>`) | `56` | `KEY_102ND` (86) |
+
+- `AltGr` is a key, not a modifier: a client never sets the Alt bit (`0x04`)
+  for it, and a host's modifier synchronisation never presses or releases it
+  (nor the left Control Windows adds to it under an `AltGr` layout).
+- A client sends them only to a host whose hello says
+  `input_capabilities.extended_keys = "available"`
+  (`supports_extended_keys_v1`). `unknown` (every older host) gets right
+  Option as Alt and the ISO key as before. The Deck advertises `available`
+  too: it may send them. The Windows and Linux Piers advertise them; the
+  macOS Pier says `unavailable`.
+- Positions, not characters: the host's layout decides what the key types.
+  The Windows Pier injects scan codes (`KEYEVENTF_SCANCODE`) from the shared
+  `arcen_input::keyboard::scancode` table for every key with one; keypad,
+  lock, Pause and Print keys keep their Virtual-Keys.
+
+### Pointer-only Meta release mask (additive)
+
+`InputCapabilitiesMsg.meta_pointer_mask` (`supports_meta_pointer_mask_v1`),
+default `unknown`. Windows opens Start when the Windows key is released with
+no other *key* between its press and release; a click, scroll or drag does
+not count, so a Mac client's Command+click (sent as Windows+click) would open
+Start when Command is let go. A host that says `available` masks that itself:
+the Windows Pier injects the unassigned virtual key `0xE8` (AutoHotkey's
+"menu mask key", typing nothing) right before such a Windows-key release, and
+a lone Windows-key tap still opens Start. A client then sends nothing extra;
+for a host without it (`unknown`, older Windows Piers) the Deck taps Control
+before the release instead. The Windows Pier advertises `available`; the
+Linux and macOS Piers `unavailable`; clients leave it `unknown`.
+
+### Host platform (additive)
+
+`ServerHelloMsg.platform` is the host's operating system: `"windows"`,
+`"linux"` or `"macos"`, omitted by older hosts. Read it through
+`ServerHelloMsg::host_platform()` (`HostPlatform::{MacOs, Windows, Linux,
+Unknown}`), which falls back to `session_type` (`aqua` → macOS; `x11`,
+`wayland` → Linux) and then to the build identity's `product`
+(`arcen-pier-windows`, `arcen-pier-linux`, `arcen-pier-macos`). An unknown
+token falls through to those fallbacks rather than failing the hello. The
+Deck chooses its keyboard policy from it (`arcen_input::keyboard`).
+`session_type` keeps its meaning (a session transport; empty on Windows).
 
 ### Cursor authority and relative input (protocol v3, input v2)
 
@@ -736,6 +852,27 @@ two notices only to a client that advertised it.
 `input_unavailable`, `host_unsupported`, `rate_limited`, and `unknown`
 (`#[serde(other)]`, so a newer reason never fails to parse). Text is never
 logged by either side, only counts.
+
+How a host types a commit is its own business, but every Arcen Pier decides
+per character with the shared `arcen_input::text::route_char` rule: by its
+key on the host's own layout only when that layout provably types exactly
+that character (base, Shift, `AltGr` or Shift+`AltGr` level, lock keys as
+they are), no key is held and the layout is not an input method's; otherwise
+by the host's text route. Which hosts advertise `text_commit` (all with
+`text_commit_unicode = available` unless noted):
+
+| Host | Text route | Since |
+|---|---|---|
+| Linux Wayland | proven key strokes within the session layout (keycodes with Shift/`AltGr`, replayed on the compositor's keymap first; Mutter keysyms before 0.18.0); `ei_text` beyond it (`text_commit_unicode` follows the seat); with several differing groups only strokes every group agrees on unless the compositor reports the live group (input-source settings are not trusted); refused (`keymap_unknown`) otherwise or while the keymap is unknown | 0.17.0 |
+| Windows | `KEYEVENTF_UNICODE` | 0.18.0 |
+| Linux Xorg | an unused key (F13–F24, two Japanese keys) mapped to the character's keysym for as long as it is needed | 0.18.0 |
+| macOS | none: `unavailable` | — |
+
+A client's **Paste as Keystrokes** and **Characters** mode use this message
+unchanged: printable runs go as `text_commit`, line breaks and tabs as
+`key_event` Return and Tab (`arcen_protocol::keys::KEY_RETURN`, `KEY_TAB`),
+which no commit may carry. A client never sends key positions for clipboard
+text to a host that does not advertise `text_commit`.
 
 ### Legacy mouse/key input compatibility (protocol v3)
 
@@ -912,6 +1049,75 @@ by its `u32` length. A lane endpoint that meets the legacy
 code `0x41524C01` and a readable reason. No product sends any of this yet;
 `PROTOCOL_VERSION` moves to 5 when products switch.
 
+### Lossless refinement v1 (DRAFT — not live, ADR 0016)
+
+Nothing below is negotiated by a release build. The records and the
+capability are modelled in `arcen_protocol::refine`; products send none of
+them yet. All binary headers are big-endian; `monitor_id`,
+`topology_generation` and `stream_epoch` mean what they mean in the region
+video v1 header. Every record carries a nonzero `refine_generation`.
+
+**Capability (additive, serde-default).** `ClientHelloMsg.lossless_refine_v1`
+(`{domains: ["rgb"], codecs: ["delta-zstd1"]}`, omitted when absent).
+`ServerHelloMsg.lossless_refine` (`{state, reason?, domain, bit_depth,
+transfer, primaries, range, codec, still_ms, max_mbps}`) per session, plus a
+per-monitor state in later slices. A Pier lists the `refine` lane role (7) in
+`lane_attachment.roles` **only** for a Deck that sent the capability: an older
+Deck's grant validator refuses an unknown role token and a role list as long
+as its own role table. `RefineFence`/`RefineBarrier` are sent on the video
+lane only when `refine` was granted.
+
+| Type | Name | Lane | Purpose |
+|---|---|---|---|
+| `0x0A` | `RefineFence` | video | precedes **every** access unit of a monitor while refinement is granted; source fence + invalidated blocks |
+| `0x0B` | `RefineTiles` | refine (7) | one lossless rectangle |
+| `0x0C` | `RefineDigest` | refine (7) | canonical digest of the covered blocks at a fence |
+| `0x0D` | `RefineBarrier` | video | starts a refinement generation (ordered reset) |
+
+Common prefix, 24 bytes: `frame_type u8`, `version u8` (= 1),
+`monitor_id u16`, `topology_generation u64`, `stream_epoch u64`,
+`refine_generation u32`.
+
+`RefineFence` (`0x0A`): prefix, `fence u64` (strictly increasing within a
+generation), `block_count u32` (the monitor's 16×16 grid), `run_count u32`,
+then `run_count × (start u32, len u32)` ascending, non-overlapping,
+non-empty runs of invalidated block indices, all `< block_count`.
+
+`RefineBarrier` (`0x0D`): prefix (with the **new** generation), `reason u8`
+(1 start, 2 recovery, 3 geometry, 4 contract, 5 reset request, 6 re-enable),
+contract `domain u8` (1 rgb, 2 ycbcr), `depth u8`, `transfer u8`,
+`primaries u8`, `matrix u8`, `range u8`, `chroma u8` (2 = 4:4:4),
+`source_width u32`, `source_height u32` — 40 bytes.
+
+`RefineTiles` (`0x0B`): prefix, `valid_from_fence u64`, `domain u8`,
+`depth u8`, `codec u8` (1 = `delta-zstd1`), reserved `u8` zero, `x u16`,
+`y u16`, `width u16`, `height u16`, `payload_len u32`, payload — header 48
+bytes. `x`, `y` are multiples of 16 in visible source pixels; `width ≤ 256`,
+`height ≤ 64`, multiples of 16 except at the source's right/bottom edge.
+`width × height × 6 ≤ 98,304` and `payload_len ≤ 131,072`, both checked
+before any allocation.
+
+`delta-zstd1` payload: one Zstandard frame whose declared content size is
+exactly `width × height × 6`, window ≤ 128 KiB, no dictionary, no skippable
+frame, no trailing bytes. Content: for each plane (R′, G′, B′) the residual
+of each code against its left neighbour (the pixel above for a row's first
+pixel, zero for the tile's first), modulo `2^depth`, zigzag-folded; written
+as `width × height` low bytes then `width × height` high bytes, plane by
+plane.
+
+A barrier is authoritative: a Deck starts over on every barrier it reads
+on the video lane. A fence whose identity differs from the current
+generation, that goes backwards, or that names another grid clears the
+monitor and is answered with `refine_reset`. A barrier that repeats the
+current identity with another source size is refused.
+
+`RefineDigest` (`0x0C`): prefix, `fence u64`, `digest [u8; 16]` (canonical
+digest v1, ADR 0016 R4, XXH3-128 little-endian), `covered_count u32`,
+`run_count u32`, runs as in `RefineFence`.
+
+Control (session JSON, draft): Deck → Pier `refine_reset {monitor_id,
+stream_epoch, reason}` and `refine_control {monitor_id, enabled}`.
+
 ## Auth
 
 - `auth::hash_password(password, challenge)` = `sha256(f"{password}:{challenge}")`
@@ -931,6 +1137,46 @@ legacy `common/session_fsm.py` contract.
 
 ## Changelog
 
+- **2026-11-09 — lossless refinement v1 (DRAFT, not live)** — Records
+  `0x0A`–`0x0D`, the `refine` lane role and the `lossless_refine_v1`
+  capability are modelled in `arcen_protocol::refine`; no product sends them.
+  The grant lists `refine` only for a Deck that advertised the capability.
+  No version bump.
+- **2026-11-09 — path MTU in the host-measured path (additive)** — Add
+  `PathQualityMsg.mtu_bytes` and `PathQualityMsg.black_holes`, both
+  `#[serde(default)]` integers. Older Decks ignore them; older Piers omit
+  them and the Deck shows no MTU. No version bump.
+- **2026-11-09 — sRGB-coded SDR (additive)** — Add
+  `ClientVideoCapabilitiesMsg.srgb_transfer` and
+  `ClientHelloMsg.supports_srgb_transfer` (default `false`, omitted when
+  false). A Windows Pier serves ten-bit Grading as `srgb` to a client that
+  sets it. No version bump.
+- **2026-11-09 — committed text on Windows and Xorg hosts (no wire change)**
+  — The Windows Pier and Linux Xorg sessions now advertise `text_commit` and
+  `text_commit_unicode`; Paste as Keystrokes and Characters mode use the
+  existing messages. `arcen_protocol::keys` gains `KEY_ESCAPE`, `KEY_TAB`
+  and `KEY_RETURN` (existing Qt identifiers). No version bump.
+
+- **2026-11-08 — pointer-only Meta release mask (additive)** — Add
+  `InputCapabilitiesMsg.meta_pointer_mask` (default `Unknown`) and
+  `supports_meta_pointer_mask_v1`. No version bump.
+- **2026-11-08 — host platform and extended keys (additive)** — Add the
+  optional `ServerHelloMsg.platform` with `host_platform()`/`HostPlatform`,
+  `InputCapabilitiesMsg.extended_keys` (default `Unknown`) with
+  `supports_extended_keys_v1`, and the `keys` module with
+  `KEY_ALTGR = 0x01001103` and `KEY_INTL_BACKSLASH = 0x01001104`. Older peers
+  ignore the new hello fields and never receive the new key identifiers; no
+  version bump. Needs
+  Shared/Architecture review.
+- **2026-11-08 — cursor images from X11 and Windows Piers** — No wire
+  change: the `CursorUpdate` record, `cursor_image_v1` and the lane cache are
+  unchanged. X11 and Windows Piers now send records, the agent/relay split is
+  specified above, and `CursorImageCache` moved to `arcen_protocol::cursor`.
+- **2026-11-08 — host-measured QUIC path (additive)** — Add
+  `HealthStatsMsg.path` (`PathQualityMsg`): congestion controller, smoothed
+  and minimum RTT, cwnd, and per-window sent/lost packets, congestion events
+  and wire bytes, measured by the host. Optional and omitted when absent; no
+  version bump.
 - **2026-10-18 — host cursor images (additive)** — Add
   `FrameType::CursorUpdate = 0x50` on the input/cursor lane
   (`arcen_protocol::cursor`), `AuthResponse.cursor_image_v1` and its

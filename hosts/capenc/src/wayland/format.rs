@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! What capenc offers a `PipeWire` producer and what was negotiated.
 //!
 //! Pure data. The `PipeWire` adapter turns a [`FormatOffer`] into SPA pods and

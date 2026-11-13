@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_protocol::messages::BuildIdentityMsg;
 use std::path::Path;
 
@@ -89,8 +92,8 @@ mod tests {
             "arcen-deck-macos",
             "0.17.0",
             arcen_protocol::build_identity::BuildEnvironment {
-                build_id: Some("20261019T2200Z-0.17.0-ed28caf0"),
-                source_revision: Some("ed28caf0"),
+                build_id: Some("20261019T2200Z-0.17.0-0a1b2c3d"),
+                source_revision: Some("0a1b2c3d"),
                 ..Default::default()
             },
             None,
@@ -108,13 +111,13 @@ mod tests {
         );
         assert_eq!(facts.bundle_short_version, "0.17.0");
         assert_eq!(facts.bundle_version, "0.17.0");
-        assert_eq!(facts.build_id, "20261019T2200Z-0.17.0-ed28caf0");
-        assert_eq!(facts.source_revision, "ed28caf0");
+        assert_eq!(facts.build_id, "20261019T2200Z-0.17.0-0a1b2c3d");
+        assert_eq!(facts.source_revision, "0a1b2c3d");
         assert_eq!(facts.bundle_path, "~/arcen/dist/macos/Arcen Deck.app");
         assert!(!facts.summary().contains("someone"));
         assert_eq!(
             facts.summary(),
-            "0.17.0 (0.17.0) build 20261019T2200Z-0.17.0-ed28caf0 rev ed28caf0 at ~/arcen/dist/macos/Arcen Deck.app"
+            "0.17.0 (0.17.0) build 20261019T2200Z-0.17.0-0a1b2c3d rev 0a1b2c3d at ~/arcen/dist/macos/Arcen Deck.app"
         );
     }
 

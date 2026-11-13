@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A second, higher-priority QUIC stream for media that must not wait.
 //!
 //! The session stream is reliable and ordered, so a frame written to it waits

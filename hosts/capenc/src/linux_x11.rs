@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Dedicated-Xorg capture and portable OpenH264 encoding.
 
 use std::os::fd::AsRawFd;
@@ -24,10 +26,11 @@ use x11rb::rust_connection::RustConnection;
 
 const SOFTWARE_MAX_WIDTH: u32 = 1920;
 const SOFTWARE_MAX_HEIGHT: u32 = 1200;
-const WIDE_MAX_WIDTH: u32 = 3840;
-const WIDE_MAX_HEIGHT: u32 = 2160;
 const SOFTWARE_MAX_CAPTURE_BYTES: usize = 1920 * 1200 * 4;
-const WIDE_MAX_CAPTURE_BYTES: usize = 3840 * 2160 * 4;
+/// The wide path is budgeted in pixels, not as a 3840 by 2160 box: see
+/// `arcen_media::video::host_converted_capture_fits`.
+const WIDE_MAX_CAPTURE_BYTES: usize =
+    arcen_media::video::HOST_CONVERTED_CAPTURE_MAX_PIXELS as usize * 4;
 const MAX_FPS: u32 = 30;
 const KEEPALIVE: Duration = Duration::from_secs(1);
 /// Bounded recovery keyframe interval for one region's activity scheduler.
@@ -84,21 +87,25 @@ struct PixelLayout {
 enum CapturePurpose {
     Software,
     WideNvenc,
+    /// The no-frame native probe of the wide path. It runs before the Pier
+    /// arms the desktop at its served geometry, so a desktop still larger
+    /// than the pixel budget is probed on a budget-sized part of itself: the
+    /// probe proves depth, visual, conversion and the 10-bit encoder, while
+    /// the Pier fits the geometry it then arms
+    /// (`arcen_media::video::fit_host_converted_capture`).
+    WideProbe,
 }
 
 impl CapturePurpose {
-    const fn max_dimensions(self) -> (u32, u32) {
-        match self {
-            Self::Software => (SOFTWARE_MAX_WIDTH, SOFTWARE_MAX_HEIGHT),
-            Self::WideNvenc => (WIDE_MAX_WIDTH, WIDE_MAX_HEIGHT),
-        }
-    }
-
     const fn max_capture_bytes(self) -> usize {
         match self {
             Self::Software => SOFTWARE_MAX_CAPTURE_BYTES,
-            Self::WideNvenc => WIDE_MAX_CAPTURE_BYTES,
+            Self::WideNvenc | Self::WideProbe => WIDE_MAX_CAPTURE_BYTES,
         }
+    }
+
+    const fn is_wide(self) -> bool {
+        matches!(self, Self::WideNvenc | Self::WideProbe)
     }
 }
 
@@ -333,6 +340,12 @@ impl X11Capture {
         Self::connect(output_index, CapturePurpose::WideNvenc)
     }
 
+    /// [`Self::connect_wide`] for the native probe: see
+    /// [`CapturePurpose::WideProbe`].
+    pub(crate) fn connect_wide_probe(output_index: u32) -> Result<Self, String> {
+        Self::connect(output_index, CapturePurpose::WideProbe)
+    }
+
     fn connect(output_index: u32, purpose: CapturePurpose) -> Result<Self, String> {
         let (connection, screen_index) =
             x11rb::connect(None).map_err(|error| format!("connect authenticated X11: {error}"))?;
@@ -342,7 +355,10 @@ impl X11Capture {
             .get(screen_index)
             .ok_or_else(|| "X11 selected screen is absent".to_string())?;
         let root = screen.root;
-        let rect = selected_output_rect(&connection, root, output_index)?;
+        let mut rect = selected_output_rect(&connection, root, output_index)?;
+        if purpose == CapturePurpose::WideProbe {
+            rect = probe_rect(rect);
+        }
         validate_capture_geometry(rect, purpose)?;
 
         let setup = connection.setup();
@@ -367,8 +383,7 @@ impl X11Capture {
             visual.green_mask,
             visual.blue_mask,
         )?;
-        if purpose == CapturePurpose::WideNvenc && !matches!(pixel_format, X11PixelFormat::Rgb10(_))
-        {
+        if purpose.is_wide() && !matches!(pixel_format, X11PixelFormat::Rgb10(_)) {
             return Err(format!(
                 "wide NVENC capture requires an X11 depth-30 RGB10 visual, got depth={} format={}",
                 screen.root_depth,
@@ -462,6 +477,15 @@ impl X11Capture {
 
     pub(crate) fn has_damage(&self) -> bool {
         self.damage.is_some()
+    }
+
+    /// The packed RGB10 layout of a wide capture (`XBGR2101010` when the
+    /// capture is not RGB10, which the wide loop never runs with).
+    pub(crate) fn wide_layout(&self) -> PackedRgb10Layout {
+        match self.pixel_format {
+            X11PixelFormat::Rgb10(layout) => layout,
+            _ => PackedRgb10Layout::XBGR2101010,
+        }
     }
 
     pub(crate) fn pixel_format_token(&self) -> &'static str {
@@ -907,28 +931,57 @@ fn classify_pixel_format(
 fn validate_capture_geometry(rect: CaptureRect, purpose: CapturePurpose) -> Result<(), String> {
     let width = u32::from(rect.width);
     let height = u32::from(rect.height);
-    let (max_width, max_height) = purpose.max_dimensions();
+    let within_limits = match purpose {
+        CapturePurpose::Software => width <= SOFTWARE_MAX_WIDTH && height <= SOFTWARE_MAX_HEIGHT,
+        CapturePurpose::WideNvenc | CapturePurpose::WideProbe => {
+            arcen_media::video::host_converted_capture_fits(width, height)
+        }
+    };
     if rect.x < 0
         || rect.y < 0
         || width == 0
         || height == 0
         || (width | height) & 1 != 0
-        || width > max_width
-        || height > max_height
+        || !within_limits
     {
         return Err(format!(
-            "unsupported {} capture rectangle {}x{}+{}+{} (maximum {max_width}x{max_height})",
-            match purpose {
-                CapturePurpose::Software => "software",
-                CapturePurpose::WideNvenc => "wide NVENC",
+            "unsupported {} capture rectangle {}x{}+{}+{} ({})",
+            if purpose.is_wide() {
+                "wide NVENC"
+            } else {
+                "software"
             },
             rect.width,
             rect.height,
             rect.x,
             rect.y,
+            if purpose.is_wide() {
+                format!(
+                    "at most {} pixels with edges up to {}",
+                    arcen_media::video::HOST_CONVERTED_CAPTURE_MAX_PIXELS,
+                    arcen_media::video::HOST_CONVERTED_CAPTURE_MAX_EDGE
+                )
+            } else {
+                format!("maximum {SOFTWARE_MAX_WIDTH}x{SOFTWARE_MAX_HEIGHT}")
+            },
         ));
     }
     Ok(())
+}
+
+/// The part of an output the wide native probe captures: the whole output
+/// when it is within the pixel budget, otherwise a budget-sized rectangle at
+/// its origin.
+fn probe_rect(rect: CaptureRect) -> CaptureRect {
+    let (width, height) = arcen_media::video::fit_host_converted_capture(
+        u32::from(rect.width),
+        u32::from(rect.height),
+    );
+    CaptureRect {
+        width: u16::try_from(width).unwrap_or(rect.width),
+        height: u16::try_from(height).unwrap_or(rect.height),
+        ..rect
+    }
 }
 
 fn validate_root_bounds(
@@ -1688,6 +1741,34 @@ mod tests {
             CapturePurpose::WideNvenc,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn wide_geometry_is_a_pixel_budget_not_a_uhd_box() {
+        // The 0.17.0 refusal: a 3600x2262 Retina desktop (fewer pixels than
+        // UHD, taller than 2160) at the offset the Pier armed it.
+        let retina = CaptureRect {
+            x: 120,
+            y: 0,
+            width: 3600,
+            height: 2262,
+        };
+        assert!(validate_capture_geometry(retina, CapturePurpose::WideNvenc).is_ok());
+        assert!(checked_layout(3600, 2262, 30, 32, 32, WIDE_MAX_CAPTURE_BYTES).is_ok());
+        let five_k = CaptureRect {
+            x: 0,
+            y: 0,
+            width: 5120,
+            height: 2880,
+        };
+        let error = validate_capture_geometry(five_k, CapturePurpose::WideNvenc)
+            .expect_err("over the pixel budget");
+        assert!(error.contains("at most 8294400 pixels"), "{error}");
+        // The probe captures a budget-sized part of a larger desktop.
+        let probed = probe_rect(five_k);
+        assert_eq!((probed.width, probed.height), (3840, 2160));
+        assert!(validate_capture_geometry(probed, CapturePurpose::WideProbe).is_ok());
+        assert_eq!(probe_rect(retina), retina);
     }
 
     #[test]

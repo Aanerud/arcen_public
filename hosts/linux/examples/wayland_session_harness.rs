@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Lab harness for the headless GNOME/Mutter Wayland session adapter.
 //!
 //! Run as root on a Linux lab host, never on a production Pier:

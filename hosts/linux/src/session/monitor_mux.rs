@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Carrier A (`multi_monitor_v1` "`muxed_reliable_stream`") fair scheduler.
 //!
 //! Carrier A keeps every monitor's encoded video on the session's one

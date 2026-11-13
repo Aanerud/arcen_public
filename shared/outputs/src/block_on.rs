@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Test-only future driver.
 //!
 //! ADR 0010 forbids a dev-dependency on this crate, so its tests cannot use a

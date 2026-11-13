@@ -1,8 +1,37 @@
 # shared/input — `arcen-input`
 
-`arcen-input` is the platform-free input contract shared by the Deck and both
-active Piers. It contains no transport, async runtime, native handles, capture
-APIs, or injection APIs and forbids unsafe code.
+`arcen-input` is the platform-free input contract shared by the Deck and the
+Linux, Windows and macOS Piers. It contains no transport, async runtime, native
+handles, capture APIs, or injection APIs and forbids unsafe code.
+
+## Keyboard, text and cursor
+
+- `keyboard` is the policy between a Mac's keys and a host's keys:
+  `resolve_keyboard_policy` turns the host's platform (from its hello), what
+  the host accepts and a connection's settings into a `KeyboardPolicy`
+  (Windows App style, ⌘ and Control swapped, ⌘ is Control; AltGr on right or
+  both ⌥; the ISO key), `ShortcutTranslator` applies it to physical key edges,
+  and `keyboard::scancode` maps key identifiers to PC set-1 scan codes for a
+  host that injects by scan code. The Deck's `ui/keyboard.rs` is only the
+  egui adapter.
+- `text` is committed text at both ends: `policy` decides per keystroke
+  between the key position and the characters (Physical Keys or Characters
+  mode), `keymap` and `layout` index a host layout and its active group so a
+  host can prove a character typeable by key, `plan` splits one commit into
+  what goes by key, what goes by the host's text route and what is refused,
+  `paste` is Paste as Keystrokes (bounds, pacing, character classes) and
+  `route_char`, the per-character rule every Pier uses, and `releases`
+  recovers key releases an input method swallowed.
+- `cursor` carries host cursor images: `HostCursor` (X11 and Windows, which
+  read their one pointer) and `CursorAggregate` (Wayland capture events) feed
+  a per-desktop `CursorImageRegistry` that gives each distinct image a stable
+  id; `CursorLaneOutbox` sends the newest state on the input/cursor lane and
+  `DeckCursorState` applies it on the Deck. Named shapes
+  (`shape_for_x_cursor_name`) remain the fallback for a Deck that does not
+  take images.
+- `InputLaneOutbox` holds what the bounded input/cursor lane queue could not
+  take, in order: edges are never dropped, merged or reordered, and only
+  motion behind motion of the same kind is coalesced.
 
 ## Contracts
 

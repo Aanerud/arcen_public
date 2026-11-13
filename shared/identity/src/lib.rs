@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Provider-neutral identity and signed session-grant validation contracts.
 
 #![forbid(unsafe_code)]
@@ -724,7 +726,7 @@ pub enum GrantReplayConsumption {
 
 /// Durable atomic one-time grant replay store.
 ///
-/// Implementations used by multiple Gateway instances must share authoritative
+/// Implementations used by multiple processes or hosts must share authoritative
 /// state and atomically perform "insert if absent". A consumed key must remain
 /// protected through `retain_until_epoch_seconds`; storage cleanup may occur only
 /// after that instant.
@@ -1004,7 +1006,7 @@ mod tests {
             claims: SessionGrantClaims {
                 version: SESSION_GRANT_VERSION_V1,
                 issuer: "arcen".to_owned(),
-                audience: "gateway".to_owned(),
+                audience: "arcen-pier".to_owned(),
                 subject: "human".to_owned(),
                 tenant: Some("tenant".to_owned()),
                 client_identity: ClientIdentity::new("client-1").expect("client identity"),
@@ -1052,7 +1054,7 @@ mod tests {
         let nonce = GrantNonce::new("nonce-1").expect("nonce");
         let context = GrantValidationContext {
             issuer: "arcen",
-            audience: "gateway",
+            audience: "arcen-pier",
             expected_subject: "human",
             expected_tenant: Some("tenant"),
             expected_client_identity: &client_identity,

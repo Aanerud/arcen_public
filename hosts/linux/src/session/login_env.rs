@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The user's login-shell environment for a desktop session.
 //!
 //! A GDM login starts GNOME through the user's login shell, so `~/.profile`

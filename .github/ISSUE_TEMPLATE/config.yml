@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/Aanerud/arcen_public/tree/main/SECURITY.md
+    about: Security problems are reported privately, never in a public issue. See SECURITY.md.

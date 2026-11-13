@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -874,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_jitter_regression_keeps_three_frames_without_drop() {
+    fn jitter_keeps_three_frames_without_drop() {
         let refresh = Duration::from_nanos(16_666_667);
         let mut pacer = FramePacer::new();
         pacer.set_source_fps(Some(60));
@@ -1207,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn discrete_sim_codex_min_duration_case_lands_on_refreshes_two_and_three() {
+    fn minimum_duration_frames_land_on_refreshes_two_and_three() {
         let refresh = Duration::from_nanos(NS_PER_S / 60);
         let stats = run_discrete_presentation_sim(
             60,

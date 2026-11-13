@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! QUIC endpoint management for the Linux Pier host.
 //!
 //! Provides utilities to build a `quinn::ServerConfig` from the existing

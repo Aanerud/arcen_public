@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Hardware test for experimental raw-HID tablet capture.
 //!
 //! `#[ignore]` by design: it needs a real tablet plugged into this Mac and

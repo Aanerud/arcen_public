@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared region input pipeline: one validation, decode, ordered-state, and
 //! transform path for every host, with only point mapping left to the platform.
 

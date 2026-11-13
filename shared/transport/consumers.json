@@ -277,6 +277,12 @@
           "gate": 6,
           "symbol": "accept_session_lanes",
           "reason": "The shared lane carrier keeps every Deck connection's send window following its congestion window, so video cannot pile up inside QUIC ahead of audio and input."
+        },
+        {
+          "id": "relay-video-release",
+          "gate": 6,
+          "symbol": "video_released",
+          "reason": "The broker reports every video frame the shared lane relay is done with, so the agent's frames-in-flight limit follows the lane, not a guess."
         }
       ],
       "paths": [

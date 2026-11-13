@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The epoch runner of `linux-wayland-software` (see [`super::software`]).
 //!
 //! One epoch, in order, mirroring the NVENC runner without CUDA:
@@ -184,6 +186,7 @@ pub fn run(
             width,
             height,
             max_fps: request.fps,
+            sdr_transfer: request.video.transfer,
         },
         &evidence,
     );

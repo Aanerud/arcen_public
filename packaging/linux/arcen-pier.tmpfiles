@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+# Arcen Pier: keep the shared X11 and ICE socket directories out of the
+# daily /tmp clean-up.
+#
+# systemd creates /tmp/.X11-unix and /tmp/.ICE-unix root-owned 1777 only at
+# boot (x11.conf, "D!"), and its daily `systemd-tmpfiles --clean` ignores
+# boot-only entries, so it ages them like any other /tmp directory. A host
+# that ran no desktop for ten days loses them, and the next desktop's
+# compositor recreates them as its own user, which locks every other user's
+# GNOME Shell out of X11. These lines only exclude them from ageing; the
+# boot entries still create and empty them.
+x /tmp/.X11-unix
+x /tmp/.ICE-unix

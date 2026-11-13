@@ -19,11 +19,13 @@ steps if you have them.
 
 ## What to expect
 
-This project has **no support commitment and no response-time guarantee** — see
-[SUPPORT.md](SUPPORT.md). Security reports are read and taken seriously, but
-they are handled by one person on a best-effort basis. There is no bug bounty.
+The community project has **no support commitment and no response-time
+guarantee** — see [SUPPORT.md](SUPPORT.md). Security reports are read and taken
+seriously by the maintainers at TUTTIFRUTTI AS, on a best-effort basis. There
+is no bug bounty.
 
-If you need a guaranteed response, Arcen is not a suitable dependency for you.
+If you need a guaranteed response, ask TUTTIFRUTTI AS about a support agreement
+([SUPPORT.md](SUPPORT.md#paid-support-and-official-builds)).
 
 ## Scope
 

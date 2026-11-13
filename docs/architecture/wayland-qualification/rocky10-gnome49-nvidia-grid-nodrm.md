@@ -13,7 +13,7 @@ three labelled stacks and never mixed:
 
 | Stack | Driver | DRM | Compositor renders on | Sections |
 | --- | --- | --- | --- | --- |
-| **Phase 1 (no DRM)** | 580.65.06, installed `--no-drm` (its `nvidia-drm` does not build on this kernel) | no `/dev/dri` at all | NVIDIA, through EGL surfaceless | [Phase 1](#phase-1-no-drm-nvidia-58065) |
+| **Phase 1 (no DRM)** | 580.65.06, installed `--no-drm` (its `nvidia-drm` does not build on this kernel) | no `/dev/dri` at all | NVIDIA, through EGL surfaceless | [Phase 1](#phase-1-no-drm-nvidia-5806506) |
 | **Interim** | 580.105.08 with `nvidia-drm`, `modeset=N` | `card0` + `renderD128` (NVIDIA) | **llvmpipe** (Mesa GBM on the render node) | [Interim](#interim-nvidia-drm-loaded-modesetn) |
 | **Phase 2** | 580.105.08, licensed, `nvidia-drm modeset=1 fbdev=1` | `card0` + `renderD128` (NVIDIA, no connectors) | **NVIDIA, through NVIDIA GBM** | [Phase 2](#phase-2-drm-capable-nvidia-drm-modeset1) |
 
@@ -291,7 +291,7 @@ distribution (`clang-devel`, `pam-devel`, `pulseaudio-libs-devel`,
 ### Rocky 10 breakage found
 
 1. **SELinux: the launcher cannot exec after PAM opens the session when it
-   runs as `unconfined_service_t`. Fixed (`wlp-selinux`), see
+   runs as `unconfined_service_t`. Fixed (the launcher's SELinux policy), see
    [Linux Pier under SELinux](../../security/linux-selinux.md).**
    `/etc/pam.d/login` runs `pam_selinux open`, which sets the launcher's
    exec context to the user's (`unconfined_u:unconfined_r:unconfined_t:s0`).
@@ -302,10 +302,8 @@ distribution (`clang-devel`, `pam-devel`, `pulseaudio-libs-devel`,
    required logind session`, although logind did create a correct session
    (`Type=wayland Class=user Seat= Leader=<launcher>`). The denial *is*
    audited (`avc: denied { transition } … tcontext=unconfined_u:unconfined_r:unconfined_t:s0
-   tclass=process`); the earlier "no AVC" reading came from running
-   `ausearch` over SSH, where it reads standard input unless given
-   `--input-logs`. The lab's earlier `systemd-run /bin/bash -c …` wrapper
-   also ran as `initrc_t`, not `unconfined_service_t`. The launcher now
+   tclass=process`; run `ausearch --input-logs` from a non-interactive
+   shell, or it reads standard input). The launcher now
    keeps PAM's exec context only for the session user's processes, and the
    installer loads a one-rule SELinux module that lets
    `unconfined_service_t` enter `unconfined_t`; the harness passes as a
@@ -318,23 +316,15 @@ distribution (`clang-devel`, `pam-devel`, `pulseaudio-libs-devel`,
    refuse Wayland here even with qualified capture-route and input facts.
    Whether `render_node_access` stays a hard gate for host-copy routes is a
    shared policy question for Shared/Architecture.
-3. **Lab harness, fixed:** with `--pipeline` the harness closed the overview
-   through D-Bus before capenc ran, which made the input stage's first key a
-   focus-entering key whose press the client never sees. Fixed and
-   re-verified (first and later login).
-4. **Lab scripts, fixed:** `wayland-capture-probe.sh` wrote only the 0.4 Lua
-   WirePlumber override (0.5 ignores it); `wayland-probe.sh` gained licence,
-   module, DRM-node and SELinux facts.
-5. **capenc's DMA-BUF import route fails on this driver** (phase 2):
+3. **capenc's DMA-BUF import route fails on this driver** (phase 2):
    `cuGraphicsEGLRegisterImage` refuses EGL images of NVIDIA block-linear
    DMA-BUFs. A GL blit into a CUDA-registered texture works (see
    [CUDA import](#cuda-import-of-a-compositor-dma-buf)); reported for
-   `wlp-import`, not changed here.
-6. A transient `systemd-run --pipe` whose standard output was redirected to
-   a regular file twice made PID 1 drop its system-bus connection (`Got
-   disconnect on API bus`), after which logind could not start session
-   scopes for about three minutes. Seen with lab invocations only; the lab
-   scripts now pipe through `cat`. Not an Arcen code path.
+   GPU import, not changed here.
+4. A transient `systemd-run --pipe` whose standard output is redirected to
+   a regular file can make PID 1 drop its system-bus connection (`Got
+   disconnect on API bus`), after which logind cannot start session scopes
+   for minutes. Pipe such output through `cat`. Not an Arcen code path.
 
 GNOME Shell 49 differences that affect a remote desktop:
 
@@ -474,15 +464,15 @@ blit into a CUDA-registered texture, not through CUDA's EGL image
 registration. It was proven on a GBM buffer with the producer's format and
 modifier, not yet on a Mutter buffer, and synchronisation (`SyncTimeline`,
 implicit fences) was not exercised. Changing capenc's route is
-`wlp-import` work.
+GPU import work.
 
-**Update (`wlp-gpu-speed`):** capenc now implements that route
+**Update (GPU import and the paced Speed output):** capenc now implements that route
 (`gpu-convert`, with `PipeWire` explicit sync) and proved it on real Mutter
 and GNOME Shell buffers on this stack: GPU read-back equal to the
 shared-memory frame of the same desktop at 1080p, 1800x1130 and 4K (0
 differing pixels), every buffer explicitly synchronised, 2.3–2.9 ms of
 import per frame, Mutter's CPU halved against the host copy. See
-[GPU import and the paced Speed output](../linux-wayland-provider.md#gpu-import-and-the-paced-speed-output-wlp-gpu-speed).
+[GPU import and the paced Speed output](../linux-wayland-provider.md#gpu-import-and-the-paced-speed-output).
 
 ### Rates
 
@@ -518,10 +508,10 @@ virtual monitor and capenc offers Speed's 60 fps ceiling, so Arcen sees the
 1080p@60 was downgraded to Auto 30 fps. Serving Speed at 60 on this stack
 needs a session/capenc change (a virtual monitor above 60 Hz and an offer
 above the served rate, with capenc pacing to 60), then a measured
-`capture-rate` on that route. That is a design decision for `wlp-session` /
-`wlp-auto-speed`, not done here.
+`capture-rate` on that route. That is a design decision for the session adapter and
+the Auto and Speed compositions, not done here.
 
-**Update (`wlp-gpu-speed`):** done: Speed offers twice its ceiling, and a
+**Update (GPU import and the paced Speed output):** done: Speed offers twice its ceiling, and a
 session created for Speed gets a 120 Hz output when the host record
 qualifies it. capenc serves Speed at 60–61 fps on a 120 Hz output on both
 routes and both compositors in the lab; the product qualification on this
@@ -529,7 +519,7 @@ host measured 50–54 fps of 60 Hz pointer motion through the session's
 injector, so Speed stays served as Auto here until a qualification
 measures 57 fps.
 
-### Deck-drawn cursor (`wp-cursor`, 2026-10-18)
+### Deck-drawn cursor (2026-10-18)
 
 A development Pier on a non-production port, with its own qualification
 record, served a throwaway account to a current Deck (`media-smoke` and

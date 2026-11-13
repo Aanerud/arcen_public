@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The session's keyring, unlocked with the login password.
 //!
 //! A GDM login unlocks the user's login keyring through

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Verify a governed, locally patched third-party source tree against its
 # ARCEN_SOURCE_MANIFEST.sha256: every listed file unchanged, nothing added.
 #

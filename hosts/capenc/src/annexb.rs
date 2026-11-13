@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Convert MF's length-prefixed (AVCC) NAL unit stream into Annex-B start-code
 // framing, matching NVENC's on-wire output and what arcen-protocol expects.
 //

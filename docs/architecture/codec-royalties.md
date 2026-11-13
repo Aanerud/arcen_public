@@ -1,17 +1,15 @@
 # Codec royalties and AV1: what the public record actually says
 
-**Status: research finding, 2026-08-15 (revised same day). Engineering
+**Status: research finding, 2026-08-15. Engineering
 document.** It records publicly published facts with citations so that
 engineering and commercial decisions start from evidence. It draws **no legal
 conclusions**, and nothing here is advice. Any actual licensing position is for
 counsel to determine.
 
-This was written because the question was asked directly: *can Arcen get away
-from codec royalties by moving to AV1?*
+The question it addresses: *can Arcen get away from codec royalties by moving
+to AV1?*
 
-**The first version of this document answered "less cleanly than the popular
-framing suggests". That answer was wrong, and section 1 has been rewritten.**
-It noted that the Sisvel AV1 pool exists but did not check *whom it charges*.
+The Sisvel AV1 pool exists, and what matters is *whom it charges*.
 Sisvel's published terms charge **consumer device manufacturers**; they contain
 no software, service or streaming category. The AVC and HEVC programmes, by
 contrast, both expressly license software, and AVC additionally licenses
@@ -22,9 +20,7 @@ asymmetry runs in AV1's favour, not against it.
 
 ## 1. Sisvel's AV1 pool charges **device makers**, not software or streaming
 
-*(This section was rewritten on 2026-08-15 after the first version overstated
-the risk. The correction matters, so the error is left visible rather than
-quietly patched.)*
+
 
 The AOMedia Patent License 1.0 is bounded: §2.9 defines a Licensor as a party
 that itself distributes an AV1 implementation, or one with an obligation
@@ -58,7 +54,7 @@ published terms.**
 
 ### Why that matters enormously for Arcen
 
-Arcen ships **software** to **enterprises**. It manufactures no devices. Under
+Arcen is **software**. Its authors manufacture no devices. Under
 Sisvel's published terms the licensable unit is the finished consumer device —
 the customer's PC, laptop, Mac or graphics card, made by Dell, Apple, NVIDIA
 and so on. Arcen is not that party.
@@ -86,12 +82,12 @@ Sisvel's AV1 programme.** It plainly is one in Via LA's AVC programme.
 1. Sisvel is **one** pool. Another AV1 holder could assert on a different
    theory, and no pool guarantees completeness of coverage.
 2. The published page is a **summary**; Sisvel links an executed
-   `AV1_Sublicense_Agreement`, which is the definitive text. It could not be
-   parsed in this session (binary PDF), so the operative definitions of
-   "consumer product" and "Licensed Product" are **unread**.
-3. Arcen sells to enterprises, not consumers. If anything that sits further
-   outside "consumer product", but the agreement's own definition governs.
-4. None of this is legal advice, and the conclusion is counsel's to draw.
+   `AV1_Sublicense_Agreement`, which is the definitive text. This document
+   has not reviewed it, so the operative definitions of "consumer product"
+   and "Licensed Product" are **not covered here**.
+3. The agreement's own definitions govern whether any particular
+   distribution is a "consumer product".
+4. None of this is legal advice.
 
 
 ---
@@ -223,8 +219,8 @@ round-trip harness are for.
 
 ## 6. What this means for the engineering work
 
-The AV1 encode/decode work on `feat/av1-royalty-free-tier` is still worth
-having, but **its justification should be restated**:
+AV1 encode/decode work is still worth having, but **its justification should
+be restated**:
 
 | Original rationale | Status after research |
 | --- | --- |

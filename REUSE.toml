@@ -1,0 +1,186 @@
+version = 1
+SPDX-PackageName = "Arcen"
+SPDX-PackageSupplier = "TUTTIFRUTTI AS"
+
+# Licensing for files that cannot carry a comment header, and the true
+# licences of vendored third-party code. First-party source files carry their
+# own header (scripts/licensing/spdx-headers.py); "closest" keeps it in charge.
+#
+# REUSE applies the LAST matching annotation, so the broad first-party rule
+# comes first and every third-party rule after it.
+
+[[annotations]]
+path = [
+    "**/*.md",
+    "**/*.json",
+    "**/*.jsonl",
+    "**/*.txt",
+    "**/*.png",
+    "**/*.icns",
+    "**/*.svg",
+    "**/*.plist",
+    "**/*.entitlements",
+    "**/*.sha256",
+    "**/*.inf",
+    "**/*.vcxproj",
+    "**/*.wxs",
+    "**/*.xml",
+    "NOTICE",
+    "VERSION",
+    "Cargo.lock",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception"
+
+# Arcen-authored binary test fixtures (USB descriptors written for the
+# emulated tablet; see the fixture's README.md for provenance). Listed file by
+# file on purpose: descriptors captured from a real device
+# (fixtures/*-captured/) are the vendor's bytes and stay unannotated, so
+# `reuse lint` fails until Release/Security decides their licensing.
+[[annotations]]
+path = [
+    "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/device.bin",
+    "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/configuration.bin",
+    "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface0.bin",
+    "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface1.bin",
+    "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface2.bin",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception"
+
+# The notices file quotes other projects' licence texts, including their own
+# SPDX lines; those describe the quoted components, not this file.
+[[annotations]]
+path = "legal/THIRD_PARTY_NOTICES.md"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception"
+
+# --- Third-party material -----------------------------------------------------
+
+# Unicode CLDR windowsZones data, used to build the Windows time-zone map.
+[[annotations]]
+path = "hosts/windows/data/**"
+precedence = "override"
+SPDX-FileCopyrightText = "1991-2025 Unicode, Inc."
+SPDX-License-Identifier = "Unicode-3.0"
+
+# The usb-vhci Linux kernel module is GPL-2.0-or-later; Arcen's lab patches and
+# build configuration for it are distributed under the module's licence.
+[[annotations]]
+path = [
+    "scripts/lab/usb-vhci/*.patch",
+    "scripts/lab/usb-vhci/usb-vhci.config.h",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+# nv-codec-headers (FFmpeg ffnvcodec): the MIT-licensed NVENC header only.
+[[annotations]]
+path = "third_party/nv-codec-headers/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2010-2023 NVIDIA Corporation"
+SPDX-License-Identifier = "MIT"
+
+# apple-cf and videotoolbox, vendored with Arcen's macOS 12 patches. Arcen's
+# patches and notices in these directories are offered under the crates' own
+# licences.
+[[annotations]]
+path = [
+    "third_party/apple-cf-0.9.3-arcen1/**",
+    "third_party/videotoolbox-0.18.1-arcen1/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Per Johansson and contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = [
+    "third_party/apple-cf-0.9.3-arcen1/ARCEN_*",
+    "third_party/apple-cf-0.9.3-arcen1/arcen-*.patch",
+    "third_party/videotoolbox-0.18.1-arcen1/ARCEN_*",
+    "third_party/videotoolbox-0.18.1-arcen1/arcen-*.patch",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# opusic-sys and the Opus codec source it builds.
+[[annotations]]
+path = "third_party/opusic-sys-0.7.3-arcen1/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2001-2023 Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = [
+    "third_party/opusic-sys-0.7.3-arcen1/ARCEN_*",
+    "third_party/opusic-sys-0.7.3-arcen1/arcen-*.patch",
+    "third_party/opusic-sys-0.7.3-arcen1/opus.patch",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+# GNU build-system files shipped inside the Opus source distribution. They
+# are build inputs only; none is compiled into an Arcen binary.
+[[annotations]]
+path = [
+    "third_party/opusic-sys-0.7.3-arcen1/opus/config.guess",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/config.sub",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "1992-2022 Free Software Foundation, Inc."
+SPDX-License-Identifier = "GPL-3.0-or-later WITH Autoconf-exception-generic-3.0"
+
+[[annotations]]
+path = "third_party/opusic-sys-0.7.3-arcen1/opus/ltmain.sh"
+precedence = "override"
+SPDX-FileCopyrightText = "1996-2022 Free Software Foundation, Inc."
+SPDX-License-Identifier = "GPL-2.0-or-later WITH Libtool-exception"
+
+[[annotations]]
+path = [
+    "third_party/opusic-sys-0.7.3-arcen1/opus/compile",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/depcomp",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/missing",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/test-driver",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "1996-2021 Free Software Foundation, Inc."
+SPDX-License-Identifier = "GPL-2.0-or-later WITH Autoconf-exception-generic"
+
+[[annotations]]
+path = "third_party/opusic-sys-0.7.3-arcen1/opus/install-sh"
+precedence = "override"
+SPDX-FileCopyrightText = "1994 X Consortium"
+SPDX-License-Identifier = "X11"
+
+[[annotations]]
+path = [
+    "third_party/opusic-sys-0.7.3-arcen1/opus/aclocal.m4",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/Makefile.in",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/m4/libtool.m4",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/m4/lt~obsolete.m4",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/m4/ltoptions.m4",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/m4/ltsugar.m4",
+    "third_party/opusic-sys-0.7.3-arcen1/opus/m4/ltversion.m4",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "1994-2021 Free Software Foundation, Inc."
+SPDX-License-Identifier = "FSFULLR"
+
+[[annotations]]
+path = "third_party/opusic-sys-0.7.3-arcen1/opus/configure"
+precedence = "override"
+SPDX-FileCopyrightText = "1992-2021 Free Software Foundation, Inc."
+SPDX-License-Identifier = "FSFUL"
+
+[[annotations]]
+path = "third_party/opusic-sys-0.7.3-arcen1/opus/m4/ax_add_fortify_source.m4"
+precedence = "override"
+SPDX-FileCopyrightText = "2017 David Seifert"
+SPDX-License-Identifier = "FSFAP"

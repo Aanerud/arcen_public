@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
@@ -1187,8 +1190,12 @@ fn scrgb_sdr_code_table(transfer: TransferCharacteristics) -> &'static [u16; HAL
 /// Transform Windows FP16 scRGB capture into ten-bit SDR YCbCr.
 ///
 /// The source is linear BT.709/scRGB. Values outside SDR range are clamped,
-/// the requested SDR OETF is applied through a process-wide half-float lookup,
-/// and the result is packed through the negotiated matrix/range.
+/// the served SDR transfer is applied through a process-wide half-float
+/// lookup, and the result is packed through the negotiated matrix/range.
+/// With [`TransferCharacteristics::Srgb`] this is the exact inverse of how the
+/// compositor linearised SDR content, so desktop code values survive
+/// ([`super::sdr_desktop_transfer`]); with
+/// [`TransferCharacteristics::Bt709`] they are re-encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrgbSdrTransform {
     transfer: TransferCharacteristics,
@@ -1211,6 +1218,13 @@ impl ScrgbSdrTransform {
             transfer,
             ycbcr: ColorTransform::for_input_max(matrix, range, depth, f64::from(WIDE_INPUT_MAX)),
         })
+    }
+
+    /// The SDR transfer this transform encodes with, which a GPU
+    /// implementation must apply too.
+    #[must_use]
+    pub const fn transfer(self) -> TransferCharacteristics {
+        self.transfer
     }
 
     fn convert_half_pixel(self, r: u16, g: u16, b: u16) -> [u16; 3] {
@@ -1370,10 +1384,25 @@ pub enum Rgb10Signal {
     /// Rec.2100 PQ / BT.2020 source converted to BT.709 SDR: PQ decoded to
     /// linear light with graphics white at 203 nits (BT.2408), BT.2020
     /// primaries mapped to BT.709, clipped to SDR white, then BT.709 OETF.
+    /// The stream is `bt709`; a Deck that predates `srgb_transfer` gets this.
     PqBt2020ToSdrBt709,
+    /// The same conversion, re-encoded with the IEC 61966-2-1 (sRGB) curve
+    /// instead of the BT.709 OETF, for an `srgb` stream. An SDR desktop a
+    /// compositor composed into PQ was decoded with the sRGB curve on the way
+    /// in, so this curve returns its own code values; the BT.709 OETF moves
+    /// them (up to 16/255 in the shadows) while the Deck presents the result
+    /// as sRGB ([`super::sdr_desktop_transfer`]).
+    PqBt2020ToSdrSrgb,
+    /// The same conversion, re-encoded with a pure 2.2 power, for an `srgb`
+    /// stream from a compositor that decoded its SDR content with that power
+    /// ([`super::SdrContentCurve::Gamma22`]: Mutter in an HDR colour state).
+    /// The inverse of that decode returns the content's own code values,
+    /// which is what the `srgb` tag promises; the sRGB curve would leave the
+    /// shadows up to 8.5/255 low.
+    PqBt2020ToSdrGamma22,
 }
 
-/// Linear-light samples of the BT.709 OETF lookup, over `0.0..=1.0`.
+/// Linear-light samples of the SDR re-encoding lookups, over `0.0..=1.0`.
 const SDR_OETF_STEPS: usize = 1 << 14;
 
 /// ITU-R BT.2087 linear BT.2020 to linear BT.709 (D65).
@@ -1397,10 +1426,38 @@ fn pq_code_to_graphics_white_linear() -> &'static [f32; PQ_CODE_COUNT] {
     })
 }
 
-/// Linear light in `0.0..=1.0` to a ten-bit BT.709 code.
-fn sdr_bt709_oetf_codes() -> &'static [u16] {
-    static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
-    TABLE.get_or_init(|| {
+/// The curve a PQ-to-SDR conversion re-encodes linear light with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SdrCurve {
+    Bt709,
+    Srgb,
+    Gamma22,
+}
+
+impl SdrCurve {
+    /// Where linear light sits along the curve's lookup table. A pure power
+    /// has no linear toe, so its table is spaced by the square root of the
+    /// light: uniform steps would merge its darkest codes.
+    fn table_position(self, linear: f32) -> f32 {
+        match self {
+            Self::Bt709 | Self::Srgb => linear,
+            Self::Gamma22 => linear.sqrt(),
+        }
+    }
+}
+
+fn gamma22_from_table_position(position: f32) -> f32 {
+    (position * position).powf(1.0 / 2.2)
+}
+
+/// A table position ([`SdrCurve::table_position`]) in `0.0..=1.0` to a
+/// ten-bit code of an SDR curve: the BT.709 OETF, the sRGB curve or a pure
+/// 2.2 power.
+fn sdr_oetf_codes(curve: SdrCurve) -> &'static [u16] {
+    static BT709: OnceLock<Vec<u16>> = OnceLock::new();
+    static SRGB: OnceLock<Vec<u16>> = OnceLock::new();
+    static GAMMA22: OnceLock<Vec<u16>> = OnceLock::new();
+    let build = |encode: fn(f32) -> f32| {
         (0..=SDR_OETF_STEPS)
             .map(|step| {
                 #[allow(
@@ -1410,13 +1467,18 @@ fn sdr_bt709_oetf_codes() -> &'static [u16] {
                 )]
                 {
                     let linear = step as f32 / SDR_OETF_STEPS as f32;
-                    (linear_to_bt709(linear) * f32::from(WIDE_INPUT_MAX))
+                    (encode(linear) * f32::from(WIDE_INPUT_MAX))
                         .round()
                         .clamp(0.0, f32::from(WIDE_INPUT_MAX)) as u16
                 }
             })
             .collect()
-    })
+    };
+    match curve {
+        SdrCurve::Srgb => SRGB.get_or_init(|| build(linear_to_srgb)),
+        SdrCurve::Bt709 => BT709.get_or_init(|| build(linear_to_bt709)),
+        SdrCurve::Gamma22 => GAMMA22.get_or_init(|| build(gamma22_from_table_position)),
+    }
 }
 
 impl Rgb10Signal {
@@ -1427,12 +1489,35 @@ impl Rgb10Signal {
     pub fn map(self, rgb: [u16; 3]) -> [u16; 3] {
         match self {
             Self::Direct => rgb,
-            Self::PqBt2020ToSdrBt709 => {
+            Self::PqBt2020ToSdrBt709 | Self::PqBt2020ToSdrSrgb | Self::PqBt2020ToSdrGamma22 => {
                 let decode = pq_code_to_graphics_white_linear();
-                bt2020_graphics_linear_to_sdr_bt709_codes(
+                bt2020_graphics_linear_to_sdr_codes(
                     rgb.map(|code| decode[usize::from(code.min(WIDE_INPUT_MAX))]),
+                    self.sdr_curve(),
                 )
             }
+        }
+    }
+
+    /// The transfer a PQ-to-SDR conversion's codes are stated with; `None`
+    /// for [`Self::Direct`], which re-encodes nothing. The 2.2-power
+    /// conversion returns sRGB content's own codes, so it is `srgb`.
+    #[must_use]
+    pub const fn sdr_transfer(self) -> Option<TransferCharacteristics> {
+        match self {
+            Self::Direct => None,
+            Self::PqBt2020ToSdrBt709 => Some(TransferCharacteristics::Bt709),
+            Self::PqBt2020ToSdrSrgb | Self::PqBt2020ToSdrGamma22 => {
+                Some(TransferCharacteristics::Srgb)
+            }
+        }
+    }
+
+    const fn sdr_curve(self) -> SdrCurve {
+        match self {
+            Self::Direct | Self::PqBt2020ToSdrBt709 => SdrCurve::Bt709,
+            Self::PqBt2020ToSdrSrgb => SdrCurve::Srgb,
+            Self::PqBt2020ToSdrGamma22 => SdrCurve::Gamma22,
         }
     }
 
@@ -1442,7 +1527,7 @@ impl Rgb10Signal {
     /// expects.
     ///
     /// [`Self::Direct`] keeps the PQ signal and rounds it to ten bits.
-    /// [`Self::PqBt2020ToSdrBt709`] decodes the half-float signal itself, not
+    /// The PQ-to-SDR conversions decode the half-float signal itself, not
     /// a ten-bit rounding of it: an SDR ramp composed at 203-nit white keeps
     /// 853 of the 1024 ten-bit BT.709 codes this way, against 445 through
     /// ten-bit PQ codes (half-float PQ steps are coarser than one SDR code
@@ -1455,18 +1540,22 @@ impl Rgb10Signal {
                 let codes = pq_half_to_code();
                 rgb.map(|bits| codes[usize::from(bits)])
             }
-            Self::PqBt2020ToSdrBt709 => {
+            Self::PqBt2020ToSdrBt709 | Self::PqBt2020ToSdrSrgb | Self::PqBt2020ToSdrGamma22 => {
                 let decode = pq_half_to_graphics_white_linear();
-                bt2020_graphics_linear_to_sdr_bt709_codes(rgb.map(|bits| decode[usize::from(bits)]))
+                bt2020_graphics_linear_to_sdr_codes(
+                    rgb.map(|bits| decode[usize::from(bits)]),
+                    self.sdr_curve(),
+                )
             }
         }
     }
 }
 
-/// Linear BT.2020 light relative to 203-nit graphics white to ten-bit
-/// BT.709 SDR codes: primaries mapped, clipped at SDR white, BT.709 OETF.
-fn bt2020_graphics_linear_to_sdr_bt709_codes(linear: [f32; 3]) -> [u16; 3] {
-    let oetf = sdr_bt709_oetf_codes();
+/// Linear BT.2020 light relative to 203-nit graphics white to ten-bit SDR
+/// codes at BT.709 primaries: primaries mapped, clipped at SDR white, then the
+/// SDR `curve` ([`sdr_oetf_codes`]).
+fn bt2020_graphics_linear_to_sdr_codes(linear: [f32; 3], curve: SdrCurve) -> [u16; 3] {
+    let oetf = sdr_oetf_codes(curve);
     BT2020_TO_BT709.map(|row| {
         let value = (row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2]).clamp(0.0, 1.0);
         #[allow(
@@ -1474,7 +1563,7 @@ fn bt2020_graphics_linear_to_sdr_bt709_codes(linear: [f32; 3]) -> [u16; 3] {
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
-        let index = (value * SDR_OETF_STEPS as f32).round() as usize;
+        let index = (curve.table_position(value) * SDR_OETF_STEPS as f32).round() as usize;
         oetf[index.min(SDR_OETF_STEPS)]
     })
 }
@@ -2040,6 +2129,142 @@ mod tests {
         assert_eq!(y[3], 0xffc0, "SDR conversion clamps values above white");
         assert!(u.iter().all(|sample| *sample == 0x8000));
         assert!(v.iter().all(|sample| *sample == 0x8000));
+    }
+
+    /// The nearest binary16 to `value` (ties to even), as a compositor
+    /// storing linear light in an FP16 surface would produce it.
+    fn nearest_half(value: f64) -> u16 {
+        let positive: Vec<f64> = (0u16..0x7c00)
+            .map(|bits| f64::from(half_to_f32(bits)))
+            .collect();
+        let above = positive.partition_point(|half| *half < value);
+        if above == 0 {
+            return 0;
+        }
+        let below = above - 1;
+        if above == positive.len() {
+            return u16::try_from(below).unwrap_or(u16::MAX);
+        }
+        let (low, high) = (value - positive[below], positive[above] - value);
+        let pick = if low < high || (low == high && below % 2 == 0) {
+            below
+        } else {
+            above
+        };
+        u16::try_from(pick).unwrap_or(u16::MAX)
+    }
+
+    /// IEC 61966-2-1 decoding, as Windows applies it to SDR surfaces when it
+    /// composes them into linear scRGB.
+    fn srgb_code_to_linear(code: u8) -> f64 {
+        let signal = f64::from(code) / 255.0;
+        if signal <= 0.040_45 {
+            signal / 12.92
+        } else {
+            ((signal + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// The Grading exactness rule: every eight-bit sRGB desktop code that
+    /// Windows linearised into FP16 scRGB comes back out of the `srgb`
+    /// transfer as its ten-bit equivalent (`code × 1023/255`, within one
+    /// ten-bit code of the half-float's own rounding) and therefore as
+    /// exactly the same eight-bit code. The legacy BT.709 re-encoding moves codes by up to 16/255, which
+    /// is what the Colour check measured on a Windows Grading session.
+    #[test]
+    fn every_eight_bit_srgb_code_survives_scrgb_and_the_srgb_transfer() {
+        let srgb = scrgb_sdr_code_table(TransferCharacteristics::Srgb);
+        let bt709 = scrgb_sdr_code_table(TransferCharacteristics::Bt709);
+        let mut worst_ten_bit = 0.0f64;
+        let mut worst_bt709 = 0u8;
+        for code in 0..=u8::MAX {
+            let half = nearest_half(srgb_code_to_linear(code));
+            let ten_bit = srgb[usize::from(half)];
+            let ideal = f64::from(code) * f64::from(WIDE_INPUT_MAX) / 255.0;
+            worst_ten_bit = worst_ten_bit.max((f64::from(ten_bit) - ideal).abs());
+            let back =
+                |ten: u16| (f64::from(ten) * 255.0 / f64::from(WIDE_INPUT_MAX)).round() as u8;
+            assert_eq!(
+                back(ten_bit),
+                code,
+                "sRGB code {code} came back as {ten_bit}/1023"
+            );
+            worst_bt709 = worst_bt709.max(back(bt709[usize::from(half)]).abs_diff(code));
+        }
+        // FP16 carries about 0.1 of a ten-bit code near white, so where
+        // `code × 1023/255` lies within that of a half-code boundary (43,
+        // 127, 204, …) the rounding can land one ten-bit code to the other
+        // side: never further, and never far enough to change the eight-bit
+        // code.
+        assert!(
+            worst_ten_bit < 0.65,
+            "ten-bit codes must be the eight-bit codes ×1023/255 (worst {worst_ten_bit:.3})"
+        );
+        assert!(
+            worst_bt709 >= 10,
+            "the BT.709 re-encoding is the defect this transfer replaces (worst {worst_bt709})"
+        );
+    }
+
+    /// The same rule through the whole Grading conversion: matrix, range and
+    /// the ten-bit store, read back with the shared inverse.
+    #[test]
+    fn srgb_grading_conversion_returns_the_desktop_codes_through_the_matrix() {
+        let transform = ScrgbSdrTransform::new(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            TransferCharacteristics::Srgb,
+        )
+        .expect("sRGB is an SDR transfer");
+        let inverse = ColorTransform::for_input_max(
+            ColorMatrix::Bt709,
+            ColorRange::Full,
+            BitDepth::Ten,
+            f64::from(WIDE_INPUT_MAX),
+        );
+        let mut desktop = Vec::new();
+        for code in 0..=u8::MAX {
+            desktop.extend([
+                [code, code, code],
+                [code, 0, 0],
+                [0, code, 0],
+                [0, 0, code],
+                [code, code / 2, u8::MAX - code],
+                [code / 3, u8::MAX - code, code],
+            ]);
+        }
+        let mut src = Vec::with_capacity(desktop.len() * 8);
+        for [r, g, b] in &desktop {
+            for component in [*r, *g, *b] {
+                src.extend_from_slice(&nearest_half(srgb_code_to_linear(component)).to_le_bytes());
+            }
+            src.extend_from_slice(&0x3c00u16.to_le_bytes());
+        }
+        let width = desktop.len();
+        let (mut y, mut u, mut v) = (vec![0u16; width], vec![0u16; width], vec![0u16; width]);
+        convert_scrgb_to_sdr_i444_p16(
+            &src,
+            width * 8,
+            [&mut y, &mut u, &mut v],
+            [width; 3],
+            width,
+            1,
+            transform,
+        )
+        .expect("geometry is valid");
+        for (index, [r, g, b]) in desktop.iter().enumerate() {
+            let (out_b, out_g, out_r) = inverse.to_bgr8(
+                inverse.unpack_p16(y[index]),
+                inverse.unpack_p16(u[index]),
+                inverse.unpack_p16(v[index]),
+            );
+            assert_eq!(
+                (out_r, out_g, out_b),
+                (*r, *g, *b),
+                "desktop code survives the sRGB Grading conversion"
+            );
+        }
     }
 
     #[test]
@@ -3233,6 +3458,176 @@ mod pq_half_tests {
         } else {
             ((signal + 0.099) / 1.099).powf(1.0 / 0.45)
         }
+    }
+
+    /// IEC 61966-2-1 decoding, as a compositor applies it to an SDR window
+    /// it composes into a PQ desktop.
+    fn srgb_code_to_linear(code: u8) -> f32 {
+        let signal = f32::from(code) / 255.0;
+        if signal <= 0.040_45 {
+            signal / 12.92
+        } else {
+            ((signal + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// ITU-R BT.2087 linear BT.709 to linear BT.2020, the way SDR content
+    /// enters a BT.2020 composition space.
+    fn bt709_to_bt2020(rgb: [f32; 3]) -> [f32; 3] {
+        [
+            [0.627_404, 0.329_283, 0.043_313],
+            [0.069_097, 0.919_540, 0.011_362],
+            [0.016_391, 0.088_013, 0.895_595],
+        ]
+        .map(|row| row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2])
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn to_eight_bit(ten: u16) -> u8 {
+        (f32::from(ten) * 255.0 / f32::from(WIDE_INPUT_MAX)).round() as u8
+    }
+
+    /// The PQ-desktop counterpart of the Windows scRGB round trip: an sRGB
+    /// desktop composed into PQ at 203-nit graphics white (BT.2408) comes back
+    /// out of the sRGB conversion as its own codes.
+    ///
+    /// Every grey survives exactly, from the half-float screencast and from a
+    /// declared-PQ Xorg desktop's ten-bit codes alike; its ten-bit code is
+    /// within 1.5 of `code × 1023/255` (PQ's own precision). Colours are within a fraction of a code on average: a dark
+    /// channel beside a bright one is the small difference of two large
+    /// BT.2020 values, and the composition's own PQ precision limits it, not
+    /// this conversion. The BT.709 OETF moves greys by ten codes or more,
+    /// which is the defect the sRGB conversion replaces.
+    #[test]
+    fn an_srgb_desktop_composed_into_pq_keeps_its_codes_through_the_srgb_conversion() {
+        struct Error {
+            worst: u8,
+            sum: u64,
+            count: u64,
+        }
+        impl Error {
+            const fn new() -> Self {
+                Self {
+                    worst: 0,
+                    sum: 0,
+                    count: 0,
+                }
+            }
+            fn add(&mut self, got: u16, want: u8) {
+                let error = to_eight_bit(got).abs_diff(want);
+                self.worst = self.worst.max(error);
+                self.sum += u64::from(error);
+                self.count += 1;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            fn mean(&self) -> f64 {
+                self.sum as f64 / self.count as f64
+            }
+        }
+        let srgb = Rgb10Signal::PqBt2020ToSdrSrgb;
+        let bt709 = Rgb10Signal::PqBt2020ToSdrBt709;
+        let (mut grey_half, mut grey_rgb10, mut grey_bt709) =
+            (Error::new(), Error::new(), Error::new());
+        let (mut colour_half, mut colour_bt709) = (Error::new(), Error::new());
+        let mut worst_grey_ten_bit = 0.0f32;
+        for code in 0..=u8::MAX {
+            for pixel in [
+                [code, code, code],
+                [code, 0, 0],
+                [0, code, 0],
+                [0, 0, code],
+                [code, code / 2, u8::MAX - code],
+                [code / 3, u8::MAX - code, code],
+            ] {
+                let nits =
+                    bt709_to_bt2020(pixel.map(srgb_code_to_linear)).map(|linear| linear * 203.0);
+                let halves = nits.map(pq_half);
+                let out = srgb.map_pq_half(halves);
+                let legacy = bt709.map_pq_half(halves);
+                if pixel == [code; 3] {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let pq10 = (linear_nits_to_pq_signal(nits[1]) * f32::from(WIDE_INPUT_MAX))
+                        .round() as u16;
+                    grey_half.add(out[1], code);
+                    grey_rgb10.add(srgb.map([pq10; 3])[1], code);
+                    grey_bt709.add(legacy[1], code);
+                    assert!(out[0] == out[1] && out[1] == out[2], "grey stays grey");
+                    let ideal = f32::from(code) * f32::from(WIDE_INPUT_MAX) / 255.0;
+                    worst_grey_ten_bit = worst_grey_ten_bit.max((f32::from(out[1]) - ideal).abs());
+                } else {
+                    for channel in 0..3 {
+                        colour_half.add(out[channel], pixel[channel]);
+                        colour_bt709.add(legacy[channel], pixel[channel]);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "PQ desktop to sRGB: grey worst half {} / rgb10 {} / bt709 {}; ten-bit grey worst \
+             {worst_grey_ten_bit:.3}; colour mean {:.4} worst {} (bt709 mean {:.4} worst {})",
+            grey_half.worst,
+            grey_rgb10.worst,
+            grey_bt709.worst,
+            colour_half.mean(),
+            colour_half.worst,
+            colour_bt709.mean(),
+            colour_bt709.worst,
+        );
+        assert_eq!(grey_half.worst, 0, "half-float PQ keeps every grey");
+        assert_eq!(grey_rgb10.worst, 0, "ten-bit PQ keeps every grey");
+        assert!(
+            worst_grey_ten_bit < 1.5,
+            "grey ten-bit codes are code x 1023/255"
+        );
+        assert!(grey_bt709.worst >= 10, "the BT.709 OETF moves the shadows");
+        assert!(
+            colour_half.mean() < 0.25,
+            "colours keep their codes on average"
+        );
+        assert!(colour_half.mean() < colour_bt709.mean() / 4.0);
+    }
+
+    /// A compositor that decodes its SDR content with a pure 2.2 power
+    /// (Mutter in an HDR colour state) gets every grey back from half-float
+    /// PQ, and within one code from ten-bit PQ, through the 2.2-power
+    /// conversion; the sRGB curve leaves
+    /// the shadows several codes low (the lab measured up to 8.5/255 on
+    /// GNOME 51.1), so it is not the inverse there.
+    #[test]
+    fn a_gamma22_composition_keeps_its_codes_through_the_gamma22_conversion() {
+        let gamma22 = Rgb10Signal::PqBt2020ToSdrGamma22;
+        let (mut worst_half, mut worst_rgb10, mut worst_srgb) = (0u8, 0u8, 0u8);
+        for code in 0..=u8::MAX {
+            let linear = (f32::from(code) / 255.0).powf(2.2);
+            let nits = linear * 203.0;
+            let halves = [pq_half(nits); 3];
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pq10 = (linear_nits_to_pq_signal(nits) * f32::from(WIDE_INPUT_MAX)).round() as u16;
+            let out = gamma22.map_pq_half(halves);
+            assert!(out[0] == out[1] && out[1] == out[2], "grey stays grey");
+            worst_half = worst_half.max(to_eight_bit(out[1]).abs_diff(code));
+            worst_rgb10 = worst_rgb10.max(to_eight_bit(gamma22.map([pq10; 3])[1]).abs_diff(code));
+            worst_srgb = worst_srgb.max(
+                to_eight_bit(Rgb10Signal::PqBt2020ToSdrSrgb.map_pq_half(halves)[1]).abs_diff(code),
+            );
+        }
+        assert_eq!(worst_half, 0, "half-float PQ keeps every grey");
+        // Near white one ten-bit PQ step is wider than one eight-bit SDR
+        // code on this curve (codes 246-248 move by one): the source's
+        // precision, not the conversion's.
+        assert!(
+            worst_rgb10 <= 1,
+            "ten-bit PQ keeps every grey within one code"
+        );
+        assert!(
+            worst_srgb >= 5,
+            "the sRGB curve is not this composition's inverse"
+        );
+        assert_eq!(
+            gamma22.sdr_transfer(),
+            Some(crate::TransferCharacteristics::Srgb),
+            "the content's own codes are stated as sRGB"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #!/usr/bin/python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Lab-only helpers for the Wayland capture harness. Not shipped.
 
 `client` draws animated content in a GTK 3 Wayland window so a headless

@@ -114,7 +114,7 @@
     {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
-      "contracts": ["auth", "build_identity", "clipboard", "crate", "cursor", "fsm", "lanes", "messages", "wire"],
+      "contracts": ["auth", "build_identity", "clipboard", "crate", "cursor", "cursor_position", "fsm", "lanes", "messages", "wire"],
       "forwarded_features": {
         "wss-compat": [
           "wss-compat"
@@ -238,13 +238,13 @@
           "owner": "macOS Client"
         },
         {
-          "id": "macos-deck-usb-hard-lab",
+          "id": "macos-deck-native-tablet",
           "entry_points": [
             "clients/macos/src/usb_bridge.rs",
             "clients/macos/src/usb_helper_client.rs"
           ],
-          "build_profiles": ["macos-deck-usb-hard-lab"],
-          "validation": ["macos-deck-usb-hard-lab-test", "macos-deck-usb-lab"],
+          "build_profiles": ["macos-deck-native-tablet"],
+          "validation": ["macos-deck-native-tablet-test", "macos-deck-usb-lab"],
           "owner": "macOS Client"
         }
       ]
@@ -252,7 +252,7 @@
     {
       "package": "arcen-input",
       "dependency_kind": "normal",
-      "contracts": ["cursor", "messages"]
+      "contracts": ["cursor", "cursor_position", "messages"]
     },
     {
       "package": "arcen-media",
@@ -262,7 +262,7 @@
     {
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
-      "contracts": ["build_identity", "clipboard", "crate", "cursor", "lanes", "messages", "wire"],
+      "contracts": ["build_identity", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "wire"],
       "forwarded_features": {
         "wss-compat": [
           "wss-compat"
@@ -406,10 +406,10 @@
           "owner": "Linux Host"
         },
         {
-          "id": "linux-usb-hard-lab",
+          "id": "linux-native-tablet",
           "entry_points": ["hosts/linux/src/usb_bridge/mod.rs"],
-          "build_profiles": ["linux-pier-usb-hard-lab"],
-          "validation": ["linux-pier-usb-hard-lab-test", "linux-usb-lab"],
+          "build_profiles": ["linux-pier-native-tablet"],
+          "validation": ["linux-pier-native-tablet-test", "linux-usb-lab"],
           "owner": "Linux Host"
         }
       ]
@@ -417,7 +417,7 @@
     {
       "package": "arcen-pier-macos",
       "dependency_kind": "normal",
-      "contracts": ["build_identity", "clipboard", "crate", "messages", "wire"],
+      "contracts": ["build_identity", "clipboard", "crate", "cursor_position", "messages", "wire"],
       "paths": [
         {
           "id": "macos-pier-auto",

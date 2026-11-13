@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Real Quinn loopback test for the host side of the audio priority stream:
 //! `PriorityAudio` opens the stream on the first frame, a Deck reading it
 //! receives the same bytes in order, and a closed connection makes it

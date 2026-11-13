@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-usb-helper"
-version = "0.17.0"
+version = "0.19.0"
 edition = "2021"
 publish = false
 license.workspace = true
+authors.workspace = true
 description = "Privileged macOS USB capture helper for Arcen Deck Hard USB bridging"
 
 # The root attack surface is this crate. Keep the dependency set minimal and
@@ -14,6 +18,21 @@ arcen-protocol = { path = "../../../shared/protocol", default-features = false }
 arcen-usb-bridge = { path = "../../../shared/usb-bridge" }
 rusb = { version = "0.9.4", features = ["vendored"] }
 libc = "0.2"
+# Verified, descriptor-pinned root directory for the socket (and the
+# IOUSBHost capture marker); `rustix` sets the process umask. No unsafe code.
+arcen-secure-dir = { path = "../secure-dir" }
+rustix = { workspace = true }
+# The IOUSBHost backend (ADR 0019). Optional and off by default in a plain
+# build; release builds enable it (packaging/macos/build-deck-app.sh), and the
+# helper then captures with IOUSBHost, keeping libusb selectable.
+arcen-usb-iousbhost = { path = "../usb-iousbhost", optional = true }
+
+[features]
+default = []
+# Links the IOUSBHost backend: crash recovery from its captured marker at
+# daemon start, the read-only `--probe-iousbhost` listing, and
+# `PhysicalDevice::bridge_iousbhost`. Every release helper is built with it.
+iousbhost = ["dep:arcen-usb-iousbhost"]
 
 [[bin]]
 name = "arcen-usb-helper"

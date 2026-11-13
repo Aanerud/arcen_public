@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Following a sign-in screen into the desktop that replaces it.
 //!
 //! A host serving its operating system's sign-in screen says so in its hello

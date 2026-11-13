@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Writes one shared colour test pattern as raw BGRA to standard output.
 //!
 //! `cargo run -p arcen-media --example render_test_pattern -- chroma_detail 1800 1130 > pattern.bgra`

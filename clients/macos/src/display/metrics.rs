@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! One validated per-display metrics value object.
 //!
 //! Every Deck consumer of a local display's geometry -- the legacy

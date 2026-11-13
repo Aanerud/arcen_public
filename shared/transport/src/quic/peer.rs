@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Concrete Quinn-backed QUIC peer: authenticated binding handshake, a
 //! persistent unidirectional reliable stream per direction, encrypted
 //! datagrams for low-latency media, bounded queues, lifecycle events, and a
@@ -36,7 +38,7 @@ use super::handshake::{
 use super::identity::{PeerIdentityAuthorizer, PeerIdentityClaim, QuicRole};
 
 /// A boxed, `Send` future — the object-safe async adapter boundary used so
-/// Host, Client, and Gateway crates can consume this transport without this
+/// Host and Client crates can consume this transport without this
 /// crate depending on any of them and without requiring `async_trait`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -1219,7 +1221,7 @@ async fn lifecycle_task(shared: Arc<Shared>) {
     }
 }
 
-/// Object-safe async adapter boundary for Host, Client, and Gateway
+/// Object-safe async adapter boundary for Host and Client
 /// consumers. Uses boxed `Send` futures instead of `async_trait` so it stays
 /// object-safe (`Box<dyn AsyncTransportPeer>` / `Arc<dyn AsyncTransportPeer>`)
 /// without an extra proc-macro dependency.

@@ -1,14 +1,13 @@
 # Arcen Architecture
 
 > **STATUS — target vs. current.** This document describes the *target*
-> design. **Current reality:** the live shared crates are `arcen-protocol`,
-> `arcen-input`, `arcen-media`, `arcen-keel`, `arcen-telemetry`,
-> `arcen-observability`, `arcen-identity`, the default restore-lease surface
-> of `arcen-session`, and the dependency-light TLS lifecycle default of
-> `arcen-transport`, plus the safe Hard USB policy/state core
-> `arcen-usb-bridge`.
-> `arcen-transport`'s opt-in QUIC feature is active in the direct Linux/Windows
-> Pier and macOS Deck products while its default dependency graph stays
+> design. **Current reality:** all eleven shared crates are live:
+> `arcen-protocol`, `arcen-transport`, `arcen-media`, `arcen-input`,
+> `arcen-outputs`, `arcen-session`, `arcen-identity`, `arcen-keel`,
+> `arcen-telemetry`, `arcen-observability` and the safe Hard USB policy/state
+> core `arcen-usb-bridge`.
+> `arcen-transport`'s opt-in QUIC feature is active in the Linux, Windows and
+> macOS Piers and the macOS Deck while its default dependency graph stays
 > Quinn-free. Shipped transport is
 > **direct QUIC only**, using the shared TLS trust lifecycle. Dormant WSS source
 > is isolated behind `wss-compat` and is not enabled by product builds.
@@ -22,25 +21,25 @@ shared crates never consume products; products never consume one another.
 
 ## Product topology
 
-- **Hosts:** Linux and Windows workstation agents; macOS host in active
-  development
+- **Hosts:** Linux (X11, and GNOME/Mutter Wayland) and Windows workstation
+  Piers; a macOS Pier shipped as a preview
 - **Clients:** macOS desktop application
 - **Deferred:** Linux and Windows clients
 
-The [macOS Pier implementation plan](../todo/macos-pier.md) defines a proposed
-shared-first host, native boot/login feasibility gates, and signed-package
-acceptance criteria. The logged-in Aqua host path now exists, but this is not a
-release claim: cold-boot LoginWindow operation is still target work, and
+The macOS Pier is a shared-first host with native boot/login feasibility gates
+and signed-package acceptance criteria ([`hosts/macos/AGENTS.md`](../../hosts/macos/AGENTS.md)).
+The logged-in Aqua host path exists, but this is not a release claim: cold-boot LoginWindow operation is still target work, and
 multi-monitor is not qualified on two-display hardware.
 
 ## Transport direction
 
-Direct products use QUIC (Quinn + rustls TLS 1.3) on one bidirectional stream
-carrying the existing authenticated, WebSocket-framed session protocol. WSS
-network code is dormant behind `wss-compat` and absent from product feature
-graphs. This baseline does not yet split control/media into
-independent streams or use datagrams. Those mechanisms remain available for a
-future reviewed optimization; see
+Direct products use QUIC (Quinn + rustls TLS 1.3). Since 0.17.0 one
+authenticated connection carries isolated lanes — control, video, audio out,
+microphone, input/cursor and bulk — each on its own stream with its own worker, declared
+by a bounded lane preface (protocol v5,
+[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). WSS network
+code is dormant behind `wss-compat` and absent from product feature graphs.
+The products do not use QUIC datagrams. See
 [`transport.md`](transport.md) for API usage and known gaps, and
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
 for the current decision. Transport mechanics remain behind `arcen-transport`;
@@ -85,11 +84,12 @@ See the superseding decision in
 | `arcen-protocol` | Explicit version negotiation, bounded JSON control messages, protocol-v3 binary headers, endpoint capability exchange, and foundation-only additive `multi_monitor_v1` negotiation metadata |
 | `arcen-keel` | Pure 16×16 content-damage tracking and deterministic scenario corpus; consumed by Windows software selective conversion |
 | `arcen-transport` | Active shared rustls posture, certificate lifecycle, pins, reload, and transport contracts; opt-in Quinn/rustls direct QUIC carrier plus the separately unused advanced stream/datagram adapter |
-| `arcen-usb-bridge` | Active safe, OS-free exact-profile policy, descriptor parsing, attachment lifecycle, URB ledger, and synthetic lab tablet for the default-off Hard USB vertical slice |
+| `arcen-usb-bridge` | Active safe, OS-free exact-profile policy, descriptor parsing, attachment lifecycle, URB ledger, synthetic lab tablet, and the device-exporter engine (`UsbExporter` over a platform `CapturedUsbDevice` backend, ADR 0019) for the default-off Hard USB vertical slice |
 | `arcen-identity` | Provider-neutral OIDC/session-grant contracts plus bounded standalone disclaimer validation and acceptance evidence |
-| `arcen-session` | Active default pure IANA/restore-lease, direct-reconnect, and Deskside decisions |
-| `arcen-media` | Active pure clipboard policy/sequence/echo, bounded PNG/DIBV5 conversion, codec/chroma truth, fixed audio policy, checked video planes/conversion, media-plan resolution, optional source-built software H.264, validated monitor topology, foundation-only multi-monitor topology/admission contracts, and the Deck platform profile (`deck_platform`: Apple silicon vs Intel decisions over architecture and macOS-version facts) |
-| `arcen-input` | Active pure absolute/relative pointer, cursor-authority, global sequence ordering, typed pen/tablet (`PenEvent`/`PenTool`) capability/event contracts, and the one shared region-input encode/decode (`RegionInputWireMessage`), host pipeline (`RegionInputPipeline`), and client emitter (`RegionInputEmitter`) — see [`pen-tablet-input.md`](pen-tablet-input.md) |
+| `arcen-session` | Active pure session policy: restore leases, direct reconnect, Deskside, admission, Pier configuration schema, connection diagnostics, polkit locality and the Wayland provider's qualification and session policy — see [`shared/session/ARCHITECTURE.md`](../../shared/session/ARCHITECTURE.md) |
+| `arcen-outputs` | Monitor lifecycle, multi-display arrangement and admission, EDID construction ([ADR 0010](../adr/0010-shared-output-provider-lifecycle.md)) |
+| `arcen-media` | Active pure clipboard policy/sequence/echo/repeated-copy, bounded PNG/DIBV5 conversion, codec/chroma truth, fixed audio policy, checked video planes/conversion, media-plan resolution, optional source-built software H.264, validated monitor topology, foundation-only multi-monitor topology/admission contracts, the Deck platform profile (`deck_platform`: Apple silicon vs Intel decisions over architecture and macOS-version facts), and the colourist's Colour check and test-pattern measurement |
+| `arcen-input` | Active pure absolute/relative pointer, cursor-authority, global sequence ordering, typed pen/tablet (`PenEvent`/`PenTool`) capability/event contracts, keyboard policy, committed text and Paste as Keystrokes, host cursor images, and the one shared region-input encode/decode (`RegionInputWireMessage`), host pipeline (`RegionInputPipeline`), and client emitter (`RegionInputEmitter`) — see [`pen-tablet-input.md`](pen-tablet-input.md) |
 | `arcen-telemetry` | Pure correlation IDs, stable lifecycle categories, and redaction-safe fields |
 | [`arcen-observability`](observability.md) | Active OS-free tracing and I/O abstractions for canonical routing, live profile reload, and bounded sink workers |
 
@@ -98,3 +98,32 @@ path must pass when that crate changes is the generated
 [shared consumer register](shared-consumers.md), built from
 `shared/<crate>/consumers.json`, `scripts/ci/validation-profiles.toml` and
 `cargo metadata` by `scripts/check_shared_contracts.py`.
+
+## Documents in this directory
+
+| Document | Covers |
+| --- | --- |
+| [`LEXICON.md`](LEXICON.md) | The canonical vocabulary |
+| [`transport.md`](transport.md) | Direct QUIC: carrier, lanes, congestion control, known gaps |
+| [`tls-certificate-lifecycle.md`](tls-certificate-lifecycle.md) | Certificate generation, validation, pinning and reload |
+| [`session-auto-reconnect.md`](session-auto-reconnect.md) | Credential-free resume after a dropped connection |
+| [`media-plan-resolution.md`](media-plan-resolution.md) | How a requested preset becomes a served pipeline; portable software H.264 |
+| [`color-fidelity.md`](color-fidelity.md) | Ten-bit, 4:4:4, full range, Grading and HDR from capture to the Deck |
+| [`encode-intent.md`](encode-intent.md) | Interactive versus grading encoder intent |
+| [`rate-control.md`](rate-control.md) | Live bitrate control |
+| [`qp-maps.md`](qp-maps.md) | Keel's damage grid as NVENC QP maps |
+| [`arcen-keel.md`](arcen-keel.md) | Keel, the content-adaptive engine (planning document) |
+| [`nvenc-sdk13-blackwell.md`](nvenc-sdk13-blackwell.md) | NVENC SDK 13 on Blackwell: 4:2:2 and Ultra High Quality |
+| [`codec-royalties.md`](codec-royalties.md) | What the public record says about codec royalties and AV1 |
+| [`audio-compression.md`](audio-compression.md), [`audio-input.md`](audio-input.md) | Host audio out and the Deck's microphone in |
+| [`pen-tablet-input.md`](pen-tablet-input.md) | Typed pen and tablet input (local termination) |
+| [`linux-wayland-provider.md`](linux-wayland-provider.md) | The Linux Wayland provider, with lab evidence; qualification records in [`wayland-qualification/`](wayland-qualification) |
+| [`windows-console-policy.md`](windows-console-policy.md) | What the Windows Pier does with the physical console |
+| [`timezone-redirection.md`](timezone-redirection.md) | The session following the Deck's time zone |
+| [`disclaimer-banner.md`](disclaimer-banner.md) | The pre-session notice a host can require |
+| [`macos-peripheral-access.md`](macos-peripheral-access.md) | Webcams and other peripherals from a Mac: which route |
+| [`observability.md`](observability.md), [`ObservabilityStandard.md`](ObservabilityStandard.md) | Logging, QoS telemetry and monitoring |
+| [`shared-consumers.md`](shared-consumers.md) | Generated register of which product path uses each shared crate |
+
+Decisions are in [`../adr/`](../adr); running and configuring a Pier is in
+[`../operations/`](../operations).

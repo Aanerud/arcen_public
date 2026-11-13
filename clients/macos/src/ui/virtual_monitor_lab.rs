@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Developer-only virtual monitor lab (`dev-tools` feature).
 //!
 //! `arcen-deck virtual-monitor-lab [2|4] [--timeout-secs N]` tiles 2 or 4

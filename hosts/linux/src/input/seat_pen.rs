@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The session pen on a private udev seat: the lab seat pen
 //! (`wayland.lab_seat_pen`) and the native seat (`wayland.session_mode`).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Non-blocking canonical telemetry for the Wayland capture path.
 //!
 //! Records are built from shared vocabulary ([`super::evidence`]) and handed

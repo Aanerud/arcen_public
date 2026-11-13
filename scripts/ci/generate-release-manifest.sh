@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 set -euo pipefail
 
 if (( $# != 4 )); then
@@ -31,10 +34,12 @@ done < <(
         sort -z
 )
 
+# The canonical public repository, as owner/name, unless CI says otherwise.
+canonical_url=https://github.com/Aanerud/arcen_public
 jq -s \
     --arg version "$version" \
     --arg commit "$commit" \
-    --arg repository "${GITHUB_REPOSITORY:-Aanerud/arcen_public}" \
+    --arg repository "${GITHUB_REPOSITORY:-${canonical_url#https://github.com/}}" \
     --arg workflow_ref "${GITHUB_WORKFLOW_REF:-local}" \
     '{
         schemaVersion: 1,

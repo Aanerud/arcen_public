@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Speed's rate evidence: which output refresh a Speed session needs, what
 //! rate its capture is admitted on, and whether that rests on a measurement
 //! of this exact output or is inferred from a larger one.

@@ -1,21 +1,39 @@
 # ADR 0014: QUIC Lanes, Capture-Source Evidence and Preset Admission Contracts
 
-**Status:** Proposed 2026-10-17. Contracts and shared runtime merged; on
-the `wlp/workers` branch every product (Linux, Windows and macOS Piers, the
-macOS Deck) runs on them (protocol v5, Amendment 2), pending
-Shared/Architecture and Release/Security review. Amendment 3 adds the
-capture admission notice the Wayland Auto/Speed compositions state before
-`READY`; Amendment 4 makes Linux provider selection automatic from host
-facts and a host qualification record the source of the session-proven
-Wayland facts; Amendment 5 proves GPU import by verified pixels and gives
-Speed a paced output. Amendment 16 makes every Linux desktop's admission
-require polkit to treat its session as remote.
+**Status:** Proposed 2026-10-17; formal Shared/Architecture and
+Release/Security acceptance is still pending. The contracts shipped in 0.17.0:
+every product (Linux, Windows and macOS Piers, the macOS Deck) runs each
+session on these lanes (protocol v5, Amendment 2). Amendments 1–18 follow the
+decision; each records one later contract:
+
+| # | Date | Contract |
+| --- | --- | --- |
+| 1 | 2026-10-17 | Lane runtime decisions |
+| 2 | 2026-10-17 | Product adoption |
+| 3 | 2026-10-17 | Capture admission before `READY` |
+| 4 | 2026-10-17 | Automatic provider selection and the host qualification record |
+| 5 | 2026-10-17 | Verified GPU import and the paced Speed output |
+| 6 | 2026-10-17 | Liveness, capture restart and Wayland output generations |
+| 7 | 2026-10-18 | Orderly session close |
+| 8 | 2026-10-18 | Speed evidence without operator sizes, the runtime guard, development records and automatic re-qualification |
+| 9 | 2026-10-18 | Wayland software encode and hosts without NVENC |
+| 10 | 2026-10-18 | Wayland Grading and HDR |
+| 11 | 2026-10-18 | Host cursor images on the input/cursor lane |
+| 12 | 2026-10-19 | Arrival pacing and the paced Xorg head |
+| 13 | 2026-10-19 | Pen barrel-button capability |
+| 14 | 2026-10-19 | Committed text on the input/cursor lane |
+| 15 | 2026-10-19 | A served-pipeline remedy for the user |
+| 16 | 2026-10-20 | Desktop admission requires polkit to treat the session as remote |
+| 17 | 2026-11-08 | Cursor images from every Pier that can read them (0.18.0) |
+| 18 | 2026-11-09 | Windows Grading keeps the desktop's sRGB code values (0.18.0) |
+| 19 | 2026-11-09 | Every Pier states `srgb` for Grading; PQ-to-SDR uses the sRGB curve (0.19.0) |
 
 > Records the shared, portable contracts the headless Linux Wayland provider
 > and the isolated audio/input transport build on: QUIC lane roles and their
 > preface, lane ownership and failure semantics, capture-surface evidence,
 > per-preset admission for a capture source, and explicit desktop-provider
-> selection. Nothing here changes a shipped Pier or Deck yet.
+> selection. When it was proposed nothing here had changed a shipped Pier or
+> Deck; 0.17.0 shipped it.
 
 ## Context
 
@@ -72,7 +90,7 @@ stream of headroom per shape the peer uses
 
 `arcen_transport::quic::lane_transport_config(policy, endpoint)` grants these
 counts for the lane carrier. The single-stream `recommended_transport_config`
-keeps 1/1 until a product switches to the lane dispatcher (`wlp-workers`);
+keeps 1/1 until a product switches to the lane dispatcher;
 raising limits alone would only admit streams nothing accepts.
 
 ### 2. Lane preface v1
@@ -107,7 +125,7 @@ together; **no legacy single-stream multiplexing is retained**.
   `PeerTransportMismatch::message` gives both sides one operator message:
   update the Deck and the Pier to the same release.
 - `wire::PROTOCOL_VERSION` moves 4 → 5 in the same change that switches the
-  product adapters to lanes (`wlp-workers`), not in this contract change: no
+  product adapters to lanes, not in this contract change: no
   byte on the wire differs yet. The transport capability token stays
   `transport:quic-v1`; the lane version, not the hello, carries the layout.
 
@@ -202,7 +220,7 @@ Copy cost is per path (`ZeroCopyImport`, `GpuConvert`, `HostCopy`,
 `CrossGpu`). `CaptureBackend::PipeWire::zero_copy()` is deliberately left
 `false`; it still describes the host-memory experiment.
 
-Leases (`arcen_media::video::capture_lease`, added by `wlp-import`): a capture
+Leases (`arcen_media::video::capture_lease`, added with GPU import): a capture
 callback pushes validated buffers into a bounded latest-wins
 `CaptureMailbox`; superseded buffers return to the producer at once with their
 damage carried forward (`DamageEvidence::union`), and a `CaptureLease`
@@ -256,11 +274,11 @@ cursor fields. Field values are the stable tokens above.
 
 ## Consequences
 
-- Product adapters (`wlp-quic`, `wlp-workers`, `wlp-import`, `wlp-session`)
+- Product adapters (QUIC runtime, lane dispatcher, capture leases, session adapter)
   implement these contracts; until then no lane is opened and no admission
   runs. Each Pier's configuration loader already validates
   `capture.provider`; the Linux Pier flips `wayland_adapter_built` when the
-  adapter lands (`wlp-session`).
+  session adapter lands.
 - Pre-lane and lane builds cannot interoperate. The failure is explicit and
   names the fix.
 - Separate lanes remove video-induced blocking, not shared congestion or
@@ -272,7 +290,7 @@ cursor fields. Field values are the stable tokens above.
 ## Amendment 1 (2026-10-17): lane runtime decisions
 
 Recorded with the shared lane runtime (`arcen_transport::quic::LaneConnection`,
-`wlp-quic`); products adopt it in `wlp-workers`.
+the QUIC runtime); products adopt it with the lane dispatcher.
 
 1. **Session-message framing.** Control, input/cursor and bulk-aux lanes carry
    pre-encoded session frames through the runtime's `LaneSender`: the owner
@@ -303,7 +321,7 @@ Recorded with the shared lane runtime (`arcen_transport::quic::LaneConnection`,
 
 ## Amendment 2 (2026-10-17): product adoption
 
-Recorded with the product switch (`wlp-workers`): the Linux, Windows and
+Recorded with the product switch to the lane dispatcher: the Linux, Windows and
 macOS Piers and the macOS Deck run every session on lanes and
 `wire::PROTOCOL_VERSION` is 5.
 
@@ -401,8 +419,7 @@ macOS Piers and the macOS Deck run every session on lanes and
 
 ## Amendment 3 (2026-10-17): capture admission before READY
 
-Recorded with the Wayland Auto and Speed compositions (`wlp-auto-speed`).
-Pending Shared/Architecture review.
+Recorded with the Wayland Auto and Speed compositions.
 
 1. **Admission is stated, not inferred.** A provider that learns its source
    facts only after negotiation and a first frame (the `PipeWire` provider)
@@ -444,8 +461,7 @@ Pending Shared/Architecture review.
 
 ## Amendment 4 (2026-10-17): automatic provider selection and the host qualification record
 
-Recorded with the Pier's Wayland server path (`wlp-wiring`). Pending
-Shared/Architecture and Release/Security review.
+Recorded with the Pier's Wayland server path.
 
 1. **Session-proven facts come from a record.** The capture route, input
    injection and Speed's source rate can only be proven by a session, but
@@ -497,7 +513,7 @@ Shared/Architecture and Release/Security review.
 ## Amendment 5 (2026-10-17): verified GPU import and the paced Speed output
 
 Recorded with capenc's `gpu-convert` route and the 120 Hz Speed output
-(`wlp-gpu-speed`). Pending Shared/Architecture and Release/Security review.
+(GPU import and the paced Speed output).
 
 1. **GPU import is proven by pixels, not by a frame.** A record's
    `CaptureRouteProof` gains `gpu_import_verified_frames` (`serde`
@@ -535,7 +551,7 @@ Recorded with capenc's `gpu-convert` route and the 120 Hz Speed output
 
 ## Amendment 6 (2026-10-17): liveness, capture restart and Wayland output generations
 
-Recorded with `wlp-recovery`.
+Recorded with output reconfiguration and recovery.
 
 1. **Lane carrier liveness** (`arcen_transport::liveness`). The lane
    transport config sends a QUIC keep-alive every 1 s and closes a
@@ -555,7 +571,7 @@ Recorded with `wlp-recovery`.
    set only if the record still names the same registration and
    connection after the check, so a resumed attachment is never marked. A
    newcomer that arrives after the incumbent detached takes it over at
-   authentication instead (orchestrator decision 2026-10-18): a fresh
+   authentication instead (decided 2026-10-18): a fresh
    sign-in that passes full PAM authentication as the **same user** makes
    the detached owner hand the desktop over (`OwnerCommand::TakeOver`,
    decided by the pure `arcen_session::direct_reconnect::fresh_sign_in`);
@@ -594,9 +610,9 @@ Recorded with `wlp-recovery`.
 
 ## Amendment 7 (2026-10-18): orderly session close
 
-Recorded with the 0.17.0 qualification fix `fix/lane-close` (finding F1:
-every Pier refusal reached the Deck as `control lane ended: ConnectionLost`,
-and a Deck's clean close reached the Pier as a transport loss).
+Recorded with the 0.17.0 fix that drains final records before a lane closes
+(before it, every Pier refusal reached the Deck as `control lane ended:
+ConnectionLost`, and a Deck's clean close reached the Pier as a transport loss).
 
 1. **Cause.** Dropping a `SessionLaneSocket` finished the control lane,
    waited only until its writer had handed the bytes to QUIC, and closed the
@@ -637,9 +653,8 @@ and a Deck's clean close reached the Pier as a transport loss).
 
 ## Amendment 8 (2026-10-18): Speed evidence without operator sizes, the runtime guard, development records and automatic re-qualification
 
-Recorded with `wp/speed` (Wayland parity). Pending Shared/Architecture review
-(inferred admission, schema 3) and Release/Security review (the service
-re-qualifies itself, development records).
+Recorded with qualified Speed admission on Wayland (inferred admission,
+schema 3; the service re-qualifies itself; development records).
 
 1. **Why 60 Hz looked like 40 fps.** Mutter's ScreenCast source drops a frame
    whose timestamp lies inside one interval of the consumer's negotiated
@@ -702,7 +717,7 @@ re-qualifies itself, development records).
 
 ## Amendment 9 (2026-10-18): Wayland software encode and the hosts without NVENC
 
-Recorded with the `wp-swenc` work package (audit row 29: a Wayland host
+Recorded with the software encoder fallback (before it, a Wayland host
 without NVENC could not stream; an Xorg one could).
 
 1. **A separate composition.** `linux-wayland-software`
@@ -749,7 +764,7 @@ without NVENC could not stream; an Xorg one could).
 
 ## Amendment 10 (2026-10-18): Wayland Grading and HDR
 
-Recorded with `wp/fidelity`. Numbered after `wp/speed`'s Amendment 8 and `wp/swenc`'s Amendment 9.
+Recorded with Wayland Grading and HDR. Numbered after Amendment 8 (qualified Speed) and Amendment 9 (software encoder fallback).
 
 1. **The compositor decides whether a wide route exists.**
    `arcen_media::video::compositor_fidelity` turns the compositor release
@@ -791,18 +806,16 @@ Recorded with `wp/fidelity`. Numbered after `wp/speed`'s Amendment 8 and `wp/swe
    holds the route, the gap, the ramps and the SDR white, inside schema 3.
    It is optional, so earlier records still parse. `facts.grading` and
    `facts.hdr` become `available` only from it.
-6. **Review items.**
+6. **Constraints.**
    - `force-hdr` sets `MUTTER_DEBUG_FORCE_HDR=1` in the session
-     compositor's environment. This is a debug switch, used without
-     `--debug-control`, and needs Release/Security and Shared/Architecture
-     review before it ships.
+     compositor's environment only. It is a debug switch, used without
+     `--debug-control`.
    - Product qualification needs a GNOME ≥ 50 host.
 
 ## Amendment 11 (2026-10-18): host cursor images on the input/cursor lane
 
-Recorded with the Wayland Deck-drawn cursor (`wp-cursor`). Pending
-Shared/Architecture review. Numbered after `wp/swenc`'s Amendment 9 and
-`wp/fidelity`'s Amendment 10.
+Recorded with the Wayland Deck-drawn cursor. Numbered after Amendment 9
+(software encoder fallback) and Amendment 10 (Wayland Grading and HDR).
 
 1. **A binary record on the input/cursor lane.** `FrameType::CursorUpdate`
    (`0x50`, `arcen_protocol::cursor`) routes to `LaneRole::InputCursor` and
@@ -841,7 +854,7 @@ Shared/Architecture review. Numbered after `wp/swenc`'s Amendment 9 and
 
 ## Amendment 12 (2026-10-19): arrival pacing and the paced Xorg head
 
-Recorded with `wp/overnight-fixes`.
+Recorded with the capture pacing and recovery fixes.
 
 1. **A capture that delivers on its own clock is paced on arrival**
    (`arcen_keel::ArrivalPacer`). The eight-bit NvFBC loop used to decide
@@ -875,7 +888,7 @@ Recorded with `wp/overnight-fixes`.
 
 ## Amendment 13 (2026-10-19): pen barrel-button capability
 
-Recorded with `wp/pen`; written down at release.
+Recorded with the pen barrel-button work; written down at release.
 
 1. **Field.** `InputCapabilitiesMsg.pen_barrel_buttons`
    (`InputCapabilityAvailability`, `#[serde(default)]`, so `Unknown` from a
@@ -890,7 +903,7 @@ Recorded with `wp/pen`; written down at release.
 
 ## Amendment 14 (2026-10-19): committed text on the input/cursor lane
 
-Recorded with `wp/textinput`; written down at release. The wire format is in
+Recorded with committed text input; written down at release. The wire format is in
 `shared/protocol/WIRE.md` ("Committed text").
 
 1. **Capabilities.** `InputCapabilitiesMsg.text_commit` (a client sends
@@ -914,7 +927,7 @@ Recorded with `wp/textinput`; written down at release. The wire format is in
 
 ## Amendment 15 (2026-10-19): a served-pipeline remedy for the user
 
-Recorded with `wp/x11depth`; written down at release.
+Recorded with the per-desktop X11 depth; written down at release.
 
 1. **Field.** `ServedPipelineMsg.detail: Option<String>`, omitted when
    absent. `reason` stays the stable machine token; `detail` is one sentence
@@ -929,7 +942,7 @@ Recorded with `wp/x11depth`; written down at release.
 
 ## Amendment 16 (2026-10-20): desktop admission requires polkit to treat the session as remote
 
-Recorded with `fix/polkit-remote`.
+Recorded with the remote-session polkit rule.
 
 1. **Problem.** polkit's systemd backend calls a subject local when its
    logind session has a seat and ignores `Remote`; a session-less process is
@@ -973,6 +986,289 @@ Recorded with `fix/polkit-remote`.
    judged seatless. A start-up console self-test
    warns when the rule fails closed for the console.
 5. **polkit < 0.106** has no rules: an Arcen-seat desktop is refused; an X11
-   desktop is admitted with a `SECURITY:` error on every sign-in pending an
-   owner decision (refusing would end X11 service on such hosts).
+   desktop is admitted with a `SECURITY:` error on every sign-in (refusing
+   would end X11 service on such hosts).
 6. **Compatibility.** No wire change; the refusal travels as a close reason.
+
+## Amendment 17 (2026-11-08): cursor images from every Pier that can read them
+
+Recorded with host cursor images (0.18.0). The record parser and the relay are
+a trust boundary.
+No wire change: Amendment 11's record, capability and cache are reused as they
+are.
+
+1. **Sources.** An image comes from whatever the host can read without
+   private API. Wayland keeps Amendment 11 (Mutter cursor metadata through
+   capenc). An Xorg desktop reads `XFixesGetCursorImageAndName` on every
+   `XFixesCursorNotify` (premultiplied ARGB, `CursorImage::from_premultiplied_argb32`).
+   Windows reads `GetCursorInfo` at 40 Hz and, when the handle or its
+   visibility changes, the cursor's bitmaps (`GetIconInfo` + `GetDIBits`):
+   32-bit colour cursors with alpha as straight BGRA, colour cursors without
+   alpha and monochrome cursors through their AND/XOR masks
+   (`CursorImage::from_icon_planes`). A screen-inverting pixel, which a
+   client cursor cannot draw, becomes opaque black with a one-pixel white
+   outline so the classic I-beam stays visible on dark and light content.
+   The macOS Pier has no public API that reports another process's cursor
+   (`hosts/macos/src/cursor_probe.rs` measures `currentSystemCursor`) and
+   keeps named shapes.
+2. **One shared source for single-pointer hosts.** X11 and Windows feed
+   `arcen_input::cursor::HostCursor`: stable per-desktop ids from the
+   content-equal registry (no hash: two different images can never share an
+   id), repeat suppression, a hidden state (fully transparent image, a blank
+   X name, or a Windows application hide while a mouse is present), the
+   named fallback shape (X cursor name, Windows `IDC_*` handle) carried in
+   `CursorFacts` and the record's fallback byte, and a bound of 30 *new*
+   images per second (only fitting a new image costs CPU and link; a known
+   image costs an id). A sample over the bound waits, newest first, and is
+   applied when the window allows.
+3. **Agent hosts relay.** The Windows and macOS Piers run the session in an
+   agent that cannot see the lane. The agent sends every visible record with
+   its image inline (`agent_cursor_record`); the broker's `PierLaneRelay`
+   routes `CursorUpdate` through `arcen_protocol::cursor::CursorRecordRelay`,
+   which keeps the lane's side of the cache contract: newest state only,
+   strip an image the Deck holds, renumber for the lane, commit only what
+   the lane accepted, and resend the current state (with its image) on a
+   reopened lane. It fingerprints each mirrored PNG, so an id reused by a
+   restarted agent is inlined again rather than shown as the old image.
+   `CursorImageCache` moved from `arcen-input` to `arcen-protocol` (it is
+   wire contract); `arcen-input` re-exports it.
+4. **Negotiation is unchanged.** A Deck that declared `cursor_image_v1`
+   gets images and `CursorModeResultMsg.cursor_images: true` from every
+   Pier that can produce them; any other Deck gets `cursor_shape` names as
+   before. An X11 Deck without the capability now gets the shape of the X
+   cursor name through the same path; a Windows Deck without it gets the
+   `IDC_*` names, plus `hidden` when an application hides the pointer.
+5. **Presentation.** The Deck draws an image at the size it has in the
+   video (points per stream pixel), so a brush circle on the host matches
+   the brush on the canvas at any Deck zoom or HiDPI setting. On a display
+   with a backing scale above one, the root window's cursor is an `NSCursor`
+   whose bitmap is at the backing scale (`clients/macos/src/ui/sharp_cursor.rs`)
+   with the same point size and hotspot as winit's one-pixel-per-point
+   cursor; winit's cursor stays registered for the view's cursor rect, and
+   the next UI pass makes the sharp one current again whenever AppKit
+   reapplies that rect. Secondary windows keep winit's cursor (their state
+   crosses threads; `NSCursor` does not).
+
+## Amendment 18 (2026-11-09): Windows Grading keeps the desktop's sRGB code values
+
+Recorded with the Windows Grading transfer codes (0.18.0): an additive
+capability bit and `TransferCharacteristics::serves_request`.
+
+1. **Defect.** Windows Grading captures WGC FP16 scRGB: DWM has already
+   decoded every SDR surface with the IEC 61966-2-1 curve into linear light.
+   The shared `ScrgbSdrTransform` re-encoded it with the BT.709 OETF (the GPU
+   shader hard-coded it) and tagged `bt709`. The Deck presents every SDR
+   transfer on an sRGB layer, as the Linux XShm and macOS `ScreenCaptureKit`
+   Grading paths expect (both deliver the desktop's code values), so every
+   Windows SDR code moved, by up to 16/255 in the shadows, and the picture
+   was darker than the desktop. The Deck's Colour check measured it on the lab
+   (mean 10.29/255 against the desktop, 0.18/255 against the desktop's sRGB
+   re-encoded as BT.709).
+2. **Rule.** A linear-light SDR source is re-encoded with the curve the
+   compositor linearised with, so code values survive:
+   `arcen_media::video::linear_sdr_desktop_transfer(requested, client)` (since
+   renamed `sdr_desktop_transfer`, Amendment 19) serves
+   a `bt709` request as `srgb` when the client claims `srgb_transfer`. All
+   256 eight-bit codes round-trip through FP16 and the ten-bit matrix
+   exactly (`every_eight_bit_srgb_code_survives_scrgb_and_the_srgb_transfer`,
+   `srgb_grading_conversion_returns_the_desktop_codes_through_the_matrix`);
+   ten-bit codes are `code × 1023/255` within one code of FP16 rounding.
+3. **Truth.** The served transfer is stated, not hidden: VUI transfer
+   characteristics 13, `active_transfer: "srgb"` in READY and the hello, the
+   CoreMedia sRGB transfer on the Deck's format description, and the sRGB
+   presentation layer it already used. `TransferCharacteristics::serves_request`
+   is the single rule that a served `srgb` honours a requested `bt709`
+   (shared BT.709 primaries and D65 white, no re-encoding), so the served
+   pipeline stays Grading and neither the Deck's negotiated truth nor its
+   Colour check reports a transfer change. The reverse pair is a change.
+4. **Compatibility.** `ClientVideoCapabilitiesMsg.srgb_transfer` (auth time,
+   because the host decides the transfer before `ServerHello`) and its
+   `ClientHelloMsg.supports_srgb_transfer` mirror default to false and are
+   omitted when false. A Deck without them keeps the BT.709 re-encoding and
+   tag it was built against; a new Deck on an older Windows Pier is served
+   `bt709` as before. Administrator variant pins and eight-bit sessions
+   (including the OpenH264 fallback) are unchanged: eight-bit capture hands
+   over code values and re-encodes nothing. HDR (PQ) never enters the rule.
+5. **Other Piers.** Linux XShm RGB10 (`Rgb10Signal::Direct`) and macOS
+   `ScreenCaptureKit` (`colorSpaceName = sRGB`) already carry the desktop's
+   sRGB code values under a `bt709` tag; they are exact on the Deck and keep
+   that tag for now. Tagging them `srgb` under the same capability is a
+   follow-up for truthful VUI, not a pixel fix. The Linux PQ-to-SDR paths
+   (`Rgb10Signal::PqBt2020ToSdrBt709`, a declared PQ Xorg desktop or a Wayland
+   HDR monitor served as Grading) still apply the BT.709 OETF and are a
+   follow-up for the Linux Host owner.
+
+## Amendment 19 (2026-11-09): Every Pier states `srgb` for Grading; PQ-to-SDR uses the sRGB curve
+
+Recorded with sRGB on every host (0.19.0). Closes Amendment 18 item 5.
+No wire change: the `srgb_transfer` capability of Amendment 18 is reused.
+
+1. **One rule, three Piers.** Desktop applications draw sRGB code values on
+   every platform Arcen hosts, and the Deck presents every SDR stream on an
+   sRGB layer. `arcen_media::video::sdr_desktop_transfer(requested, client)`
+   (renamed from `linear_sdr_desktop_transfer`, because it is no longer only
+   about linear-light sources) serves a `bt709` request as `srgb` for a
+   client that claims `srgb_transfer`. `serve_sdr_desktop(video, client,
+   pinned)` adds the scope every Pier shares: only contracts above eight bits
+   that no administrator pinned. `DesktopPlan::serving_sdr_desktop` (Linux)
+   and `ResolvedVideoPlan::serving_sdr_desktop` (macOS) apply the same rule to
+   those Piers' plan shapes; the Windows Pier calls `serve_sdr_desktop`.
+2. **How each source keeps its codes.**
+   * Linux depth-30 Xorg: XShm RGB10 goes to the matrix untouched
+     (`Rgb10Signal::Direct`, chosen by `conversion_for_output`; no OETF on the
+     path). Only the tag changes: VUI 13 from NVENC, `transfer=srgb` to
+     capenc, `active_transfer: "srgb"` in READY and the hello.
+   * macOS Pier: `ScreenCaptureKit` is told `kCGColorSpaceSRGB` for the
+     `xf44` Grading surface, delivers it without colour attachments, and
+     VideoToolbox encodes it unconverted. The VideoToolbox
+     `TransferFunction` becomes `IEC_sRGB`; a real encode reads H.273 13
+     back from the SPS, and an encode/decode round trip keeps every code of a
+     1024-code ramp under either tag
+     (`srgb_grading_is_tagged_in_the_sps_and_keeps_the_codes`).
+   * Windows: unchanged from Amendment 18 (sRGB re-encode of linear light).
+   * A Rec.2100 PQ desktop served as Grading (an operator-declared Xorg PQ
+     desktop) is converted with the new `Rgb10Signal::PqBt2020ToSdrSrgb`:
+     PQ decoded at 203-nit graphics white, BT.2020 mapped to BT.709, then the
+     sRGB curve instead of the BT.709 OETF. Every grey of an sRGB desktop
+     composed into PQ survives exactly, from half-float and from ten-bit PQ
+     codes; colours average 0.04/255 (a dark channel beside a bright one is
+     limited by the composition's own PQ precision); the BT.709 OETF moved
+     greys by up to 16/255
+     (`an_srgb_desktop_composed_into_pq_keeps_its_codes_through_the_srgb_conversion`).
+3. **Unchanged.** Older Decks keep `bt709` and the BT.709 OETF; eight-bit
+   sessions (the Auto/Speed fast paths and their software fallbacks) keep the
+   tag they always had; administrator-pinned variants are served as written;
+   HDR (PQ) never enters the rule. **Wayland Grading keeps `bt709`**: a
+   Wayland wide epoch encodes the shared capture-admission contract, which
+   does not yet carry the client's capability, so the Linux Pier does not
+   promise `srgb` there. Threading the capability into `AdmissionRequest` and
+   choosing `PqBt2020ToSdrSrgb` for `HalfFloatPq` is the follow-up (closed by
+   Amendment 20).
+4. **Truth.** `serves_request` (Amendment 18) keeps the served pipeline
+   Grading and the Colour check's transfer item passing ("served srgb") on
+   Linux and macOS exactly as on Windows. capenc's admission tokens gain
+   `rgb10-pq-to-srgb` and `f16-pq-to-srgb` for the new conversion.
+5. **Lab evidence (Linux Xorg, NVENC, 1512×950 Grading).** A dev Pier on a
+   spare port served a depth-30 desktop showing a known pattern; the host's
+   own root code values (`XGetImage`, what XShm reads) were compared with the
+   Deck-recorded stream decoded off-line. A 0.18.0 Deck received
+   `transfer=srgb` (bitstream `iec61966-2-1`, NVENC VUI SRGB) and a 0.17.0
+   Deck `bt709`; both streams decode to the same pixels, the host's codes:
+   the ten-bit grey ramp within one ten-bit code (99 % of pixels exact at
+   eight bits, mean 0.01/255), against 41 ten-bit codes had an OETF been
+   applied. On a declared Rec.2100 PQ desktop holding an sRGB picture
+   composed at 203 nits, the 0.18.0 Deck's stream returns the sRGB greys
+   (98 % exact at eight bits, mean 0.02/255) while the 0.17.0 Deck's stream
+   is the BT.709 OETF (mean 11.8/255 from the desktop's codes), as intended
+   for an older Deck. On macOS, a real `ScreenCaptureKit` Grading stream
+   reads `bt709/srgb/bt709 full` from its own SPS (end-to-end test).
+
+## Amendment 20 (2026-11-09): Wayland Grading states `srgb` and returns the desktop's codes
+
+Recorded with `rc/wlsrgb` (0.19.0). Closes the Wayland exception of
+Amendment 19 item 3. No wire change.
+
+1. **The admission carries the curve.** `AdmissionRequest::sdr_transfer` is
+   the transfer the parent resolved for the session (capenc's `transfer=`).
+   `admit_grading` reads it only for its SDR output: `srgb` re-encodes PQ
+   with the inverse of the curve the compositor decoded its SDR content with
+   and keeps a ten-bit SDR source's codes; anything else keeps `bt709` and
+   the BT.709 OETF. The linear conversion has only the BT.709 curve and
+   keeps `bt709`. `AdmittedCapture::transfer` records the served transfer
+   and `epoch()` states it, so the encoder's VUI, READY and the Deck's hello
+   agree. `ADMISSION` adds `transfer=<token>` after `transform=` only when it
+   differs from the served contract's own, so every other line is
+   unchanged; a restated or unknown transfer is refused.
+2. **Which inverse is a source fact.** `SourceColour::sdr_content`
+   (`SdrContentCurve::Srgb | Gamma22`) says how a PQ or linear composition
+   decoded its SDR content. Unknown means the piecewise sRGB curve
+   (`Rgb10Signal::PqBt2020ToSdrSrgb`, as for a declared PQ Xorg desktop).
+   capenc states `Gamma22` (inferred) on Mutter's `force-hdr` route, and the
+   admission then picks `Rgb10Signal::PqBt2020ToSdrGamma22`
+   (`rgb10-pq-to-g22`, `f16-pq-to-g22`), stated `srgb` because its codes are
+   the desktop's own. Its lookup table is spaced by the square root of the
+   light, because a pure power has no linear toe and uniform steps merged
+   its darkest codes. capenc's NVENC staging of ten-bit PQ converts with the
+   admitted conversion itself (`WideSource::AdmittedPq`), checked against
+   the contract, rather than re-deriving it.
+3. **The Linux Pier applies the one rule.** `apply_initial_video_request`
+   resolves a Wayland fidelity session like an Xorg one:
+   `DesktopPlan::serving_sdr_desktop(client.srgb_transfer, pinned)` on the
+   PQ composition, so a capable Deck's Grading session asks capenc for
+   `transfer=srgb`. HDR keeps PQ, an older Deck `bt709`, a pinned variant its
+   pin; the eight-bit Auto/Speed routes never read the field.
+4. **Not covered.** An HDR request that capenc's admission downgrades to
+   Grading still asked for PQ, so its Grading fallback keeps `bt709`. The
+   2.2-power fact is inferred from the route and one compositor's
+   measurement (GNOME 51.1); the qualification does not measure it yet.
+5. **Lab evidence (Rocky Linux 10, GNOME 51.1 prefix, `force-hdr`, ten-bit
+   `xBGR_210LE` DMA-BUF, NVENC, 1800×1130 Grading).** A dev Pier on a spare
+   port; a full-screen GTK window of flat eight-bit sRGB patches (256 greys,
+   R/G/B ramps, mixed colours) in the served desktop; the Deck-recorded
+   stream decoded off-line and compared with the drawn codes. 0.18.0 Deck:
+   hello `transfer=srgb`, SPS VUI transfer 13, capenc
+   `transform=rgb10-pq-to-g22`; greys mean 0.17/255, max 0.72/255, 248 of
+   256 levels decode to their own code, shadows within 0.16/255; colour
+   patches mean 0.71/255. The same stream through the piecewise sRGB curve
+   (first build of this change) left greys mean 2.0/255 and the shadows up
+   to 8.5/255 low (grey 17 decoded as 8.5), which is what identified Mutter's
+   2.2-power decode. 0.17.0 Deck: `bt709`, VUI 1, `rgb10-pq-to-sdr`, greys
+   mean 10.5/255 and up to 20.6/255 low, as intended for an older Deck.
+
+
+## Amendment 21 (2026-11-11): host pointer positions for a Deck-drawn cursor
+
+Recorded with host cursor positions.
+
+1. **Why.** In client-drawn (`local`) cursor authority the Deck draws the
+   cursor where its own pointing device is. A USB-bridged tablet (Native
+   tablet) is driven by the host's own driver and moves only the host
+   pointer, so the pen had no visible pointer; host-drawn cursors cannot
+   cover it (Xorg depth-30 Grading has no cursor in its pixels) and cost a
+   video round trip. Application warps and host-side devices have the same
+   gap.
+2. **A second binary record on the input/cursor lane.**
+   `FrameType::CursorPosition` (`0x51`, `arcen_protocol::cursor_position`,
+   36 bytes, host → Deck, `ReliabilityClass::InputLowLatency`): sequence
+   (strictly increasing per lane, restarting when the lane reopens), output
+   and generation as in `CursorUpdate`, the video `monitor_id` of the stream
+   that shows the position (0 for the primary/legacy stream), the hotspot in
+   that stream's pixels and the pixel space it was measured in (the Deck
+   scales by fraction, so a record measured before a resize never lands on
+   another grid), and `on_stream`. One record is the whole state; the newest
+   supersedes.
+3. **Negotiation.** `AuthResponse.cursor_position_v1` (echoed in
+   `ClientHelloMsg`); the host confirms with
+   `CursorModeResultMsg.cursor_positions`. All additive and omitted when
+   false; `PROTOCOL_VERSION` stays 5. An older Deck never receives the
+   record.
+4. **Only host-caused motion is reported** (`arcen_input::host_pointer`).
+   The Pier's platform code reads its pointer; the shared
+   `HostPointerReporter` suppresses every position read within 150 ms of the
+   Deck's own pointer input (its echo) and unchanged positions, keeps only the
+   newest, sends at most 120 per second, and commits only what the lane
+   accepted. The Deck's `PointerAuthority` lets the most recent mover lead:
+   a host report takes the cursor unless the Mac pointer moved in the last
+   150 ms, and any Mac pointer motion takes it back. The Deck draws the
+   host's cursor image (or an arrow) at the reported point above the video,
+   hides its system cursor over the viewer meanwhile, and never warps the
+   Mac pointer. When the host hides its pointer while a bridged pen
+   (Native tablet) drives it — GNOME does so for a tablet tool in
+   proximity, and its screencast metadata then carries no sprite — the
+   Deck draws a small pen mark instead (`led_pointer_mark`). Where the Mac
+   pointer is, and whether it moved, comes from AppKit's global pointer
+   location, the active application and the topmost window at that point,
+   not from the last window event the UI saw: the session window covers
+   the screen under a resting pointer, and a bridged tablet never moves it
+   (amended in 0.19.0).
+5. **Sources.** Xorg (every preset, including depth-30 XShm Grading): the
+   XFixes cursor-watcher thread polls `QueryPointer` (8 ms while moving,
+   33 ms at rest; this also catches warps, which generate no input events);
+   a committed multi-head Xorg desktop maps each unrotated head to its
+   stream. Wayland metadata streams: capenc writes a framed-v2 kind 5 record
+   (`CapencCursorPosition`, only when the parent passes `cursor-position`)
+   whenever Mutter's cursor metadata moves; single-output desktops only.
+6. **Not covered yet.** Multi-output Wayland desktops (connector → video
+   monitor mapping), rotated Xorg heads, secondary Deck viewports, relayed
+   (session-agent) Piers — the shared relay drops the record — and the
+   Windows and macOS Piers.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Resolving a client's video request into a plan a host can actually serve.
 //!
 //! A client asks for a codec, a chroma layout, a bit depth, and says how
@@ -219,6 +221,26 @@ impl ResolvedVideoPlan {
             matrix: "bt709",
             degraded,
         }
+    }
+
+    /// This plan with its SDR desktop served as
+    /// [`crate::video::serve_sdr_desktop`] says: a ten-bit `bt709` plan
+    /// becomes `srgb` for a client that presents it, because the capture
+    /// already holds the desktop's sRGB code values. Nothing else changes,
+    /// and `degraded` keeps its meaning: `srgb` serves a `bt709` request
+    /// ([`crate::TransferCharacteristics::serves_request`]).
+    #[must_use]
+    pub fn serving_sdr_desktop(mut self, client_accepts_srgb: bool) -> Self {
+        if let Some(transfer) = crate::TransferCharacteristics::from_token(self.transfer) {
+            self.transfer = crate::video::fidelity_sdr_transfer(
+                transfer,
+                plan_depth(self.bit_depth),
+                client_accepts_srgb,
+                false,
+            )
+            .token();
+        }
+        self
     }
 
     /// The 10-bit PQ BT.2020 plan.
@@ -610,6 +632,27 @@ mod tests {
         let plan = resolve_video_plan(&srgb, &CAPABLE_HOST);
         assert_eq!(plan.transfer, "bt709");
         assert_eq!(plan.degraded, Some(Degradation::HostLacksExactContract));
+    }
+
+    #[test]
+    fn a_capable_client_is_served_the_grading_desktop_as_srgb() {
+        let grading = resolve_video_plan(&request(SelectionIntent::ColorFidelity), &CAPABLE_HOST);
+        assert_eq!(grading.tier, VideoTier::Grading);
+        let served = grading.serving_sdr_desktop(true);
+        assert_eq!(served.transfer, "srgb");
+        assert_eq!(
+            ResolvedVideoPlan {
+                transfer: grading.transfer,
+                ..served
+            },
+            grading,
+            "only the transfer changes"
+        );
+        assert_eq!(grading.serving_sdr_desktop(false), grading);
+        let standard = ResolvedVideoPlan::standard(None);
+        assert_eq!(standard.serving_sdr_desktop(true), standard, "fast path");
+        let hdr = ResolvedVideoPlan::hdr();
+        assert_eq!(hdr.serving_sdr_desktop(true), hdr);
     }
 
     #[test]

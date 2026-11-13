@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The SDR8 epoch runner shared by the Wayland Auto and Speed compositions.
 //!
 //! One epoch, in order:
@@ -774,6 +776,7 @@ unsafe fn run_native(
         width,
         height,
         max_fps: request.fps,
+        sdr_transfer: request.video.transfer,
     };
     let capability = EncoderCapability {
         backend: EncoderBackend::NativeNvenc,

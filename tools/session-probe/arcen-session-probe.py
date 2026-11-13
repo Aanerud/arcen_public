@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Minimal Arcen Deck stand-in: handshake, PAM auth, then count media frames.
 
 Credential is read from the environment only and never printed. Output is a

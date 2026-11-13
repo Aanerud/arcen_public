@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Client-side derivation of "what is actually happening in this session",
 //! straight from a `ServerHelloMsg`, plus the live pixel-exactness readout
 //! against a declared `arcen_media::test_pattern::TestPattern`.
@@ -22,10 +24,7 @@ use arcen_media::test_pattern::{
     measure_rgb_roundtrip, measure_transform_roundtrip, ColorAccuracy, TestPattern,
 };
 use arcen_media::video::{AcceleratorClass, ColorTransform, PlanDegradation};
-use arcen_media::{
-    BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics,
-    VideoCodec, VideoConfiguration,
-};
+use arcen_media::VideoConfiguration;
 
 use crate::protocol::messages::{ServedPipelineMsg, ServerHelloMsg, VideoSelectionIntent};
 
@@ -58,83 +57,11 @@ pub fn encoder_acceleration(encoder_backend: &str, encoder_class: &str) -> Optio
     }
 }
 
-/// Best-effort chroma read from `ServerColorCaps::advertised_pix_fmt`.
-///
-/// Unlike every other colour axis, chroma has no dedicated `active_*` wire
-/// field yet (see `arcen_protocol::messages::ServerColorCaps`): it has to be
-/// read out of this free-form pixel-format string instead, and the two host
-/// implementations do not even agree on its shape -- read directly out of
-/// both, not guessed: `hosts/linux/src/session/handshake.rs` sends plain
-/// `"yuv444p"`/`"yuv420p"`, while `hosts/windows/src/session.rs` sends
-/// `ResolvedMediaPlan::chroma_token`'s own `"yuv420"`/`"yuv422"`/`"yuv444"`
-/// (no `p` suffix, no bit-depth suffix). Matching on the
-/// `"420"`/`"422"`/`"444"` substring, plus the `p010`/`nv12`/`gbrp` prefixes
-/// real fourCCs use for 4:2:0/4:4:4 with no such digit substring at all
-/// (`ServerColorCaps::default`'s own `"p010le"` included), covers every
-/// value either host actually sends today. Anything else is reported as
-/// `None` (unknown) rather than guessed at.
-#[must_use]
-pub fn parse_chroma_from_pix_fmt(pix_fmt: &str) -> Option<ChromaSubsampling> {
-    let lowered = pix_fmt.to_ascii_lowercase();
-    if lowered.contains("444") || lowered.starts_with("gbrp") {
-        Some(ChromaSubsampling::Yuv444)
-    } else if lowered.contains("422") {
-        Some(ChromaSubsampling::Yuv422)
-    } else if lowered.contains("420") || lowered.starts_with("p010") || lowered.starts_with("nv12")
-    {
-        Some(ChromaSubsampling::Yuv420)
-    } else {
-        None
-    }
-}
-
-/// The fully-parsed "actual" colour contract, read back out of
-/// `ServerColorCaps`'s wire-string `active_*` fields (and
-/// `ServerHelloMsg::codec` for the codec axis) into the same typed
-/// vocabulary `arcen_media::VideoConfiguration` uses for the client's own
-/// request. Any field the wire string did not parse to a recognised token
-/// is `None` (unknown), never guessed at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ActiveContract {
-    pub codec: Option<VideoCodec>,
-    pub chroma: Option<ChromaSubsampling>,
-    pub bit_depth: Option<BitDepth>,
-    pub range: Option<ColorRange>,
-    pub matrix: Option<ColorMatrix>,
-    pub primaries: Option<ColorPrimaries>,
-    pub transfer: Option<TransferCharacteristics>,
-}
-
-impl ActiveContract {
-    #[must_use]
-    pub fn from_hello(hello: &ServerHelloMsg) -> Self {
-        let caps = &hello.color_caps;
-        Self {
-            codec: VideoCodec::from_token(&hello.codec),
-            chroma: parse_chroma_from_pix_fmt(&caps.advertised_pix_fmt),
-            bit_depth: BitDepth::from_token(&caps.active_bit_depth),
-            range: ColorRange::from_token(&caps.active_range),
-            matrix: ColorMatrix::from_token(&caps.active_matrix),
-            primaries: ColorPrimaries::from_token(&caps.active_primaries),
-            transfer: TransferCharacteristics::from_token(&caps.active_transfer),
-        }
-    }
-
-    /// A [`ColorTransform`] for this contract's matrix/range/bit-depth, if
-    /// every one of those three axes parsed. `None` (rather than assuming a
-    /// default) when any of them did not: a guessed axis could make the
-    /// w4-exactness-readout's "no codec involved" figure claim a transform
-    /// the session is not actually using.
-    #[must_use]
-    #[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
-    pub fn color_transform(&self) -> Option<ColorTransform> {
-        Some(ColorTransform::new(
-            self.matrix?,
-            self.range?,
-            self.bit_depth?,
-        ))
-    }
-}
+/// The fully-parsed "actual" colour contract read back out of the hello, in
+/// the same typed vocabulary the request uses. It lives in `arcen-media`
+/// (`colour_check::ColourAxes`) so the colour check and this panel read the
+/// host identically; any axis that did not parse is `None`, never guessed.
+pub use arcen_media::colour_check::ColourAxes as ActiveContract;
 
 /// Which axes changed between what was requested and what
 /// [`ActiveContract::from_hello`] read back, in the exact vocabulary
@@ -172,7 +99,7 @@ pub fn negotiated_degradation(
             .is_some_and(|primaries| primaries != requested.primaries),
         transfer_changed: active
             .transfer
-            .is_some_and(|transfer| transfer != requested.transfer),
+            .is_some_and(|transfer| !transfer.serves_request(requested.transfer)),
         fps_clamped: false,
         geometry_clamped: false,
         cursor_moved_to_local: false,
@@ -500,6 +427,10 @@ pub fn format_accuracy(label: &str, accuracy: Option<ColorAccuracy>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_media::{
+        BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange,
+        TransferCharacteristics, VideoCodec,
+    };
 
     fn hello_with_color_caps(color_caps: serde_json::Value, codec: &str) -> ServerHelloMsg {
         serde_json::from_value(serde_json::json!({
@@ -533,61 +464,6 @@ mod tests {
         );
         assert_eq!(encoder_acceleration("openh264-sw-h264", ""), Some(false));
         assert_eq!(encoder_acceleration("future-encoder", ""), None);
-    }
-
-    // ---- parse_chroma_from_pix_fmt ----
-
-    #[test]
-    fn parse_chroma_from_pix_fmt_covers_both_hosts_conventions() {
-        // hosts/windows/src/session.rs: ResolvedMediaPlan::chroma_token().
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv420"),
-            Some(ChromaSubsampling::Yuv420)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv422"),
-            Some(ChromaSubsampling::Yuv422)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv444"),
-            Some(ChromaSubsampling::Yuv444)
-        );
-        // hosts/linux/src/session/handshake.rs: plain ffmpeg-style pix_fmt.
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv420p"),
-            Some(ChromaSubsampling::Yuv420)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv444p"),
-            Some(ChromaSubsampling::Yuv444)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("yuv422p10le"),
-            Some(ChromaSubsampling::Yuv422)
-        );
-    }
-
-    #[test]
-    fn parse_chroma_from_pix_fmt_handles_fourccs_with_no_digit_substring() {
-        // ServerColorCaps::default()'s own value.
-        assert_eq!(
-            parse_chroma_from_pix_fmt("p010le"),
-            Some(ChromaSubsampling::Yuv420)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("nv12"),
-            Some(ChromaSubsampling::Yuv420)
-        );
-        assert_eq!(
-            parse_chroma_from_pix_fmt("gbrp10le"),
-            Some(ChromaSubsampling::Yuv444)
-        );
-    }
-
-    #[test]
-    fn parse_chroma_from_pix_fmt_reports_unknown_rather_than_guessing() {
-        assert_eq!(parse_chroma_from_pix_fmt("completely-unknown"), None);
-        assert_eq!(parse_chroma_from_pix_fmt(""), None);
     }
 
     // ---- ActiveContract ----
@@ -698,6 +574,31 @@ mod tests {
         assert!(degradation.matrix_changed);
         assert!(degradation.primaries_changed);
         assert!(degradation.transfer_changed);
+    }
+
+    /// A Windows Grading host keeps the desktop's own sRGB code values and
+    /// says `srgb`; that is the exact answer to this Deck's `bt709` request,
+    /// not a colour change. The reverse would be a re-encoding.
+    #[test]
+    fn srgb_served_for_a_bt709_grading_request_is_exact() {
+        let requested = VideoConfiguration::grading_reference();
+        let mut active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(requested.chroma),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(requested.matrix),
+            primaries: Some(requested.primaries),
+            transfer: Some(TransferCharacteristics::Srgb),
+        };
+        assert!(negotiated_degradation(requested, &active).is_exact());
+
+        active.transfer = Some(TransferCharacteristics::Bt709);
+        let srgb_request = VideoConfiguration {
+            transfer: TransferCharacteristics::Srgb,
+            ..requested
+        };
+        assert!(negotiated_degradation(srgb_request, &active).transfer_changed);
     }
 
     #[test]
@@ -1000,6 +901,8 @@ mod tests {
             mean_error: 0.0,
             pixels: 100,
             worst_at: (0, 0),
+            outliers: 0,
+            outlier_bounds: None,
         };
         assert_eq!(
             format_accuracy("end-to-end", Some(exact)),
@@ -1010,6 +913,8 @@ mod tests {
             mean_error: 1.5,
             pixels: 100,
             worst_at: (3, 4),
+            outliers: 1,
+            outlier_bounds: Some([3, 4, 3, 4]),
         };
         let formatted = format_accuracy("end-to-end", Some(inexact));
         assert!(formatted.contains("max 5/255"));

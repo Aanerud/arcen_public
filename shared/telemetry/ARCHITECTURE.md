@@ -64,7 +64,7 @@ serializing host paths or raw errors.
 ## Invariants
 
 - `#![forbid(unsafe_code)]`.
-- Shared-only dependency direction; no host, client, gateway, or packaging
+- Shared-only dependency direction; no host, client, or packaging
   dependency.
 - Validation occurs once at a trust boundary; emit paths borrow the validated
   string without allocating.

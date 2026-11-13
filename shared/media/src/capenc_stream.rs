@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The capenc helper's framed-v2 stdout: encoded access units and cursor
 //! events on one ordered pipe.
 //!
@@ -9,7 +11,9 @@
 //! ```
 //!
 //! Kind 1 is an Annex-B/OBU access unit, exactly what framed-v1 carried.
-//! Kind 2 is a [`CapencCursorEvent`]. A capture process runs as the desktop's
+//! Kind 2 is a [`CapencCursorEvent`]. Kind 5, only when the parent passed
+//! [`CURSOR_POSITION_ARG`], is a [`CapencCursorPosition`]: where the pointer
+//! is on the output, sent whenever it moved. A capture process runs as the desktop's
 //! user, so a parent treats every record as untrusted: lengths, kinds and
 //! cursor geometry are bounded here before anything is allocated.
 
@@ -17,6 +21,11 @@ use crate::cursor::{CursorImage, MAX_SOURCE_CURSOR_SIDE};
 
 /// capenc argument selecting framed-v2 output.
 pub const FRAMED_OUTPUT_V2: &str = "framed-v2";
+/// capenc argument asking a framed-v2 cursor stream for pointer positions.
+pub const CURSOR_POSITION_ARG: &str = "cursor-position";
+const CURSOR_POSITION_VERSION: u8 = 1;
+/// Body of a [`CapencRecordKind::CursorPosition`] record.
+pub const CURSOR_POSITION_BYTES: usize = 12;
 /// Bytes before a record's kind byte.
 pub const RECORD_LENGTH_BYTES: usize = 4;
 /// Largest access unit, as for framed-v1.
@@ -36,7 +45,19 @@ pub enum CapencRecordKind {
     AccessUnit = 1,
     /// A [`CapencCursorEvent`].
     Cursor = 2,
+    /// A lossless-refinement record for the **video** lane
+    /// (`RefineFence`/`RefineBarrier`), written immediately before the
+    /// access unit it belongs to (ADR 0016). Only with `refine=on`.
+    RefineVideo = 3,
+    /// A lossless-refinement record for the **refine** lane
+    /// (`RefineTiles`/`RefineDigest`). Only with `refine=on`.
+    RefineLane = 4,
+    /// A [`CapencCursorPosition`]. Only with [`CURSOR_POSITION_ARG`].
+    CursorPosition = 5,
 }
+
+/// Largest refinement record body on either lane.
+pub const MAX_REFINE_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 impl CapencRecordKind {
     /// The kind for a wire byte.
@@ -45,6 +66,9 @@ impl CapencRecordKind {
         match byte {
             1 => Some(Self::AccessUnit),
             2 => Some(Self::Cursor),
+            3 => Some(Self::RefineVideo),
+            4 => Some(Self::RefineLane),
+            5 => Some(Self::CursorPosition),
             _ => None,
         }
     }
@@ -55,6 +79,8 @@ impl CapencRecordKind {
         match self {
             Self::AccessUnit => MAX_ACCESS_UNIT_BYTES,
             Self::Cursor => MAX_CURSOR_EVENT_BYTES,
+            Self::RefineVideo | Self::RefineLane => MAX_REFINE_RECORD_BYTES,
+            Self::CursorPosition => CURSOR_POSITION_BYTES,
         }
     }
 }
@@ -81,6 +107,58 @@ pub struct CapencCursorEvent {
     pub on_output: bool,
     /// The sprite.
     pub sprite: CapencCursorSprite,
+}
+
+/// Where the pointer is on the captured output.
+///
+/// Layout: `u8 version 1, u8 flags (bit0 on_output), u16 reserved 0,
+/// i32_be x, i32_be y`: the hotspot in the output's stream pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapencCursorPosition {
+    /// Whether the compositor reports the cursor on this output.
+    pub on_output: bool,
+    /// Hotspot column.
+    pub x: i32,
+    /// Hotspot row.
+    pub y: i32,
+}
+
+/// Encodes a cursor position body.
+#[must_use]
+pub fn encode_cursor_position(position: &CapencCursorPosition) -> [u8; CURSOR_POSITION_BYTES] {
+    let mut out = [0u8; CURSOR_POSITION_BYTES];
+    out[0] = CURSOR_POSITION_VERSION;
+    out[1] = u8::from(position.on_output);
+    out[4..8].copy_from_slice(&position.x.to_be_bytes());
+    out[8..12].copy_from_slice(&position.y.to_be_bytes());
+    out
+}
+
+/// Decodes a cursor position body.
+///
+/// # Errors
+///
+/// [`CapencRecordError::Cursor`] for anything outside the contract.
+pub fn decode_cursor_position(body: &[u8]) -> Result<CapencCursorPosition, CapencRecordError> {
+    let malformed = CapencRecordError::Cursor;
+    let body: &[u8; CURSOR_POSITION_BYTES] =
+        body.try_into().map_err(|_| malformed("position length"))?;
+    if body[0] != CURSOR_POSITION_VERSION {
+        return Err(malformed("position version"));
+    }
+    let on_output = match body[1] {
+        0 => false,
+        1 => true,
+        _ => return Err(malformed("position flags")),
+    };
+    if body[2] != 0 || body[3] != 0 {
+        return Err(malformed("position reserved bytes"));
+    }
+    Ok(CapencCursorPosition {
+        on_output,
+        x: i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+        y: i32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+    })
 }
 
 /// Why a framed-v2 record was refused.
@@ -278,6 +356,110 @@ pub fn decode_cursor_event(body: &[u8]) -> Result<CapencCursorEvent, CapencRecor
         _ => return Err(malformed("sprite kind")),
     };
     Ok(CapencCursorEvent { on_output, sprite })
+}
+
+/// The capenc output path a process was dispatched to, for
+/// [`check_output_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapencRoute {
+    /// Linux Xorg depth-30 `XShm` NVENC streaming: framed-v2 and lossless
+    /// refinement.
+    XorgWide,
+    /// Any other Linux Xorg streaming path (`NvFBC`, software, RGB10 pipe,
+    /// self-test): framed-v1 or raw only.
+    XorgOther,
+    /// Linux Wayland: framed-v2, no refinement.
+    Wayland,
+    /// Windows: framed-v1 or raw only.
+    Windows,
+}
+
+/// Refuses output arguments the dispatched path cannot honour, before any
+/// capture resource exists: `framed-v2` where the path writes framed-v1 or
+/// raw Annex-B (the parent would misparse every byte), and `refine=on`
+/// anywhere but the Xorg depth-30 path (ADR 0016).
+///
+/// # Errors
+///
+/// A readable message naming the refused argument.
+pub fn check_output_request(args: &[String], route: CapencRoute) -> Result<(), String> {
+    let framed_v2 = args.iter().any(|arg| arg == FRAMED_OUTPUT_V2);
+    let refine = args
+        .iter()
+        .any(|arg| arg == crate::refine::CAPENC_REFINE_ON);
+    if refine && route != CapencRoute::XorgWide {
+        return Err(format!(
+            "{} is only honoured by the Xorg depth-30 NVENC path, not {route:?}",
+            crate::refine::CAPENC_REFINE_ON
+        ));
+    }
+    if framed_v2 && !matches!(route, CapencRoute::XorgWide | CapencRoute::Wayland) {
+        return Err(format!(
+            "{FRAMED_OUTPUT_V2} is not written by the {route:?} path"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn output_arguments_a_path_cannot_honour_are_refused() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+        let v2_refine = args(&["framed-v2", "refine=on"]);
+        assert_eq!(
+            check_output_request(&v2_refine, CapencRoute::XorgWide),
+            Ok(())
+        );
+        for route in [
+            CapencRoute::XorgOther,
+            CapencRoute::Wayland,
+            CapencRoute::Windows,
+        ] {
+            assert!(
+                check_output_request(&v2_refine, route).is_err(),
+                "{route:?}"
+            );
+        }
+        let v2 = args(&["framed-v2"]);
+        assert_eq!(check_output_request(&v2, CapencRoute::Wayland), Ok(()));
+        let position = CapencCursorPosition {
+            on_output: true,
+            x: -3,
+            y: 2159,
+        };
+        let body = encode_cursor_position(&position);
+        assert_eq!(decode_cursor_position(&body), Ok(position));
+        let framed = encode_record(CapencRecordKind::CursorPosition, &body).unwrap();
+        assert_eq!(
+            record_kind(framed[4], framed.len() - RECORD_LENGTH_BYTES - 1),
+            Ok(CapencRecordKind::CursorPosition)
+        );
+        assert!(record_kind(5, CURSOR_POSITION_BYTES + 1).is_err());
+        for (at, value) in [(0usize, 2u8), (1, 2), (2, 1), (3, 1)] {
+            let mut bad = body;
+            bad[at] = value;
+            assert!(decode_cursor_position(&bad).is_err(), "byte {at}");
+        }
+        assert!(decode_cursor_position(&body[..11]).is_err());
+        assert!(check_output_request(&v2, CapencRoute::XorgOther).is_err());
+        assert!(check_output_request(&v2, CapencRoute::Windows).is_err());
+        let v1 = args(&["framed-v1"]);
+        for route in [
+            CapencRoute::XorgWide,
+            CapencRoute::XorgOther,
+            CapencRoute::Wayland,
+            CapencRoute::Windows,
+        ] {
+            assert_eq!(check_output_request(&v1, route), Ok(()));
+        }
+    }
 }
 
 #[cfg(test)]

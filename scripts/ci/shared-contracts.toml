@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # What shared/ promises across products. Checked by
 # scripts/check_shared_contracts.py (CI job "Shared contracts").
 #
@@ -82,4 +84,8 @@ ignore = [
   "tls.key",
   "auth.disclaimer.directory",
   "audio.local_playback",
+  # Platform-owned (usb.native_tablet): the Linux template names the opt-in
+  # (off) because only the Linux Pier reads it; Windows never offers Native
+  # tablet (ADR 0017) and the macOS Pier gates it on its signing (ADR 0022).
+  "usb",
 ]

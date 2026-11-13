@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Headless Wayland session readiness and capability-fact aggregation.
 //!
 //! The Linux Pier's headless GNOME/Mutter adapter gathers operating-system

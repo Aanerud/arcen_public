@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 /// Version of the Pier/Deck session layout. 5: the session runs on isolated
 /// QUIC lanes (ADR 0014); a version-4 peer is refused with
 /// `lanes::PeerTransportMismatch`.
@@ -93,6 +95,15 @@ pub enum FrameType {
     RegionVideoH264 = 0x07,
     RegionVideoH265 = 0x08,
     RegionVideoAv1 = 0x09,
+    /// Lossless refinement source fence and invalidations
+    /// (`crate::refine`, ADR 0016), video lane, capability-gated.
+    RefineFence = 0x0A,
+    /// Lossless refinement tile (`crate::refine`), refine lane.
+    RefineTiles = 0x0B,
+    /// Lossless refinement digest (`crate::refine`), refine lane.
+    RefineDigest = 0x0C,
+    /// Lossless refinement generation barrier (`crate::refine`), video lane.
+    RefineBarrier = 0x0D,
     Audio = 0x10,
     AudioUpstream = 0x11,
     Clipboard = 0x20,
@@ -104,6 +115,8 @@ pub enum FrameType {
     UsbBridgeUrbComplete = 0x42,
     /// Host cursor image and visibility (`crate::cursor`), input/cursor lane.
     CursorUpdate = 0x50,
+    /// Host pointer position (`crate::cursor_position`), input/cursor lane.
+    CursorPosition = 0x51,
 }
 
 /// Whether a binary session message is a host audio frame: the frames a Pier
@@ -368,6 +381,10 @@ impl TryFrom<u8> for FrameType {
             0x07 => Ok(Self::RegionVideoH264),
             0x08 => Ok(Self::RegionVideoH265),
             0x09 => Ok(Self::RegionVideoAv1),
+            0x0A => Ok(Self::RefineFence),
+            0x0B => Ok(Self::RefineTiles),
+            0x0C => Ok(Self::RefineDigest),
+            0x0D => Ok(Self::RefineBarrier),
             0x10 => Ok(Self::Audio),
             0x11 => Ok(Self::AudioUpstream),
             0x20 => Ok(Self::Clipboard),
@@ -378,6 +395,7 @@ impl TryFrom<u8> for FrameType {
             0x41 => Ok(Self::UsbBridgeUrbCancel),
             0x42 => Ok(Self::UsbBridgeUrbComplete),
             0x50 => Ok(Self::CursorUpdate),
+            0x51 => Ok(Self::CursorPosition),
             other => Err(ProtocolError::UnknownFrameType(other)),
         }
     }

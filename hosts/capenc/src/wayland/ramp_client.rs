@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `capenc wayland-ramp-client`: the qualification's known picture.
 //!
 //! A minimal Wayland client that shows one full-screen ten-bit

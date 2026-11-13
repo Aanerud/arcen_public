@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! QUIC multi-monitor carrier benchmark foundation — a diagnostic-only
 //! comparison of two candidate carrier shapes described in
 //! `docs/adr/0009-multi-monitor-foundation.md`'s performance gate:

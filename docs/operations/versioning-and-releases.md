@@ -13,16 +13,19 @@ assessment.
 
 ## Change metadata
 
-Commit subjects follow Conventional Commits:
+Commit subjects name the area and then say what changed in behaviour, in one
+plain sentence: `linux: type committed text on Xorg sessions`,
+`protocol: srgb_transfer client capability (additive)`,
+`docs: colour check guide, README, troubleshooting and changelog`. Areas are
+the component (`shared`, `protocol`, `media`, `linux`, `windows`, `macos-pier`,
+`deck`, `capenc`, `packaging`, `docs`, `ci`), optionally narrowed
+(`capenc(windows)`). Conventional Commit types in front of the area
+(`fix(linux):`, `feat(capenc):`) are also accepted and common in the history.
 
-- `feat`: product or API capability
-- `fix`: defect correction
-- `perf`: measured performance improvement
-- `refactor`: behavior-preserving restructure
-- `test`, `docs`, `build`, `ci`, `chore`: corresponding maintenance changes
-
-Use `!` and a `BREAKING CHANGE:` footer for intentional compatibility breaks.
-The commit history informs release notes but does not replace review.
+State an intentional compatibility break in the commit body and in
+`CHANGELOG.md`. The commit history informs release notes but does not replace
+review; user-visible changes go under `[Unreleased]` in `CHANGELOG.md` as they
+land.
 
 ## Release manifest
 
@@ -50,11 +53,36 @@ Software H.264 additionally requires legal approval of the actual H.264
 distribution/patent posture and recorded physical soak/performance/allocation
 acceptance; BSD-2-Clause is not treated as patent clearance.
 
-The intended protected staging and production contract is documented in
-[Release automation](release-automation.md). Those workflows are currently
-absent, not merely disabled; Release/Security must rebuild and review them after
+The intended protected staging and production contract is stated under
+"Release artifact boundary" in
+[the supply-chain policy](../security/supply-chain.md#release-artifact-boundary).
+Those workflows are currently absent, not merely disabled; Release/Security must rebuild and review them after
 the repository environments, variables, platform packaging hooks, and
 signing/notarization hooks are defined.
+
+## Telling an official build apart
+
+Anyone may build Arcen, and every build says which build it is: the hello a
+Deck and a Pier exchange carries a build identity (`build_id`,
+`source_revision`, `artifact_sha256`, `signing_state`), and both products log
+it. An unstamped build reports `build_id` `development`.
+
+Official builds from TUTTIFRUTTI AS are made from a clean checkout of the
+published release tag and stamped by `scripts/release/official-build-id.sh`:
+
+```sh
+git checkout v0.19.0
+eval "$(scripts/release/official-build-id.sh)"
+# ARCEN_BUILD_ID=official-20261109T120000Z-v0.19.0-0123456789ab
+# ARCEN_SOURCE_REVISION=<the tagged commit>
+```
+
+so the build ID names the release tag and the public commit it was built
+from, and `arcen_protocol::build_identity::has_official_build_id_shape`
+recognises it. The shape is a label, not proof — anyone can stamp it. To
+verify that a binary is official, check that its code signature belongs to
+TUTTIFRUTTI AS and that its `artifact_sha256` is listed in the `SHA256SUMS` of
+the official release, whose notes link the exact source tag.
 
 ## Toolchain parity
 
@@ -63,13 +91,12 @@ three artefacts built on three machines, and a floating channel lets those be
 three different compilers — and makes a rebuild from the same tag produce a
 different binary months later.
 
-Pinning the file is not sufficient on its own, because each platform ignored it
-in a different way:
+Pinning the file is not sufficient on its own, because each platform can
+bypass it in a different way, so each build script enforces it:
 
 - **macOS** — Homebrew's `rust` formula installs `cargo` ahead of rustup's shims
-  on `PATH` and does not read `rust-toolchain.toml` at all. The Deck, the
-  artefact users actually download, was the one built unpinned.
-  `packaging/macos/build-deck-app.sh` now resolves the pinned channel, invokes
+  on `PATH` and does not read `rust-toolchain.toml` at all.
+  `packaging/macos/build-deck-app.sh` therefore resolves the pinned channel, invokes
   cargo through `rustup run`, and aborts if the resolved `rustc` is not the
   pinned version.
 - **Windows** — rustup resolves the host triple separately from the channel, and

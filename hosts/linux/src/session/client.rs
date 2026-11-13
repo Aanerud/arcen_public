@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Per-client outbound frame queue — the async adapter around shared policy.
 //!
 //! The portable decisions live in [`arcen_media::video::SharedVideoQueue`]:
@@ -58,6 +60,16 @@ impl FrameQueue {
             room: Notify::new(),
             idr,
         }
+    }
+
+    /// Bounds how long frames may wait for the writer before
+    /// [`Self::wait_for_room`] holds the pump back, from the session's
+    /// contract rate (`arcen_media::video::video_backlog_budget`), unless
+    /// `ARCEN_VIDEO_BACKLOG=legacy`.
+    pub fn apply_backlog_budget(&self, contract_fps: u32) {
+        self.inner.lock().unwrap().set_backlog_budget(
+            arcen_media::video::video_backlog_budget_from_env(contract_fps),
+        );
     }
 
     /// Enqueue one wire frame (10-byte header + payload). Returns `false` if a

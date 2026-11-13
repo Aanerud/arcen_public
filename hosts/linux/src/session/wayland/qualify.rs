@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `arcen-pier wayland qualify`: proves this host's headless Wayland facts
 //! with a real session and records them.
 //!
@@ -209,6 +211,9 @@ pub struct QualifyOptions {
     /// `--multi-output N`: outputs captured concurrently in one session to
     /// prove multi-monitor (2..=4; 0 skips; default 4, then 2 if 4 fails).
     pub multi_outputs: usize,
+    /// Set by the service's own run at start (internal): why it runs,
+    /// written into the record it produces.
+    pub automatic: Option<arcen_session::wayland_qualification::AutomaticRequalification>,
 }
 
 /// Usage text.
@@ -242,6 +247,7 @@ impl QualifyOptions {
             temporary_user: None,
             allow_running_service: false,
             multi_outputs: multi_output::DEFAULT_MULTI_OUTPUTS,
+            automatic: None,
         };
         let mut user = None;
         let mut password_file = None;
@@ -551,6 +557,19 @@ pub struct AutomaticOutcome {
     /// A stop was requested before it had an outcome: its desktop and
     /// temporary account were removed and nothing was recorded.
     pub interrupted: bool,
+    /// What an X11 re-proof found (`RequalifyTrigger::PreconditionCleared`
+    /// runs that passed).
+    pub x11_outcome: Option<arcen_session::wayland_qualification::X11RequalifyOutcome>,
+}
+
+/// What a qualification run ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ran {
+    /// The record serves Wayland (and, for a command, was written when
+    /// asked).
+    passed: bool,
+    /// An X11 re-proof's outcome.
+    x11_outcome: Option<arcen_session::wayland_qualification::X11RequalifyOutcome>,
 }
 
 /// Whether an automatic run has used its time
@@ -572,17 +591,49 @@ pub async fn run_automatic(
     config: crate::cli::Config,
     target: QualificationTarget,
     stop: tokio::sync::watch::Receiver<crate::service_signals::StopRequest>,
+    automatic: arcen_session::wayland_qualification::AutomaticRequalification,
 ) -> AutomaticOutcome {
     *AUTOMATIC_FAILURES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
-    let options = QualifyOptions {
+    let options = automatic_options(automatic);
+    let result = run_with(options, target, config, Mode::Automatic, Some(stop.clone())).await;
+    let mut failures = AUTOMATIC_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    let interrupted = result.is_err() && stop.borrow().is_some();
+    let (passed, x11_outcome) = match result {
+        Ok(ran) => (ran.passed, ran.x11_outcome),
+        Err(error) => {
+            failures.push(format!("qualify: {error}"));
+            (false, None)
+        }
+    };
+    AutomaticOutcome {
+        passed,
+        failures,
+        interrupted,
+        x11_outcome,
+    }
+}
+
+/// The options of the service's own run for `automatic`.
+fn automatic_options(
+    automatic: arcen_session::wayland_qualification::AutomaticRequalification,
+) -> QualifyOptions {
+    // An X11 re-proof keeps every other fact of the record, so it measures
+    // only what proving X11 needs: one display, one codec, no multi-output.
+    let x11_only = x11_reproof(Some(&automatic));
+    QualifyOptions {
         write: true,
         user: None,
         outputs: Vec::new(),
         replace_outputs: false,
         codecs: QUALIFY_CODECS
             .iter()
+            .take(if x11_only { 1 } else { QUALIFY_CODECS.len() })
             .map(|&codec| codec.to_owned())
             .collect(),
         seconds: arcen_session::wayland_qualification::AUTO_REQUALIFY_MEASURE_SECONDS,
@@ -592,28 +643,27 @@ pub async fn run_automatic(
         record: None,
         temporary_user: None,
         allow_running_service: false,
-        // The multi-monitor offer rests on it.
-        multi_outputs: multi_output::DEFAULT_MULTI_OUTPUTS,
-    };
-    let result = run_with(options, target, config, Mode::Automatic, Some(stop.clone())).await;
-    let mut failures = AUTOMATIC_FAILURES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-        .unwrap_or_default();
-    let interrupted = result.is_err() && stop.borrow().is_some();
-    let passed = match result {
-        Ok(passed) => passed,
-        Err(error) => {
-            failures.push(format!("qualify: {error}"));
-            false
-        }
-    };
-    AutomaticOutcome {
-        passed,
-        failures,
-        interrupted,
+        // The multi-monitor offer rests on it (an X11 re-proof keeps the
+        // record's).
+        multi_outputs: if x11_only {
+            0
+        } else {
+            multi_output::DEFAULT_MULTI_OUTPUTS
+        },
+        automatic: Some(automatic),
     }
+}
+
+/// Whether a run is the service's X11 re-proof
+/// (`RequalifyTrigger::PreconditionCleared`), which keeps every other fact
+/// of the record it runs for.
+fn x11_reproof(
+    automatic: Option<&arcen_session::wayland_qualification::AutomaticRequalification>,
+) -> bool {
+    automatic.is_some_and(|automatic| {
+        automatic.trigger
+            == arcen_session::wayland_qualification::RequalifyTrigger::PreconditionCleared
+    })
 }
 
 async fn command_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -962,6 +1012,7 @@ fn x11_proof(ready: &WaylandAgentReady, version: Option<&str>) -> XwaylandProof 
             glamor: GlamorRoute::Unknown,
             xwayland_version: version,
             failure: Some("the session reported nothing about Xwayland".to_owned()),
+            host_precondition: None,
         },
         Some(x11) => XwaylandProof {
             display_proven: x11.ready
@@ -971,6 +1022,7 @@ fn x11_proof(ready: &WaylandAgentReady, version: Option<&str>) -> XwaylandProof 
             glamor: x11.glamor,
             xwayland_version: version,
             failure: x11.failure.clone(),
+            host_precondition: None,
         },
     }
 }
@@ -2547,7 +2599,9 @@ fn load_config(options: &QualifyOptions) -> Result<crate::cli::Config, String> {
 
 async fn run(options: QualifyOptions, target: QualificationTarget) -> Result<bool, String> {
     let config = load_config(&options)?;
-    run_with(options, target, config, Mode::Command, None).await
+    run_with(options, target, config, Mode::Command, None)
+        .await
+        .map(|ran| ran.passed)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2560,7 +2614,7 @@ async fn run_with(
     config: crate::cli::Config,
     mode: Mode,
     stop: Option<tokio::sync::watch::Receiver<crate::service_signals::StopRequest>>,
-) -> Result<bool, String> {
+) -> Result<Ran, String> {
     if !nix::unistd::Uid::effective().is_root() {
         return Err("run as root".to_owned());
     }
@@ -2627,6 +2681,7 @@ async fn run_with(
         ),
     );
 
+    let x11_only = x11_reproof(options.automatic.as_ref());
     let previous = if options.replace_outputs {
         Vec::new()
     } else {
@@ -2648,13 +2703,16 @@ async fn run_with(
         &requested.outputs(),
         ladder,
         match mode {
+            _ if x11_only => 1,
             Mode::Command => MAX_QUALIFY_OUTPUTS,
             Mode::Automatic => arcen_session::wayland_qualification::AUTO_REQUALIFY_MAX_OUTPUTS,
         },
     );
-    // What this run leaves out is measured by the next one, never lost.
+    // What this run leaves out is measured by the next one, never lost. An
+    // X11 re-proof keeps the record's measurements, so it leaves nothing
+    // out and never edits the list.
     let mut requested = requested;
-    if options.write && !dropped.is_empty() {
+    if options.write && !dropped.is_empty() && !x11_only {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
@@ -2693,7 +2751,9 @@ async fn run_with(
             list(&previous),
             list(&requested.outputs()),
             list(ladder),
-            if dropped.is_empty() {
+            if x11_only {
+                "; an X11 re-proof: the record's measurements are kept".to_owned()
+            } else if dropped.is_empty() {
                 String::new()
             } else {
                 format!(
@@ -2742,6 +2802,37 @@ async fn run_with(
         );
     }
     let mut x11_apps: Option<XwaylandProof> = None;
+    // Only when Xwayland is tried: the shared socket directories. A missing
+    // one is recreated; an unsafe `/tmp/.X11-unix` would make this run's
+    // own desktop abort with Xwayland, so X11 is not tried and the record
+    // says so as a host precondition, which start-up re-checks (not a
+    // failed proof). An unsafe `/tmp/.ICE-unix` is only reported.
+    if let Some(version) = &version {
+        for (_, result) in super::super::socket_dirs::prepare_production() {
+            let Err(fault) = result else { continue };
+            step(
+                fault.dir.name().trim_start_matches('.'),
+                false,
+                &fault.to_string(),
+            );
+            if fault.dir == arcen_session::wayland_x11::SharedSocketDir::X11Unix {
+                step(
+                    "x11_apps",
+                    false,
+                    &format!("not tried: host precondition {}", fault.token()),
+                );
+                x11_apps = Some(XwaylandProof {
+                    display_proven: false,
+                    window_manager: false,
+                    pointer: false,
+                    glamor: GlamorRoute::Unknown,
+                    xwayland_version: version.clone(),
+                    failure: Some(fault.to_string()),
+                    host_precondition: Some(fault.token().to_owned()),
+                });
+            }
+        }
+    }
     let speed_minimum = speed_minimum_fps(pipeline_contract(PipelineId::Speed).max_fps);
     let mut results = Vec::new();
     let mut cursor_probe = None;
@@ -2810,6 +2901,7 @@ async fn run_with(
                             failure: Some(
                                 "the headless session did not start with Xwayland".to_owned(),
                             ),
+                            host_precondition: None,
                         });
                         result = qualify_output(
                             &config,
@@ -2842,7 +2934,7 @@ async fn run_with(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                if paced != display_hz && !short.is_empty() && result.route.is_some() {
+                if paced != display_hz && !short.is_empty() && result.route.is_some() && !x11_only {
                     let paced_result = qualify_output(
                         &config,
                         &user,
@@ -2859,6 +2951,17 @@ async fn run_with(
                 }
                 results.push(result);
                 measured_outputs.push(*output);
+            }
+            // An X11 re-proof keeps the record's other facts: nothing more
+            // to measure.
+            if x11_only {
+                step(
+                    "x11_reproof",
+                    true,
+                    "Grading, HDR, multi-monitor, cursor metadata and the native seat are kept \
+                     from the record",
+                );
+                return;
             }
             // Grading and HDR, in a session of their own on the stack's wide
             // composition route (when it has one).
@@ -2995,6 +3098,25 @@ async fn run_with(
 
     let route = results.iter().find_map(|result| result.route.clone());
     let input = results.iter().find_map(|result| result.input.clone());
+    // A record an automatic run writes says why and when (an X11
+    // re-proof writes only its X11 proof into the previous record, below).
+    let automatic_requalification = options.automatic.clone().map(|mut automatic| {
+        automatic.at_unix_s = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        );
+        if automatic.trigger
+            == arcen_session::wayland_qualification::RequalifyTrigger::PreconditionCleared
+        {
+            automatic.x11_outcome =
+                Some(arcen_session::wayland_qualification::x11_requalify_outcome(
+                    true,
+                    x11_apps.as_ref(),
+                ));
+        }
+        automatic
+    });
     let facts = QualifiedFacts {
         capture_route: route,
         input,
@@ -3026,6 +3148,7 @@ async fn run_with(
         x11_apps,
         cursor_metadata: CursorMetadataProbe::fact(cursor_probe.as_ref()),
         native_seat,
+        automatic_requalification,
         encoder: results.first().and_then(|first| {
             (first.native_encoder != CapabilityFact::Unknown).then(|| EncoderProof {
                 native: first.native_encoder,
@@ -3149,11 +3272,21 @@ async fn run_with(
             config.wayland_x11_apps,
             super::xwayland_installed(),
             qualified.record().facts.x11_apps.as_ref(),
+            super::super::socket_dirs::assess(
+                &super::super::socket_dirs::SocketDirRoot::production(),
+                arcen_session::wayland_x11::SharedSocketDir::X11Unix,
+            ),
         ) {
             Ok(plan) => println!(
-                "  X11 apps at start-up (platform.session.wayland_x11_apps = {}): {}",
+                "  X11 apps at start-up (platform.session.wayland_x11_apps = {}): {}{}",
                 config.wayland_x11_apps.token(),
-                plan.token()
+                plan.token(),
+                match plan {
+                    arcen_session::wayland_x11::X11AppsPlan::Disabled(reason) => {
+                        format!(" ({})", reason.remedy())
+                    }
+                    arcen_session::wayland_x11::X11AppsPlan::Enabled => String::new(),
+                }
             ),
             Err(refusal) => println!("  X11 apps at start-up: refused: {refusal}"),
         }
@@ -3202,11 +3335,42 @@ async fn run_with(
         serde_json::to_string_pretty(&record).map_err(|error| error.to_string())?
     );
     let passed = wayland.is_ok() && teardown_clean && released.is_ok();
+    let mut x11_outcome = None;
     // The command records a failure too (the Pier then refuses with its
     // reasons); an automatic run keeps the stale record instead, so the
     // next start sees the same version refusal and its attempt marker.
     if mode == Mode::Automatic && !passed {
         println!("Not recorded: the automatic re-qualification did not pass.");
+    } else if x11_only {
+        // The summary above is this short run's; the record keeps every
+        // other fact it had and takes only the new X11 proof.
+        let path = target.record_path();
+        let previous = qualification::load_record(Path::new(path))
+            .and_then(|previous| previous.validate(&identity))
+            .map_err(|error| format!("the record the X11 re-proof ran for: {error}"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let (outcome, reproof) = arcen_session::wayland_qualification::x11_reproof_record(
+            previous.record(),
+            record.facts.x11_apps.as_ref(),
+            now,
+        );
+        x11_outcome = Some(outcome);
+        match reproof {
+            arcen_session::wayland_qualification::X11Reproof::Write(merged) => {
+                qualification::write_record(Path::new(path), &merged)
+                    .map_err(|error| format!("writing {path}: {error}"))?;
+                println!(
+                    "Recorded the X11 proof ({}) in {path}; every other fact of the record kept.",
+                    outcome.token()
+                );
+            }
+            arcen_session::wayland_qualification::X11Reproof::Unchanged => println!(
+                "Record unchanged ({}): {path} keeps its facts.",
+                outcome.token()
+            ),
+        }
     } else if options.write {
         let path = target.record_path();
         qualification::write_record(Path::new(path), &record)
@@ -3236,12 +3400,37 @@ async fn run_with(
     } else {
         println!("Not recorded (pass --write).");
     }
-    Ok(passed)
+    Ok(Ran {
+        passed,
+        x11_outcome,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_x11_re_proof_measures_only_what_proving_x11_needs() {
+        use arcen_session::wayland_qualification::{AutomaticRequalification, RequalifyTrigger};
+        let automatic = |trigger| AutomaticRequalification {
+            trigger,
+            cleared_precondition: None,
+            x11_outcome: None,
+            at_unix_s: None,
+        };
+        let x11 = automatic_options(automatic(RequalifyTrigger::PreconditionCleared));
+        assert!(x11_reproof(x11.automatic.as_ref()));
+        assert_eq!(x11.codecs, vec![QUALIFY_CODECS[0].to_owned()]);
+        assert_eq!(x11.multi_outputs, 0);
+        assert!(x11.write && x11.outputs.is_empty() && !x11.replace_outputs);
+        // The version trigger keeps its full bounded run.
+        let version = automatic_options(automatic(RequalifyTrigger::RecordVersion));
+        assert!(!x11_reproof(version.automatic.as_ref()));
+        assert_eq!(version.codecs.len(), QUALIFY_CODECS.len());
+        assert_eq!(version.multi_outputs, multi_output::DEFAULT_MULTI_OUTPUTS);
+        assert!(!x11_reproof(None));
+    }
 
     #[test]
     fn the_pointer_proofs_capture_uses_the_encoder_sessions_get() {

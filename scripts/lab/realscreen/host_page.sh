@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Host side of the real-screen harness (run as root on the Pier host).
 #
 #   host_page.sh start <user> <run-dir> [port] [extra-query] [browser] [url]

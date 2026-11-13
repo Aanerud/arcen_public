@@ -27,7 +27,7 @@ Arcen uses the first route where it can and the second only where it must.
 | --- | --- | --- |
 | Microphone | Consent | **Works.** `AVAudioEngine`, `NSMicrophoneUsageDescription`, opt-in per launch. |
 | Graphics tablet, as pen input | Neither — the window already receives it | **Works.** AppKit `tabletPoint` events carry pressure and tilt. |
-| Graphics tablet, as a real USB device | Device capture | Experimental, `usb-hard-lab`, not in releases. |
+| Graphics tablet, as a real USB device | Device capture | Native tablet: IOUSBHost capture in the release Deck's helper since 0.19.0 (ADR 0019). |
 | Webcam | Undecided | Does not exist. See below. |
 
 ## Why the microphone needed no helper
@@ -54,12 +54,12 @@ entitlement moves the device-level boundary; it does not detach Apple's HID
 ownership. It is meant for the newer Accessory Access framework, which is not
 present in the SDK or runtime on the machines this was tested on.
 
-**Apple's 2026-08-20 answer confirmed the root branch is the intended one for
+**The root branch is the supported one for
 Developer ID distribution.** Full detail, including the measured interface-claim
 output, is in
-[`clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`](../../clients/macos/APPLE_ENTITLEMENT_REQUESTS.md).
+[`clients/macos/ENTITLEMENTS.md`](../../clients/macos/ENTITLEMENTS.md).
 
-That answer is the whole reason the helper exists. If device capture needs root,
+That is the whole reason the helper exists. If device capture needs root,
 the question becomes *what runs as root* — and the answer must not be the client.
 
 ## The helper pattern

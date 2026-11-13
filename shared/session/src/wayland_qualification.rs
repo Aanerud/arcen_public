@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host qualification record for the headless Wayland provider.
 //!
 //! Some Wayland facts can only be proven by a real session: that a capture
@@ -36,8 +38,10 @@ mod temporary_account;
 
 pub use requalify::{
     AUTO_REQUALIFY_DEADLINE_S, AUTO_REQUALIFY_MAX_INTERRUPTED, AUTO_REQUALIFY_MAX_OUTPUTS,
-    AUTO_REQUALIFY_MEASURE_SECONDS, AutoRequalify, REQUALIFY_MARKER_SCHEMA_VERSION,
-    REQUALIFY_RETRY_AFTER_S, RequalifyAttempt, auto_requalify_decision, identity_digest,
+    AUTO_REQUALIFY_MEASURE_SECONDS, AutoRequalify, AutomaticRequalification,
+    REQUALIFY_MARKER_SCHEMA_VERSION, REQUALIFY_RETRY_AFTER_S, RequalifyAttempt, RequalifyTrigger,
+    X11Reproof, X11RequalifyOutcome, auto_requalify_decision, identity_digest,
+    precondition_requalify_decision, x11_reproof_record, x11_requalify_outcome,
 };
 pub use requested::{
     MAX_REQUESTED_OUTPUTS, REQUESTED_SCHEMA_VERSION, RequestedSpeedOutput, RequestedSpeedOutputs,
@@ -354,6 +358,11 @@ pub struct QualifiedFacts {
     /// tried it: `wayland.session_mode = auto` then stays headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_seat: Option<crate::native_seat::NativeSeatProof>,
+    /// Set when the Pier wrote this record itself at start
+    /// ([`AutomaticRequalification`]): why, and for the X11 trigger what it
+    /// found. Absent in a record an operator's qualification wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_requalification: Option<AutomaticRequalification>,
 }
 
 // serde's `skip_serializing_if` passes a reference.
@@ -1028,7 +1037,7 @@ mod tests {
         HostIdentity {
             pier: PierBuild {
                 version: "0.17.0".into(),
-                revision: "0f73bc76".into(),
+                revision: "0a1b2c3d".into(),
                 executable_sha256: "ab".repeat(32),
             },
             stack: StackVersions {
@@ -1092,6 +1101,7 @@ mod tests {
                 x11_apps: None,
                 cursor_metadata: CapabilityFact::Unknown,
                 native_seat: None,
+                automatic_requalification: None,
                 multi_output: None,
                 fidelity: None,
                 encoder: Some(EncoderProof {
@@ -1462,6 +1472,7 @@ mod tests {
             glamor: GlamorRoute::NvidiaGbm,
             xwayland_version: Some("24.1.9".into()),
             failure: None,
+            host_precondition: None,
         });
         let json = serde_json::to_string(&proven).unwrap();
         assert!(json.contains("\"x11_apps\":{\"display_proven\":true"));

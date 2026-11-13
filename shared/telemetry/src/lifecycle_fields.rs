@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Building the fields a canonical lifecycle event carries.
 //!
 //! Each of these events declares its fields in the schema, and every host has
@@ -217,12 +219,15 @@ pub fn session_end(
 /// Builds the fields for `HEALTH_SNAPSHOT`.
 ///
 /// The measured rate, never the target. A host reporting the rate it aimed for
-/// has recorded its intention rather than its behaviour.
+/// has recorded its intention rather than its behaviour. `fps_content` is the
+/// changed-content rate the state was judged against, when the source proved
+/// one (see `QosSample::fps_content`).
 #[must_use]
 pub fn health_snapshot(
     overall_state: &str,
     fps_actual: Option<u32>,
     fps_target: Option<u32>,
+    fps_content: Option<u32>,
 ) -> Option<StructuredFields> {
     let mut fields = StructuredFields::default();
     fields
@@ -239,6 +244,11 @@ pub fn health_snapshot(
     if let Some(target) = fps_target {
         fields
             .insert("fps_target", FieldValue::Integer(i64::from(target)))
+            .ok()?;
+    }
+    if let Some(content) = fps_content {
+        fields
+            .insert("fps_content", FieldValue::Integer(i64::from(content)))
             .ok()?;
     }
     Some(fields)
@@ -389,7 +399,7 @@ mod tests {
         ));
         assert!(accepted(
             LifecycleEventKind::HealthSnapshot,
-            health_snapshot("ok", Some(58), Some(60))
+            health_snapshot("ok", Some(58), Some(60), Some(59))
         ));
         assert!(accepted(
             LifecycleEventKind::LaneRefused,
@@ -477,7 +487,7 @@ mod tests {
         ));
         assert!(accepted(
             LifecycleEventKind::HealthSnapshot,
-            health_snapshot("ok", None, None)
+            health_snapshot("ok", None, None, None)
         ));
     }
 

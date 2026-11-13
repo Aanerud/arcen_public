@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure NVIDIA Xorg output discovery parsing and ranking.
 //!
 //! Linux Piers collect the raw facts from an NVIDIA Xorg log; this module owns

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `linux-wayland-grading`: the Wayland Grading composition.
 //!
 //! Grading is the shared ten-bit SDR contract (`arcen_media::video::pipeline`
@@ -5,8 +7,11 @@
 //! priority, up to its frame-rate ceiling. A colour-managed compositor that
 //! screencasts wide formats does so from an HDR (BT.2100) composition
 //! (Mutter 50 and later offers them only then), so this composition takes
-//! that composition and converts it to BT.709 SDR in shared code, as Windows
-//! Grading converts its FP16 composition:
+//! that composition and converts it to SDR in shared code, as Windows
+//! Grading converts its FP16 composition. The curve is the one the parent
+//! named (`transfer=`, [`AdmissionRequest::sdr_transfer`]): for a Deck that
+//! presents `srgb`, the inverse of the 2.2 power Mutter decodes its sRGB
+//! content with, so the desktop's own codes come back; else BT.709:
 //!
 //! - half-float PQ / BT.2020 first: decoded from the half-float signal it
 //!   keeps 853 of the 1024 ten-bit SDR codes of an SDR ramp
@@ -72,8 +77,8 @@ impl GradingPipeline {
 pub(crate) mod tests {
     use arcen_media::video::{
         AdmissionReason, CaptureBackend, CopyPath, CursorEvidence, EncoderBackend, GpuMatch,
-        Rgb10Signal, SamplePrecision, SourceColour, SourceFact, SourceTransfer, SourceTransform,
-        StreamingPreset,
+        Rgb10Signal, SamplePrecision, SdrContentCurve, SourceColour, SourceFact, SourceTransfer,
+        SourceTransform, StreamingPreset,
     };
     use arcen_media::{ColorPrimaries, EncodeIntent, VideoCodec};
 
@@ -90,6 +95,7 @@ pub(crate) mod tests {
                 primaries: SourceFact::Authoritative(ColorPrimaries::Bt2020),
                 transfer: SourceFact::Authoritative(SourceTransfer::Pq),
                 sdr_white_nits: SourceFact::Authoritative(203),
+                sdr_content: SourceFact::Inferred(SdrContentCurve::Gamma22),
                 ..SourceColour::UNKNOWN
             },
             sample_precision: SourceFact::Authoritative(SamplePrecision::NativeWide),
@@ -108,6 +114,7 @@ pub(crate) mod tests {
             width: 1920,
             height: 1080,
             max_fps: 30,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 
@@ -147,6 +154,45 @@ pub(crate) mod tests {
             assert_eq!(plan.pipeline, PipelineId::Grading);
             assert_eq!(plan.transform, transform);
             assert_eq!(plan.copy_path, CopyPath::HostCopy);
+        }
+    }
+
+    /// The parent's `transfer=srgb` (a Deck that presents sRGB) moves the
+    /// conversion to the inverse of Mutter's 2.2-power SDR decode, which
+    /// returns the desktop's codes, and the epoch's stated transfer to
+    /// `srgb`; an older Deck's `bt709` request is served as before.
+    #[test]
+    fn grading_converts_on_the_curve_the_parent_named() {
+        use arcen_media::TransferCharacteristics::{Bt709, Srgb};
+        for (sdr_transfer, signal) in [
+            (Srgb, Rgb10Signal::PqBt2020ToSdrGamma22),
+            (Bt709, Rgb10Signal::PqBt2020ToSdrBt709),
+        ] {
+            for (format, transform) in [
+                (
+                    CapturePixelFormat::RgbaF16,
+                    SourceTransform::HalfFloatPq(signal),
+                ),
+                (
+                    CapturePixelFormat::Xbgr2101010,
+                    SourceTransform::PackedRgb10(signal),
+                ),
+            ] {
+                let PresetAdmission::Admit(plan) = GradingPipeline.admit(
+                    AdmissionRequest {
+                        sdr_transfer,
+                        ..request(StreamingPreset::Grading)
+                    },
+                    &mutter_hdr_readback(format),
+                    &encoder(EncoderBackend::NativeNvenc),
+                ) else {
+                    panic!("{format:?} not admitted");
+                };
+                assert_eq!(plan.transform, transform);
+                let epoch = plan.epoch().expect("cursor truth");
+                assert_eq!(epoch.video.transfer, sdr_transfer, "{format:?}");
+                assert_eq!(epoch.video.primaries, ColorPrimaries::Bt709);
+            }
         }
     }
 

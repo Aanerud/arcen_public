@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Shared Adoption Index (SAI): a trend of how much each product builds on shared/.
 
 Informational only. It counts dependencies and references, not correctness,

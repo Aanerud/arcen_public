@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #[cfg(not(windows))]
 fn main() {
     println!("arcen-cp-harness is available only on Windows");

@@ -35,7 +35,7 @@ its platform's decode/render path.
 1. Depends only on the active shared client surfaces (`arcen-input`, `arcen-media`,
    `arcen-observability`, `arcen-protocol`, `arcen-telemetry`, and
    `arcen-transport`) plus approved third-party crates.
-2. Never depends on a Pier crate or the gateway. The only contract to the host
+2. Never depends on a Pier crate. The only contract to the host
    is the wire protocol over QUIC.
 3. Platform code (`objc2`, VideoToolbox, AppKit) stays behind `cfg(target_os = "macos")`;
    the crate must still `cargo check` on non-macos for protocol/transport unit tests.
@@ -113,7 +113,8 @@ needs to negotiate.
 ## Module map (from the proven source)
 
 - `main.rs` / `lib.rs` — entry + crate root. `arcen-deck platform-report`
-  prints the platform profile and the real decode probe without a window.
+  prints the platform profile and the real decode probe without a window;
+  `arcen-deck diagnose <host[:port]>` prints the connection test.
 - `platform.rs` — resolves the Deck platform profile once (see above).
 - `credentials.rs` — credential entry/storage (zeroized).
 - `clipboard.rs` — capacity-one inbound/outbound slots, host-policy mapping,
@@ -122,14 +123,41 @@ needs to negotiate.
   backoff/deadline state machine. It binds grants to endpoint, TLS/security, topology, and
   connection generation; manual/configuration/terminal paths zeroize and cancel it.
 - `ui/` — `app.rs` (main app + `initial_stream_profile`), `home.rs`, `session`, `settings`,
-  `theme.rs`, `keyboard.rs`, `media_worker.rs`, `macos_menu.rs`.
+  `theme.rs`, `keyboard.rs`, `media_worker.rs`, `audio_worker.rs`, `macos_menu.rs`.
+  Keyboard and text: `keyboard.rs` is the egui adapter of the shared
+  `arcen_input::keyboard` policy (Windows App style, swapped, ⌘ is Control;
+  AltGr), `option_keys.rs` tracks which ⌥ keys are held and which act as Alt,
+  `text_input.rs` sends input-method commits and Characters-mode keystrokes as
+  `text_commit`, and `paste_keys.rs` is Paste as Keystrokes (menu state,
+  confirmation, progress, the host's report) over the shared
+  `arcen_input::text::paste`. `sharp_cursor.rs` builds the host cursor image
+  at the display's backing scale; `session_truth.rs` derives what the session
+  actually serves from the hello for the Colour check; `trusted_pins.rs` holds
+  remembered host identities; `display_fit.rs` sends `display_update` when the
+  window settles; the `multi_window*.rs` and `region_runtime.rs` files run Match
+  My Layout.
 - `transport/` — `websocket.rs` (QUIC socket plus tolerant framed `recv_json`; the filename reflects the internal tungstenite message-framing codec, not a network WSS connection),
-  `connector.rs`, `tls.rs`, `mod.rs`.
+  `lanes.rs` (ADR 0014 lane adapter: the control lane as the message
+  stream, one worker per other lane), `connector.rs`, `tls.rs`, `mod.rs`, and `diagnose.rs` — the connection test's
+  macOS adapter (resolve, one empty UDP datagram to reveal a refused port, a
+  QUIC dial per address through `tls::diagnostic_quic_rustls_config`, which
+  records the certificate and stops only on a pin mismatch, the Pier's first
+  message before sign-in, then a QUIC close). It never sends credentials. The
+  steps, findings, codes and wording are `arcen_session::connection_diagnostics`;
+  `ui/connection_test.rs` runs it off the UI thread for **Test connection** in
+  the connection editor and details panel.
 - `pipeline/` — `video_decoder.rs` (VideoToolbox, native 8/10-bit pixel-buffer
   metadata), `frame_queue.rs`, `audio.rs`.
 - `ui/video_metal_layer.rs` / `.metal` — the dedicated native ten-bit
   Grading/HDR presentation pipeline. It is separate from the ordinary egui
   surface and enables EDR only for PQ.
+- `ui/colour_check.rs` — the **Colour check** panel's macOS adapter: reads
+  the root window's `NSScreen` (reference and potential EDR headroom, colour
+  profile, P3), the presentation layers' EDR flag and colour space back from
+  Core Animation (`LayerColourState`), copies one decoded frame's planes for
+  the exactness measurement off the UI thread, and draws the checklist. The
+  items, rules, wording and codes are `arcen_media::colour_check`; the
+  measurement is `arcen_media::test_pattern::measure_biplanar`.
 - `protocol/` — `keymap.rs` (client-side key mapping), `mod.rs`.
 - `tablet/` — the default, non-experimental typed-pen capture path: `monitor.rs`
   (main-thread AppKit `NSEvent` tabletPoint/tabletProximity local-monitor RAII
@@ -238,10 +266,16 @@ missing facts remain absent rather than invented.
 ## Pointer lock and cursor authority
 
 The persisted Advanced preference defaults to Local and is repeated in
-`AuthResponse` and `ClientHello`. Deck keeps its synthetic crosshair until the
-current connection returns a matching `CursorModeResult`; a request alone never
-hides local authority. The crosshair is painted only in active Local mode and
-outside pointer lock.
+`AuthResponse` and `ClientHello`. Authority changes only when the current
+connection returns a matching `CursorModeResult`; a request alone never hides
+local authority. In active Local mode the Mac's own pointer shows the host's
+cursor: the host application's cursor image for a Deck that declared
+`cursor_image_v1` (records applied by the shared
+`arcen_input::cursor::DeckCursorState`, drawn at the size the cursor has in
+the video and, in the main window, at the display's backing scale by
+`ui/sharp_cursor.rs`; secondary viewports still use winit's one-pixel-per-point
+cursor), or the nearest named shape from a Pier that sends only names (the
+macOS Pier, older Piers). No synthetic cursor is painted over the video.
 
 The View-menu Pointer Lock command requires viewer focus plus server input-v2
 relative capability. egui 0.35 native `MouseMoved` motion is accumulated without
@@ -376,8 +410,7 @@ The active App ID is `deck.arcen.tech`. The release profile and
 `Deck.entitlements` intentionally carry only capabilities Deck implements.
 Portal-side capabilities do not become product behavior by being enabled, and
 must never be added to the executable merely to make a profile look complete.
-See `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md` for the reviewed capability
-boundary.
+See `clients/macos/ENTITLEMENTS.md` for the capability boundary.
 
 `validate_release_inputs.py` also enforces an explicit profile class
 (`--profile-class release|development`, threaded through both validator
@@ -394,15 +427,16 @@ a Developer ID profile cannot silently be reused in development mode either.
   `arcen-transport` default supplies shared TLS lifecycle and pin contracts,
   while its Quinn surface supplies the direct QUIC stream carrier. Dormant WSS
   networking exists only behind `wss-compat`.
-- `com.apple.developer.hid.virtual.device` entitlement request to Apple (for future
-  macOS Pier, not Deck) — justification text ready in `APPLE_ENTITLEMENT_REQUESTS.md`.
-- Windows Pier pen injection: decode pen-tablet HID reports → `SendInput(POINTER_PEN_INFO)`.
+- Windows Pier pen: shipped as a Windows Ink pen from typed pen events
+  (`InjectSyntheticPointerInput`); raw HID reports and Native tablet are not
+  offered on Windows hosts
+  ([ADR 0017](../../docs/adr/0017-forward-only-pen-input.md)).
 - macOS Pier: `IOHIDUserDeviceCreate` + `IOHIDUserDeviceHandleReport` (pending Apple
   entitlement approval).
 
 ## Resume pointer
 
-- **Status:** ✅ MIGRATED + LIVE-VERIFIED (updated 2026-07-31, PR #120). 339 unit tests pass; `Arcen Deck.app` built and used live to stream both Linux Pier (pier-linux.example.internal, 8,881 frames, H.265 4:4:4) and Windows Pier (pier-windows.example.internal, 7,172 frames) over direct QUIC/TLS 1.3 on UDP 18444. Includes the **Retina effective-stream-resolution** fix and the **TOFU certificate trust fix** (QUIC cert capture now correctly promotes to `CertificateUntrusted` for explicit Deck trust). Connections list shows only clean QUIC-only entries; the full-width card button fix lands in this PR. See [`docs/adr/0007-quic-only-product-transport.md`](../../docs/adr/0007-quic-only-product-transport.md).
+- **Status:** ✅ MIGRATED + LIVE-VERIFIED (updated 2026-07-31). 339 unit tests pass; `Arcen Deck.app` built and used live to stream both Linux Pier (pier-linux.example.internal, 8,881 frames, H.265 4:4:4) and Windows Pier (pier-windows.example.internal, 7,172 frames) over direct QUIC/TLS 1.3 on UDP 18444. Includes the **Retina effective-stream-resolution** fix and the **TOFU certificate trust fix** (QUIC cert capture now correctly promotes to `CertificateUntrusted` for explicit Deck trust). Connections list shows only clean QUIC-only entries; the full-width card button fix lands in this PR. See [`docs/adr/0007-quic-only-product-transport.md`](../../docs/adr/0007-quic-only-product-transport.md).
 - **Original next step (done):** establish `clients/macos` as crate
   `arcen-deck-macos`, lib `arcen_deck`, bin `arcen-deck`, using
   `arcen_protocol` via `../../shared/protocol`; the historical migration

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Illustrative HID report descriptors shared by tests across crates.
 //!
 //! These are written for Arcen's tests, not captured from devices. They

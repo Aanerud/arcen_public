@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The locale a Pier-started desktop runs in, read from the host.
 //!
 //! The decision is the shared [`SessionLocale::resolve`]; this adapter only

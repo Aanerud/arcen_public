@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure capture-surface and source evidence.
 //!
 //! A native capture adapter (PipeWire/DMA-BUF today, VA-API or Vulkan later)
@@ -371,6 +373,21 @@ pub struct SourceColour {
     pub matrix: SourceFact<ColorMatrix>,
     /// Where SDR white sits, in nits, for linear and PQ sources.
     pub sdr_white_nits: SourceFact<u16>,
+    /// For a PQ or linear-light composition: the curve the compositor decoded
+    /// its SDR (sRGB-tagged) content with on the way in. Its inverse returns
+    /// that content's own code values.
+    pub sdr_content: SourceFact<SdrContentCurve>,
+}
+
+/// How a compositor decodes SDR content into a PQ or linear-light
+/// composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdrContentCurve {
+    /// The IEC 61966-2-1 piecewise sRGB curve.
+    Srgb,
+    /// A pure 2.2 power, which the Wayland colour-management protocol makes
+    /// of `srgb` content and Mutter applies in an HDR colour state.
+    Gamma22,
 }
 
 impl SourceColour {
@@ -381,6 +398,7 @@ impl SourceColour {
         range: SourceFact::Unknown,
         matrix: SourceFact::Unknown,
         sdr_white_nits: SourceFact::Unknown,
+        sdr_content: SourceFact::Unknown,
     };
 }
 

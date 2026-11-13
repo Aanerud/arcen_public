@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use crate::abi::{
     EDID_BYTES, MAX_HEIGHT, MAX_REFRESH_MILLIHZ, MAX_WIDTH, MIN_HEIGHT, MIN_REFRESH_MILLIHZ,
     MIN_WIDTH, Mode,

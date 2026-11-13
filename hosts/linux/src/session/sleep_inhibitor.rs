@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A logind `sleep:idle` block inhibitor held for the life of a desktop.
 //!
 //! A host that serves a remote desktop must never suspend under it: not on

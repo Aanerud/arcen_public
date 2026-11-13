@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Who owns the physical console, and waiting for that to become the right
 //! person.
 //!
@@ -273,12 +275,12 @@ mod tests {
         // both accounts. "Permission denied" sends someone to check a password
         // that was correct.
         let error = ConsoleError::Mismatch {
-            authenticated: "jc".to_owned(),
+            authenticated: "artist".to_owned(),
             console_owner: "admin".to_owned(),
             waited: Duration::from_secs(600),
         }
         .to_string();
-        assert!(error.contains("jc"));
+        assert!(error.contains("artist"));
         assert!(error.contains("admin"));
         assert!(error.contains("600s"));
         assert!(error.contains("Fast User Switching"));

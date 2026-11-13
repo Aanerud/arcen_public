@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen-managed headless GNOME/Mutter Wayland session (Linux host side).
 //!
 //! Process model, one logind session per desktop:
@@ -836,8 +838,9 @@ pub fn xwayland_installed() -> bool {
 }
 
 /// Decides at start whether this Pier's Wayland sessions run Xwayland, from
-/// `platform.session.wayland_x11_apps`, the installed Xwayland and the
-/// host's qualification record, and says why.
+/// `platform.session.wayland_x11_apps`, the installed Xwayland, the host's
+/// qualification record and the state of `/tmp/.X11-unix` now (consulted
+/// only for a record that skipped Xwayland for it), and says why.
 ///
 /// # Errors
 ///
@@ -845,10 +848,12 @@ pub fn xwayland_installed() -> bool {
 pub fn resolve_configured_x11_apps(
     setting: X11AppsSetting,
     qualification: Option<&QualifiedHost>,
+    x11_unix_dir: Result<(), arcen_session::wayland_x11::SocketDirFault>,
 ) -> Result<X11AppsPlan, X11AppsRefusal> {
     let installed = xwayland_installed();
     let proof = qualification.and_then(|qualified| qualified.record().facts.x11_apps.as_ref());
-    let result = arcen_session::wayland_x11::resolve_x11_apps(setting, installed, proof);
+    let result =
+        arcen_session::wayland_x11::resolve_x11_apps(setting, installed, proof, x11_unix_dir);
     match &result {
         Ok(plan) => tracing::info!(
             target: crate::logging::target::SESSION,
@@ -885,11 +890,12 @@ pub fn configured_x11_plan(
     provider: arcen_session::desktop_provider::DesktopProvider,
     setting: X11AppsSetting,
     qualification: Option<&QualifiedHost>,
+    x11_unix_dir: Result<(), arcen_session::wayland_x11::SocketDirFault>,
 ) -> Result<Option<X11AppsPlan>, X11AppsRefusal> {
     if provider != arcen_session::desktop_provider::DesktopProvider::Wayland {
         return Ok(None);
     }
-    resolve_configured_x11_apps(setting, qualification).map(Some)
+    resolve_configured_x11_apps(setting, qualification, x11_unix_dir).map(Some)
 }
 
 /// The provider a Pier runs and, for Wayland, the qualification record that
@@ -1028,7 +1034,10 @@ pub async fn requalify_at_start(
         last.as_ref(),
         now,
     ) {
-        AutoRequalify::NotApplicable => StartRequalify::NotApplicable,
+        // Only the X11 trigger holds off for the boot.
+        AutoRequalify::NotApplicable | AutoRequalify::AttemptedThisBoot { .. } => {
+            StartRequalify::NotApplicable
+        }
         AutoRequalify::RecentFailure {
             attempted_at_unix_s,
             failures,
@@ -1076,7 +1085,18 @@ pub async fn requalify_at_start(
                     "the automatic re-qualification attempt could not be recorded as started"
                 );
             }
-            let outcome = qualify::run_automatic(config.clone(), target.clone(), stop).await;
+            let outcome = qualify::run_automatic(
+                config.clone(),
+                target.clone(),
+                stop,
+                arcen_session::wayland_qualification::AutomaticRequalification {
+                    trigger: arcen_session::wayland_qualification::RequalifyTrigger::RecordVersion,
+                    cleared_precondition: None,
+                    x11_outcome: None,
+                    at_unix_s: None,
+                },
+            )
+            .await;
             if outcome.interrupted {
                 // An orderly stop is not an attempt.
                 match std::fs::remove_file(&marker_path) {
@@ -1131,6 +1151,261 @@ pub async fn requalify_at_start(
             }
         }
     }
+}
+
+/// What start-up did about a record whose X11 proof was skipped for a host
+/// precondition that holds again.
+#[derive(Debug)]
+pub enum X11StartRequalify {
+    /// Not a case for it: serve as resolved.
+    NotApplicable,
+    /// Held off (this boot, a recent failure, or interrupted too often);
+    /// the reason is logged. Serve as resolved.
+    HeldOff,
+    /// It ran: `configured` is the provider selected with the record it
+    /// wrote (`None` when nothing new was recorded or the new record could
+    /// not be selected: keep the one selected before).
+    Finished {
+        /// The provider with the new record.
+        configured: Option<ConfiguredProvider>,
+        /// What it found about X11 applications.
+        outcome: arcen_session::wayland_qualification::X11RequalifyOutcome,
+    },
+    /// A stop was requested during the run: its desktop and temporary
+    /// account are gone, and no attempt was recorded.
+    Interrupted,
+}
+
+/// The kernel's id of this boot.
+#[must_use]
+pub fn boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
+/// After start-up resolved X11 applications as `reason`, re-proves them
+/// with the same automatic re-qualification an update uses when the
+/// record skipped them for a host precondition that holds again
+/// (`arcen_session::wayland_qualification::precondition_requalify_decision`):
+/// once per boot and stack, bounded, logged with a typed outcome and
+/// recorded in its own attempt marker and in the record it writes. Never
+/// refuses start: Wayland is served on the previous record if it fails.
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+pub async fn requalify_x11_at_start(
+    config: &crate::cli::Config,
+    reason: Option<arcen_session::wayland_x11::X11AppsDisabledReason>,
+    stop: tokio::sync::watch::Receiver<crate::service_signals::StopRequest>,
+) -> X11StartRequalify {
+    use arcen_session::wayland_qualification::{
+        identity_digest, precondition_requalify_decision, AutoRequalify, AutomaticRequalification,
+        RequalifyAttempt, RequalifyTrigger, X11RequalifyOutcome, REQUALIFY_RETRY_AFTER_S,
+    };
+    let target = &config.wayland_qualification_target;
+    let Some(qualified) = config.wayland_qualification.as_deref() else {
+        return X11StartRequalify::NotApplicable;
+    };
+    let proof = qualified.record().facts.x11_apps.as_ref();
+    let precondition = proof.and_then(|proof| proof.host_precondition.clone());
+    // The record was validated against the running stack at selection.
+    let identity = &qualified.record().host;
+    let marker_path = std::path::PathBuf::from(target.x11_requalify_marker_path());
+    let last = qualification::read_root_only(&marker_path)
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<RequalifyAttempt>(&text).ok());
+    let boot = boot_id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let interrupted_before = match precondition_requalify_decision(
+        reason,
+        proof,
+        config.wayland_auto_requalify,
+        Some(identity),
+        boot.as_deref(),
+        last.as_ref(),
+        now,
+    ) {
+        AutoRequalify::NotApplicable => {
+            if reason
+                == Some(arcen_session::wayland_x11::X11AppsDisabledReason::PreconditionCleared)
+            {
+                tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    x11_requalify = "disabled",
+                    "X11 applications are not re-proved automatically \
+                     (capture.wayland_auto_requalify is false); run `{}` as root",
+                    target.qualify_command()
+                );
+            }
+            return X11StartRequalify::NotApplicable;
+        }
+        AutoRequalify::AttemptedThisBoot {
+            attempted_at_unix_s,
+            outcome,
+        } => {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                x11_requalify = "held_this_boot",
+                x11_requalify_outcome = outcome.token(),
+                attempted_at_unix_s,
+                "X11 applications were already re-proved automatically during this boot \
+                 ({}); not again until the host reboots: run `arcen-pier repair-x11-unix-dir` \
+                 (re-arms it) or `{}` as root",
+                outcome.token(),
+                target.qualify_command()
+            );
+            return X11StartRequalify::HeldOff;
+        }
+        AutoRequalify::RecentFailure {
+            attempted_at_unix_s,
+            failures,
+        } => {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                x11_requalify = "held_recent_failure",
+                attempted_at_unix_s,
+                failures = ?failures,
+                "the automatic re-qualification for X11 applications failed {} min ago and is \
+                 not retried for {} h; fix it and run `{}` as root",
+                now.saturating_sub(attempted_at_unix_s) / 60,
+                REQUALIFY_RETRY_AFTER_S / 3600,
+                target.qualify_command()
+            );
+            return X11StartRequalify::HeldOff;
+        }
+        AutoRequalify::Run {
+            reasons,
+            interrupted_before,
+        } => {
+            tracing::warn!(
+                target: crate::logging::target::SESSION,
+                x11_requalify = "run",
+                trigger = RequalifyTrigger::PreconditionCleared.token(),
+                precondition = precondition.as_deref(),
+                interrupted_before,
+                %reasons,
+                "re-qualifying automatically to prove X11 applications before serving (a short \
+                 headless session as {})",
+                target.temporary_user()
+            );
+            interrupted_before
+        }
+    };
+    let started = std::time::Instant::now();
+    let running = RequalifyAttempt::started(identity_digest(identity), now, interrupted_before)
+        .for_precondition(precondition.clone().unwrap_or_default(), boot);
+    if let Err(error) = qualification::write_requalify_marker(&marker_path, &running) {
+        tracing::warn!(
+            target: crate::logging::target::SESSION,
+            %error,
+            path = %marker_path.display(),
+            "the automatic X11 re-qualification attempt could not be recorded as started"
+        );
+    }
+    let outcome = qualify::run_automatic(
+        config.clone(),
+        target.clone(),
+        stop,
+        AutomaticRequalification {
+            trigger: RequalifyTrigger::PreconditionCleared,
+            cleared_precondition: precondition,
+            x11_outcome: None,
+            at_unix_s: None,
+        },
+    )
+    .await;
+    if outcome.interrupted {
+        match std::fs::remove_file(&marker_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: crate::logging::target::SESSION,
+                %error,
+                path = %marker_path.display(),
+                "the interrupted X11 re-qualification's marker could not be removed"
+            ),
+        }
+        return X11StartRequalify::Interrupted;
+    }
+    let configured = if outcome.passed {
+        match select_configured_provider(
+            config.provider_preference,
+            &config.xorg_bin,
+            Path::new(target.record_path()),
+        )
+        .await
+        {
+            Ok(configured) => Some(configured),
+            Err(refused) => {
+                tracing::error!(
+                    target: crate::logging::target::SESSION,
+                    %refused,
+                    "the record the automatic X11 re-qualification wrote was not selected; \
+                     serving with the record found at start"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let x11_outcome = if outcome.passed {
+        outcome
+            .x11_outcome
+            .unwrap_or(X11RequalifyOutcome::NotRecorded)
+    } else {
+        X11RequalifyOutcome::NotRecorded
+    };
+    let marker = running
+        .finished(outcome.passed, outcome.failures.clone())
+        .with_x11_outcome(x11_outcome);
+    if let Err(error) = qualification::write_requalify_marker(&marker_path, &marker) {
+        tracing::warn!(
+            target: crate::logging::target::SESSION,
+            %error,
+            path = %marker_path.display(),
+            "the automatic X11 re-qualification attempt could not be recorded"
+        );
+    }
+    let fields = (started.elapsed().as_secs(), x11_outcome.token());
+    if x11_outcome == X11RequalifyOutcome::X11AppsProven {
+        tracing::info!(
+            target: crate::logging::target::SESSION,
+            seconds = fields.0,
+            x11_requalify_outcome = fields.1,
+            record = target.record_path(),
+            "automatic re-qualification for X11 applications: {}",
+            fields.1
+        );
+    } else {
+        tracing::warn!(
+            target: crate::logging::target::SESSION,
+            seconds = fields.0,
+            x11_requalify_outcome = fields.1,
+            passed = outcome.passed,
+            failures = ?outcome.failures,
+            record = target.record_path(),
+            "automatic re-qualification for X11 applications: {}",
+            fields.1
+        );
+    }
+    X11StartRequalify::Finished {
+        configured,
+        outcome: x11_outcome,
+    }
+}
+
+/// Without the Wayland provider there is nothing to re-qualify.
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+pub async fn requalify_x11_at_start(
+    _config: &crate::cli::Config,
+    _reason: Option<arcen_session::wayland_x11::X11AppsDisabledReason>,
+    _stop: tokio::sync::watch::Receiver<crate::service_signals::StopRequest>,
+) -> X11StartRequalify {
+    X11StartRequalify::NotApplicable
 }
 
 /// Without the Wayland provider there is nothing to re-qualify.
@@ -2425,25 +2700,28 @@ mod tests {
             X11AppsSetting::Off,
         ] {
             assert_eq!(
-                configured_x11_plan(DesktopProvider::Xorg, setting, None),
+                configured_x11_plan(DesktopProvider::Xorg, setting, None, Ok(())),
                 Ok(None)
             );
         }
         assert_eq!(
-            configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::Off, None),
+            configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::Off, None, Ok(())),
             Ok(Some(X11AppsPlan::Disabled(
                 X11AppsDisabledReason::OperatorOff
             )))
         );
         // No record proves Xwayland, so `auto` is off and says why...
         assert!(matches!(
-            configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::Auto, None),
+            configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::Auto, None, Ok(())),
             Ok(Some(X11AppsPlan::Disabled(
                 X11AppsDisabledReason::NotQualified | X11AppsDisabledReason::XwaylandNotInstalled
             )))
         ));
         // ...and `on` refuses to start.
-        assert!(configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::On, None).is_err());
+        assert!(
+            configured_x11_plan(DesktopProvider::Wayland, X11AppsSetting::On, None, Ok(()))
+                .is_err()
+        );
     }
 
     #[test]

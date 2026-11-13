@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # redact.sh: stdin to stdout filter that removes operational secrets.
 #
 # Every transcript captured from a remote machine passes through this before it

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Writes the build part of PROVENANCE.md into a finished prefix: every source
 # archive with its URL and SHA-256, the libei revision, every lab patch with
 # its merge request and SHA-256, and the build container image.

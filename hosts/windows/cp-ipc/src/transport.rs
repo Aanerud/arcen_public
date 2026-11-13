@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Transport-agnostic framing for the control pipe.
 //!
 //! The wire protocol ([`crate::CpMessage`]) is framed identically no matter what

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use png::{BitDepth, ColorType, Decoder, Encoder, Limits, Transformations};
 use std::error::Error;
 use std::fmt::{Display, Formatter};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Loopback tests for the product-facing lane session adapter
 //! (`arcen_transport::quic::session_lanes`): carrier setup on both sides,
 //! the attachment grant, session records on their lanes, the clear refusal
@@ -674,7 +676,8 @@ async fn the_session_socket_carries_control_records_as_a_sink_and_stream() {
 }
 
 mod graceful_close {
-    //! A session's last words survive its close (0.17.0 qualification F1):
+    //! A session's last words survive its close (final records must arrive
+    //! before the lane closes):
     //! closing a QUIC connection abandons unacknowledged stream data, so a
     //! refusal written just before the socket is dropped used to reach the
     //! Deck as `ConnectionLost`, and a Deck's clean close reached the Pier

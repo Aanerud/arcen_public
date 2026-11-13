@@ -1,4 +1,7 @@
 @echo off
+REM SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+REM Copyright (C) 2026 TUTTIFRUTTI AS
+
 setlocal EnableExtensions
 
 set "ROOT=%~dp0..\.."
@@ -142,6 +145,14 @@ if errorlevel 1 exit /b %errorlevel%
 copy /y "%ROOT%\hosts\windows\INSTALL.md" "%DIST%\" >nul
 if errorlevel 1 exit /b %errorlevel%
 copy /y "%ROOT%\legal\THIRD_PARTY_NOTICES.md" "%DIST%\" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /y "%ROOT%\LICENSE" "%DIST%\" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /y "%ROOT%\LICENSE-EXCEPTION.md" "%DIST%\" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /y "%ROOT%\NOTICE" "%DIST%\" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /y "%ROOT%\TRADEMARKS.md" "%DIST%\" >nul
 if errorlevel 1 exit /b %errorlevel%
 
 if defined ARCEN_SIGNED_MICROPHONE_PACKAGE (

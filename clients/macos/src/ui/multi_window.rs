@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Typed detection of the gap between a host's *applied* multi-monitor-v1
 //! topology and Deck's single-viewport legacy fallback.
 //!

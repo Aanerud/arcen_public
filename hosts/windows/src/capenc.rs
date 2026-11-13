@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Supervises the `arcen-capenc` engine as a Rust→Rust subprocess (Stage 1
 //! — no Python anywhere). The engine captures the desktop (DXGI Desktop
 //! Duplication, auto-falling-back to WGC on vGPU/RDP) and encodes with NVENC,
@@ -41,7 +43,16 @@ use crate::logging::CAPENC;
 use crate::{chroma_name, codec_name};
 
 const MAX_AU_BYTES: u32 = 16 * 1024 * 1024;
-const FRAME_QUEUE_CAPACITY: usize = 4;
+/// Encoded frames read from the engine but not yet taken by the frame router.
+///
+/// One: a frame waiting here is invisible to the outbound queue's backlog
+/// budget (`arcen_media::video::video_backlog_budget`), so a deeper queue
+/// would only hold more stale pictures in front of a slow network; the
+/// reader waits for room instead, so the engine's stdout fills and it
+/// captures the current screen when it can write again.
+/// `ARCEN_VIDEO_BACKLOG=legacy` restores four.
+const FRAME_QUEUE_CAPACITY: usize = 1;
+const LEGACY_FRAME_QUEUE_CAPACITY: usize = 4;
 const CAPENC_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPENC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPENC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -189,10 +200,17 @@ struct PipelineTelemetry {
     maximum_encode_ms: AtomicU64,
     slow_frames: AtomicU64,
     dropped_frames: AtomicU64,
+    /// Every stats second's content proof since the health tick last took
+    /// it (`arcen_telemetry::ContentWindow`).
+    content: std::sync::Mutex<arcen_telemetry::ContentWindow>,
 }
 
 impl PipelineTelemetry {
     fn record(&self, stats: &PipelineStats) {
+        self.content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(stats.content_fps());
         self.encoder_fps.store(
             stats.encoder_fps.unwrap_or_default().to_bits(),
             Ordering::Relaxed,
@@ -258,6 +276,15 @@ impl PipelineTelemetry {
             slow_frames: self.slow_frames.load(Ordering::Relaxed),
             dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
         }
+    }
+
+    /// The content rate proved over the health window since the last call,
+    /// only when every stats second in it proved one; starts the next window.
+    fn take_content_fps(&self) -> Option<u32> {
+        self.content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_fps()
     }
 }
 
@@ -425,7 +452,18 @@ impl BitrateRequester {
     }
 }
 
-async fn wait_for_input_desktop_ready(session_log_id: &CorrelationId) {
+/// Waits until this session's input desktop has been the ordinary Default
+/// desktop for `INPUT_DESKTOP_READY_STABILITY` (or the post-login ceiling has
+/// passed). The full wait runs once per session log id: the agent waits before
+/// its first display change, and capture's later wait returns at once.
+pub(crate) async fn wait_for_input_desktop_ready(session_log_id: &CorrelationId) {
+    wait_for_input_desktop_ready_with(session_log_id, input_desktop_is_default).await;
+}
+
+async fn wait_for_input_desktop_ready_with(
+    session_log_id: &CorrelationId,
+    input_desktop_is_default: impl Fn() -> Result<bool, String>,
+) {
     static FULL_GATE_SEEN: std::sync::OnceLock<
         std::sync::Mutex<std::collections::BTreeSet<String>>,
     > = std::sync::OnceLock::new();
@@ -681,7 +719,11 @@ impl Capenc {
             }
         };
 
-        let frames = Arc::new(VideoQueue::new(FRAME_QUEUE_CAPACITY));
+        let frames = Arc::new(VideoQueue::new(if crate::latest::video_backlog_legacy() {
+            LEGACY_FRAME_QUEUE_CAPACITY
+        } else {
+            FRAME_QUEUE_CAPACITY
+        }));
         let (stdin_tx, stdin_rx) = mpsc::channel(1);
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let idr = IdrRequester::new(idr_tx);
@@ -736,6 +778,13 @@ impl Capenc {
 
     pub fn pipeline_telemetry(&self) -> PipelineTelemetrySnapshot {
         self.pipeline_telemetry.snapshot()
+    }
+
+    /// The changed-content rate this capture proved over the health window
+    /// since the last call (`arcen_telemetry::ContentWindow`), for
+    /// `QosSample::fps_content`.
+    pub fn take_content_fps(&self) -> Option<u32> {
+        self.pipeline_telemetry.take_content_fps()
     }
 
     fn media_chroma(chroma: ChromaSubsampling) -> arcen_media::ChromaSubsampling {
@@ -1139,11 +1188,21 @@ async fn read_length_prefixed_inner<R>(
         }
         let keyframe = is_keyframe(codec, &au);
         frame_count += 1;
+        // Stamped when read from the engine, so the Deck's frame age counts
+        // every wait on this side.
         let frame = EncodedFrame {
             data: au,
             keyframe,
             timestamp_ms: now_ms(),
         };
+        // Back-pressure, not loss: while the router is held back by the
+        // outbound backlog budget the engine stalls on its pipe. Past the
+        // shared room wait the queue's drop-and-IDR recovery takes over.
+        if !crate::latest::video_backlog_legacy() {
+            frames
+                .wait_for_room(Some(arcen_media::video::VIDEO_ROOM_WAIT))
+                .await;
+        }
         if !enqueue_encoded_frame(&frames, &idr, frame) {
             break;
         }
@@ -1473,6 +1532,26 @@ struct PipelineStats {
     dropped_frames: Option<u64>,
 }
 
+impl PipelineStats {
+    /// Changed-content frames this second proves.
+    ///
+    /// Desktop Duplication and Windows.Graphics.Capture deliver a frame only
+    /// when something changed, so `capture_new` is the content rate — but
+    /// only a second in which the loop also found nothing new at least once
+    /// (an empty poll, or an encode skipped for want of a new frame) proves
+    /// the source set the pace. A second busy throughout proves nothing, and
+    /// health then judges the frame rate against the target as before. The
+    /// legacy Media Foundation line reports the same counters.
+    fn content_fps(&self) -> Option<u32> {
+        let idle = self.capture_empty_polls.unwrap_or(0) > 0
+            || self.encode_skipped_no_new.unwrap_or(0) > 0;
+        if !idle {
+            return None;
+        }
+        u32::try_from(self.capture_new_frames?).ok()
+    }
+}
+
 fn parse_pipeline_stats(line: &str) -> PipelineStats {
     let mut stats = PipelineStats::default();
     for item in line.split_ascii_whitespace().skip(1) {
@@ -1615,6 +1694,23 @@ mod tests {
         format_ready_v1, format_unavailable_v1, BackendUnavailableNotice, BackendUnavailableReason,
         EncoderBackend,
     };
+
+    #[tokio::test]
+    async fn desktop_gate_waits_once_per_session_then_returns_at_once() {
+        let session = CorrelationId::from_uuid_v4_bytes([0x5a; 16]);
+        let first = std::time::Instant::now();
+        wait_for_input_desktop_ready_with(&session, || Ok(true)).await;
+        assert!(
+            first.elapsed() >= crate::first_login::INPUT_DESKTOP_READY_STABILITY,
+            "the first wait for a session must observe the full stability window"
+        );
+        let second = std::time::Instant::now();
+        wait_for_input_desktop_ready_with(&session, || Ok(true)).await;
+        assert!(
+            second.elapsed() < std::time::Duration::from_millis(250),
+            "a second wait for the same session on the Default desktop must not wait again"
+        );
+    }
 
     #[test]
     fn desktop_gate_first_spawn_always_waits_even_when_default() {
@@ -2209,6 +2305,21 @@ mod tests {
                 dropped_frames: 2,
             }
         );
+        // That line reported no capture counters: it proved nothing.
+        assert_eq!(telemetry.take_content_fps(), None);
+        let still = "[capenc] enc_fps=4 cap_fps=3 capture_new=3 capture_empty=57 \
+                     raw_superseded=0 encode_submitted=4 encode_skipped_no_new=56";
+        let busy = "[capenc] enc_fps=20 cap_fps=60 capture_new=60 capture_empty=0 \
+                    raw_superseded=40 encode_submitted=20 encode_skipped_no_new=0";
+        // Two still seconds in one health window.
+        telemetry.record(&parse_pipeline_stats(still));
+        telemetry.record(&parse_pipeline_stats(still));
+        assert_eq!(telemetry.take_content_fps(), Some(3));
+        // A busy second the encoder fell behind in, then a still one: the
+        // latest line alone would have excused the busy second.
+        telemetry.record(&parse_pipeline_stats(busy));
+        telemetry.record(&parse_pipeline_stats(still));
+        assert_eq!(telemetry.take_content_fps(), None);
     }
 
     #[tokio::test]
@@ -2308,6 +2419,34 @@ mod tests {
 
         assert_eq!(frames.pop().await.unwrap().data, au);
         assert!(frames.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_frame_queue_stalls_the_reader_instead_of_dropping() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let frames = Arc::new(VideoQueue::new(1));
+        let (tx, mut idr_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(read_length_prefixed(
+            reader,
+            VideoCodec::H264,
+            frames.clone(),
+            IdrRequester::new(tx),
+        ));
+        for nal in [0x65_u8, 0x41] {
+            let au = [0, 0, 0, 1, nal];
+            writer
+                .write_all(&(au.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            writer.write_all(&au).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(frames.len(), 1, "the second AU waits in the reader");
+        assert_eq!(frames.pop().await.unwrap().data[4], 0x65);
+        assert_eq!(frames.pop().await.unwrap().data[4], 0x41);
+        assert!(idr_rx.try_recv().is_err(), "nothing was dropped");
+        drop(writer);
+        task.await.unwrap();
     }
 
     async fn spawn_shutdown_fixture(script: &str) -> (Child, mpsc::Sender<StdinCommand>) {

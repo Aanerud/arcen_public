@@ -1,7 +1,5 @@
 # LEXICON: the canonical vocabulary of Arcen
 
-Reviewed commit `eb6373e14addd45b537325d799fe02fcee39a4d1`.
-
 This is the reference a future rename wave follows. It is descriptive where the
 codebase is already consistent and prescriptive where it is not. Every "banned"
 entry lists where the banned form actually appears, so the rename is mechanical.
@@ -17,7 +15,6 @@ to search than a consistently wrong one.
 | **Pier** | The host service that owns a physical workstation and serves its desktop. One per host OS. | crate `arcen-pier-linux`, `arcen-pier-windows`; binary `arcen-pier`; log target `arcen::session` | "broker" | `hosts/windows/src/resume.rs:66` ("broker-owned registry"), `hosts/windows/src/auth.rs:1` ("machine broker"), `hosts/windows/src/session.rs` `BrokerAgentLease`, `ResumeRegistryError::BrokerShutdown` at `hosts/windows/src/resume.rs:231` |
 | **Deck** | The client application a user runs to reach a Pier. | crate `arcen-deck-macos`; binary `arcen-client`; app bundle `Arcen Deck.app` | "client" as a *product* noun (fine as a *role* noun) | binary name `arcen-client` in `clients/macos/src/main.rs:36-39` contradicts the product noun |
 | **Deck platform** | Which kind of Mac a Deck build runs on — Apple silicon or Intel — plus the running macOS version; the single profile every Apple-silicon/Intel difference is decided from. | `arcen_media::deck_platform::DeckPlatform`; log field `deck_platform` = `macos-apple-silicon` / `macos-intel`; apps `Arcen Deck.app` / `Arcen Deck Intel.app` | "Intel build" as a separate client | n/a |
-| **Span** | The relay/gateway tier. Roadmap only; no code in this repository. | none yet | "gateway", "relay" | n/a — if it is built, the crate and directory should be named `span`, not `gateway`. |
 | **capenc** | The separate capture-and-encode child process both Piers spawn through their own multicall executable. | crate `arcen-capenc`; Pier subcommand `capenc` | none | consistent |
 | **Keel** | The damage-tracking / dirty-block subsystem. | crate `arcen-keel` | none | consistent |
 | **session** | One authenticated client attachment to one desktop. | `ActiveHostSessionId`, `session_log_id`, `sid` log field | "connection" when a session is meant | mostly consistent |

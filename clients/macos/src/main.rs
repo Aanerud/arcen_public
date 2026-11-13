@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -27,6 +30,10 @@ use arcen_deck::ui::run_native_app;
 /// output is byte-for-byte unchanged and never advertises the lab.
 #[cfg(not(feature = "dev-tools"))]
 const DEV_TOOLS_USAGE: &str = "";
+#[cfg(not(feature = "usb-emulate-lab"))]
+const USB_EMULATE_USAGE: &str = "";
+#[cfg(feature = "usb-emulate-lab")]
+const USB_EMULATE_USAGE: &str = "arcen-client input-smoke <host> [port] ... --usb-emulate wacom-intuos5 [--usb-emulate-strokes N] [--usb-emulate-lead-in-ms MS] [--usb-emulate-stroke scripted|landing|alternate|realistic|tilted|rest|hover-rest|upper-held]   (lab-only; implies --tablet-mode hard; plays a scripted pen stroke through an emulated Wacom Intuos5 instead of capturing a tablet; the same flags after `--connect HOST PORT` give the GUI the emulated pen)\n";
 #[cfg(feature = "dev-tools")]
 const DEV_TOOLS_USAGE: &str = "arcen-client virtual-monitor-lab [2|4] [--timeout-secs N]   (developer-only; requires ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1)\narcen-client probe-matrix [--parameter-sets <dir>] [--output <path>]   (developer-only; see docs/testing/color-matrix-results.json)\n";
 
@@ -90,7 +97,7 @@ async fn main() {
         arcen_deck::logging::shutdown();
         return;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if subcommand == Some("usb-helper-status") {
         use arcen_deck::usb_helper_install::{install_state, HelperInstallState};
         let state = install_state();
@@ -112,7 +119,7 @@ async fn main() {
         arcen_deck::logging::shutdown();
         return;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if subcommand == Some("usb-helper-install") {
         // Registers the bundled LaunchDaemon. Raises one administrator prompt;
         // after this launchd starts the helper as root and no password is ever
@@ -144,7 +151,7 @@ async fn main() {
         }
         return;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if subcommand == Some("usb-helper-uninstall") {
         let code = match arcen_deck::usb_helper_install::unregister() {
             Ok(()) => {
@@ -162,7 +169,7 @@ async fn main() {
         }
         return;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if subcommand == Some("usb-claim-probe") {
         let code = match usb_claim_probe() {
             Ok(()) => 0,
@@ -177,7 +184,7 @@ async fn main() {
         }
         return;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if subcommand == Some("usb-capture-probe") {
         let code = match usb_capture_probe() {
             Ok(()) => 0,
@@ -201,12 +208,12 @@ async fn main() {
     /// Identities of attached HID devices whose report descriptors classify
     /// as a pen tablet (`arcen_usb_bridge::classify_pen_tablet`). The lab
     /// probes below pick their device from this list, never by vendor id.
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     fn is_attached_pen_tablet(vendor_id: u16, product_id: u16) -> bool {
         arcen_deck::tablet::attached_pen_tablets().contains(&(vendor_id, product_id))
     }
 
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     fn usb_claim_probe() -> Result<(), String> {
         let device = nusb::list_devices()
             .map_err(|error| error.to_string())?
@@ -254,7 +261,7 @@ async fn main() {
         Ok(())
     }
 
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     fn usb_capture_probe() -> Result<(), String> {
         use rusb::UsbContext;
 
@@ -357,6 +364,14 @@ async fn main() {
             return;
         }
     }
+    if subcommand == Some("diagnose") {
+        let code = run_diagnose_subcommand(&args).await;
+        arcen_deck::logging::shutdown();
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return;
+    }
     if subcommand != Some("connect-smoke")
         && subcommand != Some("media-smoke")
         && subcommand != Some("input-smoke")
@@ -371,16 +386,18 @@ async fn main() {
                   arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
                   arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
                   arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--hidpi-displays MASK] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
-                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--text STRING]...\n\
+                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                   arcen-client platform-report\n\
-                {}transport: QUIC/TLS 1.3 over UDP; default port 18444\n\
+                  arcen-client diagnose <host[:port]> [port] [--pin-sha256 FP | --pin-spki FP] [--ignore-remembered]   (connection test; sends no credentials)\n\
+                {}{}transport: QUIC/TLS 1.3 over UDP; default port 18444\n\
                 \n\
                 {}\n\
                 Source: {}",
                 arcen_deck::protocol::PROTOCOL_VERSION,
                 DEV_TOOLS_USAGE,
+                USB_EMULATE_USAGE,
                 arcen_deck::SOURCE_OFFER,
                 arcen_deck::SOURCE_URL
             );
@@ -394,6 +411,13 @@ async fn main() {
                 shutdown_and_exit(2);
             }
         };
+        // Lab builds: `--connect … --usb-emulate wacom-intuos5` gives the GUI
+        // the scripted pen too, so a host-led cursor can be proven on screen
+        // without a tablet or any input on this Mac.
+        if let Err(error) = select_usb_emulation(&args) {
+            eprintln!("{error}");
+            shutdown_and_exit(2);
+        }
         if let Err(error) = run_native_app(initial_connect) {
             tracing::error!(
                 target: arcen_deck::logging::target::UI,
@@ -414,6 +438,10 @@ async fn main() {
             shutdown_and_exit(2);
         }
     };
+    if let Err(error) = select_usb_emulation(&args) {
+        eprintln!("{error}");
+        shutdown_and_exit(2);
+    }
     // The smoke subcommands double as a support diagnostic dump: emit the USB
     // inventory (tablets highlighted) so a sysadmin can capture client hardware
     // without the GUI. Synchronous here is fine — these are one-shot tools.
@@ -434,8 +462,66 @@ async fn main() {
         return;
     }
     if subcommand == Some("input-smoke") {
-        let pen = args.iter().any(|arg| arg == "--pen");
-        if let Err(error) = input_smoke(options, flag_values(&args, "--text"), pen).await {
+        let pen = if args.iter().any(|arg| arg == "--pen-full") {
+            Some(PenSmokeScript::Full {
+                wait_ms: flag_value(&args, "--pen-wait-ms")
+                    .and_then(|ms| ms.parse().ok())
+                    .unwrap_or(500),
+                end_in_contact: args.iter().any(|arg| arg == "--pen-end-in-contact"),
+            })
+        } else if let Some(path) = flag_value(&args, "--pen-file") {
+            match std::fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| parse_pen_file(&text))
+            {
+                Ok(samples) => Some(PenSmokeScript::File {
+                    samples,
+                    go_file: flag_value(&args, "--pen-go-file"),
+                }),
+                Err(error) => {
+                    eprintln!("--pen-file: {error}");
+                    std::process::exit(2);
+                }
+            }
+        } else if args.iter().any(|arg| arg == "--pen") {
+            Some(PenSmokeScript::Strokes)
+        } else {
+            None
+        };
+        let mut scripts = flag_values(&args, "--keys");
+        let quiet = flag_value(&args, "--keys-file").is_some();
+        if let Some(path) = flag_value(&args, "--keys-file") {
+            match std::fs::read_to_string(&path) {
+                Ok(script) => scripts.push(script),
+                Err(error) => {
+                    eprintln!("--keys-file: {}", error.kind());
+                    std::process::exit(2);
+                }
+            }
+        }
+        let keys = KeysSmoke {
+            scripts,
+            quiet,
+            settings: arcen_input::keyboard::KeyboardSettings {
+                shortcuts: flag_value(&args, "--keyboard-shortcuts")
+                    .and_then(|token| arcen_input::keyboard::ShortcutPreference::from_token(&token))
+                    .unwrap_or_default(),
+                left_option_altgr: args.iter().any(|arg| arg == "--left-option-altgr"),
+                typing: None,
+            },
+        };
+        let paste = flag_value(&args, "--paste-file").map(|path| PasteSmoke {
+            path,
+            rate: flag_value(&args, "--paste-rate").and_then(|rate| rate.parse().ok()),
+            wait_ms: flag_value(&args, "--paste-wait-ms")
+                .and_then(|ms| ms.parse().ok())
+                .unwrap_or(0),
+            click: args.iter().any(|arg| arg == "--paste-click"),
+            return_after: args.iter().any(|arg| arg == "--paste-return"),
+        });
+        if let Err(error) =
+            input_smoke(options, flag_values(&args, "--text"), pen, keys, paste).await
+        {
             eprintln!("input-smoke failed: {error}");
             shutdown_and_exit(1);
         }
@@ -464,16 +550,6 @@ async fn main() {
                         .map_or("absent", arcen_protocol::messages::ServedStreamPipeline::token),
                     result.fsm_state
                 );
-            } else if let Some(hello) = result.broker_hello {
-                println!(
-                    "connected uri={} broker_hello machines={} state={}",
-                    result.uri,
-                    hello
-                        .get("machines")
-                        .and_then(|machines| machines.as_array())
-                        .map_or(0, Vec::len),
-                    result.fsm_state
-                );
             }
         }
         Err(error) => {
@@ -487,6 +563,94 @@ async fn main() {
 fn shutdown_and_exit(code: i32) -> ! {
     arcen_deck::logging::shutdown();
     std::process::exit(code)
+}
+
+const DIAGNOSE_USAGE: &str = "usage: arcen-deck diagnose <host[:port]> [port] [--pin-sha256 FP | --pin-spki FP] [--ignore-remembered]\n\
+Tests the way to a Pier step by step (name, UDP 18444, certificate, the Pier's\n\
+greeting before sign-in, path MTU, round trip) and prints a report.\n\
+No user name or password is asked for or sent.\n\
+Without a pin it expects the identity this Deck remembers for that address.\n\
+Exit status: 0 ready, 1 warnings, 2 cannot connect, 64 bad arguments.";
+
+/// `diagnose <host[:port]>`: the connection test, as text.
+async fn run_diagnose_subcommand(args: &[String]) -> i32 {
+    use arcen_deck::transport::diagnose::{DiagnoseRequest, PinOrigin};
+    use arcen_deck::transport::tls::parse_fingerprint;
+    use arcen_session::connection_diagnostics::DiagnosticTarget;
+
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{DIAGNOSE_USAGE}");
+        return 0;
+    }
+    let mut positional = args
+        .iter()
+        .skip(2)
+        .scan(false, |skip_value, arg| {
+            let was_value = *skip_value;
+            *skip_value = matches!(arg.as_str(), "--pin-sha256" | "--pin-spki");
+            Some((was_value, arg))
+        })
+        .filter(|(was_value, arg)| !was_value && !arg.starts_with("--"))
+        .map(|(_, arg)| arg.as_str());
+    let Some(address) = positional.next() else {
+        eprintln!("{DIAGNOSE_USAGE}");
+        return 64;
+    };
+    let port = match positional.next().map(str::parse::<u16>) {
+        None => None,
+        Some(Ok(port)) if port != 0 => Some(port),
+        Some(_) => {
+            eprintln!("diagnose: the port must be a number from 1 to 65535");
+            return 64;
+        }
+    };
+    let target = match DiagnosticTarget::parse_with_port(address, port) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("diagnose: {error}");
+            return 64;
+        }
+    };
+    let supplied = match (
+        flag_value(args, "--pin-sha256"),
+        flag_value(args, "--pin-spki"),
+    ) {
+        (Some(_), Some(_)) => {
+            eprintln!("diagnose: give either --pin-sha256 or --pin-spki, not both");
+            return 64;
+        }
+        (Some(value), None) => Some((arcen_transport::tls::PinKind::CertificateSha256, value)),
+        (None, Some(value)) => Some((
+            arcen_transport::tls::PinKind::SubjectPublicKeyInfoSha256,
+            value,
+        )),
+        (None, None) => None,
+    };
+    let request = match supplied {
+        Some((kind, value)) => match parse_fingerprint(&value) {
+            Ok(digest) => DiagnoseRequest {
+                target,
+                pin: Some((
+                    arcen_transport::tls::TlsPin::new(kind, digest),
+                    PinOrigin::Supplied,
+                )),
+            },
+            Err(error) => {
+                eprintln!("diagnose: {error}");
+                return 64;
+            }
+        },
+        None if args.iter().any(|arg| arg == "--ignore-remembered") => {
+            DiagnoseRequest { target, pin: None }
+        }
+        None => DiagnoseRequest::with_remembered_pin(target),
+    };
+    let report = arcen_deck::transport::diagnose::run(request).await;
+    print!(
+        "{}",
+        report.render_text(&arcen_deck::transport::diagnose::deck_label())
+    );
+    report.exit_code()
 }
 
 /// `multi-monitor-harness [1|2|4] [--frames N]`: drives the synthetic
@@ -1014,7 +1178,17 @@ fn connect_options_from_parts_with_monitors(
         }
     }
 
-    let tablet_mode_requested = match flag_value(args, "--tablet-mode").as_deref() {
+    let tablet_mode = flag_value(args, "--tablet-mode");
+    let tablet_mode = match (tablet_mode.as_deref(), flag_value(args, "--usb-emulate")) {
+        (None | Some("hard"), Some(_)) => Some("hard".to_owned()),
+        (Some(other), Some(_)) => {
+            return Err(format!(
+                "--usb-emulate needs --tablet-mode hard, not '{other}'"
+            ));
+        }
+        (_, None) => tablet_mode,
+    };
+    let tablet_mode_requested = match tablet_mode.as_deref() {
         Some("light") | None if !args.iter().any(|arg| arg == "--no-tablet-input") => {
             TabletModeMsg::LocalTermination
         }
@@ -1074,13 +1248,116 @@ fn cursor_mode_from_args(args: &[String]) -> Result<CursorMode, String> {
     }
 }
 
+/// Host pointer positions seen by the emulated-pen smoke (a host that reads
+/// the pen itself reports where it moved the pointer): every record is
+/// printed, and the ones applied in sequence are counted.
+#[cfg(feature = "usb-emulate-lab")]
+#[derive(Default)]
+struct SmokeHostPointer {
+    pointer: arcen_input::host_pointer::DeckHostPointer,
+    positions: u64,
+    first_at: Option<(f64, f64)>,
+    last_at: Option<(f64, f64)>,
+}
+
+#[cfg(feature = "usb-emulate-lab")]
+impl SmokeHostPointer {
+    /// Applies one `CursorPosition` record; returns its log line.
+    fn record(&mut self, bytes: &[u8]) -> String {
+        match self.pointer.apply(bytes) {
+            Ok(Some(position)) => {
+                self.positions += 1;
+                let fraction = position.fraction();
+                self.first_at = self.first_at.or(fraction);
+                self.last_at = fraction;
+                format!(
+                    "cursor-position seq={} x={} y={} space={}x{} on_stream={}",
+                    position.sequence,
+                    position.x,
+                    position.y,
+                    position.space_width,
+                    position.space_height,
+                    position.on_stream
+                )
+            }
+            Ok(None) => "cursor-position dropped: stale sequence".to_string(),
+            Err(error) => format!("cursor-position dropped: {error}"),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let fraction = |at: Option<(f64, f64)>| {
+            at.map_or_else(|| "-".to_string(), |(x, y)| format!("{x:.3},{y:.3}"))
+        };
+        format!(
+            "host_pointer_positions={} first={} last={} dropped={}",
+            self.positions,
+            fraction(self.first_at),
+            fraction(self.last_at),
+            self.pointer.dropped()
+        )
+    }
+}
+
+/// Holds the session while the emulated tablet plays its scripted strokes,
+/// then closes it.
+#[cfg(feature = "usb-emulate-lab")]
+async fn emulated_pen_smoke(session: &mut SessionHandle) -> Result<(), String> {
+    use arcen_deck::usb_emulate::{selected, status, PlaybackStatus};
+    let (device, playback) = selected().ok_or_else(|| "no emulated USB device".to_string())?;
+    let budget = Duration::from_secs(150)
+        + arcen_usb_bridge::RESTING_HOLD
+        + playback.lead_in
+        + playback.gap * u32::try_from(playback.strokes).unwrap_or(u32::MAX);
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut host_pointer = SmokeHostPointer::default();
+    let outcome = loop {
+        match status() {
+            PlaybackStatus::Done { strokes, reports } => break Ok((strokes, reports)),
+            PlaybackStatus::Failed(error) => break Err(error),
+            _ if tokio::time::Instant::now() >= deadline => {
+                break Err(format!(
+                    "emulated playback did not finish within {budget:?}"
+                ));
+            }
+            _ => {}
+        }
+        match tokio::time::timeout(Duration::from_millis(100), session.events.recv()).await {
+            Ok(Some(SessionEvent::Ended(end))) => break Err(end.message),
+            Ok(Some(SessionEvent::MediaReady)) => {
+                let _ = session.media.take_batch();
+            }
+            // Where the host reports its pointer while the bridged pen
+            // moves it (client-drawn cursor authority).
+            Ok(Some(SessionEvent::CursorPosition(bytes))) => {
+                println!("{} stroke={:?}", host_pointer.record(&bytes), status());
+            }
+            Ok(None) => break Err("session ended during emulated playback".to_string()),
+            Ok(Some(_)) | Err(_) => {}
+        }
+    };
+    // Let the host drain the last reports before the device detaches.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    close_smoke_session(session).await;
+    let (strokes, reports) = outcome?;
+    println!("input-smoke {}", host_pointer.summary());
+    println!(
+        "input-smoke complete usb_hard=true emulated={} strokes={strokes} reports={reports}",
+        device.name()
+    );
+    Ok(())
+}
+
 async fn input_smoke(
     mut options: ConnectOptions,
     texts: Vec<String>,
-    pen: bool,
+    pen: Option<PenSmokeScript>,
+    keys: KeysSmoke,
+    paste: Option<PasteSmoke>,
 ) -> Result<(), String> {
     let hard_mode = options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge;
     let mut text_capabilities = None;
+    let mut host_hello = None;
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
         password: std::mem::take(&mut options.password),
@@ -1107,6 +1384,7 @@ async fn input_smoke(
                     hello.input_capabilities.text_commit,
                     hello.input_capabilities.text_commit_unicode,
                 ));
+                host_hello = Some(hello);
                 hello_ready = true;
             }
             SessionEvent::Ended(end) => return Err(end.message),
@@ -1134,6 +1412,11 @@ async fn input_smoke(
                 return Err("server certificate requires interactive trust".to_string());
             }
             SessionEvent::Json(value) => {
+                if hard_mode
+                    && msg_type(&value) == Some(arcen_protocol::messages::CURSOR_MODE_RESULT)
+                {
+                    println!("cursor-mode-result {value}");
+                }
                 if hard_mode && msg_type(&value) == Some(TABLET_MODE_RESULT) {
                     let result = serde_json::from_value::<TabletModeResultMsg>(value)
                         .map_err(|error| error.to_string())?;
@@ -1143,19 +1426,36 @@ async fn input_smoke(
                             result.reason.as_str()
                         ));
                     }
+                    println!("input-smoke tablet accepted: {}", result.reason.as_str());
                     hard_mode_ready = true;
+                } else if msg_type(&value)
+                    == Some(arcen_deck::protocol::messages::CURSOR_MODE_RESULT)
+                {
+                    if let Ok(result) = serde_json::from_value::<
+                        arcen_deck::protocol::messages::CursorModeResultMsg,
+                    >(value)
+                    {
+                        println!(
+                            "input-smoke cursor active={:?} cursor_positions={}",
+                            result.active, result.cursor_positions
+                        );
+                    }
                 }
             }
-            SessionEvent::BrokerHello(_)
-            | SessionEvent::MicrophoneActive(_)
+            SessionEvent::MicrophoneActive(_)
             | SessionEvent::ConnectionStatusHint(_)
             | SessionEvent::CursorUpdate(_)
+            | SessionEvent::CursorPosition(_)
             | SessionEvent::CursorLaneReset
             | SessionEvent::PresentationRecoveryRequested => {}
         }
     }
 
     tokio::time::sleep(Duration::from_millis(500)).await;
+    #[cfg(feature = "usb-emulate-lab")]
+    if hard_mode && arcen_deck::usb_emulate::selected().is_some() {
+        return emulated_pen_smoke(&mut session).await;
+    }
     if hard_mode {
         for sequence in 1_u64..=750 {
             let phase = (sequence % 100) as f64 / 100.0;
@@ -1187,11 +1487,27 @@ async fn input_smoke(
         return Ok(());
     }
 
+    if let Some(paste) = paste {
+        return paste_smoke(&mut session, &paste, text_capabilities).await;
+    }
     if !texts.is_empty() {
         return text_smoke(&mut session, &texts, text_capabilities).await;
     }
-    if pen {
-        return pen_smoke(&mut session).await;
+    if let Some(script) = pen {
+        return match script {
+            PenSmokeScript::Strokes => pen_smoke(&mut session).await,
+            PenSmokeScript::Full {
+                wait_ms,
+                end_in_contact,
+            } => pen_full_smoke(&mut session, wait_ms, end_in_contact).await,
+            PenSmokeScript::File { samples, go_file } => {
+                pen_file_smoke(&mut session, &samples, go_file.as_deref()).await
+            }
+        };
+    }
+    if !keys.scripts.is_empty() {
+        let hello = host_hello.ok_or_else(|| "no server hello".to_string())?;
+        return keys_smoke(&mut session, &hello, &keys).await;
     }
 
     let events = [
@@ -1214,6 +1530,267 @@ async fn input_smoke(
     tokio::time::sleep(Duration::from_millis(500)).await;
     close_smoke_session(&mut session).await;
     println!("input-smoke complete input_events=8 reset_events=1 keyboard=3 mouse=3 scroll=2");
+    Ok(())
+}
+
+/// Lab (`input-smoke --keys SCRIPT`): physical Mac keystrokes through the
+/// same shared keyboard policy the Deck window applies, resolved from this
+/// host's hello and the given connection settings.
+#[derive(Debug)]
+struct KeysSmoke {
+    scripts: Vec<String>,
+    /// Never print the tokens or key edges (`--keys-file`: a script that
+    /// may type a secret, such as a password into a streamed login window).
+    quiet: bool,
+    settings: arcen_input::keyboard::KeyboardSettings,
+}
+
+/// A script token's physical key: `cmd`, `ctrl`, `shift`, `lopt`, `ropt`,
+/// `iso` (the key next to left Shift), `grave`, a letter or digit, or a
+/// named key.
+fn smoke_deck_key(
+    name: &str,
+    policy: arcen_input::keyboard::KeyboardPolicy,
+) -> Option<arcen_input::keyboard::DeckKey> {
+    use arcen_input::keyboard::DeckKey;
+    Some(match name {
+        "cmd" => DeckKey::Command,
+        "ctrl" => DeckKey::Control,
+        "shift" => DeckKey::Shift,
+        "lopt" => DeckKey::LeftOption,
+        "ropt" => DeckKey::RightOption,
+        "iso" if policy.intl_backslash => DeckKey::Other(arcen_protocol::keys::KEY_INTL_BACKSLASH),
+        "iso" | "grave" => DeckKey::Other(0x60),
+        "minus" => DeckKey::Other(0x2D),
+        "equal" => DeckKey::Other(0x3D),
+        "lbracket" => DeckKey::Other(0x5B),
+        "rbracket" => DeckKey::Other(0x5D),
+        "backslash" => DeckKey::Other(0x5C),
+        "semicolon" => DeckKey::Other(0x3B),
+        "quote" => DeckKey::Other(0x27),
+        "comma" => DeckKey::Other(0x2C),
+        "period" => DeckKey::Other(0x2E),
+        "slash" => DeckKey::Other(0x2F),
+        "space" => DeckKey::Other(0x20),
+        "enter" => DeckKey::Other(0x0100_0004),
+        "esc" => DeckKey::Other(0x0100_0000),
+        "tab" => DeckKey::Other(0x0100_0001),
+        "backspace" => DeckKey::Other(0x0100_0003),
+        "home" => DeckKey::Other(0x0100_0010),
+        "end" => DeckKey::Other(0x0100_0011),
+        "left" => DeckKey::Other(0x0100_0012),
+        "up" => DeckKey::Other(0x0100_0013),
+        "right" => DeckKey::Other(0x0100_0014),
+        "down" => DeckKey::Other(0x0100_0015),
+        _ => {
+            let [byte] = name.as_bytes() else {
+                return None;
+            };
+            match byte.to_ascii_uppercase() {
+                letter @ (b'A'..=b'Z' | b'0'..=b'9') => DeckKey::Other(u32::from(letter)),
+                _ => return None,
+            }
+        }
+    })
+}
+
+async fn keys_smoke(
+    session: &mut SessionHandle,
+    hello: &ServerHelloMsg,
+    keys: &KeysSmoke,
+) -> Result<(), String> {
+    use arcen_input::keyboard::{DeckKey, DeckModifiers, ShortcutTranslator};
+    use arcen_input::text::OptionSide;
+
+    let platform = hello.host_platform();
+    let extended_keys =
+        arcen_protocol::messages::supports_extended_keys_v1(hello.input_capabilities);
+    let host_meta_mask =
+        arcen_protocol::messages::supports_meta_pointer_mask_v1(hello.input_capabilities);
+    let policy =
+        arcen_input::keyboard::resolve_keyboard_policy(platform, extended_keys, keys.settings)
+            .with_host_meta_mask(host_meta_mask);
+    println!(
+        "input-smoke keys platform={platform:?} extended_keys={extended_keys} policy={policy:?}"
+    );
+    let mut translator = ShortcutTranslator::new(policy);
+    let mut held = DeckModifiers::default();
+    let mut sequence = 1_000_u64;
+    let mut sent = 0_usize;
+    let mut position = 0_usize;
+    for script in &keys.scripts {
+        for token in script.split_whitespace() {
+            position += 1;
+            // A quiet script may type a secret: errors name the token's
+            // position, never its text.
+            let named = |token: &str| {
+                if keys.quiet {
+                    format!("token #{position}")
+                } else {
+                    token.to_owned()
+                }
+            };
+            if let Some(millis) = token.strip_prefix("sleep:") {
+                let millis = millis
+                    .parse::<u64>()
+                    .map_err(|_| format!("bad sleep {}", named(token)))?;
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                continue;
+            }
+            let mut edges = Vec::new();
+            let mut reset = false;
+            let mut click = None;
+            let mut scroll = false;
+            if token == "scroll" {
+                edges = translator.settle_command_for_pointer();
+                scroll = true;
+            } else if token == "click" {
+                // A left click at the centre, after settling a held-back
+                // Command as the Deck window does before pointer input.
+                edges = translator.settle_command_for_pointer();
+                click = Some((0.5, 0.5));
+            } else if let Some(at) = token.strip_prefix("click:") {
+                // `click:X,Y`: a left click at that fraction of the desktop.
+                let (x, y) = at
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
+                    .filter(|(x, y)| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+                    .ok_or_else(|| format!("bad click {}", named(token)))?;
+                edges = translator.settle_command_for_pointer();
+                click = Some((x, y));
+            } else if token == "reset" {
+                edges = translator.release_all();
+                held = DeckModifiers::default();
+                reset = true;
+            } else {
+                let (phases, name): (&[bool], &str) = match token.as_bytes().first() {
+                    Some(b'+') => (&[true], &token[1..]),
+                    Some(b'-') => (&[false], &token[1..]),
+                    _ => (&[true, false], token),
+                };
+                let key = smoke_deck_key(name, policy)
+                    .ok_or_else(|| format!("unknown key in {}", named(token)))?;
+                for &pressed in phases {
+                    match key {
+                        DeckKey::Command => held.command = pressed,
+                        DeckKey::Control => held.control = pressed,
+                        DeckKey::Shift => held.shift = pressed,
+                        DeckKey::LeftOption | DeckKey::RightOption => {
+                            let left = matches!(held.option, OptionSide::Left | OptionSide::Both);
+                            let right = matches!(held.option, OptionSide::Right | OptionSide::Both);
+                            let (left, right) = if key == DeckKey::LeftOption {
+                                (pressed, right)
+                            } else {
+                                (left, pressed)
+                            };
+                            held.option = match (left, right) {
+                                (false, false) => OptionSide::None,
+                                (true, false) => OptionSide::Left,
+                                (false, true) => OptionSide::Right,
+                                (true, true) => OptionSide::Both,
+                            };
+                        }
+                        DeckKey::Other(_) => {}
+                    }
+                    edges.extend(translator.key(key, pressed, false, held));
+                }
+            }
+            let described: Vec<String> = edges
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{}{:#x}/{:#04x}",
+                        if edge.pressed { '+' } else { '-' },
+                        edge.qt_key,
+                        edge.modifiers
+                    )
+                })
+                .collect();
+            if !keys.quiet {
+                println!("input-smoke key {token} -> [{}]", described.join(" "));
+            }
+            for edge in edges {
+                sequence += 1;
+                session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "key_event",
+                        "scan_code": edge.qt_key,
+                        "pressed": edge.pressed,
+                        "modifiers": edge.modifiers,
+                        "server_x": -1,
+                        "server_y": -1,
+                        "sequence": sequence,
+                        "timestamp_ns": 0,
+                        "coalescable": false,
+                    })))
+                    .map_err(|_| "session closed while sending keys".to_string())?;
+                sent += 1;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            if scroll {
+                sequence += 1;
+                session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "mouse_scroll",
+                        "x": 0.5,
+                        "y": 0.5,
+                        "dx": 0.0,
+                        "dy": -1.0,
+                        "server_x": -1,
+                        "server_y": -1,
+                        "sequence": sequence,
+                        "timestamp_ns": 0,
+                        "coalescable": false,
+                    })))
+                    .map_err(|_| "session closed while scrolling".to_string())?;
+            }
+            if let Some((x, y)) = click {
+                sequence += 1;
+                session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "mouse_move", "x": x, "y": y, "server_x": -1, "server_y": -1,
+                        "sequence": sequence, "timestamp_ns": 0, "coalescable": false,
+                    })))
+                    .map_err(|_| "session closed while clicking".to_string())?;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                for pressed in [true, false] {
+                    sequence += 1;
+                    session
+                        .commands
+                        .send(SessionCommand::Json(serde_json::json!({
+                            "type": "mouse_button",
+                            "x": x,
+                            "y": y,
+                            "button": 1,
+                            "pressed": pressed,
+                            "server_x": -1,
+                            "server_y": -1,
+                            "sequence": sequence,
+                            "timestamp_ns": 0,
+                            "coalescable": false,
+                        })))
+                        .map_err(|_| "session closed while clicking".to_string())?;
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+            if reset {
+                session
+                    .commands
+                    .send(SessionCommand::Json(serde_json::json!({
+                        "type": "key_reset_modifiers",
+                        "reason": "input-smoke keys reset",
+                    })))
+                    .map_err(|_| "session closed while resetting keys".to_string())?;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    close_smoke_session(session).await;
+    println!("input-smoke complete key_events={sent}");
     Ok(())
 }
 
@@ -1270,6 +1847,527 @@ async fn pen_smoke(session: &mut SessionHandle) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     close_smoke_session(session).await;
     println!("input-smoke complete pen_events={sent}");
+    Ok(())
+}
+
+/// Which typed-pen script `input-smoke` sends.
+#[derive(Clone, Debug, PartialEq)]
+enum PenSmokeScript {
+    /// `--pen`: two tilted strokes with a pressure ramp.
+    Strokes,
+    /// `--pen-full [--pen-wait-ms MS]`: every pen state a host must honour,
+    /// with fixed values a host-side probe can check (`pen_full_script`),
+    /// after waiting `wait_ms` for the remote desktop to settle.
+    /// `--pen-end-in-contact` closes the session with the tip down.
+    Full { wait_ms: u64, end_in_contact: bool },
+    /// `--pen-file PATH [--pen-go-file GO]`: samples from a file
+    /// (`parse_pen_file`), so a lab script can keep every point inside a
+    /// window it has checked. With `GO`, nothing is sent until that file
+    /// reads `go` (the script checks the host's windows while this session
+    /// is live, since a session can rearrange them); any other content, or
+    /// none within 60 s, ends the session without a sample.
+    File {
+        samples: Vec<(PenScriptSample, u64)>,
+        go_file: Option<String>,
+    },
+}
+
+/// Parses a `--pen-file` script: one sample per line,
+/// `x y pressure tilt_x tilt_y rotation tip|eraser in_proximity touching buttons pause_ms`
+/// (`x`/`y` normalized 0..=1, flags 0/1); blank lines and `#` comments are
+/// skipped. Every line is checked before anything is sent.
+fn parse_pen_file(text: &str) -> Result<Vec<(PenScriptSample, u64)>, String> {
+    let mut samples = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || format!("line {}: expected 11 fields", index + 1);
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [x, y, pressure, tilt_x, tilt_y, rotation, tool, prox, touch, buttons, pause] =
+            fields.as_slice()
+        else {
+            return Err(bad());
+        };
+        let number = |value: &str| value.parse::<f64>().map_err(|_| bad());
+        let flag = |value: &str| match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(bad()),
+        };
+        let (x, y) = (number(x)?, number(y)?);
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+            return Err(format!("line {}: x and y must be within 0..=1", index + 1));
+        }
+        let sample = PenScriptSample {
+            x,
+            y,
+            pressure: number(pressure)? as f32,
+            tilt_x_degrees: number(tilt_x)? as f32,
+            tilt_y_degrees: number(tilt_y)? as f32,
+            rotation_degrees: number(rotation)? as f32,
+            eraser: match *tool {
+                "tip" => false,
+                "eraser" => true,
+                _ => return Err(bad()),
+            },
+            in_proximity: flag(prox)?,
+            touching: flag(touch)?,
+            buttons: buttons.parse().map_err(|_| bad())?,
+        };
+        samples.push((sample, pause.parse().map_err(|_| bad())?));
+    }
+    if samples.is_empty() {
+        return Err("no samples".to_string());
+    }
+    Ok(samples)
+}
+
+/// Lab (`input-smoke --pen-file PATH`): sends the file's samples with their
+/// pauses and increasing sequence numbers.
+async fn pen_file_smoke(
+    session: &mut SessionHandle,
+    samples: &[(PenScriptSample, u64)],
+    go_file: Option<&str>,
+) -> Result<(), String> {
+    if let Some(path) = go_file {
+        println!("input-smoke pen waiting for go file");
+        let mut verdict = None;
+        for _ in 0..600 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.trim().is_empty() {
+                    verdict = Some(text.trim().to_string());
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if verdict.as_deref() != Some("go") {
+            close_smoke_session(session).await;
+            return Err(format!("pen not sent: go file said {verdict:?}"));
+        }
+    }
+    for (index, (sample, pause)) in samples.iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        session
+            .commands
+            .send(SessionCommand::Json(sample.json(sequence)))
+            .map_err(|_| "session closed while sending pen".to_string())?;
+        tokio::time::sleep(Duration::from_millis(*pause)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    close_smoke_session(session).await;
+    println!("input-smoke complete pen_file_events={}", samples.len());
+    Ok(())
+}
+
+/// One `pen_event` of the `--pen-full` script.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PenScriptSample {
+    x: f64,
+    y: f64,
+    pressure: f32,
+    tilt_x_degrees: f32,
+    tilt_y_degrees: f32,
+    rotation_degrees: f32,
+    eraser: bool,
+    in_proximity: bool,
+    touching: bool,
+    buttons: u16,
+}
+
+impl PenScriptSample {
+    const fn out_of_range(x: f64, y: f64) -> Self {
+        Self {
+            x,
+            y,
+            pressure: 0.0,
+            tilt_x_degrees: 0.0,
+            tilt_y_degrees: 0.0,
+            rotation_degrees: 0.0,
+            eraser: false,
+            in_proximity: false,
+            touching: false,
+            buttons: 0,
+        }
+    }
+
+    fn json(self, sequence: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "pen_event",
+            "x": self.x,
+            "y": self.y,
+            "server_x": -1,
+            "server_y": -1,
+            "pressure": self.pressure,
+            "tilt_x_degrees": self.tilt_x_degrees,
+            "tilt_y_degrees": self.tilt_y_degrees,
+            "rotation_degrees": self.rotation_degrees,
+            "tool": if self.eraser { "eraser" } else { "tip" },
+            "in_proximity": self.in_proximity,
+            "touching": self.touching,
+            "buttons": self.buttons,
+            "sequence": sequence,
+            "timestamp_ns": 0,
+            "coalescable": true,
+        })
+    }
+}
+
+/// The `--pen-full` script, in phases a host probe can tell apart by
+/// position (each phase has its own row):
+/// 1. hover only, y 0.30: in range, never touching, tilt (+20, -10);
+/// 2. tip stroke, y 0.45: pressure 0.10 → 1.00 linear, tilt (+40, +25),
+///    rotation 90, then a lift that stays in range;
+/// 3. barrel stroke, y 0.55: button bit 0, pressure 0.50, tilt (-40, -25);
+/// 4. eraser, y 0.65: the eraser end hovers, then rubs at pressure 0.70;
+/// 5. second button tap at (0.50, 0.75): button bit 1, pressure 0.30;
+/// 6. corner taps at (0, 0), (1, 1) and (0.25, 0.85), pressures 0.25, 0.50
+///    and 0.75, for the coordinate mapping;
+/// 7. a short stroke at y 0.92 whose lift lands 0.05 further right, as a
+///    real pen lifting mid-motion does.
+///
+/// Every phase ends out of range, unless `end_in_contact` adds a final
+/// stroke at y 0.95 that never lifts (the session closes under the pen).
+fn pen_full_script(end_in_contact: bool) -> Vec<PenScriptSample> {
+    const STEPS: u32 = 60;
+    let mut samples = Vec::new();
+    let row = |samples: &mut Vec<PenScriptSample>, y: f64, template: PenScriptSample| {
+        for step in 0..=STEPS {
+            let t = f64::from(step) / f64::from(STEPS);
+            let mut sample = template;
+            sample.x = 0.2 + 0.6 * t;
+            sample.y = y;
+            if template.touching && template.pressure < 0.0 {
+                // A negative template pressure asks for the linear ramp.
+                sample.pressure = (0.1 + 0.9 * t) as f32;
+            }
+            samples.push(sample);
+        }
+    };
+    let hover = PenScriptSample {
+        pressure: 0.0,
+        tilt_x_degrees: 20.0,
+        tilt_y_degrees: -10.0,
+        in_proximity: true,
+        ..PenScriptSample::out_of_range(0.0, 0.0)
+    };
+    row(&mut samples, 0.30, hover);
+    samples.push(PenScriptSample::out_of_range(0.8, 0.30));
+
+    let tip = PenScriptSample {
+        pressure: -1.0,
+        tilt_x_degrees: 40.0,
+        tilt_y_degrees: 25.0,
+        rotation_degrees: 90.0,
+        in_proximity: true,
+        touching: true,
+        ..PenScriptSample::out_of_range(0.0, 0.0)
+    };
+    samples.push(PenScriptSample {
+        x: 0.2,
+        y: 0.45,
+        pressure: 0.0,
+        touching: false,
+        ..tip
+    });
+    row(&mut samples, 0.45, tip);
+    samples.push(PenScriptSample {
+        x: 0.8,
+        y: 0.45,
+        pressure: 0.0,
+        touching: false,
+        ..tip
+    });
+    samples.push(PenScriptSample::out_of_range(0.8, 0.45));
+
+    let barrel = PenScriptSample {
+        pressure: 0.5,
+        tilt_x_degrees: -40.0,
+        tilt_y_degrees: -25.0,
+        in_proximity: true,
+        touching: true,
+        buttons: 0b01,
+        ..PenScriptSample::out_of_range(0.0, 0.0)
+    };
+    row(&mut samples, 0.55, barrel);
+    samples.push(PenScriptSample::out_of_range(0.8, 0.55));
+
+    let eraser_hover = PenScriptSample {
+        eraser: true,
+        in_proximity: true,
+        ..PenScriptSample::out_of_range(0.0, 0.0)
+    };
+    for step in 0..5 {
+        samples.push(PenScriptSample {
+            x: 0.2,
+            y: 0.65 - 0.01 * f64::from(5 - step),
+            ..eraser_hover
+        });
+    }
+    row(
+        &mut samples,
+        0.65,
+        PenScriptSample {
+            pressure: 0.7,
+            touching: true,
+            ..eraser_hover
+        },
+    );
+    samples.push(PenScriptSample {
+        x: 0.8,
+        y: 0.65,
+        ..eraser_hover
+    });
+    samples.push(PenScriptSample {
+        eraser: true,
+        ..PenScriptSample::out_of_range(0.8, 0.65)
+    });
+
+    let tap = |samples: &mut Vec<PenScriptSample>, x: f64, y: f64, pressure: f32, buttons: u16| {
+        let hover = PenScriptSample {
+            in_proximity: true,
+            buttons,
+            ..PenScriptSample::out_of_range(x, y)
+        };
+        samples.push(hover);
+        for _ in 0..3 {
+            samples.push(PenScriptSample {
+                pressure,
+                touching: true,
+                ..hover
+            });
+        }
+        samples.push(hover);
+        samples.push(PenScriptSample::out_of_range(x, y));
+    };
+    tap(&mut samples, 0.5, 0.75, 0.3, 0b10);
+    tap(&mut samples, 0.0, 0.0, 0.25, 0);
+    tap(&mut samples, 1.0, 1.0, 0.5, 0);
+    tap(&mut samples, 0.25, 0.85, 0.75, 0);
+
+    let moving = PenScriptSample {
+        pressure: 0.6,
+        in_proximity: true,
+        touching: true,
+        ..PenScriptSample::out_of_range(0.0, 0.0)
+    };
+    for step in 0..=10 {
+        samples.push(PenScriptSample {
+            x: 0.40 + 0.01 * f64::from(step),
+            y: 0.92,
+            ..moving
+        });
+    }
+    samples.push(PenScriptSample {
+        x: 0.55,
+        y: 0.92,
+        pressure: 0.0,
+        touching: false,
+        ..moving
+    });
+    samples.push(PenScriptSample::out_of_range(0.55, 0.92));
+
+    if end_in_contact {
+        for step in 0..=10 {
+            samples.push(PenScriptSample {
+                x: 0.60 + 0.01 * f64::from(step),
+                y: 0.95,
+                ..moving
+            });
+        }
+    }
+    samples
+}
+
+/// Lab (`input-smoke --pen-full`): sends `pen_full_script`, 8 ms apart,
+/// with increasing sequence numbers.
+async fn pen_full_smoke(
+    session: &mut SessionHandle,
+    wait_ms: u64,
+    end_in_contact: bool,
+) -> Result<(), String> {
+    let script = pen_full_script(end_in_contact);
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    for (index, sample) in script.iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        session
+            .commands
+            .send(SessionCommand::Json(sample.json(sequence)))
+            .map_err(|_| "session closed while sending pen".to_string())?;
+        let pause = if sample.in_proximity { 8 } else { 250 };
+        tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    close_smoke_session(session).await;
+    println!("input-smoke complete pen_full_events={}", script.len());
+    Ok(())
+}
+
+/// Lab (`input-smoke --paste-file PATH`): Paste as Keystrokes of a file's
+/// text, through the same shared planner and pacing as the Deck's menu
+/// command. Prints counts only, never the text.
+struct PasteSmoke {
+    path: String,
+    rate: Option<u32>,
+    /// Waits this long after the hello (a lab script starts the target
+    /// application meanwhile).
+    wait_ms: u64,
+    /// Clicks the centre of the desktop before typing.
+    click: bool,
+    /// Presses Return after the text (a paste never types a final line
+    /// break itself).
+    return_after: bool,
+}
+
+async fn paste_smoke(
+    session: &mut SessionHandle,
+    paste: &PasteSmoke,
+    capabilities: Option<(InputCapabilityAvailability, InputCapabilityAvailability)>,
+) -> Result<(), String> {
+    use arcen_deck::protocol::messages::{TextCommitMsg, TextCommitResultMsg, TEXT_COMMIT_RESULT};
+    use arcen_input::text::{prepare_paste, HostTextTruth, PasteSettings, PasteTyping, PasteUnit};
+    let (text_commit, unicode) = capabilities.ok_or("no server hello")?;
+    let text = zeroize::Zeroizing::new(
+        std::fs::read_to_string(&paste.path).map_err(|error| format!("--paste-file: {error}"))?,
+    );
+    let host = HostTextTruth {
+        text_commit: text_commit == InputCapabilityAvailability::Available,
+        unicode: unicode == InputCapabilityAvailability::Available,
+    };
+    let settings = PasteSettings {
+        chars_per_second: paste
+            .rate
+            .unwrap_or(arcen_input::text::paste::DEFAULT_CHARS_PER_SECOND),
+        ..PasteSettings::default()
+    }
+    .clamped();
+    println!(
+        "input-smoke paste host text_commit={text_commit:?} text_commit_unicode={unicode:?} rate={}",
+        settings.chars_per_second
+    );
+    let prepared = prepare_paste(&text, host).map_err(|refusal| refusal.message())?;
+    let summary = prepared.summary();
+    println!(
+        "input-smoke paste items={} keys={} dropped={} trailing_breaks={}",
+        summary.items, summary.keys, summary.dropped, summary.trailing_breaks
+    );
+    // A first input reaches the session, so its layout is read, and every
+    // key is released, as the Deck does before typing.
+    for json in [
+        serde_json::json!({"type":"mouse_move","x":0.5,"y":0.5,"server_x":-1,"server_y":-1,"sequence":1,"timestamp_ns":0,"coalescable":true}),
+        serde_json::json!({"type":"key_reset_modifiers","reason":"input-smoke paste"}),
+    ] {
+        session
+            .commands
+            .send(SessionCommand::Json(json))
+            .map_err(|_| "session closed while sending input".to_string())?;
+    }
+    tokio::time::sleep(Duration::from_millis(500 + paste.wait_ms)).await;
+    if paste.click {
+        for (sequence, pressed) in [(2_u64, true), (3, false)] {
+            session
+                .commands
+                .send(SessionCommand::Json(serde_json::json!({
+                    "type": "mouse_button", "x": 0.5, "y": 0.5, "button": 1,
+                    "pressed": pressed, "server_x": -1, "server_y": -1,
+                    "sequence": sequence, "timestamp_ns": 0, "coalescable": false,
+                })))
+                .map_err(|_| "session closed while clicking".to_string())?;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let mut typing = PasteTyping::new(prepared, settings);
+    let started = std::time::Instant::now();
+    let (mut sequence, mut commits, mut keys, mut refused) = (1000_u64, 0_u32, 0_u32, 0_u32);
+    let mut unverified = 0_u32;
+    loop {
+        let poll = typing.poll(std::time::Instant::now(), false);
+        for unit in poll.units {
+            match unit {
+                PasteUnit::Text(run) => {
+                    sequence += 1;
+                    commits += 1;
+                    let message = TextCommitMsg::new(run, sequence);
+                    session
+                        .commands
+                        .send(SessionCommand::Json(
+                            serde_json::to_value(message).map_err(|error| error.to_string())?,
+                        ))
+                        .map_err(|_| "session closed while typing".to_string())?;
+                }
+                PasteUnit::Key(key) => {
+                    keys += 1;
+                    for pressed in [true, false] {
+                        sequence += 1;
+                        session
+                            .commands
+                            .send(SessionCommand::Json(serde_json::json!({
+                                "type": "key_event",
+                                "scan_code": key.qt_key(),
+                                "pressed": pressed,
+                                "modifiers": 0,
+                                "server_x": -1,
+                                "server_y": -1,
+                                "sequence": sequence,
+                                "timestamp_ns": 0,
+                                "coalescable": false,
+                            })))
+                            .map_err(|_| "session closed while typing".to_string())?;
+                    }
+                }
+            }
+        }
+        while let Ok(event) = session.events.try_recv() {
+            if let SessionEvent::Json(value) = event {
+                if msg_type(&value) == Some(TEXT_COMMIT_RESULT) {
+                    if let Ok(result) = serde_json::from_value::<TextCommitResultMsg>(value) {
+                        refused += result.refused_chars;
+                        unverified += u32::from(result.unverified);
+                    }
+                }
+            }
+        }
+        let Some(after) = poll.wake_after else {
+            break;
+        };
+        tokio::time::sleep(after.max(Duration::from_millis(1))).await;
+    }
+    let elapsed = started.elapsed();
+    if paste.return_after {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for pressed in [true, false] {
+            sequence += 1;
+            session
+                .commands
+                .send(SessionCommand::Json(serde_json::json!({
+                    "type": "key_event", "scan_code": arcen_protocol::keys::KEY_RETURN,
+                    "pressed": pressed, "modifiers": 0, "server_x": -1, "server_y": -1,
+                    "sequence": sequence, "timestamp_ns": 0, "coalescable": false,
+                })))
+                .map_err(|_| "session closed while typing".to_string())?;
+        }
+        println!("input-smoke paste return pressed");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    while let Ok(event) = session.events.try_recv() {
+        if let SessionEvent::Json(value) = event {
+            if msg_type(&value) == Some(TEXT_COMMIT_RESULT) {
+                if let Ok(result) = serde_json::from_value::<TextCommitResultMsg>(value) {
+                    refused += result.refused_chars;
+                    unverified += u32::from(result.unverified);
+                }
+            }
+        }
+    }
+    close_smoke_session(session).await;
+    println!(
+        "input-smoke complete paste_items={} text_commits={commits} keys={keys} refused_chars={refused} unverified_commits={unverified} elapsed_ms={}",
+        typing.progress().1,
+        elapsed.as_millis()
+    );
     Ok(())
 }
 
@@ -1430,6 +2528,43 @@ fn smoke_clipboard_files(
         .collect()
 }
 
+/// JSON-lines measurement record written by `media-smoke` when
+/// `ARCEN_MEDIA_SMOKE_STATS` names a file.
+struct SmokeStatsWriter {
+    file: std::io::BufWriter<std::fs::File>,
+}
+
+impl SmokeStatsWriter {
+    fn create(path: &str) -> Result<Self, String> {
+        std::fs::File::create(path)
+            .map(|file| Self {
+                file: std::io::BufWriter::new(file),
+            })
+            .map_err(|error| format!("cannot create stats file {path}: {error}"))
+    }
+
+    fn line(&mut self, value: &serde_json::Value) {
+        use std::io::Write as _;
+        let _ = serde_json::to_writer(&mut self.file, value);
+        let _ = self.file.write_all(b"\n");
+    }
+}
+
+impl Drop for SmokeStatsWriter {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        let _ = self.file.flush();
+    }
+}
+
+fn unix_ms_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
+}
+
 async fn media_smoke(
     mut options: ConnectOptions,
     require_multi_monitor: bool,
@@ -1548,6 +2683,13 @@ async fn media_smoke(
         Err(_) => None,
     };
     let mut dumped_aus = 0_u32;
+    // ARCEN_MEDIA_SMOKE_STATS=<path>: write one JSON line per received video
+    // packet (wall-clock receive time, host timestamp, size), per health
+    // ping/pong and per host health_stats, for offline path measurements.
+    let mut smoke_stats = match std::env::var("ARCEN_MEDIA_SMOKE_STATS") {
+        Ok(path) => Some(SmokeStatsWriter::create(&path)?),
+        Err(_) => None,
+    };
     let mut dump_complete = false;
     // ARCEN_MEDIA_SMOKE_RESIZE=WxH[,WxH...]: once video decodes, ask the host
     // for each size in turn (`display_update`), one every
@@ -1579,6 +2721,7 @@ async fn media_smoke(
     let smoke_cursor_report =
         std::env::var("ARCEN_MEDIA_SMOKE_CURSOR").is_ok_and(|value| value == "1");
     let mut smoke_cursor = arcen_input::cursor::DeckCursorState::default();
+    let mut smoke_pointer = arcen_input::host_pointer::DeckHostPointer::default();
     let mut input_sequence = 0_u64;
     let mut last_input_at = Instant::now();
     let mut resize_sequence = 0_u64;
@@ -1609,8 +2752,18 @@ async fn media_smoke(
         }
         let remaining = smoke_timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
+            let audio_note = pending_audio_note(
+                audio_requirement_satisfied(
+                    require_multi_monitor,
+                    verify_audio,
+                    server_supports_audio,
+                    audio_packets_consumed,
+                    audio_refused,
+                ),
+                video_packets,
+            );
             return Err(format!(
-                "media smoke timed out after {}s (video_packets={video_packets}, audio_packets={audio_packets}, received_monitors={:?}, decoded_monitors={:?}, microphone_active={microphone_active}, input_probe_confirmed={input_probe_confirmed}, decoders_wanting_keyframe={:?})",
+                "media smoke timed out after {}s (video_packets={video_packets}, audio_packets={audio_packets}, received_monitors={:?}, decoded_monitors={:?}, microphone_active={microphone_active}, input_probe_confirmed={input_probe_confirmed}, decoders_wanting_keyframe={:?}){audio_note}",
                 smoke_timeout.as_secs(),
                 received_monitor_ids,
                 decoded_monitor_ids,
@@ -1634,7 +2787,10 @@ async fn media_smoke(
                 let _ = full_frame_requests.send_due(&session.commands);
                 continue;
             }
-            Err(_) => return Err("timed out waiting for media".to_string()),
+            // The deadline passed while waiting: the check at the top of the
+            // loop reports what arrived and what is still missing, rather
+            // than a bare timeout that reads as "nothing arrived".
+            Err(_) => continue,
         }
         .ok_or_else(|| "session ended before media arrived".to_string())?;
         if smoke_input
@@ -1731,6 +2887,11 @@ async fn media_smoke(
                     "sequence": health_sequence
                 })));
             last_health_ping = Instant::now();
+            if let Some(stats) = smoke_stats.as_mut() {
+                stats.line(&serde_json::json!({
+                    "k": "ping", "seq": health_sequence, "tx": unix_ms_f64(),
+                }));
+            }
         }
         match event {
             SessionEvent::CertificateUntrusted(_) => {
@@ -1906,9 +3067,6 @@ async fn media_smoke(
                 full_frame_requests.request();
                 let _ = full_frame_requests.send_due(&session.commands);
             }
-            SessionEvent::BrokerHello(_) => {
-                return Err("media-smoke expects a direct host, not a gateway".to_string());
-            }
             SessionEvent::AuthRequired(request) => {
                 if request.disclaimer.is_some() && !accept_disclaimer {
                     return Err("DisclaimerRequired".to_string());
@@ -2009,6 +3167,16 @@ async fn media_smoke(
                     let _ = full_frame_requests.send_due(&session.commands);
                 }
 
+                if let Some(stats) = smoke_stats.as_mut() {
+                    let rx = unix_ms_f64();
+                    for (header, payload) in &batch.video {
+                        stats.line(&serde_json::json!({
+                            "k": "v", "rx": rx, "ts": header.timestamp_ms,
+                            "b": payload.len(), "key": header.is_keyframe(),
+                            "m": header.monitor_id,
+                        }));
+                    }
+                }
                 for (header, payload) in batch.video {
                     let monitor_id = header.monitor_id;
                     if received_monitor_ids.insert(monitor_id) {
@@ -2190,6 +3358,20 @@ async fn media_smoke(
                 }
             }
             SessionEvent::Json(value) => {
+                if let Some(stats) = smoke_stats.as_mut() {
+                    match msg_type(&value) {
+                        Some("health_stats") => stats.line(&serde_json::json!({
+                            "k": "h", "rx": unix_ms_f64(), "stats": &value,
+                        })),
+                        Some("health_pong") => stats.line(&serde_json::json!({
+                            "k": "pong", "rx": unix_ms_f64(),
+                            "seq": value.get("sequence"),
+                            "ping": value.get("ping_timestamp_ms"),
+                            "server": value.get("server_timestamp_ms"),
+                        })),
+                        _ => {}
+                    }
+                }
                 if msg_type(&value) == Some("health_stats") {
                     if require_multi_monitor {
                         let stats = serde_json::from_value::<HealthStatsMsg>(value.clone())
@@ -2270,8 +3452,25 @@ async fn media_smoke(
                     Err(error) => println!("cursor-update dropped: {error}"),
                 }
             }
+            SessionEvent::CursorPosition(bytes) => match smoke_pointer.apply(&bytes) {
+                Ok(Some(position)) if smoke_cursor_report => println!(
+                    "cursor-position seq={} monitor={} output={} x={} y={} space={}x{} on_stream={} elapsed_ms={}",
+                    position.sequence,
+                    position.monitor_id,
+                    position.output,
+                    position.x,
+                    position.y,
+                    position.space_width,
+                    position.space_height,
+                    position.on_stream,
+                    started.elapsed().as_millis()
+                ),
+                Ok(_) => {}
+                Err(error) => println!("cursor-position dropped: {error}"),
+            },
             SessionEvent::CursorLaneReset => {
                 smoke_cursor.reset_lane();
+                smoke_pointer.reset_lane();
                 if smoke_cursor_report {
                     println!("cursor-lane-reset");
                 }
@@ -2319,6 +3518,20 @@ const fn audio_requirement_satisfied(
         || !server_supports_audio
         || audio_refused
         || audio_packets_consumed > 0
+}
+
+/// The timeout report's note on audio. A host that advertised audio and sent
+/// video but never one audio packet usually has a silent source (a Windows
+/// Pier's loopback capture delivers nothing while nothing plays), not a
+/// stalled stream; say so instead of leaving the counters to be misread.
+fn pending_audio_note(audio_satisfied: bool, video_packets: u64) -> &'static str {
+    if audio_satisfied || video_packets == 0 {
+        ""
+    } else {
+        "; video arrived but no audio packet did: the host's audio source is probably silent \
+         (a Windows Pier sends no audio while nothing plays). Play sound on the host, or pass \
+         --video-only to validate video alone"
+    }
 }
 
 fn describe_deck_cursor(cursor: &arcen_input::cursor::DeckCursor) -> String {
@@ -2479,6 +3692,48 @@ fn send_multi_monitor_input_probe(
     Ok(())
 }
 
+/// `--usb-emulate NAME`: emulate a USB device for the Hard USB bridge instead
+/// of capturing one (lab builds with `usb-emulate-lab` only).
+#[cfg(feature = "usb-emulate-lab")]
+fn select_usb_emulation(args: &[String]) -> Result<(), String> {
+    use arcen_deck::usb_emulate::{select, EmulatedDevice, Playback, StrokeScript};
+    let Some(name) = flag_value(args, "--usb-emulate") else {
+        return Ok(());
+    };
+    let device = EmulatedDevice::parse(&name)?;
+    let mut playback = Playback::default();
+    if let Some(strokes) = flag_value(args, "--usb-emulate-strokes") {
+        playback.strokes = strokes
+            .parse()
+            .ok()
+            .filter(|strokes| (1..=100).contains(strokes))
+            .ok_or_else(|| format!("invalid --usb-emulate-strokes '{strokes}' (1-100)"))?;
+    }
+    if let Some(lead_in) = flag_value(args, "--usb-emulate-lead-in-ms") {
+        playback.lead_in = lead_in
+            .parse()
+            .ok()
+            .filter(|milliseconds| *milliseconds <= 600_000)
+            .map(Duration::from_millis)
+            .ok_or_else(|| format!("invalid --usb-emulate-lead-in-ms '{lead_in}'"))?;
+    }
+    if let Some(stroke) = flag_value(args, "--usb-emulate-stroke") {
+        playback.stroke = StrokeScript::parse(&stroke)?;
+    }
+    select(device, playback)
+}
+
+#[cfg(not(feature = "usb-emulate-lab"))]
+fn select_usb_emulation(args: &[String]) -> Result<(), String> {
+    if flag_value(args, "--usb-emulate").is_some() {
+        return Err(
+            "--usb-emulate is a lab tool; this Deck was built without the usb-emulate-lab feature"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
@@ -2497,6 +3752,45 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(feature = "usb-emulate-lab")]
+    #[test]
+    fn emulated_pen_smoke_prints_and_counts_every_host_pointer_position() {
+        use arcen_protocol::cursor_position::{encode_cursor_position, CursorPosition};
+        let at = |sequence, x, y| {
+            encode_cursor_position(&CursorPosition {
+                sequence,
+                on_stream: true,
+                output: 0,
+                generation: 1,
+                monitor_id: 0,
+                x,
+                y,
+                space_width: 1800,
+                space_height: 1130,
+            })
+            .expect("valid record")
+        };
+        let mut pointer = SmokeHostPointer::default();
+        assert_eq!(
+            pointer.record(&at(1, 450, 565)),
+            "cursor-position seq=1 x=450 y=565 space=1800x1130 on_stream=true"
+        );
+        assert!(pointer
+            .record(&at(2, 900, 113))
+            .starts_with("cursor-position seq=2 "));
+        assert_eq!(
+            pointer.record(&at(2, 900, 113)),
+            "cursor-position dropped: stale sequence"
+        );
+        assert!(pointer
+            .record(&[0_u8; 3])
+            .starts_with("cursor-position dropped: "));
+        assert_eq!(
+            pointer.summary(),
+            "host_pointer_positions=2 first=0.250,0.500 last=0.500,0.100 dropped=2"
+        );
+    }
+
     fn base_smoke_args() -> Vec<String> {
         vec![
             "arcen-client".to_string(),
@@ -2505,6 +3799,75 @@ mod tests {
             "18444".to_string(),
             "--tls".to_string(),
         ]
+    }
+
+    #[test]
+    fn pen_file_lines_are_all_checked_before_any_is_sent() {
+        let samples = parse_pen_file(
+            "# comment\n\n0.5 0.25 0.7 30 -20 90 tip 1 1 1 8\n1 0 0 0 0 0 eraser 0 0 0 300\n",
+        )
+        .expect("valid file");
+        assert_eq!(samples.len(), 2);
+        let (first, pause) = &samples[0];
+        assert!(first.touching && first.in_proximity && !first.eraser);
+        assert_eq!((first.buttons, *pause), (1, 8));
+        assert!(samples[1].0.eraser && !samples[1].0.in_proximity);
+
+        for bad in [
+            "",
+            "0.5 0.5 0 0 0 0 tip 1 1 0",
+            "1.5 0.5 0 0 0 0 tip 1 1 0 8",
+            "0.5 0.5 0 0 0 0 pencil 1 1 0 8",
+            "0.5 0.5 0 0 0 0 tip 2 1 0 8",
+            "0.5 0.5 0 0 0 0 tip 1 1 0 8\n0.5 0.5 0 0 0 0 tip 1 1 x 8",
+        ] {
+            assert!(parse_pen_file(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn pen_full_script_is_valid_and_covers_every_pen_state() {
+        use arcen_deck::protocol::messages::{PenEventMsg, PenToolMsg};
+        let script = pen_full_script(false);
+        assert!(pen_full_script(true).last().unwrap().touching);
+        let messages: Vec<PenEventMsg> = script
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| {
+                let message: PenEventMsg =
+                    serde_json::from_value(sample.json(index as u64 + 1)).unwrap();
+                message.validate().unwrap();
+                message
+            })
+            .collect();
+        let hover_only = |m: &PenEventMsg| m.in_proximity && !m.touching;
+        assert!(messages
+            .iter()
+            .any(|m| hover_only(m) && m.tool == PenToolMsg::Tip && m.tilt_x_degrees > 0.0));
+        assert!(messages
+            .iter()
+            .any(|m| hover_only(m) && m.tool == PenToolMsg::Eraser));
+        assert!(messages
+            .iter()
+            .any(|m| m.touching && m.tool == PenToolMsg::Eraser));
+        assert!(messages.iter().any(|m| m.touching && m.buttons == 0b01));
+        assert!(messages.iter().any(|m| m.touching && m.buttons == 0b10));
+        assert!(messages
+            .iter()
+            .any(|m| m.touching && m.tilt_x_degrees < 0.0 && m.tilt_y_degrees < 0.0));
+        assert!(messages
+            .iter()
+            .any(|m| m.touching && (m.pressure - 1.0).abs() < 1e-6));
+        assert!(messages
+            .iter()
+            .any(|m| m.touching && m.x == 0.0 && m.y == 0.0));
+        assert!(messages
+            .iter()
+            .any(|m| m.touching && m.x == 1.0 && m.y == 1.0));
+        assert!(!messages.last().unwrap().in_proximity);
+        assert!(messages
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
     }
 
     #[test]
@@ -2570,6 +3933,16 @@ mod tests {
         // answered the question; waiting the timeout out only delays a result
         // that is already known.
         assert!(audio_requirement_satisfied(false, true, true, 0, true));
+    }
+
+    #[test]
+    fn a_timeout_waiting_only_for_audio_names_a_silent_source() {
+        let silent = pending_audio_note(false, 13);
+        assert!(silent.contains("no audio packet"));
+        assert!(silent.contains("--video-only"));
+        assert_eq!(pending_audio_note(true, 13), "");
+        // Without video the stream itself is the problem, not the audio source.
+        assert_eq!(pending_audio_note(false, 0), "");
     }
 
     fn test_monitor(id: u32, width_px: u32, height_px: u32, is_primary: bool) -> ClientMonitor {

@@ -1,15 +1,15 @@
 # Transport: Direct QUIC
 
-> **STATUS (2026-10-17):** Shipped Linux and Windows Pier plus macOS Deck use
-> direct QUIC exclusively, normally on UDP 18444. On the `wlp/workers`
-> integration branch every product (Linux, Windows and macOS Piers, the
+> **STATUS:** The Linux and Windows Piers and the macOS Deck use
+> direct QUIC exclusively, normally on UDP 18444. Every
+> product (Linux, Windows and macOS Piers, the
 > macOS Deck) runs every session on isolated QUIC lanes (protocol v5, see
 > "QUIC lanes" below); a released single-stream peer is refused with the
 > shared "update the Deck and the Pier to the same release" message. WSS
 > network code is dormant
 > source behind the default-off `wss-compat` feature and is excluded from
 > product builds. `arcen-transport` remains dependency-light by default;
-> product crates opt into its Quinn feature. Arcen Span remains dormant.
+> product crates opt into its Quinn feature.
 
 **Owner:** Shared/Architecture. See
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
@@ -34,8 +34,8 @@ in [`session-auto-reconnect.md`](session-auto-reconnect.md).
 
 ## Direct product QUIC profile
 
-The single-stream profile below is what released (pre-v5) products serve.
-Every product on this branch has replaced it with the lane layout in "QUIC
+The single-stream profile below is what pre-v5 releases serve.
+Every current product has replaced it with the lane layout in "QUIC
 lanes"; everything about TLS, ALPN, certificates and the compatibility MTU
 still applies to them.
 
@@ -63,9 +63,20 @@ still applies to them.
 - Deck records a five-second QUIC feedback sample containing RTT, congestion
   window/events, loss counters, sent counters, MTU, and black-hole detections.
 - The compatibility profile pins QUIC packets to the RFC 9000 1200-byte
-  minimum and disables upward MTU discovery. This avoids local oversize-probe
-  failures on the fleet's 1280-byte IPsec path; a future path-aware policy may
-  safely raise the ceiling.
+  minimum and, by default, does not search above it.
+  `ARCEN_QUIC_MTU_DISCOVERY=on` (`MtuDiscovery`) enables Quinn's path MTU
+  discovery (RFC 8899) up to 1452 bytes with black-hole fallback to 1200 and
+  a 60-second cooldown. It stays off because of what it did on the VPN path
+  the Deck is tested over (a 1280-byte IPsec tunnel): the tunnel fragmented
+  oversize packets rather than dropping them, so a 1452-byte probe from the
+  Pier was acknowledged; at full rate the fragments were lost in bursts
+  (130-1,000 packets per episode), black-hole detection returned the
+  connection to 1200 bytes, and the cycle repeated after every cooldown.
+  Goodput fell by about 6 % and no larger MTU lasted beyond one 2-second
+  sample. In the other direction the Deck's own 1280-byte interface refused
+  oversize probes locally and discovery settled at 1230 bytes. The host
+  reports the MTU in use in `HealthStatsMsg.path.mtu_bytes` and the Deck's
+  connection test reports the size its own connection reached.
 
 This baseline intentionally retains WebSocket framing and one reliable ordered
 stream. It therefore does not yet claim independent loss domains for media and
@@ -315,7 +326,7 @@ Each product is a thin adapter over one shared layer:
 | control (bidi, Deck opens) | authentication, `lane_attachment`, hellos, quality/display/audio/microphone negotiation and results, output transactions, health, resume grants, close | `SessionLaneSocket` as the session `Sink`/`Stream`; control writer task (control messages, resume refresh) | `SessionLaneSocket` as the session `Sink`/`Stream`; consumes `lane_attachment` |
 | video (uni, Pier opens) | every encoded video frame, fair monitor mux (ADR 0013) | video writer task (`LocalLaneWriter`); waits only for video-lane room; IDR on every monitor after a reopen | video reader → video inbox only; a replaced lane requests presentation recovery |
 | audio_output (uni, Pier opens) | audio-v1 Opus/PCM frames | audio writer task, `try_send` (full queue drops the frame); exhausted lane disables audio visibly (`audio_stream_result` reason `lane_unavailable`) | audio reader → its own queue → dedicated audio-worker thread (owns CoreAudio) |
-| input_cursor (bidi, Deck opens) | key, pointer, scroll, pen, gestures, text, held-state reset; `cursor_shape`; host → Deck `CursorUpdate` images (`0x50`, ADR 0014 amendment 11) | input worker injects in its own task; writes the newest cursor shape or image back (an image inline only when the Deck does not hold it); releases held input on supersession, failure and end | input bypasses the session loop (`SessionCommandSender`), `try_send` with an ordered outbox (edges kept; a trailing position replaced by a newer one of the same kind, trailing relative deltas summed, relative and absolute never merged); cursor messages to the UI |
+| input_cursor (bidi, Deck opens) | key, pointer, scroll, pen, gestures, text, held-state reset; `cursor_shape`; host → Deck `CursorUpdate` images (`0x50`, ADR 0014 amendment 11) and `CursorPosition` host pointer positions (`0x51`, amendment 21) | input worker injects in its own task; writes the newest cursor shape or image back (an image inline only when the Deck does not hold it); releases held input on supersession, failure and end | input bypasses the session loop (`SessionCommandSender`), `try_send` with an ordered outbox (edges kept; a trailing position replaced by a newer one of the same kind, trailing relative deltas summed, relative and absolute never merged); cursor messages to the UI |
 | microphone (uni, Deck opens) | microphone-v1 frames | microphone worker with the shared ingress state; consent generation untouched by lane recovery | frames queued with `try_send` when capture runs |
 | bulk_aux (bidi, Deck opens) | `clipboard_data`, clipboard chunks, HID, USB URBs | bulk reader forwards to the dispatcher (clipboard/USB state); clipboard writer and a separate USB writer task use the bulk lane; a disabled or stuck bulk lane stops Hard USB (`tablet_mode_result`) and ends nothing | bulk worker both ways; clipboard sends only when the bulk channel has room; a disabled bulk lane turns clipboard and Hard USB off, refuses further sends quietly and ends nothing |
 
@@ -917,6 +928,108 @@ comparison run end-to-end against real hardware (pier-linux.example.internal and
 Deck client) with real capture/encode/decode/presentation in the loop, per
 ADR 0009's performance gate, before either carrier is wired into Deck/Pier or
 advertised as a product default.
+
+## Congestion control, host backlog and the path indicator
+
+Measured end to end over a real WAN path (Wi-Fi, a VPN, a Linux Pier in
+another country; ~33 ms RTT, ~36 Mbit/s available) with the Deck CLI
+`media-smoke` (`ARCEN_MEDIA_SMOKE_STATS` per-frame records) against a
+Pier serving Speed with continuous full-screen motion. Impairments were
+applied only to that Pier's own UDP port on the host. Each configuration
+ran at least three alternating 95-second runs; the method is reproducible
+with `media-smoke` and `ARCEN_MEDIA_SMOKE_STATS`.
+
+- **Congestion controller** (`CongestionControl`, `ARCEN_QUIC_CONGESTION`):
+  `bbr` (default), `bbr-guarded` (opt-in experiment), `cubic`, `newreno`.
+  `bbr-guarded` is not the default: its
+  app-limited gate keeps the ceiling from engaging when an app-limited
+  sender still overshoots a slow bottleneck, the case it exists for, so the
+  bottleneck figure below is from its first version. On a clean path all four
+  are equal (frame age p50 ≈ 19.5 ms). Under 1 % random loss the loss-based
+  controllers collapse (Cubic 6 Mbit/s and ~675 ms frame age, NewReno 7
+  Mbit/s and ~575 ms) while BBR and `bbr-guarded` keep 16 Mbit/s and ~19 ms.
+  Against a shallow-buffered 8 Mbit/s bottleneck (100 ms `tbf`) plain BBR
+  overshoots to twice the link rate, loses 54 % of its packets and ages
+  frames to ~1.35 s; `bbr-guarded` loses 11 % at ~0.77 s; Cubic and NewReno
+  lose 0.1 % at ~0.66 s. `bbr-guarded` (`quic/loss_guard.rs`) is BBR under a
+  loss-bounded window ceiling. A round lasts at least one smoothed RTT and
+  until 12 kB have been resolved (at most 8 RTTs); it is lossy when it lost
+  at least three packets and more than 5 % of its bytes. After two
+  consecutive lossy rounds the window is capped at three quarters of the
+  lower of the current cap and what that round delivered, never below
+  24 kB. Since 0.19.0 whether the sender was application-limited no longer
+  matters: Quinn marks a connection application-limited whenever its send
+  buffer was empty at its last poll, which a video sender's is between
+  frames, so the 0.18.0 gate kept the cap from ever engaging. A clean round
+  relaxes the cap by an eighth while the round's largest bytes in flight
+  reached half of it; a clean round, or a quiet loss-free stretch, whose
+  largest bytes in flight stayed below half the cap removes it. Random loss
+  below 5 % or a single unlucky round never engages it, and the cap can only
+  lower BBR's own window. Re-measured with the 0.19.0 rule (three
+  alternating runs each, 8 Mbit/s `tbf`): plain BBR loses 54 % at frame age
+  p50 1.36 s / p95 1.89 s; `bbr-guarded` loses 12 % at p50 0.77 s / p95
+  1.06 s with the same delivered video rate. Under 1 % random loss the two
+  are indistinguishable (16-17 Mbit/s, p50 ~18-19 ms) and the cap does not
+  engage. `bbr` stays the default until a release cycle of field use.
+- **Host backlog** (`arcen_media::video::video_backlog_budget`,
+  `ARCEN_VIDEO_BACKLOG=legacy` to disable): once two encoded frames wait for
+  the writer and the oldest has waited two contract frame periods (20-100
+  ms), the send queue refuses room; the Linux frame pump then stops taking
+  frames, capenc stalls, and its next capture is the current screen. No
+  encoded frame is dropped by the rule. The capenc→pump channel is one frame
+  deep, and the wire timestamp is taken when the Pier reads the frame from
+  capenc, so the Deck's frame age includes every host-side wait. At the
+  8 Mbit/s bottleneck this cut frame age p50 from ~1.09 s
+  (`ARCEN_VIDEO_BACKLOG=legacy`) to ~0.76 s and raised the delivered frame
+  rate from ~23 to ~26 fps.
+- **Frames in flight on a split Pier** (`arcen_media::video::RelayedVideoWindow`):
+  the Windows Pier's agent hands video to the broker's lane relay
+  (`PierLaneRelay`) over a local socket, and the relay's own backlog (16
+  frames, plus the lane's queue) used to hold a slow path's frames where no
+  budget saw them, then drop them and ask for a keyframe. The relay now counts
+  every video frame it is done with (`PierLaneRelay::video_released`: sent into
+  the lane's queue, or dropped by its policy), the broker reports that running
+  count to the agent (`ServiceMessage::VideoReleased`, broker-agent vocabulary
+  in `arcen-session`), and the agent keeps at most one frame unreleased
+  (`RELAYED_VIDEO_FRAMES_IN_FLIGHT`): in flight is always the frames it handed
+  over minus the relay's count, both counted from the start of the
+  attachment. Older frames wait in the agent's
+  per-monitor shared queues under the same budget; the frame router waits
+  (`VIDEO_ROOM_WAIT`, 500 ms) before taking a delta frame, and the engine
+  reader waits instead of dropping (one-frame queue), so the engine stalls on
+  its pipe. Keyframes never wait; the wire timestamp is still taken when the
+  agent reads the frame from capenc. A relay that releases nothing for a
+  second (a large keyframe at a low bitrate, a QUIC stall) gets one more frame
+  per second, still counted, so the backlog returns to one frame once the
+  lane drains. `ARCEN_VIDEO_BACKLOG=legacy` in the service's environment stops
+  the reports, and the broker hands the choice to the agent in its start
+  packet (the agent runs with the signed-in user's environment), which then
+  uses the old four-frame engine queue, drops instead of waiting, and applies
+  no budget. Measured on a Windows Pier at
+  8 Mbit/s (alternating ×3 against that full legacy, Speed, full-screen
+  random text): frame age p50 unchanged on average (~1.28 s both; legacy
+  1.04–1.48 s run to run, because it sheds load by dropping and re-keying),
+  p95 ~1.58 → ~1.34 s, delivered fps equal (~41), stutters ~259 → ~37 per
+  minute and keyframe requests ~116 → 0 per run; a clean link is unchanged
+  (~15 ms). Most of the remaining ~1.2 s is above the socket (the control
+  lane's ping/pong RTT stayed ~115 ms): the video lane's own queue and QUIC's
+  send buffer, still to pace. The cap there was a Windows QoS throttle, not a
+  router queue, so these figures are not comparable with the Linux ones
+  above.
+- **Path indicator**: every `health_stats` from the Linux and Windows Piers
+  carries `path` (`PathQualityMsg`, see `shared/protocol/WIRE.md`): the
+  controller, smoothed and minimum RTT, cwnd, packets sent and declared lost,
+  congestion events and wire bytes for the window, sampled by
+  `PathQualityTracker` on the connection that carries the video. The Deck's
+  Session → Connection Health overlay shows it as one `Path:` row with a
+  good/fair/poor grade (`PathGrade`: RTT 80/150 ms, queueing 30/100 ms,
+  loss 0.5 %/2 %), formatted by `path_quality_summary` so a future Deck
+  shows the same words.
+- **No FEC.** Every lane is a reliable QUIC stream and QUIC already repairs
+  loss by retransmission. Loss measured on the real link was 0 % (clean runs)
+  and FEC would not have helped the bottleneck case, where loss is caused by
+  sending too much. Revisit only with datagram video and measured residual
+  loss after `bbr-guarded`.
 
 ## Known gaps and non-claims
 

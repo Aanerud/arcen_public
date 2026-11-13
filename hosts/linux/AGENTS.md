@@ -37,6 +37,15 @@ NVIDIA GPU and driver on the build/test host.
 - Xorg depth 30 is genuine precision but not an HDR composition contract. PQ
   and HLG requests must resolve to Grading BT.709 SDR until a color-managed
   Wayland provider proves transfer, primaries, metadata, and capture format.
+- Grading passes the depth-30 desktop's sRGB codes to the matrix untouched
+  (`Rgb10Signal::Direct`); `Config::apply_initial_video_request` states them
+  `srgb` for a Deck that claims `srgb_transfer` through the shared
+  `DesktopPlan::serving_sdr_desktop` (a declared PQ desktop then converts on
+  the sRGB curve). A Wayland Grading epoch gets the same `transfer=srgb`;
+  capenc passes it to the shared admission (`AdmissionRequest::sdr_transfer`),
+  which converts the compositor's PQ with the inverse of Mutter's 2.2-power
+  SDR decode (`SourceColour::sdr_content`) and states `srgb`. Never assume
+  the piecewise sRGB curve for a compositor's SDR content: measure it.
 - XShm cannot composite the host cursor. Resolve Host to Local before native
   preflight and live spawn; keep Host unchanged on the eight-bit NvFBC path.
 - READY and session truth must identify `capture=nvfbc
@@ -67,9 +76,46 @@ NVIDIA GPU and driver on the build/test host.
   with `arcen_input::virtual_device::SessionInputIdentity` and keep the
   launcher's `with_session_input_isolation` classes on every rendered
   configuration. Never add another input device to a session's X server, and
-  never let console devices reach a remote desktop.
+  never let console devices reach a remote desktop. The one exception is a
+  lab Native tablet (ADR 0021): it stays on `seat0`, its nodes tagged for
+  Xorg by the helper's per-port rule before the port connects
+  (`ID_INPUT.tags=arcen_bridge,arcen_bridge_<display>`,
+  `LIBINPUT_IGNORE_DEVICE=1`, no `uaccess`, no logind `seat` tag); the installed
+  `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` makes every X server
+  ignore `arcen_bridge`, and the launcher appends, last and after the
+  isolation classes, a class ignoring every `arcen_bridge` again (the
+  session class admits by name and VID, which a bridged device can imitate)
+  and the one class that re-admits this display's own tag
+  (`arcen_usb_bridge::bridge_seat::xorg_session_bridge_class`). Nothing may
+  follow them. Never admit
+  a bridged device by name, VID or a wider tag, never start a bridge before
+  `usb_bridge::seat::x11_isolation` proves every running X server keeps it
+  out, and never tell a user to sign out for it.
 - Never emit `KEY_SYSRQ` from a kernel virtual keyboard
   (`input/keymap.rs::kernel_safe_key`).
+
+## Native tablet: one path
+
+- `usb.native_tablet = "enabled"` is the only switch (the `usb-hard-lab`
+  feature and `ARCEN_USB_HARD_LAB` are gone; the feature is
+  `native-tablet`, default).
+- Where the bridged pen points is ADR 0023's one path, for X11 and Wayland
+  alike: `usb_bridge::tablet_pointer` reads the pen's own evdev node
+  (read-only, never grabbed, `O_NOFOLLOW`, device number and seat rule
+  re-verified after the open) into `media::desktop_pointer` (the shared
+  `PenPointerHub`); the shared `PenPointerLead` decides when the pen leads.
+  Never add a second pen reader or a platform-specific mapping.
+- On X11 the cursor watcher reads the X pointer only when the pen does not
+  lead (application warps, a remapped tablet, sessions without a bridged
+  pen), and proves the mapping once a second from the pen's
+  `xf86-input-wacom` devices (`x11_wacom_mapping`).
+- `xf86-input-wacom` averages raw samples ("Wacom Sample and Suppress" 2, 4),
+  so the X pointer and application ink trail the bridged pen by about one
+  and a half reports (one report per network round trip); the Deck's dot
+  does not.
+- Prove pen changes with a real tablet or a real browser, not only the
+  emulated Intuos5; read `BTN_STYLUS*` before blaming timing ("pen but no
+  ink" is usually a held side switch).
 
 ## Headless Wayland session (`wayland-provider`, default off)
 
@@ -148,10 +194,14 @@ NVIDIA GPU and driver on the build/test host.
   proves it: the agent reads its compositor's keymap as a Wayland client
   (request `wl_keyboard` only after the seat advertises the keyboard
   capability; earlier crashes headless Mutter 49.4), indexes it with
-  libxkbcommon loaded at run time, and types by keysym only what Mutter's
-  active-group rule will type; the rest goes through the compositor's
-  `ei_text` when its EIS seat offers it, or is refused and reported to the
-  Deck. Never log committed text, only counts. The agent keeps one
+  libxkbcommon loaded at run time, and types by proven keycode strokes
+  (Shift and AltGr held by their own keys, every stroke replayed on the
+  compositor's keymap first) only what the keymap proves; with several
+  differing groups, only strokes every group agrees on unless the live group
+  is known. Never type through Mutter's `NotifyKeyboardKeysym`: it presses the
+  first key listing a keysym and drops higher-level modifiers. The rest goes
+  through the compositor's `ei_text` when its EIS seat offers it, or is
+  refused and reported to the Deck. Never log committed text, only counts. The agent keeps one
   long-lived EIS connection for text (`session/wayland/eis_text.rs`); the
   stylus probe (`session/wayland/eis.rs`) is short-lived, and a bound
   stylus should share the text connection rather than open another.
@@ -179,6 +229,11 @@ NVIDIA GPU and driver on the build/test host.
   capability on Deck-side or network numbers.
 - A stale record (version change only) is re-qualified by the service at
   start (`requalify_at_start`); a missing or untrusted record never is.
+  A valid record whose X11 proof was skipped for a host precondition that
+  holds again is re-proved by the same run (`requalify_x11_at_start`,
+  shared `precondition_requalify_decision`): once per boot and stack,
+  never refusing start, outcome typed (`X11RequalifyOutcome`). Never add
+  another trigger without a shared decision and its own hold-off.
 - A desktop fixes its streams' `cursor-mode` when it opens
   (`resolve_stream_cursor_mode`, kept through every reconfiguration):
   `metadata` for a Deck that wants a local cursor and declared
@@ -189,7 +244,9 @@ NVIDIA GPU and driver on the build/test host.
   framed-v2 cursor events; the Pier keeps the desktop's cursor
   (`media::wayland_cursor`, outliving attachments because Mutter sends a
   sprite only when it changes) and sends `CursorUpdate` images on the input
-  lane. Never start the X11 cursor watcher for a Wayland session. The Pier
+  lane. Never start the X11 cursor watcher for a Wayland session; on an
+  Xorg desktop that watcher (`cursor_watcher.rs`) feeds the shared
+  `HostCursor` with XFixes images and names, through the same `CursorFeed`. The Pier
   sets `cursor=` from the hand-off.
 - The provider is chosen at start from facts (`capture.provider = auto`):
   an installed Xorg server keeps X11 and is never migrated; without Xorg,
@@ -302,7 +359,8 @@ A Pier drives **one physical desktop session at a time**. That is a hardware
 constraint, not a policy one: a second concurrent session would fight the first
 over the same display, input devices, and encoder. The Pier therefore holds a
 capacity-one session admission gate, and keeps the slot reserved for a bounded
-reconnect window (max two hours) so a dropped Deck can resume rather than lose
+reconnect window (`auth.reconnect_window_secs`, 180 s by default, at most two
+hours) so a dropped Deck can resume rather than lose
 the session. Do not remove or widen that gate without understanding what it
 protects.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Transport-independent outbound video queue policy.
 //!
 //! This core owns the decisions that must match on every Pier: bounded video
@@ -244,6 +246,175 @@ impl<T> QueuedVideo<T> {
     }
 }
 
+/// Frames that may always wait behind the writer, whatever their age: one
+/// being written and one ready, so a writer that has not yet woken never
+/// throttles the encoder.
+pub const MIN_VIDEO_BACKLOG_FRAMES: usize = 2;
+
+/// How long encoded video may wait for the host's writer before the encoder
+/// side should stop handing over more pictures: two frame periods of the
+/// contract rate, clamped to 20-100 ms.
+///
+/// When the network is slower than the encoder, every frame admitted behind
+/// a full writer waits for all the frames ahead of it; with an eight-frame
+/// queue at the 20-odd fps a capped link sustains, that is hundreds of
+/// milliseconds of stale pictures. Refusing room once the oldest queued frame
+/// is this old turns the backlog into backpressure instead: the producer
+/// stops taking encoded frames, the encoder stalls, and the next picture it
+/// captures is the current screen (latest frame wins) rather than one more
+/// frame of a queue. Encoded frames are never dropped by this rule, so the
+/// prediction chain is untouched.
+#[must_use]
+pub fn video_backlog_budget(contract_fps: u32) -> Duration {
+    (Duration::from_secs(2) / contract_fps.max(1))
+        .clamp(Duration::from_millis(20), Duration::from_millis(100))
+}
+
+/// Environment override read by [`video_backlog_budget_from_env`]:
+/// `ARCEN_VIDEO_BACKLOG=legacy` restores the capacity-only queue.
+pub const VIDEO_BACKLOG_ENV: &str = "ARCEN_VIDEO_BACKLOG";
+
+/// [`video_backlog_budget`] unless the operator set
+/// [`VIDEO_BACKLOG_ENV`] to `legacy`.
+#[must_use]
+pub fn video_backlog_budget_from_env(contract_fps: u32) -> Option<Duration> {
+    (!video_backlog_is_legacy_from_env()).then(|| video_backlog_budget(contract_fps))
+}
+
+/// Whether the operator restored the capacity-only queue with
+/// `ARCEN_VIDEO_BACKLOG=legacy`.
+#[must_use]
+pub fn video_backlog_is_legacy_from_env() -> bool {
+    std::env::var(VIDEO_BACKLOG_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("legacy"))
+}
+
+/// How long a frame producer waits for room in a full send queue before it
+/// lets the queue's drop-and-keyframe recovery take over: past this the link
+/// is not slow but gone.
+pub const VIDEO_ROOM_WAIT: Duration = Duration::from_millis(500);
+
+/// Encoded frames a split Pier's desktop agent may have handed to its
+/// network relay that the relay has not yet released into the video lane.
+///
+/// A single-process Pier's writer takes a frame from the shared queue and
+/// then waits for room in the video lane, so its backlog budget sees every
+/// frame the network has not taken. A split Pier (the Windows broker and
+/// agent, ADR 0014) has a local socket and the relay's own backlog between
+/// the agent's queue and the lane; without this window those frames wait
+/// where no budget sees them. With one frame outstanding the relay always
+/// has the next frame ready when the lane takes one, and every older frame
+/// waits in the agent's shared queue, under its budget.
+pub const RELAYED_VIDEO_FRAMES_IN_FLIGHT: u64 = 1;
+
+/// How long a blocked [`RelayedVideoWindow`] waits without the relay
+/// releasing anything before it lets one more frame through. Reports cross a
+/// reliable local socket, so a quiet relay means a slow lane (a large
+/// keyframe at a low bitrate, a QUIC stall), not lost reports: the window
+/// keeps counting and only paces one frame per period past the limit.
+pub const RELAYED_VIDEO_RESYNC: Duration = Duration::from_secs(1);
+
+/// The agent-side half of a split Pier's frames-in-flight limit: the video
+/// frames this attachment handed to its relay, against the relay's running
+/// count of frames it released (sent into the lane, or dropped by its own
+/// policy). Both counts start with the attachment and are never reset, so
+/// what is in flight is always `sent - released`.
+///
+/// It stays open until the first release report arrives, so a relay that
+/// never reports (an older service, a transport without lanes, or
+/// `ARCEN_VIDEO_BACKLOG=legacy` on the service) keeps the previous
+/// behaviour. Once a report arrived the limit stays on.
+#[derive(Debug, Clone)]
+pub struct RelayedVideoWindow {
+    limit: u64,
+    sent: u64,
+    released: u64,
+    active: bool,
+    blocked_since: Option<Instant>,
+    resyncs: u64,
+}
+
+impl Default for RelayedVideoWindow {
+    fn default() -> Self {
+        Self::new(RELAYED_VIDEO_FRAMES_IN_FLIGHT)
+    }
+}
+
+impl RelayedVideoWindow {
+    /// A window allowing `limit` frames (at least one) in flight.
+    #[must_use]
+    pub const fn new(limit: u64) -> Self {
+        Self {
+            limit: if limit == 0 { 1 } else { limit },
+            sent: 0,
+            released: 0,
+            active: false,
+            blocked_since: None,
+            resyncs: 0,
+        }
+    }
+
+    /// Whether the writer may hand the relay another frame at `now`: below
+    /// the limit, or blocked for [`RELAYED_VIDEO_RESYNC`] without the relay
+    /// releasing anything (one frame; [`Self::note_sent_at`] restarts the
+    /// period).
+    pub fn admits(&mut self, now: Instant) -> bool {
+        if !self.active || self.outstanding() < self.limit {
+            self.blocked_since = None;
+            return true;
+        }
+        let since = *self.blocked_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= RELAYED_VIDEO_RESYNC
+    }
+
+    /// When a blocked window lets the next frame through if the relay
+    /// releases nothing first.
+    #[must_use]
+    pub fn resync_at(&self) -> Option<Instant> {
+        self.blocked_since.map(|since| since + RELAYED_VIDEO_RESYNC)
+    }
+
+    /// The writer handed the relay one video frame at `now`. Counted whether
+    /// or not the window is active yet.
+    pub fn note_sent_at(&mut self, now: Instant) {
+        if self.active && self.outstanding() >= self.limit {
+            // The stall allowance was used: the next one is a period away.
+            self.blocked_since = Some(now);
+            self.resyncs = self.resyncs.saturating_add(1);
+        }
+        self.sent = self.sent.saturating_add(1);
+    }
+
+    /// The relay has released `released` video frames of this attachment in
+    /// total. The first report activates the window; a count that does not
+    /// grow changes nothing.
+    pub fn note_released_total(&mut self, released: u64) {
+        self.active = true;
+        if released > self.released {
+            self.released = released;
+            self.blocked_since = None;
+        }
+    }
+
+    /// Whether a release report has been seen.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Frames handed to the relay and not yet released by it.
+    #[must_use]
+    pub const fn outstanding(&self) -> u64 {
+        self.sent.saturating_sub(self.released)
+    }
+
+    /// Frames let through past the limit because the relay released nothing
+    /// for [`RELAYED_VIDEO_RESYNC`].
+    #[must_use]
+    pub const fn resyncs(&self) -> u64 {
+        self.resyncs
+    }
+}
+
 /// Whether an async adapter should keep waiting for writer room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomState {
@@ -279,6 +450,7 @@ pub struct SharedVideoQueue<T> {
     wait_total: Duration,
     wait_max: Duration,
     wait_frames: u64,
+    backlog_budget: Option<Duration>,
 }
 
 impl<T> SharedVideoQueue<T> {
@@ -311,7 +483,15 @@ impl<T> SharedVideoQueue<T> {
             wait_total: Duration::ZERO,
             wait_max: Duration::ZERO,
             wait_frames: 0,
+            backlog_budget: None,
         }
+    }
+
+    /// Bounds how long ordinary frames may wait for the writer before
+    /// [`Self::room_state_at`] reports [`RoomState::Full`]; see
+    /// [`video_backlog_budget`]. `None` keeps the capacity-only rule.
+    pub fn set_backlog_budget(&mut self, budget: Option<Duration>) {
+        self.backlog_budget = budget;
     }
 
     /// Enqueues one AU or suppresses it according to the shared policy.
@@ -535,17 +715,35 @@ impl<T> SharedVideoQueue<T> {
     /// Returns whether the writer should wait for ordinary queue capacity.
     #[must_use]
     pub fn room_state(&self) -> RoomState {
+        self.room_state_at(Instant::now())
+    }
+
+    /// [`Self::room_state`] at a caller-injected time: full at capacity, or,
+    /// with a backlog budget, once at least [`MIN_VIDEO_BACKLOG_FRAMES`] wait
+    /// and the oldest has waited the whole budget.
+    #[must_use]
+    pub fn room_state_at(&self, now: Instant) -> RoomState {
         let ordinary = !self.closed
             && !self.paused
             && !self.awaiting_keyframe
             && !self.generation_chain
             && !self.protected_front;
         if !ordinary {
-            RoomState::NotOrdinary
-        } else if self.deque.len() < self.capacity {
-            RoomState::HasRoom
-        } else {
+            return RoomState::NotOrdinary;
+        }
+        if self.deque.len() >= self.capacity {
+            return RoomState::Full;
+        }
+        let over_budget = self.backlog_budget.is_some_and(|budget| {
+            self.deque.len() >= MIN_VIDEO_BACKLOG_FRAMES
+                && self.deque.front().is_some_and(|oldest| {
+                    now.saturating_duration_since(oldest.enqueued_at) >= budget
+                })
+        });
+        if over_budget {
             RoomState::Full
+        } else {
+            RoomState::HasRoom
         }
     }
 
@@ -788,6 +986,41 @@ mod tests {
 
     fn byte(value: usize) -> u8 {
         u8::try_from(value).expect("test value fits u8")
+    }
+
+    #[test]
+    fn backlog_budget_scales_with_the_contract_rate_within_bounds() {
+        assert_eq!(video_backlog_budget(60), Duration::from_nanos(33_333_333));
+        assert_eq!(video_backlog_budget(30), Duration::from_nanos(66_666_666));
+        assert_eq!(video_backlog_budget(240), Duration::from_millis(20));
+        assert_eq!(video_backlog_budget(0), Duration::from_millis(100));
+        assert_eq!(video_backlog_budget(10), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_stale_backlog_refuses_room_until_the_writer_catches_up() {
+        let mut q = queue();
+        let budget = Duration::from_millis(33);
+        q.set_backlog_budget(Some(budget));
+        let start = Instant::now();
+        assert!(push_p(&mut q, 1, start).enqueued());
+        // One old frame never throttles: the writer may just not have woken.
+        assert_eq!(q.room_state_at(start + budget * 4), RoomState::HasRoom);
+        assert!(push_p(&mut q, 2, start + Duration::from_millis(16)).enqueued());
+        assert_eq!(
+            q.room_state_at(start + Duration::from_millis(20)),
+            RoomState::HasRoom
+        );
+        assert_eq!(q.room_state_at(start + budget), RoomState::Full);
+        // The frames are kept, not dropped: the chain stays intact.
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.frames_dropped(), 0);
+        assert_eq!(q.pop_front(), Some(vec![1]));
+        assert_eq!(q.room_state_at(start + budget), RoomState::HasRoom);
+        // Without a budget only capacity counts.
+        q.set_backlog_budget(None);
+        assert!(push_p(&mut q, 3, start).enqueued());
+        assert_eq!(q.room_state_at(start + budget * 10), RoomState::HasRoom);
     }
 
     #[test]
@@ -1141,5 +1374,76 @@ mod tests {
         assert_eq!(q.frames_sent(), 2);
         assert_eq!(q.bytes_sent(), 5);
         assert_eq!(q.keyframe_bytes_sent(), 3);
+    }
+
+    #[test]
+    fn a_relayed_window_stays_open_until_the_relay_reports_and_counts_from_the_start() {
+        let now = Instant::now();
+        let mut window = RelayedVideoWindow::default();
+        for _ in 0..5 {
+            assert!(window.admits(now));
+            window.note_sent_at(now);
+        }
+        assert!(!window.is_active());
+        // The relay has released four of the five frames sent so far.
+        window.note_released_total(4);
+        assert!(window.is_active());
+        assert_eq!(window.outstanding(), 1);
+        assert!(!window.admits(now), "one frame already waits in the relay");
+        window.note_released_total(5);
+        assert!(window.admits(now));
+    }
+
+    #[test]
+    fn a_relayed_window_holds_one_frame_in_flight() {
+        let now = Instant::now();
+        let mut window = RelayedVideoWindow::default();
+        window.note_released_total(0);
+        assert!(window.admits(now));
+        window.note_sent_at(now);
+        assert!(!window.admits(now));
+        assert_eq!(window.resync_at(), Some(now + RELAYED_VIDEO_RESYNC));
+        // A report that does not grow frees nothing.
+        window.note_released_total(0);
+        assert!(!window.admits(now));
+        window.note_released_total(1);
+        assert!(window.admits(now + Duration::from_millis(5)));
+        assert_eq!(window.resync_at(), None);
+    }
+
+    /// The reviewer's case: a slow lane stays quiet for 1.5 s while the agent
+    /// has frames queued. The window lets one frame per period through,
+    /// keeps counting, and once the relay catches up holds one frame in
+    /// flight again instead of forgetting the frames it sent meanwhile.
+    #[test]
+    fn a_quiet_relay_paces_one_extra_frame_per_period_and_the_backlog_returns_to_one() {
+        let start = Instant::now();
+        let mut window = RelayedVideoWindow::default();
+        let mut released = 0;
+        window.note_released_total(released);
+        // Steady state: one in flight.
+        assert!(window.admits(start));
+        window.note_sent_at(start);
+        // The lane stalls for 1.5 s; the writer polls every 10 ms.
+        let mut let_through = 0;
+        for tick in 1..=150 {
+            let now = start + Duration::from_millis(10 * tick);
+            if window.admits(now) {
+                window.note_sent_at(now);
+                let_through += 1;
+            }
+        }
+        assert_eq!(let_through, 1, "one frame per quiet second");
+        assert_eq!(window.outstanding(), 2);
+        assert!(window.is_active(), "the limit never turns off");
+        // The lane drains what it holds.
+        released += 2;
+        let later = start + Duration::from_millis(1600);
+        window.note_released_total(released);
+        assert_eq!(window.outstanding(), 0);
+        assert!(window.admits(later));
+        window.note_sent_at(later);
+        assert!(!window.admits(later), "back to one frame in flight");
+        assert_eq!(window.outstanding(), 1);
     }
 }

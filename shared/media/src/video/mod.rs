@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure video frame, conversion, backend-plan, and optional software-codec APIs.
 
 mod bitrate;
@@ -16,6 +18,7 @@ mod desktop_encoding;
 mod fps_limiter;
 mod frame;
 mod frame_queue;
+mod host_converted_capture;
 mod intent;
 mod obu;
 pub mod pipeline;
@@ -66,8 +69,8 @@ pub use capture_surface::{
     CaptureGeometry, CaptureImporter, CaptureMemory, CapturePixelFormat, CaptureSurface,
     CaptureSurfaceError, CaptureTimestamps, CopyPath, CursorEvidence, DamageEvidence,
     FormatModifier, GpuIdentity, GpuMatch, MAX_CAPTURE_DAMAGE_RECTS, MAX_CAPTURE_PLANES,
-    ModifierClass, PciAddress, PlaneLayout, SamplePrecision, SourceColour, SourceFact,
-    SourcePrecision, SourceTransfer, ValidatedCaptureSurface, compare_gpus,
+    ModifierClass, PciAddress, PlaneLayout, SamplePrecision, SdrContentCurve, SourceColour,
+    SourceFact, SourcePrecision, SourceTransfer, ValidatedCaptureSurface, compare_gpus,
 };
 pub use convert::{
     ColorTransform, ConversionError, FrameRegion, PackedRgb10Layout, Rgb10Signal,
@@ -84,9 +87,10 @@ pub use desktop_depth::{
     DepthDecision, DepthReason, DesktopDepth, DesktopDepthPolicy, FixedDepthOutcome,
     choose_desktop_depth, serve_on_fixed_depth,
 };
+pub(crate) use desktop_encoding::fidelity_sdr_transfer;
 pub use desktop_encoding::{
     DesktopPlan, DesktopPlanError, DesktopSignalEncoding, conversion_for_output,
-    resolve_desktop_plan,
+    resolve_desktop_plan, sdr_desktop_transfer, serve_sdr_desktop,
 };
 pub use fps_limiter::{FrameRateLimiter, FrameRateVerdict, FrameRateWindow, classify_frame_rate};
 pub use frame::{
@@ -95,7 +99,14 @@ pub use frame::{
 };
 pub use frame_queue::{
     FrameClassification, FullFrameRequestCoalescer, FullFrameRequestDecision, KeyframeRequestRetry,
-    PinGenerationRecovery, RoomState, SharedVideoQueue, VideoQueuePush, VideoQueueWaitStats,
+    MIN_VIDEO_BACKLOG_FRAMES, PinGenerationRecovery, RELAYED_VIDEO_FRAMES_IN_FLIGHT,
+    RELAYED_VIDEO_RESYNC, RelayedVideoWindow, RoomState, SharedVideoQueue, VIDEO_BACKLOG_ENV,
+    VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats, video_backlog_budget,
+    video_backlog_budget_from_env, video_backlog_is_legacy_from_env,
+};
+pub use host_converted_capture::{
+    HOST_CONVERTED_CAPTURE_MAX_EDGE, HOST_CONVERTED_CAPTURE_MAX_PIXELS, fit_host_converted_capture,
+    host_converted_capture_fits,
 };
 pub use intent::{
     ClientVideoRequestError, ResolvedClientVideoRequest, resolve_client_video_request,
@@ -103,16 +114,17 @@ pub use intent::{
 pub use obu::av1_low_overhead_has_sequence_header;
 pub use pipeline::{
     BitratePolicy, CodecPolicy, DecodeLatencyPolicy, EncodedFrameOverflowDisposition,
-    EncodedFrameOverflowPolicy, KeelPolicy, KeyframePolicy, PROVEN_PATH_CEILING_BPS,
-    PROVEN_PATH_HEADROOM, PipelineContract, PipelineId, PipelineQpMapDefault, QueuePolicy,
-    RawFrameOverflowDisposition, RawFrameOverflowPolicy, ServedPipelineContext,
-    SoftwareFallbackDecision, aggregate_encoder_backend, aggregate_plan_encoder_backend,
-    clamp_live_bitrate_target, operational_bitrate_bounds, operational_encode_intent,
-    operational_encoder_bitrate_bounds, operational_keyframe_policy, operational_motion_priority,
-    operational_pipeline, operational_rate_control_policy, pipeline_codec_ladder,
-    pipeline_contract, pipeline_for_request, proven_path_ceiling_bps, resolve_request_pipeline,
-    served_pipeline, served_pipeline_wants_display_hdr, session_wants_display_hdr,
-    software_fallback_decision,
+    EncodedFrameOverflowPolicy, FidelityRefusal, KeelPolicy, KeyframePolicy,
+    PROVEN_PATH_CEILING_BPS, PROVEN_PATH_HEADROOM, PipelineContract, PipelineId,
+    PipelineQpMapDefault, QueuePolicy, RawFrameOverflowDisposition, RawFrameOverflowPolicy,
+    ServedPipelineContext, SoftwareFallbackDecision, aggregate_encoder_backend,
+    aggregate_plan_encoder_backend, clamp_live_bitrate_target, coded_fidelity_refusal,
+    operational_bitrate_bounds, operational_encode_intent, operational_encoder_bitrate_bounds,
+    operational_keyframe_policy, operational_motion_priority, operational_pipeline,
+    operational_rate_control_policy, pipeline_codec_ladder, pipeline_contract,
+    pipeline_for_request, proven_path_ceiling_bps, resolve_request_pipeline, served_pipeline,
+    served_pipeline_wants_display_hdr, session_wants_display_hdr, software_fallback_decision,
+    software_fallback_decision_after_hardware,
 };
 pub use plan::{
     AcceleratorClass, BackendAvailability, BackendCandidate, BackendLimits,

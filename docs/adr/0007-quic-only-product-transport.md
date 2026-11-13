@@ -1,6 +1,6 @@
 # ADR 0007: QUIC-Only Product Transport
 
-**Status:** Accepted (2026-07-31) — implemented in PR #120 (`feature/quic-end-to-end`, head `9e09a26`)
+**Status:** Accepted (2026-07-31) — implemented 2026-07-31
 
 **Fleet validation:**
 - pier-linux.example.internal (Linux): 8,881 frames decoded, keyboard + mouse + scroll, UDP 18444, RTT ~35 ms
@@ -15,8 +15,8 @@ delivery improvements on some hosts, including the strongest operator
 experience on pier-windows.example.internal, while also showing that presentation and audio
 bottlenecks remain above the transport layer.
 
-The product owner selected QUIC as the forward transport for technical
-positioning and future development. Shipping both WSS and QUIC would preserve
+Arcen uses QUIC as its forward transport for its technical position and
+future development. Shipping both WSS and QUIC would preserve
 two network attack surfaces, two operational port models, a runtime selector,
 and a fallback path that could quietly reverse that decision.
 

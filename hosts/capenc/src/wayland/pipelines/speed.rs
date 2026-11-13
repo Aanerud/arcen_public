@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `linux-wayland-speed`: the Wayland Speed composition.
 //!
 //! Speed is the shared motion-first contract (`arcen_media::video::pipeline`
@@ -143,6 +145,7 @@ mod tests {
             width: 1920,
             height: 1080,
             max_fps: 60,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 

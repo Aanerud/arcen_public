@@ -49,6 +49,9 @@
         "video::variant"
       ],
       "forwarded_features": {
+        "lossless-refine": [
+          "refine-zstd-encode"
+        ],
         "software-av1": [
           "software-av1-source"
         ],
@@ -57,6 +60,12 @@
         ]
       },
       "production_uses": [
+        {
+          "id": "host-converted-capture-budget",
+          "gate": 1,
+          "symbol": "host_converted_capture_fits",
+          "reason": "capenc's depth-30 XShm capture checks the same pixel budget the Pier fits a ten-bit session to, so the two cannot disagree about which desktop the GPU path serves."
+        },
         {
           "id": "desktop-conversion",
           "gate": 1,
@@ -309,6 +318,7 @@
         "audio::playout",
         "clipboard",
         "clipboard::image",
+        "colour_check",
         "crate",
         "cursor",
         "deck_platform",
@@ -452,7 +462,11 @@
         },
         {
           "id": "macos-deck-session",
-          "entry_points": ["clients/macos/src/ui/app.rs", "clients/macos/src/main.rs"],
+          "entry_points": [
+            "clients/macos/src/ui/app.rs",
+            "clients/macos/src/main.rs",
+            "clients/macos/src/ui/colour_check.rs"
+          ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -521,6 +535,18 @@
       ],
       "features": ["audio-opus"],
       "production_uses": [
+        {
+          "id": "host-converted-capture-fit",
+          "gate": 1,
+          "symbol": "fit_host_converted_capture",
+          "reason": "A ten-bit Xorg session is armed at a geometry the depth-30 XShm path accepts, so a large Deck display is served smaller with its shape kept instead of falling through to a software refusal."
+        },
+        {
+          "id": "fidelity-refusal-cause",
+          "gate": 1,
+          "symbol": "software_fallback_decision_after_hardware",
+          "reason": "A Grading or HDR refusal after the GPU encoder was unavailable names the hardware cause instead of only that software is 8-bit."
+        },
         {
           "id": "x11-desktop-depth",
           "gate": 1,
@@ -990,6 +1016,24 @@
           "gate": 6,
           "symbol": "take_wait_stats",
           "reason": "Linux and Windows feed the shared controller real host-side video queue wait instead of hiding QUIC/application backlog."
+        },
+        {
+          "id": "relayed-video-window",
+          "gate": 6,
+          "symbol": "RelayedVideoWindow",
+          "reason": "The agent keeps one video frame unreleased in the broker's lane relay, so a slow path holds frames in its budgeted shared queue instead of the relay's backlog."
+        },
+        {
+          "id": "video-backlog-budget",
+          "gate": 6,
+          "symbol": "video_backlog_budget",
+          "reason": "Linux and Windows stop taking encoded frames once the oldest queued frame waited two frame periods, so a slow path stalls the encoder rather than aging pictures."
+        },
+        {
+          "id": "fidelity-refusal-cause",
+          "gate": 1,
+          "symbol": "coded_fidelity_refusal",
+          "reason": "A Grading or HDR refusal leads with the shared code of the GPU encoder's typed cause instead of only saying that software is 8-bit."
         }
       ],
       "paths": [

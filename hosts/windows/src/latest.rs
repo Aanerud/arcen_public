@@ -1,7 +1,27 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tokio::sync::Notify;
+
+static VIDEO_BACKLOG_LEGACY: AtomicBool = AtomicBool::new(false);
+
+/// Records the service's `ARCEN_VIDEO_BACKLOG=legacy` choice in a session
+/// agent, which runs with the signed-in user's environment, not the
+/// service's (`AgentStart::video_backlog_legacy`).
+pub fn set_video_backlog_legacy(legacy: bool) {
+    VIDEO_BACKLOG_LEGACY.store(legacy, Ordering::Relaxed);
+}
+
+/// Whether this process serves video the pre-budget way: the service's
+/// environment, or the flag its broker handed this agent.
+pub fn video_backlog_legacy() -> bool {
+    VIDEO_BACKLOG_LEGACY.load(Ordering::Relaxed)
+        || arcen_media::video::video_backlog_is_legacy_from_env()
+}
 
 struct State<T> {
     items: VecDeque<T>,
@@ -98,11 +118,20 @@ pub enum VideoPushResult<T> {
     Closed(T),
 }
 
+impl<T> VideoPushResult<T> {
+    pub const fn enqueued(&self) -> bool {
+        matches!(self, Self::Enqueued { .. })
+    }
+}
+
 /// Platform-local async wrapper around the shared video policy. Audio
 /// intentionally continues to use [`LatestQueue`].
 pub struct VideoQueue<T> {
     state: Mutex<arcen_media::video::SharedVideoQueue<T>>,
     notify: Notify,
+    /// Signalled whenever the consumer takes, clears or closes, for
+    /// [`Self::wait_for_room`].
+    room: Notify,
 }
 
 impl<T> VideoQueue<T> {
@@ -117,6 +146,46 @@ impl<T> VideoQueue<T> {
                     .keyframe_request_min_interval,
             )),
             notify: Notify::new(),
+            room: Notify::new(),
+        }
+    }
+
+    /// Bounds how long frames may wait for the consumer before
+    /// [`Self::wait_for_room`] holds the producer back
+    /// (`arcen_media::video::video_backlog_budget` of the contract rate).
+    pub fn set_backlog_budget(&self, budget: Option<std::time::Duration>) {
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .set_backlog_budget(budget);
+    }
+
+    /// Waits until an ordinary enqueue would neither overflow nor exceed the
+    /// backlog budget, for at most `max_wait` when one is given. Returns at
+    /// once when the queue is recovering, paused or closed: those states
+    /// have their own rules. Returns whether there is room.
+    pub async fn wait_for_room(&self, max_wait: Option<std::time::Duration>) -> bool {
+        let deadline = max_wait.map(|wait| tokio::time::Instant::now() + wait);
+        loop {
+            let room = self.room.notified();
+            match self
+                .state
+                .lock()
+                .expect("video queue lock poisoned")
+                .room_state()
+            {
+                arcen_media::video::RoomState::NotOrdinary => return false,
+                arcen_media::video::RoomState::HasRoom => return true,
+                arcen_media::video::RoomState::Full => {}
+            }
+            match deadline {
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, room).await.is_err() {
+                        return false;
+                    }
+                }
+                None => room.await,
+            }
         }
     }
 
@@ -168,6 +237,8 @@ impl<T> VideoQueue<T> {
             {
                 let mut state = self.state.lock().expect("video queue lock poisoned");
                 if let Some(item) = state.pop_front() {
+                    drop(state);
+                    self.room.notify_waiters();
                     return Some(item);
                 }
                 if state.is_closed() {
@@ -179,10 +250,15 @@ impl<T> VideoQueue<T> {
     }
 
     pub fn try_pop(&self) -> Option<T> {
-        self.state
+        let item = self
+            .state
             .lock()
             .expect("video queue lock poisoned")
-            .pop_front()
+            .pop_front();
+        if item.is_some() {
+            self.room.notify_waiters();
+        }
+        item
     }
 
     pub fn is_closed(&self) -> bool {
@@ -205,10 +281,13 @@ impl<T> VideoQueue<T> {
     }
 
     pub fn clear(&self) -> usize {
-        self.state
+        let cleared = self
+            .state
             .lock()
             .expect("video queue lock poisoned")
-            .clear()
+            .clear();
+        self.room.notify_waiters();
+        cleared
     }
 
     pub fn close(&self) {
@@ -217,6 +296,7 @@ impl<T> VideoQueue<T> {
             .expect("video queue lock poisoned")
             .close();
         self.notify.notify_waiters();
+        self.room.notify_waiters();
     }
 
     /// Close the queue **and discard any buffered items immediately**, so
@@ -235,6 +315,7 @@ impl<T> VideoQueue<T> {
             .expect("video queue lock poisoned")
             .close_and_clear();
         self.notify.notify_waiters();
+        self.room.notify_waiters();
     }
 
     #[cfg(test)]
@@ -335,6 +416,43 @@ mod tests {
         queue.close();
         assert!(matches!(queue.push(9, true), VideoPushResult::Closed(9)));
         assert_eq!(queue.pop().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_full_budgeted_queue_holds_the_producer_until_the_consumer_takes() {
+        let queue = std::sync::Arc::new(VideoQueue::new(8));
+        queue.set_backlog_budget(Some(std::time::Duration::from_millis(20)));
+        assert!(queue.push(1, true).enqueued());
+        assert!(queue.push(2, false).enqueued());
+        assert!(queue.wait_for_room(None).await, "fresh frames leave room");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !queue
+                .wait_for_room(Some(std::time::Duration::from_millis(10)))
+                .await,
+            "two frames older than the budget refuse room"
+        );
+        let waiter = {
+            let queue = std::sync::Arc::clone(&queue);
+            tokio::spawn(async move { queue.wait_for_room(None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        assert_eq!(queue.try_pop(), Some(1));
+        assert!(waiter.await.unwrap(), "a take frees room");
+    }
+
+    #[tokio::test]
+    async fn closing_releases_a_producer_waiting_for_room() {
+        let queue = std::sync::Arc::new(VideoQueue::new(1));
+        assert!(queue.push(1, false).enqueued());
+        let waiter = {
+            let queue = std::sync::Arc::clone(&queue);
+            tokio::spawn(async move { queue.wait_for_room(None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        queue.close();
+        assert!(!waiter.await.unwrap());
     }
 
     #[tokio::test]

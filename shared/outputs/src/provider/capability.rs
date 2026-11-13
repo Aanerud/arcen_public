@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Unified output capability semantics and the shared admission gate.
 //!
 //! Section 5 of ADR 0010: every field here is *semantic*. It states what the

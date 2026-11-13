@@ -35,7 +35,7 @@
     <array>
         <string>arcen-usb-helper</string>
         <string>--socket</string>
-        <string>/var/run/arcen-usb-helper.sock</string>
+        <string>/private/var/db/arcen/run/usb-helper.sock</string>
     </array>
 
     <!-- Started on demand and kept alive: the helper holds no device until a

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Lab-gated Hard USB responders.
 //!
 //! Physical capture lives in the separate privileged `arcen-usb-helper`
@@ -32,6 +34,10 @@ enum ResponderMode {
     /// Physical capture, performed by the privileged helper process. Deck never
     /// touches the device itself; see docs/adr/0011-macos-privileged-usb-helper.md.
     Helper(Box<crate::usb_helper_client::HelperClient>),
+    /// A lab-only emulated device fed through the shared exporter in-process
+    /// (`--usb-emulate`); nothing is captured.
+    #[cfg(feature = "usb-emulate-lab")]
+    Emulated(Box<crate::usb_emulate::EmulatedResponder>),
 }
 
 impl UsbHardResponder {
@@ -39,9 +45,17 @@ impl UsbHardResponder {
     /// deterministic synthetic responder when `ARCEN_USB_HARD_SYNTHETIC=1`.
     ///
     /// Deck deliberately does not capture the device in-process: that would
-    /// require running the whole app as root, which Apple rejected and which
-    /// was measured corrupting Deck's own configuration ownership.
+    /// require running the whole app as root, which leaves its per-user
+    /// configuration owned by root (ADR 0011).
     pub async fn start() -> Result<Self, String> {
+        #[cfg(feature = "usb-emulate-lab")]
+        if let Some((device, playback)) = crate::usb_emulate::selected() {
+            return Ok(Self {
+                mode: ResponderMode::Emulated(Box::new(
+                    crate::usb_emulate::EmulatedResponder::start(device, playback)?,
+                )),
+            });
+        }
         if std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() == Some("1") {
             return Ok(Self {
                 mode: ResponderMode::Synthetic(LabUsbTablet::default()),
@@ -62,6 +76,7 @@ impl UsbHardResponder {
             socket = %socket,
             vendor_id = client.device().vendor_id,
             product_id = client.device().product_id,
+            backend = client.backend(),
             "privileged USB helper captured the device for Hard USB"
         );
         Ok(Self {
@@ -84,6 +99,8 @@ impl UsbHardResponder {
                 )],
             },
             ResponderMode::Helper(client) => client.device(),
+            #[cfg(feature = "usb-emulate-lab")]
+            ResponderMode::Emulated(emulated) => emulated.device(),
         }
     }
 
@@ -107,6 +124,11 @@ impl UsbHardResponder {
                 client.submit(header, payload).await?;
                 Ok(SubmitResult::Pending)
             }
+            #[cfg(feature = "usb-emulate-lab")]
+            ResponderMode::Emulated(emulated) => {
+                emulated.submit(header, payload)?;
+                Ok(SubmitResult::Pending)
+            }
         }
     }
 
@@ -124,24 +146,31 @@ impl UsbHardResponder {
                 client.cancel(generation, urb_id).await?;
                 Ok(None)
             }
+            #[cfg(feature = "usb-emulate-lab")]
+            ResponderMode::Emulated(emulated) => emulated.cancel(generation, urb_id).map(Some),
         }
     }
 
     #[must_use]
     pub const fn has_async_completions(&self) -> bool {
-        matches!(self.mode, ResponderMode::Helper(_))
+        !matches!(self.mode, ResponderMode::Synthetic(_))
     }
 
     pub async fn next_completion(&mut self) -> Result<Vec<u8>, String> {
         match &mut self.mode {
             ResponderMode::Helper(client) => client.next_completion().await,
+            #[cfg(feature = "usb-emulate-lab")]
+            ResponderMode::Emulated(emulated) => emulated.next_completion().await,
             ResponderMode::Synthetic(_) => std::future::pending().await,
         }
     }
 
     pub async fn shutdown(self) {
-        if let ResponderMode::Helper(client) = self.mode {
-            client.shutdown().await;
+        match self.mode {
+            ResponderMode::Helper(client) => client.shutdown().await,
+            #[cfg(feature = "usb-emulate-lab")]
+            ResponderMode::Emulated(emulated) => emulated.shutdown().await,
+            ResponderMode::Synthetic(_) => {}
         }
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 
 use arcen_protocol::messages::{ClientNetworkSnapshotMsg, NetworkInterfaceKind, NetworkScopeMsg};
@@ -40,6 +43,24 @@ pub fn probe(host: &str, port: u16) -> NetworkProbeResult {
         snapshot,
         permission: NetworkIdentityPermission::NotRequested,
     }
+}
+
+/// The interface traffic to `peer` leaves through, as `Wi-Fi (en0)`, and its
+/// MTU. For the connection test's path step.
+pub fn outgoing_interface(peer: IpAddr) -> (Option<String>, Option<u32>) {
+    let Some((name, mtu, _)) = source_address(peer).and_then(interface_for_address) else {
+        return (None, None);
+    };
+    let mtu = mtu.or_else(|| link_mtu(&name));
+    let kind = match classify_interface_name(&name) {
+        NetworkInterfaceKind::Ethernet => "Ethernet",
+        NetworkInterfaceKind::Wifi => "Wi-Fi",
+        NetworkInterfaceKind::Cellular => "Cellular",
+        NetworkInterfaceKind::Vpn => "VPN",
+        NetworkInterfaceKind::Loopback => "Loopback",
+        NetworkInterfaceKind::Other => "Other",
+    };
+    (Some(format!("{kind} ({name})")), mtu)
 }
 
 fn source_address(peer: IpAddr) -> Option<IpAddr> {
@@ -126,6 +147,43 @@ fn sockaddr_ip(address: *const libc::sockaddr) -> Option<IpAddr> {
 
 #[cfg(not(unix))]
 fn interface_for_address(_address: IpAddr) -> Option<(String, Option<u32>, Option<u32>)> {
+    None
+}
+
+/// The MTU Darwin reports on the interface's link-layer (`AF_LINK`) entry.
+/// Address entries carry no `if_data`, so an address lookup alone finds none.
+#[cfg(target_os = "macos")]
+fn link_mtu(name: &str) -> Option<u32> {
+    use std::ffi::CStr;
+    use std::ptr;
+
+    let mut interfaces: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: getifaddrs initializes a linked list owned by freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return None;
+    }
+    let mut cursor = interfaces;
+    let mut found = None;
+    while !cursor.is_null() {
+        // SAFETY: cursor belongs to the live getifaddrs list.
+        let item = unsafe { &*cursor };
+        // SAFETY: a non-null ifa_addr points at a sockaddr with a family.
+        let is_link = !item.ifa_addr.is_null()
+            && i32::from(unsafe { (*item.ifa_addr).sa_family }) == libc::AF_LINK;
+        // SAFETY: ifa_name is a NUL-terminated interface name for this item.
+        if is_link && unsafe { CStr::from_ptr(item.ifa_name) }.to_bytes() == name.as_bytes() {
+            found = interface_facts(item).0;
+            break;
+        }
+        cursor = item.ifa_next;
+    }
+    // SAFETY: interfaces is the original pointer returned by getifaddrs.
+    unsafe { libc::freeifaddrs(interfaces) };
+    found
+}
+
+#[cfg(not(target_os = "macos"))]
+fn link_mtu(_name: &str) -> Option<u32> {
     None
 }
 

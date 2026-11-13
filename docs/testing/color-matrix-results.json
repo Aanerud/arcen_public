@@ -32,7 +32,7 @@
         "reference_mode": "macOS default; no display reference preset was independently recorded"
       },
       "recorded_at": "2026-08-14T21:10:02Z",
-      "arcen_commit": "086edeeed0aac87ca7275892318fa81dac093453"
+      "arcen_commit": "development build"
     },
     {
       "environment_id": "linux-grid-v100d-16q-m4-pro-macos-26.6.1",
@@ -50,7 +50,7 @@
         "reference_mode": "macOS default; no display reference preset was independently recorded"
       },
       "recorded_at": "2026-08-15T07:00:13Z",
-      "arcen_commit": "1d202cc0338a88b0969ada3e2f01dfb6c448e774"
+      "arcen_commit": "development build"
     },
     {
       "environment_id": "linux-l40s-24q-m4-pro-macos-26.6.1",
@@ -69,8 +69,8 @@
         "reference_mode": "macOS default; no display reference preset was independently recorded"
       },
       "recorded_at": "2026-08-15T19:51:51Z",
-      "arcen_commit": "7e217080987b6c9ba718a08dbc8c34bf7e2e50bf",
-      "source_state": "uncommitted feat/av1-royalty-free-tier test tree",
+      "arcen_commit": "development build",
+      "source_state": "development test tree; no public source revision recorded",
       "pier_artifact_sha256": "70fd247b0d891a3ff19d99032ced82c51d8958a45559c6ea93471e2655c5b328"
     }
   ],
@@ -121,7 +121,7 @@
       "roundtrip_pattern": "grey_ramp",
       "sustained_fps": 42.40198200541952,
       "bitrate_mbps": 16.55084496891593,
-      "notes": "Target row succeeded in a required-hardware VideoToolbox session and delivered xf44. Five-pattern maxima: grey_ramp=0, shadow_highlight_wedge=1, saturated_primaries=0, chroma_detail=1, full_gamut_noise=252. A live pier-windows.example.internal session on its configured GRID V100D-16Q also logged variant=hevc-444-10-full-bt709, full-range VUI and READY bit_depth=10 range=full; Deck displayed the desktop and reported negotiated exactly as requested. Retest on pier-linux.example.internal's GRID V100D-16Q at 1d202cc: the Linux matrix initialised both HEVC 4:4:4 and 4:2:0 10-bit rows; ffprobe reported Rext yuv444p10le full-range BT.709; the corrected per-frame wire flags made Deck receive xf44-full, decode 1800x1130 in hardware, and report negotiated exactly as requested."
+      "notes": "Target row succeeded in a required-hardware VideoToolbox session and delivered xf44. Five-pattern maxima: grey_ramp=0, shadow_highlight_wedge=1, saturated_primaries=0, chroma_detail=1, full_gamut_noise=252. A live pier-windows.example.internal session on its configured GRID V100D-16Q also logged variant=hevc-444-10-full-bt709, full-range VUI and READY bit_depth=10 range=full; Deck displayed the desktop and reported negotiated exactly as requested. Retest on pier-linux.example.internal's GRID V100D-16Q: the Linux matrix initialised both HEVC 4:4:4 and 4:2:0 10-bit rows; ffprobe reported Rext yuv444p10le full-range BT.709; the corrected per-frame wire flags made Deck receive xf44-full, decode 1800x1130 in hardware, and report negotiated exactly as requested."
     },
     {
       "variant": "hevc-444-10-limited-bt709",

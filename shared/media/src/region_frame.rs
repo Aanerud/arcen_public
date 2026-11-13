@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure region-video frame admission for multi-monitor-v1 clients.
 //!
 //! Every client that presents region video (Deck today, the Windows client

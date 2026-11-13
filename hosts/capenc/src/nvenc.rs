@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // NVENC encoder — D3D11/NVENC path. Loads nvEncodeAPI64.dll
 // dynamically (no link dep, no CUDA) and drives NVENC via the vendored
 // bindgen bindings (crate::nvenc_sys), generated from the MIT-licensed
@@ -487,7 +489,11 @@ enum WideScrgbTransform {
 impl WideScrgbTransform {
     const fn shader_mode(self) -> WideShaderMode {
         match self {
-            Self::Sdr(_) => WideShaderMode::SdrBt709,
+            Self::Sdr(transform) => match transform.transfer() {
+                // `ScrgbSdrTransform::new` admits only the two SDR transfers.
+                TransferCharacteristics::Srgb => WideShaderMode::SdrSrgb,
+                _ => WideShaderMode::SdrBt709,
+            },
             Self::Pq(_) => WideShaderMode::PqBt2020,
         }
     }
@@ -526,6 +532,9 @@ enum GpuSlotFormat {
 enum WideShaderMode {
     SdrBt709,
     PqBt2020,
+    /// The inverse of the IEC 61966-2-1 decode DWM applies to SDR surfaces:
+    /// desktop code values survive (`arcen_media::video::sdr_desktop_transfer`).
+    SdrSrgb,
 }
 
 #[repr(C)]
@@ -565,6 +574,10 @@ const WIDE_SHADER_HLSL: &str = r#"
 
     float linear_to_bt709(float value) {
         return value < 0.018 ? 4.5 * value : 1.099 * pow(value, 0.45) - 0.099;
+    }
+
+    float linear_to_srgb(float value) {
+        return value <= 0.0031308 ? 12.92 * value : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
     }
 
     float linear_nits_to_pq_signal(float nits) {
@@ -621,9 +634,13 @@ const WIDE_SHADER_HLSL: &str = r#"
         float3 codes;
         float kr;
         float kb;
-        if (mode == 0) {
+        if (mode == 0 || mode == 2) {
             rgb = saturate(rgb);
-            rgb = float3(linear_to_bt709(rgb.r), linear_to_bt709(rgb.g), linear_to_bt709(rgb.b));
+            if (mode == 2) {
+                rgb = float3(linear_to_srgb(rgb.r), linear_to_srgb(rgb.g), linear_to_srgb(rgb.b));
+            } else {
+                rgb = float3(linear_to_bt709(rgb.r), linear_to_bt709(rgb.g), linear_to_bt709(rgb.b));
+            }
             codes = float3(code10(rgb.r), code10(rgb.g), code10(rgb.b));
             kr = 0.2126;
             kb = 0.0722;
@@ -674,6 +691,7 @@ impl WideGpuConverter {
             mode: match transform.shader_mode() {
                 WideShaderMode::SdrBt709 => 0,
                 WideShaderMode::PqBt2020 => 1,
+                WideShaderMode::SdrSrgb => 2,
             },
             range_full: u32::from(matches!(range, ColorRange::Full)),
             output_kind: u32::from(output_format == GpuSlotFormat::Abgr10),
@@ -876,7 +894,7 @@ fn max_code_error(actual: &[u16], expected: &[u16]) -> u16 {
 pub(crate) unsafe fn wide_shader_vector_selftest(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-) -> Result<(u16, u16), String> {
+) -> Result<(u16, u16, u16), String> {
     let width = u32::try_from(SCRGB_CONVERSION_TEST_VECTORS.len()).unwrap_or(0);
     let height = 1u32;
     let source = scrgb_vector_source_bytes();
@@ -1020,6 +1038,21 @@ pub(crate) unsafe fn wide_shader_vector_selftest(
         width,
         WideScrgbTransform::Sdr(sdr),
     )?;
+    let srgb = ScrgbSdrTransform::new(
+        ColorMatrix::Bt709,
+        ColorRange::Full,
+        BitDepth::Ten,
+        TransferCharacteristics::Srgb,
+    )
+    .expect("sRGB SDR transform");
+    let srgb_error = run_one(
+        device,
+        context,
+        &source_tex,
+        &source,
+        width,
+        WideScrgbTransform::Sdr(srgb),
+    )?;
     let hdr_error = run_one(
         device,
         context,
@@ -1028,7 +1061,7 @@ pub(crate) unsafe fn wide_shader_vector_selftest(
         width,
         WideScrgbTransform::Pq(hdr),
     )?;
-    Ok((sdr_error, hdr_error))
+    Ok((sdr_error, srgb_error, hdr_error))
 }
 
 /// Two-phase staging state: whether the CPU-readable staging texture currently
@@ -1157,9 +1190,15 @@ macro_rules! nvchk {
     }};
 }
 
+const OPEN_SESSION_OPERATION: &str = "OpenEncodeSessionEx";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NvencInitFailure {
     Unavailable,
+    /// `nvEncodeAPI64.dll` or its entry point is missing.
+    RuntimeMissing,
+    /// No encode session could be opened: the GPU's session limit.
+    SessionLimit,
     Unsupported,
     Fatal,
 }
@@ -1173,7 +1212,7 @@ pub(crate) struct NvencInitError {
 impl NvencInitError {
     fn runtime_unavailable(detail: impl Into<String>) -> Self {
         Self {
-            failure: NvencInitFailure::Unavailable,
+            failure: NvencInitFailure::RuntimeMissing,
             detail: detail.into(),
         }
     }
@@ -1198,6 +1237,11 @@ impl NvencInitError {
 
     fn from_status(status: NVENCSTATUS, operation: &'static str) -> Self {
         let failure = match status {
+            // Opening a session is where a GPU at its concurrent-session
+            // limit fails, and NVENC reports that as out of memory.
+            NV_ENC_ERR_OUT_OF_MEMORY if operation == OPEN_SESSION_OPERATION => {
+                NvencInitFailure::SessionLimit
+            }
             NV_ENC_ERR_NO_ENCODE_DEVICE
             | NV_ENC_ERR_UNSUPPORTED_DEVICE
             | NV_ENC_ERR_DEVICE_NOT_EXIST => NvencInitFailure::Unavailable,
@@ -1215,7 +1259,10 @@ impl NvencInitError {
     pub(crate) const fn allows_software_fallback(&self) -> bool {
         matches!(
             self.failure,
-            NvencInitFailure::Unavailable | NvencInitFailure::Unsupported
+            NvencInitFailure::Unavailable
+                | NvencInitFailure::RuntimeMissing
+                | NvencInitFailure::SessionLimit
+                | NvencInitFailure::Unsupported
         )
     }
 
@@ -1225,6 +1272,8 @@ impl NvencInitError {
         use arcen_media::video::BackendUnavailableReason;
         match self.failure {
             NvencInitFailure::Unavailable => Some(BackendUnavailableReason::HardwareUnavailable),
+            NvencInitFailure::RuntimeMissing => Some(BackendUnavailableReason::RuntimeMissing),
+            NvencInitFailure::SessionLimit => Some(BackendUnavailableReason::SessionLimit),
             NvencInitFailure::Unsupported => {
                 Some(BackendUnavailableReason::UnsupportedConfiguration)
             }
@@ -1917,7 +1966,7 @@ impl Encoder {
         let open_session = fl
             .nvEncOpenEncodeSessionEx
             .ok_or_else(|| NvencInitError::fatal("missing nvEncOpenEncodeSessionEx"))?;
-        nvchk_init!(open_session(&mut sp, &mut enc), "OpenEncodeSessionEx");
+        nvchk_init!(open_session(&mut sp, &mut enc), OPEN_SESSION_OPERATION);
         let mut resources = EncoderInitGuard {
             fl: &fl,
             enc,
@@ -4236,6 +4285,27 @@ mod init_error_tests {
         ] {
             assert!(!NvencInitError::from_status(status, "test").allows_software_fallback());
         }
+    }
+
+    #[test]
+    fn a_full_gpu_and_a_missing_runtime_are_typed_causes() {
+        let full = NvencInitError::from_status(NV_ENC_ERR_OUT_OF_MEMORY, OPEN_SESSION_OPERATION);
+        assert!(full.allows_software_fallback());
+        assert_eq!(
+            full.unavailable_reason(),
+            Some(arcen_media::video::BackendUnavailableReason::SessionLimit)
+        );
+        assert!(
+            !NvencInitError::from_status(NV_ENC_ERR_OUT_OF_MEMORY, "CreateInputBuffer")
+                .allows_software_fallback(),
+            "out of memory after the session opened is not a session limit"
+        );
+        let missing = NvencInitError::runtime_unavailable("load nvEncodeAPI64.dll");
+        assert!(missing.allows_software_fallback());
+        assert_eq!(
+            missing.unavailable_reason(),
+            Some(arcen_media::video::BackendUnavailableReason::RuntimeMissing)
+        );
     }
 
     #[test]

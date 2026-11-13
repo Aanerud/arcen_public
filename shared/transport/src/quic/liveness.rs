@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Liveness of a live QUIC session connection and the Pier's incumbent
 //! attachment (see [`crate::liveness`] for the rules).
 

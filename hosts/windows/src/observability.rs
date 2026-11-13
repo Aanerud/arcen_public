@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_protocol::messages::{
     ClientTelemetrySnapshotMsg, HealthStateMsg, HealthStatsMsg, SampleWindowSecs,
 };
@@ -19,6 +22,10 @@ pub(crate) struct HostCounters {
     pub(crate) input_events: u64,
     pub(crate) last_input_sequence: u64,
     pub(crate) last_input_type: &'static str,
+    /// Changed-content frames per second capenc's latest stats line proved
+    /// (`PipelineTelemetrySnapshot::content_fps`); `None` when it proved
+    /// nothing.
+    pub(crate) content_fps: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -129,6 +136,7 @@ impl SessionHealth {
             timestamp_ms,
             fps_actual,
             fps_target: Some(fps_target),
+            fps_content: counters.content_fps,
             fps_warmup: self.fps_warmup_enabled
                 && timestamp_ms.saturating_sub(first) < FPS_WARMUP_MS,
             frames_sent: Some(sent_delta),
@@ -258,6 +266,11 @@ fn apply_client_sample(sample: &mut QosSample, telemetry: Option<&ClientTelemetr
     if let (Some(presented), Some(window)) = (qos.frames_presented, qos.sample_window_secs) {
         sample.fps_actual = u32::try_from(presented / u64::from(window.get())).ok();
     }
+    // The client presents what arrived; a still desktop arrives as one
+    // keepalive a second, and that is not the client falling short.
+    if let (Some(received), Some(window)) = (qos.frames_received, qos.sample_window_secs) {
+        sample.fps_content = u32::try_from(received / u64::from(window.get())).ok();
+    }
 }
 
 fn health_state_message(state: HealthState) -> HealthStateMsg {
@@ -290,6 +303,7 @@ pub(crate) fn snapshot_fields(
     );
     insert_u32(&mut fields, "fps_actual", sample.fps_actual);
     insert_u32(&mut fields, "fps_target", sample.fps_target);
+    insert_u32(&mut fields, "fps_content", sample.fps_content);
     insert_u32(&mut fields, "rtt_ms", sample.rtt_ms);
     insert_u32(&mut fields, "heartbeat_misses", sample.heartbeat_misses);
     if let (Some(sent), Some(dropped)) = (sample.frames_sent, sample.frames_dropped) {
@@ -395,12 +409,7 @@ enum HealthSideKind {
 /// a network fault that does not exist and hides the real presentation
 /// problem.
 fn unpresented_basis_points(sample: &QosSample) -> u32 {
-    let decoded = sample.frames_decoded.unwrap_or(0);
-    if decoded == 0 {
-        return 0;
-    }
-    let missed = decoded.saturating_sub(sample.frames_presented.unwrap_or(0));
-    u32::try_from(missed.saturating_mul(10_000) / decoded).unwrap_or(u32::MAX)
+    arcen_telemetry::unpresented_basis_points(sample).unwrap_or(0)
 }
 
 fn cause_value_threshold(
@@ -413,14 +422,7 @@ fn cause_value_threshold(
     match cause {
         HealthCause::Fps => (
             sample.fps_actual.unwrap_or(0),
-            sample.fps_target.map(|target| {
-                let percent = if state == HealthState::Critical {
-                    targets.fps_critical_percent()
-                } else {
-                    targets.fps_degraded_percent()
-                };
-                target.saturating_mul(u32::from(percent)) / 100
-            }),
+            arcen_telemetry::fps_threshold(sample, targets, state),
         ),
         HealthCause::Rtt => (
             sample.rtt_ms.unwrap_or(0),
@@ -721,8 +723,9 @@ mod tests {
             field_string(&fields, "dominant_cause").as_deref(),
             Some("unpresented")
         );
-        // 1000 decoded, 861 presented -> 139 unpresented -> 1390 basis points.
-        assert_eq!(field_integer(&fields, "value"), Some(1_390));
+        // 2000 decoded, 1722 presented -> 278 unpresented, one of them still
+        // in flight at the window boundary -> 1385 basis points.
+        assert_eq!(field_integer(&fields, "value"), Some(1_385));
         assert_ne!(field_integer(&fields, "value"), Some(0));
         assert_eq!(
             field_integer(&fields, "threshold"),

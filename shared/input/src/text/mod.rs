@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Committed text: what a client's input method produced, and how a host
 //! types it into a desktop.
 //!
@@ -17,25 +19,34 @@
 //!   keymap's own names and the desktop's input-source settings.
 //! - [`policy`]: the client-side choice, per keystroke, between sending the
 //!   key position and sending the characters.
+//! - [`paste`]: the clipboard typed as keystrokes — bounded, paced and
+//!   cancellable on the client, by key or text route per character on the
+//!   host.
 
 pub mod keymap;
 pub mod layout;
+pub mod paste;
 pub mod plan;
 pub mod policy;
 pub mod releases;
 
-pub use keymap::{KeyLocation, KeymapEntry, KeymapIndex, PositionChars};
+pub use keymap::{KeyLocation, KeymapEntry, KeymapIndex, PositionChars, StrokeEntry, TextStroke};
 pub use layout::{
     GroupResolution, InputSource, XkbRegistry, active_input_source, group_names,
     layouts_from_symbols_section, parse_input_sources, resolve_active_group,
     resolve_active_group_by_names, symbols_section_name,
 };
+pub use paste::{
+    CharRoute, LayoutLevel, LayoutProbe, PasteKey, PastePhase, PastePoll, PasteRefusal,
+    PasteSettings, PasteSummary, PasteText, PasteTyping, PasteUnit, prepare_paste, route_char,
+};
 pub use plan::{
-    MAX_TEXT_PART_CHARS, MAX_UTF8_CHUNK_BYTES, TextDeliveryReport, TextPlan, TextRoutes, TextRun,
-    plan_text, text_parts, utf8_chunks,
+    MAX_TEXT_PART_CHARS, MAX_UTF8_CHUNK_BYTES, MAX_UTF16_CHUNK_UNITS, TextDeliveryReport, TextPlan,
+    TextRoutes, TextRun, plan_text, text_parts, utf8_chunks, utf16_chunks,
 };
 pub use policy::{
     DeckTextAction, DeckTextEvent, HostKeyPositions, HostTextTruth, KeyPhase, KeyStroke,
-    OptionKeyMode, OptionSide, SuppressReason, TextInputPolicy, TypingMode, split_commit,
+    KeyboardMode, OptionKeyMode, OptionKeyPreference, OptionSide, SuppressReason, TextInputPolicy,
+    TypingMode, split_commit,
 };
 pub use releases::{LOST_RELEASE_GRACE, ReleaseRecovery, SentPress};

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2010-2023 NVIDIA Corporation
+// SPDX-FileCopyrightText: 2026 TUTTIFRUTTI AS
+// Derived from the MIT-licensed nv-codec-headers header vendored in
+// third_party/nv-codec-headers, so it keeps that header's licence.
+
 #![allow(missing_docs)]
 //! NVENC structure-version constants transcribed from the vendored MIT-licensed
 //! nv-codec-headers header.

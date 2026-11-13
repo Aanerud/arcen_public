@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! This Deck's platform profile, resolved once per process.
 //!
 //! The Deck gathers the facts -- the architecture it was compiled for, the

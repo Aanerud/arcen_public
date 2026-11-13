@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `linux-wayland-auto`: the Wayland Auto composition.
 //!
 //! Auto is the shared detail-first contract (`arcen_media::video::pipeline`
@@ -99,6 +101,7 @@ pub(crate) mod tests {
             width: 1920,
             height: 1080,
             max_fps: 30,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 

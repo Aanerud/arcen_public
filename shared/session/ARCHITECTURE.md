@@ -1,7 +1,28 @@
 # `arcen-session` Architecture
 
-**Status (2026-08-25):** active. Default features expose the pure,
-dependency-light restore-lease, direct-reconnect, and Deskside surfaces.
+**Status (2026-11-09):** active. Default features expose the pure,
+dependency-light session policy every Pier and Deck shares: restore leases,
+direct reconnect and Deskside below, and the modules in the map that follows.
+
+## Module map
+
+| Module | Owns |
+| --- | --- |
+| `agent_relay` | The contract between a Pier's network service and its per-session desktop agents. |
+| `auth_throttle` | Backing off repeated failed sign-ins, per source address and per account (used by the macOS Pier). |
+| `connection_diagnostics` | The steps, typed `diag.*` findings and wording behind `arcen-deck diagnose` and the Deck's **Test connection**; platforms only probe. |
+| `session_admission` | Capacity-one Pier admission and the bounded reconnect hold. |
+| `setup_budget` | One setup budget for a Pier's broker and its per-session agent (30 s broker wait, 25 s for the agent's own waits), so a slow setup ends in a typed refusal instead of a terminated agent. |
+| `login_window_handover` | Following a sign-in screen into the desktop that replaces it. |
+| `local_playback` | Silencing the host's own speakers for a session, and the evidence that proves it. |
+| `pier_config` | The shared, platform-parameterised `pier.json` schema. |
+| `session_locale`, `zoneinfo` | The locale of a host-started desktop and IANA time-zone validation for redirection. |
+| `host_lifecycle`, `install_lifecycle` | OS-free Pier and installer lifecycle state machines. |
+| `network_reachability` | Classification of outbound reachability failures. |
+| `desktop_provider`, `install_provider` | Linux desktop choice (X11 or Wayland) from host facts, at start and at install. |
+| `x11_seat` | One X11 desktop per host, on `seat0`. |
+| `polkit_remote` | Keeping remote desktops remote to polkit. |
+| `wayland_qualification`, `wayland_session`, `wayland_outputs`, `wayland_x11`, `desktop_session`, `native_seat`, `compositor_prefix` | The headless and native Wayland provider's policy: the qualification record, session readiness, virtual outputs, Xwayland, the GNOME session parts Arcen assembles, the native seat and an optional side-by-side GNOME prefix. |
 
 ## Default surface
 

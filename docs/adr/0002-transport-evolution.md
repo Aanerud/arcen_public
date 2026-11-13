@@ -19,12 +19,12 @@ host reports it in `ServerHello`, and the client confirms it in `ClientHello`.
 Standardized independent QUIC streams and
 encrypted datagrams remain behind the same opt-in feature for a future,
 separately reviewed optimization; the direct profile does not use them yet.
-Arcen Span remains roadmap, not a live implication of direct QUIC. The shared
+The shared
 crate retains a dormant WSS compatibility abstraction behind `wss-compat`
 without placing it in product builds. Both profiles are represented by the same product-neutral
 `arcen-transport` contract types (`TransportProfile`, `ReliabilityClass`,
 `DeliveryMechanism`, `BoundedTransportPolicy`, `TransportEvent`,
-`TransportContractError`) so Host, Client, and Gateway components reason about
+`TransportContractError`) so Host and Client components reason about
 delivery semantics identically regardless of which concrete transport is
 active. No vendor-specific QUIC wire format is exposed as the Arcen protocol;
 QUIC is used only as a standardized transport underneath `arcen-protocol`.
@@ -149,7 +149,8 @@ admission time. A replacement connection cannot reuse this value.
 
 Handshake protocol v2 performs one bounded request/response exchange over a
 dedicated QUIC bidirectional stream (`quic::handshake`). The initiator states
-its claimed product-neutral role (`QuicRole::Host | Client | Gateway`), grant-
+its claimed product-neutral role (`QuicRole::Host | Client`, encoded 0 and 1;
+any other role code is rejected as malformed), grant-
 bound session, supported capabilities, and required capabilities. The acceptor
 checks the exact expected role/session, computes the bounded capability
 intersection, rejects missing profile or policy requirements, and acknowledges
@@ -250,3 +251,15 @@ single-stream compatibility profile, not the advanced adapter.
 Compatibility coverage in `tests/compatibility/transport_downgrade.rs` remains
 for the explicit dormant feature. Product capability tests require QUIC and
 cannot silently downgrade.
+
+## Amendment 2026-11-09: two handshake roles
+
+The handshake role field carries only Host (0) and Client (1). A third role
+code (2), reserved for a peer between Deck and Pier, was never sent by any
+product and was removed; a request or acknowledgement carrying it is now
+rejected as `Malformed`.
+
+**Accepted** 2026-11-09. Rationale: a Deck↔Pier connection is one-to-one, and anything that
+sits between them lives outside Arcen Deck and Arcen Pier, so the shared wire
+contract has no third role to carry. Old Decks and Piers never sent role 2, so
+the change breaks no released peer.

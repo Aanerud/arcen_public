@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Finishes a side-by-side GNOME prefix on the host it will run on (as root):
 # links the system typelibs and GIO modules the prefix does not build, so the
 # prefix's newer GLib finds them, refreshes the GIO module cache and the

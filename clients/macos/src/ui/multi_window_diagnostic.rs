@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Real, host-free native fullscreen multi-window diagnostic.
 //!
 //! `arcen-deck multi-monitor-window-diagnostic [1|2|4]` is the visual

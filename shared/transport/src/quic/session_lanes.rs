@@ -1,4 +1,6 @@
-//! Product-facing lane session adapter (ADR 0014, `wlp-workers`).
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+//! Product-facing lane session adapter (ADR 0014).
 //!
 //! The lane runtime ([`super::LaneConnection`]) moves bytes; this module is
 //! the small layer every Pier and Deck uses on top of it, so that each

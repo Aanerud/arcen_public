@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Capturing more than one display at once.
 //!
 //! `ScreenCaptureKit` captures a display, not a desktop: there is no single
@@ -71,6 +73,16 @@ impl MultiDisplayCapture {
             .iter()
             .map(|monitor| monitor.session.dropped_frames())
             .sum()
+    }
+
+    /// Each display's live `SCFrameStatus::Idle` counter, in display order:
+    /// health needs evidence from every display, not their sum.
+    #[must_use]
+    pub fn unchanged_counters(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.monitors
+            .iter()
+            .map(|monitor| monitor.session.unchanged_counter())
+            .collect()
     }
 }
 

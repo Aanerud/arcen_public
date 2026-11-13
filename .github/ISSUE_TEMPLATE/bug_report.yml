@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+name: Bug report
+description: Something in Arcen Deck or Arcen Pier does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems: please do not file them here. Report them privately as SECURITY.md describes.
+        This issue is public. Do not paste credentials, private keys, internal host names or addresses, or customer data; redact logs first.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Deck and Pier versions or build IDs (the Deck's `diagnose` output names both).
+      placeholder: "Deck 0.19.0 (build …), Pier 0.19.0 (build …)"
+    validations:
+      required: true
+  - type: dropdown
+    id: pier
+    attributes:
+      label: Pier
+      options:
+        - Linux X11
+        - Linux Wayland
+        - Windows
+        - macOS
+        - Not applicable
+    validations:
+      required: true
+  - type: input
+    id: platforms
+    attributes:
+      label: Operating systems and hardware
+      description: Deck Mac (Apple silicon or Intel, macOS version); Pier OS, GPU and driver.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (redacted)
+      description: Relevant lines from the Deck and Pier logs. Remove anything private first.
+      render: text

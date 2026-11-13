@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Structured host telemetry for the macOS Pier.
 //!
 //! The Linux Pier emits canonical lifecycle records — a schema-validated event

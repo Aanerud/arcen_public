@@ -1,8 +1,8 @@
 # Arcen Pier administration guide
 
-Audience: sysadmins operating large Linux and Windows Pier deployments. This guide describes the direct QUIC Pier to macOS Deck product scope. Gateway or Span, Windows Deck, Linux Deck, accounts portal, and commercial licensing services are not available in this build.
+Audience: sysadmins operating large Linux and Windows Pier deployments (the macOS Pier is a preview; see its notes where they appear). This guide describes the direct QUIC Pier to macOS Deck product scope. A Windows Deck and a Linux Deck do not exist, and there is no accounts portal or licensing service.
 
-Verification note: every command, path, config key, default, and failure string below is tied to source files in this repository. Items marked **target state, not verified in this branch** describe the single-binary installer work that is still in flight.
+Verification note: every command, path, config key, default, and failure string below is tied to source files in this repository. Items marked **target state** describe operations the installer does not support yet.
 
 ## 1. What Arcen is
 
@@ -10,12 +10,12 @@ Arcen has two active operator surfaces today:
 
 | Surface | Active product | What it does |
 | --- | --- | --- |
-| Host | Arcen Pier on Linux and Windows | Listens on direct QUIC UDP 18444, authenticates a user, mutates or owns a desktop, launches a user-session agent, captures and encodes the display, forwards audio and clipboard policy, and injects input. |
+| Host | Arcen Pier on Linux and Windows (macOS as a preview) | Listens on direct QUIC UDP 18444, authenticates a user, mutates or owns a desktop, launches a user-session agent, captures and encodes the display, forwards audio and clipboard policy, and injects input. |
 | Client | Arcen Deck on macOS | Connects directly to one Pier over QUIC, authenticates, decodes media, renders the desktop, and forwards input. |
 
-Installing Pier changes the blast radius of the workstation. Linux Pier runs as root, uses PAM, creates a dedicated Xorg session, starts user-context helpers, and can inject input through uinput. Windows Pier runs as LocalSystem, uses `LogonUserW`, can drive an additive Credential Provider at LogonUI for first login, mutates display topology under a recovery journal, launches a user-session agent on `winsta0\default`, and injects input with `SendInput`.
+Installing Pier changes the blast radius of the workstation. Linux Pier runs as root, uses PAM, creates a dedicated Xorg session or a GNOME Wayland session per sign-in, starts user-context helpers, and can inject input through uinput. Windows Pier runs as LocalSystem, uses `LogonUserW`, can drive an additive Credential Provider at LogonUI for first login, mutates display topology under a recovery journal, launches a user-session agent on `winsta0\default`, and injects input with `SendInput`.
 
-Arcen Span gateway, multi-stream/datagram QUIC optimization, federated identity, MFA, Windows Deck, Linux Deck, and web account management are roadmap or dormant in this repository. The macOS Pier is active development rather than an operator surface: the logged-in Aqua path can serve a real Deck, but cold-boot LoginWindow operation, release packaging, and two-display multi-monitor qualification are not production procedures.
+QUIC datagrams, federated identity, MFA, a Windows Deck, a Linux Deck, and web account management are not part of this repository. (Each session already runs on isolated QUIC lanes; see [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md).) The macOS Pier ships as a signed, notarised preview package and its logged-in Aqua path can serve a real Deck, but cold-boot LoginWindow operation and two-display multi-monitor qualification are not production procedures, and it has not completed Release/Security review.
 
 ## 2. Installation
 
@@ -38,6 +38,7 @@ The script builds on the target, installs runtime files, validates `/etc/arcen/p
 | TLS | `/etc/arcen/host.crt`, `/etc/arcen/host.key` |
 | Logs | `/var/log/arcen/arcen-pier.log` |
 | Log rotation | `/etc/logrotate.d/arcen-pier` |
+| X11 socket directory kept out of `/tmp` ageing | `/etc/tmpfiles.d/arcen-pier.conf` |
 | Support bundles | `/var/lib/arcen/support` |
 
 The script creates `/opt/arcen/bin`, `/usr/share/doc/arcen`, `/etc/arcen`, `/var/log/arcen`, and `/var/lib/arcen/support`. It installs `/etc/systemd/system/arcen-pier.service` with `User=root`, `Restart=on-failure` bounded by `StartLimitBurst=10` over ten minutes, ordering after `time-sync.target`, and `ExecReload=/bin/kill -HUP $MAINPID`.
@@ -207,8 +208,8 @@ cannot open that GPU, the NVIDIA path reports itself unavailable and Auto falls
 back to software encoding rather than capturing on a different GPU.
 
 `install_arcen_pier --uninstall` stops and disables the service and removes
-the binary, the `PATH` link, the systemd unit, the documentation and the
-logrotate rule. It also removes what the installer's Wayland and firewall
+the binary, the `PATH` link, the systemd unit, the documentation, the
+logrotate rule and the tmpfiles rule. It also removes what the installer's Wayland and firewall
 steps added: the qualification record
 `/var/lib/arcen/wayland-qualification.json`, a leftover temporary
 qualification account `arcen-wlq` (only the one whose GECOS is `Arcen Wayland
@@ -288,17 +289,24 @@ Desktop provider detection:
 | Host | The installer |
 | --- | --- |
 | An Xorg server is installed (`capture.provider` `auto` or `xorg`) | installs the X11 path exactly as before: `/etc/arcen/xorg.conf` and its `BusID`, enable and start. Nothing Wayland is run. An existing install is never moved. |
-| No Xorg server; GNOME Shell or Mutter with `--headless` and `--virtual-monitor`, systemd-logind, `/usr/bin/dbus-daemon`, PipeWire, WirePlumber, and a `/dev/dri/renderD*` node every user can open | installs, then runs `/opt/arcen/bin/arcen-pier wayland qualify --write` (it measures Speed at the previous record's display sizes, those Decks asked for, and 1920x1080, 2560x1600 and 3840x2160 at 60 Hz; `--qualify-output WIDTHxHEIGHT@HZ` adds one, rarely needed). It enables and starts the service only when that passes. The BusID step is skipped; run the installer again if you later install an Xorg server. |
+| No Xorg server; GNOME Shell or Mutter with `--headless` and `--virtual-monitor`, systemd-logind, `/usr/bin/dbus-daemon`, PipeWire, WirePlumber, and a `/dev/dri/renderD*` node every user can open | installs, then runs `/opt/arcen/bin/arcen-pier wayland qualify --write` (it measures Speed at the previous record's display sizes, those Decks asked for, and 1920x1080, 2560x1600 and 3840x2160 at 60 Hz; `--qualify-output WIDTHxHEIGHT@HZ` adds one, rarely needed; every command the installer prints for a later qualification carries those sizes as `--output`). It enables and starts the service only when that passes. The BusID step is skipped; run the installer again if you later install an Xorg server. |
 | The same, but the qualification fails | leaves the Pier installed and **not started**, prints the failing steps (`FAIL …`, `Wayland on this host: refused: …`) and the commands to run once they are fixed, and exits non-zero. Starting it would only make the service refuse to start ten times and give up. |
 | No Xorg server, and render nodes exist but only a group can open them (for example mode 0660, group `render`) | stops before writing anything and says why: a headless Wayland session has no seat, so logind grants it no device access, and the Pier accepts a render node only when every session user can open it. Make the nodes readable and writable by every user (the systemd default; for example a udev rule `SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0666"`), or install an Xorg server. No driver advice: the driver is fine. |
 | No Xorg server and no DRM render node | stops before writing anything and names the driver to install. For NVIDIA loaded without `nvidia-drm`: install the driver with `nvidia-drm` and set `options nvidia-drm modeset=1`; when the driver predates 580.82.07 and the kernel's DRM `fb_create` takes a format-info argument (read from the kernel headers when installed, otherwise Linux 6.17 or later), it names 580.82.07 or newer, because older `nvidia-drm` does not build there. |
 | No Xorg server and part of the GNOME stack missing | stops before writing anything and lists each missing part. |
 | `capture.provider` `xorg` without Xorg, or `wayland` without the stack | stops and says so; an existing operator override is kept on upgrade and decides, as it does at Pier start. |
 
-The installer never installs packages and never changes driver, kernel
-module, kernel, Secure Boot, display-manager (except with `--disable-gdm`,
-below), device-permission or group
-configuration, or the SELinux mode. Where SELinux is enabled it loads Arcen's
+The one package the installer may install is `kernel-modules-internal` for
+the running kernel, which carries the `vhci-hcd` USB/IP controller Native
+tablet needs. It does so only when Native tablet is enabled (`--native-tablet`,
+or `usb.native_tablet` already `"enabled"` on an upgrade), the host is in the
+Rocky Linux/RHEL family, and the running kernel has no `vhci-hcd` module; it
+installs the signed package with `dnf` and GPG checking on, and
+`--no-native-tablet-modules` skips it. `--no-native-tablet` removes the
+package again if the installer installed it.
+Apart from that, the installer installs no packages and never changes
+driver, kernel, Secure Boot, display-manager (except with `--disable-gdm`,
+below), device-permission or group configuration, or the SELinux mode. Where SELinux is enabled it loads Arcen's
 own one-rule policy module before the qualification runs (see
 [Linux Pier under SELinux](../security/linux-selinux.md)) and unloads it on
 uninstall; the summary reports the SELinux mode and whether that module is
@@ -402,6 +410,54 @@ the packaged service starts the user's session in the context `pam_selinux`
 assigns through the installer's `arcen` policy module (see
 [SELinux](#selinux) above and
 [Linux Pier under SELinux](../security/linux-selinux.md)).
+
+X11 applications need the shared `/tmp/.X11-unix` to be `root:root 1777`.
+systemd creates it so only at boot and its daily `/tmp` clean removes it once
+no desktop has used it for ten days; the first desktop afterwards would
+recreate it as its own user and lock every other user's GNOME Shell out of
+X11. The installer therefore adds `/etc/tmpfiles.d/arcen-pier.conf`, which
+keeps `/tmp/.X11-unix` and `/tmp/.ICE-unix` out of that clean, and the Pier
+checks the directory at start and before every desktop with X11
+applications: a missing one it recreates from the system's own tmpfiles
+entry; one owned by a user, not sticky or not world-writable it leaves
+alone, logs as an error at start (`x11_unix_dir_foreign_owner`,
+`x11_unix_dir_not_shared`, `x11_unix_dir_not_a_directory`; `ice_unix_dir_*`
+for `/tmp/.ICE-unix`, reported only) and serves that desktop without X11
+applications rather than letting GNOME Shell abort. A qualification that
+finds `/tmp/.X11-unix` unsafe does not try X11 and records the fault as a
+host precondition, not a failed proof; start-up re-checks it and reports
+either the fault or, once it is fixed, `x11_precondition_cleared`. To fix
+it, as root:
+
+```sh
+arcen-pier repair-x11-unix-dir --check        # report only, any user
+arcen-pier repair-x11-unix-dir                # root: systemd-tmpfiles --boot --create --prefix=… for both
+arcen-pier repair-x11-unix-dir --requalify    # the same, then restart arcen-pier to re-prove X11 now
+```
+
+The repair sets owner, mode and SELinux label through the distribution's own
+tmpfiles entry and never removes an entry inside; it lists sockets other
+users left there for you to remove once none of their X servers runs.
+
+Once the directory is sound, the Pier re-proves X11 applications itself:
+when start-up finds `x11_precondition_cleared`, it runs a short automatic
+re-qualification (one display, one codec; logged step by step, `systemctl
+reload` safe, about 30 s on a GNOME 49 host) before it serves, and
+writes only its X11 proof into the record: speeds, Grading/HDR,
+multi-monitor, cursor and native-seat facts from your last qualification are
+kept, and a precondition that failed again leaves the record as it was. It
+then serves X11 applications if Xwayland is proven. Wayland desktops are
+served whatever it finds; it never refuses start. It runs once per boot on one stack (a failed attempt also not
+again for six hours; an interrupted one is retried, three times at most),
+logs `x11_requalify_outcome` (`x11_apps_proven`, `x11_apps_failed`,
+`precondition_returned` when the directory went bad again during the run,
+`not_recorded`) and records it in `<record stem>-x11-requalify.json` and in
+the new record's `automatic_requalification`. A repair re-arms it.
+`--requalify` is off by default because restarting the service ends every
+running desktop; without it the re-proof waits for the next start (restart
+the service when no desktop is in use, or let the next reboot do it).
+`capture.wayland_auto_requalify = false` turns it off. See
+[error codes](error-codes.md#x11-applications-in-wayland-sessions).
 
 
 #### Upgrading the GNOME session on EL10
@@ -565,8 +621,10 @@ Wayland desktop is headless (`auto`) or refused (`native_seat`).
 **What the Pier changes while a native desktop runs.** All of it is
 volatile and undone when the Pier ends the desktop, when the Pier stops, and
 by the sweep at Pier start. A desktop ended from outside the Pier (for
-example `loginctl terminate-session`) keeps its seat until the next
-sign-in, which takes it apart first, or until the Pier restarts:
+example `loginctl terminate-session`) is noticed by logind's
+`SessionRemoved` and its seat taken apart at once, or as soon as a Deck
+still attached to it goes; a Pier that cannot reach the system bus logs so
+and leaves it to the next sign-in or a Pier restart:
 
 - a rule `/run/udev/rules.d/72-arcen-lab-seat-pen-<id>.rules` puts the GPU's
   card node, the `vkms` card and the desktop's tablet on the desktop's seat
@@ -631,6 +689,103 @@ The installer explains this and offers:
   to the next boot.
 
 Nothing is disabled without the option.
+
+#### Native tablet (`usb.native_tablet`)
+
+Native tablet attaches a Deck user's own pen tablet to their remote desktop
+as if it were plugged into this host: the Deck's privileged helper captures
+the tablet on the Mac and forwards its USB traffic, and the Pier presents it
+on the kernel's USB/IP virtual host controller `vhci-hcd`, where the host's
+own tablet driver (`wacom`, `hid-uclogic`, `usbhid`) binds it. Every Linux
+Pier build carries it; it is **off until you enable it**, because it attaches
+a device supplied by a remote user to this host's kernel.
+
+```sh
+sudo install-arcen-pier --native-tablet --restart      # enable (and install vhci-hcd's package)
+sudo install-arcen-pier --no-native-tablet --restart   # disable (and remove that package if the installer installed it)
+```
+
+A running Pier picks the change up only when it restarts: `--restart` does
+that now (it ends the sessions in progress); without it, restart
+`arcen-pier` in a maintenance window. On an X11 host, enabling it for the
+first time also needs one display-manager restart while nobody is signed in
+at the console (`systemctl restart gdm`), or a reboot.
+
+or set the key yourself and restart the Pier:
+
+```json
+"usb": { "native_tablet": "enabled" }
+```
+
+`sudo arcen-pier validate-config` prints `Native tablet: off: …` or the state
+of the controller (`vhci-hcd is loaded for kernel …`, installed but not
+loaded, or the exact `dnf` command that installs it). The choice is read at
+start; a reload does not change it.
+
+**The kernel module (ADR 0020).** Rocky Linux and RHEL build `vhci-hcd` but
+ship it only in `kernel-modules-internal`, from the distribution's `devel`
+repository, one package per kernel release; Red Hat labels the package
+internal and unsupported. With Native tablet enabled, the installer installs
+it for the running kernel with GPG checking on, checks that the module is
+signed by the same key as the kernel's own modules (so Secure Boot is
+unaffected and no machine owner key is enrolled), and records that it did so;
+`--uninstall` and `--no-native-tablet` remove only a package it installed.
+Nothing is loaded at install time: an enabled Pier runs `modprobe vhci-hcd`
+once when it starts. `--no-native-tablet-modules` installs nothing (you
+provide the module). Other distributions are told where the module would come
+from, and Native tablet stays unavailable until it exists. After a kernel
+update see [Native tablet after a kernel update](#8-upgrade-and-rollback).
+
+**Security model (ADR 0021).** What you enable is bounded:
+
+- Only a device whose HID report descriptors classify it as a pen tablet is
+  attached, and the Pier classifies it again itself; vendor ids are logged,
+  never trusted. Joysticks, gamepads and keyboards-only devices are refused;
+  on X11, so are tablets with keyboard keys.
+- Only a signed-in user's own desktop receives it, never the login screen or
+  the console: on X11 the device is tagged for that desktop's X server alone
+  and every other X server ignores it
+  (`/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf`; restart the display
+  manager once after installing); on a native-seat Wayland desktop it joins
+  that desktop's own seat. Headless Wayland desktops refuse it.
+- No user ACL (`uaccess`) is granted on its nodes, and every descriptor the
+  attached device serves must match what was authorized, or the session ends
+  with `usb_hard_device_refused`.
+- The bridge ends with the attachment; a starting Pier removes rules a
+  crashed one left.
+
+**0.18 lab hosts.** The 0.18 lab switch, `Environment=ARCEN_USB_HARD_LAB=1`
+in a service drop-in, is no longer read (since 0.19.0): `usb.native_tablet`
+is the only switch. Before upgrading such a host, run the installer with
+`--native-tablet`, then remove the drop-in and `systemctl daemon-reload`.
+
+**What users see.** While the bridged pen is near the tablet the Deck draws
+a white pen dot where it points, on X11 and Wayland alike; the Pier reads the
+pen's own evdev node for it (read-only, never grabbed) and sends each
+position as it arrives. On X11 the Pier checks the pen's `xf86-input-wacom`
+properties once a second; a tablet the user remapped (tablet area, rotation,
+"Coordinate Transformation Matrix", mouse mode) makes the dot follow the X
+pointer instead. A user who reports "pressure but no ink" on X11 usually has
+the pen's upper side switch held: it acts as a held right button. Lifting the
+pen out of range and back, or remapping the switch, fixes it. Browsers on a
+Mac Deck are not involved, but Safari on a macOS Pier reports every pen as a
+mouse; use Chrome there. Details:
+[pen and tablet guide](pen-tablet-input.md#native-tablet-one-path).
+
+**What is proven, and known limits (0.19.0).** X11 and native-seat Wayland
+desktops were proven with an emulated Wacom Intuos5 drawing with pressure in
+Firefox and Chrome; on X11 a real Wacom proved first-connection hot-plug,
+the Deck-drawn cursor and hand-back, and drawing with a real pen is not
+confirmed yet. On GNOME Wayland, Mutter squares stylus pressure on its
+default curve (thinner lines: raise the stylus pressure curve in the user's
+Settings › Wacom Tablet); a tablet remapped there offsets the Deck's cursor
+(the Pier reports the pen where GNOME's default mapping puts it); and a
+desktop with several outputs reports no cursor positions. The Linux Pier
+also accepts typed pen events from a Deck that negotiated mouse
+compatibility; tightening that is a follow-up.
+
+The Deck side, the pairing with Local cursor rendering, and the verification
+steps are in [the pen and tablet guide](pen-tablet-input.md#5c-native-tablet-usb-bridged-with-any-tablet).
 
 ### Windows
 
@@ -716,6 +871,10 @@ host therefore moves streaming onto whichever adapter enumerates first unless
 the pin is restored. Copy the preserved file back before starting the service,
 or re-apply the pin by hand. A failed copy warns but does not stop the purge.
 
+Uninstalling removes the install prefix once it is empty, and then
+`C:\Program Files\Arcen` too when nothing else is left in it. A custom
+`--prefix` outside an `Arcen` directory never has its parent removed.
+
 `--force` is about TLS, typically after `--extra-san`. It does **not** rewrite
 the configuration, so it cannot be used to escape a bad `pier.json`.
 
@@ -762,68 +921,18 @@ Credential Provider uninstall uses the generated CP `uninstall.ps1` from the sig
 
 ## 3. Configuration reference
 
-Both platforms use strict JSON with `deny_unknown_fields`. Unknown keys fail parsing. `audio`, `microphone_input`, and `platform` are required. Paths may be absolute. Relative `tls`, `capture`, and disclaimer paths resolve relative to `pier.json`; Linux also resolves Linux platform paths relative to `pier.json`.
+Every Pier (Linux, Windows, macOS) uses strict JSON with `deny_unknown_fields`. Unknown keys fail parsing. `audio`, `microphone_input`, and `platform` are required. Paths may be absolute. Relative `tls`, `capture`, and disclaimer paths resolve relative to `pier.json`; Linux also resolves Linux platform paths relative to `pier.json`.
 
 Packaged services pass only `--config`, so the JSON file is the operator surface. CLI overrides exist for diagnostics and validation.
 
-### Common schema keys
+### Every key
 
-| Key | Type | Default | Applies to | What it does | Takes effect |
-| --- | --- | --- | --- | --- | --- |
-| `listen.host` | string | Linux built-in `127.0.0.1`, Linux package `0.0.0.0`; Windows `0.0.0.0` | Both | Bind address. | Restart |
-| `listen.port` | nonzero u16 | `18444` | Both | Mandatory direct QUIC UDP port. Bind failure stops startup. | Restart |
-| `listen.quic_port` | u16 or absent | absent | Both | Deprecated migration alias for the QUIC UDP port; new configs must omit it. | Restart |
-| `tls.mode` | string | unset or `pem` | Both | Only PEM files are supported. | Restart or TLS reload |
-| `tls.cert`, `tls.certificate` | path string | package path | Both | PEM certificate chain. Alias `certificate` maps to `cert`. | Restart or TLS reload |
-| `tls.key`, `tls.private_key` | path string | package path | Both | PEM private key. Alias `private_key` maps to `key`. | Restart or TLS reload |
-| `tls.minimum_version` | `TLS1.3` | `TLS1.3` | Both | Shipped QUIC requires TLS 1.3. | Restart or TLS reload |
-| `tls.disabled_cipher_suites` | array of suite names | `[]` | Both | Blacklists the three rustls/ring TLS 1.3 suites. | Restart or TLS reload |
-| `tls.expiry_warning_days` | u64 | `30` | Both | Warning window before certificate expiry. | Restart or TLS reload |
-| `tls.expected_sans` | array of strings | `[]` | Both | Extra exact DNS/IP SANs that must appear in the leaf. | Restart or TLS reload |
-| `capture.provider` | string or absent | absent (`auto`) | Linux | `auto` chooses from host facts (Xorg installed → X11; otherwise a qualified headless Wayland with DRM; otherwise refuse), `xorg` or `wayland` override it and refuse to start when they cannot be honoured. `wayland` is accepted only by a `wayland-provider` build. See "Which desktop a Linux Pier serves" under Installation. Windows and macOS refuse the key. | Restart |
-| `capture.binary` | path string | unset | Both | Legacy external-helper path; accepted with a warning and ignored because Pier always spawns its own `capenc` subcommand. | Restart |
-| `video.codec` | string or absent | absent in packages | Both | Optional exact administrator codec pin: `h264`, `h265`/`hevc`, or `av1`. Omit for automatic client-capability/hardware selection. | Restart |
-| `video.chroma` | string or absent | absent in packages | Both | Legacy host default (`yuv420` or `yuv444`). Use `video.variant` when the full format must be pinned exactly. | Restart |
-| `video.fps` | u32 | Linux built-in `60`, Windows `30` | Both | Target FPS, 1 through 240. | Restart |
-| `video.encoder` | string | `auto` | Both | `auto`, `nvenc`, or `software-h264` (`openh264` alias on Windows). `nvenc` and `software-h264` are exact backend pins. | Restart |
-| `video.bit_depth` | string | Built-in `8`; packages `10` | Both | Ceiling coded component depth: `8`, `10`, or `12`. This is a policy ceiling under `video.color_policy`'s `default-*` values (see below), and an absolute value under its `always-*` values. Packaged hosts expose the proven 10-bit ceiling without forcing it. `12` requires the software encoder tier: NVENC has no 12-bit mode at any subsampling. | Restart |
-| `video.color_range` | string | Built-in `limited`; packages `full` | Both | Ceiling coded sample range: `limited` or `full`. Existing hand-written deployments that omit it retain `limited`; packaged hosts expose the full-range ceiling under `default-off`. | Restart |
-| `video.color_matrix` | string | `bt709` | Both | Ceiling matrix coefficients used to derive luma/chroma from RGB: `identity`, `bt709`, `bt601`, or `bt2020ncl`. | Restart |
-| `video.color_policy` | string | `default-off` | Both | `always-on`, `always-off`, `default-on`, or `default-off`. Governs how `bit_depth`/`color_range`/`color_matrix` interact with a negotiating client. See "Colour fidelity policy" below. | Restart |
-| `video.desktop_encoding` | string | `sdr` | Linux | What the Xorg desktop's code values mean, which Xorg cannot report: `sdr` or `rec2100-pq`. Set `rec2100-pq` only when a colour-managed application writes Rec.2100 PQ into the desktop (for example Flame's HDR UI with graphics monitor `Rec.2100-PQ`); a ten-bit HDR request then stays PQ / BT.2020 instead of resolving to Grading, a Grading session is converted to true BT.709 SDR, and eight-bit sessions (Auto, Speed) are refused with a message naming Grading and HDR. Windows rejects any value but `sdr` because it reads HDR state from the OS. | Restart |
-| `video.x11_desktop_depth` | string | `auto` | Linux (Xorg) | The depth a new dedicated Xorg desktop is created at: `auto`, `24`, or `30`. Under `auto`, a desktop is created at 30 only for a ten-bit session (Grading, HDR, or ten-bit custom axes) or a `rec2100-pq` desktop, and at 24 otherwise. The depth is fixed for the desktop's whole life; see "Linux desktop depth" below. Set `30` on hosts used for grading (Flame, Resolve). Other hosts ignore it. | Restart |
-| `video.qp_map` | string or object | Built-in `off`; packaged templates `{"auto":"on","speed":"on"}` | Linux, Windows; accepted/no-op on macOS | Damage-driven NVENC QP maps: `off`, `neutral`, or `on`, either as one string for every served pipeline or an object keyed by `auto`, `speed`, `grading`, `hdr`, `software`, `custom`. Missing object keys default to `off`. Linux eight-bit CUDA and macOS VideoToolbox do not carry maps. See `docs/architecture/qp-maps.md`. | Restart |
-| `video.variant` | string or absent | absent | Both | Strongest exact administrator pin: a complete probe-matrix variant id such as `hevc-444-10-full-bt709`. It overrides the individual format keys and the Deck's automatic codec choice. | Restart |
-| `audio.enabled` | bool | Required. Built-in `false`; packaged templates `true` | Both | Enables host-to-Deck audio. | Restart |
-| `audio.compressed` | bool | Required. Built-in `false`; packaged templates `true` | Both | `false` selects PCM; `true` selects fixed Opus policy. | Restart |
-| `microphone_input.enabled` | bool | Required. Built-in `false`; packaged templates `true` | Both | Enables optional Deck microphone publication policy. | Restart |
-| `clipboard.direction` | string | policy default `both`; packages `both` | Both | `both`, `client_to_host`, `host_to_client`, or `disabled`. | Restart |
-| `clipboard.content` | string | policy default `all`; packages `all` | Both | `all`, `text`, or `image`. | Restart |
-| `clipboard.max_bytes` | usize | policy default and packages `8388608` | Both | Encoded clipboard cap. Valid 1 MiB through 20 MiB. | Restart |
-| `auth.disclaimer.enabled` | bool | `false` | Both | Requires disclaimer acknowledgement before OS authentication. | Restart |
-| `auth.disclaimer.locale` | string | `en_US` | Both | Locale file stem. | Restart |
-| `auth.disclaimer.directory` | path string | Linux `/etc/arcen/disclaimers`; Windows `disclaimers` relative to config | Both | Directory containing `<locale>.txt`. | Restart |
-| `auth.reconnect_window_secs` | u32 | `180` | Both | Direct resume window. Valid shared range is 0 through 7200. Zero disables resume. The host keeps its display authority for the whole window, so this is also how long another user waits after somebody disconnects. | Restart |
-| `redirection.timezone` | bool | Built-in `false`; packaged templates `true` | Both | Linux sets `TZ` in authenticated desktop process tree. Windows temporarily changes machine time zone under journal. macOS sets `TZ` in the served GUI launchd session for newly launched apps only. | Restart |
-| `wayland.first_login_setup` | string | `run` | Linux (headless Wayland desktops); other Piers accept and ignore it | `run`: on a user's first desktop, GNOME's initial-setup assistant (`gnome-initial-setup --existing-user`) and GNOME Shell's welcome tour run exactly as after a GDM login. `skip`: before the desktop starts, Arcen writes GNOME's own completion markers for that user (`~/.config/gnome-initial-setup-done` and `org.gnome.shell welcome-dialog-last-shown-version`), as finishing them would have; nothing else changes and no input is faked. `wayland qualify` always skips for its temporary account. Unknown tokens fail configuration loading. | Restart |
-| `wayland.session_mode` | string | `auto` | Linux (Wayland desktops); other Piers accept and ignore it | `auto`: a new desktop runs natively on its own logind seat with a real pen when the qualification record proves it and the seat can be built (one per host), otherwise headless with the reason logged. `native_seat`: native or the sign-in is refused. `headless`: never native. See "Native desktops and the pen". Unknown tokens fail configuration loading. | Restart |
-| `logging.level` | integer | `0` | Both | Operational profile: 0 Critical, 1 Error, 2 Info, 3 Debug. | Linux SIGHUP, Windows control 201, restart |
-| `logging.verbosity` | integer | unset | Both | Legacy one-release mapping: 0→Error, 1→Info, 2/3→Debug. Mutually exclusive with `logging.level`. | Linux SIGHUP, Windows control 201, restart |
-| `logging.retention_days` | u16 | `30`, normalized 7 through 100 | Both | Log archive retention. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.fps_degraded_percent` | u8 | `90` | Both | Degraded FPS percent threshold. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.fps_critical_percent` | u8 | `70` | Both | Critical FPS percent threshold. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.rtt_degraded_ms` | u32 | `60` | Both | Degraded RTT threshold. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.rtt_critical_ms` | u32 | `150` | Both | Critical RTT threshold. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.drop_degraded_basis_points` | u16 | `50` | Both | Degraded drop threshold. 50 is 0.5%. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.drop_critical_basis_points` | u16 | `500` | Both | Critical drop threshold. 500 is 5%. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.input_degraded_ms` | u32 | `50` | Both | Degraded input latency. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.input_critical_ms` | u32 | `120` | Both | Critical input latency. | Linux SIGHUP, Windows control 201 |
-| `logging.qos_targets.heartbeat_critical_misses` | u32 | `3` | Both | Missed-heartbeat critical threshold. | Linux SIGHUP, Windows control 201 |
-| `platform` | object | required | Both | Platform-specific section below. | Depends on child key |
-
-TLS cipher-suite names accepted in `tls.disabled_cipher_suites` are exactly: `TLS13_AES_256_GCM_SHA384`, `TLS13_AES_128_GCM_SHA256`, `TLS13_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, and `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`.
-
-QoS validation rules: FPS degraded must be 100 or lower and greater than FPS critical; degraded RTT must be nonzero and less than critical RTT; degraded drop basis points must be less than critical and critical must be at most 10000; degraded input must be nonzero and less than critical; heartbeat critical misses must be nonzero.
+The complete key-by-key table — type, default, meaning, when a change takes
+effect and the release that introduced it, for the common keys and the Linux,
+Windows and macOS `platform` sections — is the
+[Pier configuration reference](config-reference.md). It is checked against the
+configuration types on every change, so it is never behind the Pier. This
+section explains the policies behind the keys.
 
 ### Automatic Deck policy and administrator overrides
 
@@ -839,8 +948,29 @@ The preset also selects a capture pipeline; it is not only an encoder setting:
 
 | Host | Auto / Speed | Grading | HDR |
 | --- | --- | --- | --- |
-| Linux Xorg | NvFBC/CUDA/NVENC, 8-bit device-to-device | Depth-30 XShm RGB10, host conversion and CUDA upload (a depth-30 desktop; see "Linux desktop depth") | Resolves to Grading BT.709 and reports transfer/primaries/matrix degradation |
-| Windows | DDA after real-frame proof or WGC BGRA8 | Mandatory WGC FP16 scRGB converted to ten-bit BT.709 | Final HDR EDID/topology, exact-target HDR proof, WGC FP16 scRGB converted to BT.2020/PQ |
+| Linux Xorg | NvFBC/CUDA/NVENC, 8-bit device-to-device | Depth-30 XShm RGB10, host conversion and CUDA upload (a depth-30 desktop; see "Linux desktop depth"); the desktop's sRGB codes, stated `srgb` to 0.18.0+ Decks | Resolves to Grading BT.709 and reports transfer/primaries/matrix degradation |
+| Windows | DDA after real-frame proof or WGC BGRA8 | Mandatory WGC FP16 scRGB converted to ten-bit SDR that keeps the desktop's sRGB code values (`srgb`; BT.709 OETF for Decks before 0.18.0) | Final HDR EDID/topology, exact-target HDR proof, WGC FP16 scRGB converted to BT.2020/PQ |
+
+On Linux Xorg the ten-bit path copies and converts every frame on the CPU, so
+it has a pixel budget: one 3840×2160 frame (8,294,400 pixels; edges up to
+8192). A Deck display within it — a 3600×2262 Retina size included — is served
+at its own size; a larger one (5K, Pro Display XDR) is served at the largest
+size with the same shape that fits, and the session log says `session display
+fitted to the encoder's and capture path's limits`. The eight-bit NvFBC path
+has no such budget.
+
+When the GPU encoder is unavailable, Grading and HDR are refused (software
+encodes only H.264 8-bit 4:2:0), and the refusal names the GPU encoder's
+reason: the desktop's size or depth, every encoder session in use, no usable
+device, driver or vGPU licence, a missing runtime, or an unsupported ten-bit
+format. Auto and Speed fall back to software instead.
+
+On Windows an HDR session's virtual display must carry ten bits per colour
+over the link its HDR EDID declares (550 MHz). Large Retina sizes do not fit
+at 60 Hz, so the Pier creates them at a lower refresh that is a multiple of
+the HDR stream's 30 fps — 3600×2260 runs at 30 Hz — and logs `HDR10 display
+refresh lowered to fit the 10-bit link`. The stream rate does not change.
+A multi-monitor HDR request at such a size is refused with that reason.
 
 Operators should diagnose the capture backend from capenc READY
 (`capture=nvfbc|xshm|dda|wgc`) and `capture_zero_copy`, not infer it from the
@@ -980,71 +1110,13 @@ encoder tier.
 
 ### Linux `platform.*` keys
 
-| Key | Type | Default | What it does | Takes effect |
-| --- | --- | --- | --- | --- |
-| `platform.auth.mode` | string | `pam` | Only `pam` is accepted in release builds. `none` is refused by SEC-001. | Restart |
-| `platform.auth.pam_service` | string | `login` | PAM service name. | Restart |
-| `platform.auth.unsafe_allow_remote_no_auth` | bool | `false` | Retired SEC-001 compatibility key. Parses, but release builds refuse startup when `true`. | Restart |
-| `platform.capture.monitor` | u32 | `1` | **Linux 1-based** monitor index. Pier subtracts 1 for capenc. Not interchangeable with Windows `output_index`. | Restart |
-| `platform.capture.display` | string | `:0`, package `:0` | X display for capture. | Restart |
-| `platform.capture.xauthority` | path string | unset | Xauthority for capture child. | Restart |
-| `platform.capture.width` | u32 | `0` | Advertised width placeholder when live size not known. | Restart |
-| `platform.capture.height` | u32 | `0` | Advertised height placeholder when live size not known. | Restart |
-| `platform.session.desktop` | string | `gnome` | `gnome` or `gnome-classic`. | Restart |
-| `platform.session.display` | string | built-in `:10`, package `:11` | Dedicated PAM display. Valid `:1` through `:99`. | Restart |
-| `platform.session.gpu_head` | string | built-in `DFP-1`, package `DFP-2` | Dedicated NVIDIA head. Valid `DFP-0` through `DFP-3`. | Restart |
-| `platform.session.xorg_bin` | path string | built-in `/usr/libexec/Xorg` | Xorg executable. | Restart |
-| `platform.session.wayland_x11_apps` | `auto`, `on` or `off` | `auto` | X11 applications in headless Wayland sessions, through the compositor's Xwayland. `auto` serves them where `/usr/bin/Xwayland` is installed and the qualification record proves it (requalify after installing Xwayland); `on` refuses to start unless both hold; `off` starts every compositor with `--no-x11`. Each session then runs one Xwayland (about 80 MB of memory). Logged at start as `X11 applications in Wayland sessions: …`. See [X11 applications (Xwayland)](../architecture/linux-wayland-provider.md#x11-applications-xwayland). | Restart and requalify |
-| `platform.session.xorg_config_template` | path string | built-in `/run/arcen/xorg.conf`, package `/etc/arcen/xorg.conf` | Single-head NVIDIA Xorg template. Its `BusID` is checked against the host's NVIDIA GPUs before each X server starts. | Restart |
-| `platform.session.runtime_root` | path string | `/run/arcen/sessions` | Root-owned session artifact directory. | Restart |
-| `platform.session.agent_bin` | path string | discovered or package path | Session agent helper. **Target state:** becomes `arcen-pier session-agent`. | Restart |
-| `platform.session.launcher_bin` | path string | discovered or package path | Privileged PAM launcher. **Target state:** becomes `arcen-pier session-launcher`. | Restart |
-| `platform.session.zoneinfo_root` | path string | `/usr/share/zoneinfo` | Trusted IANA time-zone database root. | Restart |
-| `platform.session.disconnected_idle_timeout_secs` | u64 or null | unset/null | Linux-only opt-in hygiene. When set to a value greater than 0, a persistent desktop that has been continuously disconnected for longer than this limit is torn down before the next connection creates a fresh desktop. Omit or set `null` to preserve the default persistent-forever behaviour. | Restart |
-| `platform.multi_monitor.advertise_enabled` | bool | `true` | Administrator off switch. `true` permits advertisement only after startup has found usable NVIDIA heads; `false` withholds `multi_monitor_v1`. | Restart |
-| `platform.multi_monitor.heads` | array of strings | `[]` (discover) | Empty means run the NVIDIA Xorg head probe at service start. A non-empty list is an administrator override and ordered ceiling, for example `["DFP-0", "DFP-1"]`; Pier provisions the first N heads of the roster for an N-monitor request. | Restart |
-| `platform.multi_monitor.nvenc_session_limit` | u8 or null | unset | Optional operator ceiling for simultaneous NVENC sessions. Unset uses measured runtime admission: Pier opens the planned encoder set rather than guessing from the GPU model. | Restart |
-| `platform.multi_monitor.allow_software_fallback` | bool | `false` | Permit exact overflow monitors to use OpenH264/H.264/4:2:0 when the NVENC ceiling is exhausted. Full-color displays receive NVENC priority and the complete roster still fails atomically if any software geometry is unsupported. | Restart |
-| `platform.input.mode` | string | built-in `none`, package `uinput` | `none` or `uinput`; `uinput` requires PAM. | Restart |
-| `platform.audio.capture_binary` | path string | package path | audiocap helper. **Target state:** becomes `arcen-pier audiocap`. | Restart |
-| `platform.audio.user` | string | `session` | `session` or `host` audio runtime owner. | Restart |
-| `platform.audio.pactl_binary` | path string | `/usr/bin/pactl` | PulseAudio/PipeWire-Pulse control binary. | Restart |
-| `platform.logging.managed_log` | path string | package `/var/log/arcen/arcen-pier.log` | Fixed JSONL file reopened on SIGHUP. | SIGHUP or restart |
-| `platform.deskside.enabled` | bool | `false` | Physical-console privacy guard. | Restart |
-| `platform.deskside.firmware_sha256` | string | empty | Pinned normalized DMI/chassis hash. | Restart |
-| `platform.deskside.console_uid` | u32 | unset | Expected local seat0 owner UID. | Restart |
-| `platform.deskside.console_display` | string | unset | Physical console `DISPLAY`. | Restart |
-| `platform.deskside.console_xauthority` | path string | unset | Physical console Xauthority. | Restart |
-| `platform.deskside.input_devices` | array of paths | `[]` | Expected keyboard/pointer devices. | Restart |
-| `platform.deskside.outputs[].name` | string | required per output | Physical output name. | Restart |
-| `platform.deskside.outputs[].drm_sha256` | string | required per output | Pinned DRM identity hash. | Restart |
-| `platform.deskside.outputs[].edid_sha256` | string | required per output | Pinned EDID hash. | Restart |
+Listed in the [configuration reference](config-reference.md#linux-platform-keys).
+`platform.capture.monitor` is **1-based** and not interchangeable with Windows
+`platform.desktop.output_index`, which is 0-based.
 
 ### Windows `platform.*` keys
 
-| Key | Type | Default | What it does | Takes effect |
-| --- | --- | --- | --- | --- |
-| `platform.desktop.adapter` | string | unset | Exact case-insensitive DXGI adapter description. Mutually exclusive with `platform.desktop.output_index`. | Restart |
-| `platform.desktop.output` | u32 | `0` when adapter is set | Adapter-local output ordinal. Valid only with `platform.desktop.adapter`. | Restart |
-| `platform.desktop.output_index` | u32 | `0` | **Windows 0-based** global attached-output index. Not interchangeable with Linux `monitor`. | Restart |
-| `platform.desktop.deskside.enabled` | bool | `false` | Physical-workstation privacy guard. | Restart |
-| `platform.desktop.deskside.firmware_sha256` | string | empty | Pinned SMBIOS firmware hash. | Restart |
-| `platform.desktop.deskside.capture_sha256` | string | empty | Pinned capture output hash. | Restart |
-| `platform.desktop.deskside.monitors[].identity_sha256` | string | required per monitor | Physical monitor identity hash. | Restart |
-| `platform.desktop.deskside.monitors[].edid_sha256` | string | required per monitor | Monitor EDID hash. | Restart |
-| `platform.iddcx.enabled` | bool | `false` | Dormant source-research gate. Supported packages do not ship an Arcen IddCx driver; leave `false`. | Restart |
-| `platform.iddcx.render_adapter.stable_id` | string | unset | Research-only exact adapter selector; has no supported packaged provider. | Restart |
-| `platform.iddcx.render_adapter.description` | string | unset | Research-only exact adapter selector; has no supported packaged provider. | Restart |
-| `platform.multi_monitor.advertise_enabled` | bool | `true` | Administrator off switch. `true` permits advertisement only after startup chooses an eligible live NVIDIA/NVENC streaming adapter; `false` withholds `multi_monitor_v1`. | Restart |
-| `platform.multi_monitor.allowed_adapters` | array of strings | `[]` | Exact case-insensitive DXGI adapter descriptions that multi-monitor may use. Empty means any eligible adapter that is not excluded; startup resolves the effective streaming adapter. | Restart |
-| `platform.multi_monitor.excluded_adapters` | array of strings | `[]` | Exact case-insensitive DXGI adapter descriptions multi-monitor must not use. Prefer this to reserve a GPU for other work. | Restart |
-| `platform.multi_monitor.max_monitors` | u8 or null | unset | Optional operator ceiling on the advertised monitor count, 1 through 4. Native NVIDIA headless mode clamps this to its hardware-validated safe provider maximum (currently 2); an explicit lower value still wins. Ordinary attached-output mode cannot probe the interactive desktop from session 0, so set a truthful ceiling there when fewer than four outputs are available. | Restart |
-| `platform.multi_monitor.nvenc_session_limit` | u8 or null | unset | Optional operator ceiling for simultaneous NVENC sessions across allowed adapters. Unset uses measured runtime admission: Pier attempts the complete planned encoder set and observes whether it meets the configured QoS thresholds. | Restart |
-| `platform.multi_monitor.allow_software_fallback` | bool | `true` | Allow eligible non-4:4:4 monitors to use MF/H.264/YUV420 when exact geometry is supported; otherwise reject the complete roster. | Restart |
-| `platform.multi_monitor.nvidia_headless_enabled` | bool or null | unset/null | Provision missing monitors through unused native NVIDIA display IDs on the selected streaming adapter. `null` lets startup enable it for a GRID/Quadro-class adapter, `false` is an off switch, and `true` forces the provider. Cannot be combined with `platform.iddcx.enabled`. | Restart |
-| `platform.logging.rotate_mb` | u64 | `32` | Active log rotation size in MiB. | Windows control 201 or restart |
-| `platform.first_login_timeout_secs` | u64 | `300` | CP first-login session wait. Valid 30 through 1800. | Restart |
-| `platform.font_smoothing` | string | `unchanged` | `grayscale` replaces ClearType with grey-scale text anti-aliasing for the length of each session and restores the user's setting when the session's agent ends. ClearType's sub-pixel colour fringes show as coloured text edges on a Deck, worst on 4:2:0 Auto/Speed streams. The user's stored preference is never written. A volatile per-session marker (`HKCU\Software\ArcenVolatile`, gone at logoff) records the change, so if the agent is killed, the next agent start in that session restores ClearType whatever the policy is then; logoff also restores it. Affects everything drawn in that Windows session, including a physical console. | Next session |
+Listed in the [configuration reference](config-reference.md#windows-platform-keys).
 
 Do not enable `platform.iddcx` on a supported installation. No Arcen IddCx
 binary is shipped or installed; the existing unsigned source/build material is
@@ -1338,23 +1410,22 @@ Interpretation: service started, TLS material loaded, OS authentication succeede
 
 ## 7. Troubleshooting
 
-| Symptom | Check | Likely cause and action |
-| --- | --- | --- |
-| Pier will not start, TLS error | Linux `journalctl -u arcen-pier`; Windows service log | Missing PEM, key/cert mismatch, SAN-less cert, unsupported key, expired cert, or Windows key DACL too broad. Validate and reload or restart. |
-| Pier will not start, port error | Startup stderr or service log reports a QUIC bind failure | Another process owns the configured UDP port, name resolution failed, or QUIC TLS setup failed. Repair UDP 18444/configuration and restart. |
-| Pier will not start, config parse error | `validate-config --config <path>` | Unknown JSON key, missing required `audio` or `microphone_input`, or validation error from the table above. |
-| Client connects but authentication fails | Event 1101 `SESSION_AUTH_FAIL`; Linux PAM logs; Windows CP or LogonUser stage | Bad account/password, PAM service problem, ambiguous Windows session topology, or CP not registered/ready. Do not enable no-auth. |
-| Login takes about 25 seconds | Windows first-login logs | PERF-365: current Windows first login includes a fixed 15 second post-login desktop-stability wait after WTS first reports the exact unlocked session. This prevents black WGC capture before Explorer/DWM stabilizes. It is expected current behavior. |
-| Resize causes black bars and host does not follow client window | ServerHello has `supports_display_update:false`; session-agent or broker display logs include `retarget custom timing enumeration unavailable; persistent save disabled` | SEC-364: on some GRID vGPU hosts `NvAPI_DISP_EnumCustomDisplay` is unavailable. Display restore backend is not retarget-capable, so Pier advertises no display update and Deck correctly does not request resize. This is a GPU capability limit, not a config fix. |
-| Health reports `overall_state: unavailable` during a working session | Event 1806 `HEALTH_SNAPSHOT` | ERR-366: do not trust `overall_state` yet. Use `SESSION_STREAM_START`, frame/QoS fields, client behavior, and component logs. |
-| Capture or encode fails | capenc READY line and event 1102 fields | Auto/Speed rank AV1 → HEVC → H.264 on the approved NVENC adapter, then either host uses source-built OpenH264. Exact codec/variant pins reject substitution. Grading/HDR target HEVC 4:4:4 instead of silently becoming AV1. `not_built` means the selected backend was not compiled. `capenc READY protocol error: missing cursor` means an old Pier is deployed. Rebuild/deploy the fused Pier. |
-| Audio absent but video works | Logs for WASAPI or audiocap | Windows needs a default render endpoint for loopback. Linux audiocap can wait during idle PulseAudio monitor suspension and report a capture gap rather than killing the helper. |
-| Deck reports Match My Layout unsupported | Host `AuthRequest` has no `multi_monitor_v1`; Windows `diagnose-host` **in an interactive session**; Linux startup discovery log | The pre-auth offer is withheld when `platform.multi_monitor.advertise_enabled` is `false`, Linux automatic head discovery found no usable NVIDIA heads, Windows startup found no eligible live NVIDIA/NVENC adapter after `allowed_adapters`/`excluded_adapters`, or the selected Windows adapter has no attached or provisionable outputs. `max_monitors` is only an operator ceiling; set it to a truthful lower value for attached-output hosts that cannot serve the Deck's full layout. |
-| Every Linux session fails with `graphical session setup failed: session launcher failed: dedicated Xorg failed to start` | `Xorg GPU:` lines in `/var/log/arcen/arcen-pier.log`; the head-probe log `/run/arcen/sessions/discovery/nvidia-head-probe-<epoch>.log`; `lspci -D -d 10de:` | `(EE) No devices detected.` and `no screens found` in the X log mean the template's `BusID` names no NVIDIA GPU on this host, or the `nvidia` kernel driver is not loaded. Rerun the installer to set the `BusID`, or edit it in `/etc/arcen/xorg.conf` (decimal, `0000:00:10.0` is `PCI:0:16:0`). See "The NVIDIA GPU in `/etc/arcen/xorg.conf`". |
-| Every Linux session fails with `SELinux policy does not let the launcher start the session in the context PAM assigned` (`selinux_context_refused`) | `semodule -l \| grep -x arcen`; the launcher's `launcher_context` and `session_context` in the Pier log | The `arcen` SELinux module is not loaded, or the user is mapped to a confined SELinux user. Rerun the installer or `semodule -i /usr/share/arcen/selinux/arcen.cil`. Never use `setenforce 0` or remove `pam_selinux`. See [Linux Pier under SELinux](../security/linux-selinux.md). |
-| Linux sign-in refused with `Another remote desktop is active on this host (one X11 desktop per host)` | `loginctl list-sessions` (a session with `SEAT seat0`, `TTY`/VT 1 and class `user`); `another remote desktop holds this host's X11 seat` in `/var/log/arcen/arcen-pier.log` | Another X11 desktop holds `seat0`'s VT 1 (another Pier on the host, or a desktop still closing). Sign out of it or let it reach its idle timeout. Earlier Piers reported this as `session launcher protocol failed`. |
-| Linux sign-in refused with `The host refused this desktop: it could not keep it from local administrator rights (polkit).` | `arcen-pier polkit-rule status`; `SECURITY: this desktop is refused` in `/var/log/arcen/arcen-pier.log` (its `reason`, `checks` and `polkit` fields) | `polkit_rule_missing`: run `arcen-pier polkit-rule install` (or rerun the installer) and restart the Pier. `polkit_grants_remote_session`: a rule numbered below `05-` grants one of the probe actions to remote users; narrow it. `polkit_unverified`: `pkaction`/`pkcheck` did not answer (polkit not running). See "polkit" under Installation. |
-| Clipboard absent | ServerHello and session logs (`clipboard_bridge_ready`, `clipboard_bridge_unavailable`, `clipboard_bridge_lost`, `clipboard_transfer_abandoned`) | Clipboard starts only after exact clipboard v1 negotiation and authenticated dedicated/user session. No-auth/shared-display sessions advertise disabled. A Wayland desktop whose agent could not prove the compositor clipboard advertises disabled. A Wayland bridge that is lost turns the clipboard off for that attachment only. A host copy above `clipboard.max_bytes` is refused and the session goes on; the helper's `clipboard_host_item_refused` diagnostic is below the helpers' default (critical) log profile. |
+Symptoms, causes and fixes — cannot connect, sign-in refused, black screen,
+lag, colours, pen, keyboard, audio, clipboard, USB, displays, and a Pier that
+will not start — are in [Troubleshooting](troubleshooting.md). Every code the
+Pier logs or sends a Deck is explained in [Error codes](error-codes.md).
+
+The fastest first step for any connection problem needs no password: on the
+Deck, **Test connection** in the connection editor, or
+`arcen-deck diagnose <host>` from a terminal. It checks name resolution, UDP
+18444 with a real QUIC handshake, the certificate against the identity the
+Deck remembers, the Pier's greeting before sign-in, the path MTU and the round
+trip. It sends no user name or password, so it never counts towards sign-in
+throttling or an account lockout. The Pier still records it, like any client
+that leaves before signing in: the Linux Pier logs `SESSION_AUTH_FAIL` (1101)
+with `stage` `await_auth_response` and `reason_class` `transport_error`. A
+burst of those from an unknown address is someone probing the port; one at the
+time a user ran the test is the test.
 
 ## 8. Upgrade and rollback
 
@@ -1386,8 +1457,9 @@ honours it, and its default is `muted`, including in an existing
 the session user's audio server except Arcen's own is muted, so nobody beside
 the host hears the remote user. A host that cannot prove that silence
 refuses the session and the Deck is told "The host could not mute its own
-speakers". To keep the host's speakers playing, opt out before or after the
-upgrade:
+speakers". The installer prints a NOTE saying so when it replaces a Pier
+older than 0.17.0 and the configuration does not name the key. To keep the
+host's speakers playing, opt out before or after the upgrade:
 
 ```json
 "audio": { "enabled": true, "compressed": true, "local_playback": "audible" }
@@ -1395,6 +1467,31 @@ upgrade:
 
 then `sudo arcen-pier validate-config --config /etc/arcen/pier.json` and
 restart the service. See [Local playback](pier-configuration.md#local-playback).
+
+**Native tablet after a kernel update (Rocky Linux/RHEL).** Native tablet
+(when enabled) uses the distribution's in-tree USB/IP controller `vhci-hcd`,
+which Rocky Linux and RHEL ship only in `kernel-modules-internal`, one package
+per kernel release ([ADR 0020](../adr/0020-linux-native-tablet-in-tree-vhci-hcd.md);
+Red Hat labels the package internal and unsupported). With Native tablet
+enabled, the installer installs it for the kernel running at install time, with GPG checking on, and checks
+that the module is signed by the kernel's own key; `--no-native-tablet-modules`
+skips it. dnf does not install it for a new kernel, so after a kernel update
+and reboot install the matching package:
+
+```sh
+sudo dnf --enablerepo=devel install kernel-modules-internal-$(uname -r)
+```
+
+For a Rocky kernel whose point release has moved on, the package is in the
+vault (`https://dl.rockylinux.org/vault/rocky/<release>/devel/<arch>/os/Packages/k/`);
+running the installer again finds it. The Pier logs the exact command at
+start, and `arcen-pier validate-config` prints it. The Pier loads `vhci-hcd`
+once, when it starts: after installing the package on a host whose Pier is
+already running, restart the Pier (or run `modprobe vhci-hcd`).
+`validate-config` says whether the module is loaded, or installed but not
+loaded.
+`--uninstall` and `--no-native-tablet` remove the package only if the
+installer installed it.
 
 ### Windows
 
@@ -1428,9 +1525,9 @@ Preserve `%ProgramData%\Arcen\tls` and logs unless the host is being decommissio
 | Credential Provider | Additive provider for remote first login and unlock. It must be signed for production. It does not disable Microsoft's password provider. Autologon must remain disabled. |
 | Session agent | Runs in the authenticated user session. It handles clipboard APIs and per-session capture/control IPC. LocalSystem brokers TLS/auth and relays bounded frames. |
 | TLS keys | Operator-managed PEM. Windows refuses private keys without restrictive DACL. Linux requires root-owned restrictive files. Self-signed certificates issued by either installer are valid for 825 days; ordinary installer upgrades reissue only positively classified unmarked legacy-Arcen pairs over the existing key, preserving SANs, and leave operator self-signed or CA-issued material alone. Same-key renewal uses the host-cert helpers (`new-host-cert.ps1 -Renew`, `arcen-pier new-host-cert --renew`, or `arcen-new-host-cert --renew`); installer `--force` is a trust-changing key replacement. |
-| Password attempts | **Arcen applies no lockout, backoff, or attempt limit of its own.** Each connection presents one credential to PAM or `LogonUserW`, and throttling is entirely whatever the operating system already enforces. On Linux configure `pam_faillock`; on Windows configure the account-lockout policy. A Pier reachable from a network you do not control, on a host with a permissive PAM stack, is an unthrottled password oracle against a real OS account. |
+| Password attempts | **The Linux and Windows Piers apply no lockout, backoff, or attempt limit of their own** (the macOS Pier preview backs off per address and per account, shared `arcen_session::auth_throttle`). Each connection presents one credential to PAM or `LogonUserW`, and throttling is entirely whatever the operating system already enforces. On Linux configure `pam_faillock`; on Windows configure the account-lockout policy. A Pier reachable from a network you do not control, on a host with a permissive PAM stack, is an unthrottled password oracle against a real OS account. |
 | Logs and support bundles | Sensitive operational data. Bundles pseudonymize selected identities but are not anonymous. Protect them in storage and transit. |
-| Known gaps | PERF-365 first-login delay; SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; headless Linux Wayland (chosen automatically on a qualified host without Xorg) is not a released provider yet; ERR-366 `overall_state` unreliable. |
+| Known gaps | SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; Linux Wayland serves Speed, Grading and HDR only where qualification proves them (see [Which desktop a Linux Pier serves](#which-desktop-a-linux-pier-serves)); ERR-366 `overall_state` unreliable. |
 
 ## Proving a host actually streams
 
@@ -1554,6 +1651,15 @@ sign-in proves it silent within about 3 s and takes over the same way; a
 Deck that is still connected and answering keeps the session. Another user
 is still refused until the window ends. With a sign-in disclaimer
 configured, only resume continues a detached session.
+
+A Windows Pier does the same for its signed-in Windows session: the same
+account signing in again takes over a detached session at once, and proves a
+silent but still open Deck connection gone within about 3 s (the Deck process
+was killed, or its network vanished) instead of waiting out the resume
+window. The new sign-in then starts its own session agent on the same Windows
+desktop; on the lab host the first picture arrives about 18 s after the old
+Deck died, against about 11.5 s for an ordinary sign-in. A still-connected
+Deck of the same account keeps the display, and another account is refused.
 
 ## Display modes
 
@@ -1995,36 +2101,9 @@ spctl -a -t exec -vvv "Arcen Deck.app"    # must exit 0
 ```
 
 Do this on a machine that did not build the bundle. On the build host the check
-passes for the wrong reason. See BUILD-376.
-
-## Validation account on pier-linux.example.internal
-
-A local account `arcen-test` (uid 1001) was created on **pier-linux.example.internal** on
-2026-07-26 to validate authenticated sessions. It exists because the supplied
-AD account `jc` was rejected by PAM and guessing further risked a domain
-lockout; creating a local account was the authorised alternative.
-
-It is a local account, not a domain one, has no sudo rights, and its password
-is rotated to a fresh random value before each validation run and never
-written to disk or into this repository.
-
-Remove it when validation on that host is finished:
-
-```sh
-sudo systemctl stop arcen-pier          # only if a session may be attached
-sudo pkill -u arcen-test || true
-sudo userdel -r arcen-test              # -r also removes /home/arcen-test
-getent passwd arcen-test || echo "removed"
-sudo systemctl start arcen-pier
-```
-
-Check for a leftover session first, because the Linux Pier has been observed
-leaving `Xorg` and the session agent running after disconnect (SEC-367):
-
-```sh
-ps -u arcen-test -o pid,cmd
-ls /run/arcen/sessions/
-```
+passes for the wrong reason. Released Decks are built this way for both
+architectures: `Arcen Deck` (Apple silicon) and `Arcen Deck Intel`
+(`--arch x86_64`).
 
 ## Known operational gaps
 
@@ -2053,19 +2132,12 @@ These are open findings, listed so an administrator is not surprised by them.
   Keep `max_monitors` at 2 or lower when enabling
   `platform.multi_monitor.nvidia_headless_enabled`; three-output support
   remains a release blocker.
-- **PERF-365** — session start waits a fixed 15 s stability window even when
-  the session is already stable on the first poll, which dominates a roughly
-  25 s login.
 - **ERR-366** — `HEALTH_SNAPSHOT` reports `overall_state: unavailable`
   throughout an otherwise healthy streaming session, so it cannot currently be
   used as a health signal.
 - **SEC-367** — after a clean disconnect, the session launcher, `Xorg` and the
   session agent have been observed still running well beyond the reconnect
   window. Check for orphaned `Xorg` processes when decommissioning a host.
-- **BUILD-376** — the Deck bundle is currently distributable only to the
-  machine that built it: development builds are unsigned and Gatekeeper
-  rejects them elsewhere, and the binary is arm64-only while the declared
-  minimum OS admits Intel Macs.
 - **BUILD-375, partly open** — on a Linux host with *no* usable NVENC, the
   `auto` path arms the session display at the client's requested geometry
   before the NVENC probe result is known. Clients at or below 1920x1080 fall

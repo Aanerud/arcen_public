@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! How many bits a picture of a given shape is worth.
 //!
 //! One formula, because a host that invents its own produces a stream the

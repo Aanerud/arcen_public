@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared, platform-parameterized Pier configuration schema.
 
 use std::collections::BTreeMap;
@@ -31,7 +33,81 @@ pub struct PierConfig<P> {
     /// Linux headless Wayland desktop policy.
     #[serde(default)]
     pub wayland: WaylandConfig,
+    /// Physical USB devices bridged from a Deck (Native tablet).
+    #[serde(default)]
+    pub usb: UsbConfig,
     pub platform: P,
+}
+
+/// USB bridging policy (`usb`).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsbConfig {
+    /// `enabled`: the Pier offers Native tablet — a Deck's physical pen
+    /// tablet attached to the desktop as a virtual USB device — where the
+    /// platform supports it (ADR 0020, ADR 0021). `disabled`, or absent:
+    /// never offered. An administrator opt-in because it attaches a
+    /// Deck-supplied USB device to the host kernel.
+    pub native_tablet: Option<NativeTabletSetting>,
+}
+
+/// The administrator's Native tablet choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeTabletSetting {
+    Enabled,
+    Disabled,
+}
+
+/// Where the effective Native tablet decision came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeTabletSource {
+    /// `usb.native_tablet` in the Pier configuration.
+    Config,
+    /// Not configured: off.
+    Default,
+}
+
+/// The effective Native tablet decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeTabletPolicy {
+    pub enabled: bool,
+    pub source: NativeTabletSource,
+}
+
+impl NativeTabletPolicy {
+    /// Resolves `usb.native_tablet`: the configuration is the only switch
+    /// (the 0.18 `ARCEN_USB_HARD_LAB=1` environment is gone since 0.19.0).
+    #[must_use]
+    pub const fn resolve(setting: Option<NativeTabletSetting>) -> Self {
+        match setting {
+            Some(setting) => Self {
+                enabled: matches!(setting, NativeTabletSetting::Enabled),
+                source: NativeTabletSource::Config,
+            },
+            None => Self {
+                enabled: false,
+                source: NativeTabletSource::Default,
+            },
+        }
+    }
+
+    /// Why Native tablet is off, in words shown to a Deck user and to the
+    /// administrator; `None` when it is on.
+    #[must_use]
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match (self.enabled, self.source) {
+            (true, _) => None,
+            (false, NativeTabletSource::Config) => Some(
+                "Native tablet is disabled on this host (usb.native_tablet is \"disabled\" in \
+                 the Pier configuration)",
+            ),
+            (false, _) => Some(
+                "Native tablet is not enabled on this host; an administrator enables it with \
+                 usb.native_tablet = \"enabled\" in the Pier configuration",
+            ),
+        }
+    }
 }
 
 /// Linux headless Wayland desktop policy (`wayland`).
@@ -629,6 +705,59 @@ mod tests {
         .expect("parse");
         assert!(!muted_but_disabled.audio.enabled);
         assert!(muted_but_disabled.audio.local_playback.requires_mute());
+    }
+
+    #[test]
+    fn native_tablet_is_an_administrator_opt_in_that_outranks_the_old_variable() {
+        let parse = |usb: &str| {
+            serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                r#"{{{usb}"audio":{{"enabled":false,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "platform":{{"name":"test"}}}}"#
+            ))
+        };
+        let absent = parse("").expect("a configuration without usb parses");
+        assert_eq!(absent.usb.native_tablet, None);
+        let enabled = parse(r#""usb":{"native_tablet":"enabled"},"#).expect("enabled");
+        assert_eq!(
+            enabled.usb.native_tablet,
+            Some(NativeTabletSetting::Enabled)
+        );
+        for typo in [
+            r#""usb":{"native_tablet":"on"},"#,
+            r#""usb":{"native_tablet":true},"#,
+            r#""usb":{"native_tablets":"enabled"},"#,
+        ] {
+            assert!(
+                parse(typo).is_err(),
+                "{typo} must fail configuration loading"
+            );
+        }
+
+        let resolve = NativeTabletPolicy::resolve;
+        assert_eq!(
+            resolve(None),
+            NativeTabletPolicy {
+                enabled: false,
+                source: NativeTabletSource::Default
+            }
+        );
+        assert!(
+            resolve(None)
+                .disabled_reason()
+                .is_some_and(|reason| reason.contains("usb.native_tablet"))
+        );
+        let disabled = resolve(Some(NativeTabletSetting::Disabled));
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.source, NativeTabletSource::Config);
+        assert!(
+            disabled
+                .disabled_reason()
+                .is_some_and(|reason| reason.contains("\"disabled\""))
+        );
+        let on = resolve(Some(NativeTabletSetting::Enabled));
+        assert!(on.enabled);
+        assert_eq!(on.disabled_reason(), None);
     }
 
     #[test]

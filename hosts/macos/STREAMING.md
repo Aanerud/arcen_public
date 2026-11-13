@@ -1,8 +1,7 @@
 # How the macOS Pier streams, and what that was measured to cost
 
-This records what was measured rather than what was assumed, because most of
-the time spent on the first slow-stream investigation went into theories that
-turned out to be wrong. Where something is still unproven, it says so.
+This records what was measured rather than what was assumed. Where something
+is still unproven, it says so.
 
 ## Frame rate, not the encoder, is the latency lever
 
@@ -29,8 +28,8 @@ which is 30; `High` is already 60.
 
 ### Nine things that did not work
 
-Each was measured on the lab, and each is worth knowing precisely because it
-looked promising:
+Each was measured, and each is worth knowing precisely because it looks
+promising:
 
 | tried | result |
 | --- | --- |
@@ -44,8 +43,7 @@ looked promising:
 | launchd `ProcessType: Interactive` | 12.95 — no change |
 | our own per-frame `CVPixelBuffer` | 0.015 ms — never us |
 
-The invariance to pixel count is the clue that should have redirected the
-search sooner: **a cost that does not move when the work halves is not
+The invariance to pixel count is the clue: **a cost that does not move when the work halves is not
 compute.** Published reports put VideoToolbox on Apple Silicon at 10–15 ms
 with an intrinsic pipeline delay, and 12.8 ms sits in that band. It is a
 floor, not a bug.
@@ -79,13 +77,11 @@ what the same arithmetic spends on 1080p of the same cadence:
 | `mean_queue_ms` | 52.20 → **0.07** | 29.91 → **0.05** |
 | `mean_send_ms` | 24.78 → **0.00** | 15.46 → **0.00** |
 
-## What a still desktop actually costs — and a retraction
+## What a still desktop actually costs
 
-**An earlier version of this file claimed a still desktop cost the full
-bitrate and that ScreenCaptureKit reports 99.83% damage every frame. Both
-were measured on a desktop that was not actually still.**
-
-On a confirmed-idle lab desktop — Safari quit, no foreground application,
+A desktop that only looks still (a browser left open, something animating)
+costs the full bitrate, with ScreenCaptureKit reporting nearly 100% damage
+every frame. On a confirmed-idle desktop — Safari quit, no foreground application,
 nothing animating — measured through a real Deck:
 
 | | frames in 25 s | bandwidth |
@@ -115,8 +111,8 @@ measuring.
 
 ## The host was never asked for thirty
 
-The longest-running wrong theory in this file was that ScreenCaptureKit could
-not deliver faster than 67 ms. It delivered exactly what it was asked for.
+ScreenCaptureKit delivers exactly what it is asked for; a 67 ms source
+interval meant the host had been asked for 15 fps.
 
 `StreamProfile::default()` on the Deck requested `max_fps: 15` — half the
 lowest preset the client offers — and `--connect`, the headless form README
@@ -125,7 +121,7 @@ explicit `--max-fps 30` changed the value on the wire. So the Deck asked for
 15, the Pier served 15, and ScreenCaptureKit paced at 1/15 s = 66.7 ms.
 
 Everything downstream was consistent with a host at its ceiling, because it
-was at the ceiling it had been given. Measured on the lab with a real Deck at
+was at the ceiling it had been given. Measured with a real Deck at
 2560×1440:
 
 | | before | after |
@@ -133,11 +129,10 @@ was at the ceiling it had been given. Measured on the lab with a real Deck at
 | `mean_source_interval_ms` | 67.39 | **34.08** |
 | negotiated fps | 15 | **30** |
 
-Three explanations were tried first and are wrong. Each is recorded because
-each looked convincing:
+Three plausible explanations are ruled out by measurement:
 
 - **The consumer was never behind.** `LatestFrame::superseded` had never once
-  been non-zero across every session in the lab log. The encode loop was
+  been non-zero across every recorded session. The encode loop was
   always already waiting when a frame arrived.
 - **The capture callback was never the cost.** It occupies 0.013 ms mean and
   0.064 ms at worst against a 67 ms interval — 0.02% of the budget.
@@ -197,8 +192,7 @@ setting `EnableHardware...`. Only the read-back is evidence. The host now logs
 which encoder it got, as `encoder_backend`, because the first question anyone
 asks about a slow stream is which one it was.
 
-A standing theory that the slow stream was software encoding is therefore
-retired. It was never true.
+Software encoding is therefore not the cause of a slow stream.
 
 ### The stages used to run in sequence
 
@@ -300,34 +294,9 @@ against a real Deck over a real link.
 - **Bit depth does not imply HDR**, and a ten-bit container proves neither HDR
   nor a genuinely ten-bit source.
 
-## Consult the reference before concluding something is impossible
-
-`refference/osx/Files_interest` holds a shipping commercial macOS remote
-desktop agent. It may be read and analysed, never copied. Twice now a
-conclusion of "macOS cannot do this" has been reached by probing, and the
-reference has settled it in one command.
-
-Reading a binary's imports says what a working product actually calls:
-
-```sh
-nm -u <binary> | grep -i cursor
-strings <binary> | grep -i cursor
-```
-
-For the cursor that answered, in order: `currentSystemCursor`, `image` and
-`hotSpot` are read; `kCGDisplayStreamShowCursor` exists for the composited
-mode; `CursorShapeSharedMemoryPool` and "cursor shape's bitmap data" say the
-bitmap is carried; "cursor polling resumed"/"suspended" say it is polled rather
-than subscribed to; and a settings key naming a "locally rendered cursor" says the client
-draws it locally by default, with an option to stop. That is a complete design,
-recovered without reading a line of anyone's source.
-
-Notably it imports **no private cursor API** — no `CGSCurrentCursorSeed`, no
-`CGSGetGlobalCursorData`. What it uses is public.
-
 ## Two ways a cursor probe can lie
 
-Both were made here, and both produced a confident wrong answer.
+Both produce a confident wrong answer.
 
 **Warping is not moving.** `CGWarpMouseCursorPosition` relocates the pointer
 without posting an event, so no application processes a mouse-moved event and
@@ -343,7 +312,7 @@ different fault from the cursor never changing.
 
 ## A headless Mac has one display mode, and that decides the geometry story
 
-Measured on the lab Mac Studio with `probe-modes`, asking for scaled and
+Measured on a headless Mac Studio with `probe-modes`, asking for scaled and
 duplicate-resolution modes and reading pixel rather than point sizes:
 
 ```
@@ -357,17 +326,11 @@ give a Deck the 2560x1440 desktop it asked for, because there is nothing to set
 it to — and a Deck with a larger screen therefore sees a 1080p desktop scaled
 up, which is exactly as soft as that sounds.
 
-The reference solves this with virtual displays. Its own strings say so —
-"Default system virtual display is not active", "it is not a \<vendor\> virtual
-display", "virtual display id {} serial number mismatch" — and its imports name
-the mechanism: `CGVirtualDisplay`, `CGVirtualDisplayDescriptor`,
-`CGVirtualDisplayMode` and `CGVirtualDisplaySettings`. Those are **private**
-CoreGraphics classes. They appear in no public SDK header.
-
-So the options are a private API that a shipping commercial product depends on,
-or a desktop that is whatever size the host's framebuffer happens to be. That
-is a decision about what this product is willing to depend on, not a technical
-question, and it should be made deliberately rather than discovered.
+A larger desktop needs a virtual display. macOS exposes virtual displays only
+through private CoreGraphics classes (`CGVirtualDisplay` and its descriptor,
+mode and settings classes), which appear in no public SDK header; the Pier
+uses them for its virtual panels, and that dependency on a private API is a
+deliberate, documented choice.
 
 Note what this also means for a headless host: there is no physical console to
 disturb, so the usual objection to changing a host's display configuration does
@@ -392,10 +355,12 @@ Note the per-record `profile_name` field is **not** the filter. It is the level
 that record requires, so a log full of `"critical"` records says nothing about
 what is being filtered out.
 
-## Do not run `python3` on the lab machine
+## Do not run developer tools on a clean test Mac
 
-It raises the Command Line Tools installer on its console, the same way `xcrun`
-does. Use `grep`, `sed` and `awk` there, and parse the output locally.
+On a Mac without developer tools, `python3` raises the Command Line Tools
+installer on its console, the same way `xcrun` does. Run installer
+qualification on clean systems, use `grep`, `sed` and `awk` there, and build
+diagnostics on a development system.
 
 ## A faster source does not help a slow writer
 

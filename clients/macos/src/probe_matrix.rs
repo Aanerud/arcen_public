@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `arcen-deck probe-matrix` (`dev-tools` feature) -- the colour-matrix
 //! hardware-decode probe.
 //!
@@ -395,7 +397,7 @@ struct ProbeReport {
 fn environment_info() -> EnvironmentInfo {
     let client = backend::client_environment();
     // Deliberately built from model + macOS version rather than hostname:
-    // a hostname (e.g. "andreas-mbp.local") is personally identifying and
+    // a hostname (e.g. "studio-mbp.local") is personally identifying and
     // this identifier ends up in a file the tool's caller may commit.
     let environment_id = format!(
         "{}-{}",

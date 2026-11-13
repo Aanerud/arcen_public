@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-audiocap"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-telemetry",
  "libpulse-binding",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-capenc"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-cp-ipc"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "ring",
  "serde",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-credential-provider"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-cp-ipc",
  "windows 0.58.0",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-macos"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -286,11 +286,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-iddcx-provider"
-version = "0.17.0"
+version = "0.19.0"
 
 [[package]]
 name = "arcen-identity"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-input"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-media",
  "arcen-protocol",
@@ -311,11 +311,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-input-helper"
-version = "0.17.0"
+version = "0.19.0"
 
 [[package]]
 name = "arcen-keel"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-media"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-keel",
  "arcen-protocol",
@@ -334,14 +334,17 @@ dependencies = [
  "opusic-c",
  "png",
  "rav1e",
+ "ruzstd",
  "serde",
  "serde_json",
+ "xxhash-rust",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
 name = "arcen-microphone-driver"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "libc",
  "mach2",
@@ -349,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-observability"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-telemetry",
  "serde_json",
@@ -359,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-outputs"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-media",
  "arcen-telemetry",
@@ -367,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-audiocap",
  "arcen-capenc",
@@ -416,18 +419,19 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux-installer"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-outputs",
  "arcen-session",
  "arcen-transport",
+ "arcen-usb-bridge",
  "rustix 1.1.4",
  "serde_json",
 ]
 
 [[package]]
 name = "arcen-pier-macos"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -439,6 +443,7 @@ dependencies = [
  "arcen-session",
  "arcen-telemetry",
  "arcen-transport",
+ "arcen-usb-bridge",
  "block2 0.6.2",
  "dispatch2",
  "futures-util",
@@ -477,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-capenc",
  "arcen-cp-ipc",
@@ -514,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows-installer"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-session",
  "arcen-transport",
@@ -525,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-protocol"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-usb-bridge",
  "getrandom 0.2.17",
@@ -537,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-region-patch-benchmark"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -545,8 +550,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcen-secure-dir"
+version = "0.19.0"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "arcen-session"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-telemetry",
  "serde",
@@ -557,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-telemetry"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -566,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-transport"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-identity",
  "arcen-observability",
@@ -576,6 +588,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "rustls",
  "serde_json",
@@ -588,19 +601,39 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-bridge"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "arcen-usb-helper"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "arcen-protocol",
+ "arcen-secure-dir",
  "arcen-usb-bridge",
+ "arcen-usb-iousbhost",
  "libc",
  "rusb",
+ "rustix 1.1.4",
+]
+
+[[package]]
+name = "arcen-usb-iousbhost"
+version = "0.19.0"
+dependencies = [
+ "arcen-secure-dir",
+ "arcen-usb-bridge",
+ "block2 0.6.2",
+ "dispatch2",
+ "libc",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-io-kit",
+ "objc2-io-usb-host",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1478,6 +1511,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
  "objc2 0.6.4",
 ]
 
@@ -3366,6 +3400,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
+ "dispatch2",
+ "libc",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-io-surface"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3374,6 +3420,20 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2 0.6.4",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-usb-host"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d0187e19ea8d0ad052f2cab5f4e6eb2e399cbb942a9510a2c6766728d704e11"
+dependencies = [
+ "bitflags 2.13.1",
+ "block2 0.6.2",
+ "dispatch2",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-io-kit",
 ]
 
 [[package]]
@@ -4455,6 +4515,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "safe_arch"
@@ -6780,6 +6846,34 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zune-core"

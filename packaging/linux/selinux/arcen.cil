@@ -1,4 +1,5 @@
-; SPDX-License-Identifier: AGPL-3.0-only
+; SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+; Copyright (C) 2026 TUTTIFRUTTI AS
 ;
 ; Arcen Pier SELinux policy module (CIL). Installed by install-arcen-pier
 ; with `semodule -i arcen.cil` only on a host with SELinux enabled; removed

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Real Quinn loopback tests for the isolated lane runtime (ADR 0014,
 //! plan §9): independent per-lane writers, the single accept dispatcher,
 //! refusal before any worker, Deck pending authorization, supersession and

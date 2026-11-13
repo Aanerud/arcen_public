@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! What an HEVC stream really is, read from its sequence parameter set.
 //!
 //! A session's hello says what the host meant to send, and the host's encoder

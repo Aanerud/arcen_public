@@ -31,6 +31,6 @@ the Swift 5.7 toolchain and run on macOS 12, the oldest release
 The Arcen patch has SHA-256
 `95b05e3b1bea74f5a775c7e3a520c71bea2833b3c317128d208f7f0bafa29877`.
 
-The source, licenses and authorship records must remain intact. Release/Security
-owner approval is required before release. See `legal/ORIGINS.md` and
-`legal/THIRD_PARTY_NOTICES.md`.
+The upstream licence, source checksum and patch accompany this source; the
+source, licences and authorship records must remain intact. See
+`legal/ORIGINS.md` and `legal/THIRD_PARTY_NOTICES.md`.

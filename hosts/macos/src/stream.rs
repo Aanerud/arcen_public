@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Streaming encoded frames to a connected Deck.
 //!
 //! This is the piece that joins capture and encode to the wire. Everything
@@ -29,6 +31,8 @@ use crate::net::PierSocket;
 pub struct InputModeResults {
     pub cursor: arcen_protocol::messages::CursorModeResultMsg,
     pub tablet: arcen_protocol::messages::TabletModeResultMsg,
+    /// The bridged tablet to present, when Native tablet is active (ADR 0022).
+    pub native_tablet: Option<crate::bridged_tablet::AuthorizedTablet>,
 }
 
 /// How long to wait for a frame before deciding the display is idle.
@@ -83,6 +87,20 @@ pub struct StreamStats {
     /// tracking working, not a fault. A session that suppresses nothing while
     /// idle is one that is spending its bandwidth re-sending a still picture.
     pub frames_suppressed: u64,
+    /// Captured frames a Detail stream skipped to hold its frame interval:
+    /// content that changed and was not sent, so a cap below a busy screen,
+    /// or back-pressure, reads as the shortfall it is.
+    pub frames_detail_skipped: u64,
+    /// Positive evidence the screen did not change: frames Keel skipped as
+    /// unchanged, plus image-less buffers `ScreenCaptureKit` marked
+    /// `SCFrameStatus::Idle`. Never a capture wait that merely timed out — a
+    /// capture falling behind a busy screen waits too. Only a health window
+    /// with at least one proves the source set the pace.
+    pub frames_unchanged: u64,
+    /// [`Self::frames_unchanged`] per display, in display order: a window
+    /// proves the content rate only when every display showed evidence.
+    #[serde(skip)]
+    pub unchanged_per_display: Vec<u64>,
     /// Audio packets dropped because they were too old to play in time.
     ///
     /// Reported rather than silent: a non-zero count says the host could not
@@ -94,6 +112,8 @@ pub struct StreamStats {
     /// A Deck asking repeatedly is a Deck that cannot decode what it is being
     /// sent, so the request is counted as well as forwarded to the encoder.
     pub full_frame_requests: u64,
+    /// `health_stats` messages sent to the Deck.
+    pub health_stats_sent: u64,
     /// Frames the encoder produced bytes for.
     pub frames_encoded: u64,
     /// Frames written to the socket.
@@ -539,6 +559,8 @@ const HEALTH_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 /// One second, matching the Linux Pier. A Deck that has received nothing for
 /// longer cannot tell a still desktop from a dead host.
 const KEEPALIVE: Duration = Duration::from_secs(1);
+/// The window each `health_stats` covers, as on the Linux and Windows Piers.
+const HEALTH_STATS_WINDOW: Duration = Duration::from_secs(2);
 /// How often the encoding rate is reconsidered.
 const RATE_TICK: Duration = Duration::from_secs(1);
 /// Longest the encoder sleeps on an idle desktop before checking what it owes.
@@ -701,6 +723,62 @@ async fn stage_produced_frame(
     }
     *pending_frame = Some(produced);
     Ok(served)
+}
+
+/// Sends what a Native tablet step produced: USB frames for the Deck's bulk
+/// lane, then the tablet-mode result when Native tablet ended.
+async fn send_tablet_output(
+    writer: &tokio::sync::mpsc::Sender<Message>,
+    output: crate::bridged_tablet::SessionOutput,
+    input: Option<&mut crate::input_session::InputSession>,
+    pointer: Option<&mut crate::bridged_tablet::HostPenPointer>,
+) -> Result<(), StreamError> {
+    // A pen this host reads itself (ADR 0022 §14) goes straight to the
+    // injector; a failed post is logged, never fatal to the session.
+    if let Some(input) = input {
+        for pen in &output.pens {
+            if let Err(error) = input.apply_host_pen(pen) {
+                tracing::debug!(
+                    target: arcen_telemetry::names::target::HID,
+                    ?error,
+                    "Native tablet: a pen event this host read was not posted"
+                );
+            }
+        }
+    }
+    // The pointer it moved, for a Deck that draws its cursor there.
+    if let Some(pointer) = pointer {
+        pointer.observe(&output.positions);
+        send_host_pen_pointer(writer, pointer, Instant::now()).await?;
+    }
+    for frame in output.frames {
+        enqueue(writer, Message::Binary(frame)).await?;
+    }
+    if let Some(notice) = output.notice {
+        enqueue(writer, Message::Text(notice)).await?;
+    }
+    Ok(())
+}
+
+/// Sends the newest host pointer position a bridged pen moved, when one
+/// waits and the rate allows it (on the input/cursor lane, `CursorPosition`).
+async fn send_host_pen_pointer(
+    writer: &tokio::sync::mpsc::Sender<Message>,
+    pointer: &mut crate::bridged_tablet::HostPenPointer,
+    now: Instant,
+) -> Result<(), StreamError> {
+    if let Some(record) = pointer.take_record(now) {
+        enqueue(writer, Message::Binary(record.to_vec())).await?;
+    }
+    Ok(())
+}
+
+/// Resolves at `due` (never when `None`; the arm is disabled then).
+async fn sleep_until_due(due: Option<Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn send_input_mode_results(
@@ -867,6 +945,9 @@ fn handle_incoming(
                         session
                             .apply(&text)
                             .map_err(|error| StreamError::Input(error.to_string()))?;
+                        if let Some(reply) = session.take_reply() {
+                            return Ok(Incoming::Reply(reply));
+                        }
                     }
                 }
             }
@@ -953,6 +1034,8 @@ struct Producer {
     suppressed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Raw captured frames superseded before encode by the latest-wins handoff.
     superseded: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Rate-capped skips and idle evidence, for health.
+    health: std::sync::Arc<CaptureHealthCounters>,
     /// The encoding rate the session wants, in bits per second; zero keeps
     /// the encoder's own.
     rate: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -960,6 +1043,71 @@ struct Producer {
     /// decided it (`RateController::detail_framerate`); zero keeps the
     /// capture's own.
     detail_fps: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// What the encode loop publishes for health beyond the frame counts.
+#[derive(Debug, Default)]
+struct CaptureHealthCounters {
+    /// See [`StreamStats::frames_detail_skipped`].
+    detail_skipped: std::sync::atomic::AtomicU64,
+    /// Frames Keel skipped because nothing changed.
+    keel_unchanged: std::sync::atomic::AtomicU64,
+    /// Each display's live `SCFrameStatus::Idle` counter, registered once the
+    /// capture starts and incremented by `ScreenCaptureKit`'s callback, so
+    /// each health window reads the evidence as it arrived.
+    source_unchanged: std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+}
+
+impl CaptureHealthCounters {
+    fn register_sources(&self, counters: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>) {
+        *self
+            .source_unchanged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = counters;
+    }
+
+    /// Unchanged-frame evidence per display. A single display's evidence is
+    /// its `Idle` buffers plus Keel's unchanged skips; the multi-display loop
+    /// has no Keel, so each display's is its own `Idle` buffers.
+    fn unchanged_per_display(&self) -> Vec<u64> {
+        let keel = self
+            .keel_unchanged
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let sources = self
+            .source_unchanged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut per_display: Vec<u64> = sources
+            .iter()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        match per_display.as_mut_slice() {
+            [] => vec![keel],
+            [only] => vec![only.saturating_add(keel)],
+            _ => per_display,
+        }
+    }
+}
+
+/// Refreshes the capture-side counters the loops publish into `stats`.
+fn load_capture_counters(
+    stats: &mut StreamStats,
+    dropped: &std::sync::atomic::AtomicU64,
+    superseded: &std::sync::atomic::AtomicU64,
+    suppressed: &std::sync::atomic::AtomicU64,
+    health: &CaptureHealthCounters,
+) {
+    stats.frames_dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    stats.raw_frames_superseded = superseded.load(std::sync::atomic::Ordering::Relaxed);
+    stats.frames_suppressed = suppressed.load(std::sync::atomic::Ordering::Relaxed);
+    stats.frames_detail_skipped = health
+        .detail_skipped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    stats.unchanged_per_display = health.unchanged_per_display();
+    stats.frames_unchanged = stats
+        .unchanged_per_display
+        .iter()
+        .fold(0_u64, |total, display| total.saturating_add(*display));
 }
 
 /// The counters a producer publishes and the requests it reads.
@@ -979,6 +1127,8 @@ struct ProducerSignals<'a> {
     suppressed: &'a std::sync::atomic::AtomicU64,
     /// Raw captured frames superseded before encode by the latest-wins handoff.
     superseded: &'a std::sync::atomic::AtomicU64,
+    /// Rate-capped skips and idle evidence, for health.
+    health: &'a CaptureHealthCounters,
     /// The encoding rate the session wants; zero keeps the encoder's own.
     rate: &'a std::sync::atomic::AtomicU64,
     /// The Detail frame rate the session wants; zero keeps the capture's own.
@@ -1021,6 +1171,8 @@ fn spawn_producer(
     let producer_suppressed = std::sync::Arc::clone(&suppressed);
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_superseded = std::sync::Arc::clone(&superseded);
+    let health = std::sync::Arc::new(CaptureHealthCounters::default());
+    let producer_health = std::sync::Arc::clone(&health);
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
     let detail_fps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1040,6 +1192,7 @@ fn spawn_producer(
                 keyframe_requests: &producer_keyframe_requests,
                 suppressed: &producer_suppressed,
                 superseded: &producer_superseded,
+                health: &producer_health,
                 rate: &producer_rate,
                 detail_fps: &producer_detail_fps,
             },
@@ -1053,6 +1206,7 @@ fn spawn_producer(
         keyframe_requests,
         suppressed,
         superseded,
+        health,
         rate,
         detail_fps,
     }
@@ -1081,6 +1235,8 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
     let producer_suppressed = std::sync::Arc::clone(&suppressed);
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_superseded = std::sync::Arc::clone(&superseded);
+    let health = std::sync::Arc::new(CaptureHealthCounters::default());
+    let producer_health = std::sync::Arc::clone(&health);
     // Multi-monitor encoders keep their own rates for now; the session does
     // not drive this one.
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1098,6 +1254,7 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
                 keyframe_requests: &producer_keyframe_requests,
                 suppressed: &producer_suppressed,
                 superseded: &producer_superseded,
+                health: &producer_health,
                 rate: &producer_rate,
                 detail_fps: &producer_detail_fps,
             },
@@ -1111,6 +1268,7 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
         keyframe_requests,
         suppressed,
         superseded,
+        health,
         rate,
         detail_fps,
     }
@@ -1245,30 +1403,181 @@ fn finalize_timings(stats: &mut StreamStats, elapsed: Duration, timings: Timings
     };
 }
 
-/// How a measured rate compares with the rate this session promised.
+/// How a measured rate compares with the rate this session promised, judged
+/// by the shared health policy against the content that actually changed.
 ///
-/// Previously any nonzero rate reported `ok`, so a session serving four frames
-/// a second against a sixty-frame contract — unusable, and the exact thing a
-/// health snapshot exists to surface — was indistinguishable from a healthy
-/// one. Only a total stall was visible, and by then the session was already
-/// gone.
+/// `ScreenCaptureKit` is damage-driven: a still desktop delivers almost no
+/// frames, and this host then sends only a keepalive a second. Judged against
+/// the target alone, an idle session that delivered every change read as
+/// `degraded`. Judged against `fps_content` — changed frames captured, shed
+/// or superseded, less those suppressed because nothing changed — it is
+/// healthy, while a host that falls behind a busy screen still is not: the
+/// frames it could not keep up with are counted in the content and never in
+/// the sent rate.
+fn health_verdict(
+    rates: arcen_telemetry::SnapshotRates,
+    fps_content: Option<u32>,
+    fps_target: u32,
+) -> &'static str {
+    let sample = arcen_telemetry::QosSample {
+        fps_actual: Some(rates.sent_fps),
+        fps_target: Some(fps_target),
+        fps_content,
+        frames_sent: Some(rates.sent_frames),
+        ..arcen_telemetry::QosSample::default()
+    };
+    match arcen_telemetry::assess_health(&sample, &arcen_telemetry::QosTargets::default()).overall {
+        Some(arcen_telemetry::HealthState::Ok) => "ok",
+        Some(arcen_telemetry::HealthState::Degraded) => "degraded",
+        Some(arcen_telemetry::HealthState::Critical) => "critical",
+        None => "unavailable",
+    }
+}
+
+/// Frames carrying changed content that capture handed this session so far:
+/// captured, shed by the capture callback, or superseded before encode, less
+/// those Keel suppressed because nothing had changed.
 ///
-/// The thresholds are deliberately generous, because `ScreenCaptureKit` is
-/// damage-driven: a still desktop legitimately produces almost no frames, and
-/// calling that a fault would make the signal useless on the idle sessions
-/// that make up most of a working day. `degraded` therefore means the host is
-/// trying and failing to keep up, not that nobody moved the mouse.
-fn health_verdict(fps_actual: u32, fps_target: u32) -> &'static str {
-    if fps_target == 0 {
-        return "ok";
+/// `frames_captured` advances with each sent frame, so it can trail the live
+/// suppression count by up to one keepalive interval; the subtraction
+/// saturates rather than going negative across that gap.
+fn frames_offered(stats: &StreamStats) -> u64 {
+    stats
+        .frames_captured
+        .saturating_add(stats.frames_dropped)
+        .saturating_add(stats.raw_frames_superseded)
+        .saturating_sub(stats.frames_suppressed)
+}
+
+/// Whether the encode loop found the screen still at least once in a health
+/// window.
+///
+/// `ScreenCaptureKit` falling behind a busy screen is invisible in the
+/// capture counts — it simply delivers fewer frames, and the encode loop's
+/// waits time out just as they do on a still screen — so the offered rate
+/// proves the content rate only in a window with positive evidence that the
+/// screen did not change ([`StreamStats::unchanged_per_display`]) — from
+/// every display, because one still display says nothing about another that
+/// is falling behind. Any other window reports no content rate and is judged
+/// against the target, as the Linux and Windows Piers do with their capture
+/// loops' idle polls.
+#[derive(Debug, Default, Clone)]
+struct IdleEvidence {
+    at_last: Vec<u64>,
+}
+
+impl IdleEvidence {
+    /// Consumes one window, given the running per-display counts.
+    fn proven(&mut self, per_display: &[u64]) -> bool {
+        let proven = !per_display.is_empty()
+            && per_display
+                .iter()
+                .enumerate()
+                .all(|(display, count)| *count > self.at_last.get(display).copied().unwrap_or(0));
+        self.at_last = per_display.to_vec();
+        proven
     }
-    if fps_actual == 0 {
-        return "critical";
+}
+
+/// The Deck's view of this host: one `health_stats` per
+/// [`HEALTH_STATS_WINDOW`], built by the shared window tracker and health
+/// assessment, with the QUIC path measured by the shared tracker.
+///
+/// The path is measured where the connection is: by this process when it
+/// owns it, and otherwise by the network service, which fills `path` into
+/// this message as it relays it (`relay.rs`).
+struct HealthStatsReporter {
+    window: arcen_telemetry::HostWindowTracker,
+    path: arcen_transport::PathQualityTracker,
+    targets: arcen_telemetry::QosTargets,
+    codec: &'static str,
+    chroma: &'static str,
+    resolution: String,
+    fps_target: u32,
+    idle: IdleEvidence,
+}
+
+impl HealthStatsReporter {
+    fn new(
+        codec: EncoderCodec,
+        chroma: arcen_media::ChromaSubsampling,
+        width: usize,
+        height: usize,
+        fps_target: u32,
+    ) -> Self {
+        Self {
+            window: arcen_telemetry::HostWindowTracker::default(),
+            path: arcen_transport::PathQualityTracker::default(),
+            targets: arcen_telemetry::QosTargets::default(),
+            codec: match codec {
+                EncoderCodec::H264 => "h264",
+                EncoderCodec::Hevc => "h265",
+            },
+            chroma: chroma.token(),
+            resolution: format!("{width}x{height}"),
+            fps_target,
+            idle: IdleEvidence::default(),
+        }
     }
-    if fps_actual * 2 < fps_target {
-        return "degraded";
+
+    fn report(
+        &mut self,
+        elapsed: Duration,
+        stats: &StreamStats,
+        connection: Option<&quinn::Connection>,
+    ) -> arcen_protocol::messages::HealthStatsMsg {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        // `ScreenCaptureKit` is damage-driven, so a still desktop is judged
+        // against the content that changed (`frames_offered`), not the
+        // target. The keepalive owes a frame a second even then, and the
+        // shared policy judges a window that sent nothing at all — early or
+        // late tick alike — against the full target.
+        let mut window = self.window.observe(
+            elapsed_ms,
+            self.fps_target,
+            arcen_telemetry::HostCounterTotals {
+                frames_sent: stats.frames_sent,
+                frames_dropped: stats.frames_dropped,
+                bytes_sent: stats.bytes_sent,
+                input_events: stats.input.applied,
+                frames_offered: Some(frames_offered(stats)),
+            },
+            u64::try_from(HEALTH_STATS_WINDOW.as_millis()).unwrap_or(u64::MAX),
+        );
+        if !self.idle.proven(&stats.unchanged_per_display) {
+            window.sample.fps_content = None;
+        }
+        let assessment = arcen_telemetry::assess_health(&window.sample, &self.targets);
+        arcen_protocol::messages::HealthStatsMsg {
+            fps_actual: f64::from(window.sample.fps_actual.unwrap_or(0)),
+            fps_target: f64::from(self.fps_target),
+            bandwidth_mbps: window.bandwidth_mbps,
+            frames_sent: window.sample.frames_sent.unwrap_or(0),
+            frames_dropped: window.sample.frames_dropped.unwrap_or(0),
+            encode_time_ms: stats.mean_encode_ms,
+            capture_time_ms: stats.mean_capture_wait_ms,
+            input_events: window.sample.input_events.unwrap_or(0),
+            codec: self.codec.to_owned(),
+            chroma: self.chroma.to_owned(),
+            resolution: self.resolution.clone(),
+            clients_connected: 1,
+            health_state: assessment.host_delivery.state.map(|state| match state {
+                arcen_telemetry::HealthState::Ok => arcen_protocol::messages::HealthStateMsg::Ok,
+                arcen_telemetry::HealthState::Degraded => {
+                    arcen_protocol::messages::HealthStateMsg::Degraded
+                }
+                arcen_telemetry::HealthState::Critical => {
+                    arcen_protocol::messages::HealthStateMsg::Critical
+                }
+            }),
+            sample_window_secs: arcen_protocol::messages::SampleWindowSecs::try_from(
+                u32::try_from(HEALTH_STATS_WINDOW.as_secs()).unwrap_or(u32::MAX),
+            )
+            .ok(),
+            path: connection.map(|connection| self.path.sample(elapsed, connection)),
+            ..arcen_protocol::messages::HealthStatsMsg::default()
+        }
     }
-    "ok"
 }
 
 /// Emits one `HEALTH_SNAPSHOT` for a live session.
@@ -1282,18 +1591,21 @@ fn health_verdict(fps_actual: u32, fps_target: u32) -> &'static str {
 fn emit_health_snapshot(
     telemetry: &crate::observability::HostTelemetry,
     session_id: &arcen_telemetry::CorrelationId,
-    fps_actual: u32,
+    rates: arcen_telemetry::SnapshotRates,
+    fps_content: Option<u32>,
     fps_target: u32,
     stats: &StreamStats,
 ) {
     if !telemetry.is_enabled() {
         return;
     }
-    let health = health_verdict(fps_actual, fps_target);
+    let fps_actual = rates.sent_fps;
+    let health = health_verdict(rates, fps_content, fps_target);
     let Some(fields) = arcen_telemetry::lifecycle_fields::health_snapshot(
         health,
         Some(fps_actual),
         Some(fps_target),
+        fps_content,
     ) else {
         return;
     };
@@ -1326,6 +1638,7 @@ fn emit_health_diagnostics(fps_actual: u32, stats: &StreamStats) {
         frames_encoded = stats.frames_encoded,
         frames_sent = stats.frames_sent,
         frames_suppressed = stats.frames_suppressed,
+        frames_detail_skipped = stats.frames_detail_skipped,
         bytes_sent = stats.bytes_sent,
         mean_capture_wait_ms = stats.mean_capture_wait_ms,
         mean_frame_ms = stats.mean_frame_ms,
@@ -1573,6 +1886,7 @@ pub async fn stream(
         keyframe_requests,
         suppressed: capture_suppressed,
         superseded: raw_superseded,
+        health: capture_health,
         rate: encode_rate,
         detail_fps,
     } = spawn_producer(
@@ -1622,6 +1936,7 @@ pub async fn stream(
     let fps_target = capture.fps;
     let started = Instant::now();
     let mut cadence = snapshot_cadence();
+    let mut snapshot_idle = IdleEvidence::default();
     // Driven by a timer rather than by frame arrival. The check used to sit
     // after `send_frame`, so the one condition a health snapshot exists to
     // report — no frames at all — produced no snapshot either. A capture that
@@ -1631,6 +1946,18 @@ pub async fn stream(
     // on when a snapshot is owed, and asking it often costs a comparison.
     let mut health_tick = tokio::time::interval(HEALTH_TICK);
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut health_stats_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEALTH_STATS_WINDOW,
+        HEALTH_STATS_WINDOW,
+    );
+    health_stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut health_stats = HealthStatsReporter::new(
+        codec,
+        capture.pixel_format.chroma(),
+        capture.width,
+        capture.height,
+        capture.fps,
+    );
     let mut stats = StreamStats::default();
     let mut total_queue = Duration::ZERO;
     let mut total_send = Duration::ZERO;
@@ -1676,6 +2003,19 @@ pub async fn stream(
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
         tokio::pin!(pump);
         send_input_mode_results(&priority, &input_mode_results).await?;
+        // Native tablet (ADR 0022): inactive unless the handshake accepted it.
+        let (mut native_tablet, first) = crate::bridged_tablet::SessionTablet::start(
+            input_mode_results.native_tablet.clone(),
+            &input_mode_results.tablet,
+        );
+        // Where a pen this host reads itself puts the pointer, for a Deck
+        // that draws its cursor at host positions (negotiated in the hello).
+        let mut host_pen_pointer = if input_mode_results.cursor.cursor_positions {
+            crate::bridged_tablet::HostPenPointer::new(capture.width, capture.height)
+        } else {
+            None
+        };
+        send_tablet_output(&priority, first, input.as_mut(), host_pen_pointer.as_mut()).await?;
         // A session without an event source still streams; it just carries no
         // input, which is better than refusing the desktop.
         // Only worth running when the Deck draws the pointer itself. In host
@@ -1712,8 +2052,8 @@ pub async fn stream(
         // the writer waited to be polled. A Deck that vanished mid-frame left
         // the host wedged — holding its capacity-one session lease, refusing
         // every later connection with "a session is already active" until the
-        // agent was restarted. Measured on the lab: thirteen minutes and still
-        // refusing.
+        // agent was restarted. Capture must never hold an invalid session
+        // indefinitely; the wait is bounded.
         // A finished frame waiting for room in the video lane. Taken from the
         // encoder only when there is room, so the loop never blocks on video:
         // while the lane is full the encoder waits, and capture's latest-frame
@@ -1721,11 +2061,21 @@ pub async fn stream(
         let mut pending_frame: Option<Produced> = None;
         let streaming = async {
         loop {
+            let host_pen_pointer_due = host_pen_pointer
+                .as_ref()
+                .and_then(crate::bridged_tablet::HostPenPointer::due_at);
             tokio::select! {
                 biased;
                 // Input first: a keystroke waiting behind a frame is a keystroke
                 // the person feels as lag.
                 message = incoming.next() => {
+                    if let Some(Ok(Message::Binary(bytes))) = &message
+                        && native_tablet.takes(bytes)
+                    {
+                        let output = native_tablet.on_deck_frame(bytes);
+                        send_tablet_output(&priority, output, input.as_mut(), host_pen_pointer.as_mut()).await?;
+                        continue;
+                    }
                     let clipboard_arg = clipboard
                         .as_mut()
                         .map(|(worker, reassembler)| (reassembler, &*worker));
@@ -1749,6 +2099,15 @@ pub async fn stream(
                         }
                         Incoming::PeerLeft => break,
                     }
+                }
+                output = native_tablet.next(), if native_tablet.is_active() => {
+                    send_tablet_output(&priority, output, input.as_mut(), host_pen_pointer.as_mut()).await?;
+                }
+                () = sleep_until_due(host_pen_pointer_due), if host_pen_pointer_due.is_some() => {
+                    if let Some(pointer) = host_pen_pointer.as_mut() {
+                        send_host_pen_pointer(&priority, pointer, Instant::now()).await?;
+                    }
+                    continue;
                 }
                 _ = full_frame_tick.tick() => {
                     if full_frame_requests.poll(Instant::now()).deliver_now {
@@ -1796,23 +2155,68 @@ pub async fn stream(
                     }
                     continue;
                 }
+                _ = health_stats_tick.tick() => {
+                    if let Some(session) = input.as_ref() {
+                        stats.input = session.stats();
+                    }
+                    load_capture_counters(
+                        &mut stats,
+                        &capture_dropped,
+                        &raw_superseded,
+                        &capture_suppressed,
+                        &capture_health,
+                    );
+                    finalize_timings(
+                        &mut stats,
+                        started.elapsed(),
+                        Timings {
+                            total_frame,
+                            worst_frame,
+                            total_queue,
+                            total_send,
+                            total_capture_wait,
+                            total_encode,
+                        },
+                    );
+                    let message = health_stats.report(
+                        started.elapsed(),
+                        &stats,
+                        path_signal_connection.as_ref(),
+                    );
+                    if let Ok(text) = serde_json::to_string(&message) {
+                        enqueue(&priority, Message::Text(text)).await?;
+                        stats.health_stats_sent += 1;
+                    }
+                    continue;
+                }
                 _ = health_tick.tick() => {
                     // A session that streams for an hour should leave an hour
                     // of evidence, not one summary at the end that a crash
                     // discards. The rate is measured over the window that
                     // actually elapsed, so a stall reads as a low number and a
                     // dead capture as zero, rather than as silence.
-                    if let Some(fps_actual) = cadence.due(started.elapsed(), stats.frames_sent) {
+                    load_capture_counters(
+                        &mut stats,
+                        &capture_dropped,
+                        &raw_superseded,
+                        &capture_suppressed,
+                        &capture_health,
+                    );
+                    if let Some(rates) = cadence.due_rates(
+                        started.elapsed(),
+                        stats.frames_sent,
+                        frames_offered(&stats),
+                    ) {
+                        let fps_content =
+                            snapshot_idle
+                                .proven(&stats.unchanged_per_display)
+                                .then_some(rates.offered_fps);
                         // Refreshed here rather than only at the end, so a pen
                         // that stops arriving mid-session is visible while the
                         // session is still up.
                         if let Some(session) = input.as_ref() {
                             stats.input = session.stats();
                         }
-                        stats.frames_dropped =
-                            capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
-                        stats.raw_frames_superseded =
-                            raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
                         finalize_timings(
                             &mut stats,
                             started.elapsed(),
@@ -1828,7 +2232,8 @@ pub async fn stream(
                         emit_health_snapshot(
                             &telemetry,
                             &session_id,
-                            fps_actual,
+                            rates,
+                            fps_content,
                             fps_target,
                             &stats,
                         );
@@ -1969,6 +2374,13 @@ pub async fn stream(
                 "cursor shape reporting"
             );
         }
+        if let Some(pointer) = host_pen_pointer.as_ref() {
+            tracing::info!(
+                target: arcen_telemetry::names::target::HID,
+                host_pen_positions_sent = pointer.reports(),
+                "host pointer positions for a pen this host read"
+            );
+        }
         Ok::<(), StreamError>(())
         };
         tokio::pin!(streaming);
@@ -1987,9 +2399,13 @@ pub async fn stream(
         (Err(error), _) => Err(error),
     };
 
-    stats.frames_dropped = capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
-    stats.raw_frames_superseded = raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
-    stats.frames_suppressed = capture_suppressed.load(std::sync::atomic::Ordering::Relaxed);
+    load_capture_counters(
+        &mut stats,
+        &capture_dropped,
+        &raw_superseded,
+        &capture_suppressed,
+        &capture_health,
+    );
 
     // On every ending, not only the clean one.
     collect_peripheral_stats(
@@ -2038,7 +2454,7 @@ pub async fn stream_multi(
         mut audio,
         clipboard: clipboard_negotiation,
         cursor_mode: session_cursor_mode,
-        input_mode_results,
+        mut input_mode_results,
         audio_encoding,
         path_signal_connection,
     } = session;
@@ -2060,6 +2476,7 @@ pub async fn stream_multi(
         keyframe_requests,
         suppressed: capture_suppressed,
         superseded: raw_superseded,
+        health: capture_health,
         rate: encode_rate,
         detail_fps: _,
     } = spawn_multi_producer(MultiProducerConfig {
@@ -2086,6 +2503,7 @@ pub async fn stream_multi(
         });
     let started = Instant::now();
     let mut cadence = snapshot_cadence();
+    let mut snapshot_idle = IdleEvidence::default();
     // Driven by a timer rather than by frame arrival. The check used to sit
     // after `send_frame`, so the one condition a health snapshot exists to
     // report — no frames at all — produced no snapshot either. A capture that
@@ -2095,6 +2513,20 @@ pub async fn stream_multi(
     // on when a snapshot is owed, and asking it often costs a comparison.
     let mut health_tick = tokio::time::interval(HEALTH_TICK);
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut health_stats_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEALTH_STATS_WINDOW,
+        HEALTH_STATS_WINDOW,
+    );
+    health_stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut health_stats = HealthStatsReporter::new(
+        codec,
+        primary_capture.map_or(arcen_media::ChromaSubsampling::Yuv420, |capture| {
+            capture.pixel_format.chroma()
+        }),
+        primary_capture.map_or(0, |capture| capture.width),
+        primary_capture.map_or(0, |capture| capture.height),
+        fps_target,
+    );
     let mut stats = StreamStats::default();
     let mut total_queue = Duration::ZERO;
     let mut total_send = Duration::ZERO;
@@ -2131,7 +2563,16 @@ pub async fn stream_multi(
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
         let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
         tokio::pin!(pump);
+        // Host pointer positions are reported only on the single-display
+        // path, where a pen sample's fraction is the captured display's.
+        input_mode_results.cursor.cursor_positions = false;
         send_input_mode_results(&priority, &input_mode_results).await?;
+        // Native tablet (ADR 0022): inactive unless the handshake accepted it.
+        let (mut native_tablet, first) = crate::bridged_tablet::SessionTablet::start(
+            input_mode_results.native_tablet.clone(),
+            &input_mode_results.tablet,
+        );
+        send_tablet_output(&priority, first, input.as_mut(), None).await?;
         // Only worth running when the Deck draws the pointer itself. In host
         // cursor mode the compositor already draws the real one into the
         // picture, and naming it as well would have the Deck draw a second.
@@ -2199,6 +2640,13 @@ pub async fn stream_multi(
             tokio::select! {
                 biased;
                 message = incoming.next() => {
+                    if let Some(Ok(Message::Binary(bytes))) = &message
+                        && native_tablet.takes(bytes)
+                    {
+                        let output = native_tablet.on_deck_frame(bytes);
+                        send_tablet_output(&priority, output, input.as_mut(), None).await?;
+                        continue;
+                    }
                     let clipboard_arg = clipboard
                         .as_mut()
                         .map(|(worker, reassembler)| (reassembler, &*worker));
@@ -2222,6 +2670,9 @@ pub async fn stream_multi(
                         }
                         Incoming::PeerLeft => break,
                     }
+                }
+                output = native_tablet.next(), if native_tablet.is_active() => {
+                    send_tablet_output(&priority, output, input.as_mut(), None).await?;
                 }
                 _ = full_frame_tick.tick() => {
                     if full_frame_requests.poll(Instant::now()).deliver_now {
@@ -2306,23 +2757,68 @@ pub async fn stream_multi(
                     }
                     continue;
                 }
+                _ = health_stats_tick.tick() => {
+                    if let Some(session) = input.as_ref() {
+                        stats.input = session.stats();
+                    }
+                    load_capture_counters(
+                        &mut stats,
+                        &capture_dropped,
+                        &raw_superseded,
+                        &capture_suppressed,
+                        &capture_health,
+                    );
+                    finalize_timings(
+                        &mut stats,
+                        started.elapsed(),
+                        Timings {
+                            total_frame,
+                            worst_frame,
+                            total_queue,
+                            total_send,
+                            total_capture_wait,
+                            total_encode,
+                        },
+                    );
+                    let message = health_stats.report(
+                        started.elapsed(),
+                        &stats,
+                        path_signal_connection.as_ref(),
+                    );
+                    if let Ok(text) = serde_json::to_string(&message) {
+                        enqueue(&priority, Message::Text(text)).await?;
+                        stats.health_stats_sent += 1;
+                    }
+                    continue;
+                }
                 _ = health_tick.tick() => {
                     // A session that streams for an hour should leave an hour
                     // of evidence, not one summary at the end that a crash
                     // discards. The rate is measured over the window that
                     // actually elapsed, so a stall reads as a low number and a
                     // dead capture as zero, rather than as silence.
-                    if let Some(fps_actual) = cadence.due(started.elapsed(), stats.frames_sent) {
+                    load_capture_counters(
+                        &mut stats,
+                        &capture_dropped,
+                        &raw_superseded,
+                        &capture_suppressed,
+                        &capture_health,
+                    );
+                    if let Some(rates) = cadence.due_rates(
+                        started.elapsed(),
+                        stats.frames_sent,
+                        frames_offered(&stats),
+                    ) {
+                        let fps_content =
+                            snapshot_idle
+                                .proven(&stats.unchanged_per_display)
+                                .then_some(rates.offered_fps);
                         // Refreshed here rather than only at the end, so a pen
                         // that stops arriving mid-session is visible while the
                         // session is still up.
                         if let Some(session) = input.as_ref() {
                             stats.input = session.stats();
                         }
-                        stats.frames_dropped =
-                            capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
-                        stats.raw_frames_superseded =
-                            raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
                         finalize_timings(
                             &mut stats,
                             started.elapsed(),
@@ -2338,7 +2834,8 @@ pub async fn stream_multi(
                         emit_health_snapshot(
                             &telemetry,
                             &session_id,
-                            fps_actual,
+                            rates,
+                            fps_content,
                             fps_target,
                             &stats,
                         );
@@ -2434,9 +2931,13 @@ pub async fn stream_multi(
         (Err(error), _) => Err(error),
     };
 
-    stats.frames_dropped = capture_dropped.load(std::sync::atomic::Ordering::Relaxed);
-    stats.raw_frames_superseded = raw_superseded.load(std::sync::atomic::Ordering::Relaxed);
-    stats.frames_suppressed = capture_suppressed.load(std::sync::atomic::Ordering::Relaxed);
+    load_capture_counters(
+        &mut stats,
+        &capture_dropped,
+        &raw_superseded,
+        &capture_suppressed,
+        &capture_health,
+    );
 
     // On every ending, not only the clean one.
     collect_peripheral_stats(
@@ -2592,6 +3093,7 @@ fn emit_stream_summary(telemetry: &crate::observability::HostTelemetry, stats: &
         frames_suppressed = stats.frames_suppressed,
         bytes_sent = stats.bytes_sent,
         audio_packets_sent = stats.audio_packets_sent,
+        health_stats_sent = stats.health_stats_sent,
         audio_packets_dropped = stats.audio_packets_dropped,
         sent_fps = stats.sent_fps,
         mean_capture_wait_ms = stats.mean_capture_wait_ms,
@@ -2610,6 +3112,8 @@ fn emit_stream_summary(telemetry: &crate::observability::HostTelemetry, stats: &
         input_malformed = stats.input.malformed,
         input_unmapped_keys = stats.input.unmapped_keys,
         input_scroll_events = stats.input.scroll_events,
+        input_text_chars = stats.input.text_chars,
+        input_text_refused = stats.input.text_refused,
         pen_samples = stats.input.pen_samples,
         pen_proximity_edges = stats.input.pen_proximity_edges,
         pen_rejected = stats.input.pen_rejected,
@@ -2833,10 +3337,12 @@ fn produce(
         keyframe_requests,
         suppressed,
         superseded,
+        health,
         rate,
         detail_fps,
     } = signals;
     let session = CaptureSession::start(capture).map_err(StreamError::Capture)?;
+    health.register_sources(vec![session.unchanged_counter()]);
 
     let latest = LatestFrame::new();
     let outcome = std::thread::scope(|scope| {
@@ -2854,6 +3360,7 @@ fn produce(
                     cancelled,
                     keyframe_requests,
                     suppressed,
+                    health,
                     rate,
                     detail_fps,
                 },
@@ -2863,7 +3370,16 @@ fn produce(
             latest.close();
             result
         });
-        let capture_result = capture_loop(&session, &latest, cancelled, dropped, superseded);
+        let capture_result = capture_loop(
+            &session,
+            &latest,
+            cancelled,
+            CaptureLoopCounters {
+                dropped,
+                superseded,
+                health,
+            },
+        );
         latest.close();
         let encode_result = encode_side
             .join()
@@ -2939,13 +3455,25 @@ fn report_encoder_backend(encoder: &Encoder) {
 /// to see a session change behaviour, rare enough not to crowd the log.
 const CADENCE_REPORT_FRAMES: u64 = 150;
 
+/// What the capture side publishes for the session.
+#[derive(Clone, Copy)]
+struct CaptureLoopCounters<'a> {
+    dropped: &'a std::sync::atomic::AtomicU64,
+    superseded: &'a std::sync::atomic::AtomicU64,
+    health: &'a CaptureHealthCounters,
+}
+
 fn capture_loop(
     session: &CaptureSession,
     latest: &LatestFrame,
     cancelled: &std::sync::atomic::AtomicBool,
-    dropped: &std::sync::atomic::AtomicU64,
-    superseded: &std::sync::atomic::AtomicU64,
+    counters: CaptureLoopCounters<'_>,
 ) -> Result<(), StreamError> {
+    let CaptureLoopCounters {
+        dropped,
+        superseded,
+        health,
+    } = counters;
     let frame_timeout = capture_frame_timeout();
     let first_frame_limit = first_frame_timeout();
     let first_frame_started = Instant::now();
@@ -3033,6 +3561,7 @@ struct EncodeLoopContext<'a> {
     cancelled: &'a std::sync::atomic::AtomicBool,
     keyframe_requests: &'a std::sync::atomic::AtomicU64,
     suppressed: &'a std::sync::atomic::AtomicU64,
+    health: &'a CaptureHealthCounters,
     rate: &'a std::sync::atomic::AtomicU64,
     detail_fps: &'a std::sync::atomic::AtomicU32,
 }
@@ -3341,10 +3870,28 @@ fn publish_detail_framerate(
     *last = Some(detail);
 }
 
-/// The pacing interval for a Detail frame rate the session published, never
-/// faster than the capture.
-fn detail_frame_interval(capture_fps: u32, detail_fps: u32) -> Duration {
-    Duration::from_secs_f64(1.0 / f64::from(detail_fps.clamp(1, capture_fps.max(1))))
+/// How soon after the last frame a Detail stream sent the next arrival may
+/// be sent, for the frame rate the session published.
+///
+/// Captured frames arrive on the capture cadence, so a Detail stream can only
+/// send every k-th of them: k = ceil(capture / detail), the smallest step
+/// that never outruns the published rate. A cap of 24 on a 30 fps capture
+/// therefore sends 15 fps, a cap of 12 sends 10 fps, and the full rate sends
+/// every frame. The threshold sits half a capture frame below k frames, so an
+/// arrival a few milliseconds early is still sent on cadence. Rounding the
+/// ratio to the nearest whole frame instead let any cap above two-thirds of
+/// the capture rate send the full rate.
+fn detail_skip_threshold(capture_fps: u32, detail_fps: u32) -> Duration {
+    let capture_fps = capture_fps.max(1);
+    let detail_fps = detail_fps.clamp(1, capture_fps);
+    let step = capture_fps.div_ceil(detail_fps);
+    Duration::from_secs_f64((f64::from(step) - 0.5) / f64::from(capture_fps))
+}
+
+/// Whether a Detail stream skips a frame that arrived `since_previous` after
+/// the last frame it sent.
+fn detail_interval_skips(since_previous: Duration, skip_threshold: Duration) -> bool {
+    since_previous < skip_threshold
 }
 
 /// Encodes the newest captured frame and hands it to the writer.
@@ -3374,6 +3921,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         cancelled,
         keyframe_requests,
         suppressed,
+        health,
         rate,
         detail_fps,
         motion_priority,
@@ -3391,7 +3939,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
     );
     let start_bps = u64::from(start);
     let max_bps = u64::from(max);
-    let mut detail_interval = Duration::from_secs_f64(1.0 / f64::from(capture.fps.max(1)));
+    let mut detail_threshold = detail_skip_threshold(capture.fps, capture.fps);
     let mut applied_detail_fps = 0_u32;
     let mut encoder = Encoder::new(
         EncoderConfig::realtime_for(
@@ -3447,6 +3995,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
     let mut cadence = arcen_keel::IdleCadence::new(KEEPALIVE);
     let mut census = DamageCensus::default();
     let mut last_emit = Instant::now();
+    let mut last_sent_arrival: Option<Instant> = None;
     let mut suppressed_here = 0_u64;
     let mut capture_count = 0_u64;
     let mut encode_count = 0_u64;
@@ -3468,7 +4017,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
             && wanted_fps != 0
             && wanted_fps != applied_detail_fps
         {
-            detail_interval = detail_frame_interval(capture.fps, wanted_fps);
+            detail_threshold = detail_skip_threshold(capture.fps, wanted_fps);
             applied_detail_fps = wanted_fps;
         }
         let wanted = rate.load(std::sync::atomic::Ordering::Relaxed);
@@ -3533,6 +4082,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
             continue;
         };
 
+        let arrival = Instant::now();
         capture_count += 1;
         let capture_wait = staged.capture_wait;
         observe_damage(
@@ -3564,12 +4114,19 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         }
         let idr_pending = keyframe_requests.load(std::sync::atomic::Ordering::Relaxed)
             != encoded_keyframe_request;
+        // Paced from the previous sent frame's arrival, not from after its
+        // send: a send that blocked on back-pressure must not make the next
+        // frames look early, and an on-cadence frame must not be skipped.
         if motion_priority == arcen_media::video::MotionPriority::Detail
             && !idr_pending
-            && last_emit.elapsed() < detail_interval
+            && last_sent_arrival.is_some_and(|previous| {
+                detail_interval_skips(arrival.duration_since(previous), detail_threshold)
+            })
         {
-            suppressed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            suppressed_here += 1;
+            // Content that changed and was not sent: counted against health.
+            health
+                .detail_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         let decision = cadence.decision(idr_pending, last_emit.elapsed());
@@ -3603,6 +4160,9 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         }
         let Some(mode) = decision else {
             suppressed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            health
+                .keel_unchanged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             suppressed_here += 1;
             continue;
         };
@@ -3638,6 +4198,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         cadence.on_submitted();
         damage.reset();
         last_emit = Instant::now();
+        last_sent_arrival = Some(arrival);
         if mode != arcen_keel::EmitMode::Activity {
             tracing::debug!(
                 target: "arcen::media",
@@ -3893,6 +4454,7 @@ fn produce_multi(
         keyframe_requests,
         suppressed: _,
         superseded: _superseded,
+        health,
         rate,
         detail_fps: _,
     } = signals;
@@ -3900,6 +4462,7 @@ fn produce_multi(
         monitors.iter().map(|monitor| monitor.capture).collect(),
     )
     .map_err(|error| StreamError::Capture(CaptureError::StartFailed(error.to_string())))?;
+    health.register_sources(capture.unchanged_counters());
     let mut encoders =
         make_region_encoders(&monitors, codec, motion_priority, served_pipeline.as_ref())?;
     let mut served_pipeline_update = served_pipeline_msg_for_region_encoders(
@@ -4222,6 +4785,62 @@ fn read_clipboard_offer(text: &str) -> Option<arcen_protocol::messages::Clipboar
 #[cfg(test)]
 mod tests {
     #[test]
+    fn health_stats_report_windows_and_tell_a_still_desktop_from_a_stall() {
+        use arcen_protocol::messages::HealthStateMsg;
+        let mut reporter = super::HealthStatsReporter::new(
+            super::EncoderCodec::Hevc,
+            arcen_media::ChromaSubsampling::Yuv444,
+            3840,
+            2160,
+            60,
+        );
+        let mut stats = super::StreamStats {
+            frames_captured: 600,
+            frames_sent: 600,
+            bytes_sent: 5_000_000,
+            ..Default::default()
+        };
+        let first = reporter.report(std::time::Duration::from_secs(10), &stats, None);
+        assert_eq!(first.msg_type, arcen_protocol::messages::HEALTH_STATS);
+        assert_eq!(first.codec, "h265");
+        assert_eq!(first.chroma, "yuv444");
+        assert_eq!(first.resolution, "3840x2160");
+        assert_eq!(
+            first
+                .sample_window_secs
+                .map(arcen_protocol::messages::SampleWindowSecs::get),
+            Some(2)
+        );
+        assert_eq!(first.frames_sent, 600);
+        assert!(
+            first.path.is_none(),
+            "no connection here: the relay fills it"
+        );
+        // A still desktop past the warm-up: two keepalive frames, nothing
+        // captured, and the encode loop waited on a still screen. Not a fault.
+        stats.frames_sent += 2;
+        stats.unchanged_per_display =
+            vec![stats.unchanged_per_display.first().copied().unwrap_or(0) + 20];
+        let still = reporter.report(std::time::Duration::from_secs(22), &stats, None);
+        assert_eq!(still.frames_sent, 2);
+        assert_eq!(still.health_state, Some(HealthStateMsg::Ok));
+        // Nothing sent, keepalive included, over a tick that came a
+        // millisecond early: still a stall.
+        let stalled = reporter.report(std::time::Duration::from_millis(23_999), &stats, None);
+        assert_eq!(stalled.frames_sent, 0);
+        assert_eq!(stalled.health_state, Some(HealthStateMsg::Critical));
+        // And over a late one.
+        let late = reporter.report(std::time::Duration::from_millis(26_013), &stats, None);
+        assert_eq!(late.health_state, Some(HealthStateMsg::Critical));
+        // Sending again: back to judging what the desktop offered.
+        stats.frames_sent += 2;
+        stats.unchanged_per_display =
+            vec![stats.unchanged_per_display.first().copied().unwrap_or(0) + 20];
+        let resumed = reporter.report(std::time::Duration::from_millis(28_001), &stats, None);
+        assert_eq!(resumed.health_state, Some(HealthStateMsg::Ok));
+    }
+
+    #[test]
     fn a_detail_stream_publishes_the_controllers_frame_rate_once_per_change() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let controller = arcen_media::rate_control::RateController::new(
@@ -4271,13 +4890,18 @@ mod tests {
 
     #[test]
     fn the_detail_interval_never_outruns_the_capture() {
+        // Asking for more than the capture is the capture: every frame.
         assert_eq!(
-            super::detail_frame_interval(30, 60),
-            std::time::Duration::from_secs_f64(1.0 / 30.0)
+            super::detail_skip_threshold(30, 60),
+            super::detail_skip_threshold(30, 30)
         );
         assert_eq!(
-            super::detail_frame_interval(30, 10),
-            std::time::Duration::from_secs_f64(1.0 / 10.0)
+            super::detail_skip_threshold(30, 30),
+            std::time::Duration::from_secs_f64(0.5 / 30.0)
+        );
+        assert_eq!(
+            super::detail_skip_threshold(30, 10),
+            std::time::Duration::from_secs_f64(2.5 / 30.0)
         );
     }
 
@@ -5002,17 +5626,255 @@ mod tests {
 
     #[test]
     fn a_session_missing_its_contract_is_not_reported_as_healthy() {
-        // Any nonzero rate used to read "ok", so a session serving four frames
-        // a second against sixty looked exactly like one serving sixty.
-        assert_eq!(health_verdict(60, 60), "ok");
-        assert_eq!(health_verdict(45, 60), "ok");
-        assert_eq!(health_verdict(4, 60), "degraded");
-        assert_eq!(health_verdict(0, 60), "critical");
-        // A still desktop legitimately produces few frames; the threshold is
-        // generous so the signal stays useful on idle sessions.
-        assert_eq!(health_verdict(30, 60), "ok");
+        let rates = |sent_fps: u32, offered_fps| arcen_telemetry::SnapshotRates {
+            sent_frames: u64::from(sent_fps) * 5,
+            sent_fps,
+            offered_fps,
+        };
+        assert_eq!(health_verdict(rates(60, 60), Some(60), 60), "ok");
+        // Content changing at sixty with four sent is a host falling behind.
+        assert_eq!(health_verdict(rates(4, 60), Some(60), 60), "critical");
+        assert_eq!(health_verdict(rates(50, 60), Some(60), 60), "degraded");
+        // A still desktop: nine sent, eight changed, target thirty.
+        assert_eq!(health_verdict(rates(9, 8), Some(8), 30), "ok");
+        // Nothing changed at all, only keepalives.
+        assert_eq!(health_verdict(rates(1, 0), Some(0), 30), "ok");
+        // Not even the keepalive went out: a stall, however still the screen.
+        assert_eq!(health_verdict(rates(0, 0), Some(0), 30), "critical");
         // No contract to miss.
-        assert_eq!(health_verdict(0, 0), "ok");
+        assert_eq!(health_verdict(rates(0, 0), Some(0), 0), "unavailable");
+    }
+
+    /// One health window's verdict from cumulative counters, as the
+    /// snapshot tick computes it.
+    fn window_verdict(
+        stats: &StreamStats,
+        idle: &mut IdleEvidence,
+        fps_target: u32,
+    ) -> &'static str {
+        let mut cadence = arcen_telemetry::SnapshotCadence::new();
+        let rates = cadence
+            .due_rates(
+                Duration::from_secs(5),
+                stats.frames_sent,
+                frames_offered(stats),
+            )
+            .expect("window due");
+        let fps_content = idle
+            .proven(&stats.unchanged_per_display)
+            .then_some(rates.offered_fps);
+        health_verdict(rates, fps_content, fps_target)
+    }
+
+    /// How many of `arrivals` a Detail stream skips, paced as the encode
+    /// loop paces it.
+    fn detail_skips(arrivals_ms: &[f64], detail_fps: u32, capture_fps: u32) -> usize {
+        let threshold = detail_skip_threshold(capture_fps, detail_fps);
+        let mut last_sent: Option<f64> = None;
+        let mut skipped = 0;
+        for &arrival in arrivals_ms {
+            let skip = last_sent.is_some_and(|previous| {
+                detail_interval_skips(
+                    Duration::from_secs_f64((arrival - previous) / 1_000.0),
+                    threshold,
+                )
+            });
+            if skip {
+                skipped += 1;
+            } else {
+                last_sent = Some(arrival);
+            }
+        }
+        skipped
+    }
+
+    /// Capture waits are never idle evidence: `ScreenCaptureKit` at 8 fps
+    /// on a busy screen times them out as often as a still screen does.
+    #[test]
+    fn sck_at_eight_fps_on_a_busy_screen_is_not_excused() {
+        let health = CaptureHealthCounters::default();
+        let mut stats = StreamStats {
+            frames_captured: 40,
+            frames_sent: 40,
+            ..StreamStats::default()
+        };
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        load_capture_counters(&mut stats, &counter, &counter, &counter, &health);
+        assert_eq!(stats.frames_unchanged, 0);
+        assert_eq!(
+            window_verdict(&stats, &mut IdleEvidence::default(), 30),
+            "critical"
+        );
+    }
+
+    /// The truly still desktop: `ScreenCaptureKit` hands over only
+    /// `SCFrameStatus::Idle` buffers, and the host sends its keepalives.
+    #[test]
+    fn an_idle_desktop_of_idle_status_buffers_is_ok() {
+        let health = CaptureHealthCounters::default();
+        health.register_sources(vec![std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(150),
+        )]);
+        let mut stats = StreamStats {
+            frames_sent: 5,
+            ..StreamStats::default()
+        };
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        load_capture_counters(&mut stats, &counter, &counter, &counter, &health);
+        assert_eq!(stats.frames_unchanged, 150);
+        assert_eq!(
+            window_verdict(&stats, &mut IdleEvidence::default(), 30),
+            "ok"
+        );
+    }
+
+    /// One still display says nothing about another falling behind: a
+    /// multi-display window proves the content rate only when every display
+    /// showed unchanged evidence in it.
+    #[test]
+    fn every_display_must_show_idle_evidence() {
+        let still = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let health = CaptureHealthCounters::default();
+        health.register_sources(vec![
+            std::sync::Arc::clone(&still),
+            std::sync::Arc::clone(&busy),
+        ]);
+        let mut idle = IdleEvidence::default();
+        still.store(30, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(health.unchanged_per_display(), vec![30, 0]);
+        assert!(!idle.proven(&health.unchanged_per_display()));
+        // A busy two-display session where only the first display is still:
+        // judged against the target, so the second display's shortfall shows.
+        let mut stats = StreamStats {
+            frames_captured: 80,
+            frames_sent: 80,
+            ..StreamStats::default()
+        };
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        still.store(60, std::sync::atomic::Ordering::Relaxed);
+        load_capture_counters(&mut stats, &counter, &counter, &counter, &health);
+        assert_eq!(window_verdict(&stats, &mut idle.clone(), 60), "critical");
+        // Both displays still in the next window: proven.
+        still.store(90, std::sync::atomic::Ordering::Relaxed);
+        busy.store(5, std::sync::atomic::Ordering::Relaxed);
+        assert!(idle.proven(&health.unchanged_per_display()));
+        // Keel's skips only count for the single-display loop.
+        health
+            .keel_unchanged
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(health.unchanged_per_display(), vec![90, 5]);
+        health.register_sources(vec![std::sync::Arc::clone(&still)]);
+        assert_eq!(health.unchanged_per_display(), vec![97]);
+    }
+
+    /// Back-pressure: the writer took ten frames a second while the screen
+    /// changed thirty times. Paced from arrival, the frames that piled up
+    /// behind a blocked send are superseded (content), not exempt skips.
+    #[test]
+    fn backpressure_ten_of_thirty_is_a_shortfall() {
+        // A send that blocked for 100 ms: the next arrival is not early.
+        assert!(!detail_interval_skips(
+            Duration::from_millis(100),
+            detail_skip_threshold(30, 30)
+        ));
+        let stats = StreamStats {
+            frames_captured: 50,
+            raw_frames_superseded: 100,
+            frames_sent: 50,
+            unchanged_per_display: vec![2],
+            ..StreamStats::default()
+        };
+        let verdict = window_verdict(&stats, &mut IdleEvidence::default(), 30);
+        // 10 of 30 is a third of the expected rate: past degraded, critical.
+        assert!(matches!(verdict, "degraded" | "critical"), "{verdict}");
+        assert_eq!(verdict, "critical");
+    }
+
+    #[test]
+    fn an_on_cadence_thirty_fps_stream_skips_nothing_and_is_ok() {
+        // Thirty arrivals a second with a few milliseconds of jitter either way.
+        let arrivals: Vec<f64> = (0_u8..30)
+            .map(|frame| {
+                f64::from(frame) * 1_000.0 / 30.0 + [0.0, 4.0, -4.0][usize::from(frame % 3)]
+            })
+            .collect();
+        assert_eq!(detail_skips(&arrivals, 30, 30), 0);
+        let stats = StreamStats {
+            frames_captured: 150,
+            frames_sent: 150,
+            unchanged_per_display: vec![1],
+            ..StreamStats::default()
+        };
+        assert_eq!(
+            window_verdict(&stats, &mut IdleEvidence::default(), 30),
+            "ok"
+        );
+        // Capped to ten, the same arrivals send every third frame.
+        assert_eq!(detail_skips(&arrivals, 10, 30), 20);
+    }
+
+    /// A cap the capture cadence cannot hit exactly sends the next rate below
+    /// it, never the full rate: 24 of 30 sends 15 (every second frame), 12
+    /// of 30 sends 10 (every third). Rounding the frame ratio to the nearest
+    /// whole frame sent all 30 for any cap above 20.
+    #[test]
+    fn a_detail_cap_between_capture_steps_sends_the_step_below() {
+        let arrivals: Vec<f64> = (0_u8..30)
+            .map(|frame| {
+                f64::from(frame) * 1_000.0 / 30.0 + [0.0, 4.0, -4.0][usize::from(frame % 3)]
+            })
+            .collect();
+        assert_eq!(30 - detail_skips(&arrivals, 24, 30), 15);
+        assert_eq!(30 - detail_skips(&arrivals, 12, 30), 10);
+        assert_eq!(30 - detail_skips(&arrivals, 21, 30), 15);
+        assert_eq!(30 - detail_skips(&arrivals, 15, 30), 15);
+        assert_eq!(30 - detail_skips(&arrivals, 29, 30), 15);
+    }
+
+    /// Congestion that caps a Detail stream below a busy screen (30 -> 24):
+    /// every interval skip is content that was not sent.
+    #[test]
+    fn a_detail_cap_below_a_busy_screen_is_a_shortfall() {
+        let stats = StreamStats {
+            frames_captured: 152,
+            frames_suppressed: 2,
+            frames_detail_skipped: 30,
+            frames_sent: 120,
+            unchanged_per_display: vec![2],
+            ..StreamStats::default()
+        };
+        assert_eq!(
+            window_verdict(&stats, &mut IdleEvidence::default(), 30),
+            "degraded"
+        );
+        let capped = StreamStats {
+            frames_sent: 50,
+            frames_detail_skipped: 100,
+            ..stats
+        };
+        assert_eq!(
+            window_verdict(&capped, &mut IdleEvidence::default(), 30),
+            "critical"
+        );
+    }
+
+    #[test]
+    fn suppressed_still_frames_are_not_offered_content_but_shed_frames_are() {
+        let stats = StreamStats {
+            frames_captured: 100,
+            frames_suppressed: 90,
+            frames_dropped: 3,
+            raw_frames_superseded: 7,
+            ..StreamStats::default()
+        };
+        assert_eq!(frames_offered(&stats), 20);
+        let trailing = StreamStats {
+            frames_captured: 10,
+            frames_suppressed: 12,
+            ..StreamStats::default()
+        };
+        assert_eq!(frames_offered(&trailing), 0);
     }
 
     #[tokio::test]

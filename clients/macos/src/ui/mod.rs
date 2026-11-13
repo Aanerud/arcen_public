@@ -1,5 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 pub mod app;
 pub mod audio_worker;
+pub mod colour_check;
+pub mod connection_test;
 pub mod display_fit;
 pub mod home;
 mod keyboard;
@@ -11,9 +16,11 @@ pub mod multi_window_diagnostic;
 pub mod multi_window_runtime;
 pub mod multi_window_session;
 mod option_keys;
+mod paste_keys;
 pub(crate) mod pen_input;
 pub mod region_runtime;
 mod session_truth;
+mod sharp_cursor;
 pub mod text_input;
 pub mod theme;
 pub mod trusted_pins;

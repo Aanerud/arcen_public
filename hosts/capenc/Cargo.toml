@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-capenc"
-version = "0.17.0"
+version = "0.19.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "arcen_capenc"
@@ -99,6 +103,9 @@ mf = []
 # Portable OpenH264 path. The shared crate owns the safe wrapper and builds the
 # codec from source; capenc never links a runtime-downloaded binary.
 software-h264 = ["arcen-media/software-h264-source"]
+# Lossless refinement producer on the Xorg depth-30 path (ADR 0016): native
+# libzstd for tile compression. Off by default; also needs `refine=on`.
+lossless-refine = ["arcen-media/refine-zstd-encode"]
 # Probe-only rav1e source used to measure the software AV1 ceiling. The
 # product runtime does not select it until an interactive 4:2:0 path and
 # software decode have both been proven.

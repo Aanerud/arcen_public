@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Reading and rewriting H.264 and H.265 access units.
 //!
 //! Two encoders in this repository produce *length-prefixed* samples — macOS

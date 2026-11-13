@@ -12,6 +12,8 @@
       "contracts": [
         "crate",
         "cursor",
+        "host_pointer",
+        "keyboard",
         "lane_outbox",
         "negotiation",
         "pen_axes",
@@ -29,6 +31,7 @@
           "entry_points": [
             "clients/macos/src/ui/region_runtime.rs",
             "clients/macos/src/ui/text_input.rs",
+            "clients/macos/src/ui/keyboard.rs",
             "clients/macos/src/main.rs"
           ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
@@ -41,7 +44,7 @@
         },
         {
           "id": "macos-deck-session",
-          "entry_points": ["clients/macos/src/ui/app.rs", "clients/macos/src/main.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs", "clients/macos/src/main.rs", "clients/macos/src/ui/sharp_cursor.rs"],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
           "owner": "macOS Client"
@@ -54,10 +57,10 @@
           "owner": "macOS Client"
         },
         {
-          "id": "macos-deck-usb-hard-lab",
+          "id": "macos-deck-native-tablet",
           "entry_points": ["clients/macos/src/usb_bridge.rs"],
-          "build_profiles": ["macos-deck-usb-hard-lab"],
-          "validation": ["macos-deck-usb-hard-lab-test"],
+          "build_profiles": ["macos-deck-native-tablet"],
+          "validation": ["macos-deck-native-tablet-test"],
           "owner": "macOS Client"
         }
       ]
@@ -68,6 +71,7 @@
       "contracts": [
         "crate",
         "cursor",
+        "host_pointer",
         "pen_axes",
         "pen_emulation",
         "region",
@@ -75,6 +79,7 @@
         "region_state",
         "region_wire",
         "seat_pen",
+        "tablet_pointer",
         "text",
         "virtual_device"
       ],
@@ -100,7 +105,10 @@
           "entry_points": [
             "hosts/linux/src/input/uinput.rs",
             "hosts/linux/src/input/region_adapter.rs",
-            "hosts/linux/src/session/launcher.rs"
+            "hosts/linux/src/session/launcher.rs",
+            "hosts/linux/src/cursor_watcher.rs",
+            "hosts/linux/src/usb_bridge/tablet_pointer.rs",
+            "hosts/linux/src/media/desktop_pointer.rs"
           ],
           "build_profiles": ["linux-pier"],
           "validation": ["linux-pier-test", "linux-av-input-lab"],
@@ -120,12 +128,16 @@
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "hid_digitizer",
         "hid_reports",
+        "host_pointer",
         "negotiation",
         "pen_axes",
         "pen_edges",
         "region_pipeline",
-        "region_wire"
+        "region_wire",
+        "tablet_pointer",
+        "text"
       ],
       "paths": [
         {
@@ -154,7 +166,9 @@
           "entry_points": [
             "hosts/macos/src/input/mod.rs",
             "hosts/macos/src/input/pen.rs",
-            "hosts/macos/src/input_session.rs"
+            "hosts/macos/src/input_session.rs",
+            "hosts/macos/src/bridged_tablet.rs",
+            "hosts/macos/src/virtual_hid.rs"
           ],
           "build_profiles": ["macos-pier"],
           "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
@@ -179,7 +193,7 @@
     {
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
-      "contracts": ["crate", "region", "region_pipeline", "region_state"],
+      "contracts": ["crate", "keyboard", "region", "region_pipeline", "region_state"],
       "paths": [
         {
           "id": "windows-grading",
@@ -197,7 +211,10 @@
         },
         {
           "id": "windows-input",
-          "entry_points": ["hosts/windows/src/multi_monitor_input.rs"],
+          "entry_points": [
+            "hosts/windows/src/multi_monitor_input.rs",
+            "hosts/windows/src/input.rs"
+          ],
           "build_profiles": ["windows-pier"],
           "validation": ["windows-pier-test", "windows-av-input-lab"],
           "owner": "Windows Host"

@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 #
 # Lab-only Wayland capture harness run. Not shipped.
 #
@@ -82,23 +83,23 @@ sleep 0.5
 
 # WirePlumber with only the video graph: no ALSA, Bluetooth, V4L2 or camera
 # monitors, so the run never touches devices.
-WP="$RT/wireplumber"
-mkdir -p "$WP"
+WPCONF="$RT/wireplumber"
+mkdir -p "$WPCONF"
 for src in /usr/share/wireplumber /etc/wireplumber; do
     [ -d "$src" ] || continue
-    (cd "$src" && find . -type d | while read -r d; do mkdir -p "$WP/$d"; done
-     find . -type f | while read -r f; do ln -sfn "$src/${f#./}" "$WP/$f"; done)
+    (cd "$src" && find . -type d | while read -r d; do mkdir -p "$WPCONF/$d"; done
+     find . -type f | while read -r f; do ln -sfn "$src/${f#./}" "$WPCONF/$f"; done)
 done
-mkdir -p "$WP/main.lua.d" "$WP/bluetooth.lua.d"
+mkdir -p "$WPCONF/main.lua.d" "$WPCONF/bluetooth.lua.d"
 printf 'alsa_monitor.enabled = false\nv4l2_monitor.enabled = false\nlibcamera_monitor.enabled = false\n' \
-    > "$WP/main.lua.d/51-arcen-video-only.lua"
+    > "$WPCONF/main.lua.d/51-arcen-video-only.lua"
 printf 'bluez_monitor.enabled = false\nbluez_midi_monitor.enabled = false\n' \
-    > "$WP/bluetooth.lua.d/51-arcen-video-only.lua"
+    > "$WPCONF/bluetooth.lua.d/51-arcen-video-only.lua"
 # WirePlumber 0.5 ignores the Lua files above and reads SPA-JSON fragments.
-mkdir -p "$WP/wireplumber.conf.d"
+mkdir -p "$WPCONF/wireplumber.conf.d"
 printf 'wireplumber.profiles = {\n  main = {\n    monitor.alsa = disabled\n    monitor.alsa-midi = disabled\n    monitor.bluez = disabled\n    monitor.bluez-midi = disabled\n    monitor.libcamera = disabled\n    monitor.v4l2 = disabled\n  }\n}\n' \
-    > "$WP/wireplumber.conf.d/99-arcen-video-only.conf"
-WIREPLUMBER_CONFIG_DIR="$WP" wireplumber > "$RT/wireplumber.log" 2>&1 &
+    > "$WPCONF/wireplumber.conf.d/99-arcen-video-only.conf"
+WIREPLUMBER_CONFIG_DIR="$WPCONF" wireplumber > "$RT/wireplumber.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 

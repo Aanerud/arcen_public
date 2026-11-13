@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure multi-head NVIDIA Xorg configuration generator for the
 //! `multi_monitor_v1` Linux vertical slice.
 //!

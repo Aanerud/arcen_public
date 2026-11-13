@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! CPU reference for the host-copy route.
 //!
 //! The host-copy upload must hand the encoder exactly the producer's pixels

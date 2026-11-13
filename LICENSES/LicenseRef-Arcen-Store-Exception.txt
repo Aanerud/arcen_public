@@ -1,0 +1,91 @@
+Arcen Store Distribution Exception, version 1.0, effective 2026-11-12
+
+Additional permission under section 7 of the GNU Affero General Public
+License, version 3.
+
+Copyright (C) 2026 TUTTIFRUTTI AS
+
+The authoritative, formatted text of this exception is LICENSE-EXCEPTION.md
+at the root of the Arcen source tree. This file repeats it for tools that
+follow the REUSE specification.
+
+Arcen is licensed under the GNU Affero General Public License, version 3 only
+(the "AGPL"). TUTTIFRUTTI AS (Norwegian organisation number 919 650 826), as
+copyright holder, grants the following additional permission under section 7
+of the AGPL for every file that carries the licence expression
+"AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception".
+
+1. Definitions
+
+"Store" means an application store or platform marketplace operated by a
+third party through which software is offered to end users, such as the Apple
+App Store, the Mac App Store, the Microsoft Store and the Microsoft Azure
+Marketplace, and any similar store or marketplace.
+
+"Store Terms" means the terms, policies and technical measures a Store applies
+to software offered through it or to the people who obtain it there, including
+usage rules, limits on the number of devices, digital rights management,
+mandatory code signing and sandboxing.
+
+"Arcen Trademarks" means the names and logos described in TRADEMARKS.md.
+
+"Covered work", "convey", "object code" and "Corresponding Source" have the
+meanings given in the AGPL.
+
+2. Permission
+
+You may convey a covered work in object code form through a Store, even where
+the Store Terms impose on recipients usage restrictions, digital rights
+management, device limits or other terms that the AGPL would otherwise not
+permit, provided that all of the following conditions are met:
+
+(a) Source. The Corresponding Source for the exact version you convey is
+publicly available, free of charge, under the AGPL with this exception, for as
+long as you offer that version in the Store, and the Store listing or the
+software itself tells recipients where to obtain it.
+
+(b) Free of charge. You convey the object code free of charge. You do not
+charge for the software through the Store, whether as a purchase price, a
+subscription, an in-app purchase that unlocks its functionality, or otherwise.
+
+(c) Trademarks. You do not use the Arcen Trademarks to identify your
+distribution - not in its name, its icon, its Store listing or its publisher
+identity - except for the plain, nominative references that TRADEMARKS.md
+allows.
+
+If any condition stops being met, this permission ends for that distribution;
+the AGPL itself continues to apply.
+
+3. A permission only
+
+This exception is an additional permission and nothing else. It does not
+restrict, condition or revoke any right the AGPL grants. Anyone may continue
+to convey Arcen under the AGPL alone, in any way the AGPL allows, without
+relying on this exception.
+
+4. Removal from modified versions
+
+As section 7 of the AGPL provides, when you convey a copy of a covered work
+you may remove this exception from that copy, or from any part of it,
+including from your own modified versions. A version from which it has been
+removed is licensed under the AGPL only. If you keep it, you may extend it to
+your own modifications.
+
+5. The copyright holder
+
+TUTTIFRUTTI AS, as copyright holder, does not depend on this exception. Its
+own distributions of Arcen, including the official signed builds it offers
+through Stores and marketplaces, are made under its rights as copyright holder
+and, for contributions, under the licence it receives through the Contributor
+License Agreement (CLA.md). The exception exists so that others can do
+something similar, free of charge and under their own name.
+
+6. Third-party components
+
+This exception is granted only by the copyright holders of the files that
+carry it. It grants no permission for third-party components that Arcen
+incorporates, links or bundles; those remain under their own licences, listed
+in legal/THIRD_PARTY_NOTICES.md. Anyone who conveys Arcen through a Store must
+comply with those licences independently. In particular, a component under
+the GNU GPL or LGPL whose authors have not granted an equivalent permission
+may prevent Store distribution of an artefact that contains it.

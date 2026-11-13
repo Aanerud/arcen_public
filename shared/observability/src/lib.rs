@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! OS-independent observability runtime for Arcen's canonical telemetry contracts.
 
 #![forbid(unsafe_code)]

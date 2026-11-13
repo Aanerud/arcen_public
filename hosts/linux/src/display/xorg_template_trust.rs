@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! When `/etc/arcen/xorg.conf` may be trusted as a root-run X server's
 //! configuration.
 //!

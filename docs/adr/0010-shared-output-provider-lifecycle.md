@@ -1,9 +1,11 @@
 # ADR 0010: Shared Output Provider Lifecycle
 
-**Status:** Accepted (2026-08-10). Design gate only. At this commit there is no
-`shared/outputs` directory, no `arcen-outputs` package, no workspace member, and
-no host migration. This ADR freezes the shape that the crate and the migration
-must implement.
+**Status:** Accepted (2026-08-10). Design gate only when accepted: at that
+commit there was no `shared/outputs` directory, no `arcen-outputs` package, no
+workspace member, and no host migration. This ADR froze the shape that the
+crate and the migration must implement. Since then `arcen-outputs` exists and
+the Linux, Windows and macOS Piers and capenc depend on it (see
+`shared/outputs/consumers.json`).
 
 ## Context
 
@@ -82,8 +84,8 @@ Create `shared/outputs`, package `arcen-outputs`, owned by Shared/Architecture.
   `[dependencies]`, `[dev-dependencies]`, or `[build-dependencies]`.
 - It contains no executor, no timer, no thread spawn, no task spawn, and no I/O
   of its own. `tokio`, `tokio-util`, `quinn`, `bytes`, `futures`, and
-  `async-trait` are all excluded, and so is every `hosts/`, `clients/`,
-  `gateway/`, and `packaging/` crate.
+  `async-trait` are all excluded, and so is every `hosts/`, `clients/`
+  and `packaging/` crate.
 - Its own tests drive futures with a small in-crate `block_on` built on
   `std::thread::park` and a hand-written `RawWaker`. No `#[tokio::test]`, because
   a dev-dependency would show up in `cargo tree --locked -p arcen-outputs -e all`

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # doc-guard: refuse documentation edits that destroy content.
 #
 # Why this exists
 # ---------------
-# On 2026-07-25 a delegated documentation pass replaced ten large
-# ARCHITECTURE.md files with 18 to 36 line skeletons and deleted a block of
-# governing rules from the root AGENTS.md. Every one of those edits passed a
-# structural heading-order check, because heading order says nothing about
-# whether the content under the headings survived.
+# A structural heading-order check cannot tell whether the content under the
+# headings survived an edit: replacing a large ARCHITECTURE.md with a short
+# skeleton, or deleting governing rules from the root AGENTS.md, passes it.
 #
 # This guard is the mechanical answer. It compares each documentation file
 # against a base ref and fails on two conditions:

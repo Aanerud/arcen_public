@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Ordered outbox for the input/cursor lane (ADR 0014).
 //!
 //! The lane writer's queue is bounded and reports a full queue instead of

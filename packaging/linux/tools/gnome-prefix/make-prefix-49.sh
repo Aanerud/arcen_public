@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab only: turns a rebuilt libmutter-17 (build-patched-mutter-49.sh) into the
 # prefix /opt/arcen-gnome/49: the distribution's GNOME Shell 49 with that one
 # library. Usage: make-prefix-49.sh <dir holding libmutter-17.so*>

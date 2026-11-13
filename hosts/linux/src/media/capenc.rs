@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Supervises the native `arcen-capenc` child (NvFBC → NVENC). Ports
 //! `server/capenc_backend.py`: spawn the same helper in its optional framed-v1
 //! output mode, read exact Annex-B access units, forward `IDR\n` keyframe
@@ -49,7 +51,14 @@ use super::annexb::{access_unit_is_keyframe, AccessUnit, NalCodec};
 const FRAMED_OUTPUT_V1: &str = "framed-v1";
 const FRAME_LENGTH_SIZE: usize = 4;
 const MAX_ACCESS_UNIT_SIZE: usize = 16 * 1024 * 1024;
-const FRAME_CHANNEL_CAPACITY: usize = 4;
+/// Encoded frames read from capenc but not yet taken by the frame pump.
+///
+/// One: a frame waiting here is invisible to the send queue's backlog budget
+/// (`arcen_media::video::video_backlog_budget`), so a deeper channel would
+/// only hold more stale pictures in front of a slow network. A healthy pump
+/// takes each frame at once. `ARCEN_VIDEO_BACKLOG=legacy` restores four.
+const FRAME_CHANNEL_CAPACITY: usize = 1;
+const LEGACY_FRAME_CHANNEL_CAPACITY: usize = 4;
 const CAPENC_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPENC_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const UNAVAILABLE_PREFIX: &str = "[capenc] UNAVAILABLE ";
@@ -317,6 +326,12 @@ impl CapencConfig {
         } else {
             FRAMED_OUTPUT_V1.to_string()
         });
+        // The desktop's cursor hub reports host-caused pointer motion to a
+        // Deck that asks for it; positions are cheap (one small record per
+        // Mutter cursor update, bounded by the stream rate).
+        if self.cursor_events() {
+            v.push(arcen_media::capenc_stream::CURSOR_POSITION_ARG.to_string());
+        }
         v.push(format!("encoder={}", self.encoder.as_arg()));
         v.push(format!(
             "cursor={}",
@@ -721,6 +736,9 @@ pub(crate) enum StdinCmd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildShutdown {
     Graceful,
+    /// The child was reaped in time but did not exit successfully: it had
+    /// already died (killed or crashed) or failed its own teardown.
+    Unclean(std::process::ExitStatus),
     Forced,
 }
 
@@ -820,6 +838,18 @@ impl BitrateRequester {
 struct ObservedCapture {
     admission: Option<CaptureAdmissionNotice>,
     stats: tokio::sync::watch::Receiver<Option<PipelineStatsSample>>,
+    content: ContentWindowCell,
+}
+
+/// Every stats second's content proof since the health tick last took it.
+pub type ContentWindowCell = std::sync::Arc<std::sync::Mutex<arcen_telemetry::ContentWindow>>;
+
+/// Records one parsed stats second into the health window.
+fn record_content_second(content: &ContentWindowCell, sample: &PipelineStatsSample) {
+    content
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(sample.content_fps());
 }
 
 /// A running `capenc` session: take the access-unit stream with
@@ -859,6 +889,12 @@ impl CapencSession {
         self.observed.stats.clone()
     }
 
+    /// Every stats second's content proof since the health tick last took
+    /// it (`arcen_telemetry::ContentWindow`).
+    pub fn content_window(&self) -> ContentWindowCell {
+        std::sync::Arc::clone(&self.observed.content)
+    }
+
     /// Take the access-unit stream. Returns `None` if already taken.
     pub fn take_frames(&mut self) -> Option<mpsc::Receiver<AccessUnit>> {
         self.frames.take()
@@ -870,6 +906,13 @@ impl CapencSession {
         match shutdown_child(&mut self.child, &self.stdin_tx, Duration::from_secs(2)).await {
             ChildShutdown::Graceful => {
                 tracing::info!(target: target::CAPENC, "capenc exited cleanly")
+            }
+            ChildShutdown::Unclean(status) => {
+                tracing::warn!(
+                    target: target::CAPENC,
+                    %status,
+                    "capenc did not exit cleanly: it had already ended or failed its teardown"
+                );
             }
             ChildShutdown::Forced => {
                 tracing::warn!(target: target::CAPENC, "capenc ignored graceful stop — killing");
@@ -888,7 +931,8 @@ async fn shutdown_child(
         child.wait().await
     };
     match tokio::time::timeout(timeout, graceful).await {
-        Ok(Ok(_)) => ChildShutdown::Graceful,
+        Ok(Ok(status)) if status.success() => ChildShutdown::Graceful,
+        Ok(Ok(status)) => ChildShutdown::Unclean(status),
         Ok(Err(_)) | Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -940,7 +984,7 @@ pub async fn spawn(
                 if !software_fallback_preserves_exact_pins(&config) {
                     return Err(CapencStartError::BackendUnavailable(last_reason));
                 }
-                let (software, degradation) = software_fallback_config(config)?;
+                let (software, degradation) = software_fallback_after_native(config, &last_reason)?;
                 report_fallback(
                     &requested,
                     &software,
@@ -1114,7 +1158,7 @@ pub async fn preflight(config: CapencConfig) -> Result<(), CapencStartError> {
             if !software_fallback_preserves_exact_pins(&config) {
                 return Err(CapencStartError::BackendUnavailable(last_line));
             }
-            software_fallback_config(config)?;
+            software_fallback_after_native(config, &last_line)?;
             tracing::info!(
                 target: target::CAPENC,
                 unavailable = %last_line,
@@ -1291,6 +1335,67 @@ pub(crate) const WAYLAND_SOFTWARE_GEOMETRY_REFUSAL: &str =
 /// OpenH264 carries `cursor=host` there (`BackendLimits::with_source_cursor`).
 fn wayland_source_cursor(config: &CapencConfig) -> Option<arcen_media::video::CursorEvidence> {
     wayland_handoff(config).map(|handoff| handoff.cursor_mode().cursor_evidence())
+}
+
+/// [`software_fallback_config`] after the native encoder answered
+/// `unavailable` (its `UNAVAILABLE` line): a request software cannot serve is
+/// refused with the hardware cause named, not only "software is 8-bit".
+fn software_fallback_after_native(
+    config: CapencConfig,
+    unavailable: &str,
+) -> Result<(CapencConfig, PlanDegradation), CapencStartError> {
+    if let Some(reason) = fidelity_refusal_after_native(&config, unavailable)? {
+        tracing::warn!(
+            target: target::CAPENC,
+            unavailable = %unavailable,
+            reason,
+            "fidelity request refused: the hardware encoder is unavailable and software cannot serve it"
+        );
+        return Err(CapencStartError::PipelineRefused(reason));
+    }
+    software_fallback_config(config)
+}
+
+fn fidelity_refusal_after_native(
+    config: &CapencConfig,
+    unavailable: &str,
+) -> Result<Option<&'static str>, CapencStartError> {
+    let Ok(notice) = parse_unavailable_v1(unavailable) else {
+        return Ok(None);
+    };
+    let codec = config.codec_enum()?;
+    let requested = arcen_media::video::pipeline_for_request(
+        config.video_selection,
+        config.video_configuration(codec),
+        config.fps,
+        config.motion_priority,
+    );
+    let decision = arcen_media::video::software_fallback_decision_after_hardware(
+        requested,
+        config.video_selection,
+        notice.reason,
+    );
+    Ok(decision.is_refusal().then(|| decision.reason()))
+}
+
+/// The session geometry capture and encode can serve for a requested
+/// `width`x`height` on Xorg: [`fit_to_encoder_limits`] for software, then,
+/// when `bit_depth` selects the depth-30 XShm path, the host-converted pixel
+/// budget (`arcen_media::video::fit_host_converted_capture`). The eight-bit
+/// NvFBC path is never fitted here.
+#[must_use]
+pub fn fit_to_capture_limits(
+    encoder: EncoderRequest,
+    bit_depth: BitDepth,
+    width: u32,
+    height: u32,
+) -> (u32, u32) {
+    let (width, height) = fit_to_encoder_limits(encoder, width, height);
+    if arcen_capenc::linux_capture_is_host_converted(bit_depth) {
+        arcen_media::video::fit_host_converted_capture(width, height)
+    } else {
+        (width, height)
+    }
 }
 
 fn software_fallback_config(
@@ -1480,7 +1585,13 @@ async fn spawn_one(
         }
     };
 
-    let (frames_tx, frames_rx) = mpsc::channel::<AccessUnit>(FRAME_CHANNEL_CAPACITY);
+    let channel_capacity = if arcen_media::video::video_backlog_budget_from_env(plan.fps).is_some()
+    {
+        FRAME_CHANNEL_CAPACITY
+    } else {
+        LEGACY_FRAME_CHANNEL_CAPACITY
+    };
+    let (frames_tx, frames_rx) = mpsc::channel::<AccessUnit>(channel_capacity);
     // Small mailbox: coalesces bursts of keyframe requests (a full mailbox
     // means an IDR is already queued, so dropping extras is correct).
     let (stdin_tx, stdin_rx) = mpsc::channel::<StdinCmd>(4);
@@ -1508,6 +1619,7 @@ async fn spawn_one(
             hub: crate::media::wayland_cursor::hub(handoff.runtime_dir()),
             connector: handoff.output().as_str().to_owned(),
             generation: handoff.generation().get(),
+            stream_size: (plan.width, plan.height),
         })
     });
     match cursor.flatten() {
@@ -1523,7 +1635,11 @@ async fn spawn_one(
     }
     tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
     let (stats_tx, stats) = tokio::sync::watch::channel(None);
-    tokio::spawn(read_stderr(stderr_lines, stats_tx).instrument(helper_span));
+    let content = ContentWindowCell::default();
+    tokio::spawn(
+        read_stderr(stderr_lines, stats_tx, std::sync::Arc::clone(&content))
+            .instrument(helper_span),
+    );
 
     tracing::info!(
         target: target::CAPENC,
@@ -1544,7 +1660,11 @@ async fn spawn_one(
     Ok((
         CapencSession {
             frames: Some(frames_rx),
-            observed: Box::new(ObservedCapture { admission, stats }),
+            observed: Box::new(ObservedCapture {
+                admission,
+                stats,
+                content,
+            }),
             idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone()),
             child,
             idr_tx,
@@ -1732,7 +1852,7 @@ where
         )
     })?;
     let is_keyframe = access_unit_is_keyframe(&data, codec);
-    Ok(Some(AccessUnit { data, is_keyframe }))
+    Ok(Some(AccessUnit::new(data, is_keyframe)))
 }
 
 /// Where a capture's cursor events go: its desktop's hub, as the events of
@@ -1741,6 +1861,8 @@ struct CursorTarget {
     hub: std::sync::Arc<crate::media::wayland_cursor::WaylandCursorHub>,
     connector: String,
     generation: u64,
+    /// The stream's pixel size, the space its pointer positions are in.
+    stream_size: (u32, u32),
 }
 
 /// framed-v2 stdout → access units and cursor events. The child runs as
@@ -1752,6 +1874,7 @@ async fn read_framed_v2(
     frames_tx: mpsc::Sender<AccessUnit>,
     cursor: CursorTarget,
 ) {
+    cursor.hub.note_stream_size(cursor.stream_size);
     loop {
         match read_framed_v2_record(&mut stdout, codec).await {
             Ok(None) => {
@@ -1768,6 +1891,12 @@ async fn read_framed_v2(
                     .hub
                     .apply(&cursor.connector, cursor.generation, &event);
             }
+            Ok(Some(FramedV2Record::Position(position))) => {
+                cursor
+                    .hub
+                    .apply_position(&cursor.connector, cursor.stream_size, &position);
+            }
+            Ok(Some(FramedV2Record::Refine)) => {}
             Err(e) => {
                 tracing::warn!(target: target::CAPENC, error = %e, "invalid framed-v2 capenc stdout");
                 break;
@@ -1779,6 +1908,8 @@ async fn read_framed_v2(
 enum FramedV2Record {
     AccessUnit(AccessUnit),
     Cursor(arcen_media::capenc_stream::CapencCursorEvent),
+    Position(arcen_media::capenc_stream::CapencCursorPosition),
+    Refine,
 }
 
 async fn read_framed_v2_record<R>(
@@ -1789,7 +1920,8 @@ where
     R: AsyncRead + Unpin,
 {
     use arcen_media::capenc_stream::{
-        decode_cursor_event, record_body_length, record_kind, CapencRecordKind, RECORD_LENGTH_BYTES,
+        decode_cursor_event, decode_cursor_position, record_body_length, record_kind,
+        CapencRecordKind, RECORD_LENGTH_BYTES,
     };
     let invalid = |error: arcen_media::capenc_stream::CapencRecordError| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
@@ -1815,14 +1947,17 @@ where
                 ));
             }
             let is_keyframe = access_unit_is_keyframe(&body, codec);
-            FramedV2Record::AccessUnit(AccessUnit {
-                data: body,
-                is_keyframe,
-            })
+            FramedV2Record::AccessUnit(AccessUnit::new(body, is_keyframe))
         }
         CapencRecordKind::Cursor => {
             FramedV2Record::Cursor(decode_cursor_event(&body).map_err(invalid)?)
         }
+        CapencRecordKind::CursorPosition => {
+            FramedV2Record::Position(decode_cursor_position(&body).map_err(invalid)?)
+        }
+        // Lossless refinement (ADR 0016) is produced only with `refine=on`,
+        // which this Pier never passes yet; such records are not forwarded.
+        CapencRecordKind::RefineVideo | CapencRecordKind::RefineLane => FramedV2Record::Refine,
     }))
 }
 
@@ -1908,6 +2043,13 @@ pub struct PipelineStatsSample {
     pub limiter: Option<arcen_media::video::FrameRateLimiter>,
     /// The loop's pacing target in that second (`target_fps`).
     pub target_fps: Option<u32>,
+    /// Due frames that carried new content (`fresh_frames`), when the loop
+    /// classifies its rate.
+    pub fresh: Option<u32>,
+    /// Grabs that returned a new frame (`capture_new`) and grabs that found
+    /// the screen unchanged (`capture_old`), from the NvFBC loop.
+    pub capture_new: Option<u32>,
+    pub capture_old: Option<u32>,
 }
 
 impl PipelineStatsSample {
@@ -1930,7 +2072,35 @@ impl PipelineStatsSample {
             source: field("source_fps"),
             limiter,
             target_fps: field("target_fps"),
+            fresh: field("fresh_frames"),
+            capture_new: field("capture_new"),
+            capture_old: field("capture_old"),
         })
+    }
+
+    /// Changed-content frames this second proves, for health
+    /// (`arcen_telemetry::QosSample::fps_content`).
+    ///
+    /// Only a second that shows the source, rather than the pipeline, set
+    /// the pace proves anything: one the loop classified as content-limited
+    /// (`fps_limiter=no_damage`: due deadlines found nothing new), or, on the
+    /// NvFBC loop that does not classify, one in which some grabs found the
+    /// screen unchanged (`capture_old`), so every change was grabbed
+    /// (`capture_new`). A pipeline- or rate-limited second, or a loop that
+    /// reports neither, proves nothing, and health then judges the frame rate
+    /// against the target as before.
+    #[must_use]
+    pub fn content_fps(&self) -> Option<u32> {
+        match self.limiter {
+            Some(arcen_media::video::FrameRateLimiter::NoDamage) => {
+                Some(self.fresh.unwrap_or(self.encoded))
+            }
+            Some(_) => None,
+            None => self
+                .capture_old
+                .filter(|old| *old > 0)
+                .and(self.capture_new),
+        }
     }
 }
 
@@ -1940,6 +2110,7 @@ impl PipelineStatsSample {
 async fn read_stderr<R>(
     mut reader: crate::bounded_io::BoundedLineReader<R>,
     stats: tokio::sync::watch::Sender<Option<PipelineStatsSample>>,
+    content: ContentWindowCell,
 ) where
     R: AsyncBufRead + Unpin,
 {
@@ -1968,6 +2139,7 @@ async fn read_stderr<R>(
                         );
                         limiter = sample.limiter;
                     }
+                    record_content_second(&content, &sample);
                     stats.send_replace(Some(sample));
                 }
                 forward_capenc_line(&bounded.text);
@@ -2319,6 +2491,59 @@ mod tests {
     }
 
     #[test]
+    fn a_fidelity_refusal_after_native_names_the_hardware_cause() {
+        // Grading on a 3600x2262 depth-30 desktop: capenc's wide path
+        // answered `unsupported_display`, and the refusal must keep that
+        // hardware reason rather than say only that software is 8-bit 4:2:0.
+        let mut config = native_config();
+        config.codec = "h265".to_string();
+        config.yuv444 = true;
+        config.bit_depth = BitDepth::Ten;
+        config.color_range = ColorRange::Full;
+        config.color_matrix = ColorMatrix::Bt709;
+        config.video_selection = VideoSelectionIntent::ColorFidelity;
+        config.fps = 30;
+        config.width = 3600;
+        config.height = 2262;
+        config.cursor_mode = CursorMode::Local;
+        let unavailable =
+            "[capenc] UNAVAILABLE version=1 backend=native-nvenc code=unsupported_display";
+        match software_fallback_after_native(config.clone(), unavailable) {
+            Err(CapencStartError::PipelineRefused(reason)) => {
+                assert!(reason.contains("cannot capture this desktop"), "{reason}");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+        // A cause it cannot read keeps the generic software refusal.
+        assert!(matches!(
+            software_fallback_after_native(config, "[capenc] something else"),
+            Err(CapencStartError::PipelineRefused(reason)) if reason.contains("software fallback")
+        ));
+        // An Auto request still degrades to software whatever the cause.
+        let auto = native_config();
+        assert!(software_fallback_after_native(auto, unavailable).is_ok());
+    }
+
+    #[test]
+    fn ten_bit_xorg_geometry_is_fitted_to_the_host_converted_budget() {
+        // Fewer pixels than UHD: served as requested.
+        assert_eq!(
+            fit_to_capture_limits(EncoderRequest::Auto, BitDepth::Ten, 3600, 2262),
+            (3600, 2262)
+        );
+        // A 5K Deck display: fitted, aspect kept, instead of failing capture.
+        assert_eq!(
+            fit_to_capture_limits(EncoderRequest::Auto, BitDepth::Ten, 5120, 2880),
+            (3840, 2160)
+        );
+        // The eight-bit NvFBC path is never fitted.
+        assert_eq!(
+            fit_to_capture_limits(EncoderRequest::Auto, BitDepth::Eight, 5120, 2880),
+            (5120, 2880)
+        );
+    }
+
+    #[test]
     fn software_fallback_degrades_the_shipped_linux_default_instead_of_refusing() {
         // packaging/linux/arcen-pier.json ships h265 / yuv444 / 60fps. Before
         // this change the fallback refused exactly that, which made it
@@ -2467,6 +2692,12 @@ mod tests {
                         let case = format!("{encoder:?} {bit_depth:?} {transfer:?} {cursor:?}");
                         assert!(v1 != v2, "{case}: one framing, {argv:?}");
                         assert_eq!(config.cursor_events(), v2, "{case}");
+                        assert_eq!(
+                            argv.iter()
+                                .any(|arg| arg == arcen_media::capenc_stream::CURSOR_POSITION_ARG),
+                            v2,
+                            "{case}"
+                        );
                         assert_eq!(v2, cursor == ScreenCastCursorMode::Metadata, "{case}");
                     }
                 }
@@ -2488,14 +2719,30 @@ mod tests {
         };
         stdout
             .extend(encode_record(CapencRecordKind::Cursor, &encode_cursor_event(&event)).unwrap());
+        let position = arcen_media::capenc_stream::CapencCursorPosition {
+            on_output: true,
+            x: 12,
+            y: 34,
+        };
+        stdout.extend(
+            encode_record(
+                CapencRecordKind::CursorPosition,
+                &arcen_media::capenc_stream::encode_cursor_position(&position),
+            )
+            .unwrap(),
+        );
         let mut reader = stdout.as_slice();
         assert!(matches!(
             read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
-            Some(FramedV2Record::AccessUnit(AccessUnit { ref data, is_keyframe: true })) if data == &access_unit
+            Some(FramedV2Record::AccessUnit(AccessUnit { ref data, is_keyframe: true, .. })) if data == &access_unit
         ));
         assert!(matches!(
             read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
             Some(FramedV2Record::Cursor(ref read)) if *read == event
+        ));
+        assert!(matches!(
+            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            Some(FramedV2Record::Position(read)) if read == position
         ));
         assert!(read_framed_v2_record(&mut reader, NalCodec::H264)
             .await
@@ -2844,6 +3091,30 @@ mod tests {
         }
     }
 
+    /// A health window spans two capenc seconds. A busy second the encoder
+    /// fell behind in, followed by an idle one, must not read as a still
+    /// desktop just because the latest line was idle.
+    #[test]
+    fn a_health_window_proves_content_only_if_every_stats_second_did() {
+        let line = |new: u32, old: u32| {
+            PipelineStatsSample::parse(
+                &format!(
+                    "[capenc] enc_fps=1 encode_submitted=1 capture_backend=nvfbc \
+                     capture_new={new} capture_old={old} emit_keepalive=1"
+                ),
+                1,
+            )
+            .expect("stats line")
+        };
+        let content = ContentWindowCell::default();
+        record_content_second(&content, &line(24, 0));
+        record_content_second(&content, &line(0, 480));
+        assert_eq!(content.lock().expect("lock").take_fps(), None);
+        record_content_second(&content, &line(2, 470));
+        record_content_second(&content, &line(0, 480));
+        assert_eq!(content.lock().expect("lock").take_fps(), Some(1));
+    }
+
     #[test]
     fn pipeline_stats_lines_publish_encoded_and_source_rates() {
         let wayland = "[capenc] enc_fps=30 encode_submitted=30 source_fps=57 source_superseded=27 \
@@ -2856,7 +3127,14 @@ mod tests {
                 source: Some(57),
                 limiter: None,
                 target_fps: None,
+                fresh: None,
+                capture_new: None,
+                capture_old: None,
             })
+        );
+        assert_eq!(
+            PipelineStatsSample::parse(wayland, 3).and_then(|sample| sample.content_fps()),
+            None
         );
         let xorg_wide = "[capenc] enc_fps=11 encode_submitted=21 avg_capture_ms=3.80 \
                          capture_backend=xshm avg_convert_ms=3.10 avg_upload_ms=2.40 \
@@ -2870,6 +3148,31 @@ mod tests {
             Some(arcen_media::video::FrameRateLimiter::NoDamage)
         );
         assert_eq!(sample.target_fps, Some(8));
+        // A still desktop: four changed frames, keepalives on top.
+        assert_eq!(sample.content_fps(), Some(4));
+        // The NvFBC loop on a still desktop (from a lab session): only the
+        // keepalive went out, and every grab found the screen unchanged.
+        let nvfbc = "[capenc] enc_fps=1 encode_submitted=1 avg_encode_ms=3.72 kbps=22 \
+                     capture_backend=nvfbc capture_new=0 capture_old=484 capture_direct=0 \
+                     emit_first=0 emit_idr=0 emit_activity=0 emit_keepalive=1 sid=d57d";
+        assert_eq!(
+            PipelineStatsSample::parse(nvfbc, 6).and_then(|sample| sample.content_fps()),
+            Some(0)
+        );
+        // Every grab new: the encoder, not the screen, may have set the pace.
+        let nvfbc_busy = nvfbc.replace(
+            "capture_new=0 capture_old=484",
+            "capture_new=24 capture_old=0",
+        );
+        assert_eq!(
+            PipelineStatsSample::parse(&nvfbc_busy, 7).and_then(|sample| sample.content_fps()),
+            None
+        );
+        let busy = xorg_wide.replace("fps_limiter=no_damage", "fps_limiter=pipeline");
+        assert_eq!(
+            PipelineStatsSample::parse(&busy, 5).and_then(|sample| sample.content_fps()),
+            None
+        );
         let xorg = "[capenc] enc_fps=60 avg_encode_ms=2.1 kbps=900";
         assert_eq!(
             PipelineStatsSample::parse(xorg, 1).map(|sample| (sample.encoded, sample.source)),
@@ -3243,6 +3546,23 @@ mod tests {
             shutdown_child(&mut child, &control, Duration::from_secs(2)).await,
             ChildShutdown::Graceful
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_or_failing_capenc_is_not_reported_as_a_clean_exit() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (mut child, control) = spawn_shutdown_fixture("exit 0", "kill -9 $$").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match shutdown_child(&mut child, &control, Duration::from_secs(2)).await {
+            ChildShutdown::Unclean(status) => assert_eq!(status.signal(), Some(9)),
+            other => panic!("a SIGKILLed capenc read as {other:?}"),
+        }
+        let (mut child, control) = spawn_shutdown_fixture("exit 0", "exit 7").await;
+        match shutdown_child(&mut child, &control, Duration::from_secs(2)).await {
+            ChildShutdown::Unclean(status) => assert_eq!(status.code(), Some(7)),
+            other => panic!("a failing capenc read as {other:?}"),
+        }
     }
 
     #[tokio::test]

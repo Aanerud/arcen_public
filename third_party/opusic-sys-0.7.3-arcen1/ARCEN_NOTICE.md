@@ -21,6 +21,7 @@ The preserved upstream `opus.patch` has SHA-256
 The Arcen patch has SHA-256
 `29af076d6f2b88f63c28c93291ce4afa7d580c0ddaa4709cc6965b3a69767890`.
 
-The source, existing patch, licenses, authorship records, and bundled libopus
-tree must remain intact. Release/Security owner approval date: 2026-07-22.
-See `legal/ORIGINS.md` and `legal/THIRD_PARTY_NOTICES.md`.
+The upstream licence, source manifest and patch series accompany this source.
+The source, existing patch, licences, authorship records, and bundled libopus
+tree must remain intact. See `legal/ORIGINS.md` and
+`legal/THIRD_PARTY_NOTICES.md`.

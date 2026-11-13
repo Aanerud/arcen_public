@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A test Deck that speaks the lane transport (ADR 0014) the way the real
 //! Deck does, and presents the session as one message stream so the
 //! end-to-end tests read like a session: control on the control lane, video

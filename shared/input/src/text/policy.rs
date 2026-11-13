@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The client's choice, per keystroke, between sending the key position and
 //! sending the characters the client's own input method produced.
 //!
@@ -24,7 +26,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use arcen_protocol::messages::{HostKeymapMsg, MAX_TEXT_COMMIT_BYTES};
+use arcen_protocol::messages::{HostKeymapMsg, HostPlatform, MAX_TEXT_COMMIT_BYTES};
 
 /// How plain keystrokes reach the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,6 +61,67 @@ impl TypingMode {
             "auto" => Some(Self::Auto),
             "characters" => Some(Self::Characters),
             _ => None,
+        }
+    }
+}
+
+/// A connection's keyboard mode, chosen per connection and switchable during
+/// a session (Microsoft's Windows App calls the two "scancode" and
+/// "Unicode").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyboardMode {
+    /// Keys go as key positions and the host's layout decides each
+    /// character, as the Typing setting describes (Auto or Keys only).
+    #[default]
+    Physical,
+    /// Every typed character goes as the character this Mac's layout typed
+    /// (dead keys, Option characters, input methods included); shortcuts,
+    /// navigation and function keys stay keys.
+    Characters,
+}
+
+impl KeyboardMode {
+    /// Both, in menu order.
+    pub const ALL: [Self; 2] = [Self::Physical, Self::Characters];
+
+    /// The settings token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Physical => "physical",
+            Self::Characters => "characters",
+        }
+    }
+
+    /// The mode a settings token names.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "physical" => Some(Self::Physical),
+            "characters" => Some(Self::Characters),
+            _ => None,
+        }
+    }
+
+    /// The mode the application-wide typing setting amounts to.
+    #[must_use]
+    pub const fn of_typing(typing: TypingMode) -> Self {
+        match typing {
+            TypingMode::Characters => Self::Characters,
+            TypingMode::Keys | TypingMode::Auto => Self::Physical,
+        }
+    }
+
+    /// The typing mode in force under this keyboard mode, given the
+    /// application-wide typing setting: Characters always types characters;
+    /// Physical keeps the setting's own choice of key positions, and is
+    /// Auto when the setting itself is "always characters".
+    #[must_use]
+    pub const fn typing_mode(self, setting: TypingMode) -> TypingMode {
+        match (self, setting) {
+            (Self::Characters, _) => TypingMode::Characters,
+            (Self::Physical, TypingMode::Characters) => TypingMode::Auto,
+            (Self::Physical, setting) => setting,
         }
     }
 }
@@ -109,6 +172,89 @@ impl OptionKeyMode {
                 OptionSide::Left | OptionSide::Right | OptionSide::Both
             ) | (Self::LeftAltRightCharacters, OptionSide::Right)
         )
+    }
+}
+
+/// The Option-keys setting: [`Automatic`](Self::Automatic) unless the user
+/// chose a mode.
+///
+/// Automatic keeps a Mac host's Option keys as Option ([`OptionKeyMode::BothAlt`]),
+/// which is how a Mac host received them before it typed committed text, so
+/// a Mac-to-Mac session does not change under someone's fingers; other hosts
+/// get [`OptionKeyMode::LeftAltRightCharacters`]. A chosen mode applies to
+/// every host. Characters mode and Paste as Keystrokes send text either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptionKeyPreference {
+    /// Decided by the host's platform.
+    #[default]
+    Automatic,
+    /// The user's choice.
+    Chosen(OptionKeyMode),
+}
+
+impl From<OptionKeyMode> for OptionKeyPreference {
+    fn from(mode: OptionKeyMode) -> Self {
+        Self::Chosen(mode)
+    }
+}
+
+impl OptionKeyPreference {
+    /// The mode in force for a host on `platform`.
+    #[must_use]
+    pub const fn resolve(self, platform: HostPlatform) -> OptionKeyMode {
+        match (self, platform) {
+            (Self::Chosen(mode), _) => mode,
+            (Self::Automatic, HostPlatform::MacOs) => OptionKeyMode::BothAlt,
+            (Self::Automatic, _) => OptionKeyMode::LeftAltRightCharacters,
+        }
+    }
+
+    /// The settings token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Chosen(mode) => mode.token(),
+        }
+    }
+
+    /// The preference a settings token names.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "automatic" => Some(Self::Automatic),
+            _ => OptionKeyMode::from_token(token).map(Self::Chosen),
+        }
+    }
+
+    /// The preference stored settings hold: `preference` (written by builds
+    /// that know [`Automatic`](Self::Automatic), alongside `legacy_mode` as
+    /// it resolves for an unknown host), and the older `legacy_mode`.
+    ///
+    /// A `legacy_mode` that disagrees with `preference` was written later by
+    /// an older build (a downgrade, which keeps keys it does not know), so it
+    /// is the user's latest choice. Without `preference`, older builds stored
+    /// their default with every save, so a stored
+    /// [`OptionKeyMode::LeftAltRightCharacters`] says nothing about a choice
+    /// and reads as Automatic (which is that mode on every host those builds
+    /// typed text into); the other two modes were chosen.
+    #[must_use]
+    pub fn from_settings(preference: Option<&str>, legacy_mode: Option<&str>) -> Self {
+        let legacy = legacy_mode.and_then(OptionKeyMode::from_token);
+        if let Some(preference) = preference.and_then(Self::from_token) {
+            return match legacy {
+                Some(mode) if mode != preference.resolve(HostPlatform::Unknown) => {
+                    Self::Chosen(mode)
+                }
+                _ => preference,
+            };
+        }
+        match legacy {
+            Some(mode @ (OptionKeyMode::BothAlt | OptionKeyMode::BothCharacters)) => {
+                Self::Chosen(mode)
+            }
+            Some(OptionKeyMode::LeftAltRightCharacters) | None => Self::Automatic,
+        }
     }
 }
 
@@ -240,6 +386,13 @@ impl HostKeyPositions {
         self.active_layout.as_deref()
     }
 
+    /// Whether the notice describes any key (a host that could not read its
+    /// layout sends one that describes none).
+    #[must_use]
+    pub fn describes_keys(&self) -> bool {
+        !self.positions.is_empty()
+    }
+
     /// Whether the host's layout types `text` at `position` with `shift`.
     /// `None` when the position is not described.
     #[must_use]
@@ -254,7 +407,9 @@ impl HostKeyPositions {
 #[derive(Debug, Clone, Default)]
 pub struct TextInputPolicy {
     mode: TypingMode,
-    option: OptionKeyMode,
+    option: OptionKeyPreference,
+    /// The host's platform; `None` until a hello says it.
+    platform: Option<HostPlatform>,
     host: HostTextTruth,
     keymap: Option<HostKeyPositions>,
     text_keys: BTreeSet<u32>,
@@ -268,18 +423,24 @@ impl TextInputPolicy {
     /// A policy with these settings, for a host that has not said what it
     /// types.
     #[must_use]
-    pub fn new(mode: TypingMode, option: OptionKeyMode) -> Self {
+    pub fn new(mode: TypingMode, option: impl Into<OptionKeyPreference>) -> Self {
         Self {
             mode,
-            option,
+            option: option.into(),
             ..Self::default()
         }
     }
 
     /// Changes the settings.
-    pub fn configure(&mut self, mode: TypingMode, option: OptionKeyMode) {
+    pub fn configure(&mut self, mode: TypingMode, option: impl Into<OptionKeyPreference>) {
         self.mode = mode;
-        self.option = option;
+        self.option = option.into();
+    }
+
+    /// The host's platform, from its hello: what an automatic Option-keys
+    /// setting resolves against.
+    pub const fn set_host_platform(&mut self, platform: HostPlatform) {
+        self.platform = Some(platform);
     }
 
     /// The host's truth, from its hello. Forgets the previous host's
@@ -315,9 +476,18 @@ impl TextInputPolicy {
         self.mode
     }
 
-    /// The Option-key mode.
+    /// The Option-key mode in force for this host.
     #[must_use]
     pub const fn option_mode(&self) -> OptionKeyMode {
+        self.option.resolve(match self.platform {
+            Some(platform) => platform,
+            None => HostPlatform::Unknown,
+        })
+    }
+
+    /// The Option-keys setting.
+    #[must_use]
+    pub const fn option_preference(&self) -> OptionKeyPreference {
         self.option
     }
 
@@ -408,7 +578,7 @@ impl TextInputPolicy {
             return self.option_keystroke(index, stroke);
         }
         match self.plain_keystroke(index, stroke, text) {
-            DeckTextAction::ForwardKey(index) if self.option.composes(stroke.option) => {
+            DeckTextAction::ForwardKey(index) if self.option_mode().composes(stroke.option) => {
                 DeckTextAction::ForwardKeyWithoutAlt(index)
             }
             action => action,
@@ -425,7 +595,7 @@ impl TextInputPolicy {
         };
         let kept = match stroke.phase {
             KeyPhase::Press => {
-                self.held_composing_options[slot] = self.option.composes(stroke.option_key);
+                self.held_composing_options[slot] = self.option_mode().composes(stroke.option_key);
                 self.held_composing_options[slot]
             }
             KeyPhase::Repeat => self.held_composing_options[slot],
@@ -486,7 +656,7 @@ impl TextInputPolicy {
                     .is_some_and(|same| !same),
             }
         } else {
-            self.option.composes(stroke.option)
+            self.option_mode().composes(stroke.option)
         };
         if as_text {
             self.text_keys.insert(position);
@@ -712,6 +882,109 @@ mod tests {
     }
 
     #[test]
+    fn an_automatic_option_setting_keeps_option_on_a_mac_host() {
+        const ALT: u32 = 0x0100_0023;
+        let right_option = |pressed| KeyStroke {
+            option_key: OptionSide::Right,
+            option: if pressed {
+                OptionSide::Right
+            } else {
+                OptionSide::None
+            },
+            ..stroke(ALT, pressed)
+        };
+        let frame = [
+            DeckTextEvent::Key(right_option(true)),
+            DeckTextEvent::Key(right_option(false)),
+            DeckTextEvent::Commit("日本".to_owned()),
+        ];
+        let mut mac = TextInputPolicy::new(TypingMode::Auto, OptionKeyPreference::Automatic);
+        mac.set_host(host());
+        mac.set_host_platform(HostPlatform::MacOs);
+        assert_eq!(mac.option_mode(), OptionKeyMode::BothAlt);
+        // Option reaches a Mac host as Option, as before it typed text; an
+        // input method's commit still goes as text.
+        assert_eq!(
+            mac.plan_frame(&frame),
+            [
+                DeckTextAction::ForwardKey(0),
+                DeckTextAction::ForwardKey(1),
+                DeckTextAction::SendText("日本".to_owned()),
+            ]
+        );
+        let mut windows = TextInputPolicy::new(TypingMode::Auto, OptionKeyPreference::Automatic);
+        windows.set_host(host());
+        windows.set_host_platform(HostPlatform::Windows);
+        assert_eq!(windows.option_mode(), OptionKeyMode::LeftAltRightCharacters);
+        assert_eq!(
+            windows.plan_frame(&frame)[0],
+            DeckTextAction::SuppressKey(0, SuppressReason::ComposingOption)
+        );
+        // A chosen mode applies to a Mac host too.
+        mac.configure(TypingMode::Auto, OptionKeyMode::LeftAltRightCharacters);
+        assert_eq!(mac.option_mode(), OptionKeyMode::LeftAltRightCharacters);
+        // A host that has not said what it is gets the general default.
+        let unknown = TextInputPolicy::new(TypingMode::Auto, OptionKeyPreference::Automatic);
+        assert_eq!(unknown.option_mode(), OptionKeyMode::LeftAltRightCharacters);
+    }
+
+    #[test]
+    fn option_settings_written_by_older_builds_stay_automatic_unless_chosen() {
+        use OptionKeyPreference::{Automatic, Chosen};
+        // Older builds saved their default with every save.
+        assert_eq!(
+            OptionKeyPreference::from_settings(None, Some("left_alt_right_characters")),
+            Automatic
+        );
+        assert_eq!(OptionKeyPreference::from_settings(None, None), Automatic);
+        assert_eq!(
+            OptionKeyPreference::from_settings(None, Some("both_characters")),
+            Chosen(OptionKeyMode::BothCharacters)
+        );
+        // As this build saves them: the preference, explicit default
+        // included, and its resolution for older builds.
+        assert_eq!(
+            OptionKeyPreference::from_settings(
+                Some("automatic"),
+                Some("left_alt_right_characters")
+            ),
+            Automatic
+        );
+        assert_eq!(
+            OptionKeyPreference::from_settings(
+                Some("left_alt_right_characters"),
+                Some("left_alt_right_characters")
+            ),
+            Chosen(OptionKeyMode::LeftAltRightCharacters)
+        );
+        assert_eq!(
+            OptionKeyPreference::from_settings(Some("both_alt"), None),
+            Chosen(OptionKeyMode::BothAlt)
+        );
+        // A choice made in an older build after a downgrade (it rewrites only
+        // the legacy key and keeps this one) survives the upgrade, either way.
+        assert_eq!(
+            OptionKeyPreference::from_settings(Some("automatic"), Some("both_characters")),
+            Chosen(OptionKeyMode::BothCharacters)
+        );
+        assert_eq!(
+            OptionKeyPreference::from_settings(Some("both_alt"), Some("left_alt_right_characters")),
+            Chosen(OptionKeyMode::LeftAltRightCharacters)
+        );
+        for preference in [
+            Automatic,
+            Chosen(OptionKeyMode::BothAlt),
+            Chosen(OptionKeyMode::LeftAltRightCharacters),
+            Chosen(OptionKeyMode::BothCharacters),
+        ] {
+            assert_eq!(
+                OptionKeyPreference::from_token(preference.token()),
+                Some(preference)
+            );
+        }
+    }
+
+    #[test]
     fn a_composing_option_key_is_not_alt_on_the_host() {
         const ALT: u32 = 0x0100_0023;
         const LEFT_ARROW: u32 = 0x0100_0012;
@@ -843,5 +1116,24 @@ mod tests {
                 .all(|commit| commit.len() <= MAX_TEXT_COMMIT_BYTES)
         );
         assert_eq!(commits.concat(), text);
+    }
+
+    #[test]
+    fn the_keyboard_mode_overrides_the_typing_setting_only_where_it_must() {
+        use TypingMode::{Auto, Characters, Keys};
+        assert_eq!(KeyboardMode::Characters.typing_mode(Keys), Characters);
+        assert_eq!(KeyboardMode::Characters.typing_mode(Auto), Characters);
+        assert_eq!(KeyboardMode::Physical.typing_mode(Keys), Keys);
+        assert_eq!(KeyboardMode::Physical.typing_mode(Auto), Auto);
+        assert_eq!(KeyboardMode::Physical.typing_mode(Characters), Auto);
+        assert_eq!(
+            KeyboardMode::of_typing(Characters),
+            KeyboardMode::Characters
+        );
+        assert_eq!(KeyboardMode::of_typing(Keys), KeyboardMode::Physical);
+        for mode in KeyboardMode::ALL {
+            assert_eq!(KeyboardMode::from_token(mode.token()), Some(mode));
+        }
+        assert_eq!(KeyboardMode::from_token("unicode"), None);
     }
 }

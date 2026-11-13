@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Deck-side client for the privileged USB helper.
 //!
 //! Deck no longer captures the physical device itself. It connects to the
@@ -11,14 +13,58 @@ use arcen_usb_bridge::{AttachmentGeneration, UrbId, UsbSpeed, MAX_TRANSFER_BYTES
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-/// Default rendezvous path, matching `arcen-usb-helper`'s default.
-pub const DEFAULT_SOCKET: &str = "/var/run/arcen-usb-helper.sock";
+/// Default rendezvous path, matching `arcen-usb-helper`'s default and the
+/// launchd plist. Every directory on it is root's and writable by nobody
+/// else (not `/var/run`, which group `daemon` can write on macOS).
+pub const DEFAULT_SOCKET: &str = "/private/var/db/arcen/run/usb-helper.sock";
+
+/// The effective uid of the process at the other end of a Unix socket.
+///
+/// `getpeereid` reads the credentials the kernel recorded at connect time,
+/// never a pid that could be reused.
+fn peer_uid(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both out-params are initialized locals, and the descriptor is
+    // borrowed, so it stays open for the duration of the call.
+    let result = unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
+/// Only root may answer as the privileged helper: anything else listening on
+/// the helper's path would receive the host's URB traffic and could feed the
+/// Deck a forged device.
+fn check_helper_peer(uid: std::io::Result<u32>, path: &str) -> Result<(), String> {
+    match uid {
+        Ok(0) => Ok(()),
+        Ok(uid) => Err(format!(
+            "refusing the USB helper at {path}: it runs as uid {uid}, not root; \
+             another process may be impersonating the helper"
+        )),
+        Err(error) => Err(format!(
+            "refusing the USB helper at {path}: its credentials cannot be read: {error}"
+        )),
+    }
+}
 
 const TAG_HELLO: u8 = 0x01;
 const TAG_SUBMIT: u8 = 0x02;
 const TAG_CANCEL: u8 = 0x03;
 const TAG_COMPLETE: u8 = 0x04;
 const TAG_ERROR: u8 = 0x05;
+/// Helper facts sent right after the hello (`backend=<name>`); helpers older
+/// than 0.19 do not send it.
+const TAG_INFO: u8 = 0x06;
+/// How long [`HelperClient::connect`] waits for the info frame after the
+/// hello. A current helper writes it immediately; an older one never does,
+/// and then this is the only cost.
+const INFO_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+/// What the log says when the helper did not name its backend.
+pub const BACKEND_UNREPORTED: &str = "unreported (older helper: libusb)";
 
 const MAX_FRAME_BYTES: usize = MAX_TRANSFER_BYTES + 1024;
 
@@ -32,6 +78,8 @@ pub struct HelperClient {
     /// [`Self::next_completion`] is polled inside a `tokio::select!`. A future
     /// dropped mid-frame must not take received bytes with it.
     rx: Vec<u8>,
+    /// The capture backend the helper named in its info frame.
+    backend: Option<String>,
 }
 
 impl HelperClient {
@@ -48,6 +96,13 @@ impl HelperClient {
                  start it with `sudo arcen-usb-helper`"
             )
         })?;
+        {
+            use std::os::fd::AsFd;
+            if let Err(refusal) = check_helper_peer(peer_uid(stream.as_fd()), path) {
+                tracing::error!(target: crate::logging::target::USB, "{refusal}");
+                return Err(refusal);
+            }
+        }
         let mut rx = Vec::new();
         let (tag, payload) = read_frame(&mut stream, &mut rx).await?;
         match tag {
@@ -62,12 +117,25 @@ impl HelperClient {
         }
         let device = decode_hello(&payload)
             .ok_or_else(|| "privileged USB helper sent a short handshake".to_owned())?;
-        Ok(Self { stream, device, rx })
+        let backend = read_info(&mut stream, &mut rx).await;
+        Ok(Self {
+            stream,
+            device,
+            rx,
+            backend,
+        })
     }
 
     #[must_use]
     pub fn device(&self) -> UsbHardDeviceMsg {
         self.device.clone()
+    }
+
+    /// The capture backend the helper reported (`libusb` or `iousbhost`),
+    /// or [`BACKEND_UNREPORTED`].
+    #[must_use]
+    pub fn backend(&self) -> &str {
+        self.backend.as_deref().unwrap_or(BACKEND_UNREPORTED)
     }
 
     /// Forwards one URB to the helper.
@@ -130,6 +198,16 @@ impl HelperClient {
                             "privileged USB helper error: {}",
                             String::from_utf8_lossy(&payload)
                         ))
+                    }
+                    // Arrived after the connect wait: note it once.
+                    TAG_INFO if self.backend.is_none() => {
+                        self.backend = info_backend(&payload);
+                        tracing::info!(
+                            target: crate::logging::target::USB,
+                            backend = self.backend(),
+                            "privileged USB helper capture backend"
+                        );
+                        continue;
                     }
                     _ => continue,
                 }
@@ -223,6 +301,54 @@ async fn read_frame(
     }
 }
 
+/// Whether `buffer` starts with a whole frame, and its tag if so.
+fn whole_frame_tag(buffer: &[u8]) -> Option<u8> {
+    let header = buffer.get(..4)?;
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    (len > 0 && buffer.len() >= 4 + len).then(|| buffer[4])
+}
+
+/// Takes the info frame that follows the hello, waiting at most
+/// [`INFO_WAIT`]. Any other frame stays buffered for
+/// [`HelperClient::next_completion`]; a read failure here is left for it to
+/// report.
+async fn read_info(stream: &mut UnixStream, buffer: &mut Vec<u8>) -> Option<String> {
+    let wait = async {
+        loop {
+            match whole_frame_tag(buffer) {
+                Some(TAG_INFO) => {
+                    return take_frame(buffer)
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, payload)| info_backend(&payload));
+                }
+                Some(_) => return None,
+                None => {}
+            }
+            if fill(stream, buffer).await.is_err() {
+                return None;
+            }
+        }
+    };
+    tokio::time::timeout(INFO_WAIT, wait).await.ok().flatten()
+}
+
+/// The `backend=<name>` line of an info payload, if it names one plainly.
+fn info_backend(payload: &[u8]) -> Option<String> {
+    std::str::from_utf8(payload)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("backend="))
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .map(str::to_owned)
+}
+
 /// Decodes the helper's handshake: an eight-byte identity followed by the HID
 /// report descriptors that made the device admissible (count `u8`, then per
 /// descriptor interface `u8`, length `u16` LE, bytes). An older helper sends
@@ -270,6 +396,68 @@ fn decode_hello(payload: &[u8]) -> Option<UsbHardDeviceMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_socket_matches_the_helpers_launchd_plist() {
+        let plist = include_str!("../../../packaging/macos/tech.arcen.deck.usbhelper.plist");
+        assert!(
+            plist.contains(&format!("<string>{DEFAULT_SOCKET}</string>")),
+            "the plist must start the helper on {DEFAULT_SOCKET}"
+        );
+        assert!(!DEFAULT_SOCKET.starts_with("/var/"));
+        assert!(!DEFAULT_SOCKET.starts_with("/private/var/run"));
+    }
+
+    #[test]
+    fn only_a_root_peer_is_accepted_as_the_helper() {
+        assert_eq!(check_helper_peer(Ok(0), DEFAULT_SOCKET), Ok(()));
+        let refusal = check_helper_peer(Ok(501), DEFAULT_SOCKET).unwrap_err();
+        assert!(refusal.contains("uid 501, not root"), "{refusal}");
+        let unreadable = check_helper_peer(
+            Err(std::io::Error::from_raw_os_error(libc::ENOTCONN)),
+            DEFAULT_SOCKET,
+        )
+        .unwrap_err();
+        assert!(unreadable.contains("cannot be read"), "{unreadable}");
+    }
+
+    /// This test process's own uid, as a socket peer sees it.
+    fn own_uid() -> u32 {
+        use std::os::fd::AsFd;
+        let (deck, _impostor) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        peer_uid(deck.as_fd()).expect("peer credentials")
+    }
+
+    #[test]
+    fn a_helper_peer_that_is_not_root_is_refused() {
+        let uid = own_uid();
+        if uid != 0 {
+            assert!(check_helper_peer(Ok(uid), DEFAULT_SOCKET).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_listener_that_is_not_root_before_reading_anything() {
+        // A short path: `sun_path` holds 104 bytes.
+        let home = std::fs::canonicalize(std::env::var_os("HOME").expect("HOME")).expect("home");
+        let directory = home.join(format!(".arcen-hc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).expect("scratch directory");
+        let path = directory.join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // An impostor that would answer with a valid hello.
+        let impostor = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = std::io::Write::write_all(&mut stream, &[TAG_HELLO, 0, 0, 0, 0]);
+        });
+        let outcome = HelperClient::connect(path.to_str().expect("utf-8")).await;
+        let _ = impostor.join();
+        let _ = std::fs::remove_dir_all(&directory);
+        if own_uid() != 0 {
+            let refusal = outcome.err().expect("a non-root helper is refused");
+            assert!(refusal.contains("not root"), "{refusal}");
+        }
+    }
 
     #[test]
     fn an_older_helpers_identity_only_hello_still_decodes() {
@@ -337,6 +525,77 @@ mod tests {
     fn unknown_speed_code_is_refused_rather_than_guessed() {
         let payload = [0x6a, 0x05, 0x17, 0x03, 0x00, 0x01, 0x00, 0xff];
         assert!(decode_hello(&payload).is_none());
+    }
+
+    #[test]
+    fn the_info_frame_names_a_plain_backend_only() {
+        assert_eq!(
+            info_backend(b"backend=iousbhost").as_deref(),
+            Some("iousbhost")
+        );
+        assert_eq!(
+            info_backend(b"x=1\nbackend=libusb").as_deref(),
+            Some("libusb")
+        );
+        assert_eq!(info_backend(b"backend="), None);
+        assert_eq!(info_backend(b"backend=a b"), None);
+        assert_eq!(info_backend(&[0xff, 0xfe]), None);
+    }
+
+    #[tokio::test]
+    async fn the_backend_is_read_after_the_hello_and_other_frames_stay_queued() {
+        let (mut helper, mut deck) = UnixStream::pair().expect("pair");
+        let mut sent = wire(TAG_INFO, b"backend=iousbhost");
+        sent.extend_from_slice(&wire(TAG_COMPLETE, b"urb"));
+        helper.write_all(&sent).await.expect("write");
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_info(&mut deck, &mut buffer).await.as_deref(),
+            Some("iousbhost")
+        );
+        assert_eq!(
+            take_frame(&mut buffer).expect("valid"),
+            Some((TAG_COMPLETE, b"urb".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_helper_without_info_costs_only_the_wait() {
+        let (_helper, mut deck) = UnixStream::pair().expect("pair");
+        let mut buffer = Vec::new();
+        let started = std::time::Instant::now();
+        assert_eq!(read_info(&mut deck, &mut buffer).await, None);
+        assert!(started.elapsed() < INFO_WAIT * 3);
+
+        let (mut helper, mut deck) = UnixStream::pair().expect("pair");
+        helper
+            .write_all(&wire(TAG_COMPLETE, b"urb"))
+            .await
+            .expect("write");
+        let mut buffer = Vec::new();
+        assert_eq!(read_info(&mut deck, &mut buffer).await, None);
+        assert_eq!(
+            take_frame(&mut buffer).expect("valid"),
+            Some((TAG_COMPLETE, b"urb".to_vec())),
+            "a frame that is not the info frame must stay for next_completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_info_frame_is_noted_and_skipped_by_the_completion_reader() {
+        let (mut helper, deck) = UnixStream::pair().expect("pair");
+        let mut client = HelperClient {
+            stream: deck,
+            device: decode_hello(&[0x6a, 0x05, 0x17, 0x03, 0x00, 0x01, 0x00, 0x01]).expect("hello"),
+            rx: Vec::new(),
+            backend: None,
+        };
+        assert_eq!(client.backend(), BACKEND_UNREPORTED);
+        let mut sent = wire(TAG_INFO, b"backend=iousbhost");
+        sent.extend_from_slice(&wire(TAG_COMPLETE, b"urb"));
+        helper.write_all(&sent).await.expect("write");
+        assert_eq!(client.next_completion().await.expect("completion"), b"urb");
+        assert_eq!(client.backend(), "iousbhost");
     }
 
     /// Builds one wire frame the way `arcen-usb-helper` writes it.

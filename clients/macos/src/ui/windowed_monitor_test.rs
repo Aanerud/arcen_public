@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Developer-only windowed multi-monitor live-session test mode.
 //!
 //! `ARCEN_DECK_WINDOWED_MONITORS=2|3|4` asks a real Pier for that many

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Secret-safe Credential Provider diagnostics.
 //!
 //! A credential provider has no stdout, no log file it may reliably write, and

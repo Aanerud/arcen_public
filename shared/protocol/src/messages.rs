@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -29,9 +32,6 @@ pub const SERVER_HELLO: &str = "server_hello";
 pub const AUTH_REQUEST: &str = "auth_request";
 pub const AUTH_RESPONSE: &str = "auth_response";
 pub const AUTH_RESULT: &str = "auth_result";
-pub const BROKER_HELLO: &str = "broker_hello";
-pub const BROKER_ASSIGN: &str = "broker_assign";
-pub const BROKER_MACHINE_REQUEST: &str = "broker_machine_request";
 pub const REQUEST_FULL_FRAME: &str = "request_full_frame";
 pub const HEALTH_PING: &str = "health_ping";
 pub const HEALTH_PONG: &str = "health_pong";
@@ -794,6 +794,17 @@ pub struct ClientVideoCapabilitiesMsg {
     /// additive capability bit.
     #[serde(default)]
     pub bt2020_ncl_matrix: bool,
+    /// Client presents an IEC 61966-2-1 sRGB-coded SDR stream (H.273
+    /// transfer characteristics 13, token `srgb`) as sRGB, and accepts it as
+    /// the exact answer to a `bt709` SDR request.
+    ///
+    /// A host whose capture delivers linear light (Windows FP16 scRGB) then
+    /// re-encodes with the sRGB curve the compositor linearised with, so the
+    /// stream carries the desktop's own code values, and says so. Absent or
+    /// false keeps the legacy BT.709 re-encoding for peers predating this
+    /// additive capability bit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub srgb_transfer: bool,
 }
 
 impl ClientVideoCapabilitiesMsg {
@@ -810,6 +821,7 @@ impl ClientVideoCapabilitiesMsg {
             identity_matrix: hello.supports_identity_matrix,
             bt601_matrix: hello.supports_bt601_matrix,
             bt2020_ncl_matrix: hello.supports_bt2020_ncl_matrix,
+            srgb_transfer: hello.supports_srgb_transfer,
         }
     }
 }
@@ -1149,6 +1161,12 @@ pub struct AuthResponse {
     /// stream's `cursor-mode`). Absent and `false` for every older client.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_image_v1: bool,
+    /// The client draws its cursor where the host reports its pointer
+    /// (`FrameType::CursorPosition`, [`crate::cursor_position`]) when the
+    /// host pointer moves for a reason the client did not cause. Absent and
+    /// `false` for every older client, which never receives the record.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_position_v1: bool,
     /// Explicit client instruction to replace a persistent desktop whose
     /// committed multi-monitor topology cannot serve this request.
     ///
@@ -1194,11 +1212,32 @@ impl std::fmt::Debug for AuthResponse {
             )
             .field("cursor_preference", &self.cursor_preference)
             .field("cursor_image_v1", &self.cursor_image_v1)
+            .field("cursor_position_v1", &self.cursor_position_v1)
             .finish()
     }
 }
 
+/// The sign-in password and the resume holder nonce and grant are wiped
+/// whenever an `AuthResponse` is dropped, so a host refusing a sign-in at any
+/// step cannot leave them behind in freed memory.
+impl Drop for AuthResponse {
+    fn drop(&mut self) {
+        self.wipe_secrets();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for AuthResponse {}
+
 impl AuthResponse {
+    /// Wipes the password, resume holder nonce and resume grant now and
+    /// leaves them empty. Dropping the response does the same.
+    pub fn wipe_secrets(&mut self) {
+        use zeroize::Zeroize;
+        self.credential.zeroize();
+        self.resume_holder_nonce.zeroize();
+        self.resume_grant.zeroize();
+    }
+
     pub fn password(username: impl Into<String>, credential: impl Into<String>) -> Self {
         Self {
             msg_type: AUTH_RESPONSE.to_string(),
@@ -1219,6 +1258,7 @@ impl AuthResponse {
             resume_grant: None,
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
+            cursor_position_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1243,6 +1283,7 @@ impl AuthResponse {
             resume_grant: None,
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
+            cursor_position_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1267,6 +1308,7 @@ impl AuthResponse {
             resume_grant: None,
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
+            cursor_position_v1: false,
             replace_incompatible_desktop: false,
         }
     }
@@ -1292,18 +1334,18 @@ impl AuthResponse {
             resume_grant: None,
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
+            cursor_position_v1: false,
             replace_incompatible_desktop: false,
         }
     }
 
     /// Creates a credential-free direct-transport resume response.
     pub fn resume(holder_nonce: impl Into<String>, resume_grant: impl Into<String>) -> Self {
-        Self {
-            method: AUTH_METHOD_RESUME.to_owned(),
-            resume_holder_nonce: Some(holder_nonce.into()),
-            resume_grant: Some(resume_grant.into()),
-            ..Self::none()
-        }
+        let mut response = Self::none();
+        response.method = AUTH_METHOD_RESUME.to_owned();
+        response.resume_holder_nonce = Some(holder_nonce.into());
+        response.resume_grant = Some(resume_grant.into());
+        response
     }
 
     /// Attach the enumerated client display layout. Sets `screen_width/height`
@@ -1379,6 +1421,14 @@ impl AuthResponse {
     #[must_use]
     pub const fn with_cursor_image_v1(mut self, supported: bool) -> Self {
         self.cursor_image_v1 = supported;
+        self
+    }
+
+    /// Declares that this client draws its cursor at host-reported pointer
+    /// positions.
+    #[must_use]
+    pub const fn with_cursor_position_v1(mut self, supported: bool) -> Self {
+        self.cursor_position_v1 = supported;
         self
     }
 }
@@ -1568,6 +1618,40 @@ pub struct InputCapabilitiesMsg {
     /// lacks (emoji, another script). Meaningful only with `text_commit`.
     #[serde(default)]
     pub text_commit_unicode: InputCapabilityAvailability,
+    /// The extended key identifiers [`crate::keys::KEY_ALTGR`] and
+    /// [`crate::keys::KEY_INTL_BACKSLASH`]. From a host: it injects them as
+    /// its own `AltGr` and ISO keys. From a client: it may send them. A
+    /// client sends them only to a host that says `Available`; `Unknown` (a
+    /// host that predates the field) gets the keys as before (right Option
+    /// as Alt, the ISO key as the client always mapped it).
+    #[serde(default)]
+    pub extended_keys: InputCapabilityAvailability,
+    /// From a host: a Meta (Windows) key released after pointer input with no
+    /// other key since its press does not trigger the OS's lone-Meta action
+    /// (Start): the host masks it itself, without a visible key. A client then
+    /// sends no mask of its own; with `Unknown` (a host that predates the
+    /// field) it taps Control before such a release. Clients leave it
+    /// `Unknown`.
+    #[serde(default)]
+    pub meta_pointer_mask: InputCapabilityAvailability,
+}
+
+/// Whether a host masks a pointer-only Meta release itself.
+#[must_use]
+pub const fn supports_meta_pointer_mask_v1(capabilities: InputCapabilitiesMsg) -> bool {
+    matches!(
+        capabilities.meta_pointer_mask,
+        InputCapabilityAvailability::Available
+    )
+}
+
+/// Whether a host's capabilities accept the extended key identifiers.
+#[must_use]
+pub const fn supports_extended_keys_v1(capabilities: InputCapabilitiesMsg) -> bool {
+    matches!(
+        capabilities.extended_keys,
+        InputCapabilityAvailability::Available
+    )
 }
 
 /// Whether a peer's capabilities authorize committed text (`text_commit`).
@@ -1911,6 +1995,10 @@ pub struct ClientHelloMsg {
     /// Client can consume a BT.2020 non-constant-luminance matrix stream.
     #[serde(default)]
     pub supports_bt2020_ncl_matrix: bool,
+    /// Client presents an sRGB-coded SDR stream (`srgb`, H.273 transfer 13)
+    /// as sRGB; see [`ClientVideoCapabilitiesMsg::srgb_transfer`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_srgb_transfer: bool,
     pub supports_audio: bool,
     /// Exact audio-output support. Absent means legacy PCM behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1969,6 +2057,9 @@ pub struct ClientHelloMsg {
     /// wins when they differ.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_image_v1: bool,
+    /// Echo of [`AuthResponse::cursor_position_v1`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_position_v1: bool,
     /// Tablet mode requested by the client for this connection.
     #[serde(default, skip_serializing_if = "is_default_tablet_mode")]
     pub tablet_mode_requested: TabletModeMsg,
@@ -2015,6 +2106,7 @@ impl Default for ClientHelloMsg {
             supports_identity_matrix: false,
             supports_bt601_matrix: false,
             supports_bt2020_ncl_matrix: false,
+            supports_srgb_transfer: false,
             supports_audio: true,
             audio_output: None,
             microphone_output: None,
@@ -2036,6 +2128,7 @@ impl Default for ClientHelloMsg {
             input_capabilities: InputCapabilitiesMsg::default(),
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
+            cursor_position_v1: false,
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             tablet_mode_capabilities: TabletModeCapabilitiesMsg::default(),
             device_capabilities: BTreeMap::new(),
@@ -2069,7 +2162,7 @@ impl ClientHelloMsg {
 
     /// Returns the client's effective tablet-mode capability truth.
     ///
-    /// PR #108 clients predate the explicit mode fields but already advertise
+    /// Older clients predate the explicit mode fields but already advertise
     /// input-v3 pen support. Preserve that local-termination compatibility only
     /// when the new field is absent (`Unknown`); an explicit `Unavailable`
     /// remains authoritative.
@@ -2126,6 +2219,14 @@ impl ClientHelloMsg {
     #[must_use]
     pub const fn with_cursor_image_v1(mut self, supported: bool) -> Self {
         self.cursor_image_v1 = supported;
+        self
+    }
+
+    /// Declares that this client draws its cursor at host-reported pointer
+    /// positions.
+    #[must_use]
+    pub const fn with_cursor_position_v1(mut self, supported: bool) -> Self {
+        self.cursor_position_v1 = supported;
         self
     }
 
@@ -2287,6 +2388,12 @@ pub struct ServerHelloMsg {
     /// Session transport type such as `x11`. Empty when unavailable.
     #[serde(default)]
     pub session_type: String,
+    /// The host's operating system: `windows`, `linux` or `macos` (see
+    /// [`HostPlatform`]). Absent from hosts that predate it; read it through
+    /// [`ServerHelloMsg::host_platform`], which falls back to
+    /// `session_type` and the build identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     /// Authenticated graphical desktop such as `gnome-classic`. Empty when unavailable.
     #[serde(default)]
     pub desktop: String,
@@ -2402,15 +2509,91 @@ pub struct ServerHelloMsg {
     pub negotiated_transport: Option<String>,
 }
 
+/// A host's operating system, as its hello tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostPlatform {
+    /// A macOS desktop (an Aqua session).
+    MacOs,
+    /// A Windows desktop.
+    Windows,
+    /// A Linux desktop (X11 or Wayland).
+    Linux,
+    /// A host that does not say, or names something this build does not
+    /// know.
+    Unknown,
+}
+
+impl HostPlatform {
+    /// The `server_hello.platform` token; `None` for [`Self::Unknown`].
+    #[must_use]
+    pub const fn token(self) -> Option<&'static str> {
+        match self {
+            Self::MacOs => Some("macos"),
+            Self::Windows => Some("windows"),
+            Self::Linux => Some("linux"),
+            Self::Unknown => None,
+        }
+    }
+
+    /// The platform a `server_hello.platform` token names.
+    #[must_use]
+    pub fn from_token(token: &str) -> Self {
+        match token.to_ascii_lowercase().as_str() {
+            "macos" => Self::MacOs,
+            "windows" => Self::Windows,
+            "linux" => Self::Linux,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The platform a Pier's build-identity `product` names.
+    #[must_use]
+    pub fn from_product(product: &str) -> Self {
+        match product {
+            "arcen-pier-macos" => Self::MacOs,
+            "arcen-pier-windows" => Self::Windows,
+            "arcen-pier-linux" => Self::Linux,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 impl ServerHelloMsg {
-    /// Whether this host is a macOS desktop (an Aqua session).
+    /// The host's operating system.
+    ///
+    /// From the explicit `platform` field when a host sends one; otherwise
+    /// from `session_type` (`aqua` is macOS; `x11` and `wayland` are Linux);
+    /// otherwise from the build identity's `product`, which a Pier sends even
+    /// where its `session_type` is empty (Windows).
+    #[must_use]
+    pub fn host_platform(&self) -> HostPlatform {
+        if let Some(platform) = self.platform.as_deref().map(HostPlatform::from_token) {
+            if platform != HostPlatform::Unknown {
+                return platform;
+            }
+        }
+        let session_type = self.session_type.to_ascii_lowercase();
+        match session_type.as_str() {
+            "aqua" => return HostPlatform::MacOs,
+            "x11" | "wayland" => return HostPlatform::Linux,
+            _ => {}
+        }
+        self.build_identity()
+            .ok()
+            .flatten()
+            .map_or(HostPlatform::Unknown, |identity| {
+                HostPlatform::from_product(&identity.product)
+            })
+    }
+
+    /// Whether this host is a macOS desktop.
     ///
     /// A macOS host has a Command key of its own, so a client must send its
     /// Command key as Command rather than swapping it for Control as it does
     /// for Linux and Windows hosts, where Control is the shortcut key.
     #[must_use]
     pub fn host_is_macos(&self) -> bool {
-        self.session_type.eq_ignore_ascii_case("aqua")
+        self.host_platform() == HostPlatform::MacOs
     }
 
     /// Attaches additive multi-monitor-v1 capability metadata while preserving
@@ -2600,6 +2783,12 @@ pub struct CursorModeResultMsg {
     /// host reports cursor shapes by name only.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_images: bool,
+    /// The host reports its pointer position (`FrameType::CursorPosition`)
+    /// whenever it moves for a reason this client did not cause. Absent and
+    /// `false` from older hosts and whenever the host cannot read its
+    /// pointer for this attachment.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_positions: bool,
 }
 
 fn default_cursor_mode_result_type() -> String {
@@ -2615,6 +2804,7 @@ impl Default for CursorModeResultMsg {
             accepted: false,
             reason: CursorModeReason::default(),
             cursor_images: false,
+            cursor_positions: false,
         }
     }
 }
@@ -3326,6 +3516,102 @@ pub struct HealthStatsMsg {
     /// cadence, not zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_window_secs: Option<SampleWindowSecs>,
+    /// The host's own measurement of the QUIC path it sends media over.
+    /// Absent on hosts that predate it or carriers without QUIC statistics;
+    /// never a stand-in for a perfect path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathQualityMsg>,
+}
+
+/// Longest congestion-controller token a [`PathQualityMsg`] may carry.
+pub const MAX_CONGESTION_CONTROL_TOKEN_BYTES: usize = 16;
+
+/// Sender-side QUIC path facts for one health window, measured by the host
+/// on the connection that carries the Deck's video.
+///
+/// The host is the media sender, so only it sees retransmissions, its
+/// congestion window and the controller pacing the pictures; the Deck shows
+/// these numbers instead of guessing a "direct/relay" label. Counts are
+/// deltas over `window_ms`; RTTs are QUIC's smoothed and windowed-minimum
+/// values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathQualityMsg {
+    /// Congestion controller token (`bbr`, `cubic`, `newreno`); a receiver
+    /// shows an unknown or oversized token as unknown.
+    #[serde(default)]
+    pub congestion_control: String,
+    /// Smoothed round-trip time in microseconds.
+    #[serde(default)]
+    pub rtt_us: u64,
+    /// Lowest round-trip time over the recent baseline window, in
+    /// microseconds; `rtt_us - min_rtt_us` is queueing delay.
+    #[serde(default)]
+    pub min_rtt_us: u64,
+    /// Congestion window in bytes.
+    #[serde(default)]
+    pub cwnd_bytes: u64,
+    /// Packets the host sent during the window.
+    #[serde(default)]
+    pub sent_packets: u64,
+    /// Packets QUIC declared lost (and so retransmitted) during the window.
+    #[serde(default)]
+    pub lost_packets: u64,
+    /// Congestion events during the window.
+    #[serde(default)]
+    pub congestion_events: u64,
+    /// UDP bytes the host put on the wire during the window, every lane and
+    /// retransmission included.
+    #[serde(default)]
+    pub wire_bytes: u64,
+    /// Length of the window the deltas cover, in milliseconds.
+    #[serde(default)]
+    pub window_ms: u64,
+    /// Largest UDP payload the host currently sends on this path (QUIC's
+    /// path MTU), in bytes; 0 when not reported.
+    #[serde(default)]
+    pub mtu_bytes: u64,
+    /// Loss bursts QUIC's path MTU black-hole detector flagged during the
+    /// window: bursts in which no lost packet was smaller than the 1200-byte
+    /// floor. With discovery on, each one returns the connection to the
+    /// floor. Heavy congestion loss trips it too, so it is evidence to read
+    /// beside `lost_packets`, not proof of an MTU problem.
+    #[serde(default)]
+    pub black_holes: u64,
+}
+
+impl PathQualityMsg {
+    /// The congestion-controller token, or `None` when it is empty, too long
+    /// or not printable ASCII.
+    #[must_use]
+    pub fn congestion_control_token(&self) -> Option<&str> {
+        let token = self.congestion_control.as_str();
+        (!token.is_empty()
+            && token.len() <= MAX_CONGESTION_CONTROL_TOKEN_BYTES
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+        .then_some(token)
+    }
+
+    /// Lost share of the packets sent in the window, in permille.
+    #[must_use]
+    pub fn loss_permille(&self) -> Option<u64> {
+        (self.sent_packets > 0).then(|| {
+            self.lost_packets
+                .min(self.sent_packets)
+                .saturating_mul(1000)
+                .div_ceil(self.sent_packets)
+        })
+    }
+
+    /// Wire throughput over the window in bits per second.
+    #[must_use]
+    pub fn wire_bps(&self) -> Option<u64> {
+        (self.window_ms > 0).then(|| {
+            u64::try_from(u128::from(self.wire_bytes) * 8 * 1000 / u128::from(self.window_ms))
+                .unwrap_or(u64::MAX)
+        })
+    }
 }
 
 fn default_chroma() -> String {
@@ -3363,6 +3649,7 @@ impl Default for HealthStatsMsg {
             clients_connected: 0,
             health_state: None,
             sample_window_secs: None,
+            path: None,
         }
     }
 }
@@ -4352,22 +4639,6 @@ impl Default for HostKeymapMsg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BrokerMachineRequest {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub machine_name: String,
-}
-
-impl Default for BrokerMachineRequest {
-    fn default() -> Self {
-        Self {
-            msg_type: BROKER_MACHINE_REQUEST.to_string(),
-            machine_name: String::new(),
-        }
-    }
-}
-
 pub fn msg_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
 }
@@ -4551,6 +4822,39 @@ mod tests {
         assert!(!legacy_hello.supports_bt2020_ncl_matrix);
     }
 
+    /// An old host must see the wire it always saw from a Deck that does not
+    /// claim sRGB presentation, and an old Deck must decode as "no claim".
+    #[test]
+    fn srgb_transfer_capability_is_additive_and_absent_when_false() {
+        let legacy: ClientVideoCapabilitiesMsg =
+            serde_json::from_value(serde_json::json!({"h265": true})).expect("legacy shape");
+        assert!(!legacy.srgb_transfer);
+        let legacy_json = serde_json::to_value(legacy).unwrap();
+        assert!(legacy_json.get("srgb_transfer").is_none());
+        assert!(serde_json::to_value(ClientHelloMsg::default())
+            .unwrap()
+            .get("supports_srgb_transfer")
+            .is_none());
+
+        let hello = ClientHelloMsg {
+            supports_srgb_transfer: true,
+            ..ClientHelloMsg::default()
+        };
+        let wire = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            wire.get("supports_srgb_transfer"),
+            Some(&serde_json::json!(true))
+        );
+        let capabilities = ClientVideoCapabilitiesMsg::from_client_hello(&hello);
+        assert!(capabilities.srgb_transfer);
+        assert_eq!(
+            serde_json::to_value(capabilities)
+                .unwrap()
+                .get("srgb_transfer"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
     /// The field that asks for HDR. Depth alone must not imply it: 10-bit
     /// BT.709 SDR is an ordinary request for banding headroom, and a host that
     /// treated it as HDR would apply an EDID and tone map for no reason.
@@ -4660,6 +4964,7 @@ mod tests {
         assert_eq!(
             round_trip
                 .initial_video
+                .as_ref()
                 .expect("initial video request")
                 .quality
                 .video_selection,
@@ -4688,6 +4993,7 @@ mod tests {
                 identity_matrix: false,
                 bt601_matrix: false,
                 bt2020_ncl_matrix: false,
+                srgb_transfer: false,
             }
         );
     }
@@ -4983,6 +5289,34 @@ mod tests {
         )
         .unwrap();
         assert!(result.cursor_images);
+    }
+
+    #[test]
+    fn cursor_position_capability_is_additive_and_omitted_when_false() {
+        for json in [
+            serde_json::to_value(AuthResponse::none()).unwrap(),
+            serde_json::to_value(ClientHelloMsg::default()).unwrap(),
+        ] {
+            assert!(json.get("cursor_position_v1").is_none());
+        }
+        let result_json = serde_json::to_value(CursorModeResultMsg::default()).unwrap();
+        assert!(result_json.get("cursor_positions").is_none());
+
+        let auth: AuthResponse = serde_json::from_value(
+            serde_json::to_value(AuthResponse::none().with_cursor_position_v1(true)).unwrap(),
+        )
+        .unwrap();
+        let hello: ClientHelloMsg = serde_json::from_value(
+            serde_json::to_value(ClientHelloMsg::default().with_cursor_position_v1(true)).unwrap(),
+        )
+        .unwrap();
+        assert!(auth.cursor_position_v1 && hello.cursor_position_v1);
+        assert!(!auth.cursor_image_v1 && !hello.cursor_image_v1);
+        let result: CursorModeResultMsg = serde_json::from_str(
+            r#"{"type":"cursor_mode_result","requested":"local","active":"local","accepted":true,"reason":"","cursor_positions":true}"#,
+        )
+        .unwrap();
+        assert!(result.cursor_positions && !result.cursor_images);
     }
 
     #[test]
@@ -5316,11 +5650,83 @@ mod tests {
     }
 
     #[test]
+    fn host_platform_comes_from_platform_then_session_type_then_product() {
+        let hello = |json: &str| -> ServerHelloMsg { serde_json::from_str(json).unwrap() };
+        let with_product = |product: &str| {
+            hello(r#"{"type":"server_hello"}"#)
+                .with_build_identity(BuildIdentityMsg::development(product, "0.17.0"))
+        };
+        assert_eq!(
+            hello(r#"{"type":"server_hello","platform":"windows"}"#).host_platform(),
+            HostPlatform::Windows
+        );
+        assert_eq!(
+            hello(r#"{"type":"server_hello","session_type":"aqua"}"#).host_platform(),
+            HostPlatform::MacOs
+        );
+        assert_eq!(
+            hello(r#"{"type":"server_hello","session_type":"wayland"}"#).host_platform(),
+            HostPlatform::Linux
+        );
+        // A 0.17.0 Windows Pier: empty session_type, product only.
+        assert_eq!(
+            with_product("arcen-pier-windows").host_platform(),
+            HostPlatform::Windows
+        );
+        assert_eq!(
+            with_product("arcen-pier-linux").host_platform(),
+            HostPlatform::Linux
+        );
+        // An unknown token falls through to what else the hello says.
+        let mut future = with_product("arcen-pier-macos");
+        future.platform = Some("plan9".to_owned());
+        assert_eq!(future.host_platform(), HostPlatform::MacOs);
+        assert!(future.host_is_macos());
+        assert_eq!(
+            hello(r#"{"type":"server_hello"}"#).host_platform(),
+            HostPlatform::Unknown
+        );
+    }
+
+    #[test]
+    fn platform_and_extended_keys_are_absent_from_a_legacy_hello() {
+        let legacy = serde_json::to_value(
+            serde_json::from_str::<ServerHelloMsg>(r#"{"type":"server_hello"}"#).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.get("platform").is_none());
+        assert_eq!(legacy["input_capabilities"]["extended_keys"], "unknown");
+        let hello: ServerHelloMsg = serde_json::from_str(
+            r#"{"type":"server_hello","platform":"windows",
+                "input_capabilities":{"extended_keys":"available"}}"#,
+        )
+        .unwrap();
+        assert!(supports_extended_keys_v1(hello.input_capabilities));
+        assert!(!supports_meta_pointer_mask_v1(hello.input_capabilities));
+        assert_eq!(serde_json::to_value(&hello).unwrap()["platform"], "windows");
+    }
+
+    #[test]
     fn auth_response_uses_type_key() {
         let msg = AuthResponse::pam("artist", "secret");
         let json = serde_json::to_value(msg).unwrap();
         assert_eq!(json.get("type").unwrap(), AUTH_RESPONSE);
         assert_eq!(json.get("method").unwrap(), "pam");
+    }
+
+    #[test]
+    fn auth_response_wipes_its_secrets_and_does_so_on_drop() {
+        fn zeroized_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        zeroized_on_drop::<AuthResponse>();
+
+        let mut msg = AuthResponse::pam("artist", "dummy-password");
+        msg.resume_holder_nonce = Some("nonce".to_string());
+        msg.resume_grant = Some("grant".to_string());
+        msg.wipe_secrets();
+        assert!(msg.credential.is_empty());
+        assert_eq!(msg.resume_holder_nonce, None);
+        assert_eq!(msg.resume_grant, None);
+        assert_eq!(msg.username, "artist");
     }
 
     #[test]
@@ -5374,7 +5780,7 @@ mod tests {
         assert_eq!(hello.screen_width, 3600);
         assert_eq!(hello.screen_height, 2338);
 
-        let auth = AuthResponse::password("jc", "x").with_displays(monitors, "match_layout");
+        let auth = AuthResponse::password("artist", "x").with_displays(monitors, "match_layout");
         assert_eq!(hello.screen_width, auth.screen_width);
         assert_eq!(hello.screen_height, auth.screen_height);
     }
@@ -6329,6 +6735,56 @@ mod tests {
         let legacy: HealthStatsMsg = serde_json::from_str(r#"{"type":"health_stats"}"#).unwrap();
         assert_eq!(legacy.health_state, None);
         assert_eq!(legacy.sample_window_secs, None);
+        assert_eq!(legacy.path, None);
+    }
+
+    #[test]
+    fn health_stats_path_quality_is_additive_and_bounded() {
+        let stats = HealthStatsMsg {
+            path: Some(PathQualityMsg {
+                congestion_control: "bbr".to_string(),
+                rtt_us: 41_500,
+                min_rtt_us: 38_000,
+                cwnd_bytes: 120_000,
+                sent_packets: 4_000,
+                lost_packets: 3,
+                congestion_events: 1,
+                wire_bytes: 2_500_000,
+                window_ms: 2_000,
+                mtu_bytes: 1_252,
+                black_holes: 0,
+            }),
+            ..HealthStatsMsg::default()
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let round_tripped: HealthStatsMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, stats);
+        // An old Deck's decoder ignores the new field.
+        let downgraded: PreObservabilityHealthStatsMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(downgraded.msg_type, HEALTH_STATS);
+
+        let path = round_tripped.path.unwrap();
+        assert_eq!(path.congestion_control_token(), Some("bbr"));
+        // 3 of 4000 rounds up to 1 permille rather than hiding as zero.
+        assert_eq!(path.loss_permille(), Some(1));
+        assert_eq!(path.wire_bps(), Some(10_000_000));
+
+        let hostile = PathQualityMsg {
+            congestion_control: "bbr\u{1b}[2J".to_string(),
+            lost_packets: 9,
+            ..PathQualityMsg::default()
+        };
+        assert_eq!(hostile.congestion_control_token(), None);
+        assert_eq!(hostile.loss_permille(), None);
+        assert_eq!(hostile.wire_bps(), None);
+        let oversized = PathQualityMsg {
+            congestion_control: "x".repeat(MAX_CONGESTION_CONTROL_TOKEN_BYTES + 1),
+            sent_packets: 2,
+            lost_packets: 5,
+            ..PathQualityMsg::default()
+        };
+        assert_eq!(oversized.congestion_control_token(), None);
+        assert_eq!(oversized.loss_permille(), Some(1000));
     }
 
     #[test]

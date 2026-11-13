@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Privileged per-session launcher process.
 //!
 //! The machine broker never owns a PAM handle or a logind user session. It
@@ -1392,6 +1394,18 @@ impl SessionLauncher {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Whether this desktop runs on its own native seat.
+    pub fn has_native_seat(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.seat_pen.as_ref().is_some_and(|pen| pen.is_native())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     pub fn agent_is_running(&self) -> bool {
         agent_pid_matches(
             self.agent_pid,
@@ -2085,13 +2099,14 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             return Err(error.into());
         }
     };
-    if let Err(error) = write_response(&LauncherResponse::ready(
+    let ready = LauncherResponse::ready(
         &identity,
         &environment,
         &agent.ready,
         xorg.gpu_pci(),
         xorg.root_depth(),
-    )) {
+    );
+    if let Err(error) = write_response(&ready) {
         agent.shutdown().await;
         if let Some(deskside) = deskside.as_mut() {
             let _ = deskside.restore().await;
@@ -2194,6 +2209,34 @@ fn wayland_session_outputs(
     Ok(outputs)
 }
 
+/// Whether `/tmp/.X11-unix` may take this desktop's X11 sockets (a missing
+/// one, like a missing `/tmp/.ICE-unix`, is recreated). Otherwise the
+/// desktop starts without Xwayland: GNOME Shell aborts at start on a
+/// directory another user owns, so serving it with X11 would cost the whole
+/// desktop. An unsafe `/tmp/.ICE-unix` is only reported.
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+fn x11_socket_directory_ready() -> bool {
+    let results = super::socket_dirs::prepare_production();
+    for (_, result) in &results {
+        if let Err(fault) = result {
+            tracing::warn!(
+                target: target::SESSION,
+                fault = fault.token(),
+                %fault,
+                "shared socket directory is unsafe"
+            );
+        }
+    }
+    let ready = super::socket_dirs::x11_result(&results).is_ok();
+    if !ready {
+        tracing::warn!(
+            target: target::SESSION,
+            "this desktop starts without X11 applications"
+        );
+    }
+    ready
+}
+
 /// Runs one headless Wayland desktop inside the PAM session the caller
 /// opened, and proves its release before the caller closes PAM.
 #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
@@ -2229,6 +2272,7 @@ async fn run_wayland_desktop(
             "deskside protection guards the physical console; a seatless headless Wayland session never drives it, so it is not armed"
         );
     }
+    let x11_apps = x11_apps && x11_socket_directory_ready();
     let environment = SessionEnvironment::build_wayland(
         identity,
         desktop,
@@ -3395,8 +3439,12 @@ fn with_custom_edid(config: &str, head: &str, edid: &Path) -> Result<String, Lau
 /// device on the seat: the console's keyboard and mice and any other
 /// session's virtual devices. The appended classes ignore all of them and
 /// re-admit only devices named for this display
-/// ([`arcen_input::virtual_device::SessionInputIdentity`]). A template that
-/// already defines either class is refused rather than merged.
+/// ([`arcen_input::virtual_device::SessionInputIdentity`]), then re-admit
+/// this desktop's own bridged USB tablet (Native tablet, lab) by its Xorg
+/// tag (`arcen_usb_bridge::bridge_seat::xorg_session_bridge_class`), so the
+/// desktop hot-adds it on the first connection while every other X server
+/// ignores it (ADR 0021). A template that already defines any of these
+/// classes or names a bridge tag is refused rather than merged.
 #[cfg(any(target_os = "linux", test))]
 fn with_session_input_isolation(config: &str, x_display: &str) -> Result<String, LauncherError> {
     use arcen_input::virtual_device::{
@@ -3404,15 +3452,25 @@ fn with_session_input_isolation(config: &str, x_display: &str) -> Result<String,
     };
     let identity =
         SessionInputIdentity::for_x_display(x_display).map_err(|_| LauncherError::XorgConfig)?;
-    if config.contains(FOREIGN_INPUT_CLASS) || config.contains(SESSION_INPUT_CLASS) {
+    use arcen_usb_bridge::bridge_seat::{
+        xorg_session_bridge_class, XORG_BRIDGE_TAG, XORG_SESSION_BRIDGE_CLASS,
+    };
+    if config.contains(FOREIGN_INPUT_CLASS)
+        || config.contains(SESSION_INPUT_CLASS)
+        || config.contains(XORG_SESSION_BRIDGE_CLASS)
+        || config.contains(XORG_BRIDGE_TAG)
+    {
         return Err(LauncherError::XorgConfig);
     }
+    let display = parse_dedicated_display(x_display)?;
     let mut rendered = config.to_owned();
     if !rendered.is_empty() && !rendered.ends_with('\n') {
         rendered.push('\n');
     }
     rendered.push('\n');
     rendered.push_str(&identity.xorg_input_classes());
+    rendered.push('\n');
+    rendered.push_str(&xorg_session_bridge_class(display));
     Ok(rendered)
 }
 
@@ -3450,7 +3508,7 @@ fn parse_root_depth(xdpyinfo: &str) -> Option<u8> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn parse_dedicated_display(display: &str) -> Result<u16, LauncherError> {
     display
         .strip_prefix(':')
@@ -5121,13 +5179,57 @@ EndSection
         let foreign = appended.find("\"arcen-ignore-foreign-input\"").unwrap();
         let session = appended.find("\"arcen-session-input\"").unwrap();
         assert!(foreign < session);
-        assert_eq!(rendered.matches("Section \"InputClass\"").count(), 2);
         assert!(appended[..session].contains("Option         \"Ignore\" \"on\""));
         assert!(!appended[..session].contains("Match"));
         assert!(appended[session..].contains("MatchUSBID     \"a2ce:*\""));
         assert!(appended[session..].contains("MatchProduct   \"(session :58)\""));
         assert!(appended[session..].contains("Option         \"Ignore\" \"off\""));
-        assert_eq!(appended.matches("EndSection").count(), 2);
+        // The isolation classes, then the desktop's own bridge classes.
+        assert_eq!(rendered.matches("Section \"InputClass\"").count(), 4);
+        assert_eq!(appended.matches("EndSection").count(), 4);
+    }
+
+    /// Requirement (e): a bridged tablet reaches only the desktop it is
+    /// tagged for. The appended bridge class comes after the isolation
+    /// classes (a later class's `Ignore` wins), admits exactly this display's
+    /// tag, and nothing else: console devices still meet "Ignore on".
+    #[test]
+    fn the_desktop_readmits_only_its_own_bridged_tablet_after_the_isolation_classes() {
+        const TEMPLATE: &str = include_str!("../../../../packaging/linux/arcen-xorg.conf");
+        let rendered = with_session_input_isolation(TEMPLATE, ":58").unwrap();
+        let appended = &rendered[TEMPLATE.len()..];
+        let foreign = appended.find("\"arcen-ignore-foreign-input\"").unwrap();
+        let session = appended.find("\"arcen-session-input\"").unwrap();
+        let ignore_bridges = appended
+            .find("\"arcen-bridged-usb-session-ignore\"")
+            .unwrap();
+        let bridge = appended.find("\"arcen-bridged-usb-session\"").unwrap();
+        // The session class admits by name and vendor id, which a bridged
+        // device's string descriptors could imitate: every bridge is ignored
+        // again after it, and only this display's own is re-admitted, last.
+        assert!(foreign < session && session < ignore_bridges && ignore_bridges < bridge);
+        assert!(appended[ignore_bridges..bridge].contains("MatchTag       \"arcen_bridge\"\n"));
+        assert!(appended[ignore_bridges..bridge].contains("Option         \"Ignore\" \"on\""));
+        assert!(appended[bridge..].contains("MatchTag       \"arcen_bridge_58\"\n"));
+        assert_eq!(appended.matches("MatchTag").count(), 2);
+        assert_eq!(appended[bridge..].matches("Section \"").count(), 0);
+        assert_eq!(
+            arcen_usb_bridge::bridge_seat::admitted_bridge_display(&rendered),
+            Some(58)
+        );
+        let other = with_session_input_isolation(TEMPLATE, ":5").unwrap();
+        assert_eq!(
+            arcen_usb_bridge::bridge_seat::admitted_bridge_display(&other),
+            Some(5)
+        );
+        assert!(!other.contains("arcen_bridge_58"));
+        // A template that already carries a bridge class or tag is refused.
+        for poisoned in [
+            "Section \"InputClass\"\n    Identifier \"arcen-bridged-usb-session\"\nEndSection\n",
+            "Section \"InputClass\"\n    MatchTag \"arcen_bridge\"\nEndSection\n",
+        ] {
+            assert!(with_session_input_isolation(poisoned, ":58").is_err());
+        }
     }
 
     #[test]
@@ -5188,6 +5290,11 @@ EndSection
         assert_eq!(isolated.lines().count(), rendered.config.lines().count());
         assert!(rendered.config.contains("\"arcen-ignore-foreign-input\""));
         assert!(rendered.config.contains("MatchProduct   \"(session :62)\""));
+        // The bridge classes stay last, so the preflight still admits it.
+        assert_eq!(
+            arcen_usb_bridge::bridge_seat::admitted_bridge_display(&rendered.config),
+            Some(62)
+        );
         // Ten bits leaves the packaged template's screen exactly as shipped.
         let ten = arcen_outputs::with_session_screen(
             &isolated,
@@ -5249,6 +5356,30 @@ EndSection
         pid_max + 1
     }
 
+    /// Leaves a socket file nobody listens on, as a dead Xorg does.
+    ///
+    /// The socket is bound and never listened on. Binding a listener and
+    /// dropping it raced every process another test forked meanwhile: the
+    /// child holds a copy of the listening descriptor until it execs
+    /// (close-on-exec acts only at exec), so `connect` could still succeed
+    /// and the display read as serving clients.
+    #[cfg(target_os = "linux")]
+    fn abandoned_display_socket(path: &Path) {
+        use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            &UnixAddr::new(path).expect("socket path"),
+        )
+        .expect("bind");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_display_left_by_a_dead_xorg_is_reclaimed() {
@@ -5256,8 +5387,7 @@ EndSection
         let lock = root.join(".X11-lock");
         let socket = root.join("X11");
         std::fs::write(&lock, format!("{:>10}\n", certainly_dead_pid())).expect("lock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
-        drop(listener);
+        abandoned_display_socket(&socket);
 
         assert_eq!(
             inspect_display_lock(&lock, current_uid()),
@@ -5280,8 +5410,7 @@ EndSection
         let lock = root.join(".X11-lock");
         let socket = root.join("X11");
         std::fs::write(&lock, format!("{:>10}\n", std::process::id())).expect("lock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
-        drop(listener);
+        abandoned_display_socket(&socket);
 
         assert_eq!(
             inspect_display_lock(&lock, current_uid()),
@@ -5380,8 +5509,7 @@ EndSection
         assert!(reclaim_stale_display_at(&lock, &socket, current_uid(), 11).is_ok());
         assert!(!lock.exists());
 
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
-        drop(listener);
+        abandoned_display_socket(&socket);
         assert!(reclaim_stale_display_at(&lock, &socket, current_uid(), 11).is_ok());
         assert!(!socket.exists());
         let _ = std::fs::remove_dir_all(&root);

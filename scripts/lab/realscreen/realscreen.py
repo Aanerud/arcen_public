@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Arcen real-screen latency harness (Mac side).
 
 Runs the real Arcen Deck GUI against a real Pier, opens the latency page in a
@@ -34,7 +36,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 DRIVER_SRC = HERE / "driver.swift"
 DRIVER_BIN = ROOT / "target" / "realscreen" / "realscreen-driver"
-HOST_FILES = ("latency.html", "page_server.py", "host_page.sh")
+HOST_FILES = ("latency.html", "cursors.html", "page_server.py", "host_page.sh")
 
 
 def log(msg):
@@ -152,7 +154,7 @@ def run_locked(args):
     run_dir = f"{host_dir}/runs/{out.name}"
     ssh(args.ssh, f"install -d -m 755 {host_dir} {host_dir}/runs", check=True)
     subprocess.run(["scp", "-q", *[str(HERE / f) for f in HOST_FILES], f"{args.ssh}:{host_dir}/"], check=True)
-    ssh(args.ssh, f"chmod 755 {host_dir}/host_page.sh; chmod 644 {host_dir}/latency.html {host_dir}/page_server.py")
+    ssh(args.ssh, f"chmod 755 {host_dir}/host_page.sh; chmod 644 {host_dir}/latency.html {host_dir}/cursors.html {host_dir}/page_server.py")
 
     deck_bin = pathlib.Path(args.deck_app) / "Contents" / "MacOS" / "arcen-deck"
     deck_args = [str(deck_bin), "--connect", connect_host, str(args.port), "--pin-sha256", pin,

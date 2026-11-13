@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -29,7 +32,11 @@ $distributionDirectory = (Resolve-FileSystemLiteralPath `
     -Label "DistributionDirectory").TrimEnd("\", "/")
 $expected = @(
     "INSTALL.md"
+    "LICENSE"
+    "LICENSE-EXCEPTION.md"
+    "NOTICE"
     "THIRD_PARTY_NOTICES.md"
+    "TRADEMARKS.md"
     "arcen-cp-harness.exe"
     "arcen-pier.exe"
     "arcen_credential_provider.dll"

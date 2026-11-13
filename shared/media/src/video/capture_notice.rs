@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The capenc `ADMISSION` line: what a capture source admitted, stated
 //! before `READY`.
 //!
@@ -24,6 +26,8 @@
 //! the notice must answer the request the parent made, serve a permitted
 //! downgrade at no more than the requested rate and codec, and state cursor
 //! truth. Unknown, duplicate or malformed fields are refused, as for `READY`.
+//! A served transfer other than the served contract's own (a Grading stream
+//! served `srgb`) is stated as `transfer=srgb` after `transform=`.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -37,8 +41,11 @@ use super::capture_surface::{
     CaptureMemory, CapturePixelFormat, CopyPath, CursorEvidence, FormatModifier,
 };
 use super::pipeline::PipelineId;
-use super::{CaptureBackend, CaptureRateEvidence, PlanDegradation, Rgb10Signal, StreamingPreset};
-use crate::VideoCodec;
+use super::{
+    CaptureBackend, CaptureRateEvidence, PlanDegradation, Rgb10Signal, StreamingPreset,
+    pipeline_contract,
+};
+use crate::{TransferCharacteristics, VideoCodec};
 
 /// Prefix of the line on capenc's stderr.
 pub const ADMISSION_PREFIX: &str = "[capenc] ADMISSION ";
@@ -170,8 +177,12 @@ fn parse_transform(value: &str, sdr_white_nits: Option<u16>) -> Option<SourceTra
         "sdr8-yuv" => SourceTransform::Sdr8YuvPassthrough,
         "rgb10-direct" => SourceTransform::PackedRgb10(Rgb10Signal::Direct),
         "rgb10-pq-to-sdr" => SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrBt709),
+        "rgb10-pq-to-srgb" => SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrSrgb),
+        "rgb10-pq-to-g22" => SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrGamma22),
         "f16-pq-direct" => SourceTransform::HalfFloatPq(Rgb10Signal::Direct),
         "f16-pq-to-sdr" => SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709),
+        "f16-pq-to-srgb" => SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrSrgb),
+        "f16-pq-to-g22" => SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrGamma22),
         "linear-to-sdr" => SourceTransform::LinearToSdr,
         "linear-to-pq" => SourceTransform::LinearToPq {
             sdr_white_nits: sdr_white_nits?,
@@ -313,6 +324,12 @@ impl CaptureAdmissionNotice {
                 fields.push(format!("fps_limited_by={}", limited.token()));
             }
             fields.push(format!("transform={}", served.transform.token()));
+            // Stated only where it differs from the served contract's colour
+            // (a Grading stream served `srgb`), so every other line is as
+            // before.
+            if served.transfer != pipeline_contract(served.pipeline).colour.transfer {
+                fields.push(format!("transfer={}", served.transfer.token()));
+            }
             if let SourceTransform::LinearToPq { sdr_white_nits } = served.transform {
                 fields.push(format!("sdr_white_nits={sdr_white_nits}"));
             }
@@ -469,6 +486,13 @@ impl CaptureAdmissionNotice {
                         .map_err(|_| AdmissionNoticeError::InvalidValue("sdr_white_nits"))
                 })
                 .transpose()?;
+            let contract_transfer = pipeline_contract(served_pipeline).colour.transfer;
+            let transfer = match fields.remove("transfer") {
+                None => contract_transfer,
+                Some(value) => TransferCharacteristics::from_token(value)
+                    .filter(|transfer| *transfer != contract_transfer)
+                    .ok_or(AdmissionNoticeError::InvalidValue("transfer"))?,
+            };
             let mut take = |name: &'static str| {
                 fields
                     .remove(name)
@@ -496,6 +520,7 @@ impl CaptureAdmissionNotice {
                 copy_path,
                 colour_assumed,
                 cursor_mode,
+                transfer,
             })
         };
         let admission = match (decision, served) {
@@ -559,6 +584,23 @@ impl CaptureAdmissionNotice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_wide_transform_token_parses_back() {
+        for signal in [
+            Rgb10Signal::Direct,
+            Rgb10Signal::PqBt2020ToSdrBt709,
+            Rgb10Signal::PqBt2020ToSdrSrgb,
+            Rgb10Signal::PqBt2020ToSdrGamma22,
+        ] {
+            for transform in [
+                SourceTransform::PackedRgb10(signal),
+                SourceTransform::HalfFloatPq(signal),
+            ] {
+                assert_eq!(parse_transform(transform.token(), None), Some(transform));
+            }
+        }
+    }
     use crate::video::{
         AdmissionRequest, CaptureSourceEvidence, EncoderBackend, EncoderCapability, GpuMatch,
         SourceColour, SourceFact, admit_capture_source,
@@ -608,6 +650,7 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     max_fps: requested_fps,
+                    sdr_transfer: TransferCharacteristics::Bt709,
                 },
                 &source,
                 &EncoderCapability {
@@ -654,6 +697,37 @@ mod tests {
                 });
             assert_eq!(parsed, notice, "{line}");
             assert_eq!(parsed_sid.as_deref(), Some(sid));
+        }
+    }
+
+    #[test]
+    fn an_srgb_grading_epoch_states_its_transfer_and_nothing_else_does() {
+        let mut notice = notice(StreamingPreset::Auto, None, EncoderBackend::NativeNvenc);
+        let line = notice.format(None);
+        assert!(!line.contains("transfer="), "{line}");
+        let mut served = *notice.served().expect("Auto fixture served");
+        served.pipeline = PipelineId::Grading;
+        served.codec = VideoCodec::H265;
+        served.transform = SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrSrgb);
+        served.transfer = TransferCharacteristics::Srgb;
+        notice.requested = StreamingPreset::Grading;
+        notice.admission = PresetAdmission::Admit(served);
+        let line = notice.format(None);
+        assert!(
+            line.contains("transform=f16-pq-to-srgb transfer=srgb colour="),
+            "{line}"
+        );
+        assert_eq!(CaptureAdmissionNotice::parse(&line).unwrap().0, notice);
+        // The contract's own transfer is never restated, and an unknown one
+        // is refused.
+        for (from, to) in [
+            ("transfer=srgb", "transfer=bt709"),
+            ("transfer=srgb", "transfer=gamma"),
+        ] {
+            assert_eq!(
+                CaptureAdmissionNotice::parse(&line.replace(from, to)),
+                Err(AdmissionNoticeError::InvalidValue("transfer"))
+            );
         }
     }
 

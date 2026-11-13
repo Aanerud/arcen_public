@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which kind of Wayland desktop a host runs: a compositor on its own logind
 //! seat (native) or a seatless headless one (`wayland.session_mode`).
 //!

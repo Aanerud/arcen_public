@@ -370,8 +370,8 @@ an existing session, with no headless or system mode.
 
 | Preset | Verdict | Reason |
 | --- | --- | --- |
-| **Auto** | **qualified-candidate**, host-memory path only | Genuine eight-bit `BGRx` virtual output. Only shared memory is offered, so the path is a CPU readback in Mutter plus an upload, reported as `capture_zero_copy=false` and `copy_path=host-copy`. 36 fps was observed at 1080p against a 30 fps contract. `wlp-auto-speed` (2026-10-17): served end to end through capenc on the real session hand-off and the Pier's capenc supervision at 30 fps, Keel idle (keepalive only) and keyframe on demand while idle, BT.709 limited 4:2:0 stream truth, composited cursor (see `linux-wayland-provider.md`). Still needs a Deck end to end. |
-| **Speed** | **unavailable** | No DMA-BUF, so no zero-readback path; the shared-memory rate is not qualified for 60 fps (36 fps observed; 37.5 average, 41 peak under gnome-shell in `wlp-auto-speed`). A Speed request is admitted by the shared `admit_speed` and visibly served as Auto (`copy_path_not_rate_qualified`), never advertised as Speed. |
+| **Auto** | **qualified-candidate**, host-memory path only | Genuine eight-bit `BGRx` virtual output. Only shared memory is offered, so the path is a CPU readback in Mutter plus an upload, reported as `capture_zero_copy=false` and `copy_path=host-copy`. 36 fps was observed at 1080p against a 30 fps contract. With the Wayland Auto composition (2026-10-17): served end to end through capenc on the real session hand-off and the Pier's capenc supervision at 30 fps, Keel idle (keepalive only) and keyframe on demand while idle, BT.709 limited 4:2:0 stream truth, composited cursor (see `linux-wayland-provider.md`). Still needs a Deck end to end. |
+| **Speed** | **unavailable** | No DMA-BUF, so no zero-readback path; the shared-memory rate is not qualified for 60 fps (36 fps observed; 37.5 average, 41 peak under gnome-shell with the Auto composition). A Speed request is admitted by the shared `admit_speed` and visibly served as Auto (`copy_path_not_rate_qualified`), never advertised as Speed. |
 | **Grading** | **unavailable** | Composition and capture are eight-bit `BGRx` only. No ten-bit or FP16 format exists. |
 | **HDR** | **unavailable** | No colour management or HDR output. There is no genuine Grading path to downgrade to, so HDR requests must be reported as unavailable, not as Grading. |
 
@@ -386,8 +386,8 @@ an existing session, with no headless or system mode.
 1. **NVIDIA DMA-BUF depends on `nvidia-drm modeset=1`.** With `modeset=N`,
    NVIDIA GBM is unavailable, NVIDIA EGL DMA-BUF export and Vulkan DMA-BUF
    memory are absent, and headless Mutter goes surfaceless and turns off
-   DMA-BUF screen casting. `wlp-import` cannot assume DMA-BUF.
-   `wlp-installer` must detect `modeset` and explain the change, kernel
+   DMA-BUF screen casting. GPU import cannot assume DMA-BUF.
+   The installer must detect `modeset` and explain the change, kernel
    parameter and reboot involved. The earlier spike re-measured the Xorg
    pipelines unchanged with `modeset=1`; that should be repeated on the
    qualification host.
@@ -403,7 +403,7 @@ an existing session, with no headless or system mode.
    least `CURSOR_META_SIZE(384, 384)`, or it silently gets no cursor
    metadata. It must also handle `chunk.size == 0` cursor-only buffers.
 5. **GNOME Shell 40 binds to the caller's logind session and registers it
-   with GDM.** The `wlp-session` adapter must launch each compositor in its
+   with GDM.** The session adapter must launch each compositor in its
    own logind session (PAM with `pam_systemd`). It must never start one from
    the Pier service's session or an operator shell.
 6. **Input on GNOME 40 is Mutter D-Bus only.** There is no EIS and no pen. A
@@ -416,7 +416,7 @@ an existing session, with no headless or system mode.
    `EGL_ANDROID_native_fence_sync` on NVIDIA here), sustained 1080p/4K
    capture rates, and Deck end-to-end evidence.
 
-## Deck-drawn cursor (`wp-cursor`, 2026-10-18)
+## Deck-drawn cursor (2026-10-18)
 
 The second cursor-only buffer above (`bitmap_offset=28`, hotspot 0,0) is not
 "no new bitmap": its `spa_meta_bitmap` is all zero, which is Mutter 40's

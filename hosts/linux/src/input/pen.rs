@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Portable, pure pen/tablet mapping and idempotent tablet-tool state machine.
 //!
 //! Kept free of any `evdev`/uinput dependency: `evdev` is a Linux-only Cargo

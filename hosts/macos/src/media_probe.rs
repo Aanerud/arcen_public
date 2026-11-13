@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(unsafe_code)]
 
 //! End-to-end capture and encode proof for the macOS Pier.
@@ -184,6 +187,7 @@ pub fn run(options: &ProbeOptions) -> Result<MediaProbeReport, ProbeError> {
         shows_cursor: false,
         pixel_format: options.pixel_format,
         dynamic_range: options.dynamic_range,
+        sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
     };
     let requested = RequestedPlan {
         display_id: display.display_id,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Build-generated CLDR IANA-to-Windows time-zone mapping.
 
 include!(concat!(env!("OUT_DIR"), "/windows_zones.rs"));

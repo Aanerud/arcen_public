@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pen samples as frames for an emulated-input stylus.
 //!
 //! Some hosts cannot create a pen device of their own and have to hand pen

@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `capenc color-probe`: does this host actually deliver more than 8 bits per
 //! component from Desktop Duplication?
 //!
-//! Read `docs/internal/ten-bit-source-capture.md` before changing this. The
+//! Read `docs/architecture/color-fidelity.md` before changing this. The
 //! short version: Arcen already encodes 10-bit, but from an 8-bit capture, and
 //! the open question is whether a wider *source* is reachable at all. Public
 //! NvFBC on Linux is a closed negative. Windows is the one live lead, because

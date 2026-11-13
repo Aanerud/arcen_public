@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which GPU a dedicated NVIDIA Xorg server is told to drive.
 //!
 //! An NVIDIA `Device` section names its GPU with `BusID "PCI:<bus>:<device>:<function>"`.

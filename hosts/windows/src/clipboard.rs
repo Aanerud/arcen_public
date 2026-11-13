@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! User-session Win32 clipboard adapter and bounded transport queues.
 
 use arcen_media::clipboard::{
     dibv5_to_png, png_to_dibv5, ClipboardContent, ClipboardDirection, ClipboardFlow, ClipboardKind,
-    ClipboardPolicy, EchoMarker, EchoSuppressor, EchoToken, ImageLimits, MAX_DECODED_IMAGE_BYTES,
+    ClipboardPolicy, EchoMarker, EchoSuppressor, EchoToken, ImageLimits, RepeatedCopyFilter,
+    MAX_DECODED_IMAGE_BYTES,
 };
 use arcen_protocol::clipboard::{ClipboardCursor, ClipboardTransfer, ClipboardWireMessage};
 use arcen_protocol::messages::{
@@ -322,6 +325,8 @@ struct ThreadState {
     wake_pending: AtomicBool,
     stopping: AtomicBool,
     suppressor: Mutex<EchoSuppressor>,
+    /// One local copy can raise two updates (OLE set, then flush).
+    repeats: Mutex<RepeatedCopyFilter>,
 }
 
 impl ThreadState {
@@ -387,6 +392,7 @@ impl WindowsClipboardRuntime {
             wake_pending: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             suppressor: Mutex::new(EchoSuppressor::new(EchoToken(token))),
+            repeats: Mutex::new(RepeatedCopyFilter::new()),
         });
         let thread_state = Arc::clone(&state);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -702,8 +708,39 @@ fn observe_local_clipboard(hwnd: windows::Win32::Foundation::HWND, state: &Threa
     };
     let item = read_local_item(sequence, state.negotiation);
     if let Some(item) = item {
-        let _ = state.outbound.enqueue(item);
+        let _ = enqueue_unless_repeat(
+            &state.repeats,
+            &state.outbound,
+            item,
+            std::time::Instant::now(),
+        );
     }
+}
+
+/// Sends a local copy unless it repeats the copy sent last (the same copy
+/// announced twice); a dropped repeat is scrubbed.
+fn enqueue_unless_repeat(
+    repeats: &Mutex<RepeatedCopyFilter>,
+    outbound: &ClipboardWriterQueue,
+    mut item: ClipboardItem,
+    now: std::time::Instant,
+) -> bool {
+    let repeat = repeats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_repeat(media_kind(item.kind), &item.bytes, now);
+    if repeat {
+        tracing::debug!(
+            target: crate::logging::SESSION,
+            sequence = item.sequence,
+            kind = ?item.kind,
+            size = item.bytes.len(),
+            "clipboard update repeats the copy just sent; not sent again"
+        );
+        item.scrub();
+        return false;
+    }
+    outbound.enqueue(item)
 }
 
 fn inject_remote_clipboard(hwnd: windows::Win32::Foundation::HWND, state: &ThreadState) {
@@ -746,6 +783,11 @@ fn inject_remote_clipboard(hwnd: windows::Win32::Foundation::HWND, state: &Threa
         item.scrub();
         return;
     }
+    state
+        .repeats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     let marker = state
         .suppressor
         .lock()
@@ -1001,6 +1043,44 @@ mod tests {
         };
         assert_eq!(frame.len(), arcen_protocol::CLIPBOARD_HEADER_SIZE + 3);
         assert_eq!(queue.bounded_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn one_copy_announced_twice_reaches_the_deck_once() {
+        let queue = ClipboardWriterQueue::new();
+        let repeats = Mutex::new(RepeatedCopyFilter::new());
+        let copied = std::time::Instant::now();
+        let item = |sequence| {
+            ClipboardItem::new(
+                sequence,
+                ClipboardContentKind::TextUtf8,
+                b"copied once".to_vec(),
+                false,
+            )
+            .unwrap()
+        };
+        assert!(enqueue_unless_repeat(&repeats, &queue, item(1), copied));
+        // OleFlushClipboard re-places the same data under a new sequence.
+        assert!(!enqueue_unless_repeat(
+            &repeats,
+            &queue,
+            item(2),
+            copied + std::time::Duration::from_millis(40)
+        ));
+        assert!(matches!(queue.pop().await.unwrap(), Some(Message::Text(_))));
+        assert!(matches!(
+            queue.pop().await.unwrap(),
+            Some(Message::Binary(_))
+        ));
+        assert_eq!(queue.bounded_counts(), (0, 0));
+        // A Deck item replaced the clipboard: the same local copy is new again.
+        repeats.lock().unwrap().clear();
+        assert!(enqueue_unless_repeat(
+            &repeats,
+            &queue,
+            item(3),
+            copied + std::time::Duration::from_millis(80)
+        ));
     }
 
     #[test]

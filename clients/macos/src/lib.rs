@@ -1,12 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 /// Canonical location of the corresponding source.
 ///
 /// Arcen is AGPL-3.0 free software. Surfacing the source location from inside
 /// the running program means a user who only ever receives a built binary can
 /// still find the corresponding source.
 ///
-/// This must point at the repository the public can actually reach. Development
-/// happens in a private repository; publication is a one-way export to the
-/// public one, and it is the public one that satisfies the offer.
+/// This must point at the public repository, where every release is tagged;
+/// that is the one that satisfies the offer.
 pub const SOURCE_URL: &str = "https://github.com/Aanerud/arcen_public";
 
 /// AGPL-3.0 section 13 source offer.
@@ -52,9 +53,11 @@ pub mod tablet;
 pub mod timezone;
 pub mod transport;
 pub mod ui;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 pub mod usb_bridge;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "usb-emulate-lab")]
+pub mod usb_emulate;
+#[cfg(feature = "native-tablet")]
 pub mod usb_helper_client;
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 pub mod usb_helper_install;

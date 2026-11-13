@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 pub const QT_KEY_META: u32 = 0x0100_0022;
 pub const QT_KEY_CTRL: u32 = 0x0100_0021;
 pub const QT_KEY_SHIFT: u32 = 0x0100_0020;
@@ -106,20 +109,6 @@ pub fn qt_key_to_linux_scancode(qt_key: u32) -> u16 {
     }
 }
 
-pub fn swap_cmd_ctrl_for_linux_dest(qt_key: u32, qt_modifiers: u32) -> (u32, u32) {
-    let out_key = if qt_key == QT_KEY_META {
-        QT_KEY_CTRL
-    } else {
-        qt_key
-    };
-    let out_modifiers = if qt_modifiers & MOD_META != 0 {
-        (qt_modifiers & !MOD_META) | MOD_CTRL
-    } else {
-        qt_modifiers
-    };
-    (out_key, out_modifiers)
-}
-
 pub const FLAME_CRITICAL_CHORDS: &[(u32, u32, &str)] = &[
     (0x20, MOD_SHIFT, "Shift+Space -- Flame pan"),
     (0x20, MOD_ALT, "Alt+Space -- Flame zoom"),
@@ -166,19 +155,5 @@ mod tests {
                 "{description} must have a Linux scancode mapping"
             );
         }
-    }
-
-    #[test]
-    fn swaps_cmd_to_ctrl_for_linux_destinations() {
-        let (key, modifiers) = swap_cmd_ctrl_for_linux_dest(QT_KEY_META, MOD_META);
-        assert_eq!(key, QT_KEY_CTRL);
-        assert_eq!(modifiers, MOD_CTRL);
-    }
-
-    #[test]
-    fn leaves_ctrl_chords_unchanged() {
-        let (key, modifiers) = swap_cmd_ctrl_for_linux_dest(0x53, MOD_CTRL);
-        assert_eq!(key, 0x53);
-        assert_eq!(modifiers, MOD_CTRL);
     }
 }

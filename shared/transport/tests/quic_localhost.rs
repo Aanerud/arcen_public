@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Deterministic localhost integration test for the concrete QUIC transport
 //! adapter.
 //!
@@ -145,7 +147,6 @@ fn admission(role: PeerRole, session_id: &str, nonce: &str) -> QuicAdmission {
     let (local_identity, remote_role, remote_identity) = match role {
         PeerRole::Client => ("client-1", PeerRole::Host, "host-1"),
         PeerRole::Host => ("host-1", PeerRole::Client, "client-1"),
-        PeerRole::Gateway => panic!("test only connects client and host"),
     };
     let required = NegotiatedCapabilities::new([]).expect("no extra requirements");
     QuicAdmission::new(

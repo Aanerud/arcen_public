@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Edge-preserving pen sample forwarding.
 //!
 //! A client turns native digitizer reports into [`PenEvent`]s and hands them

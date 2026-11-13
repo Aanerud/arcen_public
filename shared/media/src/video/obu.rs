@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 fn read_leb128(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut value = 0usize;
     for (index, byte) in bytes.iter().copied().enumerate().take(8) {

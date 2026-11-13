@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Primary remote-video surface: a `wgpu` paint callback that renders the
 //! decoded video directly, replacing the CPU "decode -> BGRA -> RGBA
 //! `Vec<u8>` -> `egui::ColorImage` -> `Context::load_texture`" path that used

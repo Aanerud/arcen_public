@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Per-lane workers of one Linux Pier attachment (ADR 0014).
 //!
 //! Each role has its own task: the video writer drains the monitor mux, the
@@ -512,15 +514,116 @@ fn release_held_input(input: &Mutex<Option<PierInput>>) {
 
 /// Where an attachment's host cursor comes from.
 pub(super) enum CursorFeed {
-    /// Named shapes from the X11 watcher, as `cursor_shape` JSON.
-    Shapes(mpsc::Receiver<String>),
-    /// A Wayland desktop's cursor (`media::wayland_cursor`): `CursorUpdate`
-    /// images for a Deck that declared `cursor_image_v1`, and the named
-    /// fallback (`default` or `hidden`) for one that did not.
+    /// A desktop's cursor — an Xorg desktop's XFixes watcher
+    /// (`cursor_watcher`) or a Wayland desktop's capture
+    /// (`media::wayland_cursor`): `CursorUpdate` images for a Deck that
+    /// declared `cursor_image_v1`, and the named fallback (the X cursor
+    /// name's shape, `default` or `hidden`) for one that did not.
     Images {
         facts: tokio::sync::watch::Receiver<Option<arcen_input::cursor::CursorFacts>>,
         deck_draws_images: bool,
+        /// Where the host pointer is, for a Deck that declared
+        /// `cursor_position_v1` on a desktop whose pointer can be read.
+        pointer: Option<PointerFeed>,
     },
+}
+
+/// The desktop's pointer positions and the outputs that stream them.
+pub(super) struct PointerFeed {
+    pub(super) samples:
+        tokio::sync::watch::Receiver<Option<arcen_input::host_pointer::DesktopPointerSample>>,
+    /// The streamed outputs of a multi-head desktop; `None` when one stream
+    /// shows the whole desktop (its size then follows the samples).
+    pub(super) outputs: Option<arcen_input::host_pointer::HostPointerLayout>,
+}
+
+/// The input worker's host pointer reporting: the shared
+/// [`arcen_input::host_pointer::HostPointerFeed`].
+struct PointerReporting {
+    samples: tokio::sync::watch::Receiver<Option<arcen_input::host_pointer::DesktopPointerSample>>,
+    feed: arcen_input::host_pointer::HostPointerFeed,
+    /// The lane refused the last record: wait before trying again.
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl PointerReporting {
+    fn new(feed: PointerFeed) -> Self {
+        Self {
+            samples: feed.samples,
+            feed: arcen_input::host_pointer::HostPointerFeed::new(feed.outputs),
+            retry_at: None,
+        }
+    }
+
+    /// Notes Deck input that moves the host pointer, before it is injected,
+    /// so its echo is never reported back.
+    fn note_input(&mut self, text: &str) {
+        #[derive(serde::Deserialize)]
+        struct Kind {
+            #[serde(rename = "type", default)]
+            kind: String,
+        }
+        if serde_json::from_str::<Kind>(text)
+            .is_ok_and(|message| arcen_input::host_pointer::moves_host_pointer(&message.kind))
+        {
+            self.feed.reporter().note_client_pointer(Instant::now());
+        }
+    }
+
+    fn observe(&mut self) {
+        let Some(sample) = *self.samples.borrow_and_update() else {
+            return;
+        };
+        self.feed.observe(&sample);
+    }
+
+    /// When the waiting report may go out.
+    fn due(&self) -> Option<tokio::time::Instant> {
+        let due = tokio::time::Instant::from_std(self.feed.due_at()?);
+        Some(self.retry_at.map_or(due, |retry| retry.max(due)))
+    }
+
+    /// The lane is gone: nothing waits for it (a reopened lane starts
+    /// afresh, see [`arcen_input::host_pointer::HostPointerReporter::reset_lane`]).
+    fn lane_lost(&mut self) {
+        self.feed.reporter().reset_lane();
+        self.retry_at = None;
+    }
+
+    /// Writes the waiting report when the rate and the lane allow it.
+    fn flush(&mut self, slot: &LaneSenderSlot) {
+        let Some(sender) = slot.current() else {
+            // Without a lane the timer must not fire again at once.
+            self.retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(20));
+            return;
+        };
+        let now = Instant::now();
+        let prepared = match self.feed.reporter().prepare(now) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(target: INPUT, %error, "cursor position could not be encoded");
+                return;
+            }
+        };
+        let Some(record) = message_bytes(Message::Binary(prepared.bytes.to_vec())) else {
+            return;
+        };
+        if sender.try_send(record).is_ok() {
+            self.retry_at = None;
+            self.feed.reporter().commit(&prepared, now);
+            trace!(
+                target: INPUT,
+                x = prepared.position.x,
+                y = prepared.position.y,
+                monitor_id = prepared.position.monitor_id,
+                on_stream = prepared.position.on_stream,
+                "host pointer position sent"
+            );
+        } else {
+            self.retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(20));
+        }
+    }
 }
 
 /// Deck input on the input/cursor lane, injected in this task only, and the
@@ -540,21 +643,31 @@ pub(super) async fn input_lane_worker(
     let mut pending_text = TextNoticeBacklog::default();
     let mut cursor_images = arcen_input::cursor::CursorLaneOutbox::default();
     let mut fallback_sequence = 0u64;
-    let (mut cursor_shapes, mut cursor_facts, deck_draws_images) = match cursor_feed {
-        Some(CursorFeed::Shapes(shapes)) => (Some(shapes), None, false),
+    let (mut cursor_facts, deck_draws_images, mut pointer) = match cursor_feed {
         Some(CursorFeed::Images {
             mut facts,
             deck_draws_images,
+            pointer,
         }) => {
             // The desktop's current cursor goes out as soon as the lane opens.
             facts.mark_changed();
-            (None, Some(facts), deck_draws_images)
+            (
+                Some(facts),
+                deck_draws_images,
+                pointer.map(PointerReporting::new),
+            )
         }
-        None => (None, None, false),
+        None => (None, false, None),
     };
     let mut retry = tokio::time::interval(Duration::from_millis(20));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reason = loop {
+        // No timer without a lane: a waiting position goes out (or is
+        // dropped) when the lane reopens, never by spinning on the timer.
+        let pointer_due = pointer
+            .as_ref()
+            .filter(|_| slot.current().is_some())
+            .and_then(PointerReporting::due);
         tokio::select! {
             event = reader.next() => match event {
                 Ok(PeerLaneEvent::Opened { lane_generation, release_held_input: release, sender, .. }) => {
@@ -568,6 +681,9 @@ pub(super) async fn input_lane_worker(
                     // The Deck's cache starts empty on every lane, and the
                     // current state is sent again on it.
                     cursor_images.reset_lane();
+                    if let Some(pointer) = pointer.as_mut() {
+                        pointer.feed.reporter().reset_lane();
+                    }
                     flush_cursor(&slot, &mut pending_cursor);
                     flush_cursor_image(&slot, &mut cursor_images);
                     pending_text.flush(&slot);
@@ -575,6 +691,9 @@ pub(super) async fn input_lane_worker(
                 Ok(PeerLaneEvent::Lost { release_held_input: release, .. }) => {
                     // Released now, not when the Deck's replacement arrives.
                     slot.clear();
+                    if let Some(pointer) = pointer.as_mut() {
+                        pointer.lane_lost();
+                    }
                     if release {
                         release_held_input(&input);
                     }
@@ -585,6 +704,9 @@ pub(super) async fn input_lane_worker(
                             warn!(target: INPUT, "non-input message on the input lane");
                             reader.fail(LaneFailure::MalformedFrame);
                             continue;
+                        }
+                        if let Some(pointer) = pointer.as_mut() {
+                            pointer.note_input(&text);
                         }
                         let mut controller = lock_recover(&input);
                         super::handle_input_json(&text, controller.as_mut(), &mut sequence);
@@ -607,15 +729,6 @@ pub(super) async fn input_lane_worker(
                     };
                 }
             },
-            shape = async { cursor_shapes.as_mut()?.recv().await }, if cursor_shapes.is_some() => {
-                match shape {
-                    Some(json) => {
-                        pending_cursor = message_bytes(Message::Text(json));
-                        flush_cursor(&slot, &mut pending_cursor);
-                    }
-                    None => cursor_shapes = None,
-                }
-            }
             notice = async { text_notices.as_mut()?.recv().await }, if text_notices.is_some() => {
                 match notice {
                     Some(json) => {
@@ -648,6 +761,24 @@ pub(super) async fn input_lane_worker(
                             flush_cursor(&slot, &mut pending_cursor);
                         }
                     }
+                }
+            }
+            moved = async { pointer.as_mut()?.samples.changed().await.ok() }, if pointer.is_some() => {
+                match (moved, pointer.as_mut()) {
+                    (Some(()), Some(reporting)) => {
+                        reporting.observe();
+                        reporting.flush(&slot);
+                    }
+                    _ => pointer = None,
+                }
+            }
+            () = async {
+                if let Some(due) = pointer_due {
+                    tokio::time::sleep_until(due).await;
+                }
+            }, if pointer_due.is_some() => {
+                if let Some(reporting) = pointer.as_mut() {
+                    reporting.flush(&slot);
                 }
             }
             _ = retry.tick(), if pending_cursor.is_some() || cursor_images.is_pending() || !pending_text.is_empty() => {
@@ -1168,7 +1299,7 @@ mod tests {
         let grant = grant_attachment(
             &pier,
             arcen_transport::quic::next_attachment_generation(),
-            LaneRoleSet::all(),
+            LaneRoleSet::BASE,
         )
         .expect("grant");
         accept_attachment(&deck, &grant).expect("accept grant");
@@ -1270,12 +1401,16 @@ mod tests {
 
         // Input/cursor: the Deck opens its lane; the Pier's input worker
         // follows it and writes cursor shapes back.
-        let (cursor_tx, cursor_rx) = mpsc::channel(4);
+        let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
         let input_slot = LaneSenderSlot::new(LaneRole::InputCursor);
         let input_worker = tokio::spawn(input_lane_worker(
             pair.pier.clone(),
             Arc::new(Mutex::new(None)),
-            Some(CursorFeed::Shapes(cursor_rx)),
+            Some(CursorFeed::Images {
+                facts: cursor_rx,
+                deck_draws_images: false,
+                pointer: None,
+            }),
             None,
             input_slot,
         ));
@@ -1287,7 +1422,15 @@ mod tests {
         )
         .expect("session lane");
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The writer needs time to run the lane out of credit, and under a
+        // loaded suite 200 ms was sometimes not enough: wait for the backlog
+        // itself rather than for a fixed time.
+        let backed_up = Instant::now() + Duration::from_secs(10);
+        while pair.pier.status().role(LaneRole::Video).queued_records == 0
+            && Instant::now() < backed_up
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let video_status = pair.pier.status();
         assert!(
             video_status.role(LaneRole::Video).queued_records > 0,
@@ -1313,12 +1456,10 @@ mod tests {
                 .try_send(session_record_bytes(&key))
                 .expect("input lane has room for every edge");
             let sent = Instant::now();
-            cursor_tx
-                .send(format!(
-                    "{{\"type\":\"cursor_shape\",\"shape\":\"arrow\",\"n\":{sequence}}}"
-                ))
-                .await
-                .expect("cursor channel");
+            cursor_tx.send_replace(Some(arcen_input::cursor::CursorFacts::Hidden {
+                output: sequence,
+                generation: 0,
+            }));
             let record = tokio::time::timeout(STEP, deck_input.reader.next_record())
                 .await
                 .expect("cursor in time")
@@ -1759,6 +1900,7 @@ mod tests {
                 Some(CursorFeed::Images {
                     facts: facts_rx,
                     deck_draws_images,
+                    pointer: None,
                 }),
                 None,
                 input_slot,
@@ -1823,5 +1965,128 @@ mod tests {
             }
             input_worker.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn a_pending_position_without_a_lane_waits_instead_of_spinning() {
+        use arcen_input::host_pointer::DesktopPointerSample;
+        let (samples_tx, samples_rx) = tokio::sync::watch::channel(None);
+        let mut reporting = PointerReporting::new(PointerFeed {
+            samples: samples_rx,
+            outputs: None,
+        });
+        let sample = |x: i32| {
+            Some(DesktopPointerSample {
+                x,
+                y: 0,
+                desktop_width: 100,
+                desktop_height: 100,
+                at: Instant::now(),
+            })
+        };
+        samples_tx.send_replace(sample(1));
+        reporting.observe();
+        samples_tx.send_replace(sample(2));
+        reporting.observe();
+        assert!(reporting.feed.reporter().is_pending());
+        let slot = LaneSenderSlot::new(LaneRole::InputCursor);
+        let before = tokio::time::Instant::now();
+        reporting.flush(&slot);
+        let due = reporting.due().expect("still pending");
+        assert!(
+            due >= before + Duration::from_millis(20),
+            "a flush without a lane must push the timer out"
+        );
+        // A lost lane drops what waited for it.
+        reporting.lane_lost();
+        assert!(!reporting.feed.reporter().is_pending());
+        assert!(reporting.due().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_pointer_moves_reach_the_deck_but_echoes_of_its_input_do_not() {
+        use arcen_input::host_pointer::DesktopPointerSample;
+        let (_facts_tx, facts_rx) =
+            tokio::sync::watch::channel(Some(arcen_input::cursor::CursorFacts::Hidden {
+                output: 0,
+                generation: 0,
+            }));
+        let (samples_tx, samples_rx) = tokio::sync::watch::channel(None);
+        let pair = pair().await;
+        let input_worker = tokio::spawn(input_lane_worker(
+            pair.pier.clone(),
+            Arc::new(Mutex::new(None)),
+            Some(CursorFeed::Images {
+                facts: facts_rx,
+                deck_draws_images: false,
+                pointer: Some(PointerFeed {
+                    samples: samples_rx,
+                    outputs: None,
+                }),
+            }),
+            None,
+            LaneSenderSlot::new(LaneRole::InputCursor),
+        ));
+        let mut deck_input = SessionLane::split(
+            tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))
+                .await
+                .expect("open in time")
+                .expect("input lane"),
+        )
+        .expect("session lane");
+        deck_input
+            .sender
+            .try_send(session_record_bytes(&SessionRecord::Ping(vec![1])))
+            .expect("queued");
+        async fn next(lane: &mut SessionLane) -> SessionRecord {
+            tokio::time::timeout(STEP, lane.reader.next_record())
+                .await
+                .expect("record in time")
+                .expect("record")
+        }
+        let position = |record: SessionRecord| match record {
+            SessionRecord::Binary(bytes) => {
+                arcen_protocol::cursor_position::decode_cursor_position(&bytes)
+                    .expect("cursor position")
+            }
+            other => panic!("cursor position expected, got {other:?}"),
+        };
+        assert!(matches!(
+            next(&mut deck_input).await,
+            SessionRecord::Text(_)
+        ));
+        let sample = |x: i32| {
+            Some(DesktopPointerSample {
+                x,
+                y: 50,
+                desktop_width: 1920,
+                desktop_height: 1080,
+                at: Instant::now(),
+            })
+        };
+        // Where the pointer rests at the start is not news; a bridged
+        // tablet moving it is.
+        samples_tx.send_replace(sample(90));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        samples_tx.send_replace(sample(100));
+        let first = position(next(&mut deck_input).await);
+        assert_eq!((first.x, first.y, first.sequence), (100, 50, 1));
+        assert_eq!((first.space_width, first.space_height), (1920, 1080));
+        // The Deck's own motion moves it next: that echo is not reported ...
+        deck_input
+            .sender
+            .try_send(session_record_bytes(&SessionRecord::Text(
+                r#"{"type":"mouse_move","x":0.1,"y":0.1}"#.to_owned(),
+            )))
+            .expect("queued");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        samples_tx.send_replace(sample(200));
+        // ... and the next host-caused move after the Deck rested is.
+        tokio::time::sleep(arcen_input::host_pointer::ECHO_WINDOW + Duration::from_millis(50))
+            .await;
+        samples_tx.send_replace(sample(300));
+        let second = position(next(&mut deck_input).await);
+        assert_eq!((second.x, second.sequence), (300, 2));
+        input_worker.abort();
     }
 }

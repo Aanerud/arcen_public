@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The local socket between the Pier's network service and its desktop agents.
 //!
 //! The service runs as `_arcen` from boot, owns UDP 18444 and the TLS key, and
@@ -543,6 +545,8 @@ pub struct MediaRelayStats {
 ///
 /// `path_signal` sends the connection's path truth to the agent once a
 /// session has started; an in-process session samples the connection itself.
+/// With it, the agent's `health_stats` also leave here carrying this
+/// connection's measured path, which the agent cannot see.
 ///
 /// # Errors
 ///
@@ -584,6 +588,7 @@ where
     });
 
     let mut path_state = arcen_telemetry::PathSignalState::default();
+    let mut path_quality = arcen_transport::PathQualityTracker::default();
     let path_started = tokio::time::Instant::now();
     let mut path_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     path_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -646,9 +651,17 @@ where
                     Some(Ok(message)) => message,
                     Some(Err(error)) => break Err(format!("from agent: {error}")),
                 };
-                let Some(record) = message_record(message) else {
+                let Some(mut record) = message_record(message) else {
                     continue;
                 };
+                if path_signal
+                    && let SessionRecord::Text(text) = &record
+                    && let Some(filled) = with_service_path(text, || {
+                        path_quality.sample(path_started.elapsed(), &connection)
+                    })
+                {
+                    record = SessionRecord::Text(filled);
+                }
                 stats.to_deck += 1;
                 let control = match relay.as_mut() {
                     Some(relay) => match relay.route_to_deck(record) {
@@ -740,7 +753,7 @@ async fn grant_lanes(deck: &mut arcen_transport::quic::SessionLaneSocket) -> Res
     let grant = arcen_transport::quic::grant_attachment(
         deck.lanes(),
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::all(),
+        arcen_protocol::lanes::LaneRoleSet::BASE,
     )
     .map_err(|error| format!("lane attachment: {error}"))?;
     let record = arcen_protocol::lanes::session_text_record(&grant)
@@ -790,6 +803,25 @@ fn is_successful_auth_result(record: &arcen_protocol::lanes::SessionRecord) -> b
     text_json(record, arcen_protocol::messages::AUTH_RESULT).is_some_and(|value| {
         value.get("success").and_then(serde_json::Value::as_bool) == Some(true)
     })
+}
+
+/// An agent's `health_stats` with `path` set from `measure`, or `None` for
+/// any other message and for stats that already carry a path (an agent that
+/// owns its connection measured it).
+fn with_service_path(
+    text: &str,
+    measure: impl FnOnce() -> arcen_protocol::messages::PathQualityMsg,
+) -> Option<String> {
+    use arcen_protocol::messages::{HEALTH_STATS, HealthStatsMsg};
+    if !text.contains(HEALTH_STATS) {
+        return None;
+    }
+    let mut stats = serde_json::from_str::<HealthStatsMsg>(text).ok()?;
+    if stats.msg_type != HEALTH_STATS || stats.path.is_some() {
+        return None;
+    }
+    stats.path = Some(measure());
+    serde_json::to_string(&stats).ok()
 }
 
 fn message_record(
@@ -932,7 +964,7 @@ pub async fn park(
     write_line(&mut stream, &AgentRegistration::new(kind, crate::VERSION)).await?;
     match read_service_message(&mut stream).await? {
         ServiceMessage::Registered { .. } => {}
-        ServiceMessage::PathSignal { .. } => {}
+        ServiceMessage::PathSignal { .. } | ServiceMessage::VideoReleased { .. } => {}
         ServiceMessage::Refused { reason } => return Err(RelayError::Refused(reason)),
         ServiceMessage::Attach { .. } => {
             return Err(RelayError::Protocol(
@@ -952,6 +984,9 @@ pub async fn park(
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
         ServiceMessage::PathSignal { .. } => Err(RelayError::Protocol(
             "received path signal before Deck attachment".to_owned(),
+        )),
+        ServiceMessage::VideoReleased { .. } => Err(RelayError::Protocol(
+            "received a video release before Deck attachment".to_owned(),
         )),
         ServiceMessage::Registered { .. } => {
             Err(RelayError::Protocol("registered twice".to_owned()))
@@ -999,7 +1034,7 @@ pub async fn open_audio_channel(
     .await?;
     match read_service_message(&mut stream).await? {
         ServiceMessage::Registered { .. } => Ok(stream),
-        ServiceMessage::PathSignal { .. } => Ok(stream),
+        ServiceMessage::PathSignal { .. } | ServiceMessage::VideoReleased { .. } => Ok(stream),
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
         ServiceMessage::Attach { .. } => Err(RelayError::Protocol(
             "offered a Deck on an audio channel".to_owned(),
@@ -1047,6 +1082,38 @@ async fn read_service_message(stream: &mut UnixStream) -> Result<ServiceMessage,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_service_fills_the_path_into_an_agent_s_health_stats_only() {
+        let path = || arcen_protocol::messages::PathQualityMsg {
+            congestion_control: "bbr".to_owned(),
+            rtt_us: 12_000,
+            sent_packets: 40,
+            window_ms: 2_000,
+            ..Default::default()
+        };
+        let agent = serde_json::to_string(&arcen_protocol::messages::HealthStatsMsg {
+            frames_sent: 120,
+            ..Default::default()
+        })
+        .unwrap();
+        let filled: arcen_protocol::messages::HealthStatsMsg =
+            serde_json::from_str(&with_service_path(&agent, path).expect("filled")).unwrap();
+        assert_eq!(filled.path, Some(path()));
+        assert_eq!(filled.frames_sent, 120);
+        // Measured by an agent that owns its connection: left alone.
+        let measured = serde_json::to_string(&filled).unwrap();
+        assert!(with_service_path(&measured, || unreachable!()).is_none());
+        // Anything else is never parsed into stats.
+        assert!(with_service_path(r#"{"type":"cursor_shape"}"#, || unreachable!()).is_none());
+        assert!(
+            with_service_path(
+                r#"{"type":"text_commit_result","note":"health_stats"}"#,
+                || { unreachable!() }
+            )
+            .is_none()
+        );
+    }
+
     fn scratch_socket(name: &str) -> PathBuf {
         // Short: a Unix socket path is limited to about a hundred bytes.
         PathBuf::from(format!(
@@ -1065,6 +1132,10 @@ mod tests {
     }
 
     async fn lane_rig(name: &str) -> LaneRig {
+        lane_rig_with(name, false).await
+    }
+
+    async fn lane_rig_with(name: &str, path_signal: bool) -> LaneRig {
         use arcen_protocol::lanes::LaneEndpoint;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::current_dir()
@@ -1117,7 +1188,7 @@ mod tests {
         let (pier, _peer) = accepted.expect("accept");
         let (deck, deck_control) = connected.expect("connect");
         let (agent_end, relay_end) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(relay_lanes(pier, relay_end, 1, None, false));
+        tokio::spawn(relay_lanes(pier, relay_end, 1, None, path_signal));
         let agent = tokio_tungstenite::WebSocketStream::from_raw_socket(
             agent_end,
             tokio_tungstenite::tungstenite::protocol::Role::Server,
@@ -1270,6 +1341,49 @@ mod tests {
             }
         }
         assert!(asked, "a dropped video frame must ask for a keyframe");
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_deck_receives_the_agent_s_health_stats_with_the_service_s_path() {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let mut rig = lane_rig_with("health", true).await;
+        for text in [
+            r#"{"type":"auth_result","success":true}"#,
+            r#"{"type":"server_hello"}"#,
+        ] {
+            rig.agent
+                .send(Message::Text(text.into()))
+                .await
+                .expect("agent control");
+        }
+        assert!(deck_text(&mut rig).await.contains("auth_result"));
+        let grant = deck_text(&mut rig).await;
+        arcen_transport::quic::accept_attachment(
+            &rig.deck,
+            &serde_json::from_str(&grant).expect("grant"),
+        )
+        .expect("accepted");
+        assert!(deck_text(&mut rig).await.contains("server_hello"));
+        let agent_stats = arcen_protocol::messages::HealthStatsMsg {
+            frames_sent: 57,
+            ..Default::default()
+        };
+        assert!(agent_stats.path.is_none(), "the agent cannot see the path");
+        rig.agent
+            .send(Message::Text(
+                serde_json::to_string(&agent_stats).expect("json").into(),
+            ))
+            .await
+            .expect("health_stats");
+        let received: arcen_protocol::messages::HealthStatsMsg =
+            serde_json::from_str(&deck_text(&mut rig).await).expect("health_stats");
+        assert_eq!(received.frames_sent, 57);
+        let path = received.path.expect("the service measured the path");
+        assert!(path.congestion_control_token().is_some(), "{path:?}");
+        assert!(path.rtt_us > 0 && path.sent_packets > 0, "{path:?}");
         std::fs::remove_dir_all(&rig.dir).ok();
     }
 

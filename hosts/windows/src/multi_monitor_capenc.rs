@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Multi-monitor `capenc` supervision: one dedicated capture worker per
 //! applied monitor, reusing the existing single-output implementation
 //! (`crate::capenc`) for spawn/READY-validation/keyframe/shutdown so this

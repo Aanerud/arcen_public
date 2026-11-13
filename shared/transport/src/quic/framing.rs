@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Wire framing for the persistent reliable stream and encrypted datagrams,
 //! plus the pure inbound datagram sequence guard shared by the QUIC adapter
 //! and the network impairment tests.

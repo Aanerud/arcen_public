@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Loopback tests for the relay a Pier uses when its session runs behind a
 //! local socket (`arcen_transport::quic::PierLaneRelay`, ADR 0014): every
 //! message lands on its own lane, a stalled video lane holds neither audio
@@ -375,6 +377,40 @@ async fn a_stalled_video_lane_holds_neither_audio_nor_input() {
 }
 
 #[tokio::test]
+async fn the_relay_reports_every_video_frame_it_is_done_with() {
+    let mut session = session().await;
+    attach(&mut session).await;
+    let mut relay = PierLaneRelay::start(&session.pier);
+    let mut released = relay.video_released();
+    assert_eq!(*released.borrow_and_update(), 0);
+    let mut video = PeerLaneReader::new(&session.deck, LaneRole::Video);
+
+    // A frame the lane takes is released once it is in the lane's queue.
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(video_frame(0, true, 1024))),
+        RelayRoute::Queued(LaneRole::Video)
+    );
+    timed(released.changed()).await.unwrap();
+    assert_eq!(*released.borrow_and_update(), 1);
+    assert_eq!(next_frame(&mut video).await[0], FrameType::VideoH264 as u8);
+
+    // A frame the relay drops is released at once.
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(vec![FrameType::VideoH264 as u8])),
+        RelayRoute::Dropped(LaneRole::Video)
+    );
+    assert_eq!(*released.borrow_and_update(), 2);
+
+    // Audio, cursor and control never count.
+    let _ = relay.route_to_deck(SessionRecord::Binary(audio_frame(20)));
+    let _ = relay.route_to_deck(SessionRecord::Text(
+        "{\"type\":\"server_hello\"}".to_owned(),
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(*released.borrow(), 2);
+}
+
+#[tokio::test]
 async fn a_replaced_input_lane_releases_held_input_and_keeps_forwarding() {
     let mut session = session().await;
     attach(&mut session).await;
@@ -493,6 +529,69 @@ async fn an_overflowing_clipboard_transfer_is_abandoned_visibly() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn usb_bridge_records_are_never_crowded_out_by_a_clipboard_transfer() {
+    use arcen_protocol::messages::{ClipboardContentKind, ClipboardDataMsg};
+    use arcen_protocol::wire::{ClipboardChunkHeader, encode_clipboard_chunk};
+
+    let mut session = session().await;
+    attach(&mut session).await;
+    let mut relay = PierLaneRelay::start(&session.pier);
+    // No Deck bulk lane yet: nothing drains, so the clipboard fills its
+    // backlog and starts dropping.
+    let offer = ClipboardDataMsg::new(9, ClipboardContentKind::TextUtf8, 400_000, false);
+    relay.route_to_deck(SessionRecord::Text(serde_json::to_string(&offer).unwrap()));
+    for chunk in 0..100_u32 {
+        let frame = encode_clipboard_chunk(
+            ClipboardChunkHeader {
+                kind: ClipboardContentKind::TextUtf8,
+                sequence: 9,
+                total_size: 400_000,
+                offset: chunk * 4_000,
+            },
+            &[b'a'; 4_000],
+        )
+        .unwrap();
+        relay.route_to_deck(SessionRecord::Binary(frame));
+    }
+    assert!(relay.stats().bulk_dropped > 0, "the clipboard overflowed");
+    // A USB host's submits and cancels still get through, all of them. The
+    // relay routes by the leading frame type alone, so a frame type and a
+    // sequence number stand in for the URB headers.
+    let mut sent = Vec::new();
+    for id in 1..=40_u32 {
+        let kind = if id % 2 == 0 {
+            arcen_protocol::wire::FrameType::UsbBridgeUrbCancel
+        } else {
+            arcen_protocol::wire::FrameType::UsbBridgeUrbSubmit
+        };
+        let mut frame = vec![kind as u8];
+        frame.extend_from_slice(&id.to_le_bytes());
+        assert_eq!(
+            relay.route_to_deck(SessionRecord::Binary(frame.clone())),
+            RelayRoute::Queued(LaneRole::BulkAux),
+            "USB record {id}"
+        );
+        sent.push(frame);
+    }
+    assert_eq!(relay.stats().usb_records, 40);
+    // Once the Deck's bulk lane opens, every USB record arrives, in order.
+    let mut deck_bulk = deck_lane(&session.deck, LaneRole::BulkAux).await;
+    let mut received = Vec::new();
+    while received.len() < sent.len() {
+        if let SessionRecord::Binary(bytes) = timed(deck_bulk.reader.next_record()).await.unwrap() {
+            if bytes
+                .first()
+                .is_some_and(|kind| (0x40..=0x42).contains(kind))
+            {
+                received.push(bytes);
+            }
+        }
+    }
+    assert_eq!(received, sent);
+    assert_eq!(relay.stats().usb_dropped, 0);
 }
 
 /// Every wire message of one clipboard transfer as the shared sender frames
@@ -650,4 +749,166 @@ async fn ending_the_attachment_ends_the_relay_with_input_released() {
         }
     }
     assert!(released);
+}
+
+fn agent_cursor_record(sequence: u64, id: u32) -> Vec<u8> {
+    use arcen_protocol::cursor::{
+        CursorAppearance, CursorImageId, CursorImageRef, CursorUpdate, encode_cursor_update,
+    };
+    let mut png = arcen_protocol::wire::PNG_MAGIC.to_vec();
+    png.resize(200, 3);
+    encode_cursor_update(&CursorUpdate {
+        sequence,
+        output: 0,
+        generation: 0,
+        fallback: arcen_protocol::messages::CursorShapeKind::Crosshair,
+        appearance: CursorAppearance::Image(CursorImageRef {
+            id: CursorImageId::new(id).unwrap(),
+            width: 32,
+            height: 32,
+            hotspot_x: 15,
+            hotspot_y: 15,
+            inline_png: Some(png),
+        }),
+    })
+    .unwrap()
+}
+
+async fn next_cursor_update(lane: &mut SessionLane) -> arcen_protocol::cursor::CursorUpdate {
+    match timed(lane.reader.next_record()).await.unwrap() {
+        SessionRecord::Binary(bytes) => {
+            arcen_protocol::cursor::decode_cursor_update(&bytes).unwrap()
+        }
+        other => panic!("expected a cursor record, got {other:?}"),
+    }
+}
+
+fn inline(update: &arcen_protocol::cursor::CursorUpdate) -> bool {
+    matches!(
+        &update.appearance,
+        arcen_protocol::cursor::CursorAppearance::Image(image) if image.inline_png.is_some()
+    )
+}
+
+#[tokio::test]
+async fn cursor_images_cross_the_input_lane_once_per_lane() {
+    let mut session = session().await;
+    attach(&mut session).await;
+    let mut relay = PierLaneRelay::start(&session.pier);
+    let mut deck_input = deck_lane(&session.deck, LaneRole::InputCursor).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(agent_cursor_record(10, 4))),
+        RelayRoute::Queued(LaneRole::InputCursor)
+    );
+    let first = next_cursor_update(&mut deck_input).await;
+    assert!(inline(&first));
+    assert_eq!(first.sequence, 1);
+    relay.route_to_deck(SessionRecord::Binary(agent_cursor_record(11, 4)));
+    let second = next_cursor_update(&mut deck_input).await;
+    assert!(!inline(&second), "the Deck already holds image 4");
+    assert_eq!(second.sequence, 2);
+
+    // A visible record without its image cannot be completed.
+    let mut reference = agent_cursor_record(12, 9);
+    reference.truncate(arcen_protocol::cursor::CURSOR_UPDATE_HEADER_SIZE);
+    reference[2] &= !0x02;
+    reference[32..36].copy_from_slice(&0u32.to_be_bytes());
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(reference)),
+        RelayRoute::Dropped(LaneRole::InputCursor)
+    );
+    assert_eq!(relay.stats().cursor_records_refused, 1);
+
+    // A replacement lane (the Pier fails this one; the Deck reopens): the
+    // Deck starts with an empty cache and gets the current cursor again,
+    // image included.
+    deck_input
+        .sender
+        .send(session_record_bytes(&SessionRecord::Text(
+            "{\"type\":\"quality_settings\"}".to_owned(),
+        )))
+        .await
+        .unwrap();
+    let exit = timed(async {
+        loop {
+            tokio::select! {
+                record = deck_input.reader.next_record() => {
+                    if let Err(exit) = record {
+                        break exit;
+                    }
+                }
+                _ = relay.next_event() => {}
+            }
+        }
+    })
+    .await;
+    let LaneRecoveryStep::Reopened { lane, .. } =
+        timed(follow_lane_exit(&session.deck, &exit)).await
+    else {
+        panic!("the Deck reopens its input lane");
+    };
+    let mut replacement = SessionLane::split(lane).unwrap();
+    let resent = timed(async {
+        loop {
+            tokio::select! {
+                record = replacement.reader.next_record() => break record.unwrap(),
+                _ = relay.next_event() => {}
+            }
+        }
+    })
+    .await;
+    let SessionRecord::Binary(bytes) = resent else {
+        panic!("expected a cursor record");
+    };
+    let resent = arcen_protocol::cursor::decode_cursor_update(&bytes).unwrap();
+    assert!(inline(&resent));
+    assert_eq!(resent.sequence, 3);
+    assert_eq!(relay.stats().cursor_records, 3);
+}
+
+#[tokio::test]
+async fn host_pointer_positions_cross_the_input_lane_renumbered_newest_first() {
+    use arcen_protocol::cursor_position::{
+        CursorPosition, decode_cursor_position, encode_cursor_position,
+    };
+    let mut session = session().await;
+    attach(&mut session).await;
+    let mut relay = PierLaneRelay::start(&session.pier);
+    let mut deck_input = deck_lane(&session.deck, LaneRole::InputCursor).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let agent = |sequence, x| {
+        encode_cursor_position(&CursorPosition {
+            sequence,
+            on_stream: true,
+            output: 0,
+            generation: 0,
+            monitor_id: 0,
+            x,
+            y: 540,
+            space_width: 1920,
+            space_height: 1080,
+        })
+        .unwrap()
+        .to_vec()
+    };
+    for (sequence, x) in [(500, 100), (501, 200)] {
+        assert_eq!(
+            relay.route_to_deck(SessionRecord::Binary(agent(sequence, x))),
+            RelayRoute::Queued(LaneRole::InputCursor)
+        );
+    }
+    for (sequence, x) in [(1, 100), (2, 200)] {
+        let SessionRecord::Binary(bytes) = timed(deck_input.reader.next_record()).await.unwrap()
+        else {
+            panic!("a position record");
+        };
+        let position = decode_cursor_position(&bytes).unwrap();
+        assert_eq!((position.sequence, position.x), (sequence, x));
+    }
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(vec![0x51, 1, 0])),
+        RelayRoute::Dropped(LaneRole::InputCursor)
+    );
 }
