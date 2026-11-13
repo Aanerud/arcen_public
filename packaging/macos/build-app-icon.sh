@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Regenerate packaging/macos/AppIcon.icns from AppIcon.svg.
 #
 # The .icns is committed so an ordinary Deck build needs no SVG toolchain, but

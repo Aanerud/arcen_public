@@ -1,15 +1,24 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The stdout of a Wayland epoch, shared by every pipeline (the NVENC
 //! eight-bit runner, the wide Grading/HDR runner and the OpenH264 runner).
 //!
 //! The parent chooses the framing: framed-v1 (`u32_be length || access
 //! unit`) or, for a metadata cursor stream whose cursor the Deck draws,
 //! framed-v2 (`arcen_media::capenc_stream`), which also carries the
-//! stream's cursor events. The parent reads exactly what it asked for, so a
-//! pipeline must never write framed-v1 to a framed-v2 parent.
+//! stream's cursor events and, when asked (`cursor-position`), where the
+//! pointer is whenever it moved (Mutter's cursor metadata carries the
+//! position with every update; the parent reports host-caused motion to a
+//! Deck that draws its cursor at host positions). The parent reads exactly
+//! what it asked for, so a pipeline must never write framed-v1 to a
+//! framed-v2 parent.
 
 use std::io::Write;
 
-use arcen_media::capenc_stream::{encode_cursor_event, write_record, CapencRecordKind};
+use arcen_media::capenc_stream::{
+    encode_cursor_event, encode_cursor_position, write_record, CapencCursorPosition,
+    CapencRecordKind,
+};
 use arcen_media::video::CursorEvidence;
 
 use super::EpochRequest;
@@ -27,6 +36,8 @@ pub(super) struct EpochOutput {
     framed_v2: bool,
     cursor: Option<CursorEmitter>,
     cursor_events_sent: u64,
+    /// The last position written, when positions are reported.
+    positions: Option<Option<CapencCursorPosition>>,
 }
 
 impl EpochOutput {
@@ -39,6 +50,10 @@ impl EpochOutput {
             cursor: (request.framed_v2 && matches!(cursor, CursorEvidence::SeparateMetadata))
                 .then(CursorEmitter::default),
             cursor_events_sent: 0,
+            positions: (request.framed_v2
+                && request.cursor_position
+                && matches!(cursor, CursorEvidence::SeparateMetadata))
+            .then_some(None),
         }
     }
 
@@ -69,17 +84,33 @@ impl EpochOutput {
         writer: &mut impl Write,
         state: &CursorState,
     ) -> std::io::Result<()> {
-        let Some(event) = self.cursor.as_mut().and_then(|emitter| emitter.poll(state)) else {
-            return Ok(());
-        };
-        write_record(
-            writer,
-            CapencRecordKind::Cursor,
-            &encode_cursor_event(&event),
-        )?;
-        self.cursor_events_sent += 1;
-        if self.cursor_events_sent <= LOGGED_CURSOR_EVENTS {
-            log(&format!("cursor event {} {event}", self.cursor_events_sent));
+        if let Some(event) = self.cursor.as_mut().and_then(|emitter| emitter.poll(state)) {
+            write_record(
+                writer,
+                CapencRecordKind::Cursor,
+                &encode_cursor_event(&event),
+            )?;
+            self.cursor_events_sent += 1;
+            if self.cursor_events_sent <= LOGGED_CURSOR_EVENTS {
+                log(&format!("cursor event {} {event}", self.cursor_events_sent));
+            }
+        }
+        if let Some(last) = self.positions.as_mut() {
+            if state.metadata_seen {
+                let position = CapencCursorPosition {
+                    on_output: state.visible,
+                    x: state.position.0,
+                    y: state.position.1,
+                };
+                if *last != Some(position) {
+                    *last = Some(position);
+                    write_record(
+                        writer,
+                        CapencRecordKind::CursorPosition,
+                        &encode_cursor_position(&position),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -161,6 +192,45 @@ mod tests {
         assert!(!decode_cursor_event(&records[1].1).unwrap().on_output);
         assert_eq!(records[2].0, CapencRecordKind::AccessUnit);
         assert_eq!(output.cursor_events_sent(), 1);
+    }
+
+    #[test]
+    fn positions_go_out_only_when_asked_and_only_when_they_moved() {
+        use arcen_media::capenc_stream::decode_cursor_position;
+        let state = |x| CursorState {
+            metadata_seen: true,
+            visible: true,
+            id: 1,
+            position: (x, 7),
+            ..CursorState::default()
+        };
+        let mut unasked = EpochOutput::new(
+            &request(&["framed-v2", "cursor=local"]),
+            CursorEvidence::SeparateMetadata,
+        );
+        let mut stdout = Vec::new();
+        unasked.cursor(&mut stdout, &state(1)).unwrap();
+        unasked.cursor(&mut stdout, &state(2)).unwrap();
+        assert!(records(&stdout)
+            .iter()
+            .all(|(kind, _)| *kind == CapencRecordKind::Cursor));
+
+        let mut output = EpochOutput::new(
+            &request(&["framed-v2", "cursor=local", "cursor-position"]),
+            CursorEvidence::SeparateMetadata,
+        );
+        let mut stdout = Vec::new();
+        output.cursor(&mut stdout, &state(1)).unwrap();
+        output.cursor(&mut stdout, &state(1)).unwrap();
+        output.cursor(&mut stdout, &state(5)).unwrap();
+        let positions = records(&stdout)
+            .into_iter()
+            .filter(|(kind, _)| *kind == CapencRecordKind::CursorPosition)
+            .map(|(_, body)| decode_cursor_position(&body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 2);
+        assert_eq!((positions[1].x, positions[1].y), (5, 7));
+        assert!(positions[1].on_output);
     }
 
     #[test]

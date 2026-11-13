@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Translating Keel's damage grid into codec-specific QP delta maps.
 //!
 //! Keel produces a uniform 16x16 damage grid ([`arcen_keel::BLOCK_SIZE`]).

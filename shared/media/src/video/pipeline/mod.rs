@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared stream-pipeline contracts.
 //!
 //! Each user-visible pipeline owns a complete data contract here. Platform
@@ -23,6 +25,8 @@ mod auto;
 mod grading;
 mod hdr;
 mod software;
+
+pub use software::FidelityRefusal;
 mod speed;
 
 /// Stable pipeline identity known by this build.
@@ -405,6 +409,34 @@ pub fn software_fallback_decision(
     selection: VideoSelectionIntent,
 ) -> SoftwareFallbackDecision {
     software::fallback_decision(requested, selection)
+}
+
+/// [`software_fallback_decision`] once the hardware encoder has reported why
+/// it is unavailable: a fidelity refusal names that cause (a desktop it cannot
+/// capture, no free session, no usable device/driver/licence, …) instead of
+/// only saying that software cannot serve the request.
+#[must_use]
+pub fn software_fallback_decision_after_hardware(
+    requested: Option<PipelineId>,
+    selection: VideoSelectionIntent,
+    cause: super::BackendUnavailableReason,
+) -> SoftwareFallbackDecision {
+    software::fallback_decision_after_hardware(requested, selection, cause)
+}
+
+/// The message a software-only fallback refuses a fidelity request with,
+/// led by its [`FidelityRefusal`] code (`gpu_sessions_in_use: Grading
+/// refused: …`), or `None` when the request may be served. `cause` is the
+/// hardware encoder's typed reason; `None` means no hardware encoder was
+/// tried. At most 140 bytes, so a Deck's 240-character message bound keeps it
+/// whole behind its own prefix.
+#[must_use]
+pub fn coded_fidelity_refusal(
+    requested: Option<PipelineId>,
+    selection: VideoSelectionIntent,
+    cause: Option<super::BackendUnavailableReason>,
+) -> Option<String> {
+    software::coded_refusal(requested, selection, cause)
 }
 
 /// Encoder keyframe cadence policy for a served pipeline.
@@ -940,7 +972,9 @@ fn product_contract_matches(
         && final_video.range == contract.colour.range
         && final_video.matrix == contract.colour.matrix
         && final_video.primaries == contract.colour.primaries
-        && final_video.transfer == contract.colour.transfer
+        && final_video
+            .transfer
+            .serves_request(contract.colour.transfer)
         && codec_policy_allows(contract.codec_policy, final_video.codec)
 }
 
@@ -1115,6 +1149,21 @@ mod tests {
             ),
             ServedStreamPipeline::Grading,
             "a final stream that exactly matches a product contract names it"
+        );
+        let srgb_grading = VideoConfiguration {
+            transfer: TransferCharacteristics::Srgb,
+            ..grading_reference()
+        };
+        assert_eq!(
+            served_pipeline(
+                Some(PipelineId::Grading),
+                srgb_grading,
+                30,
+                MotionPriority::Detail,
+                hardware_context()
+            ),
+            ServedStreamPipeline::Grading,
+            "Grading that keeps the desktop's sRGB code values is still Grading"
         );
         assert_eq!(
             served_pipeline(
@@ -1474,6 +1523,126 @@ mod tests {
             software_fallback_decision(None, VideoSelectionIntent::ColorFidelity),
             SoftwareFallbackDecision::Refuse { .. }
         ));
+    }
+
+    #[test]
+    fn a_fidelity_refusal_after_the_hardware_encoder_names_its_cause() {
+        use crate::video::BackendUnavailableReason as Cause;
+        let causes = [
+            Cause::NotBuilt,
+            Cause::RuntimeMissing,
+            Cause::HardwareUnavailable,
+            Cause::SessionLimit,
+            Cause::UnsupportedDisplay,
+            Cause::UnsupportedConfiguration,
+        ];
+        let requests = [
+            (
+                Some(PipelineId::Grading),
+                VideoSelectionIntent::ColorFidelity,
+                "Grading",
+            ),
+            (
+                Some(PipelineId::Hdr),
+                VideoSelectionIntent::ColorFidelity,
+                "HDR",
+            ),
+            (None, VideoSelectionIntent::ColorFidelity, "Colour fidelity"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (requested, selection, what) in requests {
+            for cause in causes {
+                let decision =
+                    software_fallback_decision_after_hardware(requested, selection, cause);
+                assert!(decision.is_refusal());
+                let reason = decision.reason();
+                assert!(reason.starts_with(what), "{reason}");
+                // `close_with_reason` keeps 120 bytes: the cause must survive.
+                assert!(reason.len() <= 120, "{} bytes: {reason}", reason.len());
+                assert!(seen.insert(reason), "duplicate: {reason}");
+            }
+        }
+        assert!(
+            software_fallback_decision_after_hardware(
+                Some(PipelineId::Grading),
+                VideoSelectionIntent::ColorFidelity,
+                Cause::UnsupportedDisplay
+            )
+            .reason()
+            .contains("cannot capture this desktop")
+        );
+        // Requests software can serve are unchanged by the cause.
+        assert_eq!(
+            software_fallback_decision_after_hardware(
+                Some(PipelineId::Speed),
+                VideoSelectionIntent::AdaptivePerformance,
+                Cause::HardwareUnavailable
+            ),
+            software_fallback_decision(
+                Some(PipelineId::Speed),
+                VideoSelectionIntent::AdaptivePerformance
+            )
+        );
+    }
+
+    #[test]
+    fn a_coded_fidelity_refusal_leads_with_the_cause_it_names() {
+        use super::super::BackendUnavailableReason as Cause;
+        let causes = [
+            None,
+            Some(Cause::NotBuilt),
+            Some(Cause::RuntimeMissing),
+            Some(Cause::HardwareUnavailable),
+            Some(Cause::SessionLimit),
+            Some(Cause::UnsupportedDisplay),
+            Some(Cause::UnsupportedConfiguration),
+        ];
+        let mut codes = std::collections::HashSet::new();
+        for cause in causes {
+            let refusal = FidelityRefusal::after_hardware(cause);
+            assert!(codes.insert(refusal.code()), "one code per cause");
+            for (requested, selection) in [
+                (
+                    Some(PipelineId::Grading),
+                    VideoSelectionIntent::ColorFidelity,
+                ),
+                (Some(PipelineId::Hdr), VideoSelectionIntent::ColorFidelity),
+                (None, VideoSelectionIntent::ColorFidelity),
+            ] {
+                let message = coded_fidelity_refusal(requested, selection, cause)
+                    .expect("a fidelity request is refused");
+                let sentence = match cause {
+                    Some(cause) => {
+                        software_fallback_decision_after_hardware(requested, selection, cause)
+                    }
+                    None => software_fallback_decision(requested, selection),
+                }
+                .reason();
+                assert_eq!(message, format!("{}: {sentence}", refusal.code()));
+                assert!(message.len() <= 140, "{message}");
+            }
+            assert_eq!(
+                coded_fidelity_refusal(
+                    Some(PipelineId::Speed),
+                    VideoSelectionIntent::AdaptivePerformance,
+                    cause
+                ),
+                None,
+                "Speed degrades, it is never refused"
+            );
+        }
+        assert_eq!(codes.len(), FidelityRefusal::ALL.len());
+        assert!(
+            coded_fidelity_refusal(
+                Some(PipelineId::Grading),
+                VideoSelectionIntent::ColorFidelity,
+                Some(Cause::SessionLimit)
+            )
+            .unwrap()
+            .starts_with(
+                "gpu_sessions_in_use: Grading refused: every GPU encoder session is in use"
+            )
+        );
     }
 
     #[test]

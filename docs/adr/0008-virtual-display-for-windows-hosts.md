@@ -19,7 +19,7 @@ That machinery is `display.rs` (6,532 lines), `recovery.rs` (1,540) and
 sign-out stranded a journal, and every later session was refused with an
 instruction to run `arcen-pier restore-display` — a command that needs an
 interactive desktop and therefore cannot be run on a host reachable only through
-the product that had just refused. Fixed in `16fda25` and `03bf431` by restoring
+the product that had just refused. Fixed by restoring
 automatically and setting an unapplicable journal aside, but the class of problem
 is structural: we break something global and promise to put it back.
 
@@ -32,7 +32,7 @@ mutated, so there is nothing to restore.
 **A virtual display does not create sessions.** The one-interactive-desktop
 limit on client SKUs is enforced by `termsrv.dll` as licensing policy; a display
 driver creates monitors inside a session and cannot grant new ones. The session
-takeover in `2d72589` and the credential-provider scenario handling in `fa0135d`
+takeover and the credential-provider scenario handling
 remain necessary and unaffected. Multi-session means Windows Server with the RDS
 role, or Azure Virtual Desktop.
 

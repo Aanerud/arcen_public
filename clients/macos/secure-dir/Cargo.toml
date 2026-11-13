@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-secure-dir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Root-owned directories a non-root user cannot redirect, pinned by descriptor, for Arcen's privileged macOS helper."
+
+# Linked into the root USB helper (ADR 0011): one dependency, no unsafe code.
+[dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

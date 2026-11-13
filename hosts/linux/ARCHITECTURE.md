@@ -17,7 +17,7 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
   - **Dedicated Xorg per session on its own GPU head + logind seat activation** is the
     correct per-user model (matches the established per-session launcher model:
     launch a dedicated Xorg config with `OutputClass` + `ActivateSessionOnSeat`). The
-    "gnome-session on the shared root-owned `:0`" path is **wrong** — jc's logind session is
+    "gnome-session on the shared root-owned `:0`" path is **wrong** — the user's logind session is
     `Active=no`, mutter fails `meta_later_add: assertion 'display' failed`, GNOME crash-loops
     ("Oh no…"). Proven live on pier-linux.example.internal: a dedicated `:10` on head DVI-D-1 streamed a real
     per-user desktop. **This is the top Linux Pier follow-up** — earlier analysis captured it as the
@@ -48,7 +48,7 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
 
 1. Depends on `arcen-capenc`, `arcen-input`, `arcen-media`, `arcen-protocol`,
    `arcen-session`, and `arcen-telemetry`; spawns `current_exe() capenc` as a
-   subprocess. Never depends on the Windows Pier or the gateway.
+   subprocess. Never depends on the Windows Pier.
 2. Linux-only deps (`pam-client2`, `evdev`, `nix`, `x11rb`) stay behind
    `cfg(target_os = "linux")` so protocol/transport unit tests still run on the macOS dev box.
 3. `unsafe` allowed (~49 sites: uinput, nvctrl, identity syscalls) but scoped.
@@ -218,8 +218,11 @@ encoded frame. Depth-30 XShm captures root-window pixels and has no host-cursor
 compositor, so the Pier moves a Host request to Local before both the native
 preflight probe and the live child spawn. Eight-bit NvFBC keeps Host unchanged.
 Pier rejects mismatched or missing READY metadata and sends the degraded cursor
-result before media. No raster compositor or X11 cursor-shape dependency is
-introduced.
+result before media. No raster compositor is introduced. With a local cursor
+and a Deck that declared `cursor_image_v1`, the Pier's X11 cursor watcher
+(`cursor_watcher.rs`) reads the desktop's cursor images and names through
+XFixes, hands them to the shared `arcen_input::cursor::HostCursor` and sends
+`CursorUpdate` records on the input lane; an older Deck keeps named shapes.
 
 ## Region-scoped input
 
@@ -328,6 +331,29 @@ keyboard-off mode with `DontVTSwitch`/`-novtswitch`, so while it owns the
 screen the kernel acts on no other combination (no Ctrl+Alt+Del, no
 Alt+F*n* or Ctrl+Alt+F*n* console switch) except a secure-attention key if the
 console keymap binds one.
+
+## Committed text on Xorg (0.18.0)
+
+The Pier advertises `text_commit` for an Xorg session, so the Deck's input
+method, its Characters mode and Paste as Keystrokes reach it as characters
+(`TextCommitMsg` on the input/cursor lane). `input/x11_text.rs` types each
+character through the session's uinput keyboard by the shared
+`arcen_input::text::route_char` rule, against the X server's own keymap and
+active group:
+
+- **By key** when the active group has the character at the base, Shift,
+  `AltGr` or Shift+`AltGr` level (the last two only with an
+  `ISO_Level3_Shift` key) and no key is held.
+- **By a borrowed key** otherwise: one of F13–F24 or two Japanese keys,
+  only while the server maps nothing to them, is mapped to the character's
+  keysym at both levels for as long as it is needed and given back after two
+  idle seconds. Keys the kernel or logind act on (power, sleep, `SysRq`) are
+  never borrowed.
+
+Caps Lock is turned off around a commit with cased characters and back on
+after. The text is never logged, only counts. A Wayland session types
+committed text through its own route (`hosts/linux/AGENTS.md`, "Headless
+Wayland session").
 
 ## Clipboard redirection
 
@@ -474,7 +500,7 @@ crash remains non-resumable and relies on
 the existing PDEATHSIG/drop-recovery boundaries; no resume key or slot is
 durable.
 
-This surface adds no Gateway/Span, OIDC, entitlement, licensing, mTLS, 0-RTT,
+This surface adds no OIDC, entitlement, licensing, mTLS, 0-RTT,
 host-address binding, persistence, network fetch, or protocol-version bump. The
 owning contract and complete ordering are in
 [`../../docs/architecture/session-auto-reconnect.md`](../../docs/architecture/session-auto-reconnect.md).
@@ -741,14 +767,14 @@ hostname.
   (`203.0.113.10:18444/udp`, `arcen-pier.service`). The **dedicated-Xorg-per-session model**
   was migrated and deployed: `--session-gpu-head DFP-2 /
   :11`, `/etc/arcen/xorg.conf` template, `/run/arcen/sessions`, `--desktop-session gnome`.
-  **User logged in as `jc` and streamed a real per-user GNOME desktop end-to-end.** Earlier
+  **User logged in as `artist` and streamed a real per-user GNOME desktop end-to-end.** Earlier
   shared-`:0` proof also passed (TLS 1.3, WS 101, `frames_sent=7`, NvFBC→NVENC). Remaining:
   multi-monitor (up to 4 heads) end-to-end. Linux Keel idle cadence and
-  structured INFO telemetry are implemented offline; the live GRID
-  idle/4K60/modeset checklist remains pending reviewer validation. The
-  source-built software fallback is now implemented offline; physical
-  dedicated-Xorg fallback, Deck, performance/allocation, and soak validation
-  remains pending and is not inferred from the earlier NVENC evidence.
+  structured INFO telemetry are implemented; a live GRID idle/4K60/modeset
+  measurement has not been recorded. The source-built software fallback is
+  implemented; physical dedicated-Xorg fallback, performance/allocation and
+  soak measurements have not been recorded and are not inferred from the
+  earlier NVENC evidence.
 - **Original next step (done):** copy `hosts/linux/src` + `Cargo.toml` into `hosts/linux`, rename crate →
   `arcen-pier-linux`, lib `arcen_pier_linux`, bin `arcen-pier` (+ session-launcher/agent),
   fold audiocap/input_helper bins, imports → `arcen_protocol`; the historical
@@ -822,7 +848,14 @@ encoder. The measured GRID visual is `XBGR2101010`
 
 The wide path converts directly from the host XShm mapping into MSB-aligned
 YUV444 P16 or P010 storage, then performs one host-to-device upload. It reports
-`capture=xshm capture_zero_copy=false`. A 2560×1600 continuous-motion
+`capture=xshm capture_zero_copy=false`. Because every frame is copied and
+converted on the CPU, the path is budgeted in pixels — one 3840×2160 frame,
+edges up to 8192 (`arcen_media::video::host_converted_capture_fits`) — not a
+3840 by 2160 box, which refused a 3600×2262 Retina desktop. The Pier fits a
+ten-bit session's geometry to that budget before it arms the display, on
+connect and on a live resize (`fit_to_capture_limits`, `resize_target`), and
+capenc's no-frame native probe, which runs before that modeset, probes a
+budget-sized part of a desktop that is still larger. A 2560×1600 continuous-motion
 Grading Reference run held 30–31 fps on the lab host. Sampling the live source
 found 18,124 of 95,850 RGB components outside the eight-bit expansion grid.
 

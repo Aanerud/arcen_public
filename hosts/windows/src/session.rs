@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,7 +98,11 @@ const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const CONTROL_QUEUE_CAPACITY: usize = 8;
 const VIDEO_QUEUE_CAPACITY: usize = 4;
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
-const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+use arcen_session::setup_budget::AGENT_READY_TIMEOUT;
+/// This agent's setup deadline (one session per agent process); every setup
+/// wait is bounded by it so the agent refuses before the broker gives up.
+pub(crate) static AGENT_SETUP: arcen_session::setup_budget::SetupDeadline =
+    arcen_session::setup_budget::SetupDeadline::new();
 const AGENT_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTHENTICATED_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(30);
 const PREVIOUS_TOPOLOGY_SETTLE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -140,6 +147,9 @@ pub struct BrokerAgentLease {
     admission: Arc<crate::session_admission::SessionAdmissionRuntime>,
     controls: watch::Sender<AgentControl>,
     active_log: RwLock<Option<ActiveAgentLogRegistration>>,
+    /// The QUIC connection of the attachment that holds the display, so a
+    /// same-user newcomer can prove it silent and displace it.
+    incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
 }
 
 struct BrokerAgentPermit {
@@ -250,6 +260,33 @@ enum AuthenticationRoute {
     WindowsCredential,
 }
 
+/// Why a same-user sign-in is refused while its own live Deck holds the
+/// display.
+const SAME_USER_LIVE_ATTACHMENT_REASON: &str =
+    "The Windows display is in use by another Deck signed in as this user. Disconnect it first.";
+
+/// Whether a same-user sign-in that found the display held may wait for it,
+/// given what proving the incumbent attachment's peer found
+/// (`IncumbentAttachment::displace_if_silent`). A silent or closed incumbent
+/// hands the desktop over at once; a live one keeps it.
+fn same_user_takeover_admission(
+    incumbent: arcen_transport::quic::IncumbentOutcome,
+) -> Result<(), &'static str> {
+    if incumbent.slot_may_free() {
+        Ok(())
+    } else {
+        Err(SAME_USER_LIVE_ATTACHMENT_REASON)
+    }
+}
+
+/// Resolves when `incumbent` is marked displaced; never without one.
+async fn wait_displaced(incumbent: Option<&arcen_transport::quic::IncumbentRegistration>) {
+    match incumbent {
+        Some(incumbent) => incumbent.wait_displaced().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn authentication_route(response: &AuthResponse) -> AuthenticationRoute {
     if response.method == AUTH_METHOD_RESUME {
         AuthenticationRoute::ResumeRegistry
@@ -308,6 +345,7 @@ impl BrokerAgentLease {
             admission: crate::session_admission::SessionAdmissionRuntime::new(),
             controls,
             active_log: RwLock::new(None),
+            incumbent: Arc::new(arcen_transport::quic::IncumbentAttachment::new()),
         }
     }
 
@@ -1065,11 +1103,30 @@ async fn run_correlated_broker(
         FreshAuthenticatedReconnectDecision::StartNewSession => match agent_lease.try_acquire() {
             Ok(permit) => permit,
             Err(error) if agent_lease.active_log_matches_user(&native_user_sid)? => {
+                let incumbent = agent_lease
+                    .incumbent
+                    .displace_if_silent(
+                        &native_user_sid,
+                        arcen_transport::liveness::PEER_SILENCE_PROOF,
+                    )
+                    .await;
+                if let Err(refusal) = same_user_takeover_admission(incumbent) {
+                    tracing::warn!(
+                        target: SESSION,
+                        %peer,
+                        windows_session_id = identity.session_id,
+                        incumbent = incumbent.token(),
+                        "same-user sign-in refused: the attached Deck is alive"
+                    );
+                    send_session_setup_failure(&mut ws, refusal).await?;
+                    return Ok(());
+                }
                 tracing::info!(
                     target: SESSION,
                     %peer,
                     windows_session_id = identity.session_id,
-                    "same authenticated Windows user is taking over detached session before resume registry detach is visible"
+                    incumbent = incumbent.token(),
+                    "same authenticated Windows user is taking over its attached session from a silent Deck"
                 );
                 match agent_lease
                     .acquire_after_authenticated_takeover(AUTHENTICATED_TAKEOVER_TIMEOUT)
@@ -1318,6 +1375,9 @@ async fn run_correlated_broker(
             windows_domain = %identity.domain,
             "authenticated broker session is relaying to per-session agent"
         );
+        let incumbent = ws
+            .path_signal_connection()
+            .map(|connection| agent_lease.incumbent.register(&native_user_sid, connection));
         let result = if let Some(commands) = resume_commands.as_mut() {
             relay_resumable_client_and_agent(
                 ws,
@@ -1330,6 +1390,7 @@ async fn run_correlated_broker(
                 &resume_registry,
                 cfg.reconnect_window_secs,
                 &mut session_shutdown,
+                incumbent.as_ref(),
             )
             .await
         } else {
@@ -1671,6 +1732,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let start_text = recv_text(&mut ws, AGENT_START_TIMEOUT).await?;
+    AGENT_SETUP.begin(std::time::Instant::now());
     let start: AgentStart = serde_json::from_str(&start_text)
         .map_err(|error| format!("decode session agent start: {error}"))?;
     if start.msg_type != AgentStart::TYPE {
@@ -1685,6 +1747,7 @@ where
     if start.log_control.msg_type != AgentControl::TYPE {
         return Err("agent start has an invalid private log control".to_string());
     }
+    crate::latest::set_video_backlog_legacy(start.video_backlog_legacy);
     let initial_profile =
         arcen_telemetry::OperationalProfile::try_from(start.log_control.profile_level)
             .map_err(|error| format!("agent start log control: {error}"))?;
@@ -1716,6 +1779,13 @@ where
             return Err(error);
         }
     };
+    // A fresh sign-in starts this agent while LogonUI still owns the session's
+    // input desktop, and Windows refuses display changes from a process whose
+    // desktop is not the input desktop (`SetDisplayConfig` returns
+    // ERROR_ACCESS_DENIED, NVAPI reports a generic error). Wait for the same
+    // evidence capture waits for before the first display change; capture's
+    // own wait then returns at once for this session.
+    crate::capenc::wait_for_input_desktop_ready(&expected_session_log_id).await;
     // Held for the agent's whole session; dropping it at agent exit restores
     // the user's text smoothing.
     #[cfg(windows)]
@@ -1970,6 +2040,32 @@ fn apply_resolved_display_hdr_to_request(cfg: &HostConfig, request: &mut Display
     desired_hdr
 }
 
+/// The refresh an HDR10 display of this size is created at.
+///
+/// A 10-bit mode whose deep-colour TMDS rate exceeds the HDR10 EDID's link is
+/// still offered as SDR, and Windows then never publishes HDR on it: the agent
+/// waited for an HDR state that could not arrive until the broker gave up and
+/// terminated it (a Retina 3600x2260@60 Deck). The shared rule steps down to a
+/// whole multiple of the HDR stream rate, so the stream itself is unchanged;
+/// a size no such refresh can carry is refused before any display changes.
+fn hdr_stream_fps(configured_fps: u32) -> u32 {
+    configured_fps.clamp(
+        1,
+        arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Hdr).max_fps,
+    )
+}
+
+fn hdr10_display_refresh_hz(
+    configured_fps: u32,
+    width: u32,
+    height: u32,
+    requested_hz: u32,
+) -> Result<u32, String> {
+    let stream_fps = hdr_stream_fps(configured_fps);
+    crate::edid::hdr10_refresh_hz(width, height, requested_hz.max(1), stream_fps)
+        .map_err(|error| arcen_session::setup_budget::HdrSetupRefusal::LinkExceeded.message(&error))
+}
+
 fn physical_topology_settled(
     inventory: &crate::multi_monitor_topology::PhysicalOutputInventory,
     expected_outputs: usize,
@@ -2079,7 +2175,16 @@ where
     // function answering "what did this client ask for", on both sides of the
     // process boundary.
     if let Some(request) = response.initial_video.as_ref() {
-        if let Err(error) = cfg.apply_initial_video_request_for_encoder(request, display_encoder) {
+        // An Auto host that resolved to OpenH264 before any NVENC child ran
+        // did so for a hardware reason a fidelity refusal names.
+        let auto_software_cause = (cfg.encoder == crate::capenc::EncoderSelection::Auto
+            && display_encoder == crate::capenc::EncoderSelection::SoftwareH264)
+            .then(auto_software_cause);
+        if let Err(error) = cfg.apply_initial_video_request_for_encoder_after(
+            request,
+            display_encoder,
+            auto_software_cause,
+        ) {
             let error = format!("agent video request rejected: {error}");
             send_agent_failure(&mut ws, &error).await;
             return Err(error);
@@ -2094,6 +2199,7 @@ where
     }
     let authoritative_timezone = response.timezone.clone();
     let authoritative_cursor = response.cursor_preference;
+    let authoritative_cursor_images = response.cursor_image_v1;
     let multi_monitor_quality = response
         .multi_monitor_v1
         .as_ref()
@@ -2161,10 +2267,31 @@ where
             let contracts = requested_monitors
                 .iter()
                 .map(|requested| {
+                    let refresh_hz = requested.refresh_hz.max(1);
+                    if hdr10 {
+                        // A multi-monitor topology is admitted at the exact
+                        // refresh the Deck asked for, so refuse rather than
+                        // change it.
+                        let fitted = hdr10_display_refresh_hz(
+                            cfg.fps,
+                            requested.width_px,
+                            requested.height_px,
+                            refresh_hz,
+                        )?;
+                        if fitted != refresh_hz {
+                            return Err(arcen_session::setup_budget::HdrSetupRefusal::LinkExceeded
+                                .message(&format!(
+                                    "HDR10 cannot be shown at {}x{}@{refresh_hz} on this \
+                                     host's virtual display link (it fits at {fitted} Hz); \
+                                     request a single display or a lower refresh",
+                                    requested.width_px, requested.height_px
+                                )));
+                        }
+                    }
                     Ok(crate::nvapi_headless::HeadlessDisplayContract {
                         width: requested.width_px,
                         height: requested.height_px,
-                        refresh_hz: requested.refresh_hz.max(1),
+                        refresh_hz,
                         width_mm: requested.width_mm,
                         height_mm: requested.height_mm,
                         scale: arcen_media::scale120_from_scale(requested.scale)
@@ -2325,6 +2452,24 @@ where
                 "negotiated a desktop within the OpenH264 software contract"
             );
             request.size = fitted;
+        }
+    }
+    if desired_display_hdr && multi_monitor_committed.is_none() {
+        // Kept on the request so a live retarget to another size fits its
+        // refresh from the Deck's own, not from this size's.
+        request.deck_refresh_hz = request.refresh_hz;
+        request.hdr_stream_fps = hdr_stream_fps(cfg.fps);
+        let refresh_hz = or_report!(ws, request.refresh_for(request.size));
+        if refresh_hz != request.refresh_hz {
+            tracing::info!(
+                target: DISPLAY,
+                size = %request.size,
+                requested_refresh_hz = request.refresh_hz,
+                hdr10_refresh_hz = refresh_hz,
+                max_tmds_character_rate_mhz = crate::edid::HDR10_MAX_TMDS_CHARACTER_RATE_MHZ,
+                "HDR10 display refresh lowered to fit the 10-bit link; the stream rate is unchanged"
+            );
+            request.refresh_hz = refresh_hz;
         }
     }
     // Per-encoder mirroring policy: direct NVENC recreates the client display
@@ -2821,6 +2966,7 @@ where
         "windows_session_agent_ready",
     )
     .await?;
+    AGENT_SETUP.end();
     let mut initial_media = Some(initial_media);
     let mut attachment_session_log_id = session_log_id.clone();
     let mut total_frames = 0_u64;
@@ -2923,6 +3069,9 @@ where
             preferences.audio,
             preferences.microphone,
             preferences.cursor_mode,
+            // The Deck draws host cursor images only when it declared so at
+            // sign-in and again in this attachment's hello.
+            authoritative_cursor_images && preferences.deck_cursor_images,
             preferences.clipboard,
             &mut display,
             prepared_media,
@@ -3078,6 +3227,8 @@ struct AttachmentPreferences {
         crate::microphone_input::MicrophoneIngress<crate::microphone_input::NativeMicrophoneDevice>,
     >,
     cursor_mode: CursorMode,
+    /// The Deck's `ClientHello` echo of `cursor_image_v1`.
+    deck_cursor_images: bool,
     tablet_mode_result: TabletModeResultMsg,
     clipboard: Option<ClipboardNegotiation>,
 }
@@ -3628,6 +3779,7 @@ where
         audio,
         microphone,
         cursor_mode: authoritative_cursor,
+        deck_cursor_images: client_hello.cursor_image_v1,
         tablet_mode_result,
         clipboard,
     })
@@ -3860,7 +4012,7 @@ where
 {
     let failure = serde_json::json!({
         "type": AGENT_ERROR_TYPE,
-        "message": error,
+        "message": arcen_session::setup_budget::lead_with_refusal_code(error),
     });
     let _ = send_json(ws, &failure, "windows_session_agent_error").await;
 }
@@ -4076,6 +4228,16 @@ fn nvenc_runtime_present() -> bool {
     false
 }
 
+/// Why `EncoderSelection::resolve_auto` chose OpenH264: no NVENC runtime, or
+/// no NVIDIA adapter owning the session output.
+fn auto_software_cause() -> arcen_media::video::BackendUnavailableReason {
+    if nvenc_runtime_present() {
+        arcen_media::video::BackendUnavailableReason::HardwareUnavailable
+    } else {
+        arcen_media::video::BackendUnavailableReason::RuntimeMissing
+    }
+}
+
 fn validate_client_hello(
     client_hello: &ClientHelloMsg,
     authenticated: DisplaySize,
@@ -4222,7 +4384,7 @@ fn display_update_result(
         accepted,
         width: size.width,
         height: size.height,
-        message: message.into(),
+        message: arcen_session::setup_budget::lead_with_refusal_code(&message.into()),
         ..DisplayUpdateResultMsg::default()
     }
 }
@@ -4274,7 +4436,7 @@ fn resolve_windows_tablet_mode_result(
                 // Reaches the operator verbatim: the Deck shows this reason
                 // rather than inventing its own, so it has to say what is
                 // missing and what to do instead.
-                "Native tablet (USB bridged) is not available on Windows hosts yet. It needs a signed virtual USB host-controller driver, which Arcen does not ship. Use Tablet support instead: it needs no host driver and works over any network."
+                "Native tablet (USB bridged) is not offered on Windows hosts: it needs a signed kernel USB driver that Arcen does not fund (ADR 0017). Use Tablet support instead: it needs no host driver and works over any network."
             }
             TabletModeMsg::DisabledMouseCompat => {
                 "mouse compatibility mode negotiation failed unexpectedly"
@@ -4477,6 +4639,9 @@ fn build_server_hello_with_aggregate(
         os_user: String::new(),
         session_id: String::new(),
         session_type: String::new(),
+        platform: arcen_protocol::messages::HostPlatform::Windows
+            .token()
+            .map(str::to_owned),
         desktop: String::new(),
         screen_width: display.applied.width,
         screen_height: display.applied.height,
@@ -4574,11 +4739,16 @@ fn build_server_hello_with_aggregate(
             pen_eraser: pen_capability,
             pen_proximity: pen_capability,
             pen_barrel_buttons: pen_capability,
-            // `text_commit` is typed (`KEYEVENTF_UNICODE`) but not yet
-            // advertised: the Windows owner enables it once it is validated
-            // and reported on this host.
-            text_commit: InputCapabilityAvailability::Unknown,
-            text_commit_unicode: InputCapabilityAvailability::Unknown,
+            // Committed text is typed by key where the foreground layout
+            // provably has the character, else as Unicode packets, so any
+            // character is typeable (input.rs `text_commit`).
+            text_commit: InputCapabilityAvailability::Available,
+            text_commit_unicode: InputCapabilityAvailability::Available,
+            // AltGr and the ISO key are injected as their own scan codes.
+            extended_keys: InputCapabilityAvailability::Available,
+            // A Windows key used only with the pointer is masked on release
+            // (input.rs `MetaReleaseMask`), so it never opens Start.
+            meta_pointer_mask: InputCapabilityAvailability::Available,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_capability,
@@ -4621,7 +4791,7 @@ fn build_server_hello_with_aggregate(
     .with_build_identity(windows_build_identity())
 }
 
-fn windows_build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
+pub(crate) fn windows_build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
     arcen_protocol::build_identity::this_build("arcen-pier-windows", env!("CARGO_PKG_VERSION"))
 }
 
@@ -5116,6 +5286,16 @@ impl PreparedVideo {
         }
     }
 
+    /// The single pipeline's proven content rate. A multi-monitor session's
+    /// sent count spans every output while each capenc reports only its own,
+    /// so it proves nothing and is judged against the target as before.
+    fn take_content_fps(&self) -> Option<u32> {
+        match self {
+            Self::Single(pipeline) => pipeline.capenc.take_content_fps(),
+            Self::Multi { .. } => None,
+        }
+    }
+
     fn primary_pipeline_qp_map(&self) -> arcen_media::video::QpMapPolicy {
         match self {
             Self::Single(pipeline) => pipeline.qp_map,
@@ -5237,12 +5417,20 @@ struct RoutedFrameIngress {
 }
 
 impl RoutedFrameIngress {
-    fn start(video: &PreparedVideo) -> Self {
+    /// Routes every pipeline's frames to the attachment loop. A delta frame
+    /// first waits (at most `VIDEO_ROOM_WAIT`) for room in its monitor's
+    /// outbound queue, which refuses room once its oldest frames are older
+    /// than the shared backlog budget: like the Linux frame pump, the router
+    /// then stops taking frames, the engine stalls on its pipe, and its next
+    /// capture is the current screen. Keyframes never wait.
+    fn start(video: &PreparedVideo, outbound: &Arc<OutboundVideoMux>) -> Self {
         let pipelines = video.pipelines();
         let (sender, receiver) = mpsc::channel(pipelines.len().max(1));
         let mut tasks = Vec::with_capacity(pipelines.len());
         for pipeline in pipelines {
+            outbound.apply_backlog_budget(pipeline.monitor_id, pipeline.plan.fps);
             let sender = sender.clone();
+            let outbound = Arc::clone(outbound);
             let frames = Arc::clone(&pipeline.frames);
             let monitor_id = pipeline.monitor_id;
             let plan = pipeline.plan;
@@ -5271,6 +5459,11 @@ impl RoutedFrameIngress {
                         let _ = sender.send(RoutedFrameEvent::Closed(monitor_id)).await;
                         break;
                     };
+                    if !frame.keyframe && !crate::latest::video_backlog_legacy() {
+                        outbound
+                            .wait_for_room(monitor_id, arcen_media::video::VIDEO_ROOM_WAIT)
+                            .await;
+                    }
                     let (ack, acknowledged) = oneshot::channel();
                     if sender
                         .send(RoutedFrameEvent::Frame {
@@ -5446,8 +5639,25 @@ async fn prepare_attachment_media(
                     requested_chroma = attempt_cfg.chroma_name(),
                     "video encoder fallback selected"
                 );
+                if let Some(refusal) = arcen_media::video::coded_fidelity_refusal(
+                    attempt_cfg.requested_pipeline,
+                    attempt_cfg.video_selection,
+                    Some(notice.reason),
+                ) {
+                    tracing::warn!(
+                        target: CAPENC,
+                        sid = %session_log_id,
+                        reason = ?notice.reason,
+                        refusal = %refusal,
+                        "fidelity request refused: the hardware encoder is unavailable and software cannot serve it"
+                    );
+                    return Err(refusal);
+                }
                 attempt_cfg
-                    .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
+                    .apply_software_h264_backend_after(
+                        crate::capenc::EncoderSelection::SoftwareH264,
+                        Some(notice.reason),
+                    )
                     .map_err(|error| {
                         format!(
                             "NVENC is unavailable and OpenH264 cannot preserve the exact \
@@ -5466,6 +5676,28 @@ async fn prepare_attachment_media(
                     ensure_openh264_applied_size(display.report().applied)?;
                 }
                 display_encoder = crate::capenc::EncoderSelection::SoftwareH264;
+            }
+            Err(CapencStartError::Unavailable(notice)) => {
+                // A pinned NVENC (or a codec ladder that ran out) reported a
+                // typed cause; a fidelity request names it.
+                if let Some(refusal) = arcen_media::video::coded_fidelity_refusal(
+                    attempt_cfg.requested_pipeline,
+                    attempt_cfg.video_selection,
+                    Some(notice.reason),
+                ) {
+                    tracing::warn!(
+                        target: CAPENC,
+                        sid = %session_log_id,
+                        reason = ?notice.reason,
+                        refusal = %refusal,
+                        "fidelity request refused: the hardware encoder is unavailable"
+                    );
+                    return Err(refusal);
+                }
+                return Err(format!(
+                    "capenc READY failed: {}",
+                    CapencStartError::Unavailable(notice)
+                ));
             }
             Err(error) => return Err(format!("capenc READY failed: {error}")),
         }
@@ -5961,6 +6193,7 @@ async fn stream_session<S>(
         crate::microphone_input::MicrophoneIngress<crate::microphone_input::NativeMicrophoneDevice>,
     >,
     cursor_mode: CursorMode,
+    deck_cursor_images: bool,
     clipboard_negotiation: Option<ClipboardNegotiation>,
     display: &mut ActiveDisplayLease,
     prepared_media: PreparedAttachmentMedia,
@@ -5987,7 +6220,6 @@ where
     } = prepared_media;
     let mut media_plan = video_pipelines.primary_plan();
     let mut aggregate_backend = video_pipelines.aggregate_accelerator_class();
-    let mut frame_ingress = RoutedFrameIngress::start(&video_pipelines);
     let (ws_tx, mut ws_rx) = ws.split();
     let served_pipeline = served_stream_pipeline(
         cfg,
@@ -6025,6 +6257,7 @@ where
             )));
         }
     };
+    let mut frame_ingress = RoutedFrameIngress::start(&video_pipelines, &video);
     let audio = Arc::new(LatestQueue::new(crate::audio::QUEUE_CAPACITY));
     let clipboard = ClipboardWriterQueue::new();
     let clipboard_runtime = clipboard_negotiation
@@ -6242,14 +6475,20 @@ where
     let mut input_sequence = InputSequenceTracker::default();
     let mut session_health =
         crate::observability::SessionHealth::new_with_fps_warmup(initial_qos_targets);
-    // Cursor shape streaming: poll GetCursorInfo at ~20 Hz in a dedicated OS
-    // thread; only active when cursor mode is Local.
-    let mut cursor_shape_rx = if cursor_mode == CursorMode::Local {
-        crate::cursor_watcher::spawn()
+    // Cursor streaming: poll GetCursorInfo at ~40 Hz in a dedicated OS
+    // thread; only active when cursor mode is Local. A Deck that draws
+    // host cursor images gets them (through the broker's lane relay), any
+    // other Deck the named shapes. Only the newest message waits for room.
+    let mut cursor_messages = if cursor_mode == CursorMode::Local {
+        crate::cursor_watcher::spawn(deck_cursor_images)
     } else {
         None
     };
+    let cursor_images_active = cursor_messages.is_some() && deck_cursor_images;
+    let mut pending_cursor_message: Option<Message> = None;
     let mut health_sequence = 0u64;
+    let mut path_quality = arcen_transport::PathQualityTracker::default();
+    let path_quality_started = std::time::Instant::now();
     let mut audio_health_ticks = 0u64;
     let mut network_probe_ticks = 0u64;
     let mut network_snapshot = crate::netinfo::snapshot(peer);
@@ -6351,17 +6590,27 @@ where
         }
         loop {
         tokio::select! {
-            cursor_json = async { cursor_shape_rx.as_mut()?.recv().await },
-                if cursor_shape_rx.is_some() =>
+            changed = async { cursor_messages.as_mut()?.changed().await.ok() },
+                if cursor_messages.is_some() =>
             {
-                match cursor_json {
-                    Some(json) => {
-                        // Best-effort: if the channel is full, drop this shape update.
-                        let _ = control_tx.try_send(WriterControl::Message(
-                            Message::Text(json.into()),
-                        ));
+                match changed {
+                    Some(()) => {
+                        let message = cursor_messages
+                            .as_mut()
+                            .and_then(|messages| messages.borrow_and_update().clone());
+                        if let Some(message) = message {
+                            pending_cursor_message = Some(match message {
+                                crate::cursor_watcher::CursorMessage::Shape(json) => {
+                                    Message::Text(json)
+                                }
+                                crate::cursor_watcher::CursorMessage::Record(record) => {
+                                    Message::Binary(record)
+                                }
+                            });
+                            flush_cursor_message(&control_tx, &mut pending_cursor_message);
+                        }
                     }
-                    None => cursor_shape_rx = None,
+                    None => cursor_messages = None,
                 }
             }
             _ = microphone_tick.tick(), if microphone.is_some() => {
@@ -6397,6 +6646,7 @@ where
                 }
             }
             _ = idr_retry_tick.tick() => {
+                flush_cursor_message(&control_tx, &mut pending_cursor_message);
                 video.retry_pending_keyframes(|monitor_id| {
                     video_pipelines.request_keyframe(
                         monitor_id,
@@ -6431,6 +6681,7 @@ where
                         active: cursor_mode,
                         accepted: true,
                         reason: CursorModeReason::default(),
+                        cursor_images: cursor_images_active,
                         ..CursorModeResultMsg::default()
                     };
                     let text = serde_json::to_string(&result)
@@ -6499,14 +6750,19 @@ where
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(arcen_session::agent_relay::ServiceMessage::PathSignal { signal, .. }) =
-                            serde_json::from_str::<arcen_session::agent_relay::ServiceMessage>(&text)
-                        {
-                            *latest_path_signal
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(signal);
-                            continue;
+                        match serde_json::from_str::<arcen_session::agent_relay::ServiceMessage>(&text) {
+                            Ok(arcen_session::agent_relay::ServiceMessage::PathSignal { signal, .. }) => {
+                                *latest_path_signal
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(signal);
+                                continue;
+                            }
+                            Ok(arcen_session::agent_relay::ServiceMessage::VideoReleased { released, .. }) => {
+                                video.release_relayed(released);
+                                continue;
+                            }
+                            _ => {}
                         }
                        let microphone_stop = serde_json::from_str::<serde_json::Value>(&text)
                            .ok()
@@ -6756,7 +7012,7 @@ where
                                         rate_task =
                                             spawn_rate_task(media_plan, &video_pipelines);
                                         frame_ingress =
-                                            RoutedFrameIngress::start(&video_pipelines);
+                                            RoutedFrameIngress::start(&video_pipelines, &video);
                                         last_display_update_at =
                                             Some(std::time::Instant::now());
                                         send_display_update_result(
@@ -6855,7 +7111,7 @@ where
                                             rate_task =
                                                 spawn_rate_task(media_plan, &video_pipelines);
                                             frame_ingress =
-                                                RoutedFrameIngress::start(&video_pipelines);
+                                                RoutedFrameIngress::start(&video_pipelines, &video);
                                             last_display_update_at =
                                                 Some(std::time::Instant::now());
                                             send_display_update_result(
@@ -6917,7 +7173,7 @@ where
                                 .await?;
                             }
                             rate_task = spawn_rate_task(media_plan, &video_pipelines);
-                            frame_ingress = RoutedFrameIngress::start(&video_pipelines);
+                            frame_ingress = RoutedFrameIngress::start(&video_pipelines, &video);
                             last_display_update_at = Some(std::time::Instant::now());
                             let applied = display.report().applied;
                             let capture_output_index = display.report().capture_output_index;
@@ -7164,6 +7420,7 @@ where
                 };
                 let timestamp_ms = now_ms_u64();
                 let (sent_frames, bytes_sent) = video_stats.snapshot();
+                let pipeline = video_pipelines.primary_pipeline_telemetry();
                 let counters = crate::observability::HostCounters {
                     frames_sent: sent_frames,
                     frames_dropped: dropped_frames,
@@ -7171,9 +7428,9 @@ where
                     input_events,
                     last_input_sequence: input_sequence.last_nonzero(),
                     last_input_type,
+                    content_fps: video_pipelines.take_content_fps(),
                 };
                 let observation = session_health.observe(timestamp_ms, cfg.fps, counters);
-                let pipeline = video_pipelines.primary_pipeline_telemetry();
                 let mut stats = crate::observability::SessionHealth::health_stats(
                     &observation,
                     counters,
@@ -7184,6 +7441,9 @@ where
                 );
                 stats.capture_time_ms = pipeline.average_stage_ms;
                 stats.encode_time_ms = pipeline.average_encode_ms;
+                stats.path = path_signal_connection.as_ref().map(|connection| {
+                    path_quality.sample(path_quality_started.elapsed(), connection)
+                });
                 if let Some((kind, fields)) = observation.transition.as_ref() {
                     crate::emit_lifecycle_event_with_context(
                         emitter,
@@ -7982,6 +8242,11 @@ type OutboundVideoMuxError = RosterError<u16>;
 struct OutboundVideoMux {
     roster: FairRoster<u16, Arc<VideoQueue<OutboundVideo>>>,
     notify: Notify,
+    /// Frames handed to the broker's lane relay and not yet released by it
+    /// (`ServiceMessage::VideoReleased`). While the relay holds
+    /// `RELAYED_VIDEO_FRAMES_IN_FLIGHT`, [`Self::pop`] leaves frames in the
+    /// per-monitor queues, where the shared backlog budget sees them age.
+    relayed: std::sync::Mutex<arcen_media::video::RelayedVideoWindow>,
 }
 
 impl std::fmt::Debug for OutboundVideoMux {
@@ -8008,7 +8273,38 @@ impl OutboundVideoMux {
         Ok(Self {
             roster,
             notify: Notify::new(),
+            relayed: std::sync::Mutex::new(arcen_media::video::RelayedVideoWindow::default()),
         })
+    }
+
+    /// Applies the shared backlog budget of `contract_fps` to one monitor's
+    /// queue, unless `ARCEN_VIDEO_BACKLOG=legacy`.
+    fn apply_backlog_budget(&self, monitor_id: u16, contract_fps: u32) {
+        if let Some(queue) = self.roster.get(monitor_id) {
+            queue.set_backlog_budget(
+                (!crate::latest::video_backlog_legacy())
+                    .then(|| arcen_media::video::video_backlog_budget(contract_fps)),
+            );
+        }
+    }
+
+    /// Waits, for at most `max_wait`, until one monitor's queue would take an
+    /// ordinary frame without exceeding its capacity or backlog budget.
+    async fn wait_for_room(&self, monitor_id: u16, max_wait: Duration) -> bool {
+        match self.roster.get(monitor_id) {
+            Some(queue) => queue.wait_for_room(Some(max_wait)).await,
+            None => false,
+        }
+    }
+
+    /// The broker's lane relay has released `released` video frames of this
+    /// attachment in total.
+    fn release_relayed(&self, released: u64) {
+        self.relayed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .note_released_total(released);
+        self.notify.notify_one();
     }
 
     fn push(
@@ -8071,12 +8367,34 @@ impl OutboundVideoMux {
     async fn pop(&self) -> Option<OutboundVideo> {
         loop {
             let notified = self.notify.notified();
-            for (index, _monitor_id, queue) in self.roster.entries_in_service_order() {
-                if let Some(frame) = queue.try_pop() {
-                    self.roster.record_served(index);
-                    return Some(frame);
+            let resync_at = {
+                let mut relayed = self
+                    .relayed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = Instant::now();
+                if relayed.admits(now) {
+                    for (index, _monitor_id, queue) in self.roster.entries_in_service_order() {
+                        if let Some(frame) = queue.try_pop() {
+                            self.roster.record_served(index);
+                            let resyncs = relayed.resyncs();
+                            relayed.note_sent_at(now);
+                            if relayed.resyncs() != resyncs {
+                                tracing::debug!(
+                                    target: SESSION,
+                                    in_flight = relayed.outstanding(),
+                                    paced = relayed.resyncs(),
+                                    "video relay released nothing for a second; one more frame let through"
+                                );
+                            }
+                            return Some(frame);
+                        }
+                    }
+                    None
+                } else {
+                    relayed.resync_at()
                 }
-            }
+            };
             if (0..self.roster.len()).all(|index| {
                 self.roster
                     .entry(index)
@@ -8084,7 +8402,15 @@ impl OutboundVideoMux {
             }) {
                 return None;
             }
-            notified.await;
+            match resync_at {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = notified => {}
+                        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                    }
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -8164,6 +8490,19 @@ impl WriterVideoStats {
 enum WriterControl {
     Message(Message),
     AudioBarrier(oneshot::Sender<()>),
+}
+
+/// Hands the newest cursor message to the writer when it has room; it stays
+/// pending (replaced by any newer one) otherwise.
+fn flush_cursor_message(control: &mpsc::Sender<WriterControl>, pending: &mut Option<Message>) {
+    let Some(message) = pending.take() else {
+        return;
+    };
+    if let Err(mpsc::error::TrySendError::Full(WriterControl::Message(message))) =
+        control.try_send(WriterControl::Message(message))
+    {
+        *pending = Some(message);
+    }
 }
 
 async fn writer_loop<S>(
@@ -8797,8 +9136,14 @@ async fn handle_inbound(
         }
         TEXT_COMMIT => {
             if let Ok(message) = serde_json::from_str::<TextCommitMsg>(text) {
-                injector.text_commit(&message);
-                action.input_type = Some(TEXT_COMMIT);
+                // Control characters would act as keys (a Unicode CR is
+                // Enter to many applications): keys go as key events.
+                if let Err(error) = message.validate() {
+                    tracing::debug!(target: INPUT, %error, "text_commit refused");
+                } else {
+                    injector.text_commit(&message);
+                    action.input_type = Some(TEXT_COMMIT);
+                }
             }
         }
         "quality_settings" => match serde_json::from_str::<QualitySettings>(text) {
@@ -9179,7 +9524,7 @@ where
         &AuthResult {
             msg_type: AUTH_RESULT.to_string(),
             success: false,
-            message: message.to_string(),
+            message: arcen_session::setup_budget::lead_with_refusal_code(message),
             resume_grant: None,
             resume_window_secs: None,
             resumed: false,
@@ -9303,7 +9648,7 @@ where
     let grant = arcen_transport::quic::grant_attachment(
         lanes,
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::all(),
+        arcen_protocol::lanes::LaneRoleSet::BASE,
     )
     .map_err(|error| format!("lane attachment: {error}"))?;
     let text =
@@ -9356,6 +9701,7 @@ async fn relay_resumable_client_and_agent<A>(
     registry: &crate::resume::ResumeRegistry,
     reconnect_window_secs: u32,
     session_shutdown: &mut watch::Receiver<bool>,
+    incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
 ) -> Result<(), String>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -9410,6 +9756,17 @@ where
             RelayOutcome::ResumeAuthorityFailure(error) => {
                 let _ = reconnect.apply(ReconnectEvent::OwnerCrashed, registry.monotonic_now());
                 break Err(format!("resume grant refresh failed: {error:?}"));
+            }
+            RelayOutcome::UnexpectedLoss(_)
+                if incumbent.is_some_and(arcen_transport::quic::IncumbentRegistration::displaced) =>
+            {
+                let _ =
+                    reconnect.apply(ReconnectEvent::ExplicitDisconnect, registry.monotonic_now());
+                tracing::warn!(
+                    target: SESSION,
+                    "a same-user sign-in displaced this silent attachment; handing the desktop over"
+                );
+                break Ok(());
             }
             RelayOutcome::UnexpectedLoss(reason) => {
                 let actions =
@@ -9467,6 +9824,17 @@ where
                                 registry.monotonic_now(),
                             );
                             break 'session Err("direct resume window expired".to_string());
+                        }
+                        () = wait_displaced(incumbent) => {
+                            let _ = reconnect.apply(
+                                ReconnectEvent::ExplicitDisconnect,
+                                registry.monotonic_now(),
+                            );
+                            tracing::warn!(
+                                target: SESSION,
+                                "a same-user sign-in displaced this detached attachment; handing the desktop over"
+                            );
+                            break 'session Ok(());
                         }
                         command = commands.recv() => {
                             match command {
@@ -9555,6 +9923,11 @@ where
                                         AgentAttachmentCommand::TYPE,
                                     ).await?;
                                     client = handoff.socket;
+                                    if let (Some(incumbent), Some(connection)) =
+                                        (incumbent, client.path_signal_connection())
+                                    {
+                                        incumbent.replace_connection(connection);
+                                    }
                                     registry.mark_attached(&active_session_id).map_err(|error| {
                                         format!("could not mark resumed slot attached: {error:?}")
                                     })?;
@@ -9752,6 +10125,16 @@ where
         },
         None => None,
     };
+    // The agent keeps at most `RELAYED_VIDEO_FRAMES_IN_FLIGHT` frames
+    // unreleased once it hears from us, so a slow path holds video in its
+    // budgeted queue instead of the relay's backlog.
+    // `ARCEN_VIDEO_BACKLOG=legacy` never reports, which keeps the old relay
+    // behaviour.
+    let mut video_released = lane_relay
+        .as_ref()
+        .filter(|_| !crate::latest::video_backlog_legacy())
+        .map(|relay| relay.0.video_released());
+    let mut video_released_reported = 0_u64;
     loop {
         tokio::select! {
             biased;
@@ -9776,6 +10159,26 @@ where
                 arcen_transport::quic::LaneRelayEvent::Ended(terminal) => {
                     tracing::warn!(target: SESSION, reason = %terminal, "session lanes ended");
                     return RelayOutcome::UnexpectedLoss("client_lanes");
+                }
+            },
+            changed = async {
+                match video_released.as_mut() {
+                    Some(released) => released.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if agent_streaming => {
+                let total = match (changed, video_released.as_mut()) {
+                    (Ok(()), Some(released)) => *released.borrow_and_update(),
+                    _ => {
+                        video_released = None;
+                        continue;
+                    }
+                };
+                if total > video_released_reported {
+                    video_released_reported = total;
+                    if let Err(error) = report_video_released(agent, total, write_timeout).await {
+                        return RelayOutcome::AgentFailure(error);
+                    }
                 }
             },
             _ = async {
@@ -9981,6 +10384,27 @@ where
     }
 }
 
+/// Tells the agent how many video frames of this attachment the lane relay
+/// has released in total.
+async fn report_video_released<A>(
+    agent: &mut WebSocketStream<A>,
+    released: u64,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    let message = arcen_session::agent_relay::ServiceMessage::VideoReleased {
+        session: 0,
+        released,
+    };
+    let text = serde_json::to_string(&message)
+        .map_err(|error| format!("video release encode failed: {error}"))?;
+    send_ws_with_timeout(agent, Message::Text(text.into()), timeout)
+        .await
+        .map_err(|_| "session agent IPC video-release send failed".to_string())
+}
+
 /// The attachment's lane relay; its counters are logged when it ends.
 struct LoggedLaneRelay(arcen_transport::quic::PierLaneRelay);
 
@@ -10056,7 +10480,7 @@ where
 /// Only the service sends this type (the relay refuses it from a Deck), and
 /// losing one sample during the handshake is harmless.
 fn handshake_skips(message_type: &str) -> bool {
-    message_type == "path_signal"
+    matches!(message_type, "path_signal" | "video_released")
         && arcen_session::agent_relay::ServiceMessage::is_service_type(message_type)
 }
 
@@ -10074,7 +10498,9 @@ where
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    let envelope: serde_json::Value = serde_json::from_str(text.as_ref())
+                    // `auth_response` carries the password: wipe the frame.
+                    let text = zeroize::Zeroizing::new(text);
+                    let envelope: serde_json::Value = serde_json::from_str(text.as_str())
                         .map_err(|error| format!("invalid JSON during handshake: {error}"))?;
                     let actual = envelope
                         .get("type")
@@ -10270,6 +10696,95 @@ mod tests {
             Message::Binary(payload) => payload[0],
             other => panic!("expected binary video, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn the_mux_holds_frames_while_the_relay_has_one_unreleased() {
+        let mux = OutboundVideoMux::new_with_capacity([0], 8).expect("valid mux");
+        // The relay's first report activates the limit.
+        mux.release_relayed(0);
+        assert!(mux.push(0, tagged_outbound_video(1), true).enqueued());
+        assert!(mux.push(0, tagged_outbound_video(2), false).enqueued());
+        assert_eq!(outbound_video_tag(mux.pop().await.unwrap()), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), mux.pop())
+                .await
+                .is_err(),
+            "one frame already waits in the relay"
+        );
+        mux.release_relayed(1);
+        let next = tokio::time::timeout(Duration::from_secs(1), mux.pop())
+            .await
+            .expect("a release frees the writer")
+            .unwrap();
+        assert_eq!(outbound_video_tag(next), 2);
+    }
+
+    #[tokio::test]
+    async fn frames_sent_before_the_first_report_still_count_as_in_flight() {
+        let mux = OutboundVideoMux::new_with_capacity([0], 8).expect("valid mux");
+        for tag in 1..=4 {
+            assert!(mux.push(0, tagged_outbound_video(tag), tag == 1).enqueued());
+        }
+        for tag in 1..=3 {
+            assert_eq!(outbound_video_tag(mux.pop().await.unwrap()), tag);
+        }
+        // The relay has released two of the three frames it was handed.
+        mux.release_relayed(2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), mux.pop())
+                .await
+                .is_err(),
+            "the third frame is still in the relay"
+        );
+        mux.release_relayed(3);
+        let next = tokio::time::timeout(Duration::from_secs(1), mux.pop())
+            .await
+            .expect("the relay caught up")
+            .unwrap();
+        assert_eq!(outbound_video_tag(next), 4);
+    }
+
+    #[tokio::test]
+    async fn the_mux_never_holds_frames_for_a_relay_that_never_reports() {
+        let mux = OutboundVideoMux::new_with_capacity([0], 8).expect("valid mux");
+        for tag in 1..=3 {
+            assert!(mux.push(0, tagged_outbound_video(tag), tag == 1).enqueued());
+        }
+        for tag in 1..=3 {
+            let frame = tokio::time::timeout(Duration::from_millis(50), mux.pop())
+                .await
+                .expect("no release report, no limit")
+                .unwrap();
+            assert_eq!(outbound_video_tag(frame), tag);
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_held_for_the_relay_age_into_back_pressure() {
+        let mux = Arc::new(OutboundVideoMux::new_with_capacity([0], 8).expect("valid mux"));
+        mux.apply_backlog_budget(0, 60);
+        mux.release_relayed(0);
+        assert!(mux.push(0, tagged_outbound_video(1), true).enqueued());
+        assert_eq!(outbound_video_tag(mux.pop().await.unwrap()), 1);
+        assert!(mux.push(0, tagged_outbound_video(2), false).enqueued());
+        assert!(mux.push(0, tagged_outbound_video(3), false).enqueued());
+        assert!(mux.wait_for_room(0, Duration::from_millis(1)).await);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !mux.wait_for_room(0, Duration::from_millis(5)).await,
+            "two frames older than two frame periods hold the router back"
+        );
+        let waiter = {
+            let mux = Arc::clone(&mux);
+            tokio::spawn(async move { mux.wait_for_room(0, Duration::from_secs(1)).await })
+        };
+        mux.release_relayed(1);
+        assert_eq!(outbound_video_tag(mux.pop().await.unwrap()), 2);
+        assert!(
+            waiter.await.unwrap(),
+            "the writer taking a frame frees room"
+        );
     }
 
     #[test]
@@ -10747,6 +11262,23 @@ mod tests {
             value["transport_capability"],
             arcen_protocol::CAPABILITY_TRANSPORT_QUIC
         );
+        // The service's backlog choice crosses to the agent, whose own
+        // environment is the user's; an older start packet means "budget".
+        assert_eq!(
+            value["video_backlog_legacy"],
+            arcen_media::video::video_backlog_is_legacy_from_env()
+        );
+        let mut older = value.clone();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("video_backlog_legacy");
+        let older: AgentStart = serde_json::from_value(older).unwrap();
+        assert!(!older.video_backlog_legacy);
+        let mut legacy = value;
+        legacy["video_backlog_legacy"] = serde_json::Value::Bool(true);
+        let legacy: AgentStart = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.video_backlog_legacy);
     }
 
     #[tokio::test]
@@ -10779,6 +11311,27 @@ mod tests {
         .unwrap();
         assert!(status.success);
         sender.await.unwrap();
+    }
+
+    #[test]
+    fn a_same_user_sign_in_takes_over_a_silent_deck_and_never_a_live_one() {
+        use arcen_transport::quic::IncumbentOutcome;
+        for outcome in [
+            IncumbentOutcome::Displaced {
+                silent_for: Duration::from_secs(3),
+            },
+            IncumbentOutcome::AlreadyClosed,
+            IncumbentOutcome::NoIncumbent,
+        ] {
+            assert_eq!(same_user_takeover_admission(outcome), Ok(()), "{outcome:?}");
+        }
+        for outcome in [IncumbentOutcome::Alive, IncumbentOutcome::OtherOwner] {
+            assert_eq!(
+                same_user_takeover_admission(outcome),
+                Err(SAME_USER_LIVE_ATTACHMENT_REASON),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -11641,6 +12194,43 @@ mod tests {
         config.codec = VideoCodec::H265;
         config.video_selection = arcen_protocol::messages::VideoSelectionIntent::ColorFidelity;
         assert_eq!(next_adaptive_nvenc_codec(&config), None);
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_hdr_refusal_reaches_the_deck_led_by_its_code() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut sink = RecordingSink(Arc::clone(&sent));
+        // The agent's failure as the broker relays it: the display layer's
+        // and the session's context wrap the refusal raised by the HDR wait.
+        let refusal = arcen_session::setup_budget::HdrSetupRefusal::NotActivated.message(
+            "Windows did not activate HDR on all 1 session display target(s) within 19750ms",
+        );
+        let wrapped = format!(
+            "enable HDR desktop before capture: apply authenticated client display: {refusal}"
+        );
+        send_session_setup_failure(&mut sink, &wrapped)
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        let Message::Text(text) = &sent[0] else {
+            panic!("expected a text auth result");
+        };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["session_setup_failed"], true);
+        let message = value["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("hdr_not_activated: enable HDR desktop"),
+            "{message}"
+        );
+        assert!(message.ends_with("within 19750ms"), "{message}");
+    }
+
+    #[test]
+    fn a_retina_hdr_display_is_created_at_a_refresh_its_link_carries() {
+        // A 60 fps host profile still paces HDR at the contract's 30 fps.
+        assert_eq!(hdr10_display_refresh_hz(60, 3600, 2260, 60), Ok(30));
+        assert_eq!(hdr10_display_refresh_hz(30, 1800, 1130, 60), Ok(60));
+        assert!(hdr10_display_refresh_hz(60, 4095, 4095, 60).is_err());
     }
 
     #[test]
@@ -13644,7 +14234,7 @@ mod tests {
     /// what the writer did when the Windows Pier was migrated. #121 then
     /// deliberately put audio ahead of video in the host writer loops on both
     /// platforms, to stop sustained video load starving the audio sender
-    /// (#115). The behaviour changed; this test did not, and it went on failing
+    /// (an earlier fix). The behaviour changed; this test did not, and it went on failing
     /// unnoticed because the Windows CI job was dying several steps earlier on
     /// a missing cl.exe.
     ///
@@ -14535,6 +15125,19 @@ mod lane_relay_tests {
             .expect("valid");
         assert!(matches!(&delivered, Message::Text(text) if text.contains("key_event")));
 
+        // The agent finished its handshake: from here the relay reports the
+        // video frames it releases.
+        agent
+            .send(Message::Text(
+                serde_json::to_string(&AgentStreamingReady {
+                    msg_type: AgentStreamingReady::TYPE.to_string(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
         // The Deck never reads video; audio still arrives, frame after frame.
         let mut audio = PeerLaneReader::new(&deck, LaneRole::AudioOutput);
         agent.send(Message::Binary(video(true))).await.unwrap();
@@ -14562,9 +15165,21 @@ mod lane_relay_tests {
             }
         }
         let mut asked = false;
+        let mut released = 0_u64;
         while let Ok(Some(Ok(message))) =
             tokio::time::timeout(Duration::from_millis(500), agent.next()).await
         {
+            if let Message::Text(text) = &message {
+                if let Ok(arcen_session::agent_relay::ServiceMessage::VideoReleased {
+                    released: total,
+                    ..
+                }) = serde_json::from_str(text)
+                {
+                    assert!(total > released, "a running count only grows");
+                    released = total;
+                    continue;
+                }
+            }
             if matches!(&message, Message::Text(text) if text.contains(REQUEST_FULL_FRAME)) {
                 asked = true;
                 break;
@@ -14573,6 +15188,10 @@ mod lane_relay_tests {
         assert!(
             asked,
             "a dropped video frame must ask the agent for a keyframe"
+        );
+        assert!(
+            released > 0,
+            "the relay reports the video frames it is done with"
         );
 
         // A close from the Deck ends the attachment explicitly.

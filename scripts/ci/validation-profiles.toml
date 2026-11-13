@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # The reviewed catalogue of build profiles and validations named by
 # shared/*/consumers.json. Loaded only by scripts/check_shared_contracts.py.
 #
@@ -140,11 +142,11 @@ target_os = "linux"
 package = "arcen-pier-linux"
 features = ["wayland-provider"]
 
-[build_profile.linux-pier-usb-hard-lab]
+[build_profile.linux-pier-native-tablet]
 description = "Linux Pier with the lab-only hard USB bridge"
 target_os = "linux"
 package = "arcen-pier-linux"
-features = ["usb-hard-lab"]
+features = ["native-tablet"]
 
 [build_profile.linux-capenc]
 description = "capenc as the Linux Pier links it: NvFBC/XShm capture, NVENC and OpenH264"
@@ -203,6 +205,12 @@ description = "macOS Pier (in development; not a supported host release)"
 target_os = "macos"
 package = "arcen-pier-macos"
 
+[build_profile.macos-pier-native-tablet]
+description = "macOS Pier with the lab-only Native tablet adapter (ADR 0022: USB host driver + IOHIDUserDevice)"
+target_os = "macos"
+package = "arcen-pier-macos"
+features = ["native-tablet"]
+
 [build_profile.macos-deck-apple-silicon]
 description = "macOS Deck for Apple silicon"
 target_os = "macos"
@@ -215,12 +223,19 @@ target_os = "macos"
 rust_target = "x86_64-apple-darwin"
 package = "arcen-deck-macos"
 
-[build_profile.macos-deck-usb-hard-lab]
+[build_profile.macos-deck-native-tablet]
 description = "macOS Deck with the lab-only hard USB bridge (Apple silicon)"
 target_os = "macos"
 rust_target = "aarch64-apple-darwin"
 package = "arcen-deck-macos"
-features = ["usb-hard-lab"]
+features = ["native-tablet"]
+
+[build_profile.macos-deck-usb-emulate-lab]
+description = "macOS Deck with the lab-only emulated USB tablet (--usb-emulate; Apple silicon)"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-deck-macos"
+features = ["usb-emulate-lab"]
 
 [build_profile.macos-usb-helper-apple-silicon]
 description = "Privileged USB helper embedded in the Apple-silicon Deck app"
@@ -233,6 +248,25 @@ description = "Privileged USB helper embedded in the Intel Deck app"
 target_os = "macos"
 rust_target = "x86_64-apple-darwin"
 package = "arcen-usb-helper"
+
+[build_profile.macos-usb-helper-iousbhost-apple-silicon]
+description = "Privileged USB helper with the IOUSBHost backend linked (the release helper's `iousbhost` feature, ADR 0019)"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-usb-helper"
+features = ["iousbhost"]
+
+[build_profile.macos-usb-iousbhost-apple-silicon]
+description = "IOUSBHost capture backend (ADR 0019), Apple silicon"
+target_os = "macos"
+rust_target = "aarch64-apple-darwin"
+package = "arcen-usb-iousbhost"
+
+[build_profile.macos-usb-iousbhost-intel]
+description = "IOUSBHost capture backend (ADR 0019), Intel Macs"
+target_os = "macos"
+rust_target = "x86_64-apple-darwin"
+package = "arcen-usb-iousbhost"
 
 # --- Validations: shared crates and the register -------------------------------------------
 
@@ -479,10 +513,10 @@ build_profile = "linux-pier-wayland-provider"
 template = "cargo-test"
 owner = "Linux Host"
 
-[validation.linux-pier-usb-hard-lab-test]
+[validation.linux-pier-native-tablet-test]
 description = "Linux Pier tests with the lab-only hard USB bridge"
 kind = "unit"
-build_profile = "linux-pier-usb-hard-lab"
+build_profile = "linux-pier-native-tablet"
 template = "cargo-test"
 owner = "Linux Host"
 
@@ -657,7 +691,7 @@ owner = "Linux Host"
 [validation.linux-usb-lab]
 description = "Linux lab-only hard USB bridge with a real tablet"
 kind = "hardware"
-build_profile = "linux-pier-usb-hard-lab"
+build_profile = "linux-pier-native-tablet"
 template = "recorded"
 owner = "Linux Host"
 
@@ -805,6 +839,20 @@ build_profile = "macos-pier"
 template = "recorded"
 owner = "macOS Host"
 
+[validation.macos-pier-native-tablet-test]
+description = "macOS Pier tests with the lab-only Native tablet adapter"
+kind = "unit"
+build_profile = "macos-pier-native-tablet"
+template = "cargo-test"
+owner = "macOS Host"
+
+[validation.macos-pier-native-tablet-lab]
+description = "Emulated Intuos5 through the macOS Pier stream into IOHIDUserDevices (ignored end-to-end test, ioreg/hidutil/probe-bridged-hid)"
+kind = "hardware"
+build_profile = "macos-pier-native-tablet"
+template = "recorded"
+owner = "macOS Host"
+
 # --- Validations: macOS Deck ------------------------------------------------------------------
 
 [validation.macos-deck-test-apple-silicon]
@@ -821,10 +869,17 @@ build_profile = "macos-deck-intel"
 template = "cargo-build"
 owner = "macOS Client"
 
-[validation.macos-deck-usb-hard-lab-test]
+[validation.macos-deck-native-tablet-test]
 description = "macOS Deck tests with the lab-only hard USB bridge"
 kind = "unit"
-build_profile = "macos-deck-usb-hard-lab"
+build_profile = "macos-deck-native-tablet"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-deck-usb-emulate-lab-test]
+description = "macOS Deck tests with the lab-only emulated USB tablet"
+kind = "unit"
+build_profile = "macos-deck-usb-emulate-lab"
 template = "cargo-test"
 owner = "macOS Client"
 
@@ -840,6 +895,41 @@ description = "Privileged USB helper builds for Intel Macs"
 kind = "build"
 build_profile = "macos-usb-helper-intel"
 template = "cargo-build"
+owner = "macOS Client"
+
+[validation.macos-usb-helper-iousbhost-test]
+description = "Privileged USB helper tests with the IOUSBHost backend linked"
+kind = "unit"
+build_profile = "macos-usb-helper-iousbhost-apple-silicon"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-usb-iousbhost-test]
+description = "IOUSBHost backend tests: matching, state machine, marker recovery, status mapping, read-only I/O Registry (Apple silicon)"
+kind = "unit"
+build_profile = "macos-usb-iousbhost-apple-silicon"
+template = "cargo-test"
+owner = "macOS Client"
+
+[validation.macos-usb-iousbhost-clippy]
+description = "IOUSBHost backend strict Clippy"
+kind = "lint"
+build_profile = "macos-usb-iousbhost-apple-silicon"
+template = "cargo-clippy-strict"
+owner = "macOS Client"
+
+[validation.macos-usb-iousbhost-build-intel]
+description = "IOUSBHost backend builds for Intel Macs"
+kind = "build"
+build_profile = "macos-usb-iousbhost-intel"
+template = "cargo-build"
+owner = "macOS Client"
+
+[validation.macos-usb-iousbhost-hardware]
+description = "IOUSBHost capture, bridge and release of a real USB pen tablet as root (ignored test `hardware`, run by hand)"
+kind = "hardware"
+build_profile = "macos-usb-iousbhost-apple-silicon"
+template = "recorded"
 owner = "macOS Client"
 
 [validation.macos-deck-app-apple-silicon]
@@ -901,6 +991,13 @@ owner = "macOS Client"
 [validation.macos-deck-usb-lab]
 description = "macOS Deck hard USB tablet bridge through the privileged helper"
 kind = "hardware"
-build_profile = "macos-deck-usb-hard-lab"
+build_profile = "macos-deck-native-tablet"
+template = "recorded"
+owner = "macOS Client"
+
+[validation.macos-deck-usb-emulated-wacom-lab]
+description = "Emulated Wacom Intuos5 strokes asserted at evdev on a Linux Pier (scripts/lab/wacom-replay)"
+kind = "hardware"
+build_profile = "macos-deck-usb-emulate-lab"
 template = "recorded"
 owner = "macOS Client"

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Remove AppleDouble ("._") companions from a flat component package.
 
 macOS 26 tags every file a provenance-tracked process writes with the

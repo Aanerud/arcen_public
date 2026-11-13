@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // ── Sidebar geometry ─────────────────────────────────────────────────────────
 const SIDEBAR_W: f32 = 210.0;
 const SIDEBAR_ROW_H: f32 = 56.0;
@@ -17,7 +19,6 @@ fn validate_username(username: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionKind {
     DirectMachine,
-    Gateway,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,73 +74,44 @@ impl ConnectionKind {
     pub const fn icon(self) -> &'static str {
         match self {
             Self::DirectMachine => "◉",
-            Self::Gateway => "◈",
         }
     }
 
     pub const fn title(self) -> &'static str {
         match self {
             Self::DirectMachine => "Direct Machine",
-            Self::Gateway => "Gateway",
         }
     }
 
     pub const fn short_description(self) -> &'static str {
         match self {
             Self::DirectMachine => "Connect to a specific workstation by address.",
-            Self::Gateway => "Sign in through your studio gateway and choose a machine.",
         }
     }
 
     pub const fn primary_action(self) -> &'static str {
         match self {
             Self::DirectMachine => "Connect",
-            Self::Gateway => "Sign In",
         }
     }
 
     pub const fn default_port(self) -> u16 {
         match self {
-            // Direct-to-Pier product sessions use QUIC on UDP 18444. Arcen
-            // Span (gateway) is roadmap and retains its separate port.
+            // Direct-to-Pier product sessions use QUIC on UDP 18444.
             Self::DirectMachine => 18444,
-            Self::Gateway => 8443,
         }
     }
 
     pub const fn as_key(self) -> &'static str {
         match self {
             Self::DirectMachine => "direct",
-            Self::Gateway => "gateway",
         }
     }
 
-    pub fn from_key(key: &str) -> Self {
-        match key {
-            "gateway" => Self::Gateway,
-            _ => Self::DirectMachine,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DestinationKind {
-    Linux,
-    Mac,
-    Windows,
-}
-
-impl DestinationKind {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Linux => "linux",
-            Self::Mac => "mac",
-            Self::Windows => "windows",
-        }
-    }
-
-    pub const fn default_swap_cmd_ctrl(&self) -> bool {
-        matches!(self, Self::Linux)
+    /// Every saved connection is a direct machine; an unknown or retired
+    /// kind key loads as one.
+    pub fn from_key(_key: &str) -> Self {
+        Self::DirectMachine
     }
 }
 
@@ -157,8 +129,6 @@ pub struct ConnectionDraft {
     pub use_quic: bool,
     pub tls_trust: Option<crate::transport::tls::TlsTrustConfig>,
     pub auto_reconnect: bool,
-    pub destination_kind: DestinationKind,
-    pub swap_cmd_ctrl: bool,
 }
 
 impl std::fmt::Debug for ConnectionDraft {
@@ -174,8 +144,6 @@ impl std::fmt::Debug for ConnectionDraft {
             .field("use_quic", &self.use_quic)
             .field("tls_trust", &self.tls_trust)
             .field("auto_reconnect", &self.auto_reconnect)
-            .field("destination_kind", &self.destination_kind)
-            .field("swap_cmd_ctrl", &self.swap_cmd_ctrl)
             .finish()
     }
 }
@@ -188,7 +156,6 @@ impl Drop for ConnectionDraft {
 
 impl ConnectionDraft {
     pub fn new(kind: ConnectionKind) -> Self {
-        let destination_kind = DestinationKind::Linux;
         Self {
             saved_connection_id: None,
             kind,
@@ -200,14 +167,7 @@ impl ConnectionDraft {
             use_quic: true,
             tls_trust: None,
             auto_reconnect: true,
-            swap_cmd_ctrl: destination_kind.default_swap_cmd_ctrl(),
-            destination_kind,
         }
-    }
-
-    pub fn set_destination_kind(&mut self, destination_kind: DestinationKind) {
-        self.swap_cmd_ctrl = destination_kind.default_swap_cmd_ctrl();
-        self.destination_kind = destination_kind;
     }
 }
 
@@ -227,6 +187,10 @@ pub struct SavedConnectionSettings {
     /// `None` (the default, and the value every previously saved connection
     /// parses as) preserves exactly the old application-wide behaviour.
     pub displays_mode: Option<crate::ui::app::DisplaysMode>,
+    /// What Command, Control and Option are on this connection's host.
+    /// The default (and every connection saved before it existed) follows
+    /// the host's platform, learnt from its hello.
+    pub keyboard: arcen_input::keyboard::KeyboardSettings,
     pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -237,6 +201,7 @@ impl Default for SavedConnectionSettings {
             remembered_username: None,
             tablet_mode_requested: crate::protocol::messages::TabletModeMsg::LocalTermination,
             displays_mode: None,
+            keyboard: arcen_input::keyboard::KeyboardSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -277,9 +242,13 @@ pub struct HomeViewState<'a> {
     /// Working value for the form's Displays selector. `None` renders as
     /// "Use app default".
     pub form_displays_mode: &'a mut Option<crate::ui::app::DisplaysMode>,
+    /// Working value for the form's Keyboard settings.
+    pub form_keyboard: &'a mut arcen_input::keyboard::KeyboardSettings,
     /// Connection error to show under the Connect button.
     pub connection_error: Option<&'a str>,
     pub remember_username: &'a mut bool,
+    /// The connection test shown in the editor or detail panel, if any.
+    pub connection_test: Option<&'a crate::ui::connection_test::ConnectionTest>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +272,8 @@ pub enum HomeAction {
         /// This connection's own Displays choice, or `None` to follow the
         /// application default.
         displays_mode: Option<crate::ui::app::DisplaysMode>,
+        /// This connection's keyboard settings.
+        keyboard: arcen_input::keyboard::KeyboardSettings,
     },
     /// Confirm an edit-connection form.
     SaveEdit {
@@ -314,9 +285,15 @@ pub enum HomeAction {
         /// This connection's own Displays choice, or `None` to follow the
         /// application default.
         displays_mode: Option<crate::ui::app::DisplaysMode>,
+        /// This connection's keyboard settings.
+        keyboard: arcen_input::keyboard::KeyboardSettings,
     },
     /// Cancel the add/edit form.
     CancelForm,
+    /// Run the connection test against this address. Sends no credentials.
+    TestConnection { host: String, port: String },
+    /// A button in the connection test's report.
+    ConnectionTest(crate::ui::connection_test::ConnectionTestAction),
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -429,35 +406,11 @@ fn sidebar(ui: &mut egui::Ui, state: &mut HomeViewState<'_>, panel_h: f32) -> Op
                 let has_direct = state.saved_connections.iter().any(|c| {
                     c.kind == ConnectionKind::DirectMachine && connection_matches(c, &needle)
                 });
-                let has_gateway = state
-                    .saved_connections
-                    .iter()
-                    .any(|c| c.kind == ConnectionKind::Gateway && connection_matches(c, &needle));
 
                 if has_direct {
                     sidebar_section_label(ui, "DIRECT");
                     for (idx, saved) in state.saved_connections.iter().enumerate() {
                         if saved.kind != ConnectionKind::DirectMachine {
-                            continue;
-                        }
-                        if !connection_matches(saved, &needle) {
-                            continue;
-                        }
-                        let sel =
-                            state.direct.saved_connection_id.as_deref() == Some(saved.id.as_str());
-                        if let Some(a) = sidebar_row(ui, idx, saved, sel) {
-                            action = Some(a);
-                        }
-                    }
-                }
-
-                if has_gateway {
-                    if has_direct {
-                        ui.add_space(4.0);
-                    }
-                    sidebar_section_label(ui, "GATEWAY");
-                    for (idx, saved) in state.saved_connections.iter().enumerate() {
-                        if saved.kind != ConnectionKind::Gateway {
                             continue;
                         }
                         if !connection_matches(saved, &needle) {
@@ -481,7 +434,7 @@ fn sidebar(ui: &mut egui::Ui, state: &mut HomeViewState<'_>, panel_h: f32) -> Op
                                 .size(12.0),
                         );
                     });
-                } else if !has_direct && !has_gateway {
+                } else if !has_direct {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
@@ -912,6 +865,19 @@ fn detail_connection(
                                 action = Some(HomeAction::Connect(draft));
                             }
 
+                            ui.add_space(10.0);
+                            if let Some(test_action) =
+                                connection_test_controls(ui, state.connection_test, true)
+                            {
+                                action = Some(match test_action {
+                                    None => HomeAction::TestConnection {
+                                        host: saved.host.clone(),
+                                        port: saved.port.to_string(),
+                                    },
+                                    Some(panel) => HomeAction::ConnectionTest(panel),
+                                });
+                            }
+
                             ui.add_space(24.0);
                         });
                 });
@@ -958,24 +924,6 @@ fn paint_connection_kind_icon(
                 ],
                 stroke,
             );
-        }
-        ConnectionKind::Gateway => {
-            let r = 7.0;
-            let points = vec![
-                egui::pos2(center.x, center.y - r),
-                egui::pos2(center.x + r, center.y),
-                egui::pos2(center.x, center.y + r),
-                egui::pos2(center.x - r, center.y),
-            ];
-            painter.add(egui::Shape::closed_line(
-                points.clone(),
-                egui::Stroke::new(1.5, color),
-            ));
-            painter.add(egui::Shape::convex_polygon(
-                points,
-                egui::Color32::TRANSPARENT,
-                egui::Stroke::NONE,
-            ));
         }
     }
 }
@@ -1048,6 +996,8 @@ fn connection_form(
 
                             ui.add_space(14.0);
                             displays_field(ui, state.form_displays_mode);
+                            ui.add_space(14.0);
+                            keyboard_field(ui, state.form_keyboard);
 
                             ui.add_space(24.0);
 
@@ -1096,6 +1046,7 @@ fn connection_form(
                                             port,
                                             username,
                                             displays_mode: *state.form_displays_mode,
+                                            keyboard: *state.form_keyboard,
                                         }
                                     } else {
                                         HomeAction::SaveNew {
@@ -1104,6 +1055,7 @@ fn connection_form(
                                             port,
                                             username,
                                             displays_mode: *state.form_displays_mode,
+                                            keyboard: *state.form_keyboard,
                                         }
                                     });
                                 }
@@ -1133,6 +1085,20 @@ fn connection_form(
                                 }
                             });
 
+                            ui.add_space(12.0);
+                            let can_test = !state.form_host.trim().is_empty();
+                            if let Some(test_action) =
+                                connection_test_controls(ui, state.connection_test, can_test)
+                            {
+                                action = Some(match test_action {
+                                    None => HomeAction::TestConnection {
+                                        host: state.form_host.trim().to_string(),
+                                        port: state.form_port.trim().to_string(),
+                                    },
+                                    Some(panel) => HomeAction::ConnectionTest(panel),
+                                });
+                            }
+
                             ui.add_space(24.0);
                         });
                 });
@@ -1143,6 +1109,42 @@ fn connection_form(
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
+
+/// The **Test connection** button and, below it, the report. `Some(None)`
+/// starts a test; `Some(Some(_))` is a button inside the report.
+fn connection_test_controls(
+    ui: &mut egui::Ui,
+    test: Option<&crate::ui::connection_test::ConnectionTest>,
+    enabled: bool,
+) -> Option<Option<crate::ui::connection_test::ConnectionTestAction>> {
+    let mut action = None;
+    let running = test.is_some_and(crate::ui::connection_test::ConnectionTest::running);
+    let button = ui
+        .add_enabled(
+            enabled && !running,
+            egui::Button::new(egui::RichText::new("Test connection").size(13.0))
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(0xC4, 0xC4, 0xCC),
+                ))
+                .corner_radius(8.0),
+        )
+        .on_hover_text(
+            "Checks the name, UDP 18444, the certificate, the Pier's greeting, \
+             path MTU and round trip. Sends no user name or password.",
+        );
+    if button.clicked() {
+        action = Some(None);
+    }
+    if let Some(test) = test {
+        ui.add_space(8.0);
+        if let Some(panel) = crate::ui::connection_test::render(ui, test) {
+            action = Some(Some(panel));
+        }
+    }
+    action
+}
 
 /// Read-only label + value row (e.g. "HOST   workstation.local").
 fn detail_kv(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1236,6 +1238,125 @@ fn displays_field(ui: &mut egui::Ui, value: &mut Option<crate::ui::app::Displays
     );
 }
 
+/// The connection form's Keyboard settings: what Command and Control are on
+/// the host, and whether left Option types like `AltGr` on a Windows host.
+fn keyboard_field(ui: &mut egui::Ui, value: &mut arcen_input::keyboard::KeyboardSettings) {
+    use arcen_input::keyboard::ShortcutPreference;
+
+    const FIELD_W: f32 = 340.0;
+
+    ui.label(
+        egui::RichText::new("Keyboard shortcuts")
+            .color(egui::Color32::DARK_GRAY)
+            .size(12.0),
+    );
+    ui.add_space(3.0);
+    egui::ComboBox::from_id_salt("connection_keyboard_shortcuts")
+        .selected_text(shortcut_label(value.shortcuts))
+        .width(FIELD_W)
+        .show_ui(ui, |ui| {
+            for preference in ShortcutPreference::ALL {
+                ui.selectable_value(&mut value.shortcuts, preference, shortcut_label(preference));
+            }
+        });
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(shortcut_description(value.shortcuts))
+            .color(egui::Color32::GRAY)
+            .size(11.0),
+    );
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut value.left_option_altgr,
+        "Left Option is also AltGr (Windows hosts)",
+    );
+    ui.label(
+        egui::RichText::new(
+            // The Deck's font has no Option glyph (U+2325); it would draw a box.
+            "Right Option is always AltGr on a Windows host, so Option+2 types @ on a \
+             Norwegian layout. Tick this to type those characters with left Option too.",
+        )
+        .color(egui::Color32::GRAY)
+        .size(11.0),
+    );
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Keyboard mode")
+            .color(egui::Color32::DARK_GRAY)
+            .size(12.0),
+    );
+    ui.add_space(3.0);
+    egui::ComboBox::from_id_salt("connection_keyboard_mode")
+        .selected_text(keyboard_mode_label(value.typing))
+        .width(FIELD_W)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut value.typing, None, keyboard_mode_label(None));
+            for mode in arcen_input::text::KeyboardMode::ALL {
+                ui.selectable_value(
+                    &mut value.typing,
+                    Some(mode),
+                    keyboard_mode_label(Some(mode)),
+                );
+            }
+        });
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(match value.typing {
+            None => "Follows the Typing setting in Settings.",
+            Some(arcen_input::text::KeyboardMode::Physical) => {
+                "Keys go as keys and the remote keyboard layout decides each character. Best \
+                 for games and applications that read keys."
+            }
+            Some(arcen_input::text::KeyboardMode::Characters) => {
+                "Typed characters arrive as this Mac types them, whatever the remote layout; \
+                 shortcuts, arrows and function keys stay keys. Needs a host that types text."
+            }
+        })
+        .color(egui::Color32::GRAY)
+        .size(11.0),
+    );
+}
+
+const fn keyboard_mode_label(mode: Option<arcen_input::text::KeyboardMode>) -> &'static str {
+    match mode {
+        None => "Use the Typing setting",
+        Some(arcen_input::text::KeyboardMode::Physical) => "Physical keys",
+        Some(arcen_input::text::KeyboardMode::Characters) => "Characters",
+    }
+}
+
+const fn shortcut_label(preference: arcen_input::keyboard::ShortcutPreference) -> &'static str {
+    use arcen_input::keyboard::ShortcutPreference;
+    match preference {
+        ShortcutPreference::Automatic => "Automatic (by host)",
+        ShortcutPreference::WindowsApp => "⌘ is the Windows key, Mac edit shortcuts",
+        ShortcutPreference::SwapCommandControl => "⌘ and Control swapped",
+        ShortcutPreference::CommandIsControl => "⌘ is Control",
+    }
+}
+
+const fn shortcut_description(
+    preference: arcen_input::keyboard::ShortcutPreference,
+) -> &'static str {
+    use arcen_input::keyboard::ShortcutPreference;
+    match preference {
+        ShortcutPreference::Automatic => {
+            "Windows host: ⌘ is the Windows key, ⌘C/X/V/A/Z/F/W are Ctrl. \
+             Linux host: ⌘ is Control. Mac host: ⌘ is ⌘."
+        }
+        ShortcutPreference::WindowsApp => {
+            "As Microsoft's Windows App: ⌘ alone opens Start, ⌘E opens Explorer, \
+             ⌘C/X/V/A/Z/F/W are Ctrl+C/X/V/A/Z/F/W. A Mac host keeps ⌘."
+        }
+        ShortcutPreference::SwapCommandControl => {
+            "⌘ is Ctrl for every key and Control is the Windows key. A Mac host keeps ⌘."
+        }
+        ShortcutPreference::CommandIsControl => {
+            "⌘ and Control are both Ctrl, as Arcen has always done for Linux. A Mac host keeps ⌘."
+        }
+    }
+}
+
 fn form_field(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool, width: f32) {
     const FIELD_H: f32 = 36.0;
     ui.label(
@@ -1291,19 +1412,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_and_gateway_are_visually_distinct() {
-        assert_ne!(
-            ConnectionKind::DirectMachine.icon(),
-            ConnectionKind::Gateway.icon()
-        );
-        assert_ne!(
-            ConnectionKind::DirectMachine.title(),
-            ConnectionKind::Gateway.title()
-        );
-        assert_ne!(
-            ConnectionKind::DirectMachine.default_port(),
-            ConnectionKind::Gateway.default_port()
-        );
+    fn a_direct_machine_uses_the_product_udp_port() {
+        assert_eq!(ConnectionKind::DirectMachine.default_port(), 18444);
+        assert_eq!(ConnectionKind::DirectMachine.title(), "Direct Machine");
     }
 
     #[test]
@@ -1314,16 +1425,6 @@ mod tests {
         assert!(!SavedTransport::Quic.accepts_port(0));
         assert!(SavedTransport::Wss.accepts_port(18_443));
         assert!(!SavedTransport::Wss.accepts_port(19_443));
-    }
-
-    #[test]
-    fn linux_destination_defaults_cmd_ctrl_swap_on() {
-        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        assert!(draft.swap_cmd_ctrl);
-        draft.set_destination_kind(DestinationKind::Mac);
-        assert!(!draft.swap_cmd_ctrl);
-        draft.set_destination_kind(DestinationKind::Windows);
-        assert!(!draft.swap_cmd_ctrl);
     }
 
     #[test]
@@ -1348,10 +1449,14 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_section_labels_differ_by_kind() {
-        assert_ne!(
-            ConnectionKind::DirectMachine.as_key(),
-            ConnectionKind::Gateway.as_key(),
+    fn every_saved_kind_key_loads_as_a_direct_machine() {
+        assert_eq!(
+            ConnectionKind::from_key(ConnectionKind::DirectMachine.as_key()),
+            ConnectionKind::DirectMachine
+        );
+        assert_eq!(
+            ConnectionKind::from_key("retired-kind"),
+            ConnectionKind::DirectMachine
         );
     }
 }

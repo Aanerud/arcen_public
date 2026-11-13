@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Persistent single-user graphical desktop lifecycle.
 
 use std::sync::{Arc, Mutex, Weak};
@@ -66,6 +68,10 @@ pub struct SessionMetadata {
     /// served from it and never replaces the desktop to change it. `None`
     /// for a headless Wayland desktop.
     pub x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
+    /// The desktop's own logind seat (`seat-arcen-pen-<id>`) when its
+    /// compositor runs natively on it (ADR 0015); `None` for headless Wayland
+    /// and dedicated Xorg.
+    pub native_seat: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -188,6 +194,42 @@ struct DesktopSession {
     multi_monitor_ever_usable: MultiMonitorEverUsable,
     /// See [`SessionMetadata::requested_outputs`].
     requested_outputs: Option<Vec<arcen_session::wayland_outputs::PlacedOutput>>,
+    /// logind removed this desktop's session while an attachment held it:
+    /// the desktop is torn down when that attachment ends, never retained.
+    logind_session_removed: bool,
+    /// Watches logind for this desktop's session ending outside Arcen;
+    /// stopped with the desktop.
+    _removal_watch: Option<RemovalWatch>,
+}
+
+/// Aborts a desktop's logind removal watch when the desktop goes.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "wayland-provider")),
+    allow(dead_code)
+)]
+struct RemovalWatch(tokio::task::AbortHandle);
+
+impl Drop for RemovalWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What a desktop whose logind session ended outside Arcen becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndedDesktop {
+    /// Nobody is attached: torn down now (a native seat is released).
+    TearDownNow,
+    /// An attachment still holds it: torn down when that ends.
+    TearDownAtDetach,
+}
+
+fn ended_desktop(connected: bool) -> EndedDesktop {
+    if connected {
+        EndedDesktop::TearDownAtDetach
+    } else {
+        EndedDesktop::TearDownNow
+    }
 }
 
 impl DesktopSession {
@@ -199,6 +241,20 @@ impl DesktopSession {
             .as_ref()
             .filter(|ready| ready.output_socket.is_some())
             .map(|ready| ready.output_mode)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_seat(&self) -> Option<String> {
+        self.launcher
+            .seat_pen
+            .as_ref()
+            .filter(|pen| pen.is_native())
+            .map(|pen| pen.seat())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn native_seat(&self) -> Option<String> {
+        None
     }
 
     fn metadata(&self, reconnected: bool) -> SessionMetadata {
@@ -224,6 +280,7 @@ impl DesktopSession {
             audio: self.launcher.audio.clone(),
             requested_outputs: self.requested_outputs.clone(),
             x11_desktop_depth: self.launcher.x11_desktop_depth,
+            native_seat: self.native_seat(),
         }
     }
 
@@ -581,6 +638,8 @@ impl SessionRegistry {
             } else {
                 None
             },
+            logind_session_removed: false,
+            _removal_watch: None,
         };
         let metadata = desktop.metadata(false);
         let execution = desktop.execution();
@@ -592,6 +651,8 @@ impl SessionRegistry {
             );
             guard.session = Some(desktop);
         }
+        #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+        self.watch_logind_removal(&metadata.session_id);
         tracing::info!(
             target: crate::logging::target::SESSION,
             username = %metadata.username,
@@ -824,20 +885,123 @@ impl SessionRegistry {
         }
     }
 
-    fn disconnect(&self, generation: u64, username: &str) {
+    fn disconnect(self: &Arc<Self>, generation: u64, username: &str) {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(session) = guard.session.as_mut() {
-            if session.generation == generation && session.launcher.identity.username == username {
-                if session.connected {
-                    session.connected = false;
-                    session.disconnected_since = Some(SystemTime::now());
+        let state = &mut *guard;
+        let Some(session) = state.session.as_mut().filter(|session| {
+            session.generation == generation && session.launcher.identity.username == username
+        }) else {
+            return;
+        };
+        if session.logind_session_removed && !state.draining {
+            state.draining = true;
+            let session = state.session.take().expect("existing session");
+            drop(guard);
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                username,
+                generation,
+                "client detached from a desktop whose logind session ended outside Arcen; tearing it down"
+            );
+            self.spawn_cleanup(async move {
+                session.shutdown().await;
+            });
+            return;
+        }
+        if session.connected {
+            session.connected = false;
+            session.disconnected_since = Some(SystemTime::now());
+        }
+        tracing::info!(
+            target: crate::logging::target::SESSION,
+            username,
+            generation,
+            "client detached; graphical session persists for reconnect"
+        );
+    }
+
+    /// Watches logind for the desktop's session ending outside Arcen
+    /// (`loginctl terminate-session`, an administrator's kill) and tears the
+    /// desktop down, with a native desktop's seat, instead of keeping it
+    /// until the next sign-in finds it dead.
+    #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+    fn watch_logind_removal(self: &Arc<Self>, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        let registry = Arc::downgrade(self);
+        let session_id = session_id.to_string();
+        let watched = session_id.clone();
+        let task = tokio::spawn(async move {
+            match crate::session::logind_watch::session_removed(&watched).await {
+                Ok(()) => {
+                    if let Some(registry) = registry.upgrade() {
+                        registry.logind_session_removed(&watched);
+                    }
                 }
-                tracing::info!(
+                Err(error) => tracing::warn!(
                     target: crate::logging::target::SESSION,
-                    username,
-                    generation,
-                    "client detached; graphical session persists for reconnect"
+                    session_id = %watched,
+                    %error,
+                    "cannot watch logind for this desktop's session ending; an externally ended desktop is noticed at the next sign-in"
+                ),
+            }
+        });
+        let mut guard = self.inner.lock().unwrap();
+        match guard.session.as_mut().filter(|session| {
+            session.launcher.environment.session_id() == Some(session_id.as_str())
+        }) {
+            Some(session) => session._removal_watch = Some(RemovalWatch(task.abort_handle())),
+            None => task.abort(),
+        }
+    }
+
+    /// logind removed session `session_id`: if it is the retained desktop's,
+    /// the desktop is torn down now, or when its attachment ends.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "wayland-provider")),
+        allow(dead_code)
+    )]
+    fn logind_session_removed(self: &Arc<Self>, session_id: &str) {
+        let mut guard = self.inner.lock().unwrap();
+        let state = &mut *guard;
+        if state.draining {
+            return;
+        }
+        let Some(session) = state
+            .session
+            .as_mut()
+            .filter(|session| session.launcher.environment.session_id() == Some(session_id))
+        else {
+            return;
+        };
+        let username = session.launcher.identity.username.clone();
+        let native_seat = session.launcher.has_native_seat();
+        match ended_desktop(session.connected) {
+            EndedDesktop::TearDownAtDetach => {
+                session.logind_session_removed = true;
+                tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    %username,
+                    session_id,
+                    native_seat,
+                    "the desktop's logind session ended outside Arcen; it is torn down when the attached client goes"
                 );
+            }
+            EndedDesktop::TearDownNow => {
+                state.draining = true;
+                let session = state.session.take().expect("existing session");
+                drop(guard);
+                tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    %username,
+                    session_id,
+                    native_seat,
+                    "the retained desktop's logind session ended outside Arcen; tearing it down now"
+                );
+                self.spawn_cleanup(async move {
+                    session.shutdown().await;
+                });
             }
         }
     }
@@ -1237,6 +1401,12 @@ mod tests {
             Some(limit),
             Some(limit)
         ));
+    }
+
+    #[test]
+    fn an_externally_ended_desktop_waits_only_for_its_attached_client() {
+        assert_eq!(ended_desktop(false), EndedDesktop::TearDownNow);
+        assert_eq!(ended_desktop(true), EndedDesktop::TearDownAtDetach);
     }
 
     #[test]

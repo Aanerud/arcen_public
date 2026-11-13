@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A keyboard and pointer macOS treats as hardware.
 //!
 //! `CGEvent` posting is enough for an application in a logged-in session, and
@@ -470,7 +472,7 @@ pub fn run_injector() -> ExitCode {
 }
 
 #[cfg(target_os = "macos")]
-mod native {
+pub(crate) mod native {
     #![allow(unsafe_code)]
 
     use std::ffi::c_void;
@@ -507,12 +509,12 @@ mod native {
     }
 
     /// A live virtual HID device, owned by this process for its lifetime.
-    pub(super) struct VirtualDevice {
+    pub(crate) struct VirtualDevice {
         device: *mut c_void,
     }
 
     impl VirtualDevice {
-        pub(super) fn new(descriptor: &[u8], product_id: u32, name: &str) -> Result<Self, String> {
+        pub(crate) fn new(descriptor: &[u8], product_id: u32, name: &str) -> Result<Self, String> {
             let number = |value: u32| -> Retained<NSNumber> { NSNumber::new_u32(value) };
             let descriptor = NSData::with_bytes(descriptor);
             let vendor = number(super::VENDOR_ID);
@@ -558,7 +560,7 @@ mod native {
             Ok(Self { device })
         }
 
-        pub(super) fn send(&self, report: &[u8]) -> Result<(), String> {
+        pub(crate) fn send(&self, report: &[u8]) -> Result<(), String> {
             // SAFETY: the device is live and activated; `report` is valid for
             // its length for the duration of the call.
             let status = unsafe {

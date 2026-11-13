@@ -1,8 +1,10 @@
 # Timezone Redirection
 
-**Status (2026-10-05):** implemented on macOS Deck and all active Piers.
-The feature is opt-in and defaults off on both hosts. It is a convenience
-feature: failure warns and streaming continues.
+**Status (2026-10-05):** implemented on the macOS Deck and the Linux, Windows
+and macOS Piers. `redirection.timezone` is off in the built-in defaults, and
+the `pier.json` every installer writes turns it on (see the
+[configuration reference](../operations/config-reference.md)). It is a
+convenience feature: failure warns and streaming continues.
 
 ## Wire authority and compatibility
 

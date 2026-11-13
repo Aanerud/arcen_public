@@ -127,19 +127,12 @@ build inputs**: these files must contain the real values or the build fails.
 | `packaging/macos/tech.arcen.deck.usbhelper.plist` | real helper bundle id |
 | `packaging/macos/validate_release_inputs.py` | real `TEAM_ID` / `BUNDLE_ID` constants |
 
-This is not theoretical. A documentation-scrub pass once replaced those values
-with `TEAMID1234` / `com.example.arcen.deck` placeholders across all five files.
-Everything still compiled and every unit test still passed, because the test
-fixtures were rewritten consistently. It failed only at
-`--release`, with:
-
-```
-release metadata validation failed: provisioning profile team identifier does not match
-```
-
-The entitlements no longer matched the provisioning profile, and the validator
-was checking the real profile against fake constants. Treat these files as code,
-not prose.
+Team and bundle identifiers are functional public build inputs; do not
+anonymise them. Placeholders would still compile and pass unit tests, but a
+`--release` build fails release metadata validation
+(`provisioning profile team identifier does not match`) because the
+entitlements no longer match the provisioning profile. Treat these files as
+code, not prose.
 
 By contrast, the genuinely secret material below must never be committed.
 
@@ -155,10 +148,10 @@ Nothing secret belongs in this repository. It is public, and
 | App-specific password | password manager; stored in the notary keychain profile |
 | Notary keychain profile name | password manager |
 | `.provisionprofile` files | outside the repository (for example an `AppleCerts/` directory alongside it) |
-| Test-host inventory, lab addresses | `.claude/`, which is gitignored |
+| Test-host inventory, lab addresses | outside the source tree |
 
-`*.provisionprofile` (anywhere in the tree) and `.claude/` are both in
-`.gitignore`, but ignored is not the same as absent: keep profiles out of the
+`*.provisionprofile` (anywhere in the tree) is in `.gitignore`, but ignored is
+not the same as absent: keep profiles and machine inventories out of the
 repository entirely.
 Do not `git add -f` either.
 

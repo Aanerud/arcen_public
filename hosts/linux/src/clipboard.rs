@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Dedicated-Xorg clipboard policy, bounded relay state, and user-agent supervision.
 
 use arcen_media::clipboard::eligibility::{
     clipboard_eligibility, ClipboardHostFacts, ClipboardIneligible,
 };
-use arcen_media::clipboard::{ClipboardPolicy, ClipboardRequest, HARD_MAX_CLIPBOARD_BYTES};
+use arcen_media::clipboard::{
+    ClipboardPolicy, ClipboardRequest, RepeatedCopyFilter, HARD_MAX_CLIPBOARD_BYTES,
+};
 use arcen_protocol::clipboard::{ClipboardCursor, ClipboardTransfer, ClipboardWireMessage};
 use arcen_protocol::messages::{
     ClientHelloMsg, ClipboardContentKind, ClipboardDirectionMsg, ClipboardPolicyMsg,
@@ -592,6 +596,51 @@ impl ClipboardBridgeLink {
     }
 }
 
+/// Queues a host copy for the Deck unless it repeats the copy sent last.
+///
+/// One copy on the desktop can reach the Pier twice: an X11 owner may take
+/// the selection again, and a Wayland compositor may announce a new owner
+/// for the same content. Both bridges (the Xorg child and the Wayland
+/// session agent) end here, so the shared [`RepeatedCopyFilter`] decides for
+/// both; a dropped repeat is scrubbed.
+pub fn send_host_copy(
+    repeats: &mut RepeatedCopyFilter,
+    outbound: &ClipboardWriterQueue,
+    mut item: ClipboardItem,
+    now: Instant,
+) -> bool {
+    if repeats.is_repeat(item.kind.into(), &item.bytes, now) {
+        tracing::debug!(
+            target: crate::logging::target::SESSION,
+            sequence = item.sequence,
+            kind = ?item.kind,
+            size = item.bytes.len(),
+            "clipboard update repeats the copy just sent; not sent again"
+        );
+        item.scrub();
+        return false;
+    }
+    outbound.enqueue(item)
+}
+
+/// Hands a Deck item to the desktop's bridge. Once it is taken, the desktop's
+/// clipboard holds something else, so the next host copy is new even when it
+/// repeats the one sent last.
+pub fn offer_deck_item(
+    repeats: &mut RepeatedCopyFilter,
+    bridge: Option<&ClipboardBridgeLink>,
+    item: ClipboardItem,
+) -> bool {
+    let Some(bridge) = bridge else {
+        return false;
+    };
+    let offered = bridge.offer(item);
+    if offered {
+        repeats.clear();
+    }
+    offered
+}
+
 /// What the Pier's side of a clipboard bridge has to handle next.
 #[derive(Debug)]
 pub enum ClipboardBridgeEvent {
@@ -1101,6 +1150,7 @@ mod tests {
             wayland: None,
             requested_outputs: None,
             x11_desktop_depth: None,
+            native_seat: None,
         }
     }
 
@@ -1292,5 +1342,68 @@ mod tests {
             panic!("new payload chunk");
         };
         assert_eq!(frame.len(), arcen_protocol::CLIPBOARD_HEADER_SIZE + 3);
+    }
+
+    #[tokio::test]
+    async fn one_host_copy_reaches_the_deck_once_until_the_deck_sends_one() {
+        let (pier, _agent) = tokio::net::UnixStream::pair().unwrap();
+        let bridge = ClipboardBridgeLink::new(
+            WebSocketStream::from_raw_socket(
+                ClipboardAgentIo::Session(pier),
+                Role::Client,
+                Some(bridge_websocket_config()),
+            )
+            .await,
+            ClipboardBridgeKind::WaylandSession,
+        );
+        let deck = ClipboardWriterQueue::new();
+        let mut repeats = RepeatedCopyFilter::new();
+        let copied = Instant::now();
+        let item = |sequence| {
+            ClipboardItem::new(
+                sequence,
+                ClipboardContentKind::TextUtf8,
+                b"copied once".to_vec(),
+                false,
+            )
+            .unwrap()
+        };
+        assert!(send_host_copy(&mut repeats, &deck, item(1), copied));
+        // The desktop announces the same copy again.
+        assert!(!send_host_copy(
+            &mut repeats,
+            &deck,
+            item(2),
+            copied + Duration::from_millis(40)
+        ));
+        assert!(matches!(deck.pop().await.unwrap(), Some(Message::Text(_))));
+        assert!(matches!(
+            deck.pop().await.unwrap(),
+            Some(Message::Binary(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), deck.pop())
+                .await
+                .is_err(),
+            "the repeat was never queued"
+        );
+        // With no bridge a Deck item changes nothing on the desktop.
+        assert!(!offer_deck_item(&mut repeats, None, item(1)));
+        assert!(!send_host_copy(
+            &mut repeats,
+            &deck,
+            item(3),
+            copied + Duration::from_millis(60)
+        ));
+        // A Deck item replaced the desktop's clipboard: the same host copy is
+        // new again.
+        assert!(offer_deck_item(&mut repeats, Some(&bridge), item(1)));
+        assert!(send_host_copy(
+            &mut repeats,
+            &deck,
+            item(4),
+            copied + Duration::from_millis(80)
+        ));
+        assert!(matches!(deck.pop().await.unwrap(), Some(Message::Text(_))));
     }
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Opt-in grey-scale text anti-aliasing for the length of a session.
 //!
 //! ClearType draws text with per-subpixel colour fringes tuned for the host's

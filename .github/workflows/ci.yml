@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 name: CI
 
 # Arcen is a public AGPL-3.0 repository with no support commitment, and CI is
@@ -14,10 +17,6 @@ name: CI
 # What runs here is the platform-independent subset, so a green run means
 # something. Platform builds are the contributor's responsibility — state in the
 # pull request what you built and ran, and what you did not.
-#
-# (GitHub bills hosted runners at 10x for macOS and 2x for Windows on PRIVATE
-# repositories. Standard runners are free on public repositories, so cost is no
-# longer the constraint here — correctness is.)
 
 on:
   workflow_dispatch:
@@ -48,6 +47,10 @@ jobs:
           persist-credentials: false
       - name: Refuse to publish private infrastructure or non-AGPL crates
         run: bash scripts/ci/check-publication-hygiene.sh
+      - name: REUSE compliance (every file has a licence and copyright)
+        run: |
+          python3 -m pip install --user 'reuse==6.3.0'
+          python3 -m reuse lint
 
   doc-guard:
     name: Documentation content guard
@@ -74,6 +77,9 @@ jobs:
       - name: Shared contracts and dependency direction
         run: |
           python3 -m unittest scripts/test_check_shared_contracts.py
+          python3 -m unittest scripts/test_operations_references.py
+          python3 -m unittest scripts/test_driver_source_manifest.py
+          python3 -m unittest scripts/test_publication_allowlist.py
           python3 scripts/check_shared_contracts.py --verbose
           bash scripts/ci/check-workspace-boundaries.sh
       - name: Verify governed vendored sources

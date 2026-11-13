@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The per-desktop screen lines of a dedicated session Xorg configuration:
 //! its depth and, for a single head, a `Virtual` size large enough for the
 //! served display.

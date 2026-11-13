@@ -1,38 +1,42 @@
 # Support
 
-**There is no support.**
+Arcen is free software. Using it does not require a contract, and the
+community side of the project comes with **no support commitment**. Paid
+support is available separately from TUTTIFRUTTI AS.
 
-That is not a joke or a placeholder, and it will not change. Arcen is free
-software published under the AGPL-3.0 because publishing it is more useful than
-letting it sit in a private repository. It is not a product, there is no
-company behind it, and nobody is on call.
+## Community
 
-Concretely:
-
-- **No installation help.** The README documents what the software does. If
-  that is not enough, read the source — that is what it is there for.
-- **No response-time guarantee** on issues, discussions, or pull requests.
-  Many will never be answered.
-- **No roadmap commitments.** Features appear when the maintainer wants them.
-- **No compatibility promise.** Interfaces, protocol wire format, and
-  configuration may change without a migration path.
-- **No production warranty.** See the disclaimer in
-  [LICENSE](LICENSE) sections 15–17. It means what it says.
-
-## What is still welcome
-
-- **Bug reports** with enough detail to be actionable. They may sit for a long
-  time, but they are read.
-- **Pull requests.** A good patch is far more likely to move than a request.
-- **Security reports** — these get real attention. Use the private process in
+- **Documentation first.** The [README](README.md), the
+  [administration guide](docs/operations/pier-administration.md),
+  [Troubleshooting](docs/operations/troubleshooting.md) and
+  [Error codes](docs/operations/error-codes.md) cover installation and the
+  problems people actually hit.
+- **Bug reports** with enough detail to be actionable are welcome as issues.
+  They are read, but there is **no response-time guarantee**, and some will
+  take a long time.
+- **Pull requests** are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). A good
+  patch is far more likely to move than a request.
+- **Security reports** get real attention. Use the private process in
   [SECURITY.md](SECURITY.md).
 
-## If Arcen is useful to you
+Without a support agreement there is also:
 
-Development continues for as long as it stays interesting and the tooling bill
-gets paid. If it saved you something, you can contribute to that:
+- **no compatibility promise** — interfaces, protocol wire format and
+  configuration may change between releases, as the
+  [CHANGELOG](CHANGELOG.md) records;
+- **no warranty** — see the disclaimer in [LICENSE](LICENSE), sections 15–17.
+  It means what it says.
 
-**https://wise.com/pay/me/andreasmartina**
+## Paid support and official builds
 
-Entirely optional. It buys you exactly no support, no priority, and no
-influence — see above.
+TUTTIFRUTTI AS, which owns Arcen and is its official distributor, offers:
+
+- **support** for Arcen deployments;
+- **official signed and notarised builds**, distributed through app stores and
+  marketplaces;
+- **pre-installed cloud workstation images** and packages for remote
+  workstations.
+
+These are what fund the project. See [NOTICE](NOTICE) and
+[Licensing and official builds](docs/project.md#licensing-and-official-builds).
+Paying for them buys a service; it is never required to use the software.

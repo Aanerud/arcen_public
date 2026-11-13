@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Capturing the desktop's audio, and silencing its speakers.
 //!
 //! Two requirements meet here, and they are not the same requirement.

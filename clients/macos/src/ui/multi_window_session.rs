@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Production applied-topology adoption, absolute-pointer coordinate
 //! mapping, and teardown detection for a real multi-monitor-v1 session.
 //!

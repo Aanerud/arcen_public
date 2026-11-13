@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Linux installer's desktop-provider step: host facts for the shared
 //! plan (`arcen_session::install_provider`), the embedded Pier's runtime
 //! check, the Wayland qualification run, and the install log.
@@ -121,7 +123,7 @@ const NOBODY: u32 = 65_534;
 
 /// Runs `program` with a bound; with `unprivileged`, as `nobody` when the
 /// installer is root (a side-by-side prefix's probes never need root).
-fn bounded_stdout_as(
+pub(crate) fn bounded_stdout_as(
     program: &str,
     args: &[&str],
     timeout: Duration,

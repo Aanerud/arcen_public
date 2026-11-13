@@ -1,4 +1,10 @@
-use crate::{SetupPacket, UsbDeviceId};
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
+use crate::{
+    CapturedDeviceFacts, DescriptorError, DeviceSnapshot, InterfaceReportDescriptor, SetupPacket,
+    UsbDeviceId, UsbSpeed, parse_configuration_descriptor,
+};
 
 /// Reserved invalid VID used only by the lab fixture; never a production USB
 /// identity or USB-IF assignment claim.
@@ -227,6 +233,29 @@ impl SyntheticTabletDevice {
     #[must_use]
     pub const fn report_descriptor() -> &'static [u8] {
         SYNTHETIC_TABLET_REPORT_DESCRIPTOR
+    }
+
+    /// What a backend that captured this device would read from it: its
+    /// identity, the parsed configuration, full speed, and the report
+    /// descriptor of its one HID interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser's error if the fixture's configuration descriptor
+    /// were ever made invalid.
+    pub fn captured_facts() -> Result<CapturedDeviceFacts, DescriptorError> {
+        Ok(CapturedDeviceFacts {
+            snapshot: DeviceSnapshot {
+                id: Self::identity(),
+                device_class: Self::device_descriptor()[4],
+                configuration: parse_configuration_descriptor(&Self::configuration_descriptor())?,
+            },
+            speed: UsbSpeed::Full,
+            report_descriptors: vec![InterfaceReportDescriptor {
+                interface: 0,
+                descriptor: SYNTHETIC_TABLET_REPORT_DESCRIPTOR.to_vec(),
+            }],
+        })
     }
 
     /// Handles the bounded standard/class control requests needed by the lab

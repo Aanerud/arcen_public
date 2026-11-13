@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `arcen-host` binary entry point.
 //!
 //! Parses the CLI, brings up the logging backbone, installs the rustls crypto
@@ -66,6 +68,10 @@ fn main() -> ExitCode {
             "polkit-rule" => Some(arcen_pier_linux::session::polkit_remote::cli_main(
                 &args[2..],
             )),
+            #[cfg(target_os = "linux")]
+            "repair-x11-unix-dir" => {
+                Some(arcen_pier_linux::session::socket_dirs::cli_main(&args[2..]))
+            }
             _ => None,
         }
     }
@@ -114,8 +120,12 @@ fn main() -> ExitCode {
         .is_some_and(|argument| argument == "validate-config")
     {
         return match resolve_startup(&args[2..]) {
-            Ok(_) => {
+            Ok((config, _)) => {
                 println!("Pier configuration is valid.");
+                arcen_pier_linux::usb_bridge::configure_native_tablet(config.native_tablet);
+                if let Some(line) = arcen_pier_linux::usb_bridge::native_tablet_status() {
+                    println!("{line}");
+                }
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -150,9 +160,13 @@ fn main() -> ExitCode {
     };
     let config = Arc::new(config);
 
+    let build = arcen_pier_linux::build_identity();
     tracing::info!(
         target: target::NET,
         version = %arcen_pier_linux::VERSION,
+        build_id = %build.build_id,
+        revision = %build.source_revision,
+        profile = %build.build_profile,
         license = "AGPL-3.0-only",
         source = arcen_pier_linux::SOURCE_URL,
         os = std::env::consts::OS,
@@ -237,11 +251,34 @@ fn main() -> ExitCode {
     // A Pier that crashed left its desktops' seat-pen rules (their devices
     // and grants died with it); none survives into this Pier.
     arcen_pier_linux::input::seat_pen::sweep_stale_rules();
+    // A bridge helper that was killed (SIGKILL at a Pier stop or crash) left
+    // its port's seat rule; the kernel already disconnected the port when the
+    // helper's USB/IP socket closed.
+    for rule in arcen_pier_linux::usb_bridge::seat::sweep_stale_rules() {
+        tracing::info!(target: target::SESSION, rule = %rule, "removed a stale USB bridge seat rule");
+    }
+    // Native tablet is the administrator's choice (`usb.native_tablet`),
+    // fixed for this Pier's lifetime.
+    let native_tablet = arcen_pier_linux::usb_bridge::configure_native_tablet(config.native_tablet);
+    // Load Native tablet's controller once, before serving: connections only
+    // check sysfs, never run modprobe on an async task.
+    arcen_pier_linux::usb_bridge::prepare_backend();
+    // Native tablet's controller belongs to one kernel release: after a
+    // kernel update the operator is told the exact package to install.
+    if let Some(line) = arcen_pier_linux::usb_bridge::native_tablet_status().filter(|_| {
+        native_tablet.enabled
+            && arcen_pier_linux::usb_bridge::kmod::kernel_mismatch_warning().is_some()
+    }) {
+        tracing::warn!(target: target::SESSION, "{line}");
+    }
     // Arcen's polkit rule follows the actions installed now (packages may
     // have added some, or an upgrade from a build without it).
     #[cfg(target_os = "linux")]
     arcen_pier_linux::session::polkit_remote::ensure_at_start();
     let mut config = config;
+    // Set when start-up re-qualified the host after an update: the X11
+    // trigger below then waits for the next start.
+    let mut requalified_at_start = false;
     match runtime.block_on(signals.during_startup(
         &log_controller,
         arcen_pier_linux::session::wayland::select_configured_provider(
@@ -265,6 +302,7 @@ fn main() -> ExitCode {
                 signals.during_startup(&log_controller, requalify_at_start(&config, &error, stop)),
             ) {
                 StartRequalify::Selected(configured) => {
+                    requalified_at_start = true;
                     let config = Arc::make_mut(&mut config);
                     config.desktop_provider = configured.selection.provider;
                     config.wayland_qualification = configured.qualification;
@@ -294,12 +332,72 @@ fn main() -> ExitCode {
         }
     }
     // Whichever way the provider was settled (the record as found, or one
-    // re-qualified after an update), X11 applications follow that record.
-    match arcen_pier_linux::session::wayland::configured_x11_plan(
+    // re-qualified after an update), X11 applications follow that record,
+    // judged against the socket directory's state now.
+    let mut x11_plan = arcen_pier_linux::session::wayland::configured_x11_plan(
         config.desktop_provider,
         config.wayland_x11_apps,
         config.wayland_qualification.as_deref(),
-    ) {
+        x11_unix_dir_now(&config),
+    );
+    // A record that skipped X11 applications for a host precondition that
+    // holds again (an operator repaired `/tmp/.X11-unix`) is re-proved now,
+    // with the same bounded, SIGHUP-safe run an update uses; once per boot.
+    let x11_reason = match &x11_plan {
+        Ok(Some(arcen_session::wayland_x11::X11AppsPlan::Disabled(reason))) => Some(*reason),
+        Err(refusal) => Some(refusal.reason),
+        Ok(_) => None,
+    };
+    if x11_reason == Some(arcen_session::wayland_x11::X11AppsDisabledReason::PreconditionCleared) {
+        use arcen_pier_linux::session::wayland::{requalify_x11_at_start, X11StartRequalify};
+        if requalified_at_start {
+            tracing::warn!(
+                target: target::SESSION,
+                x11_requalify = "after_record_version",
+                "X11 applications are re-proved at the next start (this start already \
+                 re-qualified the host after an update)"
+            );
+        } else {
+            let stop = signals.stop_receiver();
+            match runtime.block_on(signals.during_startup(
+                &log_controller,
+                requalify_x11_at_start(&config, x11_reason, stop),
+            )) {
+                X11StartRequalify::Finished {
+                    configured: Some(configured),
+                    ..
+                } => {
+                    {
+                        let config = Arc::make_mut(&mut config);
+                        config.desktop_provider = configured.selection.provider;
+                        config.wayland_qualification = configured.qualification;
+                    }
+                    x11_plan = arcen_pier_linux::session::wayland::configured_x11_plan(
+                        config.desktop_provider,
+                        config.wayland_x11_apps,
+                        config.wayland_qualification.as_deref(),
+                        x11_unix_dir_now(&config),
+                    );
+                }
+                X11StartRequalify::Finished {
+                    configured: None, ..
+                }
+                | X11StartRequalify::HeldOff
+                | X11StartRequalify::NotApplicable => {}
+                X11StartRequalify::Interrupted => {
+                    tracing::info!(
+                        target: target::SESSION,
+                        signal = signals.stop_requested().unwrap_or("stop"),
+                        "stopped during the automatic re-qualification for X11 applications; its \
+                         desktop and temporary account were removed and no attempt was recorded"
+                    );
+                    flush_logging_before_exit(&log_controller);
+                    return ExitCode::SUCCESS;
+                }
+            }
+        }
+    }
+    match x11_plan {
         Ok(plan) => Arc::make_mut(&mut config).wayland_x11_plan = plan,
         Err(refusal) => {
             eprintln!("{refusal}");
@@ -339,6 +437,41 @@ fn main() -> ExitCode {
     }
 }
 
+/// The shared X11/ICE socket directories, when Wayland sessions may run
+/// Xwayland: a missing one is recreated, an unsafe one is logged as an
+/// error now (and checked again before every desktop); the result is the
+/// state of `/tmp/.X11-unix`, against which a record whose X11 proof was
+/// skipped for it is judged.
+#[cfg(target_os = "linux")]
+fn x11_unix_dir_now(
+    config: &cli::Config,
+) -> Result<(), arcen_session::wayland_x11::SocketDirFault> {
+    if config.desktop_provider != arcen_session::desktop_provider::DesktopProvider::Wayland
+        || config.wayland_x11_apps == arcen_session::wayland_x11::X11AppsSetting::Off
+        || !arcen_pier_linux::session::wayland::xwayland_installed()
+    {
+        return Ok(());
+    }
+    let results = arcen_pier_linux::session::socket_dirs::prepare_production();
+    for (_, result) in &results {
+        if let Err(fault) = result {
+            tracing::error!(
+                target: target::SESSION,
+                fault = fault.token(),
+                "{fault}"
+            );
+        }
+    }
+    arcen_pier_linux::session::socket_dirs::x11_result(&results)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn x11_unix_dir_now(
+    _config: &cli::Config,
+) -> Result<(), arcen_session::wayland_x11::SocketDirFault> {
+    Ok(())
+}
+
 /// Bounded best-effort drain of every registered observability sink before
 /// process exit. The runtime is never installed via `install_global`, so
 /// this explicit flush is the only way to guarantee queued canonical/dev
@@ -366,6 +499,7 @@ fn print_help() {
          \x20  arcen-pier capenc|audiocap|input-helper|session-agent|session-launcher ...\n\
          \x20  arcen-pier new-host-cert [--directory <DIR>]\n\
          \x20  arcen-pier wayland qualify [--write] [--user <NAME> --password-file <FILE>]\n\
+         \x20  arcen-pier repair-x11-unix-dir [--check | [--requalify] [--record PATH]]\n\
          \n\
          FLAGS:\n\
          \x20   -V, --version    Print version and exit\n\
@@ -406,7 +540,7 @@ fn print_help() {
          \x20       --capenc-bin <PATH>  Ignored legacy external-helper path\n\
          \x20       --auth-mode <none|pam>  Authentication mode (default none)\n\
          \x20       --pam-service <NAME>    PAM service (default login)\n\
-         \x20       --reconnect-window-secs <0..7200>  Direct resume window (default 1200)\n\
+         \x20       --reconnect-window-secs <0..7200>  Direct resume window (default 180)\n\
          \x20       --timezone-redirection  Redirect authenticated desktop TZ (default off)\n\
          \x20       --no-timezone-redirection  Disable authenticated desktop TZ redirection\n\
          \x20       --zoneinfo-root <PATH>  Zoneinfo database root (default /usr/share/zoneinfo)\n\

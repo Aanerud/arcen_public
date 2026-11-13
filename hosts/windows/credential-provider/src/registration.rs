@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Canonical identity and registry facts for the Arcen Credential Provider.
 //!
 //! These constants are the single source of truth shared by the COM server, the

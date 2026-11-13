@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `w4-dedicated-metal-layer`: a dedicated, genuinely 10-bit `CAMetalLayer`
 //! for remote video, sitting beneath `eframe`'s own egui/wgpu-compositied
 //! view, bypassing that view's render pass (and its `Bgra8Unorm` swapchain)
@@ -920,6 +922,17 @@ fn build_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
     color_format: MTLPixelFormat,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, DedicatedLayerOutcome> {
+    build_pipeline_state_for(device, color_format, "fs_convert")
+}
+
+/// [`build_pipeline_state`] with a named fragment function: `fs_convert`,
+/// or `fs_convert_refined` (the lossless-refinement composite, ADR 0016,
+/// not yet used by a presenter).
+fn build_pipeline_state_for(
+    device: &ProtocolObject<dyn MTLDevice>,
+    color_format: MTLPixelFormat,
+    fragment: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, DedicatedLayerOutcome> {
     let source = NSString::from_str(include_str!("video_metal_layer.metal"));
     let library = device
         .newLibraryWithSource_options_error(&source, None)
@@ -928,7 +941,7 @@ fn build_pipeline_state(
         .newFunctionWithName(&NSString::from_str("vs_main"))
         .ok_or(DedicatedLayerOutcome::ShaderCompilationFailed)?;
     let fragment_function = library
-        .newFunctionWithName(&NSString::from_str("fs_convert"))
+        .newFunctionWithName(&NSString::from_str(fragment))
         .ok_or(DedicatedLayerOutcome::ShaderCompilationFailed)?;
 
     let descriptor = MTLRenderPipelineDescriptor::new();
@@ -2887,6 +2900,43 @@ where
     F: DedicatedPacedFrame + Clone + Send + 'static,
     S: DedicatedThreadStatus,
 {
+    /// The frame the layer shows now (a retained reference, no copy).
+    fn last_presented(&self) -> Option<F> {
+        self.shared
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_frame
+            .as_ref()
+            .map(|retained| retained.frame.clone())
+    }
+
+    /// The installed layer's EDR flag and colour space, read from the layer
+    /// itself rather than from what was meant to be set.
+    fn layer_colour_state(&self) -> Option<LayerColourState> {
+        let layer = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .layer_handle
+            .clone()?;
+        let colour_space = layer.colorspace().and_then(|space| {
+            objc2_core_graphics::CGColorSpace::name(Some(&space)).map(|name| {
+                let name: *const objc2_core_foundation::CFString = &*name;
+                // SAFETY: `CFString` is toll-free bridged to `NSString`; the
+                // retained name outlives this read.
+                let name = unsafe { &*name.cast::<NSString>() }.to_string();
+                name.strip_prefix("kCGColorSpace")
+                    .map_or_else(|| name.clone(), str::to_owned)
+            })
+        });
+        Some(LayerColourState {
+            edr: layer.wantsExtendedDynamicRangeContent(),
+            colour_space,
+        })
+    }
+
     fn ensure_display_link(&mut self, display_id: Option<CGDirectDisplayID>) {
         let Some(display_id) = display_id else {
             return;
@@ -3415,6 +3465,16 @@ impl DedicatedEightBitVideoPresenter {
         self.logged_window_state = None;
         self.presentation_status = DedicatedEightBitPresentationStatus::Inactive;
     }
+
+    /// What the installed eight-bit layer is set to now.
+    pub(crate) fn layer_colour_state(&self) -> Option<LayerColourState> {
+        self.thread.layer_colour_state()
+    }
+
+    /// The frame the eight-bit layer shows now.
+    pub(crate) fn last_presented(&self) -> Option<DedicatedEightBitLayerFrame> {
+        self.thread.last_presented()
+    }
 }
 
 // ============================================================================
@@ -3592,6 +3652,25 @@ impl DedicatedVideoPresenter {
         self.logged_window_state = None;
         self.presentation_status = DedicatedPresentationStatus::Inactive;
     }
+
+    /// What the installed ten-bit layer is set to now.
+    pub(crate) fn layer_colour_state(&self) -> Option<LayerColourState> {
+        self.thread.layer_colour_state()
+    }
+
+    /// The frame the ten-bit layer shows now.
+    pub(crate) fn last_presented(&self) -> Option<DedicatedLayerFrame> {
+        self.thread.last_presented()
+    }
+}
+
+/// A presentation layer's colour state, read back from Core Animation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LayerColourState {
+    /// `wantsExtendedDynamicRangeContent`.
+    pub edr: bool,
+    /// The layer's colour space name, without the `kCGColorSpace` prefix.
+    pub colour_space: Option<String>,
 }
 
 #[cfg(test)]
@@ -4623,6 +4702,195 @@ mod shader_tests {
                 .map(|px| [px[0], px[1], px[2], px[3]])
                 .collect(),
         )
+    }
+
+    /// Renders `picture` into an `RGB10A2Unorm` target -- the dedicated
+    /// layer's own format -- through `fs_convert`, or through
+    /// `fs_convert_refined` with `overlay` (`[r, g, b, valid]` per pixel)
+    /// bound as the `RGB10A2Uint` refinement texture. Returns the stored
+    /// ten-bit codes, or `None` without a Metal device.
+    fn render_rgb10(
+        picture: &Picture,
+        contract: VideoColorContract,
+        overlay: Option<&[[u16; 4]]>,
+    ) -> Option<Vec<[u16; 3]>> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue().expect("command queue");
+        let fragment = if overlay.is_some() {
+            "fs_convert_refined"
+        } else {
+            "fs_convert"
+        };
+        let pipeline = build_pipeline_state_for(&device, MTLPixelFormat::RGB10A2Unorm, fragment)
+            .expect("shader compiles");
+        let plan = plane_pixel_formats(contract.depth);
+        let luma = texture(
+            &device,
+            plan.luma_format,
+            picture.width,
+            picture.height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let chroma = texture(
+            &device,
+            plan.chroma_format,
+            picture.chroma_width,
+            picture.chroma_height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let luma_bytes = plane_bytes(&picture.luma, contract.depth);
+        let chroma_codes: Vec<u16> = picture.chroma.iter().flatten().copied().collect();
+        let chroma_bytes = plane_bytes(&chroma_codes, contract.depth);
+        let overlay_texture = texture(
+            &device,
+            MTLPixelFormat::RGB10A2Uint,
+            picture.width,
+            picture.height,
+            MTLTextureUsage::ShaderRead,
+        );
+        let overlay_bytes: Vec<u8> = overlay
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|&[r, g, b, valid]| {
+                (u32::from(r)
+                    | u32::from(g) << 10
+                    | u32::from(b) << 20
+                    | u32::from(valid.min(3)) << 30)
+                    .to_le_bytes()
+            })
+            .collect();
+        // SAFETY: each byte vector holds exactly `region` at the stated row
+        // pitch and outlives the synchronous copy.
+        unsafe {
+            luma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(picture.width, picture.height),
+                0,
+                NonNull::new(luma_bytes.as_ptr() as *mut c_void).expect("non-empty"),
+                picture.width * 2,
+            );
+            chroma.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region(picture.chroma_width, picture.chroma_height),
+                0,
+                NonNull::new(chroma_bytes.as_ptr() as *mut c_void).expect("non-empty"),
+                picture.chroma_width * 4,
+            );
+            if !overlay_bytes.is_empty() {
+                overlay_texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    region(picture.width, picture.height),
+                    0,
+                    NonNull::new(overlay_bytes.as_ptr() as *mut c_void).expect("non-empty"),
+                    picture.width * 4,
+                );
+            }
+        }
+        let target = texture(
+            &device,
+            MTLPixelFormat::RGB10A2Unorm,
+            picture.width,
+            picture.height,
+            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+        );
+        let uniform = MetalVideoUniform::from_contract(
+            contract,
+            (picture.width as u32, picture.height as u32),
+            (picture.chroma_width as u32, picture.chroma_height as u32),
+            plan.code_unnormalize_scale,
+        )
+        .to_bytes();
+        // SAFETY: the byte slice is live for the call and Metal copies it.
+        let uniform_buffer = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(uniform.as_ptr() as *mut c_void).expect("non-empty"),
+                uniform.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("uniform buffer");
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        // SAFETY: colour attachment 0 is valid on every render pass.
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&*target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let command_buffer = queue.commandBuffer().expect("command buffer");
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("render encoder");
+        encoder.setRenderPipelineState(&pipeline);
+        // SAFETY: the encoder is live; indices match the shader bindings.
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&*luma), 0);
+            encoder.setFragmentTexture_atIndex(Some(&*chroma), 1);
+            if overlay.is_some() {
+                encoder.setFragmentTexture_atIndex(Some(&*overlay_texture), 2);
+            }
+            encoder.setFragmentBuffer_offset_atIndex(Some(&*uniform_buffer), 0, 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+        let blit = command_buffer.blitCommandEncoder().expect("blit encoder");
+        blit.synchronizeResource(ProtocolObject::from_ref(&*target));
+        blit.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        let mut out = vec![0_u8; picture.width * picture.height * 4];
+        // SAFETY: `out` holds exactly the region at the stated row pitch.
+        unsafe {
+            target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(out.as_mut_ptr().cast()).expect("non-empty"),
+                picture.width * 4,
+                region(picture.width, picture.height),
+                0,
+            );
+        }
+        Some(
+            out.chunks_exact(4)
+                .map(|px| {
+                    let word = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                    [
+                        (word & 0x3ff) as u16,
+                        ((word >> 10) & 0x3ff) as u16,
+                        ((word >> 20) & 0x3ff) as u16,
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    /// ADR 0016 R1/R4 level 3 basis: a refined RGB pixel stores exactly
+    /// the tile's code in the dedicated layer's `RGB10A2Unorm` target, and
+    /// every unrefined pixel is bit-identical to `fs_convert`'s.
+    #[test]
+    fn refined_rgb_codes_reach_the_ten_bit_target_exactly() {
+        let picture = fringed_text(ChromaSubsampling::Yuv444, BitDepth::Ten);
+        let contract = contract(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorRange::Full);
+        let overlay: Vec<[u16; 4]> = (0..picture.height)
+            .flat_map(|y| {
+                (0..picture.width).map(move |x| {
+                    let valid = u16::from(x < 9 || (x + y) % 5 == 0);
+                    [
+                        ((x * 97 + y * 13) % 1024) as u16,
+                        ((y * 131 + 7) % 1024) as u16,
+                        (1023 - x * 50 % 1024) as u16,
+                        valid,
+                    ]
+                })
+            })
+            .collect();
+        let Some(plain) = render_rgb10(&picture, contract, None) else {
+            return;
+        };
+        let refined = render_rgb10(&picture, contract, Some(&overlay)).expect("device");
+        let none = vec![[0_u16; 4]; overlay.len()];
+        let refined_empty = render_rgb10(&picture, contract, Some(&none)).expect("device");
+        for (index, cell) in overlay.iter().enumerate() {
+            if cell[3] != 0 {
+                assert_eq!(refined[index], [cell[0], cell[1], cell[2]], "pixel {index}");
+            } else {
+                assert_eq!(refined[index], plain[index], "pixel {index}");
+            }
+        }
+        assert_eq!(refined_empty, plain, "an empty overlay changes nothing");
     }
 
     fn contract(

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use super::*;
 use crate::HidClassDescriptorError;
 use crate::descriptor_fixtures::BOOT_KEYBOARD;
@@ -203,6 +206,24 @@ fn a_device_descriptor_that_changes_class_identity_or_configurations_is_refused(
             DeviceDescriptorViolation::Malformed
         ))
     );
+    // A short answer that already carries another identity is refused too:
+    // 14 to 17 bytes hold vendor, product and release in full.
+    for length in 12..18 {
+        let mut short = SyntheticTabletDevice::device_descriptor();
+        short[10] ^= 0xFF;
+        assert_eq!(
+            answer(
+                &mut guard,
+                6 + u32::try_from(length).unwrap(),
+                get_descriptor(1, 18),
+                &short[..length]
+            ),
+            Err(BridgedDeviceViolation::Device(
+                DeviceDescriptorViolation::Identity
+            )),
+            "{length} bytes"
+        );
+    }
 }
 
 #[test]

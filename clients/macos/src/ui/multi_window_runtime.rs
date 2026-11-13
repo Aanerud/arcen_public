@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Native per-display fullscreen window plumbing for multi-monitor-v1.
 //!
 //! This module is the presentation-layer counterpart to

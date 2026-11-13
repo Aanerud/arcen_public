@@ -1,15 +1,13 @@
 # Observability Architecture
 
-> **Status (2026-07-25): implemented in
-> its implementation review.**
-> Design was approved in the design review.
-> This is not a release or production-acceptance claim. Target-native Windows
-> execution and Linux operational acceptance remain platform gates.
+> **Status: implemented** for the macOS Deck and the Linux and Windows Piers.
+> Each platform's behaviour is covered by that platform's own tests, run on
+> its target OS.
 
 This record describes the implemented direct-connection observability surface
-for the macOS Deck and Linux/Windows Piers. The retained
-[build plan](ObservabilityStandard.md) contains design rationale and
-acceptance history; this document records the resulting boundaries and points to
+for the macOS Deck and Linux/Windows Piers. The
+[standard](ObservabilityStandard.md) contains the design rationale and
+acceptance checklist; this document records the resulting boundaries and points to
 their implementations.
 
 ## Boundaries
@@ -169,18 +167,17 @@ drifted input, and rights-safe macOS→Linux and macOS→Windows fixtures live u
 [E2E README](../../tests/e2e/README.md#observability-conformance).
 
 Portable shared/runtime tests, strict linting, product adapter tests, and
-synthetic conformance were completed for PR #59. The synthetic
+synthetic conformance were completed. The synthetic
 fixtures are not hardware evidence. Target-native Windows execution and Linux
 operational acceptance remain required platform gates; packaging,
 signing, deployment, and release evidence remain separate.
 
 ## Explicitly deferred
 
-- Arcen Span/gateway aggregation and relay messages
 - Dormant clients and other future product surfaces
 - OpenTelemetry and any off-box aggregation/export pipeline
 - Raw SSID disclosure by default
 - A macOS native `os_log` mirror
 
 These items require their own architecture, privacy, operations, and platform
-acceptance work. They are not implied by the completed worktree implementation.
+work. They are not part of the current implementation.

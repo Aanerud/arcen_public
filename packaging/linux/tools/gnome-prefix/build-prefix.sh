@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab only: builds the Arcen side-by-side GNOME 51 prefix inside the build container.
 # Sources/build trees in /src (host /opt/arcen-build/gnome-src), output in $P (same path on host).
 set -euo pipefail

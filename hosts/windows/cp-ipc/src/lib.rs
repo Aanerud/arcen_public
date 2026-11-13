@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Framing + sealed-credential contract for the control pipe between the
 //! Arcen LocalSystem broker and the native Windows Credential Provider.
 //!

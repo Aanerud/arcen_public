@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-microphone-driver"
 version.workspace = true
@@ -5,6 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 
 [lib]

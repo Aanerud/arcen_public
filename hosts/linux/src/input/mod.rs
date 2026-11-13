@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 pub mod edges;
 pub mod eis;
 pub mod keymap;
@@ -242,29 +245,31 @@ impl PierInput {
         }
     }
 
-    /// Committed text from the Deck. An Xorg session's uinput keyboard
-    /// types key positions only, and advertises committed text unavailable.
+    /// Committed text from the Deck. An Xorg session types it through its
+    /// uinput keyboard on its own X server ([`x11_text`]) once attached.
     ///
     /// # Errors
     ///
-    /// [`InputError::TextUnavailable`] on uinput; when the Wayland
-    /// connection is down.
+    /// [`InputError::TextUnavailable`] on an Xorg session without its X
+    /// connection; when the Wayland connection is down.
     pub fn text_commit(
         &mut self,
         message: &arcen_protocol::messages::TextCommitMsg,
     ) -> Result<(), InputError> {
         match self {
-            Self::Uinput(_) => Err(InputError::TextUnavailable),
+            Self::Uinput(controller) => controller.text_commit(message),
             Self::Wayland(injector) => injector.text_commit(message),
         }
     }
 
     /// Whether committed text is typed, and characters beyond the session's
-    /// layout: `None` when it is not typed at all.
+    /// layout: `None` when it is not typed at all. An Xorg session with its
+    /// X connection types any character (a borrowed key carries what the
+    /// layout lacks).
     #[must_use]
     pub fn text_capability(&self) -> Option<bool> {
         match self {
-            Self::Uinput(_) => None,
+            Self::Uinput(controller) => controller.text_available().then_some(true),
             Self::Wayland(injector) => injector.text_capability(),
         }
     }
@@ -273,7 +278,7 @@ impl PierInput {
     /// [`wayland::WaylandInjector::take_text_notices`].
     pub fn take_text_notices(&mut self) -> Option<tokio::sync::mpsc::Receiver<String>> {
         match self {
-            Self::Uinput(_) => None,
+            Self::Uinput(controller) => controller.take_text_notices(),
             Self::Wayland(injector) => injector.take_text_notices(),
         }
     }
@@ -370,6 +375,8 @@ pub mod seat_pen;
 mod uinput;
 #[cfg(target_os = "linux")]
 pub use uinput::InputController;
+#[cfg(target_os = "linux")]
+pub mod x11_text;
 
 // SEC-raw-hid. The experimental raw-HID pen-tablet passthrough (any device
 // whose report descriptor classifies as a pen tablet; admission is
@@ -432,6 +439,7 @@ mod backend_choice_tests {
             audio: None,
             requested_outputs: None,
             x11_desktop_depth: None,
+            native_seat: None,
             wayland: wayland.then(|| WaylandAgentReady {
                 compositor: "gnome-shell".into(),
                 input_socket: runtime_dir.join(INPUT_SOCKET_NAME),
@@ -548,6 +556,25 @@ pub struct InputController;
 
 #[cfg(not(target_os = "linux"))]
 impl InputController {
+    pub fn attach_x11_text(
+        &mut self,
+        _display: &str,
+        _xauthority: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        Err("committed text needs an X server".into())
+    }
+    pub const fn text_available(&self) -> bool {
+        false
+    }
+    pub fn take_text_notices(&mut self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        None
+    }
+    pub fn text_commit(
+        &mut self,
+        _message: &arcen_protocol::messages::TextCommitMsg,
+    ) -> Result<(), InputError> {
+        Err(InputError::TextUnavailable)
+    }
     pub fn new(
         _device_w: u32,
         _device_h: u32,

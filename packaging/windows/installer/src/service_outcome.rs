@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! What starting the service achieved, carried through the shared installer
 //! transaction so the exit status reports a running service only when the
 //! service control manager says one runs.

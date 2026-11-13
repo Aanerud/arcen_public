@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -176,10 +179,19 @@ impl ClientTelemetry {
             window.stalled_windows = 0;
         }
 
+        // The host sends only what changed, so a still desktop arrives as a
+        // keepalive a second. The client's own share of the experience is
+        // whether it presented what arrived, not whether the host had
+        // anything to send: a host that fell behind reports that itself, and
+        // a window with nothing presented is still judged as a stall.
+        let fps_content = window
+            .ever_streamed
+            .then(|| window_rate(received_delta, elapsed_ms));
         let sample = QosSample {
             timestamp_ms,
             fps_target: Some(target_fps),
             fps_actual,
+            fps_content,
             fps_warmup: self
                 .media_started
                 .lock()
@@ -466,6 +478,41 @@ mod tests {
                 .current,
             HealthState::Critical
         );
+    }
+
+    #[test]
+    fn a_still_desktop_presenting_every_keepalive_is_healthy() {
+        // The reported false alarm: a mostly idle desktop arrives at a few
+        // frames a second against a target of thirty, all of them presented.
+        let telemetry = warmed_telemetry();
+        let mut window = telemetry.window(0);
+        let mut tracker = arcen_telemetry::HealthTracker::default();
+        let mut received = 0;
+        for step in 1..=4_u64 {
+            received += 15;
+            telemetry.record_media(received, received, 0, Duration::from_millis(2));
+            for _ in 0..15 {
+                telemetry.record_presented(Duration::from_millis(1));
+            }
+            let (_, health, sample) = telemetry.snapshot(&mut window, None, step * 5_000, 30, 0);
+            assert_eq!(sample.fps_actual, Some(3));
+            assert_eq!(sample.fps_content, Some(3));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+            if let Some(transition) = tracker.update(step * 5_000, &health).unwrap() {
+                assert_eq!(transition.current, HealthState::Ok);
+            }
+        }
+        // Presenting far fewer than arrived is still the client's shortfall.
+        telemetry.record_media(received + 150, received + 150, 0, Duration::from_millis(2));
+        for _ in 0..50 {
+            telemetry.record_presented(Duration::from_millis(1));
+        }
+        let (_, health, _) = telemetry.snapshot(&mut window, None, 25_000, 30, 0);
+        assert_eq!(
+            health.client_experience.dominant_cause,
+            Some(arcen_telemetry::HealthCause::Fps)
+        );
+        assert_eq!(health.client_experience.state, Some(HealthState::Critical));
     }
 
     #[test]

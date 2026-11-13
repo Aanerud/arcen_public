@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Windows host implementation: DXGI Desktop Duplication capture +
 // (feature "nvenc") NVENC D3D11 zero-copy encode. Split out of main.rs
 // when the Linux (NvFBC->CUDA->NVENC) implementation landed; the paced
@@ -1015,6 +1017,10 @@ unsafe fn select_source(
 ) -> Source {
     if force_dda && wide_capture {
         log("ERROR: Desktop Duplication cannot serve an FP16 wide capture");
+        let _ = crate::announce_unavailable(
+            arcen_media::video::EncoderBackend::NativeNvenc,
+            arcen_media::video::BackendUnavailableReason::UnsupportedDisplay,
+        );
         std::process::exit(2);
     }
     if let Some(reason) = wgc_requirement(force_wgc, cursor_mode, wide_capture) {
@@ -1313,6 +1319,14 @@ unsafe fn build_wgc(
         Ok(w) => Source::Wgc(w),
         Err(e) => {
             log(&format!("WGC init failed: {e:?}"));
+            if wide_capture {
+                // Ten-bit needs this FP16 scRGB surface; the parent names
+                // the display as the reason it refuses Grading or HDR.
+                let _ = crate::announce_unavailable(
+                    arcen_media::video::EncoderBackend::NativeNvenc,
+                    arcen_media::video::BackendUnavailableReason::UnsupportedDisplay,
+                );
+            }
             std::process::exit(2);
         }
     }
@@ -2150,8 +2164,9 @@ unsafe fn run_selftest(
                 .and_then(|result| result)
         });
     match vector_result {
-        Ok((sdr, hdr)) => log(&format!(
-            "FP16 shader vectors: sdr_max_code_error={sdr} hdr_max_code_error={hdr}"
+        Ok((sdr, srgb, hdr)) => log(&format!(
+            "FP16 shader vectors: sdr_max_code_error={sdr} srgb_max_code_error={srgb} \
+             hdr_max_code_error={hdr}"
         )),
         Err(error) => log(&format!("FP16 shader vectors unavailable: {error}")),
     }
@@ -3180,7 +3195,7 @@ pub fn run() -> ! {
 pub fn run_with_args(args: Vec<String>) -> ! {
     if args.iter().any(|a| a == "color-probe") {
         // Research diagnostic: does this host deliver >8bpc from Desktop
-        // Duplication at all? See docs/internal/ten-bit-source-capture.md.
+        // Duplication at all? See docs/architecture/color-fidelity.md.
         let enable_hdr = args.iter().any(|a| a == "--enable-hdr");
         let disable_hdr = args.iter().any(|a| a == "--disable-hdr");
         let wgc_only = args.iter().any(|a| a == "--wgc-only");
@@ -3567,17 +3582,22 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                     },
                     Err(error) => {
                         log(&format!("NVENC init failed: {error}"));
-                        if encoder_choice == "nvenc" || !error.allows_software_fallback() {
+                        if !error.allows_software_fallback() {
                             std::process::exit(4);
                         }
                         let Some(reason) = error.unavailable_reason() else {
                             log("NVENC fallback classification lost its typed reason");
                             std::process::exit(4);
                         };
+                        // A pinned NVENC has no fallback, but the parent still
+                        // names the typed cause in its refusal.
                         let _ = crate::announce_unavailable(
                             arcen_media::video::EncoderBackend::NativeNvenc,
                             reason,
                         );
+                        if encoder_choice == "nvenc" {
+                            std::process::exit(4);
+                        }
                         log(
                             "auto: parent must retarget display geometry before the OpenH264 fallback",
                         );

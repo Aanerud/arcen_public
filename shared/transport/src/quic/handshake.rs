@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Authenticated binding handshake codec and exchange.
 //!
 //! Before any application payload flows on the persistent reliable stream or
@@ -99,7 +101,6 @@ fn encode_role(role: QuicRole) -> u8 {
     match role {
         QuicRole::Host => 0,
         QuicRole::Client => 1,
-        QuicRole::Gateway => 2,
     }
 }
 
@@ -107,7 +108,6 @@ fn decode_role(value: u8) -> Option<QuicRole> {
     match value {
         0 => Some(QuicRole::Host),
         1 => Some(QuicRole::Client),
-        2 => Some(QuicRole::Gateway),
         _ => None,
     }
 }
@@ -388,7 +388,7 @@ mod tests {
     fn ack_round_trips() {
         let response = HandshakeResponse::Ack {
             protocol_version: HANDSHAKE_PROTOCOL_VERSION,
-            role: QuicRole::Gateway,
+            role: QuicRole::Host,
             session_id: "session-xyz".to_owned(),
             negotiated_capabilities: vec!["transport:quic-v1".to_owned()],
         };

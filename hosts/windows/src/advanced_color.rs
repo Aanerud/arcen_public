@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Windows HDR engagement after the session's final displays exist.
 //!
 //! An HDR EDID only makes Windows advertise support. Capture is genuinely wide
@@ -51,9 +53,12 @@ const COLOR_MODE_HDR: i32 = 2;
 
 // Hardware measurement on the GRID host showed Windows taking up to roughly
 // twenty-five seconds to publish HDR state after an EDID/topology change.
-// This runs before capture and must fail closed, so leave measured headroom
-// instead of racing the compositor and intermittently streaming SDR as PQ.
-const ENGAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+// This runs before capture and must fail closed rather than stream SDR as PQ.
+// It also runs inside the broker's readiness wait, so it is bounded by the
+// shared setup budget (counted from the agent's start packet): a wait that
+// outlasted the broker ended in a terminated agent and a crash-watchdog
+// restore instead of a refusal the Deck could read.
+const ENGAGE_TIMEOUT: std::time::Duration = arcen_session::setup_budget::AGENT_SETUP_BUDGET;
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[repr(C)]
@@ -693,7 +698,8 @@ fn set_required_targets(
     if required_targets.is_empty() {
         return Err("Advanced Color session requires at least one display target".to_string());
     }
-    let deadline = std::time::Instant::now() + ENGAGE_TIMEOUT;
+    let started = std::time::Instant::now();
+    let deadline = crate::session::AGENT_SETUP.wait_deadline(started, ENGAGE_TIMEOUT);
     let mut last_summary = String::new();
     let mut changed_targets = 0_usize;
     loop {
@@ -767,11 +773,11 @@ fn set_required_targets(
             );
         }
         if std::time::Instant::now() >= deadline {
-            let message = format!(
-                "Advanced Color setup did not reach {} mode on all {} requested target(s) within {}ms ({last_summary})",
-                if desired_hdr { "HDR" } else { "SDR" },
+            let message = engage_timeout_message(
+                desired_hdr,
                 required_targets.len(),
-                ENGAGE_TIMEOUT.as_millis()
+                started.elapsed(),
+                &last_summary,
             );
             if fail_on_verify {
                 return Err(message);
@@ -784,6 +790,28 @@ fn set_required_targets(
             return Ok(());
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The reason a session gives when Windows did not reach the desired mode in
+/// time. An HDR request is refused with `hdr_not_activated`; the caller rolls
+/// the HDR state back and the display transaction restores the display.
+fn engage_timeout_message(
+    desired_hdr: bool,
+    targets: usize,
+    waited: std::time::Duration,
+    last_summary: &str,
+) -> String {
+    let detail = format!(
+        "Windows did not activate {} on all {targets} session display target(s) within {}ms \
+         ({last_summary})",
+        if desired_hdr { "HDR" } else { "SDR" },
+        waited.as_millis()
+    );
+    if desired_hdr {
+        arcen_session::setup_budget::HdrSetupRefusal::NotActivated.message(&detail)
+    } else {
+        detail
     }
 }
 
@@ -919,6 +947,36 @@ fn clear_recovery_entries() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hdr_wait_is_the_shared_setup_budget_not_longer_than_the_broker() {
+        assert_eq!(
+            ENGAGE_TIMEOUT,
+            arcen_session::setup_budget::AGENT_SETUP_BUDGET
+        );
+        assert!(
+            ENGAGE_TIMEOUT + arcen_session::setup_budget::REFUSAL_MARGIN
+                <= arcen_session::setup_budget::AGENT_READY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn hdr_that_never_activates_is_refused_with_a_code_the_deck_sees() {
+        let message = engage_timeout_message(
+            true,
+            1,
+            std::time::Duration::from_millis(19_750),
+            "target=1 mode=sdr bpc=10",
+        );
+        assert!(message.starts_with("hdr_not_activated: "), "{message}");
+        assert!(
+            message.contains("19750ms") && message.contains("mode=sdr"),
+            "{message}"
+        );
+        // Disabling HDR for an SDR session is not an HDR refusal.
+        let sdr = engage_timeout_message(false, 1, std::time::Duration::ZERO, "");
+        assert!(!sdr.starts_with("hdr_"), "{sdr}");
+    }
 
     fn state(
         api: ColorStateApi,

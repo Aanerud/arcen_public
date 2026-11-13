@@ -1,6 +1,18 @@
 # Audio Input Operations and Release Gates
 
-Microphone input defaults off in Deck and both Piers. Deck consent is
+Microphone input is off in the Deck until the user turns it on, and on the
+host it follows `microphone_input.enabled` in `pier.json`. That key is
+required (a `pier.json` without it is refused at start), and the templates
+the installers write set it to `true` on Linux
+(`packaging/linux/arcen-pier.json`), Windows (`packaging/windows/pier.json`)
+and macOS (`packaging/macos/arcen-pier.json`); an existing `pier.json` is
+kept on upgrade (the Linux installer overwrites it only with `--force`). To
+turn it off, set `"microphone_input": { "enabled": false }` in the host's
+`pier.json` and restart the Pier: `systemctl restart arcen-pier` on Linux,
+`Restart-Service ArcenPier` on Windows, `sudo launchctl kickstart -k
+system/pier.arcen.tech.service` on macOS. A Windows Pier still
+refuses the stream unless the signed microphone driver described below is
+installed, which Arcen does not ship. Deck consent is
 launch-only and must be enabled again after every process start. Enabling host
 policy alone does not start capture: Deck consent, host backend availability,
 authenticated session binding, and successful microphone-v1 negotiation are all
@@ -80,7 +92,7 @@ Hosted jobs that fail before runner assignment or report zero executed steps are
 not validation. Native macOS, Linux audio-server, Windows WDK, protected signing,
 and physical cross-host claims require their real target environments.
 
-The 2026-07-24 PR 52 takeover ran the shared strict gates, native Deck tests and
+The 2026-07-24 validation ran the shared strict gates, native Deck tests and
 unsigned bundle assembly, Linux host tests/release builds plus a real
 PulseAudio `module-pipe-source` create/idle-pressure/restore cycle, Windows host
 tests/full release build, portable ring tests, WDK 10.0.26100 compilation,
@@ -96,10 +108,8 @@ Run this checklist only on rights-cleared source and test accounts. Do not attac
 profiles, certificates, keys, SIDs, audio payloads, or customer data to a test
 report.
 
-1. For draft-PR validation, fetch and check out the exact reviewed PR head
-   (`git fetch origin pull/52/head:audio-input-under-test &&
-   git switch audio-input-under-test`) and verify the recorded SHA with
-   `git rev-parse HEAD`. For post-merge validation, use
+1. For pre-merge validation, check out the exact reviewed head and verify the
+   recorded SHA with `git rev-parse HEAD`. For post-merge validation, use
    `git switch main && git pull --ff-only` and record the resulting exact main
    SHA. State which mode was tested; neither result substitutes for the other.
    Then build Deck with

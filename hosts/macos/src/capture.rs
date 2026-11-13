@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(unsafe_code)]
 
 //! `ScreenCaptureKit` capture for the macOS Pier.
@@ -26,10 +29,12 @@ use objc2::{AnyThread, DefinedClass, define_class, sel};
 use objc2_core_foundation::{CFRetained, Type};
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
-use objc2_screen_capture_kit::SCStreamFrameInfoDirtyRects;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
     SCStreamOutput, SCStreamOutputType,
+};
+use objc2_screen_capture_kit::{
+    SCFrameStatus, SCStreamFrameInfoDirtyRects, SCStreamFrameInfoStatus,
 };
 use serde::Serialize;
 
@@ -360,6 +365,15 @@ pub struct CaptureConfig {
     pub pixel_format: CapturePixelFormat,
     /// Requested dynamic range.
     pub dynamic_range: CaptureDynamicRange,
+    /// The transfer an SDR stream states for this capture's pixels.
+    ///
+    /// `ScreenCaptureKit` is told `kCGColorSpaceSRGB` for every SDR capture,
+    /// so the surface holds the desktop's sRGB code values and nothing
+    /// re-encodes them. A Deck that presents `srgb` is told exactly that; an
+    /// older Deck keeps the `bt709` label it was built against
+    /// ([`arcen_media::video::sdr_desktop_transfer`]). The pixels are the same
+    /// either way: this changes only the tag.
+    pub sdr_transfer: arcen_media::TransferCharacteristics,
 }
 
 impl CaptureConfig {
@@ -375,6 +389,21 @@ impl CaptureConfig {
         self
     }
 
+    /// Returns this plan stating `transfer` for its SDR pixels
+    /// ([`Self::sdr_transfer`]); a resolved plan's transfer token, so an HDR
+    /// plan's `pq` is ignored here and an unknown token keeps `bt709`.
+    #[must_use]
+    pub fn stating_sdr_transfer(mut self, transfer: &str) -> Self {
+        if let Some(
+            sdr @ (arcen_media::TransferCharacteristics::Bt709
+            | arcen_media::TransferCharacteristics::Srgb),
+        ) = arcen_media::TransferCharacteristics::from_token(transfer)
+        {
+            self.sdr_transfer = sdr;
+        }
+        self
+    }
+
     /// Creates an 8-bit SDR plan, the Auto and Speed capture shape.
     #[must_use]
     pub const fn sdr(display_id: u32, width: usize, height: usize, fps: u32) -> Self {
@@ -386,6 +415,7 @@ impl CaptureConfig {
             shows_cursor: false,
             pixel_format: CapturePixelFormat::Nv12VideoRange,
             dynamic_range: CaptureDynamicRange::Sdr,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 
@@ -407,6 +437,7 @@ impl CaptureConfig {
             shows_cursor: false,
             pixel_format: CapturePixelFormat::FourFourFourTenBitFullRange,
             dynamic_range: CaptureDynamicRange::HdrLocalDisplay,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 
@@ -431,6 +462,7 @@ impl CaptureConfig {
             shows_cursor: false,
             pixel_format: CapturePixelFormat::FourFourFourTenBitFullRange,
             dynamic_range: CaptureDynamicRange::Sdr,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 }
@@ -597,6 +629,46 @@ unsafe extern "C" {
     fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
     fn CFArrayGetCount(array: *const c_void) -> isize;
     fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> bool;
+}
+
+/// `kCFNumberSInt64Type` from `CFNumber.h`.
+const CF_NUMBER_SINT64_TYPE: isize = 4;
+
+/// Reads the `SCFrameStatus` `ScreenCaptureKit` attached to a sample buffer.
+///
+/// # Safety
+///
+/// `sample_buffer` must be a live sample buffer delivered by
+/// `ScreenCaptureKit`.
+unsafe fn read_frame_status(sample_buffer: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    // SAFETY: the caller guarantees a live sample buffer; `false` means do not
+    // manufacture an attachments array the frame did not come with.
+    let attachments = unsafe { sample_buffer.sample_attachments_array(false) }?;
+    let attachments = std::ptr::from_ref(&*attachments).cast::<c_void>();
+    // SAFETY: `attachments` is the live array returned above.
+    if unsafe { CFArrayGetCount(attachments) } == 0 {
+        return None;
+    }
+    // SAFETY: index 0 is in bounds per the count check.
+    let info = unsafe { CFArrayGetValueAtIndex(attachments, 0) };
+    if info.is_null() {
+        return None;
+    }
+    // SAFETY: `SCStreamFrameInfoStatus` is a process-lifetime constant
+    // exported by ScreenCaptureKit; taking its address reads nothing.
+    let key = unsafe { std::ptr::from_ref(SCStreamFrameInfoStatus).cast::<c_void>() };
+    // SAFETY: `info` is the attachment dictionary for sample 0.
+    let value = unsafe { CFDictionaryGetValue(info, key) };
+    if value.is_null() {
+        return None;
+    }
+    let mut status = 0_i64;
+    // SAFETY: the status is documented as a CFNumber; `status` is a live i64.
+    if !unsafe { CFNumberGetValue(value, CF_NUMBER_SINT64_TYPE, (&raw mut status).cast()) } {
+        return None;
+    }
+    Some(SCFrameStatus(isize::try_from(status).ok()?))
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -947,6 +1019,9 @@ struct FrameSink {
     /// lock or an allocation would stall the compositor for every application
     /// on the machine.
     dropped: Arc<AtomicU64>,
+    /// Image-less sample buffers `ScreenCaptureKit` marked `SCFrameStatus::Idle`:
+    /// positive evidence that nothing on screen changed.
+    unchanged: Arc<AtomicU64>,
     /// Whether the first frame's colour attachments have been reported.
     colour_reported: std::sync::atomic::AtomicBool,
 }
@@ -999,6 +1074,13 @@ define_class!(
             // SAFETY: ScreenCaptureKit guarantees the buffer is live for the
             // duration of this callback.
             let Some(frame) = (unsafe { CapturedFrame::from_sample_buffer(sample_buffer) }) else {
+                // An image-less buffer. Counted when it says the screen did
+                // not change: that is the evidence health uses to tell a
+                // still desktop from a capture that is falling behind.
+                // SAFETY: the buffer is live for this callback.
+                if unsafe { read_frame_status(sample_buffer) } == Some(SCFrameStatus::Idle) {
+                    self.ivars().unchanged.fetch_add(1, Ordering::Relaxed);
+                }
                 self.ivars().cadence.record_work(started.elapsed());
                 return;
             };
@@ -1107,6 +1189,14 @@ pub fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError>
     }
 }
 
+/// Debug builds only: `ARCEN_TEST_CAPTURE_NO_WINDOWS=1` captures the display
+/// with every application window excluded (wallpaper, Dock and menu bar
+/// remain), a still desktop for live health proofs on a machine whose screen
+/// is in use. Compiled out of release builds.
+fn test_excludes_application_windows() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("ARCEN_TEST_CAPTURE_NO_WINDOWS").is_some()
+}
+
 /// A running `ScreenCaptureKit` stream.
 pub struct CaptureSession {
     stream: Retained<SCStream>,
@@ -1115,6 +1205,7 @@ pub struct CaptureSession {
     stopped: Receiver<String>,
     config: CaptureConfig,
     dropped: Arc<AtomicU64>,
+    unchanged: Arc<AtomicU64>,
     cadence: Arc<SourceCadence>,
     stop_requested: std::sync::atomic::AtomicBool,
 }
@@ -1137,6 +1228,21 @@ impl CaptureSession {
     #[must_use]
     pub fn dropped_frames(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Sample buffers `ScreenCaptureKit` delivered as `SCFrameStatus::Idle`:
+    /// it looked and nothing had changed.
+    #[must_use]
+    pub fn unchanged_frames(&self) -> u64 {
+        self.unchanged.load(Ordering::Relaxed)
+    }
+
+    /// The live counter behind [`Self::unchanged_frames`], incremented by the
+    /// delivery callback itself, so a reader sees every `Idle` buffer as it
+    /// arrives rather than when a capture loop next wakes.
+    #[must_use]
+    pub fn unchanged_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.unchanged)
     }
 
     /// How often `ScreenCaptureKit` handed this session a frame.
@@ -1165,7 +1271,24 @@ impl CaptureSession {
             .find(|display| unsafe { display.displayID() } == config.display_id)
             .ok_or(CaptureError::DisplayNotFound(config.display_id))?;
 
-        let excluded = NSArray::new();
+        let excluded = if test_excludes_application_windows() {
+            // Every application window except the Dock's (the wallpaper and
+            // the Dock itself); the window server's menu bar has no owning
+            // application and stays.
+            // SAFETY: reading properties of live shareable-content objects.
+            let windows = unsafe { content.windows() };
+            let kept: Vec<_> = (0..windows.count())
+                .map(|index| windows.objectAtIndex(index))
+                .filter(|window| {
+                    unsafe { window.owningApplication() }.is_some_and(|application| {
+                        unsafe { application.bundleIdentifier() }.to_string() != "com.apple.dock"
+                    })
+                })
+                .collect();
+            NSArray::from_retained_slice(&kept)
+        } else {
+            NSArray::new()
+        };
         // SAFETY: both arguments are live and the initializer is the documented one.
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(
@@ -1240,12 +1363,14 @@ impl CaptureSession {
         let (sender, frames) = sync_channel(FRAME_QUEUE_DEPTH);
         let (stopped_sender, stopped) = sync_channel(1);
         let dropped = Arc::new(AtomicU64::new(0));
+        let unchanged = Arc::new(AtomicU64::new(0));
         let cadence = Arc::new(SourceCadence::default());
         let output = StreamOutput::alloc().set_ivars(FrameSink {
             frames: sender,
             stopped: stopped_sender,
             cadence: Arc::clone(&cadence),
             dropped: Arc::clone(&dropped),
+            unchanged: Arc::clone(&unchanged),
             colour_reported: std::sync::atomic::AtomicBool::new(false),
         });
         let output: Retained<StreamOutput> = unsafe { objc2::msg_send![super(output), init] };
@@ -1307,6 +1432,7 @@ impl CaptureSession {
             stopped,
             config,
             dropped,
+            unchanged,
             cadence,
             stop_requested: std::sync::atomic::AtomicBool::new(false),
         })

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! OS-free host certificate ownership markers.
 //!
 //! A marker records that this host issued the certificate sitting next to it.

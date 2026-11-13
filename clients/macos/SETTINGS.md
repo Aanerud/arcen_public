@@ -69,7 +69,9 @@ only; it never silently serves a subset. Those pinned modes request each display
 **fullscreen presentation size** — its logical
 size minus the macOS safe-area insets — not its raw panel size, so the remote desktop lands 1:1
 with no scaling. On a notched Mac the safe area is smaller than the panel (a 14" MacBook Pro at
-1800x1169 presents 1800x1130), and pinning to the panel size made the viewer aspect-fit the
+1800x1169 presents 1800x1130 — the menu bar, 39 pt, is one point taller than the 38 pt notch
+inset AppKit reports, and the Deck uses the larger, so a Retina stream is exactly 3600x2260),
+and pinning to the panel size made the viewer aspect-fit the
 stream into the shorter viewport: a downscale plus letterbox bars. `fullscreen_uses_notch_area`
 (Settings → Displays → Notch area) lets the user take the whole panel instead: macOS gives a
 *standard* fullscreen window only the safe area and offers no public API to change that, so Arcen
@@ -91,6 +93,14 @@ pixel-clock ceiling.
 The per-connection settings container is
 intentionally extensible so selected global options can move there in a future reviewed schema
 version without another connection-file redesign.
+
+Settings → Streaming → **Colour check…** (and Session → Colour Check… in a
+session) opens the colour checklist ([guide](../../docs/operations/colour-check.md)).
+Its one-click fixes write the same settings as this screen — the streaming
+preset, and `hidpi_streaming` plus the primary display's `hidpi_display_mask`
+bit for Retina-resolution streaming — and then reconnect where the host needs a
+new connection to serve them. They never change a host setting. Saved reports
+and test-pattern PNGs go to `~/Documents/Arcen/Colour Checks/`.
 
 Fresh-install video defaults are **Standard performance** (30 fps ceiling) and
 **Standard (Adaptive) colour fidelity** (automatic AV1/HEVC/H.264 selection,
@@ -121,6 +131,34 @@ setting updates the active or last-selected saved connection.
   never substitute Tablet support.
 - **Mouse compatibility only** (`disabled_mouse_compat`): disables tablet
   redirection and keeps ordinary mouse behavior, with no tablet dependencies.
+
+`keyboard_shortcuts` stores what Command and Control are on the connection's
+host: absent (Automatic — the host platform's own mapping, learnt from its
+hello), `windows_app` (Command is the Windows key, Command+C/X/V/A/Z/F/W are
+Control), `swap_command_control` (Command is Control, Control the Windows
+key), or `command_is_control` (both are Control). A Mac host keeps Command as
+Command whatever is stored. `left_option_altgr: true` makes the left Option key
+AltGr as well as the right one on a Windows host that accepts AltGr. Both are
+absent at their defaults, so connections saved before them are unchanged and
+read as Automatic. They replace the Deck's old in-memory Cmd→Ctrl switch,
+which every connection had on and which was never stored. See the README,
+"Your Mac keyboard on the host".
+
+`keyboard_mode` stores the keyboard mode a connection starts in: absent
+(follow the global Typing setting), `physical` (key positions; the Typing
+setting's Auto or Keys only), or `characters` (every typed character as the
+Mac typed it; shortcuts, navigation and function keys stay keys). It is
+absent by default, so earlier connections are unchanged. The Connection menu's
+**Keyboard: Physical Keys** (Control-Command-K) and **Keyboard: Characters**
+(Control-Command-U) override it for the session; that choice is never stored,
+and lasts across reconnects to the same endpoint only.
+
+Global `settings.json` keys for **Paste as Keystrokes**:
+`paste_chars_per_second` (default 25, clamped to 5–500; the Settings page
+offers 10, 25, 50, 100 and 250) and `paste_confirm_above` (default 2000: longer
+clipboard text asks before it is typed; clamped to 1–100,000, which is also
+the most one paste types). The clipboard text itself is never stored or
+logged.
 
 Deck resolves production paths through one config repository. Tests inject explicit
 repository-local paths; their default repository is disabled, so parallel tests and panics cannot

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Read-only NVIDIA display-target inventory.
 //!
 //! This module answers one question and mutates nothing: **does the NVIDIA

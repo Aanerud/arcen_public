@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen Keel: deterministic, platform-free content damage intelligence.
 //!
 //! Keel consumes borrowed pixels and produces reusable damage metadata. Capture,

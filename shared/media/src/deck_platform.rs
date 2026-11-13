@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Deck platform profile: which kind of Mac a Deck build runs on, and the
 //! decisions that genuinely differ between Apple silicon and Intel.
 //!

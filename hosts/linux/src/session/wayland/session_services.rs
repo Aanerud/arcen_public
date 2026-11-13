@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The GNOME login services of a headless session, assembled by the agent.
 //!
 //! See [`arcen_session::desktop_session`] for why an Arcen desktop does

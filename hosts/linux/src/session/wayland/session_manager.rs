@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `org.gnome.SessionManager` on a headless session's private bus.
 //!
 //! A GDM login gets this service from `gnome-session`, which since GNOME 49

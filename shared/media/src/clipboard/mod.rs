@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Clipboard policy, sequence, echo-suppression, and raster contracts.
 
 pub mod bridge;
@@ -5,6 +7,9 @@ pub mod eligibility;
 pub mod formats;
 pub(crate) mod image;
 pub mod latest;
+mod repeat;
+
+pub use repeat::{REPEATED_COPY_WINDOW, RepeatedCopyFilter};
 
 pub use image::{
     ClipboardImageError, ImageInfo, ImageLimits, dibv5_to_png, png_to_dibv5, validate_png,

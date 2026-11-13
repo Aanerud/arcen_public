@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Media Foundation software H.264 encoder — the VMware-SVGA / no-NVENC path.
 //
 // Pipeline:

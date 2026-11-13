@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Canonical, deterministic JSON Lines schema-v1 records.
 
 use std::error::Error;
@@ -62,8 +64,6 @@ pub enum TelemetryRole {
     Host,
     /// A user-facing Deck.
     Client,
-    /// A future relay or aggregation service.
-    Gateway,
 }
 
 /// Operating-system platform in the common monitoring schema.

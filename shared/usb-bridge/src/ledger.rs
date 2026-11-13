@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use crate::{AttachmentGeneration, EndpointAddress, MAX_IN_FLIGHT_URBS, TransferKind, UrbId};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -27,6 +30,12 @@ impl InFlightLedger {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.requests.is_empty()
+    }
+
+    /// Whether `id` is in flight.
+    #[must_use]
+    pub fn contains(&self, id: UrbId) -> bool {
+        self.requests.contains_key(&id)
     }
 
     /// Registers one unique bounded in-flight request.

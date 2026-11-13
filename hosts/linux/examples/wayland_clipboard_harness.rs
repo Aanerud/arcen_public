@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Lab harness for the headless Wayland clipboard bridge.
 //!
 //! Run as the session user of a running headless desktop, never on a

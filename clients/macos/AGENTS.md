@@ -56,6 +56,18 @@ what the monitor had to queue. Keep it that way:
 Follow-up: keyboard (and secondary-viewport pointer) input still leaves on the
 UI pass; a keyboard fast path is a separate package.
 
+## Native tablet: one path
+
+While Native tablet is active and the host leads the cursor (a bridged pen
+moved the host pointer), the Deck draws the pen dot (white, dark ring) at
+the host position on every host, whatever the host's cursor image is
+(`arcen_input::host_pointer::led_pointer_mark`, ADR 0023). The Mac's own
+mouse takes the cursor back the moment it moves. The `native-tablet` feature
+is the helper and bridge (the old `usb-hard-lab` name is gone);
+`usb-emulate-lab` stays lab-only test tooling. Emulated strokes prove
+plumbing, not a real pen: check a real tablet in Chrome (Safari reports
+every pen as a mouse).
+
 ## Following a sign-in screen into the desktop
 
 A host that serves its operating system's sign-in screen says so in its hello
@@ -81,7 +93,7 @@ from sign-in to the new desktop's hello. Keep it:
 ## Signing and certificates
 
 - Cert inventory and dev-machine setup: `clients/macos/CERTIFICATES.md`
-- Apple entitlement request justifications: `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`
+- Entitlements each app holds, and why: `clients/macos/ENTITLEMENTS.md`
 - Build + sign: `packaging/macos/build-deck-app.sh`
 - Entitlements plist: `packaging/macos/Deck.entitlements`
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The wide epoch runner of the Wayland Grading and HDR compositions.
 //!
 //! One epoch, in order:
@@ -35,14 +37,15 @@ use arcen_keel::SubmissionMode;
 use arcen_media::annexb::{annex_b_is_keyframe, NalCodec};
 use arcen_media::video::compositor_fidelity::{
     channel_order_verified, channel_patch_at, measure_ramp, precision_from_ramp, white_patch_at,
+    FidelityRoute,
 };
 use arcen_media::video::{
     convert_rgba_f16_pq_to_packed_rgb10, pq_white, AdmissionRequest, CaptureAdmissionNotice,
     CaptureBackend, CaptureLease, CaptureMemory, CapturePixelFormat, CaptureSourceEvidence,
     CaptureTakeError, ConversionBackend, CopyPath, CursorEvidence, EncoderBackend,
     EncoderCapability, FirstFrameEvidence, FormatModifier, GpuMatch, PackedRgb10Layout,
-    PresetAdmission, Rgb10Signal, SamplePrecision, SourceFact, SourceTransfer, SourceTransform,
-    SustainedRateMeter, VideoVariant,
+    PresetAdmission, Rgb10Signal, SamplePrecision, SdrContentCurve, SourceFact, SourceTransfer,
+    SourceTransform, SustainedRateMeter, VideoVariant,
 };
 use arcen_media::VideoCodec;
 
@@ -374,6 +377,12 @@ pub fn wide_source_evidence(
         .sdr_white_nits
         .map_or(SourceFact::Unknown, SourceFact::Authoritative);
     let pq = colour.transfer.authoritative() == Some(SourceTransfer::Pq);
+    // Mutter in a forced HDR colour state decodes its sRGB content with a
+    // pure 2.2 power (the lab's GNOME 51.1 greys came back on that curve,
+    // not the sRGB one), so that is the inverse that returns its codes.
+    if pq && facts.route == Some(FidelityRoute::ForcedHdr) {
+        colour.sdr_content = SourceFact::Inferred(SdrContentCurve::Gamma22);
+    }
     CaptureSourceEvidence {
         backend: CaptureBackend::PipeWire,
         format: negotiated.format,
@@ -452,14 +461,20 @@ fn measurement_line(
 
 const fn served_wide_source(transform: SourceTransform) -> Option<crate::nvenc_cuda::WideSource> {
     match transform {
-        // PQ codes: the encoder keeps them (HDR) or converts them (Grading).
-        SourceTransform::PackedRgb10(_) | SourceTransform::HalfFloatPq(Rgb10Signal::Direct) => {
+        // PQ codes: the encoder keeps them (HDR) or converts them (Grading)
+        // with the conversion the admission chose.
+        SourceTransform::PackedRgb10(signal) => {
+            Some(crate::nvenc_cuda::WideSource::AdmittedPq(signal))
+        }
+        SourceTransform::HalfFloatPq(Rgb10Signal::Direct) => {
             Some(crate::nvenc_cuda::WideSource::ColorManagedPq)
         }
-        // Already BT.709 SDR codes after the half-float conversion.
-        SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709) => {
-            Some(crate::nvenc_cuda::WideSource::NormalisedSdr)
-        }
+        // Already SDR codes after the half-float conversion.
+        SourceTransform::HalfFloatPq(
+            Rgb10Signal::PqBt2020ToSdrBt709
+            | Rgb10Signal::PqBt2020ToSdrSrgb
+            | Rgb10Signal::PqBt2020ToSdrGamma22,
+        ) => Some(crate::nvenc_cuda::WideSource::NormalisedSdr),
         _ => None,
     }
 }
@@ -650,6 +665,7 @@ pub unsafe fn run_native(
         width,
         height,
         max_fps: request.fps,
+        sdr_transfer: request.video.transfer,
     };
     let capability = EncoderCapability {
         backend: EncoderBackend::NativeNvenc,
@@ -1089,6 +1105,13 @@ mod tests {
         );
         assert_eq!(proven.output_hdr_active, SourceFact::Authoritative(true));
         assert_eq!(proven.colour.sdr_white_nits, SourceFact::Authoritative(203));
+        // Mutter's forced HDR state decodes sRGB content with a 2.2 power;
+        // without the route nothing is said about it.
+        assert_eq!(
+            proven.colour.sdr_content,
+            SourceFact::Inferred(SdrContentCurve::Gamma22)
+        );
+        assert_eq!(unproven.colour.sdr_content, SourceFact::Unknown);
         // The proof is per memory: Mutter's shared-memory wide buffers carry
         // eight-bit pixels and are never trusted on a DMA-BUF proof.
         let shm = wide_source_evidence(
@@ -1145,16 +1168,17 @@ mod tests {
     #[test]
     fn the_served_transform_picks_the_encoder_source() {
         use crate::nvenc_cuda::WideSource;
-        assert_eq!(
-            served_wide_source(SourceTransform::PackedRgb10(Rgb10Signal::Direct)),
-            Some(WideSource::ColorManagedPq)
-        );
-        assert_eq!(
-            served_wide_source(SourceTransform::PackedRgb10(
-                Rgb10Signal::PqBt2020ToSdrBt709
-            )),
-            Some(WideSource::ColorManagedPq)
-        );
+        for signal in [
+            Rgb10Signal::Direct,
+            Rgb10Signal::PqBt2020ToSdrBt709,
+            Rgb10Signal::PqBt2020ToSdrSrgb,
+            Rgb10Signal::PqBt2020ToSdrGamma22,
+        ] {
+            assert_eq!(
+                served_wide_source(SourceTransform::PackedRgb10(signal)),
+                Some(WideSource::AdmittedPq(signal))
+            );
+        }
         assert_eq!(
             served_wide_source(SourceTransform::HalfFloatPq(Rgb10Signal::Direct)),
             Some(WideSource::ColorManagedPq)
@@ -1165,6 +1189,15 @@ mod tests {
             )),
             Some(WideSource::NormalisedSdr)
         );
+        for signal in [
+            Rgb10Signal::PqBt2020ToSdrSrgb,
+            Rgb10Signal::PqBt2020ToSdrGamma22,
+        ] {
+            assert_eq!(
+                served_wide_source(SourceTransform::HalfFloatPq(signal)),
+                Some(WideSource::NormalisedSdr)
+            );
+        }
         assert_eq!(served_wide_source(SourceTransform::Sdr8Rgb), None);
     }
 

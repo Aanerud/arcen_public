@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Committed text from the Deck: the macOS input method's commits, and
 //! keystrokes the host's layout would type differently, sent as
 //! `text_commit`; everything else stays a key position.
@@ -12,12 +14,12 @@ use std::time::{Duration, Instant};
 
 use arcen_input::text::{
     split_commit, DeckTextAction, DeckTextEvent, HostKeyPositions, HostTextTruth, KeyPhase,
-    KeyStroke, OptionKeyMode, OptionSide, ReleaseRecovery, SentPress, TextInputPolicy, TypingMode,
-    LOST_RELEASE_GRACE,
+    KeyStroke, OptionKeyPreference, OptionSide, ReleaseRecovery, SentPress, TextInputPolicy,
+    TypingMode, LOST_RELEASE_GRACE,
 };
 use arcen_protocol::messages::{
-    supports_text_commit_v1, HostKeymapMsg, InputCapabilitiesMsg, InputCapabilityAvailability,
-    TextCommitResultMsg, TextRefusalReason,
+    supports_text_commit_v1, HostKeymapMsg, HostPlatform, InputCapabilitiesMsg,
+    InputCapabilityAvailability, TextCommitResultMsg, TextRefusalReason,
 };
 
 use super::keyboard::egui_key_to_qt;
@@ -68,13 +70,15 @@ impl Default for DeckTextInput {
 
 impl DeckTextInput {
     /// Applies the user's settings.
-    pub fn configure(&mut self, mode: TypingMode, option: OptionKeyMode) {
+    pub fn configure(&mut self, mode: TypingMode, option: impl Into<OptionKeyPreference>) {
         self.policy.configure(mode, option);
         self.sync_option_keys();
     }
 
-    /// The host's truth from its hello.
-    pub fn set_host(&mut self, capabilities: InputCapabilitiesMsg) {
+    /// The host's truth from its hello, and its platform (an automatic
+    /// Option-keys setting follows it).
+    pub fn set_host(&mut self, capabilities: InputCapabilitiesMsg, platform: HostPlatform) {
+        self.policy.set_host_platform(platform);
         self.policy.set_host(HostTextTruth {
             text_commit: supports_text_commit_v1(capabilities),
             unicode: capabilities.text_commit_unicode == InputCapabilityAvailability::Available,
@@ -87,7 +91,9 @@ impl DeckTextInput {
             host_text_commit = ?capabilities.text_commit,
             host_text_unicode = ?capabilities.text_commit_unicode,
             mode = self.policy.mode().token(),
+            ?platform,
             option = self.policy.option_mode().token(),
+            option_setting = self.policy.option_preference().token(),
             active = self.policy.active(),
             "committed text negotiated"
         );
@@ -95,8 +101,34 @@ impl DeckTextInput {
 
     /// Forgets the host (disconnect).
     pub fn reset(&mut self) {
-        self.set_host(InputCapabilitiesMsg::default());
+        self.set_host(InputCapabilitiesMsg::default(), HostPlatform::Unknown);
         self.notice = None;
+    }
+
+    /// What the host types committed text with.
+    #[must_use]
+    pub const fn host(&self) -> HostTextTruth {
+        self.policy.host()
+    }
+
+    /// Whether the host said it could not read its own keyboard layout (a
+    /// layout notice that describes no key), so it types text unproven.
+    #[must_use]
+    pub fn host_layout_unchecked(&self) -> bool {
+        self.policy
+            .host_keymap()
+            .is_some_and(|keymap| !keymap.describes_keys())
+    }
+
+    /// The typing mode in force.
+    #[must_use]
+    pub const fn mode(&self) -> TypingMode {
+        self.policy.mode()
+    }
+
+    /// Shows `text` where refusals are shown.
+    pub fn notify(&mut self, text: String) {
+        self.notice = Some((Instant::now(), text));
     }
 
     /// Whether committed text is in use, and so the input method may
@@ -279,8 +311,30 @@ impl DeckTextInput {
         })
     }
 
-    /// Draws the composition and the latest refusal notice over the video.
+    /// Draws the composition, the keyboard mode when it is Characters, and
+    /// the latest notice over the video.
     pub fn show(&mut self, ctx: &egui::Context, video: egui::Rect) {
+        if self.policy.active() && self.policy.mode() == TypingMode::Characters {
+            // Characters mode changes what games and shortcuts-by-letter
+            // see; it stays visible for as long as it is on.
+            egui::Area::new(egui::Id::new("arcen-keyboard-mode"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(video.right() - 150.0, video.top() + 8.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(150))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Keyboard: Characters")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(230)),
+                            );
+                        });
+                });
+        }
         if let Some(preedit) = self.preedit.as_deref().filter(|text| !text.is_empty()) {
             egui::Area::new(egui::Id::new("arcen-text-preedit"))
                 .order(egui::Order::Foreground)
@@ -370,6 +424,7 @@ pub fn notice_text(result: &TextCommitResultMsg) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_input::text::OptionKeyMode;
 
     fn host() -> InputCapabilitiesMsg {
         InputCapabilitiesMsg {
@@ -410,7 +465,7 @@ mod tests {
     fn commits_go_as_text_and_the_composition_is_shown_locally() {
         let mut input = DeckTextInput::default();
         input.configure(TypingMode::Auto, OptionKeyMode::default());
-        input.set_host(host());
+        input.set_host(host(), HostPlatform::Linux);
         assert!(input.active());
         input.route(&[egui::Event::Ime(egui::ImeEvent::Preedit {
             text: "にほん".to_owned(),
@@ -442,7 +497,7 @@ mod tests {
     fn a_composing_right_option_never_reaches_the_host() {
         let mut input = DeckTextInput::default();
         input.configure(TypingMode::Auto, OptionKeyMode::LeftAltRightCharacters);
-        input.set_host(host());
+        input.set_host(host(), HostPlatform::Linux);
         let option = |key, pressed| egui::Event::Key {
             key,
             physical_key: Some(key),
@@ -467,6 +522,42 @@ mod tests {
             ]),
             [RoutedInput::Key(0), RoutedInput::Key(1)]
         );
+    }
+
+    #[test]
+    fn an_automatic_option_setting_keeps_both_option_keys_for_a_mac_host() {
+        let option = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: if pressed {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            },
+        };
+        let right_option = [
+            option(egui::Key::AltRight, true),
+            option(egui::Key::AltRight, false),
+        ];
+        let mut input = DeckTextInput::default();
+        input.configure(TypingMode::Auto, OptionKeyPreference::Automatic);
+        input.set_host(host(), HostPlatform::MacOs);
+        assert!(input.active(), "a Mac host that types text");
+        assert_eq!(
+            input.route(&right_option),
+            [RoutedInput::Key(0), RoutedInput::Key(1)],
+            "right Option reaches a Mac host as Option, as in 0.18.0"
+        );
+        assert_eq!(
+            input.route(&[egui::Event::Ime(egui::ImeEvent::Commit("日本".to_owned()))]),
+            [RoutedInput::Text("日本".to_owned())],
+            "an input method's commit still goes as text"
+        );
+        // The same setting on a Windows host composes with right Option.
+        input.set_host(host(), HostPlatform::Windows);
+        assert!(input.route(&right_option).is_empty());
     }
 
     #[test]

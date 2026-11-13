@@ -1,7 +1,7 @@
 # macOS Pier: building, notarizing and installing the package
 
 How to produce a `.pkg` another Mac will accept, and the install-time traps
-that cost a full afternoon of "it installed fine and the client times out".
+behind "it installed fine and the client times out".
 
 Identity and entitlements live in [`SIGNING.md`](SIGNING.md); this file is
 about getting a working host onto a machine that has never seen one.
@@ -86,7 +86,7 @@ source clearly had. Unpack the real artefact:
 
 ```sh
 cd "$(mktemp -d)"
-xar -xf /path/to/ArcenPier-0.12.0.pkg
+xar -xf /path/to/ArcenPier-<version>.pkg
 mkdir sx && cd sx
 cat ../Scripts | gunzip -dc | cpio -i
 grep -c 'launchctl enable' postinstall
@@ -193,15 +193,14 @@ two are best-effort by design.
 
 ### 4. Nothing belongs to the person who ran the installer
 
-An earlier package ran the whole host as a LaunchAgent in the console user's
-session and handed `/Library/Application Support/Arcen` — key included — to
-whoever was at the console during install. The next account to log in, an AD
-user, could not read the key: `EX_CONFIG`, thirty-two restarts, no listener.
-Its `/tmp` log then belonged to that user, which locked the first one out in
-turn. And the install-time user could copy the identity every Deck had
-pinned.
+A host that runs entirely as a LaunchAgent in the console user's session,
+and hands `/Library/Application Support/Arcen` — key included — to whoever
+was at the console during install, breaks for the next account to log in: it
+cannot read the key (`EX_CONFIG`, a restart loop, no listener), its `/tmp`
+log then belongs to that account and locks the first one out in turn, and
+the install-time user can copy the identity every Deck has pinned.
 
-The package now installs two processes, the split the Linux and Windows
+The package therefore installs two processes, the split the Linux and Windows
 Piers already had: a `_arcen` LaunchDaemon that owns UDP 18444, the key and
 admission from boot, and a LaunchAgent in every Aqua session that captures,
 injects and holds the privacy grants, with no key and no port. The service
@@ -237,7 +236,7 @@ installation check (`packaging/macos/pier/distribution.xml`) refuses the
 command-line `installer` before anything is installed:
 
 ```
-$ sudo installer -pkg ArcenPier-0.12.0.pkg -target /
+$ sudo installer -pkg ArcenPier-<version>.pkg -target /
 installer: Error - Arcen Pier must be installed with Installer.app on this Mac, not from Terminal. …
 ```
 
@@ -247,7 +246,7 @@ Accessibility, and nothing will tell them to. Administrators whose Macs get the
 permissions some other way can opt in explicitly:
 
 ```sh
-sudo ARCEN_ALLOW_COMMAND_LINE_INSTALL=1 installer -pkg ArcenPier-0.12.0.pkg -target /
+sudo ARCEN_ALLOW_COMMAND_LINE_INSTALL=1 installer -pkg ArcenPier-<version>.pkg -target /
 ```
 
 This was measured on the lab Mac:
@@ -343,14 +342,14 @@ Two things an uninstall cannot reach:
   rather than re-prompting. Testing a genuine first-run experience means
   clearing them by hand in System Settings first.
 
-## The lab machine is a delivery target
+## Validate installers on a clean target
 
-Mac-S-08 exists to answer one question: does the shipped package install, run
-and uninstall on a machine that never built it. That is only worth anything
-while it stays a machine that never built it.
+Installer qualification answers one question: does the shipped package
+install, run and uninstall on a machine that never built it. That is only
+worth anything while the target stays a machine that never built it.
 
 Nothing developer-side runs there — no `xcrun`, no `cargo`, no `clang`, no
 toolchain install, no compiling a scratch probe in `/tmp`. Invoking `xcrun`
 alone raises the Command Line Tools installer on its console, which both
 interrupts whoever is sitting there and quietly makes the clean machine
-dirty. Build here, copy the artefact across, run it there.
+dirty. Build on a development Mac, copy the artefact across, run it there.

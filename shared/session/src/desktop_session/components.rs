@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which autostart entries an Arcen session runs.
 //!
 //! Every verdict carries a reason token used in logs and documentation.

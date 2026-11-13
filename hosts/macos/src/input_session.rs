@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Applying a client's input to the local desktop.
 //!
 //! This is what turns a picture into a desktop someone can use. Messages
@@ -23,6 +25,7 @@ use arcen_protocol::messages::{
     REGION_PEN_EVENT, REGION_POINTER_BUTTON, REGION_POINTER_ENTER, REGION_POINTER_LEAVE,
     REGION_POINTER_MOTION, REGION_POINTER_SCROLL, RegionPenEventMsg, RegionPointerButtonMsg,
     RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
+    TEXT_COMMIT, TextCommitMsg, TextCommitResultMsg, TextRefusalReason,
 };
 
 /// Wire names the shared crate does not expose as constants.
@@ -205,6 +208,10 @@ pub struct InputStats {
     /// one where it works — which is not a distinction anyone can make from a
     /// total.
     pub scroll_events: u64,
+    /// Committed-text characters typed.
+    pub text_chars: u64,
+    /// Committed-text characters refused (invalid text, or no way to type).
+    pub text_refused: u64,
 }
 
 /// Applies client input to the local desktop.
@@ -213,6 +220,8 @@ pub struct InputSession {
     sequence: InputSequenceTracker,
     region: Option<RegionInputPipeline<MacRegionPointMapper>>,
     stats: InputStats,
+    /// A `text_commit_result` owed to the client.
+    reply: Option<String>,
 }
 
 impl std::fmt::Debug for InputSession {
@@ -236,6 +245,7 @@ impl InputSession {
             sequence: InputSequenceTracker::default(),
             region: None,
             stats: InputStats::default(),
+            reply: None,
         })
     }
 
@@ -259,6 +269,7 @@ impl InputSession {
                 MacRegionPointMapper::new(&region.applied_regions, &region.bounds_by_region),
             )),
             stats: InputStats::default(),
+            reply: None,
         })
     }
 
@@ -274,8 +285,20 @@ impl InputSession {
             pen_proximity_edges: controller.pen_proximity_edges,
             unmapped_keys: controller.unmapped_keys,
             scroll_events: controller.scroll_events,
+            text_chars: controller.text_chars,
             ..self.stats
         }
+    }
+
+    /// Whether this session can type committed text.
+    #[must_use]
+    pub const fn types_text(&self) -> bool {
+        self.controller.types_text()
+    }
+
+    /// Takes the reply the last message owes the client, if any.
+    pub const fn take_reply(&mut self) -> Option<String> {
+        self.reply.take()
     }
 
     /// Applies one message.
@@ -308,6 +331,10 @@ impl InputSession {
             MOUSE_BUTTON => self.apply_button(&value),
             MOUSE_SCROLL => self.apply_scroll(&value),
             KEY_EVENT => self.apply_key(&value),
+            TEXT_COMMIT => {
+                self.apply_text(&value);
+                Ok(())
+            }
             PEN_EVENT => self.apply_pen(&value),
             GESTURE_MAGNIFY => self.apply_gesture_magnify(&value),
             GESTURE_ROTATE => self.apply_gesture_rotate(&value),
@@ -378,6 +405,48 @@ impl InputSession {
         self.controller.gesture_swipe(&message)?;
         self.stats.applied += 1;
         Ok(())
+    }
+
+    /// Types committed text. Not ordered against key and pointer input: a
+    /// commit's sequence numbers commits, as on the other hosts. A commit
+    /// that cannot be typed is refused to the client, never ends the session.
+    fn apply_text(&mut self, value: &serde_json::Value) {
+        let Ok(message) = serde_json::from_value::<TextCommitMsg>(value.clone()) else {
+            self.stats.malformed += 1;
+            return;
+        };
+        // Control characters would act as keys (a Unicode CR is Return to
+        // many applications): keys go as key events.
+        let refusal = if message.validate().is_err() {
+            Some(TextRefusalReason::InvalidText)
+        } else {
+            match self.controller.text_commit(&message.text) {
+                Ok(_) => None,
+                Err(InputError::VirtualHidUnavailable) => Some(TextRefusalReason::HostUnsupported),
+                Err(error) => {
+                    tracing::debug!(
+                        target: arcen_telemetry::names::target::HID,
+                        %error,
+                        "text_commit could not be typed"
+                    );
+                    Some(TextRefusalReason::InputUnavailable)
+                }
+            }
+        };
+        let Some(reason) = refusal else {
+            self.stats.applied += 1;
+            return;
+        };
+        let report = arcen_input::text::TextDeliveryReport::refused(&message.text, reason);
+        self.stats.text_refused += u64::from(report.refused_chars);
+        self.reply = serde_json::to_string(&TextCommitResultMsg {
+            sequence: message.sequence,
+            refused_chars: report.refused_chars,
+            refused_text: report.refused_text,
+            reason,
+            ..TextCommitResultMsg::default()
+        })
+        .ok();
     }
 
     /// Returns whether `sequence` may be applied, counting it if not.
@@ -485,6 +554,25 @@ impl InputSession {
             return Ok(());
         }
         self.controller.pen_event(&message)?;
+        self.stats.applied += 1;
+        Ok(())
+    }
+
+    /// Applies a pen sample this host read from a bridged tablet itself
+    /// (Native tablet, ADR 0022 §14). It is not part of the Deck's
+    /// sequenced stream, so it bypasses sequencing, but it is validated like
+    /// any other sample and mapped onto the whole desktop the way a tablet in
+    /// absolute mode maps onto the screen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] only when injection itself fails.
+    pub fn apply_host_pen(&mut self, message: &PenEventMsg) -> Result<(), InputError> {
+        if message.validate().is_err() {
+            self.stats.pen_rejected += 1;
+            return Ok(());
+        }
+        self.controller.pen_event(message)?;
         self.stats.applied += 1;
         Ok(())
     }
@@ -904,6 +992,50 @@ mod tests {
         session.apply(&move_at(10)).expect("replay");
         assert_eq!(session.stats().applied, 1);
         assert_eq!(session.stats().out_of_order, 2);
+    }
+
+    #[test]
+    fn invalid_committed_text_is_refused_to_the_client_and_never_typed() {
+        // Validation runs before any event is created, so nothing reaches
+        // the desktop this runs on.
+        let Some(mut session) = session() else {
+            return;
+        };
+        session
+            .apply(&json!({"type": TEXT_COMMIT, "text": "a\rb", "sequence": 7}).to_string())
+            .expect("an invalid commit must not end the session");
+        let reply = session.take_reply().expect("the client is told");
+        let result: TextCommitResultMsg = serde_json::from_str(&reply).expect("a result");
+        assert_eq!(result.sequence, 7);
+        assert_eq!(result.delivered_chars, 0);
+        assert_eq!(result.refused_chars, 3);
+        assert_eq!(result.reason, TextRefusalReason::InvalidText);
+        assert_eq!(session.stats().text_chars, 0);
+        assert_eq!(session.stats().text_refused, 3);
+        assert_eq!(session.stats().applied, 0);
+        assert!(session.take_reply().is_none(), "one reply per commit");
+        session
+            .apply(&json!({"type": TEXT_COMMIT, "text": 5}).to_string())
+            .expect("no panic");
+        assert_eq!(session.stats().malformed, 1);
+    }
+
+    #[test]
+    fn committed_text_is_typed_including_surrogate_pairs() {
+        // Types into whatever has focus on the desktop this runs on.
+        if !crate::desktop_tests_allowed() {
+            return;
+        }
+        let Some(mut session) = session() else {
+            return;
+        };
+        let text = format!("æøå 😀 {}", "x".repeat(40));
+        session
+            .apply(&json!({"type": TEXT_COMMIT, "text": text, "sequence": 1}).to_string())
+            .expect("text applies");
+        assert!(session.take_reply().is_none());
+        assert_eq!(session.stats().text_chars, 46);
+        assert_eq!(session.stats().applied, 1);
     }
 
     #[test]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::sync::{Mutex, OnceLock};
 
 /// Actions the native macOS menu bar dispatches back into the egui app.
@@ -14,6 +17,11 @@ pub enum MenuCommand {
         from_keyboard: bool,
     },
     ToggleHealth,
+    /// Show/hide the compact stream statistics (RTT, loss, fps, codec,
+    /// SDR/HDR, lossless coverage).
+    ToggleStreamStats,
+    /// Show/hide the lossless-tile debug view.
+    ToggleLosslessTiles,
     Disconnect,
     ReleaseModifiers,
     ToggleFullscreen,
@@ -24,10 +32,22 @@ pub enum MenuCommand {
     /// Toggle proportional tablet active-area mapping (state stored; full
     /// implementation requires physical tablet aspect ratio from device info).
     ToggleTabletForceProportions,
+    /// Type the clipboard's plain text into the host as keystrokes
+    /// (Control+Option+Command+V).
+    PasteAsKeystrokes,
+    /// Stop a paste being typed (Esc does the same).
+    StopTyping,
+    /// Keyboard mode for this session: physical keys (Control+Command+K).
+    KeyboardPhysical,
+    /// Keyboard mode for this session: characters (Control+Command+U).
+    KeyboardCharacters,
     /// Show/hide the negotiated-truth session-info panel (w5-negotiated-truth):
     /// actual codec/chroma/depth/range/matrix, hardware-vs-software encode
     /// and decode, and any degradation from what settings asked for.
     ToggleNegotiatedTruth,
+    /// Show/hide the Colour check: what the host serves, what this Mac
+    /// shows, and whether the code values arrive exactly.
+    ToggleColourCheck,
     /// Cycle which `arcen_media::test_pattern::TestPattern` the live
     /// pixel-exactness readout (w4-exactness-readout) compares the decoded
     /// frame against: None -> every pattern in turn -> None.
@@ -110,6 +130,16 @@ mod platform {
                 push_menu_command(MenuCommand::ToggleHealth);
             }
 
+            #[unsafe(method(arcenToggleStreamStats:))]
+            fn toggle_stream_stats(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::ToggleStreamStats);
+            }
+
+            #[unsafe(method(arcenToggleLosslessTiles:))]
+            fn toggle_lossless_tiles(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::ToggleLosslessTiles);
+            }
+
             #[unsafe(method(arcenDisconnect:))]
             fn disconnect(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::Disconnect);
@@ -123,6 +153,26 @@ mod platform {
             #[unsafe(method(arcenToggleFullscreen:))]
             fn toggle_fullscreen(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::ToggleFullscreen);
+            }
+
+            #[unsafe(method(arcenPasteAsKeystrokes:))]
+            fn paste_as_keystrokes(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::PasteAsKeystrokes);
+            }
+
+            #[unsafe(method(arcenStopTyping:))]
+            fn stop_typing(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::StopTyping);
+            }
+
+            #[unsafe(method(arcenKeyboardPhysical:))]
+            fn keyboard_physical(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::KeyboardPhysical);
+            }
+
+            #[unsafe(method(arcenKeyboardCharacters:))]
+            fn keyboard_characters(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::KeyboardCharacters);
             }
 
             #[unsafe(method(arcenTogglePointerLock:))]
@@ -148,6 +198,11 @@ mod platform {
             #[unsafe(method(arcenToggleNegotiatedTruth:))]
             fn toggle_negotiated_truth(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::ToggleNegotiatedTruth);
+            }
+
+            #[unsafe(method(arcenToggleColourCheck:))]
+            fn toggle_colour_check(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::ToggleColourCheck);
             }
 
             #[cfg(feature = "dev-tools")]
@@ -191,6 +246,39 @@ mod platform {
         /// while a session is on screen, with the key each normally carries.
         static HOST_SHORTCUT_ITEMS: std::cell::RefCell<Vec<(Retained<NSMenuItem>, &'static str)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// Physical Keys, Characters and Stop Typing, whose state follows
+        /// the session.
+        static KEYBOARD_ITEMS: std::cell::RefCell<Option<[Retained<NSMenuItem>; 3]>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Ticks the session's keyboard mode and enables Stop Typing while a
+    /// paste is typed. Main thread only; a no-op elsewhere.
+    pub fn set_keyboard_state(characters: bool, typing: bool) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        KEYBOARD_ITEMS.with(|items| {
+            if let Some([physical, characters_item, stop]) = items.borrow().as_ref() {
+                physical.setState(if characters { 0 } else { 1 });
+                characters_item.setState(if characters { 1 } else { 0 });
+                stop.setEnabled(typing);
+            }
+        });
+    }
+
+    /// Whether any modifier key (Shift, Control, Option, Command) is
+    /// physically held right now, from the window server's combined state.
+    pub fn modifiers_held() -> bool {
+        const SHIFT: u64 = 1 << 17;
+        const CONTROL: u64 = 1 << 18;
+        const OPTION: u64 = 1 << 19;
+        const COMMAND: u64 = 1 << 20;
+        // SAFETY: a plain query of the combined session state.
+        unsafe { CGEventSourceFlagsState(0) & (SHIFT | CONTROL | OPTION | COMMAND) != 0 }
     }
 
     /// Gives Cmd+H and Cmd+Option+H to the remote desktop, or back to this
@@ -331,6 +419,59 @@ mod platform {
             sel!(arcenReleaseModifiers:),
             None,
         ));
+        connection_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        // Windows App's own chords for its scancode and Unicode modes;
+        // none of the three is a macOS or Deck shortcut.
+        connection_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            "Paste as Keystrokes",
+            sel!(arcenPasteAsKeystrokes:),
+            Some(KeyEquivalent {
+                key: "v",
+                modifiers: Some(
+                    NSEventModifierFlags::Control
+                        | NSEventModifierFlags::Option
+                        | NSEventModifierFlags::Command,
+                ),
+            }),
+        ));
+        let stop_typing = action_item(
+            mtm,
+            &menu_target,
+            "Stop Typing",
+            sel!(arcenStopTyping:),
+            None,
+        );
+        stop_typing.setEnabled(false);
+        connection_menu.addItem(&stop_typing);
+        connection_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let physical = action_item(
+            mtm,
+            &menu_target,
+            "Keyboard: Physical Keys",
+            sel!(arcenKeyboardPhysical:),
+            Some(KeyEquivalent {
+                key: "k",
+                modifiers: Some(NSEventModifierFlags::Control | NSEventModifierFlags::Command),
+            }),
+        );
+        physical.setState(1);
+        connection_menu.addItem(&physical);
+        let characters = action_item(
+            mtm,
+            &menu_target,
+            "Keyboard: Characters",
+            sel!(arcenKeyboardCharacters:),
+            Some(KeyEquivalent {
+                key: "u",
+                modifiers: Some(NSEventModifierFlags::Control | NSEventModifierFlags::Command),
+            }),
+        );
+        connection_menu.addItem(&characters);
+        KEYBOARD_ITEMS.with(|items| {
+            *items.borrow_mut() = Some([physical, characters, stop_typing]);
+        });
         add_submenu(mtm, &menubar, "Connection", &connection_menu);
 
         let view_menu = make_menu(mtm, VIEW_MENU_TITLE);
@@ -382,8 +523,29 @@ mod platform {
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
+            "Stream Statistics",
+            sel!(arcenToggleStreamStats:),
+            None,
+        ));
+        session_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            "Lossless Tile View",
+            sel!(arcenToggleLosslessTiles:),
+            None,
+        ));
+        session_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
             "Negotiated Truth",
             sel!(arcenToggleNegotiatedTruth:),
+            None,
+        ));
+        session_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            "Colour Check…",
+            sel!(arcenToggleColourCheck:),
             None,
         ));
         #[cfg(feature = "dev-tools")]
@@ -492,6 +654,10 @@ mod platform {
     pub fn command_held() -> bool {
         false
     }
+    pub fn modifiers_held() -> bool {
+        false
+    }
+    pub fn set_keyboard_state(_characters: bool, _typing: bool) {}
 }
 
 pub fn install() {
@@ -506,6 +672,16 @@ pub fn quit_chord_held() -> bool {
 /// See `platform::command_held`.
 pub fn command_held() -> bool {
     platform::command_held()
+}
+
+/// See `platform::modifiers_held`.
+pub fn modifiers_held() -> bool {
+    platform::modifiers_held()
+}
+
+/// See `platform::set_keyboard_state`.
+pub fn set_keyboard_state(characters: bool, typing: bool) {
+    platform::set_keyboard_state(characters, typing);
 }
 
 /// See `platform::forward_app_shortcuts_to_host`.

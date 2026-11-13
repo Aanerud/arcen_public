@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //
 // Arcen real-screen driver (macOS). Drives the real Arcen Deck window with
 // real CGEvent input and watches the result with ScreenCaptureKit.
@@ -617,6 +618,20 @@ for phase in opts.phases {
             pause(0.5)
         }
         if usePen { penProximity(false, at(0.56, 0.62), phase); pause(0.3) }
+    case "cursors":
+        // cursors.html: hold the pointer in each of its eight bands (a few
+        // pixels of motion so the host re-evaluates the cursor) and snapshot
+        // the Deck window with this Mac's cursor in it.
+        _ = mark(phase)
+        for band in 0..<8 {
+            let fy = (Double(band) + 0.5) / 8
+            mouse(.mouseMoved, at(0.45, fy), phase, "move")
+            pause(0.3)
+            mouse(.mouseMoved, at(0.46, fy), phase, "move")
+            pause(0.9)
+            capture.requestSnapshot("cursor-band\(band)")
+            pause(0.4)
+        }
     case "hover":
         circle(phase, seconds: opts.hoverSeconds, button: false)
     case "draw":

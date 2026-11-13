@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! What this host can and cannot say about the desktop's pointer.
 //!
 //! The Deck can draw the pointer itself, which is instant because nothing has

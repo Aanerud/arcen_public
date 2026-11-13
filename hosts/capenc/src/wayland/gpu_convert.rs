@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The `gpu-convert` DMA-BUF route: EGL image import, a GL blit into a
 //! CUDA-registered texture, and a CUDA copy into the encoder's retained frame.
 //!

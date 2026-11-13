@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Machine-service side session-agent supervision and user-side GNOME launch.
 
 use std::path::{Path, PathBuf};
@@ -691,11 +693,8 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
         let mut desktop_process = Command::new("/usr/bin/gnome-shell");
         desktop_process
             .envs(login_environment.imported)
-            .args(&shell_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .args(&shell_args);
+        desktop_shell_stdio(&mut desktop_process);
         // SAFETY: this runs in the child immediately before exec and only arms
         // a kernel parent-death signal. GNOME remains in the agent's process
         // group, so the launcher can terminate the complete tree with killpg.
@@ -1181,6 +1180,20 @@ fn agent_dispatch(args: &[String]) -> Result<AgentDispatch, AgentError> {
     }
 }
 
+/// The desktop shell's standard streams. Its stdout is discarded: the
+/// agent's own stdout carries the READY line to the launcher, and a shell
+/// writing there corrupts that protocol (GLib prints debug messages to
+/// stdout, so a `G_MESSAGES_DEBUG` in the user's login profile stopped the
+/// desktop from starting) or blocks once the launcher stops reading. Its
+/// stderr stays the agent's, which the launcher logs.
+fn desktop_shell_stdio(command: &mut Command) -> &mut Command {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+}
+
 fn gnome_shell_arguments(display: &str) -> [String; 4] {
     [
         "--x11".to_string(),
@@ -1327,6 +1340,26 @@ pub fn agent_main(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// A shell that writes to stdout (as GLib does for a user's
+    /// `G_MESSAGES_DEBUG`) must never reach the agent's READY pipe.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_desktop_shell_never_writes_into_the_agent_protocol_pipe() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let mut child = desktop_shell_stdio(&mut command).spawn().unwrap();
+        let pid = child.id().unwrap();
+        let fd = |n: u8| std::fs::read_link(format!("/proc/{pid}/fd/{n}")).unwrap();
+        assert_eq!(fd(1), Path::new("/dev/null"), "stdout");
+        assert_eq!(fd(0), Path::new("/dev/null"), "stdin");
+        assert_eq!(
+            fd(2),
+            std::fs::read_link("/proc/self/fd/2").unwrap(),
+            "stderr stays the agent's"
+        );
+        child.kill().await.unwrap();
+    }
+
     #[tokio::test]
     async fn agent_stderr_bounds_an_enormous_unterminated_line_and_keeps_reading() {
         // Proves the integration wiring (not just the shared bounded_io
@@ -1389,17 +1422,31 @@ mod tests {
         );
     }
 
+    /// A child shell writes the stand-in, so this process never holds a
+    /// writable descriptor to it that a test forking concurrently could
+    /// inherit; running it would then fail with ETXTBSY.
+    #[cfg(target_os = "linux")]
+    fn write_script(path: &std::path::Path, body: &str) {
+        let written = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(written.success(), "script {}", path.display());
+    }
+
     #[cfg(target_os = "linux")]
     fn slow_pactl(name: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/arcen-test-artifacts")
             .join(format!("slow-pactl-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("pactl");
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&script, "#!/bin/sh\nexec sleep 30\n");
         (script, directory)
     }
 
@@ -1453,18 +1500,15 @@ mod tests {
     /// whose every other command (the bridge's `info` among them) hangs.
     #[cfg(target_os = "linux")]
     fn subscribing_pactl(name: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let (script, directory) = slow_pactl(name);
         let mark = directory.join("subscribed");
-        std::fs::write(
+        write_script(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = subscribe ]; then touch {}; fi\nexec sleep 30\n",
                 mark.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (script, directory)
     }
 
@@ -1488,10 +1532,19 @@ mod tests {
         };
         // The bridge's start is held up for the whole window (its `pactl
         // info` never answers); the lease's watcher must subscribe anyway.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(800),
-            audio.watch_within(Duration::from_secs(30)),
-        )
+        // Wait for the subscription itself: a fixed 800 ms was sometimes too
+        // short for a loaded suite to fork the watcher.
+        let subscribed = runtime.join("subscribed");
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                () = audio.watch_within(Duration::from_secs(30)) => {}
+                () = async {
+                    while !subscribed.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
         .await;
         assert!(
             runtime.join("subscribed").exists(),

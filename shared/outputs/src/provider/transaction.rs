@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The frozen transaction driver.
 //!
 //! Section 3 of ADR 0010. [`OutputTransaction::acquire`] runs admission, then

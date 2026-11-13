@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Broker side of the SYSTEM-only Credential Provider control pipe, plus the
 //! remote first-login orchestrator.
 //!

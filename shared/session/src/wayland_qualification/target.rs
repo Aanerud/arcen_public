@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Where a qualification record lives, and the names a qualification run
 //! derives from it.
 //!
@@ -219,6 +221,18 @@ impl QualificationTarget {
             .strip_suffix(".json")
             .unwrap_or(&self.record_path);
         format!("{stem}-requalify.json")
+    }
+
+    /// The root-owned marker of the last automatic re-qualification for a
+    /// cleared X11 host precondition (`<record stem>-x11-requalify.json`);
+    /// separate, so the two triggers never hold each other off.
+    #[must_use]
+    pub fn x11_requalify_marker_path(&self) -> String {
+        let stem = self
+            .record_path
+            .strip_suffix(".json")
+            .unwrap_or(&self.record_path);
+        format!("{stem}-x11-requalify.json")
     }
 
     /// The command that (re)qualifies this record.

@@ -5,7 +5,7 @@ macOS Deck (2026-07-22).** Global protocol version 3 and its binary media
 discriminants remain unchanged. Opus is enabled only by exact audio subprotocol
 v1 negotiation; peers without that capability remain on byte-compatible PCM.
 
-Audio input, media-plan resolution, Span/gateway transport, and dormant clients
+Audio input, media-plan resolution, and dormant clients
 are outside this delivery.
 
 ## Shared-first boundary

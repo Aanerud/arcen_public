@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Protocol-v3 Qt key identifiers to macOS virtual key codes.
 //!
 //! The Pier speaks one key vocabulary on the wire on every platform. This is

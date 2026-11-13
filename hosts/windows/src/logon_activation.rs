@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Active-console Winlogon activation through the documented service SAS API.
 
 use windows::core::{PCSTR, PCWSTR};

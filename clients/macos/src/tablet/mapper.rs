@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure AppKit-sample → [`arcen_input::PenEvent`] mapper.
 //!
 //! This is deliberately free of any AppKit/objc2 dependency so it can be unit
@@ -198,7 +200,7 @@ impl TabletMapper {
         // The tip button bit is contact, not a barrel button; pressure > 0 is
         // an additional signal some drivers only expose through pressure.
         let touching = sample.buttons.tip_down() || pressure > 0.0;
-        let buttons = sample.buttons.barrel_bits();
+        let buttons = sample.buttons.wire_barrel_buttons();
 
         let event = PenEvent {
             x,
@@ -472,10 +474,20 @@ mod tests {
         let event = mapper
             .on_point(point(0.0, 0.0, 0.3, raw), view(), metadata(1))
             .expect("valid point sample maps");
-        assert_eq!(
-            event.buttons,
-            TabletButtonMask::LOWER_SIDE | TabletButtonMask::UPPER_SIDE
-        );
+        // The wire's layout: bit 0 the first barrel button, bit 1 the second.
+        assert_eq!(event.buttons, 0b11);
+        assert!(event.touching);
+
+        for (sequence, appkit, wire) in [
+            (2, TabletButtonMask::LOWER_SIDE, 0b01),
+            (3, TabletButtonMask::UPPER_SIDE, 0b10),
+        ] {
+            let event = mapper
+                .on_point(point(0.0, 0.0, 0.0, appkit), view(), metadata(sequence))
+                .expect("valid point sample maps");
+            assert_eq!(event.buttons, wire);
+            assert!(!event.touching);
+        }
     }
 
     #[test]

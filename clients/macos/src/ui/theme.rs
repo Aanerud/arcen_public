@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use egui::{Color32, Visuals};
 
 pub const BG_PRIMARY: Color32 = Color32::from_rgb(0x0A, 0x0A, 0x10);

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use crate::observability::ClientTelemetry;
 use crate::pipeline::frame_queue::IncomingMediaTelemetry;
 use crate::pipeline::video_decoder::DecodedVideoFrame;
@@ -502,6 +505,73 @@ fn apply_secondary_host_cursor(
 /// `image` prepared for the native cursor at the scale `image_rect` shows a
 /// stream `stream_width` pixels wide at, reusing `presented` when the image
 /// and scale are unchanged.
+/// The viewer point for a position at `fraction` of the stream, or `None`
+/// outside it.
+fn host_pointer_point(image_rect: egui::Rect, fraction: (f64, f64)) -> Option<egui::Pos2> {
+    let (x, y) = fraction;
+    if !(0.0..1.0).contains(&x) || !(0.0..1.0).contains(&y) {
+        return None;
+    }
+    Some(egui::pos2(
+        image_rect.left() + (x as f32) * image_rect.width(),
+        image_rect.top() + (y as f32) * image_rect.height(),
+    ))
+}
+
+/// A plain arrow with its tip at `at`, for a host cursor the Deck has no
+/// image of.
+fn paint_pointer_arrow(painter: &egui::Painter, at: egui::Pos2) {
+    const ARROW: [[f32; 2]; 7] = [
+        [0.0, 0.0],
+        [0.0, 17.0],
+        [4.0, 13.0],
+        [7.0, 20.0],
+        [9.5, 19.0],
+        [6.5, 12.0],
+        [12.0, 12.0],
+    ];
+    let points = ARROW
+        .iter()
+        .map(|[x, y]| at + egui::vec2(*x, *y))
+        .collect::<Vec<_>>();
+    painter.add(egui::Shape::convex_polygon(
+        points.clone(),
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::closed_line(
+        points,
+        egui::Stroke::new(1.0, egui::Color32::BLACK),
+    ));
+}
+
+/// A small pen mark centred on `at`: a white dot ringed in black, visible
+/// on any background, for a host that hides its pointer while a bridged pen
+/// drives it (`arcen_input::host_pointer::LedPointerMark::PenMark`).
+fn paint_pen_mark(painter: &egui::Painter, at: egui::Pos2) {
+    painter.circle(
+        at,
+        3.5,
+        egui::Color32::WHITE,
+        egui::Stroke::new(1.5, egui::Color32::BLACK),
+    );
+}
+
+/// One host-led cursor decision, logged when it changes (booleans only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeadCursorDecision {
+    want: super::sharp_cursor::LeadCursorWant,
+    /// What `egui`'s own hover and focus alone would have wanted.
+    egui_want: super::sharp_cursor::LeadCursorWant,
+    mark: Option<arcen_input::host_pointer::LedPointerMark>,
+    appkit_reading: bool,
+    app_active: bool,
+    over_root_window: bool,
+    on_viewer: bool,
+    egui_hovered: bool,
+    egui_focused: bool,
+}
+
 fn present_host_cursor(
     presented: &mut Option<PresentedHostCursor>,
     id: arcen_protocol::cursor::CursorImageId,
@@ -871,7 +941,6 @@ pub enum AppScreen {
     Disclaimer(ConnectionDraft, String),
     Credentials(ConnectionDraft),
     Connecting(ConnectionDraft),
-    GatewayMachineSelect,
     LaunchingSession(ConnectionDraft),
     InSession,
     Reconnecting(ReconnectOverlay),
@@ -2225,7 +2294,7 @@ pub fn monitors_for_displays_mode(
 
 /// Whether the Deck may retarget the remote desktop to the viewer surface.
 ///
-/// DISPLAY-380 (`0f7b0d0`) fixed this deliberately: only Windowed follows the
+/// DISPLAY-380 fixed this deliberately: only Windowed follows the
 /// app window. The pinned modes lock the stream to the target monitor and
 /// suppress this tracker entirely, and hosts do not advertise
 /// `supports_display_update` in a pinned mode. Asking anyway produces a host
@@ -2474,7 +2543,7 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
             !result.reason.as_str().is_empty() && result.reconnect_required
         }
         (TabletModeMsg::UsbTabletBridge, TabletModeMsg::UsbTabletBridge, true) => {
-            cfg!(feature = "usb-hard-lab") && !result.reconnect_required
+            cfg!(feature = "native-tablet") && !result.reconnect_required
         }
         (TabletModeMsg::DisabledMouseCompat, TabletModeMsg::DisabledMouseCompat, true) => {
             !result.reconnect_required
@@ -2490,7 +2559,7 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
 /// connection saved with a mode this build cannot run fails later, at connect
 /// time, for a reason the dialog never mentioned. Offering it there only
 /// manufactures broken configurations.
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
     TabletModeMsg::LocalTermination,
     TabletModeMsg::UsbTabletBridge,
@@ -2498,7 +2567,7 @@ const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
 ];
 
 /// Tablet modes this build can actually run, in display order.
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
     TabletModeMsg::LocalTermination,
     TabletModeMsg::DisabledMouseCompat,
@@ -2538,8 +2607,10 @@ const fn tablet_mode_description(mode: TabletModeMsg) -> &'static str {
              In exchange: every pen sample makes a full round trip to the host, so latency is \
              felt directly and this is not a WAN mode. Mac applications cannot use the tablet \
              until you disconnect, and the host needs its own driver for the tablet and USB \
-             virtualization. The host draws the pointer, so pair this with host cursor \
-             rendering. The helper is what runs privileged; Arcen Deck itself never does."
+             virtualization. The host's driver moves the host's pointer; with Local cursor \
+             rendering Arcen Deck draws the cursor where the host reports it, which is the \
+             recommended pairing (host cursor rendering also works, one video round trip \
+             later). The helper is what runs privileged; Arcen Deck itself never does."
         }
         TabletModeMsg::DisabledMouseCompat => {
             "No tablet redirection. The pen behaves as a mouse; no pressure, tilt, eraser, \
@@ -2617,8 +2688,11 @@ struct ClientSettings {
     /// How typed characters reach a host that takes committed text
     /// (`arcen_input::text::TypingMode`; Auto by default).
     typing_mode: arcen_input::text::TypingMode,
-    /// What each Option key does (left Alt, right characters by default).
-    option_key_mode: arcen_input::text::OptionKeyMode,
+    /// What each Option key does: Automatic by default (a Mac host keeps
+    /// both as Option; other hosts get left Alt, right characters).
+    option_key_mode: arcen_input::text::OptionKeyPreference,
+    /// Paste as Keystrokes: confirmation threshold and typing rate.
+    paste: arcen_input::text::PasteSettings,
 }
 
 const SAVED_CONNECTIONS_VERSION: u32 = 2;
@@ -2673,7 +2747,8 @@ impl Default for ClientSettings {
             color_fidelity: ColorFidelitySettings::default(),
             encode_intent: arcen_media::EncodeIntent::default(),
             typing_mode: arcen_input::text::TypingMode::default(),
-            option_key_mode: arcen_input::text::OptionKeyMode::default(),
+            option_key_mode: arcen_input::text::OptionKeyPreference::default(),
+            paste: arcen_input::text::PasteSettings::default(),
         }
     }
 }
@@ -3008,6 +3083,13 @@ pub struct ArcenApp {
     /// selection changes so a stale readout for a different pattern can
     /// never be shown under a new pattern's label.
     pattern_accuracy: Option<ExactnessReadout>,
+    /// The Colour check panel (Session › Colour Check…, Settings ›
+    /// Streaming). Its rules live in `arcen_media::colour_check`.
+    colour_check: crate::ui::colour_check::ColourCheck,
+    /// What the host said about this session, for the Colour check.
+    colour_check_host: Option<arcen_media::colour_check::HostFacts>,
+    /// How the stream was last scaled on screen, while the panel is open.
+    colour_check_scale: Option<arcen_media::colour_check::ScaleFacts>,
     /// Live per-session state for a production Carrier A multi-window entry
     /// (see `crate::ui::multi_window_activation::MultiWindowSessionState`).
     /// Stays `Inactive` for every legacy/primary-only session -- Match My
@@ -3243,9 +3325,40 @@ pub struct ArcenApp {
     local_pen_cursor: arcen_input::cursor::LocalPenCursor,
     /// The host announced cursor images for this connection.
     host_cursor_images: bool,
+    /// Whether the cursor follows this Mac's pointer or the host's reported
+    /// pointer (a USB-bridged tablet moves only the host's).
+    pointer_authority: arcen_input::host_pointer::PointerAuthority,
+    /// The host announced pointer positions for this connection.
+    host_cursor_positions: bool,
+    /// Hides the system cursor over the video while the host leads.
+    lead_cursor: super::sharp_cursor::LeadCursor,
+    /// Whether this UI pass's video wanted the system cursor hidden.
+    lead_cursor_wanted: bool,
+    /// Where this Mac's pointer was over the viewer at the last pass, to see
+    /// it move.
+    last_local_pointer: Option<egui::Pos2>,
+    /// This Mac's own pointer motion, from AppKit's global location (a
+    /// window frame change under a resting pointer is not motion).
+    mac_pointer_motion: super::sharp_cursor::MacPointerMotion,
+    /// The last logged host-led cursor decision, so it is logged on change.
+    lead_cursor_logged: Option<LeadCursorDecision>,
+    /// Tests stand in for AppKit's pointer (never read in tests).
+    #[cfg(test)]
+    test_mac_pointer: Option<super::sharp_cursor::MacPointer>,
+    /// The host cursor image as a texture, for drawing it at the host's
+    /// pointer position.
+    host_pointer_texture: Option<(arcen_protocol::cursor::CursorImageId, egui::TextureHandle)>,
     /// The last host cursor prepared for the native cursor, by image and
     /// scale, so it is resampled only when either changes.
     presented_host_cursor: Option<PresentedHostCursor>,
+    /// The same cursor at the display's backing scale (`sharp_cursor`), by
+    /// image, scale and backing scale.
+    sharp_host_cursor: Option<(
+        arcen_protocol::cursor::CursorImageId,
+        u32,
+        u32,
+        Option<super::sharp_cursor::SharpCursor>,
+    )>,
     remote_pointer_buttons: [bool; 3],
     viewport_context: Option<egui::Context>,
     last_decode_at: Option<Instant>,
@@ -3285,6 +3398,18 @@ pub struct ArcenApp {
     session_backstop: SessionBackstopState,
     presenter_telemetry: PresenterTelemetryWindow,
     show_health_overlay: bool,
+    /// Compact stream statistics (P2-4): path, delivery, contract, dynamic
+    /// range and lossless coverage. Off by default.
+    show_stream_stats: bool,
+    /// Lossless-tile debug view: tints refined (amber) and verified (green)
+    /// 16x16 blocks over the video. Off by default.
+    show_lossless_tiles: bool,
+    /// The pipeline the Pier says it serves (`active_pipeline`, then
+    /// `served_pipeline` updates).
+    served_pipeline_token: Option<String>,
+    /// Lossless refinement state owner (ADR 0016). Nothing is refined until
+    /// a Pier grants the refine lane; this build does not advertise it yet.
+    refine: arcen_media::refine::deck::DeckRefineSession,
     fullscreen: bool,
     session_fullscreen_restore: Option<bool>,
     last_wire_video_summary: String,
@@ -3315,6 +3440,8 @@ pub struct ArcenApp {
     /// Working value for the connection form's Displays selector; `None`
     /// means "Use app default".
     add_connection_displays_mode: Option<DisplaysMode>,
+    /// Working value for the connection form's Keyboard settings.
+    add_connection_keyboard: arcen_input::keyboard::KeyboardSettings,
     editing_index: Option<usize>,
     /// `true` when the Home detail panel is showing the "Add connection" form.
     home_add_mode: bool,
@@ -3329,6 +3456,8 @@ pub struct ArcenApp {
     /// identity has changed fails terminally instead of re-asking a question
     /// the user has already answered.
     remembered_tls_pins: crate::ui::trusted_pins::TrustedPinStore,
+    /// The connection test shown on the Home screen (Test connection).
+    connection_test: Option<crate::ui::connection_test::ConnectionTest>,
     /// Ticked by the user on the changed-identity screen.
     ///
     /// Held on the app rather than inside the modal so the modal stays a pure
@@ -3341,12 +3470,12 @@ pub struct ArcenApp {
     settings_tab: SettingsTab,
     /// Cached privileged-helper registration state. Refreshed on demand rather
     /// than per frame: reading it is an XPC round trip to `smd`.
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     usb_helper_state: Option<crate::usb_helper_install::HelperInstallState>,
     /// Last privileged-helper installation failure, shown beside the control
     /// that caused it. Without this a refused or cancelled install only
     /// reached the log, and the button looked inert.
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     usb_helper_error: Option<String>,
     log_level: LogLevel,
     security_mode: SecurityMode,
@@ -3436,7 +3565,9 @@ pub struct ArcenApp {
     /// `close_multi_window_session`.
     active_secondary_keyboard_focus: Option<arcen_media::SessionMonitorId>,
     native_key_metadata: VecDeque<NativeKeyMetadata>,
-    active_swap_cmd_ctrl: bool,
+    /// The keyboard settings of the connection being made; the host's
+    /// hello turns them into the keyboard policy.
+    active_keyboard: arcen_input::keyboard::KeyboardSettings,
     reconnect: Option<ReconnectController>,
     reconnect_clock: SystemClock,
     reconnect_jitter: SystemJitter,
@@ -3465,7 +3596,22 @@ pub struct ArcenApp {
     /// Mirrors `ClientSettings::typing_mode`.
     typing_mode: arcen_input::text::TypingMode,
     /// Mirrors `ClientSettings::option_key_mode`.
-    option_key_mode: arcen_input::text::OptionKeyMode,
+    option_key_mode: arcen_input::text::OptionKeyPreference,
+    /// Paste as Keystrokes for the session; its settings mirror
+    /// `ClientSettings::paste`.
+    paste_keys: crate::ui::paste_keys::PasteKeys,
+    /// The keyboard mode chosen from the menu during a session, and the
+    /// endpoint it was chosen for: it outlives reconnects to that endpoint
+    /// and wins over the connection's saved mode.
+    session_keyboard_mode: Option<(String, arcen_input::text::KeyboardMode)>,
+    /// The endpoint of the connection being made or held.
+    keyboard_endpoint: String,
+    /// The clipboard policy the host announced in its hello, whether or not
+    /// clipboard sharing is on here: Paste as Keystrokes honours it.
+    host_clipboard_policy: Option<arcen_protocol::messages::ClipboardPolicyMsg>,
+    /// The keyboard menu state last applied (Characters ticked, Stop
+    /// Typing enabled).
+    keyboard_menu_state: Option<(bool, bool)>,
     /// Committed text for the session: input-method commits and keystrokes
     /// the host's layout types differently.
     text_input: crate::ui::text_input::DeckTextInput,
@@ -3635,11 +3781,10 @@ impl ArcenApp {
             use_quic: options.quic_enabled,
             tls_trust: Some(options.tls.clone()),
             auto_reconnect: true,
-            destination_kind: crate::ui::home::DestinationKind::Linux,
-            swap_cmd_ctrl: true,
         };
         app.apply_saved_connection_to_quick_connect(&mut options, &mut draft);
-        app.active_swap_cmd_ctrl = draft.swap_cmd_ctrl;
+        app.active_keyboard = app.saved_keyboard_for(&draft);
+        app.enter_keyboard_endpoint(connection_endpoint(&draft));
         // A saved connection's own Displays choice wins; otherwise the
         // launch arguments' mode governs this session.
         let display_mode = app.active_displays_mode.unwrap_or(display_mode);
@@ -3824,6 +3969,9 @@ impl ArcenApp {
                 None
             },
             pattern_accuracy: None,
+            colour_check: crate::ui::colour_check::ColourCheck::default(),
+            colour_check_host: None,
+            colour_check_scale: None,
             multi_window: MultiWindowSessionState::Inactive,
             #[cfg(feature = "dev-tools")]
             windowed_monitor_test: match crate::ui::windowed_monitor_test::mode_from_process_env() {
@@ -3897,7 +4045,18 @@ impl ArcenApp {
             host_cursor: arcen_input::cursor::DeckCursor::Default,
             local_pen_cursor: arcen_input::cursor::LocalPenCursor::default(),
             host_cursor_images: false,
+            pointer_authority: arcen_input::host_pointer::PointerAuthority::default(),
+            host_cursor_positions: false,
+            lead_cursor: super::sharp_cursor::LeadCursor::default(),
+            lead_cursor_wanted: false,
+            last_local_pointer: None,
+            mac_pointer_motion: super::sharp_cursor::MacPointerMotion::default(),
+            lead_cursor_logged: None,
+            #[cfg(test)]
+            test_mac_pointer: None,
+            host_pointer_texture: None,
             presented_host_cursor: None,
+            sharp_host_cursor: None,
             remote_pointer_buttons: [false; 3],
             viewport_context: None,
             last_decode_at: None,
@@ -3925,6 +4084,10 @@ impl ArcenApp {
             session_backstop: SessionBackstopState::default(),
             presenter_telemetry: PresenterTelemetryWindow::default(),
             show_health_overlay: false,
+            show_stream_stats: false,
+            show_lossless_tiles: false,
+            served_pipeline_token: None,
+            refine: arcen_media::refine::deck::DeckRefineSession::new(),
             fullscreen: false,
             session_fullscreen_restore: None,
             last_wire_video_summary: "No wire frames yet".to_string(),
@@ -3959,18 +4122,20 @@ impl ArcenApp {
             add_connection_username: String::new(),
             add_connection_tablet_mode_requested: tablet_mode_requested,
             add_connection_displays_mode: None,
+            add_connection_keyboard: arcen_input::keyboard::KeyboardSettings::default(),
             editing_index: None,
             connection_search: String::new(),
             accepted_tls_pins: Arc::new(Mutex::new(HashMap::new())),
             remembered_tls_pins,
+            connection_test: None,
             certificate_change_acknowledged: false,
             pending_connection: None,
             last_audio_queued_ms: 0,
             remember_username: true,
             settings_tab: SettingsTab::Streaming,
-            #[cfg(feature = "usb-hard-lab")]
+            #[cfg(feature = "native-tablet")]
             usb_helper_state: None,
-            #[cfg(feature = "usb-hard-lab")]
+            #[cfg(feature = "native-tablet")]
             usb_helper_error: None,
             log_level: settings.log_level,
             security_mode: settings.security_mode,
@@ -3997,7 +4162,7 @@ impl ArcenApp {
             active_keyboard_viewport: None,
             active_secondary_keyboard_focus: None,
             native_key_metadata: VecDeque::new(),
-            active_swap_cmd_ctrl: true,
+            active_keyboard: arcen_input::keyboard::KeyboardSettings::default(),
             reconnect: None,
             reconnect_clock: SystemClock::default(),
             reconnect_jitter: SystemJitter,
@@ -4014,6 +4179,15 @@ impl ArcenApp {
             encode_intent: settings.encode_intent,
             typing_mode: settings.typing_mode,
             option_key_mode: settings.option_key_mode,
+            paste_keys: {
+                let mut paste_keys = crate::ui::paste_keys::PasteKeys::default();
+                paste_keys.configure(settings.paste);
+                paste_keys
+            },
+            session_keyboard_mode: None,
+            keyboard_endpoint: String::new(),
+            host_clipboard_policy: None,
+            keyboard_menu_state: None,
             text_input: {
                 let mut text_input = crate::ui::text_input::DeckTextInput::default();
                 text_input.configure(settings.typing_mode, settings.option_key_mode);
@@ -4231,6 +4405,7 @@ impl eframe::App for ArcenApp {
         for command in macos_menu::drain_menu_commands() {
             self.handle_menu_command(command, ctx);
         }
+        self.drive_paste_keys(ctx);
         // A remote desktop on screen owns Cmd+Q and Cmd+H: they are for the
         // application the person is using on the host, not for this one.
         let forward_shortcuts = matches!(
@@ -4261,6 +4436,7 @@ impl eframe::App for ArcenApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ui_layout_load.note();
+        self.lead_cursor_wanted = false;
         let available = ui.available_size();
         egui::Frame::new()
             .fill(
@@ -4316,6 +4492,9 @@ impl eframe::App for ArcenApp {
                              this session.",
                         );
                         let conn_error = self.status.strip_prefix("Connection error: ");
+                        if let Some(test) = &mut self.connection_test {
+                            test.poll();
+                        }
                         let mut state = HomeViewState {
                             direct: &mut self.direct,
                             saved_connections: &self.saved_connections,
@@ -4328,11 +4507,52 @@ impl eframe::App for ArcenApp {
                             form_port: &mut self.add_connection_port,
                             form_username: &mut self.add_connection_username,
                             form_displays_mode: &mut self.add_connection_displays_mode,
+                            form_keyboard: &mut self.add_connection_keyboard,
                             connection_error: conn_error,
                             remember_username: &mut self.remember_username,
+                            connection_test: self.connection_test.as_ref(),
                         };
                         if let Some(action) = render_home(ui, &mut state) {
+                            if !matches!(
+                                action,
+                                HomeAction::TestConnection { .. } | HomeAction::ConnectionTest(_)
+                            ) {
+                                self.connection_test = None;
+                            }
                             match action {
+                                HomeAction::TestConnection { host, port } => {
+                                    self.connection_test =
+                                        Some(crate::ui::connection_test::ConnectionTest::start(
+                                            &host,
+                                            &port,
+                                            ui.ctx(),
+                                        ));
+                                }
+                                HomeAction::ConnectionTest(panel) => {
+                                    use crate::ui::connection_test::ConnectionTestAction;
+                                    match panel {
+                                        ConnectionTestAction::Close => self.connection_test = None,
+                                        ConnectionTestAction::Copy => {
+                                            if let Some(test) = &mut self.connection_test {
+                                                if let Some(text) = test.report_text() {
+                                                    ui.ctx().copy_text(text);
+                                                    test.copied = true;
+                                                }
+                                            }
+                                        }
+                                        ConnectionTestAction::RunAgain => {
+                                            if let Some(previous) = self.connection_test.take() {
+                                                self.connection_test = Some(
+                                                    crate::ui::connection_test::ConnectionTest::start(
+                                                        &previous.target_label,
+                                                        "",
+                                                        ui.ctx(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 HomeAction::BeginAdd => {
                                     self.editing_index = None;
                                     self.add_connection_host.clear();
@@ -4343,6 +4563,8 @@ impl eframe::App for ArcenApp {
                                     // inheriting whichever connection was
                                     // edited last.
                                     self.add_connection_displays_mode = None;
+                                    self.add_connection_keyboard =
+                                        arcen_input::keyboard::KeyboardSettings::default();
                                     self.add_connection_port =
                                         ConnectionKind::DirectMachine.default_port().to_string();
                                     self.add_connection_transport = SavedTransport::Quic;
@@ -4411,6 +4633,7 @@ impl eframe::App for ArcenApp {
                                             .unwrap_or_default();
                                         self.add_connection_displays_mode =
                                             saved.settings.displays_mode;
+                                        self.add_connection_keyboard = saved.settings.keyboard;
                                         self.editing_index = Some(index);
                                         self.home_add_mode = false;
                                     }
@@ -4446,6 +4669,7 @@ impl eframe::App for ArcenApp {
                                     port,
                                     username,
                                     displays_mode,
+                                    keyboard,
                                 } => {
                                     let port_num = port
                                         .trim()
@@ -4480,6 +4704,7 @@ impl eframe::App for ArcenApp {
                                                 &username,
                                             ),
                                             displays_mode,
+                                            keyboard,
                                             ..SavedConnectionSettings::default()
                                         },
                                         unknown: serde_json::Map::new(),
@@ -4512,6 +4737,7 @@ impl eframe::App for ArcenApp {
                                     port,
                                     username,
                                     displays_mode,
+                                    keyboard,
                                 } => {
                                     if let Some(original) =
                                         self.saved_connections.get(index).cloned()
@@ -4530,6 +4756,7 @@ impl eframe::App for ArcenApp {
                                             validated_remembered_username(&username);
                                         updated.settings.unknown.remove("remembered_username");
                                         updated.settings.displays_mode = displays_mode;
+                                        updated.settings.keyboard = keyboard;
                                         match self.config_repository.update_connection(
                                             &original.id,
                                             &original,
@@ -4658,9 +4885,6 @@ impl eframe::App for ArcenApp {
                     AppScreen::Settings => {
                         self.settings_screen(ui);
                     }
-                    AppScreen::GatewayMachineSelect => {
-                        self.launcher_status_screen(ui, "Select available machine")
-                    }
                     AppScreen::LaunchingSession(draft) => self.launching_screen(ui, &draft),
                     AppScreen::InSession => self.in_session_screen(ui),
                     AppScreen::Reconnecting(overlay) => self.reconnect_screen(ui, &overlay, false),
@@ -4676,6 +4900,17 @@ impl eframe::App for ArcenApp {
             });
         if self.microphone_active {
             Self::paint_microphone_indicator(ui);
+        }
+        if self.colour_check.open {
+            self.show_colour_check(ui.ctx());
+        }
+        // A pass that drew no video (another screen, a closed session)
+        // gives the system cursor back.
+        if !self.lead_cursor_wanted && self.lead_cursor.is_hidden() {
+            super::sharp_cursor::apply_lead_cursor(
+                self.lead_cursor
+                    .update(super::sharp_cursor::LeadCursorWant::Visible),
+            );
         }
     }
 
@@ -4728,7 +4963,6 @@ impl ArcenApp {
             closed,
             end,
             hello,
-            broker_hello,
             auth_request,
             authentication,
             cursor_mode_result,
@@ -4737,6 +4971,7 @@ impl ArcenApp {
             certificate_untrusted,
             pending_cursor_shape,
             pending_host_cursor,
+            pending_host_pointer,
             served_pipeline,
             connection_status_hint,
             generation,
@@ -4827,7 +5062,6 @@ impl ArcenApp {
                 } else {
                     state.server_hello.clone()
                 },
-                state.broker_hello,
                 state.pending_auth.take(),
                 state.pending_authentication.take(),
                 state.cursor_mode_result.take(),
@@ -4836,6 +5070,7 @@ impl ArcenApp {
                 state.certificate_untrusted.take(),
                 state.pending_cursor_shape.take(),
                 state.pending_host_cursor.take(),
+                state.pending_host_pointer.take(),
                 state.served_pipeline.take(),
                 state.connection_status_hint.clone(),
                 state.generation,
@@ -4886,12 +5121,18 @@ impl ArcenApp {
             self.text_input.on_host_keymap(keymap);
         }
         for result in &text_results {
-            self.text_input.on_result(result);
+            if !self.paste_keys.absorb_result(result, Instant::now()) {
+                self.text_input.on_result(result);
+            }
         }
         if let Some(cursor) = pending_host_cursor {
             let pen = self.pen_has_authority();
             self.local_pen_cursor.observe(&cursor, pen);
             self.host_cursor = cursor;
+        }
+        if let Some(position) = pending_host_pointer {
+            self.pointer_authority
+                .host_reported(position, Instant::now());
         }
         if let Some(result) = display_update_result {
             self.display_fit.handle_result(&result);
@@ -4915,18 +5156,10 @@ impl ArcenApp {
                 hello.input_protocol_version,
                 hello.input_capabilities,
             );
-            self.text_input.set_host(hello.input_capabilities);
-            // A Mac host's shortcuts are Command shortcuts. The Cmd-to-Ctrl
-            // swap is for hosts whose shortcut key is Control; applied to a
-            // Mac it turned Cmd+A, Cmd+C and Cmd+V into Ctrl+A, Ctrl+C and
-            // Ctrl+V, measured on the lab, and every shortcut appeared dead.
-            if hello.host_is_macos() && self.active_swap_cmd_ctrl {
-                tracing::info!(
-                    target: crate::logging::target::INPUT,
-                    "macOS host: Command is sent as Command"
-                );
-                self.active_swap_cmd_ctrl = false;
-            }
+            self.text_input
+                .set_host(hello.input_capabilities, hello.host_platform());
+            self.host_clipboard_policy = hello.clipboard;
+            self.apply_host_keyboard_policy(&hello);
             self.host_build_identity = hello.build_identity().ok().flatten();
             self.relative_pointer_confirmed = hello.input_protocol_version
                 >= crate::protocol::messages::RELATIVE_POINTER_INPUT_PROTOCOL_VERSION
@@ -5042,6 +5275,12 @@ impl ArcenApp {
                 degradation = ?negotiated_truth.degradation,
                 "resolved session colour truth",
             );
+            self.served_pipeline_token = hello
+                .active_pipeline
+                .as_ref()
+                .map(|pipeline| pipeline.token().to_string());
+            // A new hello is a new session: nothing refined survives it.
+            self.refine = arcen_media::refine::deck::DeckRefineSession::new();
             let path_note = if negotiated_truth.encoder_hardware == Some(true) {
                 format!(
                     "Native optimized media path: {}",
@@ -5050,6 +5289,14 @@ impl ArcenApp {
             } else {
                 format!("Fallback media path: {}", negotiated_truth.encoder_backend)
             };
+            self.colour_check_host = Some(arcen_media::colour_check::HostFacts::from_hello(
+                &hello,
+                self.requested_pipeline.as_ref(),
+                requested_video_variant.video,
+                self.requested_video_selection,
+                negotiated_truth.encoder_hardware,
+            ));
+            self.colour_check.reset_session();
             self.negotiated_truth = Some(negotiated_truth.clone());
             self.status = format!(
                 "{} · {} · {}x{} · {}",
@@ -5188,8 +5435,12 @@ impl ArcenApp {
             }
         }
         if let Some(served) = served_pipeline {
+            self.served_pipeline_token = Some(served.served.token().to_string());
             if let Some(truth) = self.negotiated_truth.as_mut() {
                 truth.update_served_pipeline(self.requested_pipeline.as_ref(), Some(&served));
+            }
+            if let Some(host) = self.colour_check_host.as_mut() {
+                host.apply_served(&served);
             }
         }
         // Apply the authoritative host result after ServerHello. The media
@@ -5197,11 +5448,6 @@ impl ArcenApp {
         // the ServerHello initialization overwrite the result.
         if let Some(result) = tablet_mode_result {
             self.apply_tablet_mode_result(result, generation);
-        }
-
-        if broker_hello && !matches!(self.screen, AppScreen::GatewayMachineSelect) {
-            self.status = "Gateway returned machine list".to_string();
-            self.screen = AppScreen::GatewayMachineSelect;
         }
 
         // Gate root exactly like every secondary viewport: while a
@@ -5613,7 +5859,20 @@ impl ArcenApp {
         self.host_cursor = arcen_input::cursor::DeckCursor::Default;
         self.local_pen_cursor.reset();
         self.host_cursor_images = false;
+        self.pointer_authority.reset();
+        self.host_cursor_positions = false;
+        self.last_local_pointer = None;
+        self.mac_pointer_motion.reset();
+        self.lead_cursor_logged = None;
+        // Never leave the transparent cursor behind a closed session.
+        if self.lead_cursor.is_hidden() {
+            super::sharp_cursor::apply_lead_cursor(
+                self.lead_cursor
+                    .update(super::sharp_cursor::LeadCursorWant::Visible),
+            );
+        }
         self.presented_host_cursor = None;
+        self.sharp_host_cursor = None;
         self.remote_pointer_buttons = [false; 3];
         self.relative_motion.clear();
         // Item 3 (enablement audit): a fresh attach or a reconnect/resume
@@ -6298,7 +6557,11 @@ impl ArcenApp {
     }
 
     fn send_gesture_value(&mut self, value: serde_json::Value, input_type: &'static str) {
-        if self.host_gestures_v1 && self.send_session_json(value) {
+        if !self.host_gestures_v1 {
+            return;
+        }
+        self.settle_command_for_pointer();
+        if self.send_session_json(value) {
             self.record_input_sent(input_type);
         }
     }
@@ -6489,6 +6752,9 @@ impl ArcenApp {
         pressed: bool,
         motion_mode: PointerMotionMode,
     ) {
+        if pressed {
+            self.settle_command_for_pointer();
+        }
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
             let mut region_runtime = self.region_runtime.borrow_mut();
@@ -6530,6 +6796,7 @@ impl ArcenApp {
         dy: i32,
         motion_mode: PointerMotionMode,
     ) {
+        self.settle_command_for_pointer();
         let timestamp_ns = Self::now_epoch_ns();
         let result = {
             let mut region_runtime = self.region_runtime.borrow_mut();
@@ -7747,6 +8014,16 @@ impl ArcenApp {
     /// drop the UI-side handles so `sync_media_state` becomes a no-op.
     fn disconnect(&mut self) {
         self.login_window_handover = None;
+        if self.lead_cursor.is_hidden() {
+            super::sharp_cursor::apply_lead_cursor(
+                self.lead_cursor
+                    .update(super::sharp_cursor::LeadCursorWant::Visible),
+            );
+        }
+        self.paste_keys.stop(
+            crate::ui::paste_keys::StopReason::SessionEnded,
+            Instant::now(),
+        );
         if let Some(controller) = &mut self.reconnect {
             controller.manual_cancel();
         }
@@ -7896,6 +8173,9 @@ impl ArcenApp {
         self.session_commands = None;
         self.media_events = None;
         self.session_telemetry = None;
+        self.colour_check_host = None;
+        self.colour_check.clear_frame();
+        self.colour_check_scale = None;
         if let Some(media) = self.media.take() {
             let active = media
                 .lock()
@@ -8037,6 +8317,12 @@ impl ArcenApp {
             MenuCommand::ToggleHealth => {
                 self.show_health_overlay = !self.show_health_overlay;
             }
+            MenuCommand::ToggleStreamStats => {
+                self.show_stream_stats = !self.show_stream_stats;
+            }
+            MenuCommand::ToggleLosslessTiles => {
+                self.show_lossless_tiles = !self.show_lossless_tiles;
+            }
             MenuCommand::Disconnect => {
                 if matches!(
                     self.screen,
@@ -8052,6 +8338,14 @@ impl ArcenApp {
             }
             MenuCommand::ReleaseModifiers => {
                 self.release_remote_keys("menu_release_modifiers");
+            }
+            MenuCommand::PasteAsKeystrokes => self.request_paste_as_keystrokes(),
+            MenuCommand::StopTyping => self.stop_paste_by_user(),
+            MenuCommand::KeyboardPhysical => {
+                self.choose_session_keyboard_mode(arcen_input::text::KeyboardMode::Physical);
+            }
+            MenuCommand::KeyboardCharacters => {
+                self.choose_session_keyboard_mode(arcen_input::text::KeyboardMode::Characters);
             }
             MenuCommand::ToggleFullscreen => {
                 tracing::info!(
@@ -8096,6 +8390,10 @@ impl ArcenApp {
             }
             MenuCommand::ToggleNegotiatedTruth => {
                 self.negotiated_truth_panel_open = !self.negotiated_truth_panel_open;
+            }
+            MenuCommand::ToggleColourCheck => {
+                self.colour_check.open = !self.colour_check.open;
+                self.colour_check.notice = None;
             }
             #[cfg(feature = "dev-tools")]
             MenuCommand::CycleTestPattern => {
@@ -8160,6 +8458,10 @@ impl ArcenApp {
             );
         }
         self.host_cursor_images = result.cursor_images;
+        self.host_cursor_positions = result.cursor_positions;
+        if !result.cursor_positions {
+            self.pointer_authority.reset();
+        }
         self.cursor_mode_confirmed = true;
         tracing::info!(
             target: crate::logging::target::SESSION,
@@ -8167,6 +8469,7 @@ impl ArcenApp {
             active = ?self.active_cursor_mode,
             accepted = result.accepted,
             cursor_images = result.cursor_images,
+            cursor_positions = result.cursor_positions,
             reason = result.reason.as_str(),
             "cursor authority result applied",
         );
@@ -8590,6 +8893,20 @@ impl ArcenApp {
             .displays_mode
     }
 
+    /// This connection's saved keyboard settings; the defaults (the host
+    /// platform's own mapping) when it is unsaved.
+    fn saved_keyboard_for(
+        &self,
+        draft: &ConnectionDraft,
+    ) -> arcen_input::keyboard::KeyboardSettings {
+        draft
+            .saved_connection_id
+            .as_ref()
+            .and_then(|id| self.saved_connections.iter().find(|saved| saved.id == *id))
+            .map(|saved| saved.settings.keyboard)
+            .unwrap_or_default()
+    }
+
     fn show_credentials(&mut self, mut draft: ConnectionDraft) {
         if draft.username.is_empty() {
             self.load_saved_username(&mut draft);
@@ -8830,7 +9147,8 @@ impl ArcenApp {
             host = connection_endpoint(&draft),
             "arcen-deck connecting",
         );
-        self.active_swap_cmd_ctrl = draft.swap_cmd_ctrl;
+        self.active_keyboard = self.saved_keyboard_for(&draft);
+        self.enter_keyboard_endpoint(connection_endpoint(&draft));
         let (options, policy) =
             self.connect_options_with_stream_sizing_policy(&draft, approved_multi_monitor_topology);
         // Consumed here: the flag authorises exactly the attempt now under
@@ -9335,6 +9653,16 @@ impl ArcenApp {
             observed_at: Instant::now(),
         });
         self.status = format!("Connection error: {}", end.message);
+        self.colour_check.last_close = Some(end.message.clone());
+        // A fix's reconnect that the host refused brings the panel back, with
+        // the host's reason.
+        if std::mem::take(&mut self.colour_check.reopen_on_session) {
+            self.colour_check.open = true;
+            self.colour_check.notice = Some(
+                "The host did not accept the new connection; its reason is under Session."
+                    .to_owned(),
+            );
+        }
         // Preserve the submission across the recovery screens below, the same
         // way `handle_certificate_untrusted` preserves it across the
         // certificate prompt: `drop_session_handles` clears `deferred_auth`,
@@ -9828,6 +10156,7 @@ impl ArcenApp {
         self.add_connection_username = saved.settings.remembered_username.unwrap_or_default();
         self.add_connection_tablet_mode_requested = saved.settings.tablet_mode_requested;
         self.add_connection_displays_mode = saved.settings.displays_mode;
+        self.add_connection_keyboard = saved.settings.keyboard;
         self.editing_index = Some(index);
         self.screen = AppScreen::AddConnection;
     }
@@ -10567,16 +10896,6 @@ impl ArcenApp {
         });
     }
 
-    fn launcher_status_screen(&mut self, ui: &mut egui::Ui, title: &str) {
-        ui.vertical_centered(|ui| {
-            ui.heading(egui::RichText::new(title).color(egui::Color32::BLACK));
-            ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
-            if ui.button("Back").clicked() {
-                self.screen = AppScreen::Home;
-            }
-        });
-    }
-
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
         let accent = theme::ACCENT;
         // Work on copies so the nested egui closures don't fight the borrow
@@ -10601,6 +10920,7 @@ impl ArcenApp {
         let mut cursor_preference = self.cursor_preference;
         let mut typing_mode = self.typing_mode;
         let mut option_key_mode = self.option_key_mode;
+        let mut paste_settings = self.paste_keys.settings();
         let mut clipboard_enabled = self.clipboard_enabled;
         let mut microphone_enabled = self.microphone_enabled;
         let mut tablet_mode_requested = self.tablet_mode_requested;
@@ -10611,6 +10931,7 @@ impl ArcenApp {
         let mut show_in_folder = false;
         let mut refresh_displays = false;
         let mut close = false;
+        let mut open_colour_check = false;
 
         // Populate the Displays read-out the first time Settings is shown. The
         // authoritative layout is always re-enumerated at connect time; this is
@@ -10795,6 +11116,19 @@ impl ArcenApp {
                                 .color(theme::DANGER),
                             );
                         }
+                        ui.add_space(18.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Colour check…").clicked() {
+                                open_colour_check = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "What the host serves, what this Mac shows, and whether the \
+                                     code values arrive exactly.",
+                                )
+                                .color(egui::Color32::DARK_GRAY),
+                            );
+                        });
                     }
                     SettingsTab::Displays => {
                         ui.label(
@@ -11185,7 +11519,7 @@ impl ArcenApp {
                         );
                         ui.add_space(10.0);
                         {
-                            use arcen_input::text::{OptionKeyMode, TypingMode};
+                            use arcen_input::text::{OptionKeyMode, OptionKeyPreference, TypingMode};
                             settings_radio(
                                 ui,
                                 &mut typing_mode,
@@ -11219,8 +11553,18 @@ impl ArcenApp {
                             settings_radio(
                                 ui,
                                 &mut option_key_mode,
-                                OptionKeyMode::LeftAltRightCharacters,
+                                OptionKeyPreference::Automatic,
                                 Some("(Recommended)"),
+                                "Automatic",
+                                "On a Mac host both Option keys stay Option, as on this Mac. On \
+                                 other hosts left Option is Alt and right Option types this \
+                                 Mac's special characters.",
+                            );
+                            settings_radio(
+                                ui,
+                                &mut option_key_mode,
+                                OptionKeyPreference::Chosen(OptionKeyMode::LeftAltRightCharacters),
+                                None,
                                 "Left Option is Alt, right Option types characters",
                                 "Left Option sends Alt shortcuts to the remote computer; right Option \
                                  types the special characters it types on this Mac.",
@@ -11228,7 +11572,7 @@ impl ArcenApp {
                             settings_radio(
                                 ui,
                                 &mut option_key_mode,
-                                OptionKeyMode::BothAlt,
+                                OptionKeyPreference::Chosen(OptionKeyMode::BothAlt),
                                 None,
                                 "Both Option keys are Alt",
                                 "Both Option keys send Alt shortcuts.",
@@ -11236,12 +11580,88 @@ impl ArcenApp {
                             settings_radio(
                                 ui,
                                 &mut option_key_mode,
-                                OptionKeyMode::BothCharacters,
+                                OptionKeyPreference::Chosen(OptionKeyMode::BothCharacters),
                                 None,
                                 "Both Option keys type characters",
                                 "Both Option keys type this Mac's special characters.",
                             );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "The Connection menu's Keyboard: Characters (Control-Command-U) switches a session \
+                                     to characters and Physical Keys (Control-Command-K) back; a saved \
+                                     connection can start in either.",
+                                )
+                                .color(egui::Color32::DARK_GRAY)
+                                .size(12.0),
+                            );
                         }
+                        ui.add_space(24.0);
+                        ui.label(
+                            egui::RichText::new("Paste as Keystrokes")
+                                .color(egui::Color32::BLACK)
+                                .size(19.0),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "The Connection menu's Paste as Keystrokes (Control-Option-Command-V) types this Mac's \
+                                 clipboard text into the remote computer, for sign-in screens \
+                                 and consoles that clipboard sharing cannot reach. Esc stops it.",
+                            )
+                            .color(egui::Color32::DARK_GRAY)
+                            .size(12.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Typing speed");
+                            egui::ComboBox::from_id_salt("paste_chars_per_second")
+                                .selected_text(format!(
+                                    "{} characters a second",
+                                    paste_settings.chars_per_second
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for rate in arcen_input::text::paste::RATE_CHOICES {
+                                        let label = if rate
+                                            == arcen_input::text::paste::DEFAULT_CHARS_PER_SECOND
+                                        {
+                                            format!("{rate} characters a second (default)")
+                                        } else {
+                                            format!("{rate} characters a second")
+                                        };
+                                        ui.selectable_value(
+                                            &mut paste_settings.chars_per_second,
+                                            rate,
+                                            label,
+                                        );
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ask first above");
+                            egui::ComboBox::from_id_salt("paste_confirm_above")
+                                .selected_text(format!(
+                                    "{} characters",
+                                    paste_settings.confirm_above
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for chars in arcen_input::text::paste::CONFIRM_CHOICES {
+                                        ui.selectable_value(
+                                            &mut paste_settings.confirm_above,
+                                            chars,
+                                            format!("{chars} characters"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Slow the speed down for virtual machine consoles and older \
+                                 applications that drop keys.",
+                            )
+                            .color(egui::Color32::GRAY)
+                            .size(11.0),
+                        );
                         ui.add_space(24.0);
                         // One surface owns every input decision. Tablet mode
                         // and non-HID USB forwarding used to live in two
@@ -11251,6 +11671,11 @@ impl ArcenApp {
                             egui::RichText::new("Tablet")
                                 .color(egui::Color32::BLACK)
                                 .size(19.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(self.tablet_mode_scope_note())
+                                .color(egui::Color32::GRAY)
+                                .size(11.0),
                         );
                         ui.add_space(10.0);
                         settings_radio(
@@ -11271,13 +11696,13 @@ impl ArcenApp {
                         // with nothing to click. Read once per settings visit,
                         // not per frame: each read is an XPC round trip to
                         // `smd`.
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         let helper_state = *self
                             .usb_helper_state
                             .get_or_insert_with(crate::usb_helper_install::install_state);
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         let mut helper_click = None;
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         settings_radio_with_trailing(
                             ui,
                             &mut tablet_mode_requested,
@@ -11304,7 +11729,7 @@ impl ArcenApp {
                                 }
                             },
                         );
-                        #[cfg(not(feature = "usb-hard-lab"))]
+                        #[cfg(not(feature = "native-tablet"))]
                         settings_radio(
                             ui,
                             &mut tablet_mode_requested,
@@ -11313,7 +11738,7 @@ impl ArcenApp {
                             tablet_mode_label(TabletModeMsg::UsbTabletBridge),
                             tablet_mode_description(TabletModeMsg::UsbTabletBridge),
                         );
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         if let Some(action) = helper_click {
                             use crate::usb_helper_install::{self as helper, HelperAction};
                             self.usb_helper_error = None;
@@ -11354,7 +11779,7 @@ impl ArcenApp {
                                 HelperAction::Recheck => self.usb_helper_state = None,
                             }
                         }
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         if !helper_state.is_ready() {
                             ui.horizontal(|ui| {
                                 ui.add_space(28.0);
@@ -11365,7 +11790,7 @@ impl ArcenApp {
                             });
                             ui.add_space(8.0);
                         }
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         if let Some(error) = self.usb_helper_error.clone() {
                             ui.horizontal(|ui| {
                                 ui.add_space(28.0);
@@ -11373,12 +11798,14 @@ impl ArcenApp {
                             });
                             ui.add_space(8.0);
                         }
-                        // A bridged tablet moves the *host's* pointer. The
-                        // local cursor is drawn from this Mac's mouse
-                        // position, and a captured tablet no longer produces
-                        // one, so the pen would have no visible pointer at
-                        // all. Offered as a correction next to the choice that
-                        // causes it rather than buried in Displays.
+                        // A bridged tablet moves the *host's* pointer, and a
+                        // captured tablet no longer moves this Mac's. With
+                        // Local cursor rendering the Deck draws the cursor
+                        // where the host reports its pointer
+                        // (`cursor_position_v1`), the recommended pairing; a
+                        // host that cannot report it leaves the pen without a
+                        // visible pointer, so host cursor rendering stays
+                        // offered next to the choice.
                         if tablet_mode_requested == TabletModeMsg::UsbTabletBridge
                             && cursor_preference == CursorMode::Local
                         {
@@ -11386,10 +11813,12 @@ impl ArcenApp {
                                 ui.add_space(28.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "Cursor rendering is set to Local, so the bridged pen \
-                                         will have no visible pointer.",
+                                        "With Local cursor rendering the pen's pointer is drawn \
+                                         where the host reports it. If the host cannot report \
+                                         its pointer, the pen has no visible pointer: use the \
+                                         host cursor instead.",
                                     )
-                                    .color(theme::WARNING),
+                                    .color(theme::TEXT_SECONDARY),
                                 );
                             });
                             ui.horizontal(|ui| {
@@ -11414,10 +11843,10 @@ impl ArcenApp {
                                 "Mode changes take effect on the next connection.\n\n\
                                  Native tablet needs a host that can present the tablet on a \
                                  virtual USB controller, so the host's own driver can claim it. \
-                                 Linux hosts can; Windows hosts cannot yet — it needs a signed \
-                                 driver Arcen does not ship, and it is planned rather than \
-                                 abandoned. Tablet support is unaffected on Windows and needs \
-                                 nothing installed there.",
+                                 Linux lab builds can. Windows hosts do not offer it: it would need a \
+                                 signed kernel driver the project does not fund (ADR 0017). Use \
+                                 Tablet support there — Windows Ink pressure and tilt, with \
+                                 nothing installed on the host.",
                             )
                             .color(egui::Color32::DARK_GRAY),
                         );
@@ -11775,6 +12204,7 @@ impl ArcenApp {
             || cursor_preference != self.cursor_preference
             || typing_mode != self.typing_mode
             || option_key_mode != self.option_key_mode
+            || paste_settings != self.paste_keys.settings()
             || clipboard_enabled != self.clipboard_enabled
             || microphone_enabled != self.microphone_enabled
             || tablet_mode_requested != self.tablet_mode_requested;
@@ -11794,8 +12224,9 @@ impl ArcenApp {
         if typing_mode != self.typing_mode || option_key_mode != self.option_key_mode {
             self.typing_mode = typing_mode;
             self.option_key_mode = option_key_mode;
-            self.text_input.configure(typing_mode, option_key_mode);
+            self.apply_typing_mode();
         }
+        self.paste_keys.configure(paste_settings);
         let clipboard_disabled_now = self.clipboard_enabled && !clipboard_enabled;
         let microphone_disabled_now = self.microphone_enabled && !microphone_enabled;
         let old_tablet_input_enabled = self.tablet_input_enabled;
@@ -11863,6 +12294,10 @@ impl ArcenApp {
         }
         if show_in_folder {
             open_log_dir();
+        }
+        if open_colour_check {
+            self.colour_check.open = true;
+            self.colour_check.notice = None;
         }
         if close {
             self.screen = AppScreen::Home;
@@ -12024,20 +12459,47 @@ impl ArcenApp {
         }
     }
 
+    /// The saved connection a tablet mode choice is written to.
+    ///
+    /// Deliberately NOT falling back to the last selection when an active
+    /// connection has no saved id: a quick-connect session must never
+    /// rewrite some unrelated saved connection's settings. Guarded by
+    /// `unsaved_active_connection_never_updates_last_selected_tablet_mode`.
+    fn tablet_mode_connection_id(&self) -> Option<String> {
+        if let Some(connection) = self.active_connection.as_ref() {
+            connection.saved_connection_id.clone()
+        } else {
+            self.last_selected_connection_id.clone()
+        }
+    }
+
+    /// Says which connection the Tablet choice belongs to. The mode is kept
+    /// per saved connection, and the Settings page used to give no sign of
+    /// it: an owner who chose Native tablet for three hosts connected to a
+    /// fourth with the Tablet support it had been saved with two months
+    /// earlier.
+    fn tablet_mode_scope_note(&self) -> String {
+        let name = self.tablet_mode_connection_id().and_then(|id| {
+            self.saved_connections
+                .iter()
+                .find(|saved| saved.id == id)
+                .map(|saved| saved.name.clone())
+        });
+        match name {
+            Some(name) => format!(
+                "Remembered for \u{201c}{name}\u{201d} only. Each saved connection keeps its \
+                 own tablet mode; choose it again for your other hosts."
+            ),
+            None => "Applies to this session only: select a saved connection to remember it."
+                .to_string(),
+        }
+    }
+
     fn persist_tablet_mode_for_selected_connection(
         &mut self,
         mode: TabletModeMsg,
     ) -> Result<(), ClientConfigError> {
-        // Deliberately NOT falling back to the last selection when an active
-        // connection has no saved id: a quick-connect session must never
-        // rewrite some unrelated saved connection's settings. Guarded by
-        // `unsaved_active_connection_never_updates_last_selected_tablet_mode`.
-        let id = if let Some(connection) = self.active_connection.as_ref() {
-            connection.saved_connection_id.clone()
-        } else {
-            self.last_selected_connection_id.clone()
-        };
-        let Some(id) = id else {
+        let Some(id) = self.tablet_mode_connection_id() else {
             // Nothing to write to. Correct, but previously silent: a tablet
             // choice that cannot be persisted looks to the user like the
             // setting was ignored, with nothing anywhere explaining why.
@@ -12088,6 +12550,7 @@ impl ArcenApp {
                 encode_intent: self.encode_intent,
                 typing_mode: self.typing_mode,
                 option_key_mode: self.option_key_mode,
+                paste: self.paste_keys.settings(),
             },
         )
     }
@@ -12749,10 +13212,126 @@ impl ArcenApp {
                 aspect_fit_rect(rect, Some([w, h]), ppp)
             })
             .unwrap_or(rect);
+        if self.colour_check.open {
+            let ppp = ui.ctx().pixels_per_point();
+            self.colour_check_scale =
+                self.remote_frame_size
+                    .map(|[w, h]| arcen_media::colour_check::ScaleFacts {
+                        stream: [
+                            u32::try_from(w).unwrap_or(u32::MAX),
+                            u32::try_from(h).unwrap_or(u32::MAX),
+                        ],
+                        shown: [image_rect.width() * ppp, image_rect.height() * ppp],
+                        backing_scale: ui
+                            .ctx()
+                            .input(|i| i.viewport().native_pixels_per_point)
+                            .unwrap_or(ppp),
+                        hidpi_streaming: self.hidpi_streaming,
+                        pinned,
+                        fullscreen: self.fullscreen,
+                    });
+        }
 
-        if viewer_hovered {
+        // This Mac's pointer moving takes the cursor back from a
+        // host-reported position at once. While the host can report
+        // positions, AppKit says where the Mac pointer really is: egui only
+        // knows the last window event, which a session window that covered
+        // the screen under a resting pointer (a bridged tablet never moves
+        // it) leaves stale or gone.
+        let local_pointer = ui.input(|input| input.pointer.latest_pos());
+        let egui_moved = local_pointer.is_some() && local_pointer != self.last_local_pointer;
+        self.last_local_pointer = local_pointer;
+        let focused = ui.ctx().input(|input| input.focused);
+        let mac_pointer = if self.host_cursor_positions {
+            self.mac_pointer()
+        } else {
+            None
+        };
+        let (pointer_on_viewer, mac_moved, over_root_window) = match mac_pointer {
+            Some(pointer) => {
+                let moved = self.mac_pointer_motion.moved(&pointer);
+                let view_to_egui = ui
+                    .ctx()
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .unwrap_or_else(|| ui.ctx().pixels_per_point())
+                    / ui.ctx().pixels_per_point();
+                let at = pointer
+                    .in_root_view
+                    .map(|(x, y)| egui::pos2(x as f32 * view_to_egui, y as f32 * view_to_egui));
+                let on_viewer = pointer.app_active
+                    && at.is_some_and(|at| {
+                        rect.contains(at)
+                            && ui
+                                .ctx()
+                                .layer_id_at(at)
+                                .is_none_or(|layer| layer == ui.layer_id())
+                    });
+                (on_viewer, moved, at.is_some())
+            }
+            None => (viewer_hovered && focused, egui_moved, false),
+        };
+        if mac_moved {
+            self.pointer_authority.client_moved(Instant::now());
+        }
+        let host_pointer_at = self.host_pointer_overlay_point(image_rect);
+        let viewer_shows_no_cursor = self.viewer_cursor_icon() == egui::CursorIcon::None;
+        let want = super::sharp_cursor::lead_cursor_want(
+            pointer_on_viewer,
+            host_pointer_at.is_some(),
+            viewer_shows_no_cursor,
+        );
+        if self.host_cursor_positions {
+            let decision = LeadCursorDecision {
+                want,
+                egui_want: super::sharp_cursor::lead_cursor_want(
+                    viewer_hovered && focused,
+                    host_pointer_at.is_some(),
+                    viewer_shows_no_cursor,
+                ),
+                mark: host_pointer_at.map(|_| self.led_pointer_mark()),
+                appkit_reading: mac_pointer.is_some(),
+                app_active: mac_pointer.is_some_and(|pointer| pointer.app_active),
+                over_root_window,
+                on_viewer: pointer_on_viewer,
+                egui_hovered: viewer_hovered,
+                egui_focused: focused,
+            };
+            if self.lead_cursor_logged != Some(decision) {
+                self.lead_cursor_logged = Some(decision);
+                tracing::info!(
+                    target: crate::logging::target::INPUT,
+                    want = ?decision.want,
+                    egui_want = ?decision.egui_want,
+                    mark = ?decision.mark,
+                    appkit_reading = decision.appkit_reading,
+                    app_active = decision.app_active,
+                    over_root_window = decision.over_root_window,
+                    on_viewer = decision.on_viewer,
+                    egui_hovered = decision.egui_hovered,
+                    egui_focused = decision.egui_focused,
+                    "host-led cursor decision",
+                );
+            }
+        }
+        self.lead_cursor_wanted = want != super::sharp_cursor::LeadCursorWant::Visible;
+        super::sharp_cursor::apply_lead_cursor(self.lead_cursor.update(want));
+        // Without an AppKit reading, egui's hover alone places the viewer's
+        // own cursor icon, as before.
+        let cursor_on_viewer = mac_pointer.map_or(viewer_hovered, |_| pointer_on_viewer);
+        if cursor_on_viewer && host_pointer_at.is_some() {
+            // The host leads (a USB-bridged tablet): this Mac's pointer is
+            // not where the cursor is, so it is hidden over the viewer and
+            // the cursor is drawn at the host's position below. The Mac
+            // pointer itself is never warped.
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        } else if cursor_on_viewer {
             if let Some(image) = self.host_cursor_image(image_rect) {
                 ui.ctx().set_cursor_image(Some(image));
+                let backing = ui
+                    .ctx()
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .unwrap_or(1.0);
+                self.show_sharp_host_cursor(image_rect, backing);
             }
         }
 
@@ -12797,9 +13376,20 @@ impl ArcenApp {
                 );
             }
         }
+        // After the video, so the egui texture path (multi-window, non-4:2:0,
+        // before the first frame, an 8-bit layer fallback) cannot cover it.
+        if let Some(at) = host_pointer_at {
+            self.paint_host_pointer(ui, image_rect, at);
+        }
 
+        if self.show_lossless_tiles {
+            self.paint_lossless_tiles(ui, image_rect);
+        }
         if self.show_health_overlay {
             self.paint_health_overlay(ui, rect);
+        }
+        if self.show_stream_stats {
+            self.paint_stream_stats(ui, image_rect);
         }
 
         // When the host could not present the size that was asked for there is
@@ -13064,11 +13654,93 @@ impl ArcenApp {
         self.complete_pen_pass();
     }
 
+    fn stream_stats_lines(&mut self) -> [String; 3] {
+        self.expire_presentation_histories(Instant::now());
+        let presented = Self::instant_rate(&self.presented_frame_times);
+        let presented = if presented > 0.0 {
+            presented
+        } else {
+            Self::instant_rate(&self.presented_frame_times_estimated)
+        };
+        let pipeline = self
+            .served_pipeline_token
+            .as_deref()
+            .map(stream_pipeline_label);
+        let refine = self.refine.status(1).text;
+        arcen_media::stats_overlay::stats_overlay_lines(
+            &arcen_media::stats_overlay::StatsOverlayInputs {
+                path: self
+                    .host_health
+                    .as_ref()
+                    .and_then(|stats| stats.path.as_ref()),
+                presented_fps: presented,
+                max_fps: self.active_stream_max_fps,
+                axes: self.negotiated_truth.as_ref().map(|truth| &truth.active),
+                pipeline,
+                refine: Some(refine.as_str()),
+            },
+        )
+    }
+
+    /// The compact statistics box (P2-4), bottom left of the picture.
+    fn paint_stream_stats(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        let text = self.stream_stats_lines().join("\n");
+        let font = egui::FontId::monospace(12.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text, font, egui::Color32::WHITE);
+        let size = galley.size() + egui::vec2(20.0, 14.0);
+        let origin = egui::pos2(
+            image_rect.left() + 12.0,
+            image_rect.bottom() - 12.0 - size.y,
+        );
+        let panel = egui::Rect::from_min_size(origin, size);
+        ui.painter()
+            .rect_filled(panel, 8.0, egui::Color32::from_black_alpha(170));
+        ui.painter()
+            .galley(origin + egui::vec2(10.0, 7.0), galley, egui::Color32::WHITE);
+    }
+
+    /// Lossless-tile debug view: green = verified source codes, amber =
+    /// refined but not yet verified, untinted = live (lossy video). Block
+    /// coordinates are source pixels, scaled to the picture.
+    fn paint_lossless_tiles(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        let Some((grid, blocks)) = self.refine.block_map(1) else {
+            return;
+        };
+        if grid.width == 0 || grid.height == 0 {
+            return;
+        }
+        let scale_x = image_rect.width() / grid.width as f32;
+        let scale_y = image_rect.height() / grid.height as f32;
+        for (index, state) in blocks.iter().enumerate() {
+            let Some(verified) = state else { continue };
+            let Some(block) = u32::try_from(index)
+                .ok()
+                .and_then(|index| grid.block_rect(index))
+            else {
+                continue;
+            };
+            let min = image_rect.left_top()
+                + egui::vec2(block.x as f32 * scale_x, block.y as f32 * scale_y);
+            let tile = egui::Rect::from_min_size(
+                min,
+                egui::vec2(block.width as f32 * scale_x, block.height as f32 * scale_y),
+            );
+            let tint = if *verified {
+                egui::Color32::from_rgba_unmultiplied(40, 200, 90, 70)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(230, 170, 30, 70)
+            };
+            ui.painter().rect_filled(tile, 0.0, tint);
+        }
+    }
+
     fn paint_health_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let overlay_width = (rect.width() - 36.0).clamp(320.0, 1040.0);
         let overlay = egui::Rect::from_min_size(
             rect.left_top() + egui::vec2(18.0, 18.0),
-            egui::vec2(overlay_width, 360.0),
+            egui::vec2(overlay_width, 380.0),
         );
         ui.painter().rect_filled(
             overlay,
@@ -13101,6 +13773,7 @@ impl ArcenApp {
                     "Host video contract: waiting for negotiation".to_string(),
                 )
             });
+        let host_path = host_path_row(self.host_health.as_ref());
         let host_input = self
             .host_health
             .as_ref()
@@ -13197,7 +13870,7 @@ impl ArcenApp {
             )
         };
         let text = format!(
-            "{deck_build}\n{deck_runtime}\n{host_build}\n{host_delivery}\n{host_video}\n{client_delivery}\n{client_wire}\n{client_decoder} · decode {:.1} ms avg {:.1} · upload {:.1} ms avg {:.1}\nVideo packets {} · presented {} · audio packets {} / {} KB\nInbox video: {}/{} B (high {}/{}) · dropped {} / {} B · superseded {} · loss epochs {}\nInbox audio: {}/{} B (high {}/{}) · drop-tail {} / {} B\nRecovery: waiting={} · ingress IDRs {} · malformed {} (video {} / audio {}) · decoder error={}\nInput sent: {} · last {} #{} ({}) · {pointer}\n{host_input}\n{}",
+            "{deck_build}\n{deck_runtime}\n{host_build}\n{host_delivery}\n{host_video}\n{host_path}\n{client_delivery}\n{client_wire}\n{client_decoder} · decode {:.1} ms avg {:.1} · upload {:.1} ms avg {:.1}\nVideo packets {} · presented {} · audio packets {} / {} KB\nInbox video: {}/{} B (high {}/{}) · dropped {} / {} B · superseded {} · loss epochs {}\nInbox audio: {}/{} B (high {}/{}) · drop-tail {} / {} B\nRecovery: waiting={} · ingress IDRs {} · malformed {} (video {} / audio {}) · decoder error={}\nInput sent: {} · last {} #{} ({}) · {pointer}\n{host_input}\n{}",
             self.last_decode_ms,
             Self::avg_ms(&self.decode_ms_samples),
             self.last_upload_ms,
@@ -14180,12 +14853,352 @@ impl ArcenApp {
         );
     }
 
+    /// Everything the Colour check reads, gathered from this session and
+    /// this Mac.
+    fn colour_check_input(&mut self) -> arcen_media::colour_check::ColourCheckInput {
+        use arcen_media::colour_check::{
+            ColourCheckInput, DeckFacts, PresentationFacts, PresentationPath,
+        };
+        let in_session = self.colour_check_host.is_some();
+        let ten_bit_state = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .layer_colour_state();
+        let eight_bit_state = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .layer_colour_state();
+        let (path, layer) = match self.dedicated_video_presentation {
+            DedicatedPresentationStatus::FallbackToEightBit(outcome) => (
+                PresentationPath::EightBitFallback(format!("{outcome:?}")),
+                None,
+            ),
+            _ if !in_session => (PresentationPath::None, None),
+            _ if self.dedicated_video_layer_has_picture => {
+                (PresentationPath::TenBitLayer, ten_bit_state)
+            }
+            _ if self.dedicated_eight_bit_layer_has_picture => {
+                (PresentationPath::EightBit, eight_bit_state)
+            }
+            _ if self.remote_frame_size.is_some() => (
+                PresentationPath::EightBit,
+                // The egui surface: tagged by `video_render`, never EDR.
+                Some(crate::ui::video_metal_layer::LayerColourState {
+                    edr: false,
+                    colour_space: None,
+                }),
+            ),
+            _ => (PresentationPath::None, None),
+        };
+        let deck = DeckFacts {
+            display: self.colour_check.display_facts(),
+            presentation: PresentationFacts {
+                path,
+                edr: layer.as_ref().map(|state| state.edr),
+                colour_space: layer.and_then(|state| state.colour_space),
+            },
+            scale: if in_session {
+                self.colour_check_scale
+            } else {
+                None
+            },
+            hdr_display: self.hdr_screen_available(),
+        };
+        let frame = self
+            .colour_check_presented()
+            .map(|(buffer, video)| arcen_media::colour_check::FrameFacts {
+                video,
+                width: buffer.width(),
+                height: buffer.height(),
+                pixel_format: format!(
+                    "{} (presented)",
+                    String::from_utf8_lossy(&buffer.pixel_format().to_be_bytes())
+                ),
+            })
+            .or_else(|| self.colour_check.frame_facts());
+        ColourCheckInput {
+            last_close: if self.colour_check_host.is_none() {
+                self.colour_check.last_close.clone()
+            } else {
+                None
+            },
+            host: self.colour_check_host.clone(),
+            frame,
+            deck,
+            exactness: self.colour_check.exactness(),
+        }
+    }
+
+    /// The frame a dedicated presentation layer shows now, with the coding
+    /// its decoder reported: what the Colour check reads and measures. The
+    /// frame header carries no codec, so that axis is the host's.
+    fn colour_check_presented(
+        &self,
+    ) -> Option<(apple_cf::cv::CVPixelBuffer, arcen_media::VideoConfiguration)> {
+        let codec = self
+            .colour_check_host
+            .as_ref()
+            .and_then(|host| host.active.codec)?;
+        let video = |contract: crate::ui::video_render::VideoColorContract| {
+            arcen_media::VideoConfiguration {
+                codec,
+                chroma: contract.chroma,
+                bit_depth: contract.depth,
+                range: contract.range,
+                matrix: contract.matrix,
+                primaries: contract.primaries,
+                transfer: contract.transfer,
+            }
+        };
+        if self.dedicated_video_layer_has_picture {
+            self.dedicated_video_presenter
+                .lock()
+                .expect("10-bit presenter poisoned")
+                .last_presented()
+                .map(|frame| (frame.pixel_buffer, video(frame.contract)))
+        } else if self.dedicated_eight_bit_layer_has_picture {
+            self.dedicated_eight_bit_video_presenter
+                .lock()
+                .expect("8-bit presenter poisoned")
+                .last_presented()
+                .map(|frame| (frame.pixel_buffer, video(frame.contract)))
+        } else {
+            None
+        }
+    }
+
+    fn show_colour_check(&mut self, ctx: &egui::Context) {
+        use crate::ui::colour_check::{self, ColourCheckAction};
+        let input = self.colour_check_input();
+        let report = arcen_media::colour_check::assess(&input);
+        let action = colour_check::render(ctx, &mut self.colour_check, &report);
+        match action {
+            None => {}
+            Some(ColourCheckAction::Close) => self.colour_check.open = false,
+            Some(ColourCheckAction::Copy) => {
+                let (generated, _) = colour_check::now_stamps();
+                ctx.copy_text(report.render_text(&colour_check::report_header(generated)));
+                self.colour_check.notice = Some("Report copied to the clipboard.".to_owned());
+            }
+            Some(ColourCheckAction::Save) => {
+                let (generated, compact) = colour_check::now_stamps();
+                let text = report.render_text(&colour_check::report_header(generated));
+                self.colour_check.notice = Some(match colour_check::save_report(&text, &compact) {
+                    Ok(path) => format!("Saved {}", path.display()),
+                    Err(error) => format!("Could not save the report: {error}"),
+                });
+            }
+            Some(ColourCheckAction::Apply(fix)) => self.apply_colour_fix(fix, ctx),
+        }
+    }
+
+    /// Applies one Colour check fix. Every fix changes this Deck or measures;
+    /// none changes a host setting.
+    fn apply_colour_fix(&mut self, fix: arcen_media::colour_check::ColourFix, ctx: &egui::Context) {
+        use arcen_media::colour_check::ColourFix;
+        tracing::info!(
+            target: crate::logging::target::UI,
+            fix = %fix.label(),
+            "colour check fix applied",
+        );
+        match fix {
+            ColourFix::SwitchPreset(preset) => {
+                let preset = match preset {
+                    arcen_media::video::StreamingPreset::Auto => StreamingPreset::Auto,
+                    arcen_media::video::StreamingPreset::Speed => StreamingPreset::Speed,
+                    arcen_media::video::StreamingPreset::Grading => StreamingPreset::Grading,
+                    arcen_media::video::StreamingPreset::Hdr => StreamingPreset::Hdr,
+                };
+                if preset == StreamingPreset::Hdr && !self.hdr_screen_available() {
+                    self.colour_check.notice = Some(NO_HDR_SCREEN.to_owned());
+                    return;
+                }
+                preset.apply_to(&mut self.performance_mode, &mut self.color_fidelity);
+                if let Err(error) = self.persist_settings() {
+                    tracing::error!(%error, "colour check preset could not be saved");
+                }
+                self.reconnect_for_colour_fix(&format!("{} selected", preset.title()), ctx);
+            }
+            ColourFix::StreamAtRetinaResolution => {
+                self.hidpi_streaming = true;
+                self.hidpi_display_mask |= 0b0001;
+                if let Err(error) = self.persist_settings() {
+                    tracing::error!(%error, "colour check HiDPI setting could not be saved");
+                }
+                if self.stream_sizing_policy.is_pinned() || !self.host_supports_display_update {
+                    self.reconnect_for_colour_fix("Retina-resolution streaming turned on", ctx);
+                } else {
+                    self.colour_check.notice = Some(
+                        "Retina-resolution streaming turned on; the host resizes the desktop to \
+                         match."
+                            .to_owned(),
+                    );
+                }
+            }
+            ColourFix::EnterFullscreen => {
+                if !self.fullscreen && !self.notch_fullscreen_active {
+                    self.handle_menu_command(macos_menu::MenuCommand::ToggleFullscreen, ctx);
+                }
+            }
+            ColourFix::Measure => {
+                if self.colour_check_host.is_some() {
+                    match self.colour_check_presented() {
+                        Some((buffer, video)) => {
+                            self.colour_check.measure_buffer(&buffer, video, ctx);
+                        }
+                        None => self.colour_check.request_measure(),
+                    }
+                    self.colour_check.notice = None;
+                } else {
+                    self.colour_check.notice =
+                        Some("Connect to a host to measure exactness.".to_owned());
+                }
+            }
+            ColourFix::SavePattern => {
+                let pattern = self.colour_check.pattern;
+                self.colour_check.notice = Some(match self.remote_frame_size {
+                    Some([width, height]) => {
+                        match crate::ui::colour_check::save_pattern(pattern, width, height) {
+                            Ok(path) => format!(
+                                "Saved {}. Show it full-screen on the host at 100% (one image \
+                                 pixel per screen pixel, no colour management), then Measure.",
+                                path.display()
+                            ),
+                            Err(error) => format!("Could not save the pattern: {error}"),
+                        }
+                    }
+                    None => {
+                        "Connect first: the pattern is made at the stream's exact size.".to_owned()
+                    }
+                });
+            }
+            ColourFix::ReadDoc(link) => {
+                ctx.open_url(egui::OpenUrl::new_tab(link.url()));
+            }
+        }
+    }
+
+    /// Reconnects the current session so a new Deck setting reaches the
+    /// host: a fresh sign-in, onto the same remote desktop.
+    fn reconnect_for_colour_fix(&mut self, what: &str, ctx: &egui::Context) {
+        let draft = self
+            .session_commands
+            .is_some()
+            .then(|| self.active_connection.clone())
+            .flatten();
+        match draft {
+            Some(draft) => {
+                self.colour_check.notice =
+                    Some(format!("{what}. Reconnected: check the new session below."));
+                // Step aside for sign-in; the hello brings the panel back.
+                self.colour_check.open = false;
+                self.colour_check.reopen_on_session = true;
+                self.status = format!(
+                    "{what}. Sign in again to reconnect; your remote desktop and its \
+                     applications stay open."
+                );
+                self.disconnect();
+                self.begin_connection_flow(draft, None, ctx);
+            }
+            None => {
+                self.colour_check.notice =
+                    Some(format!("{what}. It applies to the next connection."));
+            }
+        }
+    }
+
     /// The host's cursor as this Deck shows it: what the host reports,
     /// except a hide the host made for this Deck's own pen
     /// (`arcen_input::cursor::LocalPenCursor`).
     fn shown_host_cursor(&self) -> arcen_input::cursor::DeckCursor {
         self.local_pen_cursor
             .shown(&self.host_cursor, self.pen_has_authority())
+    }
+
+    /// Where to draw the cursor for a host-reported pointer position on the
+    /// root viewer (`image_rect`), while the host leads; `None` while this
+    /// Mac's pointer leads or the position is on another monitor.
+    fn host_pointer_overlay_point(&self, image_rect: egui::Rect) -> Option<egui::Pos2> {
+        if self.pointer_lock
+            || self.active_cursor_mode == CursorMode::Host
+            || !self.host_cursor_positions
+        {
+            return None;
+        }
+        let position = self.pointer_authority.host_position()?;
+        let on_root = position.monitor_id == 0
+            || self
+                .committed_root_monitor_id()
+                .is_some_and(|root| root.get() == position.monitor_id);
+        if !on_root {
+            return None;
+        }
+        host_pointer_point(image_rect, position.fraction()?)
+    }
+
+    /// What the host-led cursor looks like: the host's image or an arrow,
+    /// and a pen mark when the host hides its pointer while Native tablet
+    /// (a USB-bridged pen) drives it.
+    fn led_pointer_mark(&self) -> arcen_input::host_pointer::LedPointerMark {
+        arcen_input::host_pointer::led_pointer_mark(
+            &self.shown_host_cursor(),
+            self.tablet_mode_active == TabletModeMsg::UsbTabletBridge,
+        )
+    }
+
+    /// This Mac's pointer as AppKit reports it (`None` off the main thread).
+    fn mac_pointer(&self) -> Option<super::sharp_cursor::MacPointer> {
+        #[cfg(test)]
+        return self.test_mac_pointer;
+        #[cfg(not(test))]
+        super::sharp_cursor::probe_mac_pointer()
+    }
+
+    /// Draws the cursor the host shows at `at`, above the video.
+    fn paint_host_pointer(&mut self, ui: &egui::Ui, image_rect: egui::Rect, at: egui::Pos2) {
+        use arcen_input::cursor::DeckCursor;
+        use arcen_input::host_pointer::LedPointerMark;
+        let painter = ui.painter().with_clip_rect(image_rect);
+        match self.led_pointer_mark() {
+            LedPointerMark::Nothing => return,
+            LedPointerMark::PenMark => return paint_pen_mark(&painter, at),
+            LedPointerMark::Arrow => return paint_pointer_arrow(&painter, at),
+            LedPointerMark::Image => {}
+        }
+        let DeckCursor::Image { id, image, .. } = self.shown_host_cursor() else {
+            return;
+        };
+        let Some([stream_width, _]) = self.remote_frame_size else {
+            return;
+        };
+        if stream_width == 0 {
+            return;
+        }
+        let texture = match &self.host_pointer_texture {
+            Some((shown, texture)) if *shown == id => texture.clone(),
+            _ => {
+                let size = [image.width() as usize, image.height() as usize];
+                let texture = ui.ctx().load_texture(
+                    "host-pointer",
+                    egui::ColorImage::from_rgba_unmultiplied(size, image.rgba()),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.host_pointer_texture = Some((id, texture.clone()));
+                texture
+            }
+        };
+        let points_per_pixel = image_rect.width() / stream_width as f32;
+        let (hotspot_x, hotspot_y) = image.hotspot();
+        let min = at - egui::vec2(hotspot_x as f32, hotspot_y as f32) * points_per_pixel;
+        let size = egui::vec2(image.width() as f32, image.height() as f32) * points_per_pixel;
+        painter.image(
+            texture.id(),
+            egui::Rect::from_min_size(min, size),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     }
 
     fn viewer_cursor_icon(&self) -> egui::CursorIcon {
@@ -14225,6 +15238,44 @@ impl ArcenApp {
             image_rect,
             stream_width,
         )
+    }
+
+    /// Makes the host's cursor image current at the display's backing
+    /// scale (see `sharp_cursor`), building it only when the image, the
+    /// video scale or the backing scale changed.
+    fn show_sharp_host_cursor(&mut self, image_rect: egui::Rect, backing_scale: f32) {
+        use arcen_input::cursor::DeckCursor;
+        let DeckCursor::Image { id, image, .. } = self.shown_host_cursor() else {
+            return;
+        };
+        let Some([stream_width, _]) = self.remote_frame_size else {
+            return;
+        };
+        if stream_width == 0 {
+            return;
+        }
+        let points_per_pixel = image_rect.width() / stream_width as f32;
+        let scale_key = (points_per_pixel * 256.0).round() as u32;
+        let backing_key = (backing_scale * 256.0).round() as u32;
+        let fresh = !matches!(
+            &self.sharp_host_cursor,
+            Some((shown, scale, backing, _)) if *shown == id && *scale == scale_key && *backing == backing_key
+        );
+        if fresh {
+            self.sharp_host_cursor = Some((
+                id,
+                scale_key,
+                backing_key,
+                super::sharp_cursor::SharpCursor::for_image(
+                    &image,
+                    points_per_pixel,
+                    backing_scale,
+                ),
+            ));
+        }
+        if let Some((_, _, _, Some(cursor))) = &self.sharp_host_cursor {
+            cursor.show();
+        }
     }
 
     /// Brings a secondary viewport's cursor in line with root's; true when
@@ -14751,6 +15802,211 @@ impl ArcenApp {
         }
     }
 
+    /// A connection to `endpoint` is being made: a keyboard mode chosen from
+    /// the menu for another endpoint no longer applies.
+    fn enter_keyboard_endpoint(&mut self, endpoint: String) {
+        if self
+            .session_keyboard_mode
+            .as_ref()
+            .is_some_and(|(chosen_for, _)| *chosen_for != endpoint)
+        {
+            self.session_keyboard_mode = None;
+        }
+        self.keyboard_endpoint = endpoint;
+        self.apply_typing_mode();
+    }
+
+    /// The keyboard mode in force: the menu's choice for this endpoint, else
+    /// the connection's saved mode, else none (the typing setting alone).
+    fn keyboard_mode(&self) -> Option<arcen_input::text::KeyboardMode> {
+        self.session_keyboard_mode
+            .as_ref()
+            .filter(|(chosen_for, _)| *chosen_for == self.keyboard_endpoint)
+            .map(|(_, mode)| *mode)
+            .or(self.active_keyboard.typing)
+    }
+
+    /// Applies the typing setting under the keyboard mode in force.
+    fn apply_typing_mode(&mut self) {
+        let typing = self
+            .keyboard_mode()
+            .map_or(self.typing_mode, |mode| mode.typing_mode(self.typing_mode));
+        if typing != self.text_input.mode() {
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                typing = typing.token(),
+                setting = self.typing_mode.token(),
+                keyboard_mode = self.keyboard_mode().map(arcen_input::text::KeyboardMode::token),
+                "typing mode in force"
+            );
+        }
+        self.text_input.configure(typing, self.option_key_mode);
+    }
+
+    /// The menu's keyboard mode for this session (Control+Command+K/U, as
+    /// in Microsoft's Windows App). Characters needs a host that types
+    /// text; one that does not is said so, and the keys stay physical.
+    fn choose_session_keyboard_mode(&mut self, mode: arcen_input::text::KeyboardMode) {
+        use arcen_input::text::KeyboardMode;
+        // The menu took K or U: letting go of Command is no Windows-key tap.
+        self.keyboard.command_chord_consumed();
+        if mode == KeyboardMode::Characters && !self.text_input.host().text_commit {
+            let connected = self.session_commands.is_some();
+            self.text_input.notify(
+                if connected {
+                    "This host cannot type text sent from the Deck, so the keyboard stays on                      physical keys."
+                } else {
+                    "Keyboard: Characters applies once connected to a host that types text."
+                }
+                .to_owned(),
+            );
+            if connected {
+                return;
+            }
+        }
+        self.session_keyboard_mode = Some((self.keyboard_endpoint.clone(), mode));
+        self.apply_typing_mode();
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            mode = mode.token(),
+            typing = self.text_input.mode().token(),
+            "keyboard mode chosen for this session"
+        );
+        self.text_input.notify(match mode {
+            KeyboardMode::Characters => {
+                "Keyboard: Characters. Typed characters arrive as on this Mac; shortcuts stay \
+                 keys. Control-Command-K for physical keys."
+                    .to_owned()
+            }
+            KeyboardMode::Physical => {
+                "Keyboard: Physical keys. The remote keyboard layout decides each character."
+                    .to_owned()
+            }
+        });
+    }
+
+    /// Paste as Keystrokes from the menu.
+    fn request_paste_as_keystrokes(&mut self) {
+        if !matches!(self.screen, AppScreen::InSession) || self.session_commands.is_none() {
+            "Paste as Keystrokes types into a connected session.".clone_into(&mut self.status);
+            return;
+        }
+        // The menu took V: letting go of Command is no Windows-key tap.
+        self.keyboard.command_chord_consumed();
+        let text = crate::clipboard::read_plain_text();
+        self.request_paste_text(text.as_deref().map(String::as_str));
+    }
+
+    /// Paste as Keystrokes of `text` (the clipboard's plain text).
+    fn request_paste_text(&mut self, text: Option<&str>) {
+        use crate::ui::paste_keys::PasteRequest;
+        let allowed = crate::clipboard::policy_allows_typed_paste(self.host_clipboard_policy);
+        let request = self.paste_keys.request(
+            text,
+            self.text_input.host(),
+            allowed,
+            self.text_input.host_layout_unchecked(),
+            Instant::now(),
+        );
+        // Typing starts, or a confirmation takes the keyboard: either way
+        // the releases of the shortcut's keys will not reach the host, so
+        // what it holds is released now.
+        if matches!(request, PasteRequest::Started | PasteRequest::AskFirst) {
+            self.begin_paste_typing();
+        }
+    }
+
+    /// A paste takes the keyboard (typing, or its confirmation): whatever
+    /// the shortcut (or anything else) holds on the host is released first,
+    /// and the keyboard belongs to the paste until it ends.
+    fn begin_paste_typing(&mut self) {
+        self.release_remote_keys("paste_as_keystrokes");
+        if let Some(ctx) = &self.viewport_context {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Types what is due of a paste, draws its state, and keeps the menu in
+    /// step.
+    fn drive_paste_keys(&mut self, ctx: &egui::Context) {
+        self.drive_paste_keys_at(ctx, Instant::now(), macos_menu::modifiers_held());
+    }
+
+    fn drive_paste_keys_at(&mut self, ctx: &egui::Context, now: Instant, modifiers_held: bool) {
+        if self.paste_keys.typing() && self.session_commands.is_none() {
+            self.paste_keys
+                .stop(crate::ui::paste_keys::StopReason::SessionEnded, now);
+        }
+        let poll = self.paste_keys.poll(now, modifiers_held);
+        for unit in poll.units {
+            match unit {
+                arcen_input::text::PasteUnit::Text(text) => {
+                    if let Some(sequence) = self.send_text_commit(text) {
+                        self.paste_keys.sent_commit(sequence);
+                    }
+                }
+                arcen_input::text::PasteUnit::Key(key) => {
+                    let qt_key = key.qt_key();
+                    self.send_key_event(qt_key, true, 0);
+                    self.send_key_event(qt_key, false, 0);
+                }
+            }
+        }
+        if let Some(after) = poll.wake_after {
+            ctx.request_repaint_after(after);
+        }
+        match self.paste_keys.show(ctx) {
+            crate::ui::paste_keys::Confirmation::Confirmed => self.begin_paste_typing(),
+            crate::ui::paste_keys::Confirmation::Declined => {
+                self.release_remote_keys("paste_as_keystrokes_declined");
+            }
+            crate::ui::paste_keys::Confirmation::None => {}
+        }
+        let state = (
+            self.text_input.mode() == arcen_input::text::TypingMode::Characters
+                && self.text_input.active(),
+            self.paste_keys.typing(),
+        );
+        if self.keyboard_menu_state != Some(state) {
+            macos_menu::set_keyboard_state(state.0, state.1);
+            self.keyboard_menu_state = Some(state);
+        }
+    }
+
+    /// While a paste is typed or waits for confirmation, the keyboard is
+    /// its own: Esc stops it, and nothing else reaches the host (keys typed
+    /// in between would land in the middle of the text). `true` when the
+    /// events were taken.
+    fn paste_keys_take_keyboard(&mut self, events: &[egui::Event]) -> bool {
+        if !self.paste_keys.captures_keyboard() {
+            return false;
+        }
+        if events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            )
+        }) {
+            self.stop_paste_by_user();
+        }
+        true
+    }
+
+    /// Esc, Stop Typing, or Cancel on the confirmation: the paste ends, and
+    /// nothing it kept from the host stays held there.
+    fn stop_paste_by_user(&mut self) {
+        let was_capturing = self.paste_keys.captures_keyboard();
+        self.paste_keys
+            .stop(crate::ui::paste_keys::StopReason::User, Instant::now());
+        if was_capturing {
+            self.release_remote_keys("paste_as_keystrokes_stopped");
+        }
+    }
+
     /// Handles Quit from the menu or Cmd+Q.
     ///
     /// Outside a session the Deck quits at once. In one, Cmd+Q is Chrome's
@@ -14765,6 +16021,8 @@ impl ArcenApp {
                 | AppScreen::SigningIn
         );
         if in_session && from_keyboard {
+            // The menu took Q: letting go of Command is no Windows-key tap.
+            self.keyboard.command_chord_consumed();
             if self.quit_hold.is_none() {
                 self.quit_hold = Some(Instant::now());
             }
@@ -14798,35 +16056,98 @@ impl ArcenApp {
     }
 
     /// Sends a whole Command+Q to the host: the menu consumed the key, so the
-    /// host has seen at most the Command key. Command is pressed around Q
-    /// only if it is no longer physically held, so a person still holding it
-    /// for the next shortcut keeps it held on the host too.
+    /// host has seen at most the Command key. What Command+Q is on the host
+    /// is the keyboard policy's (Command+Q on a Mac, Control+Q on Linux,
+    /// Windows+Q on Windows); Command is pressed around Q only if it is no
+    /// longer physically held, so a person still holding it for the next
+    /// shortcut keeps it held on the host too.
     fn send_command_q_to_host(&mut self) {
-        let (command_key, command_bit) = if self.active_swap_cmd_ctrl {
-            (
-                crate::protocol::keymap::QT_KEY_CTRL,
-                u32::from(crate::protocol::keymap::MODIFIER_BIT_CTRL),
-            )
-        } else {
-            (
-                crate::protocol::keymap::QT_KEY_META,
-                u32::from(crate::protocol::keymap::MODIFIER_BIT_META),
-            )
-        };
-        let wrap_command = !macos_menu::command_held();
-        if wrap_command {
-            self.send_key_event(command_key, true, command_bit);
-        }
-        self.send_key_event(0x51, true, command_bit);
-        self.send_key_event(0x51, false, command_bit);
-        if wrap_command {
-            self.send_key_event(command_key, false, 0);
-        }
+        let edges = self
+            .keyboard
+            .tap_with_command(arcen_protocol::keys::KEY_Q, macos_menu::command_held());
+        let sent = self.send_host_key_edges(&edges, None);
         tracing::info!(
             target: crate::logging::target::INPUT,
-            wrap_command,
+            edges = edges.len(),
+            sent,
             "Cmd+Q tapped; sent to the host"
         );
+    }
+
+    /// Before a pointer action (button press, scroll, gesture) reaches the
+    /// host: a Command held back for a Windows host becomes the Windows key
+    /// now, so Command+click is Windows+click (as Microsoft's Windows App
+    /// sends it) and letting go of Command afterwards never taps Start.
+    fn settle_command_for_pointer(&mut self) {
+        let edges = self.keyboard.settle_command_for_pointer();
+        if !edges.is_empty() {
+            self.send_host_key_edges(&edges, None);
+        }
+    }
+
+    /// Applies the keyboard policy for the host whose hello this is:
+    /// whatever the previous policy held on the host is released first.
+    fn apply_host_keyboard_policy(&mut self, hello: &ServerHelloMsg) {
+        let platform = hello.host_platform();
+        let extended_keys =
+            arcen_protocol::messages::supports_extended_keys_v1(hello.input_capabilities);
+        let host_meta_mask =
+            arcen_protocol::messages::supports_meta_pointer_mask_v1(hello.input_capabilities);
+        let policy = arcen_input::keyboard::resolve_keyboard_policy(
+            platform,
+            extended_keys,
+            self.active_keyboard,
+        )
+        .with_host_meta_mask(host_meta_mask);
+        let released = self.keyboard.set_policy(policy);
+        self.send_host_key_edges(&released, None);
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            ?platform,
+            extended_keys,
+            shortcuts = ?policy.shortcuts,
+            setting = self.active_keyboard.shortcuts.token(),
+            right_option_altgr = policy.right_option_altgr,
+            left_option_altgr = policy.left_option_altgr,
+            intl_backslash = policy.intl_backslash,
+            host_meta_mask,
+            released = released.len(),
+            "keyboard policy for this host"
+        );
+    }
+
+    /// Sends host key edges in order; tells the committed-text state about
+    /// the edges of `physical` (the physical key that caused them) only.
+    /// Returns how many were sent.
+    fn send_host_key_edges(
+        &mut self,
+        edges: &[arcen_input::keyboard::HostKeyEdge],
+        physical: Option<(u32, Option<u16>)>,
+    ) -> usize {
+        let mut sent_count = 0;
+        for edge in edges {
+            let (sent, sequence) = self.send_key_event(edge.qt_key, edge.pressed, edge.modifiers);
+            self.keyboard.record_delivery(sent);
+            if sent {
+                sent_count += 1;
+            }
+            if let Some((qt_key, key_code)) = physical {
+                if qt_key == edge.qt_key {
+                    self.text_input
+                        .key_sent(edge.qt_key, edge.pressed, edge.modifiers, key_code);
+                }
+            }
+            tracing::debug!(
+                target: crate::logging::target::INPUT,
+                qt_key = format_args!("{:#010x}", edge.qt_key),
+                modifiers = format_args!("{:#04x}", edge.modifiers),
+                pressed = edge.pressed,
+                sequence,
+                sent,
+                "host key edge"
+            );
+        }
+        sent_count
     }
 
     /// The notice shown while Cmd+Q is held.
@@ -14864,6 +16185,9 @@ impl ArcenApp {
     /// the committed-text policy sends as text, plus the input method's
     /// commits.
     fn dispatch_keyboard_events(&mut self, events: &[egui::Event]) {
+        if self.paste_keys_take_keyboard(events) {
+            return;
+        }
         self.dispatch_routed_keyboard_events(events);
         self.recover_lost_releases(
             std::time::Instant::now(),
@@ -14880,17 +16204,16 @@ impl ArcenApp {
     /// swallowed while it composed, exactly as they were pressed.
     fn recover_lost_releases(&mut self, now: std::time::Instant, is_down: impl Fn(u16) -> bool) {
         for (qt_key, modifiers) in self.text_input.lost_releases(now, is_down) {
-            if !self.keyboard.forget_held(qt_key) {
+            let keypad = modifiers & u32::from(crate::protocol::keymap::MODIFIER_BIT_KEYPAD) != 0;
+            let Some(edges) = self.keyboard.release_lost(qt_key, keypad) else {
                 continue;
-            }
-            let (sent, sequence) = self.send_key_event(qt_key, false, modifiers);
-            self.keyboard.record_delivery(sent);
+            };
+            let sent = self.send_host_key_edges(&edges, Some((qt_key, None)));
             tracing::debug!(
                 target: crate::logging::target::INPUT,
                 qt_key = format_args!("{qt_key:#010x}"),
                 modifiers = format_args!("{modifiers:#04x}"),
                 sent,
-                sequence,
                 "released a key whose release the input method swallowed"
             );
         }
@@ -14909,12 +16232,15 @@ impl ArcenApp {
                     }
                     self.process_keyboard_event(&event);
                 }
-                crate::ui::text_input::RoutedInput::Text(text) => self.send_text_commit(text),
+                crate::ui::text_input::RoutedInput::Text(text) => {
+                    self.send_text_commit(text);
+                }
             }
         }
     }
 
-    fn send_text_commit(&mut self, text: String) {
+    /// Sends committed text; its sequence when it was sent.
+    fn send_text_commit(&mut self, text: String) -> Option<u64> {
         let sequence = self.next_input_sequence();
         let message = arcen_protocol::messages::TextCommitMsg::new(text, sequence);
         if message.validate().is_err() {
@@ -14923,7 +16249,7 @@ impl ArcenApp {
                 sequence,
                 "committed text not sendable; dropped"
             );
-            return;
+            return None;
         }
         let chars = message.text.chars().count();
         let sent = self.send_session_json(
@@ -14939,6 +16265,7 @@ impl ArcenApp {
             sent,
             "committed text sent"
         );
+        sent.then_some(sequence)
     }
 
     fn process_keyboard_event(&mut self, event: &egui::Event) {
@@ -14971,7 +16298,6 @@ impl ArcenApp {
         if native.is_some() {
             self.native_key_metadata.pop_front();
         }
-        let native_qt_key = native.and_then(|metadata| metadata.keypad.then_some(metadata.qt_key));
         // The physical key, for the keyboard's own state if the input
         // method swallows its release.
         // A key egui knows no physical key for has none here either: its
@@ -14984,21 +16310,14 @@ impl ArcenApp {
                 }
                 _ => None,
             });
-        let action = self.keyboard.handle_event_with_native_key(
-            event,
-            self.active_swap_cmd_ctrl,
-            native_qt_key,
-        );
+        let action = self.keyboard.handle_event_with_native_key(event, native);
         match action {
             KeyboardAction::Emit {
                 qt_key,
                 pressed,
-                modifiers,
+                edges,
             } => {
-                let (sent, sequence) = self.send_key_event(qt_key, pressed, modifiers);
-                self.keyboard.record_delivery(sent);
-                self.text_input
-                    .key_sent(qt_key, pressed, modifiers, key_code);
+                let sent = self.send_host_key_edges(&edges, Some((qt_key, key_code)));
                 tracing::debug!(
                     target: crate::logging::target::INPUT,
                     raw = self.keyboard.raw_count(),
@@ -15007,18 +16326,15 @@ impl ArcenApp {
                     frame = self.keyboard.frame(),
                     focus = self.keyboard.focused(),
                     qt_key = format_args!("{qt_key:#010x}"),
-                    modifiers = format_args!("{modifiers:#04x}"),
-                    sequence,
                     pressed,
-                    reason = if sent { "physical_edge" } else { "channel_unavailable" },
+                    edges = edges.len(),
+                    sent,
+                    reason = if sent == edges.len() { "physical_edge" } else { "channel_unavailable" },
                     "keyboard edge processed",
                 );
             }
-            KeyboardAction::RecoverClipboard { qt_key, modifiers } => {
-                let (press_sent, press_sequence) = self.send_key_event(qt_key, true, modifiers);
-                self.keyboard.record_delivery(press_sent);
-                let (release_sent, sequence) = self.send_key_event(qt_key, false, modifiers);
-                self.keyboard.record_delivery(release_sent);
+            KeyboardAction::RecoverClipboard { qt_key, edges } => {
+                let sent = self.send_host_key_edges(&edges, None);
                 tracing::debug!(
                     target: crate::logging::target::INPUT,
                     raw = self.keyboard.raw_count(),
@@ -15027,9 +16343,8 @@ impl ArcenApp {
                     frame = self.keyboard.frame(),
                     focus = self.keyboard.focused(),
                     qt_key = format_args!("{qt_key:#010x}"),
-                    modifiers = format_args!("{modifiers:#04x}"),
-                    press_sequence,
-                    sequence,
+                    edges = edges.len(),
+                    sent,
                     reason = "clipboard_release_recovery",
                     "clipboard keyboard chord recovered",
                 );
@@ -15108,10 +16423,10 @@ impl ArcenApp {
 
     fn release_remote_keys(&mut self, reason: &'static str) {
         self.text_input.focus_lost();
-        let held = self.keyboard.drain_held();
-        let released = held.len();
-        for qt_key in held {
-            let (sent, sequence) = self.send_key_event(qt_key, false, 0);
+        let edges = self.keyboard.release_all();
+        let released = edges.len();
+        for edge in edges {
+            let (sent, sequence) = self.send_key_event(edge.qt_key, false, edge.modifiers);
             self.keyboard.record_delivery(sent);
             tracing::debug!(
                 target: crate::logging::target::INPUT,
@@ -15120,8 +16435,8 @@ impl ArcenApp {
                 suppressed = self.keyboard.suppressed_count(),
                 frame = self.keyboard.frame(),
                 focus = self.keyboard.focused(),
-                qt_key = format_args!("{qt_key:#010x}"),
-                modifiers = format_args!("{:#04x}", 0),
+                qt_key = format_args!("{:#010x}", edge.qt_key),
+                modifiers = format_args!("{:#04x}", edge.modifiers),
                 sequence,
                 pressed = false,
                 reason,
@@ -15395,6 +16710,9 @@ impl ArcenApp {
         pressed: bool,
         motion_mode: PointerMotionMode,
     ) {
+        if pressed {
+            self.settle_command_for_pointer();
+        }
         let point = self.last_pointer_norm.unwrap_or((0.0, 0.0, -1, -1));
         let (x, y, server_x, server_y) = point;
         let sequence = self.next_input_sequence();
@@ -15513,6 +16831,7 @@ impl ArcenApp {
         if ux == 0 && uy == 0 {
             return;
         }
+        self.settle_command_for_pointer();
         let scroll_phase = match phase {
             arcen_protocol::messages::ScrollPhaseMsg::None => arcen_input::ScrollPhase::None,
             arcen_protocol::messages::ScrollPhaseMsg::Began => arcen_input::ScrollPhase::Began,
@@ -15919,6 +17238,9 @@ impl ArcenApp {
                 );
             }
             self.pattern_accuracy = Some(readout);
+        }
+        if let Some(ctx) = self.viewport_context.clone() {
+            self.colour_check.note_frame(&frame, &ctx);
         }
         self.dedicated_video_frame = frame
             .native
@@ -16655,6 +17977,11 @@ fn initial_stream_profile() -> crate::transport::websocket::StreamProfile {
     }
 }
 
+/// Where this Deck remembers host identities (`trusted_pins.json`).
+pub fn trusted_pins_path() -> Option<std::path::PathBuf> {
+    ClientConfigRepository::for_process().trusted_pins_file()
+}
+
 /// Resolve the production base config directory. Honors `$ARCEN_CONFIG_DIR`
 /// first (for deployment automation and power users), then falls back to:
 /// `~/Library/Application Support/Arcen` on macOS, `~/.config/arcen`
@@ -17045,11 +18372,34 @@ fn parse_saved_connection_settings(value: Option<serde_json::Value>) -> SavedCon
         .and_then(|value| value.as_str().map(str::to_string))
         .as_deref()
         .and_then(DisplaysMode::from_wire);
+    // Absent or unrecognised: the host platform's own mapping. Saved
+    // connections from before these settings existed read as that.
+    let shortcuts = unknown
+        .remove("keyboard_shortcuts")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .as_deref()
+        .and_then(arcen_input::keyboard::ShortcutPreference::from_token)
+        .unwrap_or_default();
+    let left_option_altgr = unknown
+        .remove("left_option_altgr")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    // Absent or unrecognised: the application-wide typing setting.
+    let typing = unknown
+        .remove("keyboard_mode")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .as_deref()
+        .and_then(arcen_input::text::KeyboardMode::from_token);
     SavedConnectionSettings {
         version,
         remembered_username,
         tablet_mode_requested,
         displays_mode,
+        keyboard: arcen_input::keyboard::KeyboardSettings {
+            shortcuts,
+            left_option_altgr,
+            typing,
+        },
         unknown,
     }
 }
@@ -17091,6 +18441,30 @@ fn serialize_saved_connections(
                 }
                 None => {
                     settings.remove("displays_mode");
+                }
+            }
+            // Absent while they are the defaults, so an untouched connection
+            // is stored exactly as before.
+            let keyboard = c.settings.keyboard;
+            if keyboard.shortcuts == arcen_input::keyboard::ShortcutPreference::Automatic {
+                settings.remove("keyboard_shortcuts");
+            } else {
+                settings.insert(
+                    "keyboard_shortcuts".to_string(),
+                    keyboard.shortcuts.token().into(),
+                );
+            }
+            if keyboard.left_option_altgr {
+                settings.insert("left_option_altgr".to_string(), true.into());
+            } else {
+                settings.remove("left_option_altgr");
+            }
+            match keyboard.typing {
+                Some(mode) => {
+                    settings.insert("keyboard_mode".to_string(), mode.token().into());
+                }
+                None => {
+                    settings.remove("keyboard_mode");
                 }
             }
             let mut entry = c.unknown.clone();
@@ -17449,13 +18823,29 @@ fn load_client_settings(
     {
         settings.typing_mode = mode;
     }
-    if let Some(mode) = value
-        .get("option_key_mode")
-        .and_then(serde_json::Value::as_str)
-        .and_then(arcen_input::text::OptionKeyMode::from_token)
+    // `option_keys` knows Automatic; older builds wrote only
+    // `option_key_mode`, their default included (see `from_settings`).
+    settings.option_key_mode = arcen_input::text::OptionKeyPreference::from_settings(
+        value.get("option_keys").and_then(serde_json::Value::as_str),
+        value
+            .get("option_key_mode")
+            .and_then(serde_json::Value::as_str),
+    );
+    if let Some(chars) = value
+        .get("paste_confirm_above")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|chars| usize::try_from(chars).ok())
     {
-        settings.option_key_mode = mode;
+        settings.paste.confirm_above = chars;
     }
+    if let Some(rate) = value
+        .get("paste_chars_per_second")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|rate| u32::try_from(rate).ok())
+    {
+        settings.paste.chars_per_second = rate;
+    }
+    settings.paste = settings.paste.clamped();
     Ok(settings)
 }
 
@@ -17510,8 +18900,25 @@ fn save_client_settings(
         settings.typing_mode.token().into(),
     );
     value.insert(
-        "option_key_mode".to_string(),
+        "option_keys".to_string(),
         settings.option_key_mode.token().into(),
+    );
+    // For older builds, which read only this key.
+    value.insert(
+        "option_key_mode".to_string(),
+        settings
+            .option_key_mode
+            .resolve(arcen_protocol::messages::HostPlatform::Unknown)
+            .token()
+            .into(),
+    );
+    value.insert(
+        "paste_confirm_above".to_string(),
+        settings.paste.confirm_above.into(),
+    );
+    value.insert(
+        "paste_chars_per_second".to_string(),
+        settings.paste.chars_per_second.into(),
     );
     value.insert(
         "fullscreen_uses_notch_area".to_string(),
@@ -18141,9 +19548,8 @@ fn connection_identity_with_live_monitors(
         options.tls
     );
     let topology_material = format!(
-        "{:?}:{:?}:{}:{}:{:?}:{:?}:{}:{:?}:{:?}",
+        "{:?}:{}:{}:{:?}:{:?}:{}:{:?}:{:?}",
         draft.kind,
-        draft.destination_kind,
         options.displays_mode,
         serde_json::to_string(&options.monitors).unwrap_or_default(),
         options.cursor_preference,
@@ -18426,6 +19832,30 @@ pub fn run_native_app(mut initial_connect: Option<ConnectOptions>) -> eframe::Re
             Ok(Box::new(app))
         }),
     )
+}
+
+/// The statistics row for the host's measured QUIC path.
+/// User-facing name of a served pipeline token.
+fn stream_pipeline_label(token: &str) -> &str {
+    match token {
+        "auto" => "Auto",
+        "speed" => "Speed",
+        "grading" => "Grading",
+        "hdr" => "HDR",
+        "software" => "Software",
+        "custom" => "Custom",
+        other => other,
+    }
+}
+
+fn host_path_row(stats: Option<&HealthStatsMsg>) -> String {
+    match stats {
+        None => "Path: waiting for health_stats".to_string(),
+        Some(stats) => stats.path.as_ref().map_or_else(
+            || "Path: not reported by this Pier".to_string(),
+            |path| format!("Path: {}", arcen_transport::path_quality_summary(path)),
+        ),
+    }
 }
 
 fn client_video_health_rows(wire: &str, decoder: &str) -> (String, String) {
@@ -19704,6 +21134,47 @@ mod tests {
     }
 
     #[test]
+    fn health_overlay_path_row_shows_the_host_measurement() {
+        assert_eq!(host_path_row(None), "Path: waiting for health_stats");
+        let mut stats = HealthStatsMsg::default();
+        assert_eq!(
+            host_path_row(Some(&stats)),
+            "Path: not reported by this Pier"
+        );
+        stats.path = Some(sample_path_quality());
+        assert!(host_path_row(Some(&stats)).starts_with("Path: good · BBR · RTT 40 ms"));
+    }
+
+    fn sample_path_quality() -> arcen_protocol::messages::PathQualityMsg {
+        arcen_protocol::messages::PathQualityMsg {
+            congestion_control: "bbr".to_string(),
+            rtt_us: 40_000,
+            min_rtt_us: 39_000,
+            cwnd_bytes: 64_000,
+            sent_packets: 1_000,
+            lost_packets: 0,
+            congestion_events: 0,
+            wire_bytes: 1_000_000,
+            window_ms: 2_000,
+            mtu_bytes: 0,
+            black_holes: 0,
+        }
+    }
+
+    #[test]
+    fn stream_stats_and_lossless_tiles_are_off_by_default_and_say_what_they_know() {
+        let mut app = ArcenApp::default();
+        assert!(!app.show_stream_stats);
+        assert!(!app.show_lossless_tiles);
+        let lines = app.stream_stats_lines();
+        assert_eq!(lines[0], "RTT - · loss - · path not reported");
+        assert!(lines[1].contains("pipeline ?"), "{}", lines[1]);
+        assert_eq!(lines[2], "Lossless: Refinement off");
+        app.served_pipeline_token = Some("grading".to_string());
+        assert!(app.stream_stats_lines()[1].contains("Grading"));
+    }
+
+    #[test]
     fn health_overlay_is_disabled_by_default() {
         let app = ArcenApp::default();
         assert!(!app.show_health_overlay);
@@ -19799,6 +21270,14 @@ mod tests {
         }
     }
 
+    const CMD: egui::Modifiers = egui::Modifiers {
+        alt: false,
+        ctrl: false,
+        shift: false,
+        mac_cmd: true,
+        command: true,
+    };
+
     fn key_event(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -19809,6 +21288,32 @@ mod tests {
         }
     }
 
+    fn mac_host_keyboard_policy() -> arcen_input::keyboard::KeyboardPolicy {
+        arcen_input::keyboard::resolve_keyboard_policy(
+            arcen_protocol::messages::HostPlatform::MacOs,
+            false,
+            arcen_input::keyboard::KeyboardSettings::default(),
+        )
+    }
+
+    fn sent_key_edges(
+        receiver: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    ) -> Vec<(u64, bool, u64)> {
+        let mut sent = Vec::new();
+        while !receiver.is_empty() {
+            let json = receive_json(receiver);
+            if json["type"] != "key_event" {
+                continue;
+            }
+            sent.push((
+                json["scan_code"].as_u64().unwrap(),
+                json["pressed"].as_bool().unwrap(),
+                json["modifiers"].as_u64().unwrap(),
+            ));
+        }
+        sent
+    }
+
     fn app_with_command_channel() -> (ArcenApp, mpsc::UnboundedReceiver<SessionCommand>) {
         let mut app = ArcenApp::default();
         let (commands, receiver) = mpsc::unbounded_channel();
@@ -19816,7 +21321,7 @@ mod tests {
         let (events, _events_rx) = mpsc::unbounded_channel();
         app.media_events = Some(events);
         app.region_input_confirmed = true;
-        app.active_swap_cmd_ctrl = false;
+        app.keyboard.set_policy(mac_host_keyboard_policy());
         app.update_viewer_keyboard_focus(true);
         (app, receiver)
     }
@@ -20112,7 +21617,7 @@ mod tests {
     #[test]
     fn the_connection_dialog_only_offers_tablet_modes_this_build_can_run() {
         // A connection saved with the bridged mode in a build that lacks
-        // usb-hard-lab fails at connect time, long after the dialog that
+        // native-tablet fails at connect time, long after the dialog that
         // offered it. Settings keeps the mode visible and marked
         // "(not available in this build)"; the creation path must not hand
         // anyone a configuration that cannot work.
@@ -20126,12 +21631,16 @@ mod tests {
         );
         assert_eq!(
             TABLET_MODE_CHOICES.contains(&TabletModeMsg::UsbTabletBridge),
-            cfg!(feature = "usb-hard-lab"),
+            cfg!(feature = "native-tablet"),
             "the USB-bridged mode must be offered exactly when it is compiled in"
         );
         assert_eq!(
             TABLET_MODE_CHOICES.len(),
-            if cfg!(feature = "usb-hard-lab") { 3 } else { 2 },
+            if cfg!(feature = "native-tablet") {
+                3
+            } else {
+                2
+            },
             "released builds expose two tablet modes, not three"
         );
     }
@@ -20208,7 +21717,7 @@ mod tests {
                 accepted: true,
                 ..TabletModeResultMsg::default()
             }),
-            cfg!(feature = "usb-hard-lab")
+            cfg!(feature = "native-tablet")
         );
     }
 
@@ -20550,6 +22059,36 @@ mod tests {
     }
 
     #[test]
+    fn the_tablet_setting_names_the_connection_it_is_saved_for() {
+        let dir = test_config_dir("arcen-tablet-mode-scope-note");
+        let _ = std::fs::remove_dir_all(&dir);
+        let repository = ClientConfigRepository::at(dir.clone());
+        let mut store = SavedConnectionsStore::with_connections(vec![
+            saved_connection("a", "Studio Mac", "a", 18444, None),
+            saved_connection("b", "Linux desk", "b", 18444, None),
+        ]);
+        store.last_selected_connection_id = Some("a".to_string());
+        save_saved_connections(&repository, &store);
+        let mut app = ArcenApp::from_config_repository(repository);
+        assert!(app
+            .tablet_mode_scope_note()
+            .contains("\u{201c}Studio Mac\u{201d} only"));
+
+        let mut active = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        active.saved_connection_id = Some("b".to_string());
+        app.active_connection = Some(active);
+        assert!(app
+            .tablet_mode_scope_note()
+            .contains("\u{201c}Linux desk\u{201d} only"));
+
+        let mut quick = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        quick.host = "quick-connect.example".to_string();
+        app.active_connection = Some(quick);
+        assert!(app.tablet_mode_scope_note().contains("this session only"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn unsaved_active_connection_never_updates_last_selected_tablet_mode() {
         let dir = test_config_dir("arcen-tablet-mode-unsaved-active");
         let _ = std::fs::remove_dir_all(&dir);
@@ -20758,7 +22297,15 @@ mod tests {
         app.process_keyboard_event(&key_event(egui::Key::A, true, modifiers));
         app.process_keyboard_event(&key_event(egui::Key::A, false, egui::Modifiers::NONE));
 
-        let press = receive_json(&mut receiver);
+        // Modifiers held before their own edges were seen are pressed (and
+        // later released) as keys of their own around A.
+        let mut next_a = || loop {
+            let json = receive_json(&mut receiver);
+            if json["scan_code"] == 0x41 {
+                break json;
+            }
+        };
+        let press = next_a();
         assert_eq!(press["type"], "key_event");
         assert_eq!(press["scan_code"], 0x41);
         assert_eq!(press["pressed"], true);
@@ -20772,9 +22319,10 @@ mod tests {
         assert!(press.get("num_lock_on").is_none());
         assert!(press.get("scroll_lock_on").is_none());
 
-        let release = receive_json(&mut receiver);
+        let release = next_a();
         assert_eq!(release["scan_code"], 0x41);
         assert_eq!(release["pressed"], false);
+        assert_eq!(release["modifiers"], 0);
         assert!(release["sequence"].as_u64().unwrap() > press["sequence"].as_u64().unwrap());
         assert!(
             release["timestamp_ns"].as_u64().unwrap() > press["timestamp_ns"].as_u64().unwrap()
@@ -20805,7 +22353,6 @@ mod tests {
     fn a_tapped_cmd_q_reaches_a_mac_host_as_command_q() {
         let (mut app, mut receiver) = app_with_command_channel();
         app.screen = AppScreen::InSession;
-        app.active_swap_cmd_ctrl = false;
         app.send_command_q_to_host();
         let mut sent = Vec::new();
         while !receiver.is_empty() {
@@ -20852,18 +22399,75 @@ mod tests {
     }
 
     #[test]
-    fn a_mac_host_turns_the_cmd_ctrl_swap_off() {
-        let hello = |session_type: &str| -> arcen_protocol::messages::ServerHelloMsg {
-            serde_json::from_str(&format!(
-                r#"{{"type":"server_hello","session_type":"{session_type}"}}"#
-            ))
-            .expect("hello")
-        };
-        assert!(hello("aqua").host_is_macos());
-        assert!(!hello("x11").host_is_macos());
+    fn the_hello_decides_the_keyboard_policy_by_host_platform() {
+        let hello = |json: &str| -> ServerHelloMsg { serde_json::from_str(json).expect("hello") };
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+
+        // A 0.17.0 Windows Pier says only its product.
+        let old_windows = hello(r#"{"type":"server_hello"}"#).with_build_identity(
+            arcen_protocol::messages::BuildIdentityMsg::development("arcen-pier-windows", "0.17.0"),
+        );
+        app.apply_host_keyboard_policy(&old_windows);
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        app.process_keyboard_event(&key_event(egui::Key::E, true, CMD));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![(0x0100_0022, true, 0x08), (0x45, true, 0x08)],
+            "Command is the Windows key"
+        );
+
+        // Changing hosts releases what the old policy held.
+        app.apply_host_keyboard_policy(&hello(
+            r#"{"type":"server_hello","session_type":"x11","platform":"linux"}"#,
+        ));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![(0x45, false, 0x08), (0x0100_0022, false, 0)]
+        );
+        app.release_remote_keys("test");
+        let _ = sent_key_edges(&mut receiver);
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![(0x0100_0021, true, 0x02)],
+            "Command is Control on Linux"
+        );
+    }
+
+    #[test]
+    fn a_windows_host_gets_command_q_as_windows_q_without_a_start_tap() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.apply_host_keyboard_policy(
+            &serde_json::from_str::<ServerHelloMsg>(
+                r#"{"type":"server_hello","platform":"windows",
+                    "input_capabilities":{"extended_keys":"available"}}"#,
+            )
+            .expect("hello"),
+        );
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        // The menu takes Q; Command is let go before the hold decides.
+        app.request_quit(&egui::Context::default(), true);
+        app.process_keyboard_event(&key_event(
+            egui::Key::SuperLeft,
+            false,
+            egui::Modifiers::NONE,
+        ));
         assert!(
-            !hello("").host_is_macos(),
-            "an old host that says nothing keeps the swap"
+            sent_key_edges(&mut receiver).is_empty(),
+            "no Start-menu tap"
+        );
+        app.quit_hold = None;
+        app.send_command_q_to_host();
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![
+                (0x0100_0022, true, 0x08),
+                (0x51, true, 0x08),
+                (0x51, false, 0x08),
+                (0x0100_0022, false, 0),
+            ]
         );
     }
 
@@ -20871,7 +22475,8 @@ mod tests {
     fn clipboard_semantics_become_remote_qt_edges_without_text_emission() {
         let (mut app, mut receiver) = app_with_command_channel();
         app.screen = AppScreen::InSession;
-        app.active_swap_cmd_ctrl = true;
+        app.keyboard
+            .set_policy(arcen_input::keyboard::KeyboardPolicy::LEGACY);
         let cmd = egui::Modifiers {
             mac_cmd: true,
             command: true,
@@ -20913,7 +22518,8 @@ mod tests {
     #[test]
     fn empty_clipboard_paste_release_recovers_one_press_and_release() {
         let (mut app, mut receiver) = app_with_command_channel();
-        app.active_swap_cmd_ctrl = true;
+        app.keyboard
+            .set_policy(arcen_input::keyboard::KeyboardPolicy::LEGACY);
         let cmd = egui::Modifiers {
             mac_cmd: true,
             command: true,
@@ -20956,11 +22562,13 @@ mod tests {
             arcen_input::text::TypingMode::Auto,
             arcen_input::text::OptionKeyMode::default(),
         );
-        app.text_input
-            .set_host(arcen_protocol::messages::InputCapabilitiesMsg {
+        app.text_input.set_host(
+            arcen_protocol::messages::InputCapabilitiesMsg {
                 text_commit: arcen_protocol::messages::InputCapabilityAvailability::Available,
                 ..arcen_protocol::messages::InputCapabilitiesMsg::default()
-            });
+            },
+            arcen_protocol::messages::HostPlatform::Linux,
+        );
     }
 
     #[test]
@@ -21382,6 +22990,292 @@ mod tests {
         assert_eq!(app.keyboard.held_count(), 0);
         assert!(app.active_keyboard_viewport.is_none());
         assert!(app.active_secondary_keyboard_focus.is_none());
+    }
+
+    #[test]
+    fn command_click_on_a_windows_host_is_windows_click_without_a_start_tap() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.apply_host_keyboard_policy(
+            &serde_json::from_str::<ServerHelloMsg>(
+                r#"{"type":"server_hello","platform":"windows"}"#,
+            )
+            .expect("hello"),
+        );
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        assert!(receiver.is_empty(), "Command alone is held back");
+        app.send_mouse_button_wire(1, true, PointerMotionMode::Absolute);
+        let windows_key = receive_json(&mut receiver);
+        assert_eq!(windows_key["type"], "key_event");
+        assert_eq!(windows_key["scan_code"], 0x0100_0022_u32);
+        assert_eq!(windows_key["pressed"], true);
+        assert_eq!(receive_json(&mut receiver)["type"], "mouse_button");
+        app.send_mouse_button_wire(1, false, PointerMotionMode::Absolute);
+        assert_eq!(receive_json(&mut receiver)["type"], "mouse_button");
+        app.process_keyboard_event(&key_event(
+            egui::Key::SuperLeft,
+            false,
+            egui::Modifiers::NONE,
+        ));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![
+                (0x0100_0021, true, 0x0A),
+                (0x0100_0021, false, 0x08),
+                (0x0100_0022, false, 0)
+            ],
+            "Command released after a click is masked, never a Windows-key tap"
+        );
+    }
+
+    #[test]
+    fn a_gesture_then_command_v_on_a_windows_host_never_opens_start() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.host_gestures_v1 = true;
+        app.apply_host_keyboard_policy(
+            &serde_json::from_str::<ServerHelloMsg>(
+                r#"{"type":"server_hello","platform":"windows",
+                    "input_capabilities":{"meta_pointer_mask":"available"}}"#,
+            )
+            .expect("hello"),
+        );
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        app.send_gesture_magnify(0.1, ScrollPhaseMsg::Began, false);
+        let windows_key = receive_json(&mut receiver);
+        assert_eq!(windows_key["scan_code"], 0x0100_0022_u32);
+        assert_eq!(receive_json(&mut receiver)["type"], "gesture_magnify");
+        app.process_keyboard_event(&key_event(egui::Key::V, true, CMD));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![
+                (0x0100_0021, true, 0x0A),
+                (0x0100_0022, false, 0x02),
+                (0x56, true, 0x02)
+            ],
+            "Control goes down before the Windows key comes up"
+        );
+        // This host masks a pointer-only release itself: no Control tap.
+        app.process_keyboard_event(&key_event(egui::Key::V, false, CMD));
+        app.process_keyboard_event(&key_event(
+            egui::Key::SuperLeft,
+            false,
+            egui::Modifiers::NONE,
+        ));
+        let _ = sent_key_edges(&mut receiver);
+        app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
+        app.send_mouse_button_wire(1, true, PointerMotionMode::Absolute);
+        app.send_mouse_button_wire(1, false, PointerMotionMode::Absolute);
+        app.process_keyboard_event(&key_event(
+            egui::Key::SuperLeft,
+            false,
+            egui::Modifiers::NONE,
+        ));
+        assert_eq!(
+            sent_key_edges(&mut receiver),
+            vec![(0x0100_0022, true, 0x08), (0x0100_0022, false, 0)]
+        );
+    }
+
+    fn text_host(app: &mut ArcenApp) {
+        app.screen = AppScreen::InSession;
+        app.text_input.set_host(
+            arcen_protocol::messages::InputCapabilitiesMsg {
+                text_commit: arcen_protocol::messages::InputCapabilityAvailability::Available,
+                text_commit_unicode:
+                    arcen_protocol::messages::InputCapabilityAvailability::Available,
+                ..Default::default()
+            },
+            arcen_protocol::messages::HostPlatform::Linux,
+        );
+    }
+
+    fn drive_paste(app: &mut ArcenApp, ctx: &egui::Context, at: Instant, held: bool) {
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.drive_paste_keys_at(&ui.ctx().clone(), at, held);
+        });
+    }
+
+    #[test]
+    fn paste_as_keystrokes_releases_first_types_in_order_and_esc_stops_it() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        text_host(&mut app);
+        let ctx = egui::Context::default();
+        app.paste_keys.configure(arcen_input::text::PasteSettings {
+            chars_per_second: 500,
+            ..Default::default()
+        });
+        // A modifier from the shortcut is held on the host.
+        app.process_keyboard_event(&key_event(
+            egui::Key::ShiftLeft,
+            true,
+            egui::Modifiers::SHIFT,
+        ));
+        let _ = sent_key_edges(&mut receiver);
+        let start = Instant::now();
+        assert_eq!(
+            app.paste_keys
+                .request(Some("p@\tq\n"), app.text_input.host(), true, false, start),
+            crate::ui::paste_keys::PasteRequest::Started
+        );
+        app.begin_paste_typing();
+        let mut released = Vec::new();
+        while !receiver.is_empty() {
+            released.push(receive_json(&mut receiver));
+        }
+        assert!(released
+            .iter()
+            .any(|json| json["type"] == "key_event" && json["pressed"] == false));
+        assert_eq!(released.last().unwrap()["type"], "key_reset_modifiers");
+        // Nothing while a modifier is still held.
+        drive_paste(&mut app, &ctx, start, true);
+        assert!(receiver.is_empty());
+        // A key pressed now never reaches the host.
+        app.dispatch_keyboard_events(&[key_event(egui::Key::A, true, egui::Modifiers::NONE)]);
+        assert!(receiver.is_empty());
+        let mut sent = Vec::new();
+        for step in 0..20 {
+            drive_paste(
+                &mut app,
+                &ctx,
+                start + Duration::from_millis(2 * step),
+                false,
+            );
+        }
+        while !receiver.is_empty() {
+            let json = receive_json(&mut receiver);
+            sent.push(match json["type"].as_str().unwrap() {
+                "text_commit" => json["text"].as_str().unwrap().to_owned(),
+                "key_event" => format!(
+                    "{}{:#x}",
+                    if json["pressed"] == true { "+" } else { "-" },
+                    json["scan_code"].as_u64().unwrap()
+                ),
+                other => panic!("unexpected {other}"),
+            });
+        }
+        // The trailing line break is not typed.
+        assert_eq!(sent, ["p", "@", "+0x1000001", "-0x1000001", "q"]);
+        assert!(!app.paste_keys.captures_keyboard());
+
+        // A second paste stops at Esc, which never reaches the host.
+        assert_eq!(
+            app.paste_keys
+                .request(Some("abcdef"), app.text_input.host(), true, false, start),
+            crate::ui::paste_keys::PasteRequest::Started
+        );
+        app.begin_paste_typing();
+        while !receiver.is_empty() {
+            let _ = receive_json(&mut receiver);
+        }
+        drive_paste(&mut app, &ctx, start, false);
+        assert_eq!(receive_json(&mut receiver)["text"], "a");
+        app.dispatch_keyboard_events(&[key_event(egui::Key::Escape, true, egui::Modifiers::NONE)]);
+        drive_paste(&mut app, &ctx, start + Duration::from_secs(1), false);
+        // Only the release-everything notice follows; no more text, no Esc.
+        assert_eq!(receive_json(&mut receiver)["type"], "key_reset_modifiers");
+        assert!(receiver.is_empty());
+        assert!(!app.paste_keys.captures_keyboard());
+    }
+
+    #[test]
+    fn a_long_paste_waiting_for_confirmation_leaves_nothing_held_on_the_host() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        text_host(&mut app);
+        app.paste_keys.configure(arcen_input::text::PasteSettings {
+            confirm_above: 3,
+            ..Default::default()
+        });
+        // Control and Option of Control+Option+Command+V reach the host
+        // before the menu takes V.
+        let held = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        app.process_keyboard_event(&key_event(egui::Key::ControlLeft, true, held));
+        app.process_keyboard_event(&key_event(egui::Key::AltLeft, true, held));
+        let pressed = sent_key_edges(&mut receiver);
+        assert!(pressed.iter().any(|(_, down, _)| *down), "{pressed:?}");
+        app.request_paste_text(Some("four"));
+        assert!(app.paste_keys.captures_keyboard() && !app.paste_keys.typing());
+        let mut released = Vec::new();
+        while !receiver.is_empty() {
+            released.push(receive_json(&mut receiver));
+        }
+        for (qt_key, _, _) in pressed.iter().filter(|(_, down, _)| *down) {
+            assert!(
+                released.iter().any(|json| json["type"] == "key_event"
+                    && json["scan_code"] == *qt_key
+                    && json["pressed"] == false),
+                "{qt_key:#x} still held on the host: {released:?}"
+            );
+        }
+        assert_eq!(released.last().unwrap()["type"], "key_reset_modifiers");
+        // Their physical releases are the paste's; Esc declines and the
+        // host is told again to hold nothing.
+        app.dispatch_keyboard_events(&[
+            key_event(egui::Key::ControlLeft, false, egui::Modifiers::NONE),
+            key_event(egui::Key::Escape, true, egui::Modifiers::NONE),
+        ]);
+        assert!(!app.paste_keys.captures_keyboard());
+        let after: Vec<_> =
+            std::iter::from_fn(|| (!receiver.is_empty()).then(|| receive_json(&mut receiver)))
+                .collect();
+        assert!(after.iter().all(|json| json["type"] != "text_commit"));
+        assert_eq!(after.last().unwrap()["type"], "key_reset_modifiers");
+    }
+
+    #[test]
+    fn a_session_keyboard_mode_outlives_reconnects_to_its_host_only() {
+        use arcen_input::text::{KeyboardMode, TypingMode};
+        let (mut app, _receiver) = app_with_command_channel();
+        text_host(&mut app);
+        app.enter_keyboard_endpoint("host-a.example.internal:18444".to_owned());
+        assert_eq!(app.text_input.mode(), TypingMode::Auto);
+        app.choose_session_keyboard_mode(KeyboardMode::Characters);
+        assert_eq!(app.text_input.mode(), TypingMode::Characters);
+        app.enter_keyboard_endpoint("host-a.example.internal:18444".to_owned());
+        assert_eq!(app.text_input.mode(), TypingMode::Characters);
+        app.choose_session_keyboard_mode(KeyboardMode::Physical);
+        assert_eq!(app.text_input.mode(), TypingMode::Auto);
+        app.choose_session_keyboard_mode(KeyboardMode::Characters);
+        // Another host: its own saved mode (none) and the typing setting.
+        app.enter_keyboard_endpoint("host-b.example.internal:18444".to_owned());
+        assert_eq!(app.text_input.mode(), TypingMode::Auto);
+        // A saved Characters connection starts in Characters.
+        app.active_keyboard.typing = Some(KeyboardMode::Characters);
+        app.enter_keyboard_endpoint("host-c.example.internal:18444".to_owned());
+        assert_eq!(app.text_input.mode(), TypingMode::Characters);
+    }
+
+    #[test]
+    fn characters_mode_needs_a_host_that_types_text() {
+        use arcen_input::text::{KeyboardMode, TypingMode};
+        let (mut app, _receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        app.enter_keyboard_endpoint("x11.example.internal:18444".to_owned());
+        app.choose_session_keyboard_mode(KeyboardMode::Characters);
+        assert_eq!(app.text_input.mode(), TypingMode::Auto);
+        assert!(app.session_keyboard_mode.is_none());
+    }
+
+    #[test]
+    fn a_saved_keyboard_mode_is_read_and_absent_follows_the_setting() {
+        let saved = parse_saved_connection_settings(Some(serde_json::json!({
+            "keyboard_mode": "characters"
+        })));
+        assert_eq!(
+            saved.keyboard.typing,
+            Some(arcen_input::text::KeyboardMode::Characters)
+        );
+        assert!(!saved.unknown.contains_key("keyboard_mode"));
+        let absent = parse_saved_connection_settings(Some(serde_json::json!({})));
+        assert_eq!(absent.keyboard.typing, None);
+        let bogus = parse_saved_connection_settings(Some(serde_json::json!({
+            "keyboard_mode": "unicode"
+        })));
+        assert_eq!(bogus.keyboard.typing, None);
     }
 
     #[test]
@@ -22739,6 +24633,434 @@ mod tests {
     }
 
     #[test]
+    fn host_reported_pointer_positions_lead_until_this_macs_pointer_moves() {
+        use arcen_protocol::cursor_position::CursorPosition;
+        let position = |sequence, monitor_id, x| CursorPosition {
+            sequence,
+            on_stream: true,
+            output: 0,
+            generation: 0,
+            monitor_id,
+            x,
+            y: 540,
+            space_width: 1920,
+            space_height: 1080,
+        };
+        let mut app = ArcenApp {
+            remote_frame_size: Some([1920, 1080]),
+            ..ArcenApp::default()
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(960.0, 540.0));
+        let now = Instant::now();
+        // A host that did not announce positions is never followed.
+        app.pointer_authority
+            .host_reported(position(1, 0, 480), now);
+        assert_eq!(app.host_pointer_overlay_point(rect), None);
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                accepted: true,
+                cursor_positions: true,
+                ..CursorModeResultMsg::default()
+            },
+            0,
+        );
+        assert!(app.host_cursor_positions);
+        app.pointer_authority
+            .host_reported(position(2, 0, 480), now);
+        // Stream pixel 480 of 1920 at half scale, offset by the viewer.
+        assert_eq!(
+            app.host_pointer_overlay_point(rect),
+            Some(egui::pos2(250.0, 290.0))
+        );
+        // A host-drawn cursor or pointer lock never draws one.
+        app.pointer_lock = true;
+        assert_eq!(app.host_pointer_overlay_point(rect), None);
+        app.pointer_lock = false;
+        // A position on a monitor the root viewer does not show is left to
+        // that monitor.
+        app.pointer_authority
+            .host_reported(position(3, 7, 480), now);
+        assert_eq!(app.host_pointer_overlay_point(rect), None);
+        // This Mac's pointer moving takes the cursor back.
+        app.pointer_authority
+            .host_reported(position(4, 0, 960), now);
+        assert!(app.host_pointer_overlay_point(rect).is_some());
+        app.pointer_authority.client_moved(now);
+        assert_eq!(app.host_pointer_overlay_point(rect), None);
+        // Positions outside the stream draw nothing.
+        assert_eq!(host_pointer_point(rect, (1.0, 0.5)), None);
+        assert_eq!(host_pointer_point(rect, (-0.01, 0.5)), None);
+    }
+
+    #[test]
+    fn the_system_cursor_hides_while_the_host_leads_and_returns_with_the_mac_mouse() {
+        use arcen_protocol::cursor_position::CursorPosition;
+        let mut app = ArcenApp {
+            remote_frame_size: Some([1920, 1080]),
+            host_cursor_positions: true,
+            ..ArcenApp::default()
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let pass = |app: &mut ArcenApp, focused: bool, events: Vec<egui::Event>| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(screen),
+                focused,
+                events,
+                ..egui::RawInput::default()
+            };
+            let _ = ctx.run_ui(raw_input, |ui| app.viewer_input_surface(ui));
+        };
+        // The Mac mouse rests over the video.
+        pass(
+            &mut app,
+            true,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
+        );
+        assert!(!app.lead_cursor.is_hidden());
+        // A bridged pen moves the host pointer once the mouse has rested.
+        app.pointer_authority.host_reported(
+            CursorPosition {
+                sequence: 1,
+                on_stream: true,
+                output: 0,
+                generation: 0,
+                monitor_id: 0,
+                x: 960,
+                y: 540,
+                space_width: 1920,
+                space_height: 1080,
+            },
+            Instant::now() + arcen_input::host_pointer::CLIENT_MOTION_GUARD,
+        );
+        pass(&mut app, true, Vec::new());
+        assert!(app.lead_cursor.is_hidden(), "the Mac cursor must not show");
+        // Pointer lock, a host-drawn cursor, and a host that hides its
+        // pointer while the Mac mouse moves: the viewer wants no cursor, so
+        // it stays transparent (no arrow nothing would re-hide).
+        app.pointer_lock = true;
+        pass(&mut app, true, Vec::new());
+        assert!(app.lead_cursor.is_hidden(), "pointer lock");
+        app.pointer_lock = false;
+        app.active_cursor_mode = CursorMode::Host;
+        pass(&mut app, true, Vec::new());
+        assert!(app.lead_cursor.is_hidden(), "host cursor mode");
+        app.active_cursor_mode = CursorMode::Local;
+        app.host_cursor = arcen_input::cursor::DeckCursor::Hidden;
+        pass(
+            &mut app,
+            true,
+            vec![egui::Event::PointerMoved(egui::pos2(305.0, 300.0))],
+        );
+        assert!(app.lead_cursor.is_hidden(), "host hides its pointer");
+        app.host_cursor = arcen_input::cursor::DeckCursor::Default;
+        app.pointer_authority.host_reported(
+            CursorPosition {
+                sequence: 2,
+                on_stream: true,
+                output: 0,
+                generation: 0,
+                monitor_id: 0,
+                x: 900,
+                y: 540,
+                space_width: 1920,
+                space_height: 1080,
+            },
+            Instant::now() + arcen_input::host_pointer::CLIENT_MOTION_GUARD,
+        );
+        pass(&mut app, true, Vec::new());
+        assert!(app.lead_cursor.is_hidden());
+        // Focus loss gives it back; focus regained hides it again.
+        pass(&mut app, false, Vec::new());
+        assert!(!app.lead_cursor.is_hidden());
+        pass(&mut app, true, Vec::new());
+        assert!(app.lead_cursor.is_hidden());
+        // The Mac mouse moves: its own cursor returns at once.
+        pass(
+            &mut app,
+            true,
+            vec![egui::Event::PointerMoved(egui::pos2(310.0, 300.0))],
+        );
+        assert!(!app.lead_cursor.is_hidden());
+        // A disconnect never leaves it hidden.
+        app.lead_cursor
+            .update(super::super::sharp_cursor::LeadCursorWant::HostLeads);
+        app.disconnect();
+        assert!(!app.lead_cursor.is_hidden());
+    }
+
+    #[test]
+    fn the_host_positioned_cursor_is_painted_over_the_egui_video_path() {
+        use arcen_protocol::cursor_position::CursorPosition;
+        let mut app = ArcenApp {
+            remote_frame_size: Some([1920, 1080]),
+            host_cursor_positions: true,
+            ..ArcenApp::default()
+        };
+        app.pointer_authority.host_reported(
+            CursorPosition {
+                sequence: 1,
+                on_stream: true,
+                output: 0,
+                generation: 0,
+                monitor_id: 0,
+                x: 960,
+                y: 540,
+                space_width: 1920,
+                space_height: 1080,
+            },
+            Instant::now(),
+        );
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 600.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = ctx.run_ui(raw_input, |ui| app.viewer_input_surface(ui));
+        let position = |found: &dyn Fn(&egui::Shape) -> bool| {
+            output
+                .shapes
+                .iter()
+                .position(|clipped| found(&clipped.shape))
+        };
+        // No frame yet: the egui path draws its placeholder where the video
+        // goes, and the cursor (an arrow, no host image) must come after it.
+        let video = position(&|shape| {
+            matches!(shape, egui::Shape::Text(text) if text.galley.text().contains("Waiting for first decoded frame"))
+        })
+        .expect("egui video path painted");
+        let pointer = position(&|shape| {
+            matches!(shape, egui::Shape::Path(path) if path.points.len() == 7 && path.fill == egui::Color32::WHITE)
+        })
+        .expect("host-positioned cursor painted");
+        assert!(pointer > video, "the video must not cover the cursor");
+    }
+
+    fn host_position(sequence: u64, x: i32) -> arcen_protocol::cursor_position::CursorPosition {
+        arcen_protocol::cursor_position::CursorPosition {
+            sequence,
+            on_stream: true,
+            output: 0,
+            generation: 0,
+            monitor_id: 0,
+            x,
+            y: 540,
+            space_width: 1920,
+            space_height: 1080,
+        }
+    }
+
+    /// The real-tablet flow: the session window covers the screen
+    /// under a resting Mac pointer, and the bridged tablet never moves it,
+    /// so egui has no (or a stale) pointer and no focus event. AppKit's own
+    /// reading decides: the Mac cursor hides while the host leads, a window
+    /// change is not Mac motion, and it never hides for another app.
+    #[test]
+    fn the_mac_cursor_hides_from_appkits_pointer_when_egui_has_none() {
+        use super::super::sharp_cursor::{LeadCursorWant, MacPointer};
+        let mut app = ArcenApp {
+            remote_frame_size: Some([1920, 1080]),
+            host_cursor_positions: true,
+            tablet_mode_active: TabletModeMsg::UsbTabletBridge,
+            ..ArcenApp::default()
+        };
+        let resting = MacPointer {
+            screen: (500.0, 400.0),
+            app_active: true,
+            in_root_view: Some((300.0, 300.0)),
+        };
+        app.test_mac_pointer = Some(resting);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let pass = |app: &mut ArcenApp, events: Vec<egui::Event>, popup: bool| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(screen),
+                focused: false,
+                events,
+                ..egui::RawInput::default()
+            };
+            let _ = ctx.run_ui(raw_input, |ui| {
+                if popup {
+                    egui::Area::new(egui::Id::new("deck-popup"))
+                        .fixed_pos(egui::pos2(250.0, 250.0))
+                        .show(ui.ctx(), |ui| {
+                            ui.allocate_space(egui::vec2(100.0, 100.0));
+                        });
+                }
+                app.viewer_input_surface(ui);
+            });
+        };
+        pass(&mut app, Vec::new(), false);
+        app.pointer_authority.host_reported(
+            host_position(1, 960),
+            Instant::now() + arcen_input::host_pointer::CLIENT_MOTION_GUARD,
+        );
+        pass(&mut app, Vec::new(), false);
+        assert!(app.lead_cursor.is_hidden(), "the Mac cursor must not show");
+        let logged = app.lead_cursor_logged.expect("decision logged");
+        assert_eq!(logged.want, LeadCursorWant::HostLeads);
+        assert_eq!(
+            logged.egui_want,
+            LeadCursorWant::Visible,
+            "egui alone (no pointer, no focus) kept the Mac arrow: the reported fault"
+        );
+        // The window moved under the resting pointer: egui sees a new
+        // position, AppKit's global one is unchanged. The host still leads.
+        pass(
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(310.0, 290.0))],
+            false,
+        );
+        assert!(
+            app.lead_cursor.is_hidden(),
+            "a window change is not Mac motion"
+        );
+        // Another application is active: never hide over it.
+        app.test_mac_pointer = Some(MacPointer {
+            app_active: false,
+            ..resting
+        });
+        pass(&mut app, Vec::new(), false);
+        assert!(!app.lead_cursor.is_hidden(), "another app is active");
+        // Another window (any app's, or the menu bar) is on top here.
+        app.test_mac_pointer = Some(MacPointer {
+            in_root_view: None,
+            ..resting
+        });
+        pass(&mut app, Vec::new(), false);
+        assert!(!app.lead_cursor.is_hidden(), "another window on top");
+        app.test_mac_pointer = Some(resting);
+        pass(&mut app, Vec::new(), false);
+        assert!(app.lead_cursor.is_hidden());
+        // One of the Deck's own panels over the video keeps its arrow.
+        pass(&mut app, Vec::new(), true);
+        pass(&mut app, Vec::new(), true);
+        assert!(!app.lead_cursor.is_hidden(), "a Deck panel over the video");
+        // egui keeps a closed area for one more pass.
+        pass(&mut app, Vec::new(), false);
+        pass(&mut app, Vec::new(), false);
+        assert!(app.lead_cursor.is_hidden());
+        // The Mac mouse really moves: its own cursor returns at once ...
+        app.test_mac_pointer = Some(MacPointer {
+            screen: (520.0, 400.0),
+            in_root_view: Some((320.0, 300.0)),
+            ..resting
+        });
+        pass(&mut app, Vec::new(), false);
+        assert!(
+            !app.lead_cursor.is_hidden(),
+            "Mac motion takes the cursor back"
+        );
+        // ... and the pen leads again once the mouse rests.
+        app.pointer_authority.host_reported(
+            host_position(2, 900),
+            Instant::now() + 2 * arcen_input::host_pointer::CLIENT_MOTION_GUARD,
+        );
+        pass(&mut app, Vec::new(), false);
+        assert!(app.lead_cursor.is_hidden());
+        app.disconnect();
+        assert!(!app.lead_cursor.is_hidden());
+    }
+
+    /// A keyboard-and-pen-only session: the
+    /// Mac mouse never produced a single event after the session window
+    /// appeared and went fullscreen, and egui never learnt a pointer
+    /// position at all. The Mac cursor resting over the video must still
+    /// give way to the host's, and only there.
+    #[test]
+    fn the_host_leads_even_when_the_mac_mouse_never_moved_over_the_viewer() {
+        use super::super::sharp_cursor::MacPointer;
+        let mut app = ArcenApp {
+            remote_frame_size: Some([1920, 1080]),
+            host_cursor_positions: true,
+            ..ArcenApp::default()
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let pass = |app: &mut ArcenApp| {
+            // No egui event of any kind, in any pass.
+            let raw_input = egui::RawInput {
+                screen_rect: Some(screen),
+                focused: true,
+                ..egui::RawInput::default()
+            };
+            let _ = ctx.run_ui(raw_input, |ui| app.viewer_input_surface(ui));
+            assert_eq!(ctx.input(|input| input.pointer.latest_pos()), None);
+        };
+        app.pointer_authority.host_reported(
+            host_position(1, 960),
+            Instant::now() + arcen_input::host_pointer::CLIENT_MOTION_GUARD,
+        );
+        // AppKit puts the Mac pointer over the video.
+        let over_video = MacPointer {
+            screen: (300.0, 900.0),
+            app_active: true,
+            in_root_view: Some((300.0, 300.0)),
+        };
+        app.test_mac_pointer = Some(over_video);
+        pass(&mut app);
+        assert!(app.lead_cursor.is_hidden(), "the Mac cursor must not show");
+        // On another display, outside this window: it stays the user's.
+        app.test_mac_pointer = Some(MacPointer {
+            in_root_view: Some((-200.0, 300.0)),
+            ..over_video
+        });
+        pass(&mut app);
+        assert!(!app.lead_cursor.is_hidden());
+        app.test_mac_pointer = Some(MacPointer {
+            in_root_view: None,
+            ..over_video
+        });
+        pass(&mut app);
+        assert!(!app.lead_cursor.is_hidden());
+        // No AppKit reading at all: nothing is hidden on a guess.
+        app.test_mac_pointer = None;
+        pass(&mut app);
+        assert!(!app.lead_cursor.is_hidden());
+    }
+
+    /// GNOME hides its pointer while a tablet tool is in proximity: with
+    /// Native tablet the host-led cursor is a pen mark, never nothing.
+    #[test]
+    fn a_hidden_host_cursor_is_drawn_as_a_pen_mark_while_a_bridged_pen_leads() {
+        let painted = |tablet_mode_active| {
+            let mut app = ArcenApp {
+                remote_frame_size: Some([1920, 1080]),
+                host_cursor_positions: true,
+                host_cursor: arcen_input::cursor::DeckCursor::Hidden,
+                tablet_mode_active,
+                ..ArcenApp::default()
+            };
+            app.pointer_authority
+                .host_reported(host_position(1, 960), Instant::now());
+            let ctx = egui::Context::default();
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 600.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let output = ctx.run_ui(raw_input, |ui| app.viewer_input_surface(ui));
+            output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Circle(circle)
+                    if circle.fill == egui::Color32::WHITE && circle.radius < 6.0)
+            })
+        };
+        assert!(
+            painted(TabletModeMsg::UsbTabletBridge),
+            "Native tablet: a pen mark"
+        );
+        assert!(
+            !painted(TabletModeMsg::LocalTermination),
+            "no bridged pen: the host's hide is kept"
+        );
+    }
+
+    #[test]
     fn host_cursor_images_become_the_native_cursor_at_the_video_scale() {
         use arcen_input::cursor::{DeckCursor, DeckCursorState};
         use arcen_protocol::cursor::{CursorAppearance, CursorImageId, CursorImageRef};
@@ -23367,7 +25689,7 @@ mod tests {
     #[test]
     fn unavailable_command_channel_clears_local_held_state() {
         let mut app = ArcenApp::default();
-        app.active_swap_cmd_ctrl = false;
+        app.keyboard.set_policy(mac_host_keyboard_policy());
         app.process_keyboard_event(&key_event(egui::Key::A, true, egui::Modifiers::NONE));
         assert_eq!(app.keyboard.held_count(), 1);
 
@@ -26933,8 +29255,9 @@ mod tests {
         );
         assert_eq!(
             defaults.option_key_mode,
-            arcen_input::text::OptionKeyMode::LeftAltRightCharacters,
+            arcen_input::text::OptionKeyPreference::Automatic,
         );
+        assert_eq!(defaults.paste, arcen_input::text::PasteSettings::default());
 
         save_client_settings(
             &repository,
@@ -26969,18 +29292,30 @@ mod tests {
                 },
                 encode_intent: arcen_media::EncodeIntent::Quality,
                 typing_mode: arcen_input::text::TypingMode::Characters,
-                option_key_mode: arcen_input::text::OptionKeyMode::BothAlt,
+                option_key_mode: arcen_input::text::OptionKeyMode::BothAlt.into(),
+                paste: arcen_input::text::PasteSettings {
+                    confirm_above: 500,
+                    chars_per_second: 10,
+                },
             },
         )
         .unwrap();
         let loaded = load_client_settings(&repository).unwrap();
+        assert_eq!(
+            loaded.paste,
+            arcen_input::text::PasteSettings {
+                confirm_above: 500,
+                chars_per_second: 10,
+            },
+            "Paste as Keystrokes settings round-trip through settings.json"
+        );
         assert_eq!(
             loaded.typing_mode,
             arcen_input::text::TypingMode::Characters
         );
         assert_eq!(
             loaded.option_key_mode,
-            arcen_input::text::OptionKeyMode::BothAlt
+            arcen_input::text::OptionKeyMode::BothAlt.into()
         );
         assert_eq!(loaded.log_level, LogLevel::Debug);
         assert_eq!(loaded.security_mode, SecurityMode::Low);
@@ -27268,8 +29603,7 @@ mod tests {
         assert!(load_saved_connections(&repository).unwrap().is_none());
         assert!(default_saved_connections().is_empty());
 
-        let mut gateway = saved_connection("gateway", "Gateway", "gw.studio", 8443, Some("studio"));
-        gateway.kind = ConnectionKind::Gateway;
+        let render_node = saved_connection("render-node", "Render Node", "10.0.0.6", 18444, None);
         let store = SavedConnectionsStore::with_connections(vec![
             saved_connection(
                 "studio-host",
@@ -27278,7 +29612,7 @@ mod tests {
                 9443,
                 Some("artist"),
             ),
-            gateway,
+            render_node,
         ]);
         save_saved_connections(&repository, &store);
 
@@ -27296,7 +29630,7 @@ mod tests {
                 .as_deref(),
             Some("artist")
         );
-        assert_eq!(loaded.connections[1].kind, ConnectionKind::Gateway);
+        assert_eq!(loaded.connections[1].kind, ConnectionKind::DirectMachine);
 
         loaded.connections[0].name = "Edited Flame".to_string();
         loaded.connections[0].settings.remembered_username = Some("admin".to_string());

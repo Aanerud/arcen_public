@@ -1,0 +1,38 @@
+Arcen
+Copyright (C) 2026 TUTTIFRUTTI AS
+
+Legal texts version 1.0, effective 2026-11-12.
+
+Arcen Deck (the client) and Arcen Pier (the host) are free software, licensed
+under the GNU Affero General Public License, version 3 only, with the Arcen
+Store Distribution Exception:
+
+    SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+
+See LICENSE for the licence and LICENSE-EXCEPTION.md for the exception.
+Third-party components keep their own licences; see
+legal/THIRD_PARTY_NOTICES.md.
+
+
+Official distribution
+---------------------
+
+TUTTIFRUTTI AS (Norwegian organisation number 919 650 826), as copyright
+holder, is the official distributor of Arcen. It:
+
+  - distributes official signed and notarized builds of Arcen Deck and Arcen
+    Pier, including through app stores and platform marketplaces;
+  - offers pre-installed images and packages for cloud and remote
+    workstations;
+  - provides paid support.
+
+The source code for every official build is available in the public
+repository, https://github.com/Aanerud/arcen_public, at the matching release
+tag (for example, the build of version 0.19.0 is built from tag v0.19.0).
+Each official build carries a build ID that names that release and source
+revision; see docs/operations/versioning-and-releases.md.
+
+Anyone may build, run, modify and redistribute Arcen under the licence above.
+The names "Arcen", "Arcen Deck" and "Arcen Pier" and the Arcen logos are
+trademarks of TUTTIFRUTTI AS and are not licensed under the AGPL; see
+TRADEMARKS.md.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Peer liveness on a session carrier.
 //!
 //! A Deck that vanishes without closing its connection (killed, crashed,

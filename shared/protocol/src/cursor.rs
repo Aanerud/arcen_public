@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host cursor images: the `CursorUpdate` binary record (`FrameType` 0x50).
 //!
 //! A host whose desktop reports its cursor separately from the video (a
@@ -32,7 +34,14 @@
 //! A record is legal only to a client that declared
 //! [`crate::messages::AuthResponse::cursor_image_v1`] and only while
 //! client-drawn (`local`) cursor authority is active.
+//!
+//! The lane cache itself ([`CursorImageCache`]) is part of this contract,
+//! so it lives here: the Deck, a Pier that writes its own input/cursor lane
+//! (`arcen_input::cursor::CursorLaneOutbox`) and a Pier that relays an
+//! agent's records onto that lane ([`CursorRecordRelay`]) all run the same
+//! one.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
 use crate::messages::CursorShapeKind;
@@ -371,6 +380,249 @@ pub fn decode_cursor_update(bytes: &[u8]) -> Result<CursorUpdate, CursorUpdateEr
     })
 }
 
+/// Images either end holds for one lane.
+pub const CURSOR_CACHE_ENTRIES: usize = 32;
+/// Decoded bytes either end holds for one lane.
+pub const CURSOR_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+/// A deterministic least-recently-used cache of cursor image ids.
+///
+/// Each entry weighs `width * height * 4` bytes of the wire image. Inserting
+/// evicts the least recently used entries until at most
+/// [`CURSOR_CACHE_ENTRIES`] remain and their weight is within
+/// [`CURSOR_CACHE_BYTES`]; the newest entry always stays.
+#[derive(Debug, Clone)]
+pub struct CursorImageCache<V> {
+    entries: VecDeque<(CursorImageId, usize, V)>,
+    bytes: usize,
+}
+
+impl<V> Default for CursorImageCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<V> CursorImageCache<V> {
+    /// The weight of an image of this size.
+    #[must_use]
+    pub fn weight(width: u16, height: u16) -> usize {
+        usize::from(width) * usize::from(height) * 4
+    }
+
+    /// Whether `id` is held.
+    #[must_use]
+    pub fn contains(&self, id: CursorImageId) -> bool {
+        self.entries.iter().any(|(entry, _, _)| *entry == id)
+    }
+
+    /// The value held for `id`, without marking it used.
+    #[must_use]
+    pub fn peek(&self, id: CursorImageId) -> Option<&V> {
+        self.entries
+            .iter()
+            .find(|(entry, _, _)| *entry == id)
+            .map(|(_, _, value)| value)
+    }
+
+    /// Marks `id` most recently used and returns its value.
+    pub fn touch(&mut self, id: CursorImageId) -> Option<&V> {
+        let index = self.entries.iter().position(|(entry, _, _)| *entry == id)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, _, value)| value)
+    }
+
+    /// Inserts `id` as most recently used, replacing an existing entry.
+    pub fn insert(&mut self, id: CursorImageId, weight: usize, value: V) {
+        if let Some(index) = self.entries.iter().position(|(entry, _, _)| *entry == id) {
+            if let Some((_, old, _)) = self.entries.remove(index) {
+                self.bytes -= old;
+            }
+        }
+        self.entries.push_back((id, weight, value));
+        self.bytes += weight;
+        while self.entries.len() > 1
+            && (self.entries.len() > CURSOR_CACHE_ENTRIES || self.bytes > CURSOR_CACHE_BYTES)
+        {
+            if let Some((_, weight, _)) = self.entries.pop_front() {
+                self.bytes -= weight;
+            }
+        }
+    }
+
+    /// Forgets everything.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    /// Ids from least to most recently used.
+    pub fn ids(&self) -> impl Iterator<Item = CursorImageId> + '_ {
+        self.entries.iter().map(|(id, _, _)| *id)
+    }
+
+    /// Number of entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// 64-bit FNV-1a of a PNG: tells two images under one id apart.
+fn png_fingerprint(png: &[u8]) -> u64 {
+    png.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A relayed record ready for the lane, and what sending it commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRelayRecord {
+    /// The encoded record for the lane.
+    pub bytes: Vec<u8>,
+    /// Whether the image travels inline.
+    pub inline_image: bool,
+    sequence: u64,
+    image: Option<(CursorImageId, usize, u64)>,
+}
+
+/// Puts a session agent's cursor records on the Deck's input/cursor lane.
+///
+/// A Pier whose session runs in a separate agent process (Windows, macOS)
+/// relays that agent's messages onto the lanes; the agent never sees the
+/// lane, so it cannot know which images the Deck holds. The agent therefore
+/// sends every visible record with its image inline, and the relay keeps
+/// the lane's side of the cache contract: it keeps only the newest state,
+/// strips an image the Deck already holds, numbers records for the lane,
+/// commits only what the lane accepted, and sends the current state again
+/// (images included) on a reopened lane.
+///
+/// The relay also remembers a fingerprint of every image it mirrors, so an
+/// agent that reuses an id for a different image (a restarted agent behind
+/// the same relay) gets the new image inlined rather than the Deck showing
+/// the old one.
+#[derive(Debug, Default)]
+pub struct CursorRecordRelay {
+    mirror: CursorImageCache<u64>,
+    latest: Option<CursorUpdate>,
+    latest_sent: bool,
+    lane: Option<u64>,
+    sequence: u64,
+    last_agent_sequence: Option<u64>,
+    refused: u64,
+}
+
+impl CursorRecordRelay {
+    /// Takes one record from the agent. A record older than the newest one
+    /// taken is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`CursorUpdateError`] for a malformed record, or
+    /// [`CursorUpdateError::InlineImage`] for a visible one without its
+    /// image; it is dropped and the current state kept.
+    pub fn offer(&mut self, record: &[u8]) -> Result<(), CursorUpdateError> {
+        let update = match decode_cursor_update(record) {
+            Ok(update) => update,
+            Err(error) => {
+                self.refused += 1;
+                return Err(error);
+            }
+        };
+        if let CursorAppearance::Image(image) = &update.appearance {
+            if image.inline_png.is_none() {
+                self.refused += 1;
+                return Err(CursorUpdateError::InlineImage);
+            }
+        }
+        if self
+            .last_agent_sequence
+            .is_some_and(|last| update.sequence <= last)
+        {
+            return Ok(());
+        }
+        self.last_agent_sequence = Some(update.sequence);
+        self.latest = Some(update);
+        self.latest_sent = false;
+        Ok(())
+    }
+
+    /// Whether a state waits for the lane.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.latest.is_some() && !self.latest_sent
+    }
+
+    /// Whether the relay ever took a record (it then follows lane reopens).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.latest.is_some()
+    }
+
+    /// Records the agent sent that were dropped as malformed.
+    #[must_use]
+    pub const fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// Builds the record for the lane of generation `lane_generation`, or
+    /// `None` when the Deck already shows the newest state on that lane. A
+    /// new lane generation empties the mirror: the Deck reset its cache.
+    pub fn prepare(&mut self, lane_generation: u64) -> Option<PreparedRelayRecord> {
+        if self.lane != Some(lane_generation) {
+            self.lane = Some(lane_generation);
+            self.mirror.clear();
+            self.latest_sent = false;
+        }
+        if self.latest_sent {
+            return None;
+        }
+        let mut update = self.latest.clone()?;
+        let sequence = self.sequence + 1;
+        update.sequence = sequence;
+        let mut image = None;
+        let mut inline_image = false;
+        if let CursorAppearance::Image(reference) = &mut update.appearance {
+            let weight = CursorImageCache::<u64>::weight(reference.width, reference.height);
+            let fingerprint = reference.inline_png.as_deref().map_or(0, png_fingerprint);
+            if self.mirror.peek(reference.id) == Some(&fingerprint) {
+                reference.inline_png = None;
+            } else {
+                inline_image = true;
+            }
+            image = Some((reference.id, weight, fingerprint));
+        }
+        let bytes = encode_cursor_update(&update).ok()?;
+        Some(PreparedRelayRecord {
+            bytes,
+            inline_image,
+            sequence,
+            image,
+        })
+    }
+
+    /// Commits a record the lane accepted.
+    pub fn commit(&mut self, prepared: PreparedRelayRecord) {
+        self.sequence = prepared.sequence;
+        if let Some((id, weight, fingerprint)) = prepared.image {
+            if prepared.inline_image || self.mirror.touch(id).is_none() {
+                self.mirror.insert(id, weight, fingerprint);
+            }
+        }
+        self.latest_sent = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +771,158 @@ mod tests {
             assert_eq!(shape_wire_index(shape_from_wire_index(index)), index);
         }
         assert_eq!(shape_from_wire_index(200), CursorShapeKind::Default);
+    }
+
+    fn agent_record(sequence: u64, id: u32, png_fill: u8) -> Vec<u8> {
+        let mut png = png(64);
+        png[40] = png_fill;
+        let mut update = visible(Some(png));
+        update.sequence = sequence;
+        if let CursorAppearance::Image(image) = &mut update.appearance {
+            image.id = CursorImageId::new(id).unwrap();
+        }
+        encode_cursor_update(&update).unwrap()
+    }
+
+    /// What a Deck holds: applies relayed records like `DeckCursorState`.
+    #[derive(Default)]
+    struct Deck {
+        cache: CursorImageCache<Vec<u8>>,
+        shown: Option<Vec<u8>>,
+        unknown: u32,
+    }
+
+    impl Deck {
+        fn apply(&mut self, bytes: &[u8]) {
+            let update = decode_cursor_update(bytes).unwrap();
+            self.shown = match update.appearance {
+                CursorAppearance::Hidden => None,
+                CursorAppearance::Image(image) => {
+                    let weight = CursorImageCache::<()>::weight(image.width, image.height);
+                    if let Some(png) = image.inline_png {
+                        self.cache.insert(image.id, weight, png.clone());
+                        Some(png)
+                    } else if let Some(png) = self.cache.touch(image.id) {
+                        Some(png.clone())
+                    } else {
+                        self.unknown += 1;
+                        None
+                    }
+                }
+            };
+        }
+    }
+
+    fn relay_once(relay: &mut CursorRecordRelay, lane: u64, deck: &mut Deck) -> Option<bool> {
+        let prepared = relay.prepare(lane)?;
+        deck.apply(&prepared.bytes);
+        let inline = prepared.inline_image;
+        relay.commit(prepared);
+        Some(inline)
+    }
+
+    #[test]
+    fn relay_sends_each_image_once_per_lane_and_renumbers() {
+        let mut relay = CursorRecordRelay::default();
+        let mut deck = Deck::default();
+        assert!(relay.prepare(1).is_none());
+        relay.offer(&agent_record(100, 5, 1)).unwrap();
+        assert_eq!(relay_once(&mut relay, 1, &mut deck), Some(true));
+        assert_eq!(relay_once(&mut relay, 1, &mut deck), None);
+        relay.offer(&agent_record(101, 6, 2)).unwrap();
+        assert_eq!(relay_once(&mut relay, 1, &mut deck), Some(true));
+        relay.offer(&agent_record(102, 5, 1)).unwrap();
+        let prepared = relay.prepare(1).unwrap();
+        assert!(!prepared.inline_image);
+        assert_eq!(prepared.bytes.len(), CURSOR_UPDATE_HEADER_SIZE);
+        assert_eq!(decode_cursor_update(&prepared.bytes).unwrap().sequence, 3);
+        deck.apply(&prepared.bytes);
+        relay.commit(prepared);
+        assert_eq!(deck.unknown, 0);
+        assert_eq!(deck.shown.as_ref().map(|png| png[40]), Some(1));
+        // A reopened lane: the Deck reset its cache; the state goes again,
+        // with its image.
+        deck.cache.clear();
+        assert_eq!(relay_once(&mut relay, 2, &mut deck), Some(true));
+        assert_eq!(deck.unknown, 0);
+    }
+
+    #[test]
+    fn relay_keeps_the_newest_state_until_the_lane_accepts_it() {
+        let mut relay = CursorRecordRelay::default();
+        let mut deck = Deck::default();
+        relay.offer(&agent_record(1, 1, 1)).unwrap();
+        // The lane refused it: nothing is committed.
+        assert!(relay.prepare(7).unwrap().inline_image);
+        relay.offer(&agent_record(2, 2, 2)).unwrap();
+        // A stale agent record is ignored.
+        relay.offer(&agent_record(1, 1, 1)).unwrap();
+        assert_eq!(relay_once(&mut relay, 7, &mut deck), Some(true));
+        assert_eq!(deck.shown.as_ref().map(|png| png[40]), Some(2));
+        assert!(!relay.is_pending());
+    }
+
+    #[test]
+    fn relay_inlines_an_image_whose_id_was_reused() {
+        let mut relay = CursorRecordRelay::default();
+        let mut deck = Deck::default();
+        relay.offer(&agent_record(1, 3, 1)).unwrap();
+        relay_once(&mut relay, 1, &mut deck);
+        relay.offer(&agent_record(2, 3, 9)).unwrap();
+        assert_eq!(relay_once(&mut relay, 1, &mut deck), Some(true));
+        assert_eq!(deck.shown.as_ref().map(|png| png[40]), Some(9));
+    }
+
+    #[test]
+    fn relay_refuses_records_it_cannot_complete() {
+        let mut relay = CursorRecordRelay::default();
+        // A visible reference without its image.
+        let reference = encode_cursor_update(&visible(None)).unwrap();
+        assert_eq!(relay.offer(&reference), Err(CursorUpdateError::InlineImage));
+        assert_eq!(relay.offer(&[0x50]), Err(CursorUpdateError::Truncated));
+        let mut oversized = agent_record(1, 1, 1);
+        oversized.extend(std::iter::repeat_n(0, MAX_CURSOR_PNG_BYTES));
+        assert!(relay.offer(&oversized).is_err());
+        assert_eq!(relay.refused(), 3);
+        assert!(!relay.is_active());
+        let hidden = encode_cursor_update(&CursorUpdate {
+            sequence: 4,
+            output: 0,
+            generation: 0,
+            fallback: CursorShapeKind::Hidden,
+            appearance: CursorAppearance::Hidden,
+        })
+        .unwrap();
+        relay.offer(&hidden).unwrap();
+        let prepared = relay.prepare(1).unwrap();
+        assert!(!prepared.inline_image);
+        assert_eq!(
+            decode_cursor_update(&prepared.bytes).unwrap().appearance,
+            CursorAppearance::Hidden
+        );
+    }
+
+    #[test]
+    fn decoding_never_panics_on_arbitrary_bytes() {
+        let good = encode_cursor_update(&visible(Some(png(80)))).unwrap();
+        let mut state = 0x9e37_79b9_u32;
+        for round in 0..20_000u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let mut bytes = good.clone();
+            let len = (state as usize) % (good.len() + 8);
+            bytes.resize(len, (state >> 8) as u8);
+            if !bytes.is_empty() {
+                let at = (state as usize / 7) % bytes.len();
+                bytes[at] ^= (round as u8) | 1;
+            }
+            if let Ok(update) = decode_cursor_update(&bytes) {
+                if let CursorAppearance::Image(image) = update.appearance {
+                    assert!(image.width >= 1 && image.width <= MAX_CURSOR_SIDE);
+                    assert!(image.hotspot_x < image.width && image.hotspot_y < image.height);
+                }
+            }
+        }
     }
 }

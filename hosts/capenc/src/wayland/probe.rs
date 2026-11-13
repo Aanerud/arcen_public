@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! `capenc wayland-capture-probe`: the Wayland capture harness.
 //!
 //! Lab evidence only; not a product mode. Given the session hand-off in the

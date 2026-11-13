@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure per-attachment lane registry: admission, ownership and failure
 //! semantics for the QUIC lanes defined in [`arcen_protocol::lanes`].
 //!
@@ -143,8 +145,17 @@ pub const fn lane_send_priority(role: LaneRole) -> i32 {
         LaneRole::AudioOutput | LaneRole::Microphone => 10,
         LaneRole::Video => 0,
         LaneRole::BulkAux => -10,
+        LaneRole::Refine => REFINE_LANE_SEND_PRIORITY,
     }
 }
+
+/// Send priority of the lossless-refinement lane: below every other lane,
+/// so tiles never delay video, audio, input or bulk traffic (ADR 0016).
+pub const REFINE_LANE_SEND_PRIORITY: i32 = -20;
+
+/// Largest framed refinement record: the 48-byte tile header plus the
+/// 128 KiB compressed-payload bound (ADR 0016 R5).
+pub const REFINE_LANE_MAX_FRAME_BYTES: usize = 48 + 128 * 1024;
 
 /// Largest single framed message a lane accepts.
 #[must_use]
@@ -154,6 +165,7 @@ pub const fn lane_max_frame_bytes(role: LaneRole, policy: &BoundedTransportPolic
         LaneRole::Video => policy.max_media_payload_bytes,
         LaneRole::AudioOutput => AUDIO_PRIORITY_MAX_FRAME_BYTES,
         LaneRole::InputCursor => policy.max_input_payload_bytes,
+        LaneRole::Refine => REFINE_LANE_MAX_FRAME_BYTES,
         LaneRole::Microphone => {
             MICROPHONE_HEADER_SIZE
                 + if MAX_MICROPHONE_OPUS_BYTES > MICROPHONE_PCM_BYTES {
@@ -216,7 +228,9 @@ impl LaneRecoveryPolicy {
                 release_held_input: true,
                 requires_keyframe: false,
             },
-            LaneRole::BulkAux => Self {
+            // A lost refine lane also clears the monitor's refinement on
+            // both ends (new generation); it never needs a video keyframe.
+            LaneRole::BulkAux | LaneRole::Refine => Self {
                 max_consecutive_failures: 2,
                 exhausted: LaneExhaustion::DisableVisibly,
                 release_held_input: false,
@@ -1078,7 +1092,7 @@ mod tests {
         );
         assert_eq!(
             lanes_opened_by(LaneEndpoint::Pier, LaneShape::Unidirectional),
-            2
+            3
         );
         assert_eq!(
             PIER_LANE_STREAM_LIMITS,
@@ -1091,7 +1105,7 @@ mod tests {
             DECK_LANE_STREAM_LIMITS,
             LaneStreamLimits {
                 max_concurrent_bidi_streams: 0,
-                max_concurrent_uni_streams: 3,
+                max_concurrent_uni_streams: 4,
             }
         );
     }

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Static schema-v1 lifecycle mirror of shared/telemetry/src/lifecycle.rs."""
 
 from __future__ import annotations
@@ -611,6 +614,7 @@ EVENT_DEFINITIONS = {
             ("client_network_scope", STRING),
             ("client_link_mbps", INTEGER),
             ("client_mtu", INTEGER),
+            ("fps_content", INTEGER),
         ),
     ),
     1900: _event(

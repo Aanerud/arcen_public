@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Transport-config helpers and connection parameter bundles.
 //!
 //! Callers remain in control of the actual `quinn::ServerConfig` /
@@ -38,6 +40,18 @@ pub(super) const ARCEN_QUIC_INITIAL_MTU: u16 = 1200;
 ///
 /// Matches `ARCEN_QUIC_INITIAL_MTU`.
 pub(super) const ARCEN_QUIC_MIN_MTU: u16 = 1200;
+
+/// Largest UDP payload path MTU discovery may probe for, when enabled
+/// ([`MtuDiscovery`]): a 1500-byte Ethernet MTU less IPv6 and UDP headers,
+/// so a probe never needs fragmentation on an ordinary LAN.
+pub const ARCEN_QUIC_MTU_UPPER_BOUND: u16 = 1452;
+
+/// How often a connection re-probes for a larger MTU after a search ended.
+pub(super) const ARCEN_QUIC_MTU_REPROBE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How long a connection stays at the 1200-byte floor after a black hole
+/// (a burst of lost packets larger than the floor) before probing again.
+pub(super) const ARCEN_QUIC_MTU_BLACK_HOLE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Idle timeout (milliseconds). 30 s is the Quinn default and matches common
 /// UDP NAT binding lifetimes (enterprise NAT floor ~30 s). Range: 20–60 s.
@@ -80,6 +94,194 @@ pub(super) const ARCEN_QUIC_DIRECT_INCOMING_BUFFER_BYTES: u64 = 16 * 1024;
 /// Aggregate pre-accept buffering for all unauthenticated attempts.
 pub(super) const ARCEN_QUIC_DIRECT_INCOMING_BUFFER_TOTAL_BYTES: u64 = 512 * 1024;
 
+/// Which QUIC congestion controller paces a connection's sender.
+///
+/// Cubic, Quinn's default, reads every loss as congestion. On Wi-Fi, cellular
+/// and VPN paths that carry a random loss floor of a few tenths of a percent
+/// that caps the window far below the path: at 0.3% loss and 32 ms RTT with
+/// 1200-byte packets, about 7 Mbps for the whole session. BBR models the
+/// bottleneck from delivery rate and RTT instead, so random loss does not
+/// collapse the window.
+///
+/// BBR ignores loss entirely, which is its weakness: against a
+/// shallow-buffered bottleneck slower than the video it overshoots to about
+/// twice the link rate and loses half its packets.
+///
+/// BBR is the default. `bbr-guarded` ([`super::LossGuardedBbrConfig`]) is
+/// opt-in: BBR under a loss-bounded window ceiling that only engages after
+/// two round trips in a row lose more than 5 %. Measured on the Deck's real
+/// Wi-Fi + VPN link against a Linux Pier (Speed, full-screen motion, three
+/// alternating runs per case): equal to every controller on a clean path
+/// (frame age p50 ≈ 19 ms); under 1 % random loss it keeps BBR's 16 Mbit/s
+/// and ~19 ms where Cubic falls to 6 Mbit/s and ~675 ms; at a
+/// shallow-buffered 8 Mbit/s bottleneck it cuts BBR's 54 % loss and 1.36 s
+/// frame age (p95 1.89 s) to 12 % and 0.77 s (p95 1.06 s) (Cubic: 0.1 %,
+/// ~0.66 s). It stays opt-in until it has field use. Earlier, on a VPN path with
+/// a few tenths of a percent of random loss, BBR gave two displays 2.5-3x the
+/// bitrate at half the video age of Cubic. Quinn labels its BBR experimental;
+/// `ARCEN_QUIC_CONGESTION` selects `bbr`, `cubic` or `newreno` (the RFC 9002
+/// reference controller, kept for comparisons) instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CongestionControl {
+    /// Loss-based (Quinn's own default).
+    Cubic,
+    /// Model-based: bottleneck bandwidth and round-trip propagation time.
+    #[default]
+    Bbr,
+    /// Loss-based RFC 9002 reference controller.
+    NewReno,
+    /// BBR under Arcen's loss-bounded window ceiling
+    /// ([`super::LossGuardedBbrConfig`]). Opt-in (`bbr-guarded`).
+    BbrGuarded,
+}
+
+impl CongestionControl {
+    /// Environment override read by [`Self::from_env`].
+    pub const ENV: &'static str = "ARCEN_QUIC_CONGESTION";
+
+    /// Parses `cubic`, `bbr`, `newreno` or `bbr-guarded`, case-insensitively.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "cubic" => Some(Self::Cubic),
+            "bbr" => Some(Self::Bbr),
+            "newreno" => Some(Self::NewReno),
+            "bbr-guarded" => Some(Self::BbrGuarded),
+            _ => None,
+        }
+    }
+
+    /// The operator's choice from [`Self::ENV`]; an unknown value keeps the
+    /// default rather than guessing.
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var(Self::ENV)
+            .ok()
+            .and_then(|value| Self::from_token(&value))
+            .unwrap_or_default()
+    }
+
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr => "bbr",
+            Self::NewReno => "newreno",
+            Self::BbrGuarded => "bbr-guarded",
+        }
+    }
+
+    /// Installs this controller on a transport config.
+    pub fn apply(self, config: &mut quinn::TransportConfig) {
+        match self {
+            Self::Cubic => {
+                config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::CubicConfig::default(),
+                ));
+            }
+            Self::Bbr => {
+                config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::BbrConfig::default(),
+                ));
+            }
+            Self::NewReno => {
+                config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::NewRenoConfig::default(),
+                ));
+            }
+            Self::BbrGuarded => {
+                config.congestion_controller_factory(Arc::new(
+                    super::LossGuardedBbrConfig::default(),
+                ));
+            }
+        }
+    }
+}
+
+/// Whether a connection searches for a path MTU above the 1200-byte floor.
+///
+/// `ARCEN_QUIC_MTU_DISCOVERY=on` enables Quinn's packetization-layer path MTU
+/// discovery (RFC 8899 DPLPMTUD): after the handshake it sends padded probe
+/// packets up to [`ARCEN_QUIC_MTU_UPPER_BOUND`] bytes and adopts the largest
+/// one the peer acknowledges. Probes are not data: a lost probe, including one
+/// the local stack refuses because the interface MTU is smaller (a 1280-byte
+/// `IPsec` tunnel), only narrows the search. If packets larger than the floor
+/// are later lost in a burst (a black hole: the path shrank), the connection
+/// falls back to 1200 bytes and probes again after
+/// [`ARCEN_QUIC_MTU_BLACK_HOLE_COOLDOWN`]. Quinn only enables it on sockets
+/// that set the don't-fragment bit.
+///
+/// Off by default, on evidence. Measured from a Linux Pier to a Deck behind
+/// a 1280-byte `IPsec` VPN (Speed, full-screen motion, three alternating runs
+/// each way), the tunnel fragmented oversize packets instead of dropping
+/// them, so a 1452-byte probe was acknowledged; at full rate the fragmented
+/// packets were then lost in bursts (130-1,000 packets per episode) until
+/// black-hole detection returned the connection to 1200 bytes, and the
+/// search repeated after every cooldown. A larger MTU never lasted beyond
+/// one 2-second sample, and goodput fell by about 6 %. Turn it on only for paths that drop,
+/// rather than fragment, oversize packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MtuDiscovery {
+    /// Fixed 1200-byte packets.
+    #[default]
+    Off,
+    /// Probe up to [`ARCEN_QUIC_MTU_UPPER_BOUND`] with black-hole fallback.
+    On,
+}
+
+impl MtuDiscovery {
+    /// Environment switch read by [`Self::from_env`].
+    pub const ENV: &'static str = "ARCEN_QUIC_MTU_DISCOVERY";
+
+    /// Parses `on`/`off` (also `1`/`0`, `true`/`false`), case-insensitively.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" => Some(Self::On),
+            "off" | "0" | "false" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The operator's choice from [`Self::ENV`]; an unknown value keeps the
+    /// default.
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var(Self::ENV)
+            .ok()
+            .and_then(|value| Self::from_token(&value))
+            .unwrap_or_default()
+    }
+
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Installs this choice on a transport config. The initial and minimum
+    /// MTU stay at the 1200-byte floor either way.
+    pub fn apply(self, config: &mut quinn::TransportConfig) {
+        config.initial_mtu(ARCEN_QUIC_INITIAL_MTU);
+        config.min_mtu(ARCEN_QUIC_MIN_MTU);
+        config.mtu_discovery_config(match self {
+            Self::Off => None,
+            Self::On => {
+                let mut discovery = quinn::MtuDiscoveryConfig::default();
+                discovery
+                    .upper_bound(ARCEN_QUIC_MTU_UPPER_BOUND)
+                    .interval(ARCEN_QUIC_MTU_REPROBE_INTERVAL)
+                    .black_hole_cooldown(ARCEN_QUIC_MTU_BLACK_HOLE_COOLDOWN);
+                Some(discovery)
+            }
+        });
+    }
+}
+
 /// Builds a `quinn::TransportConfig` compatible with this adapter's stream
 /// and datagram usage.
 ///
@@ -87,14 +289,14 @@ pub(super) const ARCEN_QUIC_DIRECT_INCOMING_BUFFER_TOTAL_BYTES: u64 = 512 * 1024
 ///
 /// | Parameter | Value | Notes |
 /// |-----------|-------|-------|
-/// | Congestion | CUBIC (Quinn default) | Baseline; tune to BBR after profiling |
+/// | Congestion | BBR ([`CongestionControl`]) | `ARCEN_QUIC_CONGESTION` overrides (`bbr-guarded` adds a loss ceiling); see the enum |
 /// | Concurrent bidi streams | 1 | Direct product carrier or advanced handshake |
 /// | Concurrent uni streams | 1 | Advanced adapter's single persistent stream |
 /// | Idle timeout | 30 s | Matches NAT floor; tune 20–60 s |
 /// | Keep-alive | 20 s | Must be < idle timeout; tune 15–30 s |
 /// | Initial MTU | 1200 | RFC 9000 minimum |
 /// | Min MTU | 1200 | Floor; never fragment below |
-/// | MTU discovery | disabled | Avoid oversize probes on VPN/IPsec paths |
+/// | MTU discovery | off ([`MtuDiscovery`]) | `ARCEN_QUIC_MTU_DISCOVERY=on` probes up to 1452 with black-hole fallback |
 /// | Datagram buffers | max(policy, 2 MiB) send + recv | Prevent media burst drops |
 /// | Stream recv window | 1 MiB | Per-stream flow control |
 /// | Conn recv/send window | 16 MiB | Connection-level flow control |
@@ -127,79 +329,6 @@ pub(super) const ARCEN_QUIC_DIRECT_INCOMING_BUFFER_TOTAL_BYTES: u64 = 512 * 1024
 /// stream classes (RFC 9308 §4.1). If control/input traffic and media frames
 /// need different DSCP or network treatment, place them on **separate QUIC
 /// connections** — each with its own `TransportConfig` and `QoS` marking.
-/// Which QUIC congestion controller paces a connection's sender.
-///
-/// Cubic, Quinn's default, reads every loss as congestion. On Wi-Fi, cellular
-/// and VPN paths that carry a random loss floor of a few tenths of a percent
-/// that caps the window far below the path: at 0.3% loss and 32 ms RTT with
-/// 1200-byte packets, about 7 Mbps for the whole session. BBR models the
-/// bottleneck from delivery rate and RTT instead, so random loss does not
-/// collapse the window.
-///
-/// BBR is the default. Measured on a VPN path with a few tenths of a percent
-/// of random loss it gave two displays 2.5-3x the bitrate at half the video
-/// age of Cubic, matched or beat Cubic on a calm path in every preset, and
-/// held a 20-minute session without a stall or reconnect. Quinn labels its
-/// BBR experimental, so `ARCEN_QUIC_CONGESTION=cubic` restores Cubic.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CongestionControl {
-    /// Loss-based (Quinn's own default).
-    Cubic,
-    /// Model-based: bottleneck bandwidth and round-trip propagation time.
-    #[default]
-    Bbr,
-}
-
-impl CongestionControl {
-    /// Environment override read by [`Self::from_env`].
-    pub const ENV: &'static str = "ARCEN_QUIC_CONGESTION";
-
-    /// Parses `cubic` or `bbr`, case-insensitively.
-    #[must_use]
-    pub fn from_token(token: &str) -> Option<Self> {
-        match token.trim().to_ascii_lowercase().as_str() {
-            "cubic" => Some(Self::Cubic),
-            "bbr" => Some(Self::Bbr),
-            _ => None,
-        }
-    }
-
-    /// The operator's choice from [`Self::ENV`]; an unknown value keeps the
-    /// default rather than guessing.
-    #[must_use]
-    pub fn from_env() -> Self {
-        std::env::var(Self::ENV)
-            .ok()
-            .and_then(|value| Self::from_token(&value))
-            .unwrap_or_default()
-    }
-
-    /// Stable log token.
-    #[must_use]
-    pub const fn token(self) -> &'static str {
-        match self {
-            Self::Cubic => "cubic",
-            Self::Bbr => "bbr",
-        }
-    }
-
-    /// Installs this controller on a transport config.
-    pub fn apply(self, config: &mut quinn::TransportConfig) {
-        match self {
-            Self::Cubic => {
-                config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::CubicConfig::default(),
-                ));
-            }
-            Self::Bbr => {
-                config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-        }
-    }
-}
-
 #[must_use]
 pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
@@ -235,12 +364,9 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
         ARCEN_QUIC_IDLE_TIMEOUT_MS,
     ))));
 
-    // Keep the compatibility baseline at the QUIC minimum. The fleet path
-    // includes 1280-byte IPsec interfaces, where Quinn's default 1452-byte
-    // discovery probe fails locally before black-hole recovery can help.
-    config.initial_mtu(ARCEN_QUIC_INITIAL_MTU);
-    config.min_mtu(ARCEN_QUIC_MIN_MTU);
-    config.mtu_discovery_config(None);
+    // Packets start, and by default stay, at the QUIC minimum; see
+    // `MtuDiscovery` for the opt-in search above it.
+    MtuDiscovery::from_env().apply(&mut config);
 
     // Datagram buffers: floor at 2 MiB to absorb H.264/audio frame bursts.
     let datagram_buffer = policy
@@ -345,7 +471,7 @@ pub fn recommended_transport_config_arc(
 /// [`recommended_transport_config`] with the concurrent-stream limits
 /// `local` grants its peer under ADR 0014 —
 /// [`crate::lanes::PIER_LANE_STREAM_LIMITS`] (4 bidi, 2 uni) on a Pier and
-/// [`crate::lanes::DECK_LANE_STREAM_LIMITS`] (0 bidi, 3 uni) on a Deck: the
+/// [`crate::lanes::DECK_LANE_STREAM_LIMITS`] (0 bidi, 4 uni: video, audio, refine and one replacement) on a Deck: the
 /// lanes the peer opens plus one replacement stream of headroom per shape.
 ///
 /// Liveness is the lane carrier's own ([`crate::liveness`]): a keep-alive
@@ -502,11 +628,27 @@ mod lane_window_tests {
 }
 
 #[cfg(test)]
+mod mtu_discovery_tests {
+    use super::MtuDiscovery;
+
+    #[test]
+    fn mtu_discovery_is_off_unless_switched_on() {
+        assert_eq!(MtuDiscovery::default(), MtuDiscovery::Off);
+        assert_eq!(MtuDiscovery::from_token(" ON "), Some(MtuDiscovery::On));
+        assert_eq!(MtuDiscovery::from_token("0"), Some(MtuDiscovery::Off));
+        assert_eq!(MtuDiscovery::from_token("auto"), None);
+        for choice in [MtuDiscovery::Off, MtuDiscovery::On] {
+            assert_eq!(MtuDiscovery::from_token(choice.token()), Some(choice));
+        }
+    }
+}
+
+#[cfg(test)]
 mod congestion_control_tests {
     use super::CongestionControl;
 
     #[test]
-    fn congestion_control_tokens_are_exact_and_default_is_bbr() {
+    fn congestion_control_tokens_are_exact_and_default_is_guarded_bbr() {
         assert_eq!(
             CongestionControl::from_token("bbr"),
             Some(CongestionControl::Bbr)
@@ -519,9 +661,18 @@ mod congestion_control_tests {
             CongestionControl::from_token("cubic"),
             Some(CongestionControl::Cubic)
         );
+        assert_eq!(
+            CongestionControl::from_token("NewReno"),
+            Some(CongestionControl::NewReno)
+        );
         assert_eq!(CongestionControl::from_token("reno"), None);
         assert_eq!(CongestionControl::default(), CongestionControl::Bbr);
-        for control in [CongestionControl::Cubic, CongestionControl::Bbr] {
+        for control in [
+            CongestionControl::Cubic,
+            CongestionControl::Bbr,
+            CongestionControl::NewReno,
+            CongestionControl::BbrGuarded,
+        ] {
             assert_eq!(
                 CongestionControl::from_token(control.token()),
                 Some(control)

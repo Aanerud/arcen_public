@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+#
+# Secret-scan rules for gitleaks (CI and the publication pipeline). They extend
+# gitleaks' built-in rules, which already cover private keys, cloud and
+# payment-provider tokens (Stripe and others) and generic API keys.
+
+title = "Arcen secret scan"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "arcen-dotenv-file"
+description = "An environment file; these hold credentials and are never committed"
+path = '''(^|/)\.env(\.[A-Za-z0-9_-]+)?$'''
+
+[[rules]]
+id = "arcen-apple-api-key-file"
+description = "An App Store Connect / notarization API private key file"
+path = '''(^|/)AuthKey_[A-Z0-9]{10}\.p8$'''
+
+[[rules]]
+id = "arcen-signing-material-file"
+description = "Signing identities, provisioning profiles and key stores"
+path = '''(?i)\.(p12|pfx|mobileprovision|provisionprofile|keychain(-db)?|jks|keystore)$'''
+
+[[rules]]
+id = "arcen-signing-key-assignment"
+description = "A licence- or release-signing key written into a file"
+regex = '''(?i)(signing|license|licence|release|notary|notarization)[_-]?(private[_-]?)?(key|secret|password|token)\s*[:=]\s*["']?[A-Za-z0-9+/=_\-]{16,}'''
+keywords = ["signing", "license", "licence", "release", "notary", "notarization"]
+
+[[rules]]
+id = "arcen-portal-credential"
+description = "Portal, store or payment account credentials written into a file"
+regex = '''(?i)(portal|partner[_-]?center|app[_-]?store[_-]?connect|marketplace|payment|stripe|vipps|adyen)[_-]?(password|secret|token|api[_-]?key)\s*[:=]\s*["']?[^\s"']{8,}'''
+keywords = ["portal", "partner", "connect", "marketplace", "payment", "stripe", "vipps", "adyen"]

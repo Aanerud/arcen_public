@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The parts of a GNOME login that a headless Arcen desktop assembles
 //! itself, as pure policy.
 //!

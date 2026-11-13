@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Credential Provider side of the SYSTEM-only broker control pipe.
 //!
 //! When LogonUI `Advise`s the provider, [`CredentialPipe::start`] launches a

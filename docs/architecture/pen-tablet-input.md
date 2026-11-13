@@ -69,7 +69,7 @@ device and full bidirectional USB semantics traverse the network — is a
 different feature, driver, latency, and security boundary. It is **not**
 implemented, is **not** what the raw-HID quarantine or its future removal
 enables, and is described only as a scoped-out future decision boundary
-below (["Future true USB bridge (not implemented)"](#future-true-usb-bridge-not-implemented)).
+below (["Future true USB bridge (not implemented)"](#earlier-plan-for-a-true-usb-bridge-now-native-tablet)).
 
 ## Data path
 
@@ -147,7 +147,7 @@ Where it is used:
 | --- | --- |
 | Deck `tablet::presence` | whether a pen tablet is present, from every HID device's `ReportDescriptor` in the I/O Registry (no open, no permission), plus "AppKit already delivered a pen sample this run". Informational only (Tablet Monitor, diagnostics): typed pen is offered whenever capture is possible (`tablet::typed_pen_capability`), because the hello cannot be renegotiated when a tablet appears later. |
 | Deck raw-HID capture (`hid/session.rs`) | match by digitizer usage page; offer an interface only if its descriptor declares a digitizer; forward reports only from pen-declaring interfaces. |
-| `arcen-usb-helper` (root, macOS) | Hard USB candidate: every interface HID, and the same shared `authorize_hard_usb_tablet` the host applies (pen tablet, no game-controller collection, aggregate size). Descriptors come from the I/O Registry (`IOHIDDevice` `ReportDescriptor`, matched by vendor/product id, a known and equal `LocationID` when two identical devices are attached, and the interface's `bInterfaceNumber`; conflicting entries refuse the device), so no device is opened to be examined. The handshake size is checked before the device is seized. `GET_DESCRIPTOR(Report)` is sent only for an interface the registry left undescribed, on a device the registry already shows to be a digitizer and that has no boot-keyboard interface. |
+| `arcen-usb-helper` (root, macOS) | Hard USB candidate: every interface HID, and the same shared `authorize_hard_usb_tablet` the host applies (pen tablet, no game-controller collection, aggregate size). Descriptors come from the I/O Registry (`IOHIDDevice` `ReportDescriptor`, matched by vendor/product id, a known and equal `LocationID` when two identical devices are attached, and the interface's `bInterfaceNumber`; conflicting entries refuse the device), so no device is opened to be examined. The handshake size is checked before the device is seized. `GET_DESCRIPTOR(Report)` is sent only for an interface the registry left undescribed, on a device the registry already shows to be a digitizer and that has no boot-keyboard interface. After capture the shared exporter engine (`arcen_usb_bridge::UsbExporter`, ADR 0019) re-runs the same checks on the descriptors the backend read (`verify_captured_tablet`) and releases a refused device at once. |
 | Linux Pier `usb_bridge::authorize_device` | before creating the `usb-vhci` device: `authorize_hard_usb_tablet` over the Deck's claimed descriptors; afterwards `BridgedDeviceGuard` checks every device, configuration and report descriptor the device returns before giveback. |
 | Linux Pier raw HID (`net/server.rs`) | `RawHidAdmission`: a `/dev/uhid` device only for a pen-bearing interface of a device that classifies as a pen tablet, and never for a descriptor that also carries a joystick, gamepad or multi-axis controller collection. Express-key keyboard collections in the pen's descriptor are admitted with it. |
 
@@ -220,9 +220,16 @@ conversion into or out of it is shared:
   `WINDOWS_INK_PRESSURE_RANGE` (`0..=1024`, the Windows Ink API ceiling),
   tilt/rotation via `whole_tilt_degrees`/`whole_rotation_degrees`.
 - macOS Pier (`hosts/macos/src/input/pen.rs`): `clamp_pressure`,
-  `tilt_degrees_to_unit`, `wrap_rotation_degrees`. Its proximity events report
-  vendor id `0xFFFF` (reserved, never assigned; Arcen's id for synthetic
-  devices), not a tablet maker's.
+  `tilt_degrees_to_unit`, `wrap_rotation_degrees`. Pressure is written to both
+  `kCGMouseEventPressure` (what `-[NSEvent pressure]` reads, 256 levels) and
+  `kCGTabletEventPointPressure` (full precision); proximity edges are
+  `kCGEventTabletProximity` events with a capability mask. Its proximity events
+  report vendor id `0xFFFF` (reserved, never assigned; Arcen's id for synthetic
+  devices), not a tablet maker's. A generic HID pen digitizer
+  (`shared/input/src/hid_digitizer.rs`, presented through `IOHIDUserDevice`)
+  was measured as the alternative and rejected: macOS 26.7 delivers its
+  proximity but no pressure, tilt or rotation to applications
+  (`arcen-pier-macos probe-pen-hid`; `hosts/macos/AGENTS.md`).
 
 In Native tablet (USB bridged) mode no conversion happens at all: the host
 kernel reads the device's own report descriptor, so the pen's native pressure
@@ -256,7 +263,12 @@ Full field-level contract: [`shared/protocol/WIRE.md`](../../shared/protocol/WIR
   `pressure`, `tilt_x_degrees`/`tilt_y_degrees`, `rotation_degrees`, `tool`,
   `in_proximity`/`touching`, a `buttons` bitset (bit 0 = first barrel button,
   bit 1 = second), and the shared `sequence`/`timestamp_ns`/`coalescable`
-  metadata used by every other input message.
+  metadata used by every other input message. This is not AppKit's layout:
+  `-[NSEvent buttonMask]` keeps bit 0 for the tip and puts the lower/upper
+  barrel buttons on bits 1 and 2. The macOS Deck shifts them down
+  (`TabletButtonMask::wire_barrel_buttons`) and the macOS Pier builds AppKit's
+  layout back from `touching` + `buttons` for `kCGTabletEventPointButtons`
+  (`pen::tablet_button_mask`); before 0.19 both copied the bits verbatim.
 - **Validation is `PenEventMsg::validate()`, not a custom `Deserialize`.**
   `serde` alone accepts an untrusted peer's out-of-range finite value (e.g.
   `pressure: 2.0`); every product boundary calls `validate()` — checked
@@ -545,9 +557,9 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
   pointer device created with the public
   `CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)` /
   `InjectSyntheticPointerInput` / `DestroySyntheticPointerDevice` API — not
-  `SendInput`, and not a Wintab driver. **Arcen makes no Wintab claim**;
-  legacy Wintab-only creative applications are out of scope for this
-  backend.
+  `SendInput`, and not a Wintab driver. **Arcen does not support Wintab**
+  ([ADR 0017](../adr/0017-forward-only-pen-input.md)); legacy Wintab-only
+  creative applications get no pressure on a Windows host.
 - Pressure maps to the **documented `0..=1024`** Windows Ink pointer-pressure
   range (`pen_pressure_to_windows`: the shared `scale_unit` over
   `WINDOWS_INK_PRESSURE_RANGE`) even
@@ -555,17 +567,26 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
   ceiling, not an Arcen-imposed limit, and this document does not claim 8192
   levels through that API.
 - Rotation maps to `0..=359` (`pen_rotation_to_windows`), tilt to `-90..=90`
-  (`pen_tilt_to_windows`), and eraser/barrel state maps to `PEN_FLAG_ERASER`/
-  `PEN_FLAG_BARREL` in `POINTER_PEN_INFO` (`pen_tool_flags`: bit 0 of
-  `PenEventMsg::buttons` is barrel/tip button truth; `tool == Eraser`
-  selects the eraser flag). `PenPointerState`/`PenPointerEdge` is a small,
+  (`pen_tilt_to_windows`), and eraser/barrel state maps to `PEN_FLAG_*` in
+  `POINTER_PEN_INFO` as a real digitizer reports it (`pen_ink_flags`): the
+  eraser end in range sets `PEN_FLAG_INVERTED`, and only an eraser end in
+  contact adds `PEN_FLAG_ERASER` — Windows treats that flag as the eraser's
+  tip switch, so setting it while hovering clicks. Either barrel button
+  (bit 0 or bit 1 of `PenEventMsg::buttons`) sets `PEN_FLAG_BARREL`, which
+  Windows reports as the second pointer button; Windows Ink has one barrel
+  switch and ignores an injected `POINTER_FLAG_SECONDBUTTON` for a pen.
+  `PenPointerState`/`PenPointerEdge` is a small,
   unit-tested proximity/hover/contact transition state machine
   (`Out -> Hovering -> Contact` and back) driving the exact
   `POINTER_FLAG_INRANGE`/`_DOWN`/`_UPDATE`/`_UP`/`_INCONTACT` combination
   Microsoft documents for each transition.
 - `pen_pixel_location()` reuses the same validated selected-output geometry
   already used for mouse `POINTER_INFO.ptPixelLocation`; pen is never routed
-  through mouse `SendInput`.
+  through mouse `SendInput`. `InjectSyntheticPointerInput` takes
+  `ptPixelLocation` relative to the virtual screen's top-left, so the
+  injector subtracts the virtual-screen origin (`pen_injection_point`);
+  desktop coordinates are only correct while no display sits left of or
+  above the primary.
 - The handle and state live in the interactive user-session agent process,
   never the LocalSystem service, matching the existing Windows Host
   process-boundary rule (`hosts/windows/AGENTS.md`).
@@ -595,9 +616,9 @@ vendor-neutral 65535; no tablet of another make has been physically tested.
 | Tilt X/Y | ✅ ±90° whole-degree | ✅ ±90° whole-degree | |
 | Hover/proximity | ✅ `BTN_TOOL_PEN` | ✅ `POINTER_FLAG_INRANGE` | Enter/leave tracked |
 | Tip contact | ✅ `BTN_TOUCH` | ✅ `POINTER_FLAG_INCONTACT` | |
-| Eraser end | ✅ `BTN_TOOL_RUBBER` | ✅ `PEN_FLAG_ERASER` | |
+| Eraser end | ✅ `BTN_TOOL_RUBBER` | ✅ `PEN_FLAG_INVERTED`, `+ PEN_FLAG_ERASER` in contact | |
 | Lower barrel button | ✅ `BTN_STYLUS` → right-click | ✅ `PEN_FLAG_BARREL` | |
-| Upper barrel button | ✅ `BTN_STYLUS2` → middle-click | ✅ `POINTER_FLAG_SECONDBUTTON` | |
+| Upper barrel button | ✅ `BTN_STYLUS2` → middle-click | ⚠️ `PEN_FLAG_BARREL` | Windows Ink has one barrel switch: both buttons press it |
 | Rotation | ❌ Not injected | ✅ `PEN_MASK_ROTATION` | Protocol carries it; Linux omitted intentionally |
 
 ### Hard OS ceilings (not fixable in Arcen code)
@@ -606,15 +627,16 @@ vendor-neutral 65535; no tablet of another make has been physically tested.
 `InjectSyntheticPointerInput` documents `0..=1024` as the pressure range for
 `PT_PEN` pointer data. A pen may report far more levels (8192 or 16384 are common); AppKit and the
 protocol carry the full float normalised value; `pen_pressure_to_windows`
-maps it faithfully to the 1024-step range. Closing this gap requires either
-a kernel-mode Wintab driver (out of scope — USB redirect territory) or a
-future Windows API change.
+maps it faithfully to the 1024-step range. Only a future Windows API change
+closes this gap: a Wintab driver and a Windows USB bridge are both ruled out
+([ADR 0017](../adr/0017-forward-only-pen-input.md)).
 
-**Wintab-only applications on Windows.**
-Some older creative applications (some legacy Photoshop/ArtRage builds) use
-Wintab rather than Windows Ink (`WM_POINTER`/`GetPointerPenInfo`). The
-`InjectSyntheticPointerInput` / `PT_PEN` backend is Windows Ink only. Wintab
-support requires a kernel-mode HID driver, which is USB redirect territory.
+**Wintab-only applications on Windows (not supported).**
+Some older creative applications (Mari 4.7 and earlier) use only Wintab
+rather than Windows Ink (`WM_POINTER`/`GetPointerPenInfo`). The
+`InjectSyntheticPointerInput` / `PT_PEN` backend is Windows Ink only, and
+Arcen neither ships a `wintab32.dll` nor emulates a tablet maker's device:
+see [ADR 0017](../adr/0017-forward-only-pen-input.md) for why.
 
 ### Improvable in Arcen code (without USB redirect)
 
@@ -631,11 +653,11 @@ handshake.
 
 The following capabilities **cannot be provided by local termination** and
 require the future true USB bridge (see
-["Future true USB bridge (not implemented)"](#future-true-usb-bridge-not-implemented)):
+["Future true USB bridge (not implemented)"](#earlier-plan-for-a-true-usb-bridge-now-native-tablet)).
+Windows hosts do not offer that bridge
+([ADR 0017](../adr/0017-forward-only-pen-input.md)), so on Windows they stay
+unavailable, as do more than 1,025 pressure steps and Wintab.
 
-- **Full 8192 pressure levels on Windows** — requires a kernel-mode Wintab
-  driver owning the physical device.
-- **Wintab API support on Windows** — same requirement.
 - **Tangential pressure / fingerwheel** (airbrush side-wheel) — a device
   feature not exposed by AppKit `NSEvent`; only accessible via raw HID.
 - **Vendor-driver pressure curves and device-specific calibration** — the
@@ -696,7 +718,39 @@ the future USB bridge described below.
   `experimental_raw_hid` is never admitted, regardless of local
   feature/env-var state.
 
-## Future true USB bridge (not implemented)
+## Native tablet: where each piece lives
+
+Native tablet (USB bridged) is the true USB bridge: the Deck's physical
+tablet is attached to the host, and since 0.19.0 there is one path for where
+its pen points (ADR 0023). Each piece has one home:
+
+| Piece | Owning crate and module | What it is |
+| --- | --- | --- |
+| Pen sample | `arcen-input` `tablet_pointer::PenSample`, `PenTool`, `AxisRange` | What a platform adapter produces: tool in proximity, x/y in device units with ranges, read time |
+| evdev decoding | `arcen-input` `tablet_pointer::EvdevPenFrames` | evdev frames to samples, with `SYN_DROPPED` resync |
+| Lead and mapping | `arcen-input` `tablet_pointer::PenPointerLead`, `PenPointerHub`, `PenMapping`, `x11_wacom_mapping`, `map_to_output` | Whether the pen leads, whether the host remapped the tablet, and the X server's and Mutter's scaling |
+| Host pointer reporting | `arcen-input` `host_pointer::HostPointerFeed`, `HostPointerReporter`, `HostPointerLayout` | Desktop to stream pixels, echo suppression, coalescing, 120 Hz limit |
+| Deck authority and mark | `arcen-input` `host_pointer::DeckHostPointer`, `PointerAuthority`, `led_pointer_mark` | Who leads on the Deck, and what to draw (a bridged pen always gets the pen dot) |
+| The wire record | `arcen-protocol` `cursor_position` (`CursorPosition`, frame `0x51`, `CursorPositionRelay`) | One position per record on the input/cursor lane; the relay renumbers for a split Pier |
+| Admission | `arcen-usb-bridge` `tablet_claim`, `bridged_device_guard` | Vendor-neutral: a device is a tablet because its report descriptors declare a pen |
+| Bridge engine | `arcen-usb-bridge` `exporter` (Deck side), `hid_host` (macOS Pier) | URB admission, cancellation, the interrupt hold, exactly-once release; a host-side HID driver over the bridge |
+| Desktop isolation (Linux) | `arcen-usb-bridge` `bridge_seat` | The per-port udev rule, the Xorg ignore and per-desktop classes, `PressureRecalibration` off |
+| Pen reader (macOS Pier) | `arcen-usb-bridge` `wacom_intuos_pen` (`IntuosPenReader`, `host_decoded_intuos_model`, `HOST_DECODED_INTUOS_MODELS`) | Reads a known model's pen packets; a new model is a table entry here |
+| Lab emulation | `arcen-usb-bridge` `wacom_intuos5` | An emulated Intuos5 with scripted strokes, for tests and lab proofs |
+
+Platform adapters only read devices and publish: the Linux Pier's
+`hosts/linux/src/usb_bridge/tablet_pointer.rs` (the bridged pen's evdev node,
+X11 and Wayland alike), the macOS Pier's `hosts/macos/src/bridged_tablet.rs`,
+and the Deck's `clients/macos/src/ui/sharp_cursor.rs`. **Extend the shared
+modules above; do not add another pen-position, mapping or admission
+mechanism.** A new Pier adds an adapter that produces `PenSample`s; a new
+tablet model on a macOS Pier is an entry in `HOST_DECODED_INTUOS_MODELS`
+with its packet layout.
+
+## Earlier plan for a true USB bridge (now Native tablet)
+
+> Superseded by Native tablet (see the section above, and ADRs 0019 to
+> 0023). Kept as the original boundary.
 
 Recorded here as a decision boundary, not a design in progress. A true USB
 bridge — where a host owns the physical tablet's full logical USB identity
@@ -717,7 +771,8 @@ requiring all of:
   control/feature/output transfers.
 - **A production-signed Windows virtual USB/HID driver** — a synthetic
   pointer device (this document's Windows backend) cannot present full USB
-  device semantics.
+  device semantics. Not funded, so Windows hosts do not offer the bridge
+  ([ADR 0017](../adr/0017-forward-only-pen-input.md)).
 - **An explicit low-latency network policy/warning**: USB bridging is
   latency-sensitive in a way local termination is not, and a bridge over a
   lossy or high-latency network needs its own documented warning and
@@ -762,7 +817,11 @@ logs/privacy checklist, plus the outstanding human-physical test gate.
   "Typed pen/tablet input" host section.
 - [`hosts/windows/ARCHITECTURE.md`](../../hosts/windows/ARCHITECTURE.md) —
   "Typed pen/tablet input" host section.
-- [`hosts/windows/todo_later.md`](../../hosts/windows/todo_later.md) — the
-  future true-USB-bridge roadmap entry.
+- [ADR 0012](../adr/0012-hard-usb-on-windows-hosts.md) — the route a true
+  USB bridge for Windows hosts would take (not taken).
+- [ADR 0017](../adr/0017-forward-only-pen-input.md) — no Wintab, and no
+  Native tablet on Windows hosts.
+- [ADR 0018](../adr/0018-unified-typed-devices.md) — proposed: typed pen
+  as the first class of a capability-announced device model.
 - [`legal/ORIGINS.md`](../../legal/ORIGINS.md) —
   provenance record.

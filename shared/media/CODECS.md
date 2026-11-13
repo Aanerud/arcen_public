@@ -1,8 +1,7 @@
 # Codecs: adding, changing, and updating
 
 This is the runbook for changing what Arcen can encode. It is written so a
-competent engineer who has never read this crate can ship a new codec safely in
-an afternoon.
+competent engineer who has never read this crate can ship a new codec safely.
 
 Read the whole page before starting. It is short on purpose.
 

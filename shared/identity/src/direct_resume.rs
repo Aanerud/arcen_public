@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Direct-QUIC reconnect grant contracts.
 
 use crate::{DisclaimerDigest, HostIdentity};
@@ -1553,7 +1555,7 @@ mod tests {
             ),
             (
                 "audience",
-                serde_json::json!("gateway"),
+                serde_json::json!("another-audience"),
                 DirectResumeError::AudienceMismatch,
             ),
             (

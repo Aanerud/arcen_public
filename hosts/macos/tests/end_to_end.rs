@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! End-to-end proof that a client can reach the macOS Pier.
 //!
 //! This dials the real listener over QUIC with the real certificate, using the
@@ -578,6 +580,104 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
         stats.mean_send_ms
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Real `ScreenCaptureKit` Grading to a client that presents `srgb`: the
+/// `xf44` capture (sRGB code values) reaches the wire as HEVC 4:4:4 ten-bit
+/// whose own SPS says transfer 13 (IEC 61966-2-1) and BT.709 primaries and
+/// matrix. An older Deck's plan keeps `bt709` (unit-tested in `session`).
+#[tokio::test]
+async fn a_grading_stream_for_an_srgb_deck_says_srgb_in_its_sps() {
+    let _desktop = exclusive_desktop();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = temp_dir("grading-srgb");
+    arcen_pier_macos::host_cert::provision(
+        &dir,
+        ProvisioningRequest::Ensure,
+        &["localhost".to_owned()],
+        1_800_000_000,
+    )
+    .expect("provision");
+    let paths = MaterialPaths::in_directory(&dir);
+    let config = arcen_pier_macos::net::server_config(&paths.certificate, &paths.key)
+        .expect("server config");
+    let listener = Listener::bind("127.0.0.1:0".parse().expect("address"), config).expect("bind");
+    let bound = listener.local_addr().expect("bound");
+
+    const WANTED: u64 = 10;
+    let server = tokio::spawn(async move {
+        let (mut socket, _peer) = listener.accept().await.expect("accept");
+        let offered = hello_only(&mut socket).await;
+        let capture =
+            arcen_pier_macos::capture::CaptureConfig::grading(offered.display_id, 256, 256, 30)
+                .stating_sdr_transfer("srgb");
+        arcen_pier_macos::stream::stream(
+            &mut socket,
+            arcen_pier_macos::stream::StreamSession {
+                microphone: None,
+                capture,
+                codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
+                frame_budget: Some(WANTED),
+                input_bounds: arcen_pier_macos::input::DesktopBounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(offered.width),
+                    f64::from(offered.height),
+                ),
+                telemetry: arcen_pier_macos::observability::HostTelemetry::disabled(),
+                session_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([7; 16]),
+                audio: None,
+                clipboard: test_clipboard(),
+                cursor_mode: arcen_protocol::messages::CursorMode::Local,
+                audio_channel: None,
+                audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
+                input_mode_results: Default::default(),
+                path_signal_connection: None,
+            },
+        )
+        .await
+        .expect("stream")
+    });
+
+    let mut client = connect_pinned(&paths.certificate, bound).await;
+    client_hello_only(&mut client).await;
+    let mut truth = None;
+    while truth.is_none() {
+        let message = tokio::time::timeout(Duration::from_secs(20), client.next())
+            .await
+            .expect("a frame arrives in time")
+            .expect("a frame")
+            .expect("a valid frame");
+        let Message::Binary(bytes) = message else {
+            continue;
+        };
+        let header = arcen_protocol::wire::decode_video_header(&bytes).expect("a video header");
+        if header.is_keyframe() {
+            truth = Some(
+                arcen_media::hevc_sps::stream_truth_in_access_unit(
+                    &bytes[arcen_protocol::wire::VIDEO_HEADER_SIZE..],
+                )
+                .expect("the keyframe carries an SPS"),
+            );
+        }
+    }
+    let truth = truth.expect("an SPS");
+    let colour = truth.colour.expect("a colour description");
+    println!("e2e grading srgb: {}", truth.summary());
+    assert_eq!(truth.chroma_format_idc, 3, "4:4:4");
+    assert_eq!(truth.bit_depth_luma, 10);
+    assert_eq!(
+        (colour.primaries, colour.transfer, colour.matrix),
+        (1, 13, 1),
+        "BT.709 primaries and matrix, sRGB transfer"
+    );
+    assert!(colour.full_range);
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(20), server).await;
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1382,16 +1482,26 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
     let mut client = connect_pinned(&paths.certificate, bound).await;
     client_hello_only(&mut client).await;
 
-    // A stroke, in the order a digitizer reports one.
+    // A stroke, in the order a digitizer reports one, then a barrel-button
+    // click while hovering and an eraser pass: each end of the pen and each
+    // kind of edge the shared planner produces.
     let stroke = [
-        (0.40, 0.40, 0.0_f32, false, true),
-        (0.41, 0.41, 0.25, true, true),
-        (0.42, 0.42, 0.60, true, true),
-        (0.43, 0.43, 0.90, true, true),
-        (0.44, 0.44, 0.0, false, true),
-        (0.44, 0.44, 0.0, false, false),
+        (0.40, 0.40, 0.0_f32, false, true, "tip", 0_u8),
+        (0.41, 0.41, 0.25, true, true, "tip", 0),
+        (0.42, 0.42, 0.60, true, true, "tip", 0),
+        (0.43, 0.43, 0.90, true, true, "tip", 0),
+        (0.44, 0.44, 0.0, false, true, "tip", 0),
+        (0.44, 0.44, 0.0, false, true, "tip", 1),
+        (0.44, 0.44, 0.0, false, true, "tip", 0),
+        (0.44, 0.44, 0.0, false, false, "tip", 0),
+        (0.42, 0.40, 0.0, false, true, "eraser", 0),
+        (0.42, 0.41, 0.50, true, true, "eraser", 0),
+        (0.42, 0.42, 0.0, false, true, "eraser", 0),
+        (0.42, 0.42, 0.0, false, false, "eraser", 0),
     ];
-    for (index, (x, y, pressure, touching, in_proximity)) in stroke.iter().enumerate() {
+    for (index, (x, y, pressure, touching, in_proximity, tool, buttons)) in
+        stroke.iter().enumerate()
+    {
         client
             .send(Message::Text(
                 serde_json::json!({
@@ -1400,10 +1510,10 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
                     "pressure": pressure,
                     "tilt_x_degrees": 30.0, "tilt_y_degrees": -15.0,
                     "rotation_degrees": 12.0,
-                    "tool": "tip",
+                    "tool": tool,
                     "in_proximity": in_proximity,
                     "touching": touching,
-                    "buttons": 0,
+                    "buttons": buttons,
                     "server_x": 0, "server_y": 0,
                     "sequence": index as u64 + 1,
                     "timestamp_ns": 0
@@ -1440,15 +1550,231 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
         stats.input
     );
     // Entering and leaving proximity are the two edges that a host handling
-    // only steady-state samples would silently drop, stranding the tool.
+    // only steady-state samples would silently drop, stranding the tool. Two
+    // tools, so two pairs.
     assert!(
-        stats.input.pen_proximity_edges >= 2,
+        stats.input.pen_proximity_edges >= 4,
         "proximity in and out must both be posted, stats: {:?}",
         stats.input
     );
     println!(
         "e2e pen: {} samples, {} proximity edges, {} rejected",
         stats.input.pen_samples, stats.input.pen_proximity_edges, stats.input.pen_rejected,
+    );
+}
+
+/// The application this process will type into, when it is frontmost.
+///
+/// Committed text is posted to the HID event stream, so it lands in whatever
+/// application is frontmost. The lab harness names the one it opened (a text
+/// probe) and this refuses to send anything unless that application is in
+/// front at that moment and has not reported losing focus.
+fn text_target_is_frontmost(target_pid: &str, abort_file: Option<&str>) -> bool {
+    if abort_file.is_some_and(|path| std::path::Path::new(path).exists()) {
+        return false;
+    }
+    let front = std::process::Command::new("lsappinfo")
+        .arg("front")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let Some(front) = front.filter(|front| !front.is_empty()) else {
+        return false;
+    };
+    std::process::Command::new("lsappinfo")
+        .args(["info", "-only", "pid", &front])
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .rsplit('=')
+                .next()
+                .is_some_and(|pid| pid.trim() == target_pid)
+        })
+}
+
+/// Sends committed text as a Deck does and checks the desktop typed it, and
+/// that the Deck is sent `health_stats` with the measured QUIC path.
+///
+/// Types into the frontmost application, so it does nothing unless
+/// `ARCEN_E2E_TEXT_TARGET_PID` names a target the harness opened (and checks
+/// that target is frontmost before every commit). What the target received
+/// is read back by the harness, not here.
+#[ignore = "types into the frontmost application on the machine running it"]
+#[tokio::test]
+async fn committed_text_is_typed_and_health_stats_carry_the_path() {
+    let Ok(target_pid) = std::env::var("ARCEN_E2E_TEXT_TARGET_PID") else {
+        eprintln!("ARCEN_E2E_TEXT_TARGET_PID unset: nothing typed");
+        return;
+    };
+    let abort_file = std::env::var("ARCEN_E2E_TEXT_ABORT_FILE").ok();
+    let _desktop = exclusive_desktop();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = temp_dir("text");
+    arcen_pier_macos::host_cert::provision(
+        &dir,
+        ProvisioningRequest::Ensure,
+        &["localhost".to_owned()],
+        1_800_000_000,
+    )
+    .expect("provision");
+    let paths = MaterialPaths::in_directory(&dir);
+    let config = arcen_pier_macos::net::server_config(&paths.certificate, &paths.key)
+        .expect("server config");
+    let listener = Listener::bind("127.0.0.1:0".parse().expect("address"), config).expect("bind");
+    let bound = listener.local_addr().expect("bound");
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _peer) = listener.accept().await.expect("accept");
+        let offered = hello_only(&mut socket).await;
+        let capture = arcen_pier_macos::capture::CaptureConfig::sdr(
+            offered.display_id,
+            offered.width as usize,
+            offered.height as usize,
+            60,
+        );
+        let path_signal_connection = socket.get_ref().path_signal_connection();
+        arcen_pier_macos::stream::stream(
+            &mut socket,
+            arcen_pier_macos::stream::StreamSession {
+                microphone: None,
+                capture,
+                codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
+                frame_budget: None,
+                input_bounds: arcen_pier_macos::input::DesktopBounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(offered.width),
+                    f64::from(offered.height),
+                ),
+                telemetry: arcen_pier_macos::observability::HostTelemetry::disabled(),
+                session_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([23; 16]),
+                audio: None,
+                clipboard: test_clipboard(),
+                // Host: a test process has no window-server connection for
+                // the local-cursor watcher, and the cursor is not under test.
+                cursor_mode: arcen_protocol::messages::CursorMode::Host,
+                audio_channel: None,
+                audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
+                input_mode_results: Default::default(),
+                path_signal_connection,
+            },
+        )
+        .await
+        .expect("stream")
+    });
+
+    let mut client = connect_pinned(&paths.certificate, bound).await;
+    let hello = tokio::time::timeout(Duration::from_secs(10), client.next())
+        .await
+        .expect("server_hello in time")
+        .expect("frame")
+        .expect("valid");
+    let Message::Text(hello) = hello else {
+        panic!("server_hello is text");
+    };
+    let hello: arcen_protocol::messages::ServerHelloMsg =
+        serde_json::from_str(&hello).expect("server_hello parses");
+    println!(
+        "e2e text: hello text_commit={:?} text_commit_unicode={:?}",
+        hello.input_capabilities.text_commit, hello.input_capabilities.text_commit_unicode
+    );
+    assert!(
+        arcen_protocol::messages::supports_text_commit_v1(hello.input_capabilities),
+        "this process holds the keyboard grant, so the hello must offer text"
+    );
+    client
+        .send(Message::Text(
+            serde_json::json!({ "type": arcen_protocol::messages::CLIENT_HELLO }).to_string(),
+        ))
+        .await
+        .expect("client_hello");
+
+    let texts = [
+        "Arcen text ÆØÅ æøå ".to_owned(),
+        "😀 👍🏽 👨\u{200D}👩\u{200D}👧 🇳🇴 e\u{301} ".to_owned(),
+        format!("{} ", "0123456789abcdefghijklmnopqrstuvwxyz😀".repeat(8)),
+        "end.".to_owned(),
+    ];
+    let mut sent_chars = 0_u64;
+    let mut health = Vec::new();
+    let mut refusals = 0_u32;
+    let mut drain = |message: Option<Result<Message, _>>| {
+        if let Some(Ok(Message::Text(text))) = message {
+            if let Ok(stats) =
+                serde_json::from_str::<arcen_protocol::messages::HealthStatsMsg>(&text)
+                && stats.msg_type == arcen_protocol::messages::HEALTH_STATS
+            {
+                health.push(stats);
+            } else if text.contains(arcen_protocol::messages::TEXT_COMMIT_RESULT) {
+                refusals += 1;
+                println!("e2e text: result {text}");
+            }
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (index, text) in texts.iter().enumerate() {
+        assert!(
+            text_target_is_frontmost(&target_pid, abort_file.as_deref()),
+            "the target is not frontmost: nothing more is typed"
+        );
+        let message = arcen_protocol::messages::TextCommitMsg::new(text.clone(), index as u64 + 1);
+        message.validate().expect("a valid commit");
+        client
+            .send(Message::Text(
+                serde_json::to_string(&message).expect("json"),
+            ))
+            .await
+            .expect("text_commit sends");
+        sent_chars += text.chars().count() as u64;
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        while let Ok(message) = tokio::time::timeout_at(deadline.into(), client.next()).await {
+            drain(message);
+        }
+    }
+    // Two health windows at least.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Ok(message) = tokio::time::timeout(Duration::from_millis(200), client.next()).await {
+            drain(message);
+        }
+    }
+    drop(client);
+    let stats = tokio::time::timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the Pier finishes")
+        .expect("no panic");
+
+    for stats in &health {
+        println!(
+            "e2e health_stats: fps={} target={} frames={} mbps={:.3} state={:?} window={:?} path={:?}",
+            stats.fps_actual,
+            stats.fps_target,
+            stats.frames_sent,
+            stats.bandwidth_mbps,
+            stats.health_state,
+            stats
+                .sample_window_secs
+                .map(arcen_protocol::messages::SampleWindowSecs::get),
+            stats.path,
+        );
+    }
+    println!(
+        "e2e text: sent_chars={sent_chars} typed_chars={} refused={} results={refusals} health_stats={}",
+        stats.input.text_chars,
+        stats.input.text_refused,
+        health.len()
+    );
+    assert_eq!(refusals, 0, "no commit may be refused");
+    assert_eq!(stats.input.text_chars, sent_chars);
+    assert!(health.len() >= 2, "a health_stats every two seconds");
+    assert!(
+        health.iter().all(|stats| stats.path.is_some()),
+        "the path is measured on the connection this process owns"
     );
 }
 
@@ -2001,5 +2327,678 @@ async fn a_still_desktop_sends_almost_nothing() {
         rate < f64::from(REQUESTED_FPS) * 0.9,
         "the host suppressed {} frames yet still sent {rate:.2} fps",
         stats.frames_suppressed
+    );
+}
+
+/// Live proof that a still screen stays healthy: a real stream for
+/// `ARCEN_E2E_STILL_SECS` (default 75), every `health_stats` window judged,
+/// and a second capture of the same picture counting `ScreenCaptureKit`'s
+/// `Idle` buffers per second. Run with `ARCEN_TEST_CAPTURE_NO_WINDOWS=1` (a
+/// debug-build capture hook that excludes every window) when the machine's
+/// own screen is in use.
+#[tokio::test]
+#[ignore = "streams the real screen for over a minute"]
+#[allow(clippy::too_many_lines)]
+async fn a_still_screen_stays_healthy_for_a_minute() {
+    let seconds: u64 = std::env::var("ARCEN_E2E_STILL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(75);
+    let _desktop = exclusive_desktop();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = temp_dir("still");
+    arcen_pier_macos::host_cert::provision(
+        &dir,
+        ProvisioningRequest::Ensure,
+        &["localhost".to_owned()],
+        1_800_000_000,
+    )
+    .expect("provision");
+    let paths = MaterialPaths::in_directory(&dir);
+    let config = arcen_pier_macos::net::server_config(&paths.certificate, &paths.key)
+        .expect("server config");
+    let listener = Listener::bind("127.0.0.1:0".parse().expect("address"), config).expect("bind");
+    let bound = listener.local_addr().expect("bound");
+    let display = unsafe { objc2_core_graphics::CGMainDisplayID() };
+
+    // The observer: the same display, counted once a second.
+    let observing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let observer_running = std::sync::Arc::clone(&observing);
+    let observer = std::thread::spawn(move || {
+        let session = arcen_pier_macos::capture::CaptureSession::start(
+            arcen_pier_macos::capture::CaptureConfig::sdr(display, 1280, 720, 30),
+        )
+        .expect("observer capture starts");
+        let mut per_second = Vec::new();
+        let mut frames = 0_u64;
+        let mut second = std::time::Instant::now();
+        let mut idle_mark = 0;
+        let mut frame_mark = 0;
+        while observer_running.load(std::sync::atomic::Ordering::Relaxed) {
+            if session.next_frame(Duration::from_millis(50)).is_ok() {
+                frames += 1;
+            }
+            if second.elapsed() >= Duration::from_secs(1) {
+                let idle = session.unchanged_frames();
+                per_second.push((idle - idle_mark, frames - frame_mark));
+                idle_mark = idle;
+                frame_mark = frames;
+                second = std::time::Instant::now();
+            }
+        }
+        session.stop();
+        per_second
+    });
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _peer) = listener.accept().await.expect("accept");
+        let offered = hello_only(&mut socket).await;
+        let capture = arcen_pier_macos::capture::CaptureConfig::sdr(
+            offered.display_id,
+            offered.width as usize,
+            offered.height as usize,
+            30,
+        );
+        let path_signal_connection = socket.get_ref().path_signal_connection();
+        arcen_pier_macos::stream::stream(
+            &mut socket,
+            arcen_pier_macos::stream::StreamSession {
+                microphone: None,
+                capture,
+                codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
+                frame_budget: None,
+                input_bounds: arcen_pier_macos::input::DesktopBounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(offered.width),
+                    f64::from(offered.height),
+                ),
+                telemetry: arcen_pier_macos::observability::HostTelemetry::disabled(),
+                session_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([29; 16]),
+                audio: None,
+                clipboard: test_clipboard(),
+                cursor_mode: arcen_protocol::messages::CursorMode::Host,
+                audio_channel: None,
+                audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
+                input_mode_results: Default::default(),
+                path_signal_connection,
+            },
+        )
+        .await
+        .expect("stream")
+    });
+
+    let mut client = connect_pinned(&paths.certificate, bound).await;
+    let _hello = tokio::time::timeout(Duration::from_secs(10), client.next())
+        .await
+        .expect("server_hello in time");
+    client
+        .send(Message::Text(
+            serde_json::json!({ "type": arcen_protocol::messages::CLIENT_HELLO }).to_string(),
+        ))
+        .await
+        .expect("client_hello");
+    let started = std::time::Instant::now();
+    let mut health = Vec::new();
+    let mut video = 0_u64;
+    while started.elapsed() < Duration::from_secs(seconds) {
+        match tokio::time::timeout(Duration::from_millis(200), client.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(stats) =
+                    serde_json::from_str::<arcen_protocol::messages::HealthStatsMsg>(&text)
+                    && stats.msg_type == arcen_protocol::messages::HEALTH_STATS
+                {
+                    health.push((started.elapsed().as_secs_f64(), stats));
+                }
+            }
+            Ok(Some(Ok(Message::Binary(_)))) => video += 1,
+            _ => {}
+        }
+    }
+    drop(client);
+    let stats = tokio::time::timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the Pier finishes")
+        .expect("no panic");
+    observing.store(false, std::sync::atomic::Ordering::Relaxed);
+    let per_second = observer.join().expect("observer");
+
+    for (at, stats) in &health {
+        println!(
+            "still health_stats t={at:5.1}s fps={} target={} frames={} state={:?}",
+            stats.fps_actual, stats.fps_target, stats.frames_sent, stats.health_state
+        );
+    }
+    println!("still observer per second (idle_buffers, frames): {per_second:?}");
+    println!(
+        "still summary: secs={seconds} video_msgs={video} health_stats={} captured={} sent={} \
+         unchanged={} suppressed={} detail_skipped={} superseded={} dropped={}",
+        health.len(),
+        stats.frames_captured,
+        stats.frames_sent,
+        stats.frames_unchanged,
+        stats.frames_suppressed,
+        stats.frames_detail_skipped,
+        stats.raw_frames_superseded,
+        stats.frames_dropped,
+    );
+    // Past the shared ten-second warm-up, every window must be healthy.
+    let judged: Vec<_> = health.iter().filter(|(at, _)| *at > 12.0).collect();
+    assert!(judged.len() >= 25, "a health window every two seconds");
+    assert!(
+        judged
+            .iter()
+            .all(|(_, stats)| stats.health_state
+                == Some(arcen_protocol::messages::HealthStateMsg::Ok)),
+        "a still screen read as unhealthy"
+    );
+}
+
+/// Native tablet end to end (ADR 0022): the real Pier stream and lane
+/// transport, the shared USB host adapter, the entitled `hid-injector` child
+/// and real `IOHIDUserDevice`s, against the Deck's own exporter serving the
+/// emulated Intuos5 (what `input-smoke --usb-emulate wacom-intuos5` does).
+///
+/// Needs `ARCEN_E2E_PIER_PROGRAM` = a Pier built with `lab-bridged-hid-probe` and
+/// signed with the virtual HID entitlement, run from a process whose
+/// responsible app holds Accessibility. It hovers the pen only (pressure 0):
+/// if the tablet maker's driver is installed it may move the pointer, and it
+/// never clicks. `probe-bridged-hid` of that Pier reads what the HID system
+/// sees, sends the Wacom mode switch through it and counts reports.
+#[cfg(feature = "lab-bridged-hid-probe")]
+#[ignore = "publishes real HID devices on the machine running it"]
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down() {
+    use arcen_usb_bridge::{
+        INTUOS5_GRIP_PEN_TOOL_ID, INTUOS5_PEN_IN, Intuos5PenReport, Intuos5PenState, ReleaseReason,
+        SCRIPTED_PEN_SERIAL, SyntheticDevice, UrbSubmission, UsbExporter, WacomIntuos5,
+    };
+    const REPORTS: usize = 800;
+    let Some(program) = std::env::var_os("ARCEN_E2E_PIER_PROGRAM").map(std::path::PathBuf::from)
+    else {
+        println!("ARCEN_E2E_PIER_PROGRAM is not set; nothing to publish");
+        return;
+    };
+    let _desktop = exclusive_desktop();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let probe = |arguments: &[&str]| {
+        let output = std::process::Command::new(&program)
+            .arg("probe-bridged-hid")
+            .args(arguments)
+            .output()
+            .expect("run probe-bridged-hid");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        println!("--- probe-bridged-hid {arguments:?}\n{text}");
+        text
+    };
+    assert!(
+        probe(&[]).contains("bridged_hid devices=0"),
+        "no bridged device before the session"
+    );
+
+    // As a freshly started agent or `serve`: the capability probe starts
+    // now, and the very first Deck arrives while it is still running.
+    arcen_pier_macos::bridged_tablet::set_injector_program(program.clone());
+    assert_eq!(
+        arcen_pier_macos::bridged_tablet::availability(true),
+        Err(arcen_pier_macos::bridged_tablet::LOGIN_WINDOW.to_owned()),
+        "never at the login window"
+    );
+
+    // The Deck's half: the shared exporter serving the emulated tablet.
+    let (device, handle) = SyntheticDevice::emulate(WacomIntuos5::new()).expect("emulate");
+    let exporter = Arc::new(
+        UsbExporter::new(Box::new(device))
+            .map_err(|(refusal, _)| refusal.to_string())
+            .expect("the shared policy admits the emulated tablet"),
+    );
+    let facts = exporter.facts();
+    let claim = arcen_protocol::messages::UsbHardDeviceMsg {
+        vendor_id: facts.snapshot.id.vendor_id,
+        product_id: facts.snapshot.id.product_id,
+        bcd_device: facts.snapshot.id.bcd_device,
+        device_class: facts.snapshot.device_class,
+        speed: facts.speed,
+        hid_report_descriptors: facts
+            .report_descriptors
+            .iter()
+            .map(|report| {
+                arcen_protocol::messages::UsbHidReportDescriptorMsg::new(
+                    report.interface,
+                    &report.descriptor,
+                )
+            })
+            .collect(),
+    };
+
+    let dir = temp_dir("native-tablet");
+    arcen_pier_macos::host_cert::provision(
+        &dir,
+        ProvisioningRequest::Ensure,
+        &["localhost".to_owned()],
+        1_800_000_000,
+    )
+    .expect("provision");
+    let paths = MaterialPaths::in_directory(&dir);
+    let config = arcen_pier_macos::net::server_config(&paths.certificate, &paths.key)
+        .expect("server config");
+    let listener = Listener::bind("127.0.0.1:0".parse().expect("address"), config).expect("bind");
+    let bound = listener.local_addr().expect("bound");
+    let server = tokio::spawn(async move {
+        let (mut socket, _peer) = listener.accept().await.expect("accept");
+        // The handshake's own steps, minus the credential gate: advertise,
+        // settle Native tablet before the hello (the first connection is
+        // offered it), then negotiate from the Deck's real client hello.
+        let mut offered = arcen_pier_macos::session::advertise().expect("a display to offer");
+        let settling = std::time::Instant::now();
+        offered.native_tablet = arcen_pier_macos::bridged_tablet::settled_availability(
+            false,
+            arcen_pier_macos::bridged_tablet::PROBE_WAIT,
+        )
+        .await;
+        println!(
+            "native tablet offer settled in {:.0} ms: {:?}",
+            settling.elapsed().as_secs_f64() * 1000.0,
+            offered.native_tablet
+        );
+        arcen_pier_macos::net::send_json(
+            &mut socket,
+            arcen_pier_macos::session::server_hello_json(&offered, "e2e"),
+        )
+        .await
+        .expect("server_hello");
+        let reply = arcen_pier_macos::net::receive_json(&mut socket)
+            .await
+            .expect("receive")
+            .expect("a client_hello");
+        let client_hello: arcen_protocol::messages::ClientHelloMsg =
+            serde_json::from_str(&reply).expect("a client_hello");
+        let results = arcen_pier_macos::session::negotiate_input_modes(
+            arcen_protocol::messages::CursorMode::Host,
+            Some(&client_hello),
+            &offered.native_tablet,
+        );
+        assert!(
+            results.native_tablet.is_some(),
+            "Native tablet accepted on the first connection: {:?}",
+            results.tablet
+        );
+        let capture = arcen_pier_macos::capture::CaptureConfig::sdr(
+            offered.display_id,
+            offered.width as usize,
+            offered.height as usize,
+            30,
+        );
+        arcen_pier_macos::stream::stream(
+            &mut socket,
+            arcen_pier_macos::stream::StreamSession {
+                microphone: None,
+                capture,
+                codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
+                frame_budget: None,
+                input_bounds: arcen_pier_macos::input::DesktopBounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(offered.width),
+                    f64::from(offered.height),
+                ),
+                telemetry: arcen_pier_macos::observability::HostTelemetry::disabled(),
+                session_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([22; 16]),
+                audio: None,
+                clipboard: None,
+                // Host cursor: a test process has no NSApplication, so the
+                // Deck-cursor watcher has no cursor to read.
+                cursor_mode: arcen_protocol::messages::CursorMode::Host,
+                audio_channel: None,
+                audio_encoding: arcen_pier_macos::stream::AudioEncoding::Pcm,
+                motion_priority: arcen_media::video::MotionPriority::Detail,
+                requested_pipeline: None,
+                served_pipeline: None,
+                input_mode_results: results,
+                path_signal_connection: None,
+            },
+        )
+        .await
+    });
+
+    let mut client = connect_pinned(&paths.certificate, bound).await;
+    // The Deck's half of the hello: it captures its tablet only for a host
+    // that offers Native tablet, then names the device in its client hello.
+    let server_hello = tokio::time::timeout(Duration::from_secs(10), client.next())
+        .await
+        .expect("server_hello in time")
+        .expect("frame")
+        .expect("valid");
+    let Message::Text(server_hello) = server_hello else {
+        panic!("expected a text server_hello");
+    };
+    let server_hello: arcen_protocol::messages::ServerHelloMsg =
+        serde_json::from_str(&server_hello).expect("a server_hello");
+    assert!(server_hello.usb_hard_v1, "offered on the first connection");
+    assert_eq!(
+        server_hello.tablet_mode_capabilities.usb_tablet_bridge,
+        arcen_protocol::messages::InputCapabilityAvailability::Available
+    );
+    let client_hello = arcen_protocol::messages::ClientHelloMsg {
+        tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::UsbTabletBridge,
+        tablet_mode_capabilities: arcen_protocol::messages::TabletModeCapabilitiesMsg {
+            usb_tablet_bridge: arcen_protocol::messages::InputCapabilityAvailability::Available,
+            ..arcen_protocol::messages::TabletModeCapabilitiesMsg::default()
+        },
+        usb_hard_v1: true,
+        usb_hard_device: Some(claim),
+        ..arcen_protocol::messages::ClientHelloMsg::default()
+    };
+    client
+        .send(Message::Text(
+            serde_json::to_string(&client_hello).expect("encode"),
+        ))
+        .await
+        .expect("client_hello");
+    let tablet_results = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    // The Deck's completion pump.
+    let (completions_tx, mut completions) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pump = {
+        let exporter = Arc::clone(&exporter);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                if let Ok(Some(done)) = exporter.next_completion_within(Duration::from_millis(50)) {
+                    let frame = arcen_protocol::encode_usb_urb_complete(
+                        arcen_protocol::UsbUrbCompletionHeader {
+                            generation: done.generation,
+                            urb_id: done.urb_id,
+                            status: done.status,
+                            actual_length: u32::try_from(done.data.len()).expect("bounded"),
+                        },
+                        &done.data,
+                    )
+                    .expect("encode completion");
+                    if completions_tx.send(frame).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    };
+    let serve_deck = |client: &mut LaneClient, frame: Message| {
+        let bytes = match frame {
+            Message::Binary(bytes) => bytes,
+            Message::Text(text) => {
+                if text.contains(arcen_protocol::messages::TABLET_MODE_RESULT) {
+                    println!("tablet_mode_result: {text}");
+                    tablet_results.lock().expect("lock").push(text.clone());
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        match bytes.first().copied() {
+            Some(kind) if kind == arcen_protocol::FrameType::UsbBridgeUrbSubmit as u8 => {
+                let (header, payload) =
+                    arcen_protocol::decode_usb_urb_submit(&bytes).expect("a valid submit");
+                exporter
+                    .submit(
+                        UrbSubmission {
+                            generation: header.generation,
+                            urb_id: header.urb_id,
+                            endpoint: header.endpoint,
+                            transfer_kind: header.transfer_kind,
+                            timeout_ms: header.timeout_ms,
+                            declared_length: header.declared_length,
+                            setup: header.setup,
+                        },
+                        payload,
+                    )
+                    .expect("the exporter admits every request the Pier makes");
+                None
+            }
+            Some(kind) if kind == arcen_protocol::FrameType::UsbBridgeUrbCancel as u8 => {
+                let (generation, urb) =
+                    arcen_protocol::decode_usb_urb_cancel(&bytes).expect("a valid cancel");
+                let _ = client;
+                exporter.cancel(generation, urb).ok()
+            }
+            _ => None,
+        }
+    };
+    let pump_deck = async |client: &mut LaneClient,
+                           completions: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+                           duration: Duration| {
+        let until = tokio::time::Instant::now() + duration;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(until) => return,
+                frame = client.next() => {
+                    let Some(Ok(frame)) = frame else { return };
+                    if let Some(cancelled) = serve_deck(client, frame) {
+                        let frame = arcen_protocol::encode_usb_urb_complete(
+                            arcen_protocol::UsbUrbCompletionHeader {
+                                generation: cancelled.generation,
+                                urb_id: cancelled.urb_id,
+                                status: cancelled.status,
+                                actual_length: u32::try_from(cancelled.data.len()).expect("bounded"),
+                            },
+                            &cancelled.data,
+                        )
+                        .expect("encode");
+                        client.send(Message::Binary(frame)).await.expect("send");
+                    }
+                }
+                Some(frame) = completions.recv() => {
+                    client.send(Message::Binary(frame)).await.expect("send completion");
+                }
+            }
+        }
+    };
+
+    // Enumeration, then the devices: the Pier polls the pen once they exist.
+    let started = std::time::Instant::now();
+    while handle.held_on(INTUOS5_PEN_IN) == 0 && started.elapsed() < Duration::from_secs(15) {
+        pump_deck(&mut client, &mut completions, Duration::from_millis(100)).await;
+    }
+    assert!(
+        handle.held_on(INTUOS5_PEN_IN) > 0,
+        "the Pier polls the pen interface once its devices exist"
+    );
+    let accepted: arcen_protocol::messages::TabletModeResultMsg = serde_json::from_str(
+        tablet_results
+            .lock()
+            .expect("lock")
+            .first()
+            .expect("a tablet_mode_result"),
+    )
+    .expect("a tablet_mode_result");
+    assert!(accepted.accepted && !accepted.reconnect_required);
+    assert_eq!(
+        accepted.active,
+        arcen_protocol::messages::TabletModeMsg::UsbTabletBridge
+    );
+    println!(
+        "published and polling after {:.0} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // A hover pass at the pen's own pace: one report per poll, every 5 ms.
+    let player = {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_500));
+            let mut delivered = 0_usize;
+            let enter = Intuos5PenReport::Enter {
+                tool_id: INTUOS5_GRIP_PEN_TOOL_ID,
+                serial: SCRIPTED_PEN_SERIAL,
+            };
+            let mut reports = vec![enter.encode().to_vec()];
+            for step in 0..REPORTS - 2 {
+                let state = Intuos5PenState {
+                    x: 20_000 + u32::try_from(step).expect("small") * 30,
+                    y: 20_000,
+                    pressure: 0,
+                    distance: 20,
+                    ..Intuos5PenState::default()
+                };
+                reports.push(Intuos5PenReport::Pen(state).encode().to_vec());
+            }
+            reports.push(Intuos5PenReport::Exit.encode().to_vec());
+            for report in reports {
+                if handle.deliver_when_polled(INTUOS5_PEN_IN, report, Duration::from_secs(1)) {
+                    delivered += 1;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            delivered
+        })
+    };
+    let probing = {
+        let program = program.clone();
+        std::thread::spawn(move || {
+            let output = std::process::Command::new(&program)
+                .args(["probe-bridged-hid", "--mode-switch", "--count", "5"])
+                .output()
+                .expect("run probe-bridged-hid");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        })
+    };
+    while !(player.is_finished() && probing.is_finished()) {
+        pump_deck(&mut client, &mut completions, Duration::from_millis(100)).await;
+    }
+    let delivered = player.join().expect("player");
+    let seen = probing.join().expect("probe");
+    println!("--- probe-bridged-hid --mode-switch --count 5\n{seen}");
+    println!(
+        "pen reports delivered by the Deck side: {delivered}; wacom_mode={}",
+        handle.inspect(WacomIntuos5::wacom_mode)
+    );
+    assert!(
+        seen.contains("bridged_hid devices=1"),
+        "only the pen interface is published; touch (0xFF00) and the boot mouse are withheld on macOS"
+    );
+    assert!(!seen.contains("usage_page=0x0001"), "no mouse device");
+    assert!(seen.contains("vendor=0x056a product=0x0317"));
+    // The device is created with `Transport` "USB"; macOS 26 publishes every
+    // IOHIDUserDevice as "Virtual" whatever it was given (measured), so the
+    // value is reported, not asserted.
+    assert!(seen.contains("transport=\"USB\"") || seen.contains("transport=\"Virtual\""));
+    assert!(
+        seen.contains("answer=[2, 2]"),
+        "the mode switch crossed the bridge"
+    );
+    assert!(
+        handle.inspect(WacomIntuos5::wacom_mode),
+        "the tablet left mouse mode"
+    );
+    assert!(delivered > REPORTS / 2, "the pen was polled continuously");
+
+    if std::env::var_os("ARCEN_E2E_TABLET_HOLD").is_some() {
+        println!("HOLDING pid={}", std::process::id());
+        pump_deck(&mut client, &mut completions, Duration::from_secs(60)).await;
+    }
+
+    // The console leaves this account (as at a Fast User Switch or a return
+    // to the login window): the devices go at once and the Deck is told,
+    // while the session streams on. The console is switched in-process
+    // (lab builds); switching the real one needs a second account here.
+    if let Some(switch) = std::env::var_os("ARCEN_E2E_TABLET_CONSOLE") {
+        let holder = if switch == "other-user" {
+            arcen_session::agent_relay::ConsoleHolder::User(u32::MAX - 1)
+        } else {
+            arcen_session::agent_relay::ConsoleHolder::LoginWindow
+        };
+        let checking = {
+            let program = program.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                loop {
+                    let output = std::process::Command::new(&program)
+                        .arg("probe-bridged-hid")
+                        .output()
+                        .expect("run probe-bridged-hid");
+                    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    if text.contains("bridged_hid devices=0")
+                        || started.elapsed() > Duration::from_secs(3)
+                    {
+                        return (started.elapsed(), text);
+                    }
+                }
+            })
+        };
+        let switched = std::time::Instant::now();
+        arcen_pier_macos::bridged_tablet::set_console_holder_for_lab_tests(Some(holder));
+        while !checking.is_finished() {
+            pump_deck(&mut client, &mut completions, Duration::from_millis(50)).await;
+        }
+        let (gone_after, seen) = checking.join().expect("checker");
+        println!(
+            "console switched to {holder:?}: devices gone within {:.0} ms (probe), {seen}",
+            gone_after.as_secs_f64() * 1000.0
+        );
+        assert!(seen.contains("bridged_hid devices=0"), "devices destroyed");
+        pump_deck(&mut client, &mut completions, Duration::from_millis(300)).await;
+        let ended = tablet_results
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|text| text.contains("console"))
+            .cloned()
+            .expect("the Deck is told why");
+        println!(
+            "Deck told after {:.0} ms: {ended}",
+            switched.elapsed().as_secs_f64() * 1000.0
+        );
+        let ended: arcen_protocol::messages::TabletModeResultMsg =
+            serde_json::from_str(&ended).expect("a tablet_mode_result");
+        assert!(!ended.accepted && ended.reconnect_required);
+        // The session itself goes on.
+        let before = std::time::Instant::now();
+        let mut frames = 0;
+        while before.elapsed() < Duration::from_secs(2) {
+            if let Ok(Some(Ok(Message::Binary(bytes)))) =
+                tokio::time::timeout(Duration::from_millis(200), client.next()).await
+            {
+                if bytes
+                    .first()
+                    .is_some_and(|kind| (0x01..=0x09).contains(kind))
+                {
+                    frames += 1;
+                }
+            }
+        }
+        println!("video frames after the switch: {frames}");
+        arcen_pier_macos::bridged_tablet::set_console_holder_for_lab_tests(None);
+    }
+
+    // Disconnect: the devices go with the session.
+    drop(client);
+    let ended = tokio::time::timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the Pier finishes")
+        .expect("no panic");
+    println!(
+        "stream ended: {:?}",
+        ended.as_ref().map(|stats| stats.frames_sent)
+    );
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = pump.join();
+    let _ = exporter.release(ReleaseReason::SessionEnded);
+    let gone = std::time::Instant::now();
+    let mut after = probe(&[]);
+    while !after.contains("bridged_hid devices=0") && gone.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(100));
+        after = probe(&[]);
+    }
+    println!(
+        "devices gone {:.0} ms after the disconnect",
+        gone.elapsed().as_secs_f64() * 1000.0
+    );
+    assert!(
+        after.contains("bridged_hid devices=0"),
+        "torn down with the session"
     );
 }

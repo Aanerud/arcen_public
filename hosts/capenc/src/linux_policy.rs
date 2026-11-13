@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::time::Duration;
 
 use arcen_media::BitDepth;
@@ -61,7 +64,8 @@ pub(crate) const fn startup_path(requested: RequestedEncoder, probe_token: bool)
 }
 
 #[cfg(any(feature = "nvenc", test))]
-pub(crate) use arcen_keel::{SubmissionGate, SubmissionMode};
+pub(crate) use arcen_keel::SubmissionGate;
+pub(crate) use arcen_keel::SubmissionMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinuxCaptureBackend {

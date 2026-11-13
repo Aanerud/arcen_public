@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Mutter's D-Bus interfaces on a headless session's private bus:
 //! `DisplayConfig` (monitor facts), `ScreenCast` (streams) and
 //! `RemoteDesktop` (input), through the pure-Rust `zbus` client.

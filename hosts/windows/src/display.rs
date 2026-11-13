@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,9 +75,38 @@ pub struct DisplayRequest {
     /// luminance go into the EDID, through the shared rule, instead of a
     /// fixed grade. `None` from a Deck that does not report it.
     pub color: Option<arcen_media::display_color::DisplayColor>,
+    /// The refresh the Deck asked for (`0`: `refresh_hz`). `refresh_hz` is
+    /// what the display is created at, which an HDR10 display may lower per
+    /// size (see [`Self::refresh_for`]).
+    pub deck_refresh_hz: u32,
+    /// The HDR stream rate an HDR10 display's refresh stays a multiple of.
+    pub hdr_stream_fps: u32,
 }
 
 impl DisplayRequest {
+    /// The refresh to create a display of `size` at, whether at session start
+    /// or on a live retarget. SDR keeps `refresh_hz`; HDR10 takes the Deck's
+    /// refresh when its 10-bit link fits and otherwise the shared
+    /// `hdr10_refresh_hz` step-down, refusing with `hdr_link_exceeded` when
+    /// nothing fits.
+    pub fn refresh_for(&self, size: DisplaySize) -> Result<u32, String> {
+        if !self.hdr10 {
+            return Ok(self.refresh_hz);
+        }
+        let requested = if self.deck_refresh_hz == 0 {
+            self.refresh_hz
+        } else {
+            self.deck_refresh_hz
+        };
+        crate::edid::hdr10_refresh_hz(
+            size.width,
+            size.height,
+            requested.max(1),
+            self.hdr_stream_fps.max(1),
+        )
+        .map_err(|error| arcen_session::setup_budget::HdrSetupRefusal::LinkExceeded.message(&error))
+    }
+
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         Ok(Self {
             size: DisplaySize::validate(width, height)?,
@@ -91,6 +123,11 @@ impl DisplayRequest {
             hdr10: false,
             desired_hdr: false,
             color: None,
+            deck_refresh_hz: 0,
+            hdr_stream_fps: arcen_media::video::pipeline_contract(
+                arcen_media::video::PipelineId::Hdr,
+            )
+            .max_fps,
         })
     }
 }
@@ -1594,8 +1631,9 @@ fn ensure_recovery_journal_clear(pending: bool, path: &std::path::Path) -> Resul
 /// refused. And the journal is not an obstacle to recovery, it is the recipe for
 /// it, so holding it while declining to act on it helps nobody.
 ///
-/// This runs in the per-session agent, inside the signed-in user's session, so
-/// it has the desktop the restore needs. If the restore fails the journal is
+/// This runs in the per-session agent, inside the signed-in user's session,
+/// after the agent has waited for that session's Default input desktop, so it
+/// has the desktop the restore needs. If the restore fails the journal is
 /// deliberately left in place and the original message is returned unchanged,
 /// so a genuinely stuck host still stops rather than looping over a broken
 /// display.
@@ -4465,6 +4503,20 @@ mod windows_backend {
             target: &DisplayTarget,
             size: DisplaySize,
         ) -> Result<(), String> {
+            // The EDID, the mode set and its readback all follow
+            // `request.refresh_hz`, so a retarget into a size whose HDR10
+            // link needs a lower refresh records it before any of them.
+            let refresh_hz = self.request.refresh_for(size)?;
+            if refresh_hz != self.request.refresh_hz {
+                tracing::info!(
+                    target: DISPLAY,
+                    size = %size,
+                    from_refresh_hz = self.request.refresh_hz,
+                    to_refresh_hz = refresh_hz,
+                    "display retarget refresh follows the HDR10 link"
+                );
+                self.request.refresh_hz = refresh_hz;
+            }
             let recovering_failed_apply = self.nvapi_failed && self.nvapi_active.is_some();
             require_nvapi_exact_retarget(
                 target.vendor_id,
@@ -8449,7 +8501,8 @@ mod tests {
             )
             .expect("rect"),
             scale: arcen_media::Scale120::new(240).expect("scale"),
-            refresh_hz: 60,
+            // 3600x2260 carries HDR10 only at 30 Hz (`hdr10_refresh_hz`).
+            refresh_hz: 30,
             rotation: arcen_media::Rotation::Degrees0,
             primary: true,
             color: Some(color),
@@ -10248,6 +10301,47 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert!(calls.contains(&Call::Apply(requested)));
         assert!(calls.contains(&Call::Apply(original.size)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_hdr_retarget_into_a_retina_size_fits_its_refresh_to_the_link() {
+        // A Deck starting HDR at 1800x1130@60, then going fullscreen at
+        // Retina size: the EDID and mode set follow the refreshed request.
+        let mut request = DisplayRequest::new(1800, 1130).expect("request");
+        request.hdr10 = true;
+        request.deck_refresh_hz = 60;
+        request.hdr_stream_fps = 30;
+        request.refresh_hz = request.refresh_for(request.size).expect("start");
+        assert_eq!(request.refresh_hz, 60);
+
+        let retina = DisplaySize::validate(3600, 2260).expect("size");
+        request.refresh_hz = request.refresh_for(retina).expect("retarget");
+        assert_eq!(request.refresh_hz, 30);
+        let edid = crate::edid::generate_hdr10(crate::edid::EdidRequest {
+            width: retina.width,
+            height: retina.height,
+            refresh_hz: request.refresh_hz,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            scale: 2.0,
+            product_id: 1,
+            serial: 0,
+            color: None,
+        });
+        assert!(edid.is_ok(), "{edid:?}");
+
+        // Back to the start size: the Deck's own refresh again.
+        assert_eq!(request.refresh_for(request.size), Ok(60));
+        // A size no refresh can carry is refused with its code, before any change.
+        let error = request
+            .refresh_for(DisplaySize::validate(4094, 4094).expect("size"))
+            .unwrap_err();
+        assert!(error.starts_with("hdr_link_exceeded: "), "{error}");
+        // SDR keeps its refresh whatever the size.
+        request.hdr10 = false;
+        request.refresh_hz = 120;
+        assert_eq!(request.refresh_for(retina), Ok(120));
     }
 
     #[cfg(windows)]

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! QUIC listener for the macOS Pier.
 //!
 //! This is what makes the host reachable. A Deck dials UDP 18444 over QUIC with
@@ -561,7 +563,7 @@ pub async fn send_json(socket: &mut PierSocket, json: String) -> Result<(), Stri
 pub async fn receive_json(socket: &mut PierSocket) -> Result<Option<String>, String> {
     loop {
         match socket.next().await {
-            Some(Ok(Message::Text(text))) => return Ok(Some(text.clone())),
+            Some(Ok(Message::Text(text))) => return Ok(Some(text)),
             // Ping/Pong, binary and raw frames are transport noise here, not
             // session messages, so none of them reach the caller.
             Some(Ok(

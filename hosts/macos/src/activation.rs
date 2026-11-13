@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Starting the installed Pier and proving it runs, for the package.
 //!
 //! The package's `postinstall` puts files in place and then hands the one

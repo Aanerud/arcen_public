@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Bounded clipboard offer reassembly, and the framing that produces one.
 //!
 //! Receiving a transfer was already shared; sending one was not, and was

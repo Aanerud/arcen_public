@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The compositor's keymap, read as an ordinary Wayland client.
 //!
 //! A `wl_keyboard` receives the compositor's keymap when it is created and

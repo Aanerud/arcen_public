@@ -18,8 +18,11 @@
         <string>webcredentials:arcen.tech</string>
     </array>
 
-    <!-- Lab-only physical USB claim experiment. Keep this out of ordinary
-         Light builds; the regenerated external profile authorizes it. -->
+    <!-- Native tablet: the embedded helper claims the Deck's physical pen
+         tablet (ADR 0011, ADR 0019). Release Decks embed the helper and are
+         signed with this file; the external Developer ID profile for
+         deck.arcen.tech authorizes it. Builds without the helper use
+         Deck.entitlements. -->
     <key>com.apple.developer.accessory-access.usb</key>
     <true/>
 </dict>

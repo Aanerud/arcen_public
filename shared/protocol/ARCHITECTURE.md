@@ -6,27 +6,28 @@ every Pier and the Deck speak. Internal crate.
 ## What this is
 
 The host-agnostic, serde-based on-wire protocol: message types, the auth handshake, the
-connection state machine, bounded clipboard reassembly, and byte-level wire framing. Both Arcen Pier (Linux/Windows)
-and Arcen Deck depend on it and on nothing else in-repo. Byte-compatible with the legacy
-Python `common/messages.py`.
+connection state machine, bounded clipboard reassembly, lane prefaces, cursor records and
+byte-level wire framing. Every Arcen Pier (Linux, Windows, macOS) and the Deck depend on it;
+it depends on nothing else in-repo. It replaced an earlier Python message module, whose
+JSON shapes it keeps.
 
 ## How it's grounded
 
 - Lessons encoded:
-  - **One wire, three platforms.** The contract is deliberately host-agnostic so a Linux
-    Pier and a Windows Pier are byte-interchangeable to the Deck. Do not add
+  - **One wire, every platform.** The contract is deliberately host-agnostic so a Linux,
+    Windows or macOS Pier is byte-interchangeable to the Deck. Do not add
     platform-specific fields; platform capability travels as negotiated fields, not forks.
-  - **`ServerHello`/handshake carries capabilities + a version field** so a future Arcen
-    Span gateway can proxy/negotiate without understanding the payload.
-  - Compatibility is verified by transcript fixtures (see roadmap): a recorded
-    Linux-host↔macOS-client and Windows-host↔macOS-client session must decode identically.
+  - **`ServerHello`/handshake carries capabilities + a version field** so a peer
+    can negotiate without understanding the payload.
+  - New fields are additive and `serde(default)`, gated by a capability, so an older Deck
+    or Pier keeps working; `WIRE.md` records each with the release that introduced it.
 
 ## Rules — what it must be (invariants)
 
 1. **Pure and safe.** `#![forbid(unsafe_code)]` at crate level. No FFI, no OS calls, no I/O
    beyond serde. It must cross-compile trivially for every target.
 2. **No in-repo dependencies.** Depends only on approved third-party crates (serde,
-   serde_json, sha2, getrandom). Never on hosts, clients, gateway, or packaging.
+   serde_json, sha2, getrandom). Never on hosts, clients, or packaging.
 3. **Byte-stable.** Changing the wire is a breaking change: bump the protocol version and
    keep a compatibility fixture. Never silently reorder/rename serialized fields. Pre-1.0
    Rust-only API hardening (validated constructors, private fields, `#[non_exhaustive]`)
@@ -37,8 +38,9 @@ Python `common/messages.py`.
 ## Interfaces / boundaries
 
 - **Exposes:** message enums/structs, `auth` handshake helpers, the connection `fsm`, and
-  `wire` encode/decode. Consumed by `arcen-deck-macos`, `arcen-pier-linux`,
-  `arcen-pier-windows`, and (indirectly, via framing) `arcen-capenc` output.
+  `wire` encode/decode. Consumed by `arcen-deck-macos` (and its USB helper),
+  `arcen-pier-linux`, `arcen-pier-windows`, `arcen-pier-macos`, `arcen-capenc`, and the
+  shared `arcen-input`, `arcen-media` and `arcen-transport` crates.
 - **Consumes:** nothing in-repo.
 
 ## Module map
@@ -56,14 +58,18 @@ Python `common/messages.py`.
 - `fsm.rs` — connection state machine (handshake → authed → streaming → teardown).
 - `wire.rs` — byte framing: media headers and exact bounded clipboard chunks.
 - `clipboard.rs` — one contiguous latest-wins clipboard reassembly with scrub/expiry.
+- `lanes.rs` — QUIC lane roles and the bounded lane preface (lane protocol v1, ADR 0014).
+- `cursor.rs` — the `CursorUpdate` binary record (cursor images) and its lane relay.
+- `keys.rs` — the key identifiers and modifier bits a `key_event` carries beyond letters
+  and digits (AltGr, the ISO key and the other extended keys).
+- `build_identity.rs` — the build identity every product advertises in its hello.
 - `WIRE.md` — the human-readable wire spec (migrate alongside).
 
 ## Deferred / roadmap
 
-- Harvest SOL's `import-proven-protocol` v3 transcript fixtures
-  (`linux_host_macos_client_v3.json`, `windows_host_macos_client_v3.json`) **only** if they
-  validate byte-for-byte against the real wire; otherwise regenerate from a live capture.
-- Add the capability-handshake version field for Arcen Span if not already present.
+- Recorded session transcripts (a Linux, Windows and macOS Pier against the Deck) as
+  decode-compatibility fixtures. None are committed; record them from a live capture,
+  never reconstruct them.
 
 ## Resume pointer
 

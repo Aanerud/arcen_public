@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Transport-independent media and monitor capability contracts.
 
 #![deny(unsafe_code)]
@@ -18,6 +20,7 @@ pub mod audio;
 pub mod capenc_control;
 pub mod capenc_stream;
 pub mod clipboard;
+pub mod colour_check;
 pub mod cursor;
 pub mod deck_platform;
 pub mod display_color;
@@ -26,11 +29,13 @@ pub mod hevc_sps;
 mod multi_monitor;
 pub mod presentation;
 pub mod rate_control;
+pub mod refine;
 mod region;
 mod region_activity;
 mod region_frame;
 mod region_schedule;
 pub mod session_plan;
+pub mod stats_overlay;
 pub mod test_pattern;
 mod topology_placement;
 pub mod video;
@@ -565,6 +570,27 @@ impl TransferCharacteristics {
             Self::Pq => 16,
             Self::Hlg => 18,
         }
+    }
+
+    /// Whether a stream served with this transfer honours a request for
+    /// `requested`, without re-encoding anything.
+    ///
+    /// Equal transfers do. Beyond that, exactly one pair does: an SDR
+    /// request for `bt709` served as `srgb`. Arcen's `bt709` SDR request asks
+    /// for the desktop as SDR at BT.709 primaries and D65 white; IEC 61966-2-1
+    /// shares both, and a host serves `srgb` only to keep the desktop's own
+    /// sRGB code values instead of re-encoding them with the BT.709 curve
+    /// ([`video::sdr_desktop_transfer`]). The reverse, `bt709` for an
+    /// `srgb` request, is a re-encoding and remains a change.
+    #[must_use]
+    pub const fn serves_request(self, requested: Self) -> bool {
+        matches!(
+            (requested, self),
+            (Self::Bt709, Self::Bt709 | Self::Srgb)
+                | (Self::Srgb, Self::Srgb)
+                | (Self::Pq, Self::Pq)
+                | (Self::Hlg, Self::Hlg)
+        )
     }
 }
 

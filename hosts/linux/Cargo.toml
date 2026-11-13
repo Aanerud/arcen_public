@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-pier-linux"
-version = "0.17.0"
+version = "0.19.0"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "arcen_pier_linux"
@@ -25,7 +29,7 @@ name = "wayland_clipboard_harness"
 required-features = ["wayland-provider"]
 
 [features]
-default = []
+default = ["native-tablet"]
 # SEC-001. Restores the unauthenticated listener for an isolated lab network.
 # Never enable this in a release artifact: it disables the product's only trust
 # boundary. There is no runtime flag or config key that can turn it on.
@@ -39,9 +43,12 @@ insecure-lab-no-auth = []
 # negotiates the matching `experimental_raw_hid` ClientHello capability. This
 # is not USB bridging; see `docs/architecture` for the true-bridge scope.
 experimental-raw-hid = []
-# Lab-only Hard USB virtual-HCD importer. Production/package builds must not
-# enable this until the kernel-module/signing support boundary is approved.
-usb-hard-lab = []
+# Native tablet (ADR 0020, ADR 0021): a Deck's physical pen tablet attached
+# to the desktop through the in-tree USB/IP `vhci-hcd` and the fused bridge
+# helper. On by default and in release builds; at run time nothing is
+# offered or loaded unless the administrator sets
+# `usb.native_tablet = "enabled"` in pier.json.
+native-tablet = []
 # Builds the Arcen-managed headless GNOME/Mutter Wayland session adapter
 # (`session::wayland`): a private runtime directory, D-Bus session bus,
 # PipeWire and WirePlumber per session, Mutter virtual outputs, and the
@@ -54,7 +61,11 @@ usb-hard-lab = []
 # It also builds the fused capenc's Wayland capture (`arcen-capenc/wayland`),
 # which links libpipewire-0.3, so the Pier can capture the sessions it
 # starts.
-wayland-provider = ["dep:zbus", "dep:rustix", "dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
+wayland-provider = ["dep:zbus", "dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
+# Lossless refinement producer in the fused capenc (ADR 0016, first slice).
+# Off by default; the Pier does not negotiate or forward refinement yet, so
+# this only enables `arcen-pier capenc … framed-v2 refine=on` for lab proof.
+lossless-refine = ["arcen-capenc/lossless-refine"]
 # Dormant source compatibility only. Release/package builds must not enable
 # this feature; shipped Pier binaries expose QUIC exclusively.
 wss-compat = [
@@ -116,8 +127,8 @@ ring = "0.17"
 # transport, and unit tests remain runnable on the macOS development machine.
 pam-client2 = { version = "0.5.5", default-features = false }
 evdev = "0.13.2"
-nix = { version = "0.29", features = ["fs", "ioctl", "process", "signal", "socket", "time", "uio", "user"] }
-x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes"] }
+nix = { version = "0.29", features = ["fs", "ioctl", "poll", "process", "signal", "socket", "time", "uio", "user"] }
+x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes", "xinput"] }
 # Pure-Rust D-Bus client (MIT) for the Mutter ScreenCast, RemoteDesktop and
 # DisplayConfig interfaces on a headless session's private bus. Only the
 # `wayland-provider` feature links it; it runs on the existing tokio runtime.
@@ -128,9 +139,11 @@ zbus = { version = "5.13.2", default-features = false, features = ["tokio"], opt
 # (`ei_text`) and the emulated stylus. Needs Release/Security approval as a
 # new dependency.
 reis = { version = "0.7.1", default-features = false, features = ["tokio"], optional = true }
-# pidfd_open/pidfd_send_signal for race-free signalling of session processes
-# (already a workspace dependency of the Linux installer).
-rustix = { workspace = true, optional = true }
+# pidfd_open/pidfd_send_signal for race-free signalling of session processes,
+# and the no-follow `lstat` checks of /tmp/.X11-unix and /tmp/.ICE-unix
+# (`session::socket_dirs`), which every build needs (already a workspace
+# dependency of the Linux installer).
+rustix = { workspace = true }
 # Committed text into a headless Wayland session (`wayland-provider` only).
 # `xkbcommon-dl` (MIT) loads the system's libxkbcommon at run time (no build
 # dependency) to read the compositor's keymap, so the session proves a

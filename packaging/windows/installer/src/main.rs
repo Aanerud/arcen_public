@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("install-arcen-pier is Windows-only");
@@ -173,6 +176,19 @@ mod imp {
     /// travel with what they describe.
     const ADMIN_GUIDE: &str = include_str!("../../../../docs/operations/pier-administration.md");
     const THIRD_PARTY_NOTICES: &str = include_str!("../../../../legal/THIRD_PARTY_NOTICES.md");
+    /// The licence set written to `%ProgramData%\Arcen` beside the Pier: the
+    /// AGPL, the store exception, the notice, the trademark policy and the
+    /// third-party notices.
+    const LEGAL_FILES: [(&str, &str); 5] = [
+        ("LICENSE", include_str!("../../../../LICENSE")),
+        (
+            "LICENSE-EXCEPTION.md",
+            include_str!("../../../../LICENSE-EXCEPTION.md"),
+        ),
+        ("NOTICE", include_str!("../../../../NOTICE")),
+        ("TRADEMARKS.md", include_str!("../../../../TRADEMARKS.md")),
+        ("THIRD_PARTY_NOTICES.md", THIRD_PARTY_NOTICES),
+    ];
     const SERVICE_NAME: &str = "ArcenPier";
     const CP_DLL: &str = "arcen_credential_provider.dll";
     const EVENTLOG_SOURCE_SCRIPT_NAME: &str = "eventlog-source.ps1";
@@ -503,12 +519,9 @@ mod imp {
             ADMIN_GUIDE.as_bytes(),
             false,
         )?;
-        atomic_write(
-            opts,
-            &opts.programdata.join("THIRD_PARTY_NOTICES.md"),
-            THIRD_PARTY_NOTICES.as_bytes(),
-            false,
-        )?;
+        for (name, text) in LEGAL_FILES {
+            atomic_write(opts, &opts.programdata.join(name), text.as_bytes(), false)?;
+        }
         let eventlog_script = opts.programdata.join(EVENTLOG_SOURCE_SCRIPT_NAME);
         atomic_write(
             opts,
@@ -843,7 +856,7 @@ mod imp {
             if opts.purge {
                 remove_installer_leftovers(opts)?;
             }
-            remove_dir_if_empty(opts, &opts.prefix)?;
+            remove_prefix_if_empty(opts)?;
         }
         if opts.purge {
             preserve_config_before_purge(opts)?;
@@ -1876,6 +1889,27 @@ mod imp {
         Ok(())
     }
 
+    /// Removes the emptied prefix, and then the `Arcen` vendor directory it
+    /// sits in (`C:\Program Files\Arcen`) when nothing else is left there.
+    /// A custom prefix's parent is not ours and is never touched.
+    fn remove_prefix_if_empty(opts: &Options) -> Result<(), String> {
+        remove_dir_if_empty(opts, &opts.prefix)?;
+        if let Some(vendor) = vendor_dir(&opts.prefix) {
+            if opts.dry_run || !opts.prefix.exists() {
+                remove_dir_if_empty(opts, vendor)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn vendor_dir(prefix: &Path) -> Option<&Path> {
+        let parent = prefix.parent()?;
+        parent
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Arcen"))
+            .then_some(parent)
+    }
+
     fn remove_dir_all(opts: &Options, path: &Path) -> Result<(), String> {
         if opts.dry_run {
             println!("dry-run: purge {}", path.display());
@@ -1895,6 +1929,22 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn the_installer_ships_the_whole_licence_set() {
+            let names: Vec<&str> = LEGAL_FILES.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                names,
+                [
+                    "LICENSE",
+                    "LICENSE-EXCEPTION.md",
+                    "NOTICE",
+                    "TRADEMARKS.md",
+                    "THIRD_PARTY_NOTICES.md"
+                ]
+            );
+            assert!(LEGAL_FILES.iter().all(|(_, text)| !text.trim().is_empty()));
+        }
 
         /// `--purge` deletes ProgramData outright, and the configuration is the
         /// one thing there the installer cannot rebuild: adapter exclusions,
@@ -1948,6 +1998,50 @@ mod imp {
                 tuned,
                 "preserved copy must be byte-identical to the tuned config"
             );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// Purging left an empty `C:\Program Files\Arcen` behind.
+        #[test]
+        fn an_emptied_prefix_takes_an_empty_arcen_directory_with_it_and_nothing_else() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "arcen-windows-installer-vendor-{}-{unique}",
+                std::process::id()
+            ));
+            let options = |prefix: PathBuf| Options {
+                prefix,
+                programdata: root.join("ProgramData"),
+                dry_run: false,
+                uninstall: true,
+                purge: true,
+                version: false,
+                force: false,
+                adopt_legacy: false,
+                service_name: SERVICE_NAME.to_string(),
+                extra_sans: Vec::new(),
+            };
+
+            let alone = root.join("alone").join("Arcen");
+            fs::create_dir_all(alone.join("Pier")).expect("create prefix");
+            remove_prefix_if_empty(&options(alone.join("Pier"))).expect("remove prefix");
+            assert!(!alone.exists(), "an empty Arcen directory must go");
+
+            let shared = root.join("shared").join("Arcen");
+            fs::create_dir_all(shared.join("Pier")).expect("create prefix");
+            fs::create_dir_all(shared.join("Deck")).expect("create sibling");
+            remove_prefix_if_empty(&options(shared.join("Pier"))).expect("remove prefix");
+            assert!(!shared.join("Pier").exists());
+            assert!(shared.join("Deck").exists(), "another product stays");
+
+            let custom = root.join("Tools");
+            fs::create_dir_all(custom.join("Pier")).expect("create custom prefix");
+            remove_prefix_if_empty(&options(custom.join("Pier"))).expect("remove prefix");
+            assert!(!custom.join("Pier").exists());
+            assert!(custom.exists(), "a custom prefix's parent is not ours");
+
             let _ = fs::remove_dir_all(&root);
         }
 

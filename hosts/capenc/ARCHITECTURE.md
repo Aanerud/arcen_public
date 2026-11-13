@@ -16,7 +16,7 @@ one pixel pipeline.
 | Linux Grading, 10-bit SDR | Depth-30 Xorg → MIT-SHM packed RGB10 (the XDamage rectangle, or the whole frame compared with the last whole frame) → shared RGB10-to-P16 conversion of what changed → page-locked host planes → CUDA master frame → NVENC slot | Host capture/conversion of the changed rectangle, one host-to-device upload of it, one device-to-device copy of the frame |
 | Linux HDR request on Xorg | Same as Linux Grading after the Pier changes transfer/primaries/matrix to BT.709 | Explicit degradation; capenc refuses PQ/HLG from Xorg |
 | Windows Auto/Speed, 8-bit | DDA after real-image proof, otherwise WGC BGRA8 → D3D11 staging → negotiated YUV → NVENC | CPU-visible conversion path |
-| Windows Grading, 10-bit SDR | WGC FP16 scRGB → shared SDR OETF/matrix → NVENC I444 P16 | CPU-visible FP16 conversion |
+| Windows Grading, 10-bit SDR | WGC FP16 scRGB → shared SDR transfer (sRGB for a Deck that presents `srgb`, keeping desktop code values; BT.709 for older Decks) → matrix → NVENC I444 P16; the GPU shader applies the same transfer | CPU-visible FP16 conversion |
 | Windows HDR | Verified HDR display state → WGC FP16 scRGB → shared linear-primary conversion + absolute PQ/BT.2020 → NVENC I444 P16 | CPU-visible FP16 conversion |
 | Windows MF comparison path | Exact-output WGC BGRA8 → shared BGRA-to-NV12 → inbox Media Foundation H.264 | CPU-visible; not selected by the current packaged Pier policy |
 | Portable OpenH264 | Windows WGC or Linux authenticated X11 BGRA → shared checked I420 → source-built OpenH264 | CPU capture/conversion/encode |
@@ -102,10 +102,14 @@ because the destination buffer is wider.
    advertise codec/chroma/backend/cursor before validating it.
 10. Windows Host cursor mode is WGC-only. The WGC cursor toggle is strict; DDA is
    local-cursor-only and has no cursor-shape compositor.
-11. Linux depth-30 XShm has no host-cursor compositor. The Linux Pier resolves
+11. Linux depth-30 XShm is budgeted in pixels (one 3840×2160 frame, edges up
+    to 8192, shared `host_converted_capture_fits`), not as a 3840 by 2160
+    box. `probe-v1` probes a budget-sized part of a larger desktop, because
+    the Pier fits the geometry it arms afterwards.
+12. Linux depth-30 XShm has no host-cursor compositor. The Linux Pier resolves
     Host to Local before native preflight and live spawn; eight-bit NvFBC keeps
     its existing in-video cursor path.
-12. The default dependency graph contains no OpenH264/native build graph.
+13. The default dependency graph contains no OpenH264/native build graph.
     `software-h264` enables only `arcen-media/software-h264-source`; no host
     module calls `openh264-sys2`.
 

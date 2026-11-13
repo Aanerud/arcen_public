@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Builds the macOS Pier installer package.
 #
 # Usage:
@@ -149,7 +151,7 @@ chmod 644 "$RESOURCES/common.sh"
 # Anything shipping in a release artefact carries its notices. The app build
 # put them in the bundle; refuse a payload whose copies are missing or differ
 # from the source being packaged.
-for notice in LICENSE legal/THIRD_PARTY_NOTICES.md; do
+for notice in LICENSE LICENSE-EXCEPTION.md NOTICE TRADEMARKS.md legal/THIRD_PARTY_NOTICES.md; do
   cmp -s "$REPO/$notice" "$RESOURCES/$(basename "$notice")" || {
     echo "error: the payload's $(basename "$notice") is missing or differs from $notice" >&2
     exit 1

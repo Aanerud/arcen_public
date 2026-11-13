@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Lane relay for a Pier whose session runs in another process (ADR 0014).
 //!
 //! The Windows Pier's broker and the macOS Pier's service own the network
@@ -14,7 +16,15 @@
 //!   ever falls back onto another lane, so a blocked video lane cannot hold
 //!   audio, input or control behind it.
 //! - Cursor messages go on the input/cursor lane, newest first: a shape the
-//!   lane has no room for is replaced by the next one, never queued.
+//!   lane has no room for is replaced by the next one, never queued. Cursor
+//!   image records (`CursorUpdate`, which the agent always sends with its
+//!   image inline) pass through [`arcen_protocol::cursor::CursorRecordRelay`],
+//!   which keeps the lane's image cache contract with the Deck: an image
+//!   crosses the link once per lane, and a reopened lane gets the current
+//!   cursor again.
+//!   Host pointer positions (`CursorPosition`) pass through
+//!   [`arcen_protocol::cursor_position::CursorPositionRelay`]: newest wins,
+//!   renumbered from 1 on each lane.
 //! - Clipboard, HID and USB messages go on the bulk lane through a bounded
 //!   backlog; a full backlog (or a bulk lane that stays unavailable) drops
 //!   and counts the message. A dropped clipboard transfer is abandoned
@@ -42,6 +52,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arcen_protocol::cursor::CursorRecordRelay;
+use arcen_protocol::cursor_position::CursorPositionRelay;
 use arcen_protocol::lanes::{
     LaneRole, SessionRecord, clipboard_transfer_sequence, lane_for_binary_message,
     lane_for_session_text, session_text_record,
@@ -52,7 +64,7 @@ use arcen_protocol::messages::{
 };
 use arcen_protocol::wire::{FrameType, decode_microphone_frame, decode_video_header};
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::session_lanes::{
@@ -70,6 +82,13 @@ pub const RELAY_VIDEO_BACKLOG: usize = 16;
 pub const RELAY_AUDIO_BACKLOG: usize = 8;
 /// Bulk messages waiting for the bulk lane.
 pub const RELAY_BULK_BACKLOG: usize = 64;
+/// USB bridge records (URB submits and cancels) waiting for the bulk lane,
+/// in a queue of their own: a clipboard transfer can fill
+/// [`RELAY_BULK_BACKLOG`], and a dropped interrupt-IN submit would leave a
+/// bridged interface silent. Far more than a USB host adapter keeps
+/// outstanding (one control and one interrupt transfer per interface, with
+/// their cancellations).
+pub const RELAY_USB_BACKLOG: usize = 256;
 /// Deck input records waiting for the agent.
 pub const RELAY_INPUT_BACKLOG: usize = 256;
 /// Deck microphone frames waiting for the agent.
@@ -130,10 +149,20 @@ pub struct LaneRelayStats {
     pub audio_dropped: u64,
     /// Cursor shapes replaced by a newer one before the lane had room.
     pub cursor_replaced: u64,
+    /// Cursor image records the lane accepted.
+    pub cursor_records: u64,
+    /// Cursor image records from the agent dropped as malformed.
+    pub cursor_records_refused: u64,
     /// Bulk messages dropped (full backlog, lane unavailable).
     pub bulk_dropped: u64,
     /// Clipboard transfers abandoned (the Deck was told).
     pub clipboard_failed: u64,
+    /// USB bridge records queued for the bulk lane.
+    pub usb_records: u64,
+    /// USB bridge records dropped (their own backlog full, or no bulk lane
+    /// within the write timeout). The host adapter's watchdog renews what
+    /// was lost.
+    pub usb_dropped: u64,
     /// Deck input records forwarded to the agent.
     pub input_records: u64,
     /// Deck microphone frames forwarded to the agent.
@@ -150,8 +179,12 @@ struct Counters {
     audio_frames: AtomicU64,
     audio_dropped: AtomicU64,
     cursor_replaced: AtomicU64,
+    cursor_records: AtomicU64,
+    cursor_records_refused: AtomicU64,
     bulk_dropped: AtomicU64,
     clipboard_failed: AtomicU64,
+    usb_records: AtomicU64,
+    usb_dropped: AtomicU64,
     input_records: AtomicU64,
     microphone_frames: AtomicU64,
     microphone_dropped: AtomicU64,
@@ -171,8 +204,12 @@ impl Counters {
             audio_frames: read(&self.audio_frames),
             audio_dropped: read(&self.audio_dropped),
             cursor_replaced: read(&self.cursor_replaced),
+            cursor_records: read(&self.cursor_records),
+            cursor_records_refused: read(&self.cursor_records_refused),
             bulk_dropped: read(&self.bulk_dropped),
             clipboard_failed: read(&self.clipboard_failed),
+            usb_records: read(&self.usb_records),
+            usb_dropped: read(&self.usb_dropped),
             input_records: read(&self.input_records),
             microphone_frames: read(&self.microphone_frames),
             microphone_dropped: read(&self.microphone_dropped),
@@ -247,11 +284,15 @@ fn input_release() -> Option<SessionRecord> {
 /// Dropping it aborts every lane task it started.
 pub struct PierLaneRelay {
     video: mpsc::Sender<Bytes>,
+    video_released: Arc<watch::Sender<u64>>,
     audio: mpsc::Sender<Bytes>,
     bulk: mpsc::Sender<BulkRecord>,
+    usb: mpsc::Sender<Bytes>,
     failed_clipboard: Option<u64>,
     input_slot: LaneSenderSlot,
     pending_cursor: Option<Bytes>,
+    cursor_records: CursorRecordRelay,
+    cursor_positions: CursorPositionRelay,
     cursor_retry: tokio::time::Interval,
     resync: VideoResync,
     owed: VecDeque<LaneRelayEvent>,
@@ -288,8 +329,10 @@ impl PierLaneRelay {
     pub fn start(lanes: &LaneConnection) -> Self {
         let counters = Arc::new(Counters::default());
         let (video_tx, video_rx) = mpsc::channel(RELAY_VIDEO_BACKLOG);
+        let video_released = Arc::new(watch::Sender::new(0));
         let (audio_tx, audio_rx) = mpsc::channel(RELAY_AUDIO_BACKLOG);
         let (bulk_tx, bulk_rx) = mpsc::channel(RELAY_BULK_BACKLOG);
+        let (usb_tx, usb_rx) = mpsc::channel(RELAY_USB_BACKLOG);
         let (events_tx, events_rx) = mpsc::channel(16);
         let (input_tx, input_rx) = mpsc::channel(RELAY_INPUT_BACKLOG);
         let (microphone_tx, microphone_rx) = mpsc::channel(RELAY_MICROPHONE_BACKLOG);
@@ -297,7 +340,12 @@ impl PierLaneRelay {
         let input_slot = LaneSenderSlot::new(LaneRole::InputCursor);
         let bulk_slot = LaneSenderSlot::new(LaneRole::BulkAux);
         let tasks = vec![
-            tokio::spawn(video_writer(lanes.clone(), video_rx, events_tx.clone())),
+            tokio::spawn(video_writer(
+                lanes.clone(),
+                video_rx,
+                events_tx.clone(),
+                Arc::clone(&video_released),
+            )),
             tokio::spawn(audio_writer(
                 lanes.clone(),
                 audio_rx,
@@ -306,6 +354,7 @@ impl PierLaneRelay {
             )),
             tokio::spawn(bulk_writer(
                 bulk_rx,
+                usb_rx,
                 bulk_slot.clone(),
                 events_tx.clone(),
                 Arc::clone(&counters),
@@ -329,11 +378,15 @@ impl PierLaneRelay {
         cursor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             video: video_tx,
+            video_released,
             audio: audio_tx,
             bulk: bulk_tx,
+            usb: usb_tx,
             failed_clipboard: None,
             input_slot,
             pending_cursor: None,
+            cursor_records: CursorRecordRelay::default(),
+            cursor_positions: CursorPositionRelay::default(),
             cursor_retry,
             resync: VideoResync::default(),
             owed: VecDeque::new(),
@@ -352,6 +405,21 @@ impl PierLaneRelay {
         self.counters.snapshot()
     }
 
+    /// The running count of video frames the relay is done with: sent into
+    /// the video lane's queue, or dropped by the relay's own policy. A split
+    /// Pier reports its growth to the agent, which keeps
+    /// `arcen_media::video::RELAYED_VIDEO_FRAMES_IN_FLIGHT` frames
+    /// unreleased at most, so a slow path holds video in the agent's
+    /// budgeted queue rather than in [`RELAY_VIDEO_BACKLOG`].
+    #[must_use]
+    pub fn video_released(&self) -> watch::Receiver<u64> {
+        self.video_released.subscribe()
+    }
+
+    fn release_video(&self) {
+        release(&self.video_released);
+    }
+
     /// Puts one message from the agent on its lane, without waiting.
     ///
     /// Control messages (and ping, pong and close) come back as
@@ -364,11 +432,26 @@ impl PierLaneRelay {
                 _ => RelayRoute::Control(SessionRecord::Text(text)),
             },
             SessionRecord::Binary(bytes) => match lane_for_binary_message(&bytes) {
+                Some(LaneRole::InputCursor)
+                    if bytes.first() == Some(&(FrameType::CursorUpdate as u8)) =>
+                {
+                    self.route_cursor_record(&bytes)
+                }
+                // Host pointer positions: newest wins, renumbered for the
+                // lane (`CursorPositionRelay`), like cursor images.
+                Some(LaneRole::InputCursor)
+                    if bytes.first() == Some(&(FrameType::CursorPosition as u8)) =>
+                {
+                    self.route_cursor_position(&bytes)
+                }
                 Some(LaneRole::Video) => self.route_video(bytes),
                 Some(LaneRole::AudioOutput) => self.route_audio(bytes),
                 Some(LaneRole::BulkAux) => self.route_bulk(&SessionRecord::Binary(bytes)),
                 // Microphone frames flow Deck to Pier only.
                 Some(LaneRole::Microphone) => RelayRoute::Dropped(LaneRole::Microphone),
+                // The relay never carries refinement: a relayed session
+                // does not grant the refine lane (ADR 0016 R7).
+                Some(LaneRole::Refine) => RelayRoute::Dropped(LaneRole::Refine),
                 _ => RelayRoute::Control(SessionRecord::Binary(bytes)),
             },
             other => RelayRoute::Control(other),
@@ -378,11 +461,13 @@ impl PierLaneRelay {
     fn route_video(&mut self, frame: Vec<u8>) -> RelayRoute {
         let Ok(header) = decode_video_header(&frame) else {
             bump(&self.counters.video_dropped);
+            self.release_video();
             return RelayRoute::Dropped(LaneRole::Video);
         };
         let keyframe = header.is_keyframe();
         if !self.resync.admits(header.monitor_id, keyframe) {
             bump(&self.counters.video_dropped);
+            self.release_video();
             self.request_keyframe_if_due();
             return RelayRoute::Dropped(LaneRole::Video);
         }
@@ -391,6 +476,7 @@ impl PierLaneRelay {
             RelayRoute::Queued(LaneRole::Video)
         } else {
             bump(&self.counters.video_dropped);
+            self.release_video();
             self.break_video_chain(header.monitor_id);
             RelayRoute::Dropped(LaneRole::Video)
         }
@@ -445,7 +531,70 @@ impl PierLaneRelay {
         }
     }
 
+    fn route_cursor_record(&mut self, bytes: &[u8]) -> RelayRoute {
+        if self.cursor_records.offer(bytes).is_err() {
+            bump(&self.counters.cursor_records_refused);
+            return RelayRoute::Dropped(LaneRole::InputCursor);
+        }
+        self.flush_cursor_record();
+        RelayRoute::Queued(LaneRole::InputCursor)
+    }
+
+    fn route_cursor_position(&mut self, bytes: &[u8]) -> RelayRoute {
+        if self.cursor_positions.offer(bytes).is_err() {
+            bump(&self.counters.cursor_records_refused);
+            return RelayRoute::Dropped(LaneRole::InputCursor);
+        }
+        self.flush_cursor_position();
+        RelayRoute::Queued(LaneRole::InputCursor)
+    }
+
+    /// Writes the newest host pointer position when the input lane has
+    /// room; a full lane keeps it for the retry tick.
+    fn flush_cursor_position(&mut self) {
+        let Some(sender) = self.input_slot.current() else {
+            return;
+        };
+        let Some(prepared) = self
+            .cursor_positions
+            .prepare(u64::from(sender.lane_generation().get()))
+        else {
+            return;
+        };
+        let record = session_record_bytes(&SessionRecord::Binary(prepared.bytes.to_vec()));
+        if sender.try_send(record).is_ok() {
+            self.cursor_positions.commit(&prepared);
+        }
+    }
+
+    /// Writes the newest cursor image state when the input lane has room,
+    /// and the current one again on a reopened lane.
+    fn flush_cursor_record(&mut self) {
+        let Some(sender) = self.input_slot.current() else {
+            return;
+        };
+        let Some(prepared) = self
+            .cursor_records
+            .prepare(u64::from(sender.lane_generation().get()))
+        else {
+            return;
+        };
+        let record = session_record_bytes(&SessionRecord::Binary(prepared.bytes.clone()));
+        if sender.try_send(record).is_ok() {
+            bump(&self.counters.cursor_records);
+            self.cursor_records.commit(prepared);
+        }
+    }
+
     fn route_bulk(&mut self, record: &SessionRecord) -> RelayRoute {
+        if is_usb_bridge_record(record) {
+            if self.usb.try_send(session_record_bytes(record)).is_ok() {
+                bump(&self.counters.usb_records);
+                return RelayRoute::Queued(LaneRole::BulkAux);
+            }
+            bump(&self.counters.usb_dropped);
+            return RelayRoute::Dropped(LaneRole::BulkAux);
+        }
         let clipboard = clipboard_transfer_sequence(record);
         if clipboard.is_some() && clipboard == self.failed_clipboard {
             // The rest of an abandoned transfer.
@@ -499,9 +648,18 @@ impl PierLaneRelay {
                 }
                 Some(record) = self.microphone.recv() => return LaneRelayEvent::ToSession(record),
                 Some(record) = self.bulk_in.recv() => return LaneRelayEvent::ToSession(record),
-                _ = self.cursor_retry.tick(), if self.pending_cursor.is_some() => {
+                // An active cursor image relay also follows lane reopens.
+                _ = self.cursor_retry.tick(),
+                    if self.pending_cursor.is_some()
+                        || self.cursor_records.is_active()
+                        || self.cursor_positions.is_pending() =>
+                {
                     self.flush_cursor();
+                    self.flush_cursor_record();
+                    self.flush_cursor_position();
                 }
+                // Every lane task has stopped: nothing can arrive any more.
+                else => return LaneRelayEvent::Ended(LaneTerminal::ConnectionLost(None)),
             }
         }
     }
@@ -544,10 +702,15 @@ async fn report(events: &mpsc::Sender<TaskEvent>, event: LaneRelayEvent) {
     let _ = events.send(TaskEvent::Relay(event)).await;
 }
 
+fn release(released: &watch::Sender<u64>) {
+    released.send_modify(|count| *count = count.wrapping_add(1));
+}
+
 async fn video_writer(
     lanes: LaneConnection,
     mut frames: mpsc::Receiver<Bytes>,
     events: mpsc::Sender<TaskEvent>,
+    released: Arc<watch::Sender<u64>>,
 ) {
     let mut writer: Option<LocalLaneWriter> = None;
     while let Some(frame) = frames.recv().await {
@@ -560,7 +723,9 @@ async fn video_writer(
         let Some(lane) = writer.as_mut() else {
             continue;
         };
-        match lane.send(frame).await {
+        let sent = lane.send(frame).await;
+        release(&released);
+        match sent {
             Ok(LaneWriteOutcome::Reopened { request_keyframe }) => {
                 if request_keyframe {
                     let _ = events.send(TaskEvent::VideoReopened).await;
@@ -643,12 +808,26 @@ async fn audio_stopped(terminal: LaneTerminal, events: &mpsc::Sender<TaskEvent>)
 
 async fn bulk_writer(
     mut records: mpsc::Receiver<BulkRecord>,
+    mut usb: mpsc::Receiver<Bytes>,
     slot: LaneSenderSlot,
     events: mpsc::Sender<TaskEvent>,
     counters: Arc<Counters>,
 ) {
     let mut failed: Option<u64> = None;
-    while let Some(record) = records.recv().await {
+    loop {
+        // USB bridge records first: they are small, and a bridged device's
+        // polling must not wait behind a multi-megabyte clipboard transfer.
+        let record = tokio::select! {
+            biased;
+            Some(bytes) = usb.recv() => {
+                if !send_on_slot(&slot, bytes, RELAY_BULK_WRITE_TIMEOUT).await {
+                    bump(&counters.usb_dropped);
+                }
+                continue;
+            }
+            Some(record) = records.recv() => record,
+            else => return,
+        };
         if record.clipboard.is_some() && record.clipboard == failed {
             bump(&counters.bulk_dropped);
             continue;
@@ -842,6 +1021,23 @@ async fn bulk_reader(
     }
 }
 
+/// A USB bridge frame (URB submit, cancel or completion).
+fn is_usb_bridge_record(record: &SessionRecord) -> bool {
+    let SessionRecord::Binary(bytes) = record else {
+        return false;
+    };
+    matches!(
+        bytes
+            .first()
+            .and_then(|first| FrameType::try_from(*first).ok()),
+        Some(
+            FrameType::UsbBridgeUrbSubmit
+                | FrameType::UsbBridgeUrbCancel
+                | FrameType::UsbBridgeUrbComplete
+        )
+    )
+}
+
 fn is_bulk_record(record: &SessionRecord) -> bool {
     match record {
         SessionRecord::Text(text) => lane_for_session_text(text) == LaneRole::BulkAux,
@@ -869,6 +1065,54 @@ mod tests {
         assert!(!resync.admits(1, false));
         assert!(resync.admits(1, true));
         assert!(!resync.is_waiting());
+    }
+
+    /// A relay whose every lane task has already stopped (all their senders
+    /// dropped), as at the end of a torn-down connection.
+    fn stopped_relay() -> super::PierLaneRelay {
+        use super::{Counters, CursorRecordRelay, LaneRole, LaneSenderSlot, mpsc, watch};
+        let (video, _) = mpsc::channel(1);
+        let (audio, _) = mpsc::channel(1);
+        let (bulk, _) = mpsc::channel(1);
+        let (usb, _) = mpsc::channel(1);
+        let (_, events) = mpsc::channel(1);
+        let (_, input) = mpsc::channel(1);
+        let (_, microphone) = mpsc::channel(1);
+        let (_, bulk_in) = mpsc::channel(1);
+        super::PierLaneRelay {
+            video,
+            video_released: std::sync::Arc::new(watch::Sender::new(0)),
+            audio,
+            bulk,
+            usb,
+            failed_clipboard: None,
+            input_slot: LaneSenderSlot::new(LaneRole::InputCursor),
+            pending_cursor: None,
+            cursor_records: CursorRecordRelay::default(),
+            cursor_positions: arcen_protocol::cursor_position::CursorPositionRelay::default(),
+            cursor_retry: tokio::time::interval(Duration::from_millis(20)),
+            resync: VideoResync::default(),
+            owed: std::collections::VecDeque::new(),
+            events,
+            input,
+            microphone,
+            bulk_in,
+            counters: std::sync::Arc::new(Counters::default()),
+            tasks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_whose_tasks_all_stopped_ends_instead_of_panicking() {
+        let mut relay = stopped_relay();
+        for _ in 0..3 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), relay.next_event())
+                    .await
+                    .expect("answers at once"),
+                super::LaneRelayEvent::Ended(super::LaneTerminal::ConnectionLost(None))
+            );
+        }
     }
 
     #[test]

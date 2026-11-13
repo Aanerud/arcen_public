@@ -3,16 +3,19 @@
 > Measuring feel and latency with the real Deck window instead? See
 > [`realscreen.md`](realscreen.md).
 
-Operator runbook for the grader/VFX colour work on
-`feat/color-fidelity-10bit-444` (4:4:4 chroma, 10-bit depth, full-range
-colour, negotiated end to end). Read
+Operator runbook for the grader/VFX colour work (4:4:4 chroma, 10-bit depth,
+full-range colour, negotiated end to end). Read
 [`../architecture/color-fidelity.md`](../architecture/color-fidelity.md)
 first for the design and the rationale — this document only covers how to
 run the matrix and record findings, and does not repeat the design doc. Host
 config keys (`video.bit_depth`, `video.color_range`, `video.color_matrix`,
-`video.variant`, `video.color_policy`) are documented in
+`video.variant`, `video.color_policy`) are listed in the
+[configuration reference](../operations/config-reference.md), and the policy
+is explained in
 [`../operations/pier-administration.md`](../operations/pier-administration.md)
-under "Colour fidelity policy" — link there rather than duplicating.
+under "Colour fidelity policy" — link there rather than duplicating. To
+check a live session from the Deck instead, use the
+[colour check](../operations/colour-check.md).
 
 ## 1. Why the matrix exists
 
@@ -41,8 +44,8 @@ what this matrix exists to eliminate.
 
 ## 2. Current state of the loop (verified 2026-08-14)
 
-Both matrix-walking tools are implemented and were run on real hardware at
-commit `086edeeed0aac87ca7275892318fa81dac093453`:
+Both matrix-walking tools are implemented and were run on real hardware with a
+development build:
 
 - `arcen-capenc probe-matrix` walks all 11 rows, performs real encoder
   initialisation, emits host JSON, and can write one deterministic Annex-B
@@ -92,6 +95,14 @@ Do not replace the explicit trust option with
 `media-smoke --video-only` skips only the completion requirement for an audio
 packet. Use it when validating video on a deliberately silent source; it does
 not disable host audio and must not be used as evidence that audio passed.
+
+Without `--video-only` the smoke completes only after one audio packet. A
+Pier may send no audio while nothing plays — a Windows Pier sends none, because
+WASAPI loopback delivers no packets for a silent endpoint — so against an idle
+desktop the smoke runs to its timeout while video keeps arriving, and the
+timeout report says so. To prove audio, play sound in the host session for the
+whole run. The smoke prints only the first decoded frame; set
+`ARCEN_MEDIA_SMOKE_STATS=PATH` to record every packet.
 
 `input-smoke --text STRING` (repeatable) sends each string as committed text
 (`text_commit`), the way the Deck sends its input method's commits, after
@@ -148,8 +159,8 @@ wayland-provider --lib -- --ignored libei_demo_server`.
 
 **Client** (decodes and reports):
 
-- An Apple Silicon Mac (the Deck client is arm64-only; see
-  `pier-administration.md`'s BUILD-376). Recent macOS with VideoToolbox.
+- A Mac with VideoToolbox: `Arcen Deck` for Apple silicon or `Arcen Deck
+  Intel` (Intel Macs decode some rows in software and never offer AV1).
   Which macOS versions/chips actually hardware-decode which rows is
   precisely what this matrix measures — do not assume, run it.
 - Build with the default-off `dev-tools` feature (`clients/macos/Cargo.toml`)

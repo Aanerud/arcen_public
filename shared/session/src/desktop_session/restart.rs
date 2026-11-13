@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The auto-restart budget of `X-GNOME-AutoRestart` entries.
 
 use std::collections::VecDeque;

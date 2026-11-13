@@ -3,7 +3,7 @@
 Builds a newer GNOME Shell and Mutter into a prefix such as
 `/opt/arcen-gnome/51`, used only by Arcen's headless Wayland sessions
 (`capture.wayland_compositor_prefix`). The why and the mechanism are in
-[`docs/architecture/linux-wayland-provider.md`](../../../../docs/architecture/linux-wayland-provider.md#running-a-newer-gnome-than-the-distribution-ships-wp-gnomeupgrade).
+[`docs/architecture/linux-wayland-provider.md`](../../../../docs/architecture/linux-wayland-provider.md#running-a-newer-gnome-than-the-distribution-ships).
 The operator procedure, including the rollback, is in
 [`docs/operations/pier-administration.md`](../../../../docs/operations/pier-administration.md#upgrading-the-gnome-session-on-el10).
 

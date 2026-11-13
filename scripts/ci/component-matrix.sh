@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 set -euo pipefail
 
-for value in GLOBAL UNKNOWN LINUX_HOST WINDOWS_HOST MACOS_CLIENT WINDOWS_CLIENT GATEWAY; do
+for value in GLOBAL UNKNOWN LINUX_HOST WINDOWS_HOST MACOS_CLIENT WINDOWS_CLIENT; do
     case "${!value:-false}" in
         true | false) ;;
         *)
@@ -33,9 +36,6 @@ fi
 if [[ "${GLOBAL:-false}" == "true" || "${WINDOWS_CLIENT:-false}" == "true" ]]; then
     add_target '{"name":"Windows client","runner":"windows-latest","packages":"arcen-client-windows","artifact":"windows-client"}'
 fi
-if [[ "${GLOBAL:-false}" == "true" || "${GATEWAY:-false}" == "true" ]]; then
-    add_target '{"name":"Gateway","runner":"ubuntu-latest","packages":"arcen-gateway-service arcen-gateway-relay","artifact":"gateway"}'
-fi
 
 # Unknown paths are integration changes until they are classified explicitly.
 if (( ${#targets[@]} == 0 )); then
@@ -43,7 +43,6 @@ if (( ${#targets[@]} == 0 )); then
     add_target '{"name":"Windows host","runner":"windows-latest","packages":"arcen-host-windows","artifact":"windows-host"}'
     add_target '{"name":"macOS client","runner":"macos-latest","packages":"arcen-client-macos","artifact":"macos-client"}'
     add_target '{"name":"Windows client","runner":"windows-latest","packages":"arcen-client-windows","artifact":"windows-client"}'
-    add_target '{"name":"Gateway","runner":"ubuntu-latest","packages":"arcen-gateway-service arcen-gateway-relay","artifact":"gateway"}'
 fi
 
 matrix='{"include":['

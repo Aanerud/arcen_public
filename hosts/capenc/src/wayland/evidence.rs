@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Import route selection, epoch source evidence and capture-path telemetry.
 //!
 //! Each route is classified truthfully with a shared [`CopyPath`]:
@@ -367,6 +369,7 @@ mod tests {
             width: 1920,
             height: 1080,
             max_fps: preset.pipeline_contract().max_fps,
+            sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
         }
     }
 

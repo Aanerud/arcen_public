@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! One X11 desktop per host.
 //!
 //! A dedicated Xorg desktop is a logind session on `seat0` at virtual

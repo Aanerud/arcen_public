@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab only (inside a throwaway rockylinux:10 container): rebuild the host's exact
 # mutter SRPM with the headless-libinput lab patch; copy only libmutter-17 out.
 set -euxo pipefail

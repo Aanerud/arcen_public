@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Reloadable Linux logging built on the shared `arcen_observability` runtime.
 //!
 //! Every subsystem log line and lifecycle event flows through one

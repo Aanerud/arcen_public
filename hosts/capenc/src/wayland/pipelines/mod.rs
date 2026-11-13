@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Wayland compositions: Auto and Speed (eight-bit SDR) and Grading and
 //! HDR (wide).
 //!
@@ -104,6 +106,9 @@ pub struct EpochRequest {
     /// Tagged framed-v2 output: access units and cursor events
     /// (`arcen_media::capenc_stream`). Implies `framed`.
     pub framed_v2: bool,
+    /// A framed-v2 cursor stream also reports pointer positions
+    /// (`arcen_media::capenc_stream::CURSOR_POSITION_ARG`).
+    pub cursor_position: bool,
     /// Native availability probe only (`probe-v1`).
     pub probe: bool,
     /// What the host's qualification proved about wide composition, for the
@@ -348,6 +353,9 @@ impl EpochRequest {
             gpu_import_verified: gpu_import_verified.unwrap_or(false),
             framed: crate::framed_output_from_args(args) || framed_v2_from_args(args),
             framed_v2: framed_v2_from_args(args),
+            cursor_position: args
+                .iter()
+                .any(|argument| argument == arcen_media::capenc_stream::CURSOR_POSITION_ARG),
             probe: args.iter().any(|argument| argument == "probe-v1"),
             fidelity: FidelityArgs::from_args(args)?,
         })

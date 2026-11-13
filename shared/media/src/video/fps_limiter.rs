@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Why a capture loop delivered the frame rate it did, for one window.
 //!
 //! A host that emits fewer frames than its contract has exactly three

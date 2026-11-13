@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Research-only comparison of complete-region and bounded patch framing.
 //!
 //! This crate is outside the workspace default members. It models pre-codec

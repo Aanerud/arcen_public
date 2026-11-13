@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Preset admission for a capture source.
 //!
 //! Auto, Speed, Grading and HDR are complete contracts
@@ -13,7 +15,8 @@
 //!   capture is never routed through the fast path.
 //! - Grading admits only genuine wide SDR-convertible samples with
 //!   authoritative colour. Eight-bit or up-converted content is refused, never
-//!   labelled Grading.
+//!   labelled Grading. Its SDR output is `srgb` only when the parent asked for
+//!   it ([`AdmissionRequest::sdr_transfer`]), otherwise the contract's `bt709`.
 //! - HDR admits only a proven active HDR output whose samples are PQ/BT.2020
 //!   (ten-bit codes or half-float signal) composed with SDR white at
 //!   BT.2408's 203 nits, or documented linear light with a known SDR white. Otherwise it falls
@@ -29,8 +32,8 @@ use std::fmt::{Display, Formatter};
 use arcen_protocol::messages::CursorMode;
 
 use super::capture_surface::{
-    CapturePixelFormat, CopyPath, CursorEvidence, GpuMatch, SamplePrecision, SourceColour,
-    SourceFact, SourcePrecision, SourceTransfer,
+    CapturePixelFormat, CopyPath, CursorEvidence, GpuMatch, SamplePrecision, SdrContentCurve,
+    SourceColour, SourceFact, SourcePrecision, SourceTransfer,
 };
 use super::pipeline::{KeyframePolicy, PipelineContract, PipelineId, SoftwareFallbackDecision};
 use super::{
@@ -40,7 +43,8 @@ use super::{
     software_fallback_decision,
 };
 use crate::{
-    ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent, VideoCodec, VideoConfiguration,
+    ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent, TransferCharacteristics, VideoCodec,
+    VideoConfiguration,
 };
 
 /// Epoch-level facts about a capture source, gathered by the native adapter
@@ -91,6 +95,12 @@ pub struct AdmissionRequest {
     /// exceeds it, and asking for less than the contract's ceiling is not a
     /// degradation.
     pub max_fps: u32,
+    /// The transfer the parent resolved for the session (capenc's
+    /// `transfer=`). Only Grading's SDR output reads it: `Srgb`, which the
+    /// parent asks for only under [`super::serve_sdr_desktop`], keeps a
+    /// desktop's sRGB codes and converts PQ on the sRGB curve; anything else
+    /// serves the contract's own `bt709`.
+    pub sdr_transfer: TransferCharacteristics,
 }
 
 /// Which shared conversion turns source samples into encoder input.
@@ -107,7 +117,8 @@ pub enum SourceTransform {
     /// [`Rgb10Signal::map_pq_half`]: kept as PQ, or converted to BT.709 SDR
     /// from the half-float signal rather than from ten-bit PQ codes.
     HalfFloatPq(Rgb10Signal),
-    /// Linear half-float to BT.709 SDR (`ScrgbSdrTransform`).
+    /// Linear half-float to SDR (`ScrgbSdrTransform`, with the served SDR
+    /// transfer from `sdr_desktop_transfer`).
     LinearToSdr,
     /// Linear half-float to PQ (`ScrgbPqTransform`), SDR white placed at
     /// BT.2408's 203 nits.
@@ -126,8 +137,12 @@ impl SourceTransform {
             Self::Sdr8YuvPassthrough => "sdr8-yuv",
             Self::PackedRgb10(Rgb10Signal::Direct) => "rgb10-direct",
             Self::PackedRgb10(Rgb10Signal::PqBt2020ToSdrBt709) => "rgb10-pq-to-sdr",
+            Self::PackedRgb10(Rgb10Signal::PqBt2020ToSdrSrgb) => "rgb10-pq-to-srgb",
+            Self::PackedRgb10(Rgb10Signal::PqBt2020ToSdrGamma22) => "rgb10-pq-to-g22",
             Self::HalfFloatPq(Rgb10Signal::Direct) => "f16-pq-direct",
             Self::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709) => "f16-pq-to-sdr",
+            Self::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrSrgb) => "f16-pq-to-srgb",
+            Self::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrGamma22) => "f16-pq-to-g22",
             Self::LinearToSdr => "linear-to-sdr",
             Self::LinearToPq { .. } => "linear-to-pq",
         }
@@ -155,6 +170,10 @@ pub struct AdmittedCapture {
     /// composited into video, [`CursorMode::Local`] when metadata allows
     /// local authority, `None` when the provider does not say.
     pub cursor_mode: Option<CursorMode>,
+    /// Transfer the served stream signals: the served contract's own, or
+    /// `srgb` for a Grading request that asked for it
+    /// ([`AdmissionRequest::sdr_transfer`]).
+    pub transfer: TransferCharacteristics,
 }
 
 /// The served contract an admitted epoch runs: a downgraded request runs
@@ -195,6 +214,7 @@ impl AdmittedCapture {
             pipeline: self.pipeline,
             video: VideoConfiguration {
                 codec: self.codec,
+                transfer: self.transfer,
                 ..contract.colour
             },
             fps: self.fps_ceiling,
@@ -623,33 +643,54 @@ fn grading_plan(
 ) -> Result<AdmittedCapture, AdmissionReason> {
     fidelity_preconditions(StreamingPreset::Grading, source, encoder)?;
     let (transfer, primaries) = authoritative_colour(source)?;
-    let transform = match (source.format.precision(), transfer, primaries) {
+    // A desktop's SDR codes are sRGB on every Pier (`sdr_desktop_transfer`):
+    // a parent that resolved `srgb` gets those codes untouched and PQ
+    // re-encoded on the sRGB curve; any other request keeps `bt709`.
+    let sdr = if request.sdr_transfer == TransferCharacteristics::Srgb {
+        TransferCharacteristics::Srgb
+    } else {
+        TransferCharacteristics::Bt709
+    };
+    // For `srgb`, the inverse of the curve the compositor decoded its SDR
+    // content with returns that content's codes; the sRGB curve unless the
+    // source says otherwise.
+    let pq_to_sdr = match (sdr, source.colour.sdr_content.value()) {
+        (TransferCharacteristics::Srgb, Some(SdrContentCurve::Gamma22)) => {
+            Rgb10Signal::PqBt2020ToSdrGamma22
+        }
+        (TransferCharacteristics::Srgb, _) => Rgb10Signal::PqBt2020ToSdrSrgb,
+        _ => Rgb10Signal::PqBt2020ToSdrBt709,
+    };
+    let (transform, served_transfer) = match (source.format.precision(), transfer, primaries) {
         (
             SourcePrecision::Ten,
             SourceTransfer::Srgb | SourceTransfer::Bt709,
             ColorPrimaries::Bt709,
-        ) => SourceTransform::PackedRgb10(Rgb10Signal::Direct),
+        ) => (SourceTransform::PackedRgb10(Rgb10Signal::Direct), sdr),
         (SourcePrecision::Ten, SourceTransfer::Pq, ColorPrimaries::Bt2020) => {
             pq_graphics_white(source)?;
-            SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrBt709)
+            (SourceTransform::PackedRgb10(pq_to_sdr), sdr)
         }
         (SourcePrecision::HalfFloat, SourceTransfer::Pq, ColorPrimaries::Bt2020) => {
             pq_graphics_white(source)?;
-            SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709)
+            (SourceTransform::HalfFloatPq(pq_to_sdr), sdr)
         }
+        // The linear conversion re-encodes with the contract's BT.709 curve.
         (SourcePrecision::HalfFloat, SourceTransfer::LinearExtended, ColorPrimaries::Bt709) => {
-            SourceTransform::LinearToSdr
+            (SourceTransform::LinearToSdr, TransferCharacteristics::Bt709)
         }
         _ => return Err(AdmissionReason::NoSharedConversion),
     };
-    complete_plan(
+    let mut plan = complete_plan(
         request,
         &pipeline_contract(PipelineId::Grading),
         source,
         encoder,
         transform,
         false,
-    )
+    )?;
+    plan.transfer = served_transfer;
+    Ok(plan)
 }
 
 /// HDR: a proven active HDR output with PQ/BT.2020 or documented linear
@@ -846,6 +887,7 @@ fn complete_plan(
         copy_path: source.copy_path,
         colour_assumed,
         cursor_mode: source.cursor.authority(),
+        transfer: contract.colour.transfer,
     })
 }
 
@@ -908,6 +950,7 @@ mod tests {
             width: 1920,
             height: 1080,
             max_fps: preset.pipeline_contract().max_fps,
+            sdr_transfer: TransferCharacteristics::Bt709,
         }
     }
 
@@ -1482,6 +1525,87 @@ mod tests {
             .transform,
             SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709)
         );
+    }
+
+    /// A parent that resolved `srgb` for its Grading session (a Deck that
+    /// presents it) gets PQ re-encoded on the sRGB curve and an `srgb` epoch;
+    /// every other request, and the linear path, keeps `bt709`.
+    #[test]
+    fn grading_serves_srgb_only_when_the_parent_asked_for_it() {
+        use TransferCharacteristics::{Bt709, Pq, Srgb};
+        let grading = |sdr_transfer| AdmissionRequest {
+            sdr_transfer,
+            ..request(StreamingPreset::Grading)
+        };
+        for (source, srgb_transform, bt709_transform) in [
+            (
+                rgb10_pq_hdr(),
+                SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrSrgb),
+                SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrBt709),
+            ),
+            (
+                f16_pq_hdr(),
+                SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrSrgb),
+                SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709),
+            ),
+            // A ten-bit SDR desktop's codes pass through either way.
+            (
+                rgb10_sdr(),
+                SourceTransform::PackedRgb10(Rgb10Signal::Direct),
+                SourceTransform::PackedRgb10(Rgb10Signal::Direct),
+            ),
+        ] {
+            let served = admitted(admit_grading(grading(Srgb), &source, &nvenc()));
+            assert_eq!(served.transform, srgb_transform);
+            assert_eq!(served.transfer, Srgb);
+            let epoch = served.epoch().unwrap();
+            assert_eq!(epoch.video.transfer, Srgb);
+            assert_eq!(epoch.video.primaries, ColorPrimaries::Bt709);
+            for other in [Bt709, Pq] {
+                let served = admitted(admit_grading(grading(other), &source, &nvenc()));
+                assert_eq!(served.transform, bt709_transform, "{other:?}");
+                assert_eq!(served.transfer, Bt709, "{other:?}");
+                assert_eq!(served.epoch().unwrap().video.transfer, Bt709);
+            }
+        }
+        // A composition that decoded its SDR content with a 2.2 power is
+        // re-encoded with that power for `srgb`; `bt709` keeps the OETF.
+        for source in [rgb10_pq_hdr(), f16_pq_hdr()] {
+            let gamma22 = with_colour(source, |colour| {
+                colour.sdr_content = SourceFact::Inferred(SdrContentCurve::Gamma22);
+            });
+            let served = admitted(admit_grading(grading(Srgb), &gamma22, &nvenc()));
+            assert!(matches!(
+                served.transform,
+                SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrGamma22)
+                    | SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrGamma22)
+            ));
+            assert_eq!(served.transfer, Srgb);
+            let legacy = admitted(admit_grading(grading(Bt709), &gamma22, &nvenc()));
+            assert!(matches!(
+                legacy.transform,
+                SourceTransform::PackedRgb10(Rgb10Signal::PqBt2020ToSdrBt709)
+                    | SourceTransform::HalfFloatPq(Rgb10Signal::PqBt2020ToSdrBt709)
+            ));
+        }
+        // The linear conversion has only the BT.709 curve.
+        let linear = with_colour(f16_linear_hdr(), |colour| {
+            colour.primaries = SourceFact::Authoritative(ColorPrimaries::Bt709);
+        });
+        if let PresetAdmission::Admit(served) = admit_grading(grading(Srgb), &linear, &nvenc()) {
+            assert_eq!(served.transform, SourceTransform::LinearToSdr);
+            assert_eq!(served.transfer, Bt709);
+        }
+        // HDR keeps PQ; its Grading fallback follows the same request.
+        let hdr = AdmissionRequest {
+            sdr_transfer: Srgb,
+            ..request(StreamingPreset::Hdr)
+        };
+        let PresetAdmission::Admit(pq) = admit_hdr(hdr, &f16_pq_hdr(), &nvenc()) else {
+            panic!("HDR not admitted");
+        };
+        assert_eq!(pq.transfer, Pq);
+        assert_eq!(pq.epoch().unwrap().video.transfer, Pq);
     }
 
     #[test]

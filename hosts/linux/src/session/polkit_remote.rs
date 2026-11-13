@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen's polkit rule on this host and the proof that a desktop is remote
 //! to polkit (see [`arcen_session::polkit_remote`]).
 //!
@@ -819,31 +821,40 @@ mod tests {
     /// --version` prints `version`, `pkaction` lists `installed`, and
     /// `pkcheck` exits `granted_status` for power-off and 2 otherwise.
     fn fake_tools(name: &str, version: &str, installed: &[&str], granted_status: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!("arcen-polkit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fake tool dir");
-        let pkaction = dir.join("pkaction");
-        std::fs::write(
-            &pkaction,
-            format!(
+        write_tool(
+            &dir.join("pkaction"),
+            &format!(
                 "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'pkaction version {version}'; exit 0; }}\nprintf '%s\\n' {}\n",
                 installed.join(" ")
             ),
-        )
-        .expect("fake pkaction");
-        let pkcheck = dir.join("pkcheck");
-        std::fs::write(
-            &pkcheck,
-            format!(
+        );
+        write_tool(
+            &dir.join("pkcheck"),
+            &format!(
                 "#!/bin/sh\n[ \"$4\" = org.freedesktop.login1.power-off ] && exit {granted_status}\nexit 2\n"
             ),
-        )
-        .expect("fake pkcheck");
-        for tool in [&pkaction, &pkcheck] {
-            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
+        );
         dir
+    }
+
+    /// A child shell writes the fake tool, so this process never holds a
+    /// writable descriptor to it. A child another test forks meanwhile would
+    /// inherit that descriptor until it execs, and running the tool would
+    /// then fail with ETXTBSY: `pkaction` "did not answer" and the state read
+    /// `Unknown`.
+    fn write_tool(path: &Path, body: &str) {
+        let written = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .arg(body)
+            .status()
+            .expect("fake tool");
+        assert!(written.success(), "fake tool");
     }
 
     fn tool_paths(dir: &Path) -> (String, String) {

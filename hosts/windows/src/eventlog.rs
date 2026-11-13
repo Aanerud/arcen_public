@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Windows Event Log lifecycle sink.
 //!
 //! Formatting is fully separated from the Win32 FFI backend so the exact

@@ -1,4 +1,8 @@
-"""macOS bundles ship the AGPL licence and the third-party notices.
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+"""macOS bundles ship the licence set: the AGPL, the store exception, the
+notice, the trademark policy and the third-party notices.
 
 The static tests read the build scripts, so they run anywhere. The artefact
 tests open a built package or Deck bundle; point ARCEN_PIER_PKG or
@@ -22,7 +26,14 @@ REPO = MACOS.parents[1]
 APP_SCRIPT = MACOS / "build-pier-app.sh"
 PKG_SCRIPT = MACOS / "build-pier-pkg.sh"
 DECK_SCRIPT = MACOS / "build-deck-app.sh"
-NOTICES = ("LICENSE", "legal/THIRD_PARTY_NOTICES.md")
+NOTICES = (
+    "LICENSE",
+    "LICENSE-EXCEPTION.md",
+    "NOTICE",
+    "TRADEMARKS.md",
+    "legal/THIRD_PARTY_NOTICES.md",
+)
+NOTICE_LOOP = "for notice in " + " ".join(NOTICES)
 PAYLOAD_RESOURCES = "Applications/Arcen Pier.app/Contents/Resources"
 
 
@@ -40,16 +51,17 @@ class NoticeSourcesTests(unittest.TestCase):
             (REPO / "LICENSE").read_text(encoding="utf-8"),
         )
 
-    def test_third_party_notices_exist(self):
-        self.assertTrue((REPO / "legal/THIRD_PARTY_NOTICES.md").is_file())
+    def test_every_notice_exists(self):
+        for notice in NOTICES:
+            self.assertTrue((REPO / notice).is_file(), notice)
 
 
 class PierAppScriptTests(unittest.TestCase):
     def setUp(self):
         self.lines = APP_SCRIPT.read_text(encoding="utf-8").splitlines()
 
-    def test_copies_both_notices_into_the_pier_bundle(self):
-        loop = first_line(self.lines, "for notice in LICENSE legal/THIRD_PARTY_NOTICES.md")
+    def test_copies_every_notice_into_the_pier_bundle(self):
+        loop = first_line(self.lines, NOTICE_LOOP)
         copy = first_line(self.lines, 'cp "$REPO/$notice" "$APP/Contents/Resources/', loop)
         self.assertLess(copy - loop, 4, "the copy belongs to the notice loop")
 
@@ -64,7 +76,7 @@ class PierPkgScriptTests(unittest.TestCase):
         self.lines = PKG_SCRIPT.read_text(encoding="utf-8").splitlines()
 
     def test_payload_notices_are_verified_against_source(self):
-        loop = first_line(self.lines, "for notice in LICENSE legal/THIRD_PARTY_NOTICES.md")
+        loop = first_line(self.lines, NOTICE_LOOP)
         check = first_line(self.lines, 'cmp -s "$REPO/$notice" "$RESOURCES/', loop)
         self.assertLess(check - loop, 3)
 

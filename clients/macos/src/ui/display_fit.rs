@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Tracks viewer surface size changes and issues `display_update` messages to
 //! the host when the surface has been stable long enough and the delta exceeds
 //! the minimum threshold.

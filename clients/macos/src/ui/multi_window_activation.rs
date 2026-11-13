@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Production live-session wiring for Carrier A (`MuxedReliableStream`)
 //! multi-monitor-v1 presentation.
 //!

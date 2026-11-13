@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen wire protocol — the single source of truth for the on-wire
 //! contract shared by Arcen Pier (Linux/Windows) and Arcen Deck (macOS).
 //!
@@ -15,6 +17,8 @@
 //! - [`auth`]     — SHA-256 challenge/response (`hash_password`, `generate_challenge`).
 //! - [`lanes`]    — QUIC lane roles and the bounded lane preface (lane protocol v1).
 //! - [`cursor`]   — the `CursorUpdate` host cursor image record.
+//! - [`cursor_position`] — the `CursorPosition` host pointer position record.
+//! - [`keys`]     — `key_event` key identifiers and modifier bits.
 //!
 //! Byte-compatibility and any change to the wire is governed by `WIRE.md` in this
 //! crate. See it for the authoritative layout + dated changelog.
@@ -25,10 +29,13 @@ pub mod auth;
 pub mod build_identity;
 pub mod clipboard;
 pub mod cursor;
+pub mod cursor_position;
 pub mod fsm;
+pub mod keys;
 pub mod lanes;
 pub mod messages;
 mod multi_monitor;
+pub mod refine;
 mod region_input;
 pub mod wire;
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_protocol::messages::{AuthResponse, VideoSelectionIntent};
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
 use arcen_telemetry::CorrelationId;
@@ -314,6 +317,10 @@ pub struct AgentStart {
     pub log_control: AgentControl,
     #[serde(default = "default_direct_transport")]
     pub transport_capability: String,
+    /// The service runs with `ARCEN_VIDEO_BACKLOG=legacy`. The agent's own
+    /// environment is the signed-in user's, so the service hands it over.
+    #[serde(default)]
+    pub video_backlog_legacy: bool,
 }
 
 impl AgentStart {
@@ -329,7 +336,7 @@ impl AgentStart {
         log_control: AgentControl,
         transport_capability: &str,
     ) -> Self {
-        auth_response.credential.clear();
+        zeroize::Zeroize::zeroize(&mut auth_response.credential);
         Self {
             msg_type: Self::TYPE.to_string(),
             peer,
@@ -340,6 +347,7 @@ impl AgentStart {
             session_log_id: session_log_id.to_string(),
             log_control,
             transport_capability: transport_capability.to_string(),
+            video_backlog_legacy: arcen_media::video::video_backlog_is_legacy_from_env(),
         }
     }
 }
@@ -3347,8 +3355,8 @@ mod tests {
 
     #[test]
     fn measured_lab_topology_after_rdp_disconnect_moves_the_account_to_the_console() {
-        // Reproduces pier-windows.example.internal exactly as measured on 2026-08-04, after the
-        // owner signed in over RDP and closed the client:
+        // Reproduces pier-windows.example.internal exactly as measured on 2026-08-04, after an
+        // administrator signed in over RDP and closed the client:
         //
         //   WTSGetActiveConsoleSessionId() = 2, GlassSessionId = 2
         //   0     Services  proto 0  no user   Disconnected
@@ -3357,7 +3365,7 @@ mod tests {
         //   65536/65537     proto 0  no user   Listen
         //
         // Before this change the broker refused with "another, stale, or
-        // unverifiable interactive session exists" and the owner had no way to
+        // unverifiable interactive session exists" and the administrator had no way to
         // reach the machine with Arcen at all.
         let candidates = vec![
             cp_candidate(

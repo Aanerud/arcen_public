@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The session-user side of a headless Wayland desktop.
 //!
 //! Runs inside the session's own logind scope as the authenticated user.

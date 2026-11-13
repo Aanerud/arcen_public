@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Session-scoped identity of a host's virtual input devices.
 //!
 //! A Linux Pier injects into its dedicated X server through kernel virtual

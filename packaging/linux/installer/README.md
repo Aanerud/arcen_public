@@ -52,7 +52,10 @@ own speakers during every session, and refuses a session when it cannot prove
 that. The installer keeps an existing configuration as it is. An operator who
 wants the host's speakers to keep playing sets `"local_playback": "audible"`
 in the `audio` section (see "Upgrade and rollback" in
-`docs/operations/pier-administration.md`).
+`docs/operations/pier-administration.md`). The installer says so in a NOTE
+block when it replaces a Pier older than 0.17.0 (asked with `--version`, as
+`nobody`, before the new binary is written) and the kept configuration does
+not name `audio.local_playback`.
 
 ## Desktop provider
 
@@ -70,7 +73,14 @@ refusal naming what to install. A render node of any vendor qualifies: the
 qualification probes for a native encoder (NVENC) first, and a host without
 one (Intel or AMD graphics, a GPU with no encoder) is qualified and served
 with the software encoder (OpenH264, H.264 4:2:0 at up to 30 fps, outputs
-fitted to 1920x1200). It never installs packages or changes
+fitted to 1920x1200). The one package the installer may install is `kernel-modules-internal` for
+the running kernel, which carries the `vhci-hcd` USB/IP controller Native
+tablet needs. It does so only when Native tablet is enabled (`--native-tablet`,
+or `usb.native_tablet` already `"enabled"` on an upgrade), the host is in the
+Rocky Linux/RHEL family, and the running kernel has no `vhci-hcd` module; it
+installs the signed package with `dnf` and GPG checking on, and
+`--no-native-tablet-modules` skips it. `--no-native-tablet` removes the
+package again if the installer installed it. Apart from that it installs no packages, and never changes
 driver, kernel, device-permission or boot configuration, or the SELinux
 mode; on an SELinux host it loads only Arcen's own policy module (checked
 for `semodule` in preflight, loaded before the qualification runs). `--check` prints the same

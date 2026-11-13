@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Generic all-or-reverse-rollback start policy.
 //!
 //! Both hosts hand-wrote the same algorithm as `spawn_all_or_rollback`: start

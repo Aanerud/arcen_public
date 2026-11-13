@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! QUIC multi-monitor carrier benchmark CLI: a diagnostic-only comparison
 //! of Carrier A (all monitor frames multiplexed over one reliable stream)
 //! and Carrier B (one reliable stream per monitor) over real, local Quinn

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! X11 applications inside a headless Wayland session (Xwayland).
 //!
 //! A headless Mutter or GNOME Shell started without `--no-x11` runs Xwayland
@@ -28,6 +30,9 @@ pub const X11_LOCK_DIR: &str = "/tmp";
 
 /// Directory holding X11 unix sockets.
 pub const X11_UNIX_DIR: &str = "/tmp/.X11-unix";
+
+/// Directory holding ICE (X session management) unix sockets.
+pub const ICE_UNIX_DIR: &str = "/tmp/.ICE-unix";
 
 /// Prefix of the authority file Mutter creates in the runtime directory.
 pub const MUTTER_XAUTHORITY_PREFIX: &str = ".mutter-Xwaylandauth.";
@@ -125,6 +130,11 @@ pub struct XwaylandProof {
     /// Why the proof failed, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Set when X11 applications were not tried because a host
+    /// precondition did not hold (a [`SocketDirFault`] token). Not a failed
+    /// proof: start-up re-checks the precondition ([`resolve_x11_apps`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_precondition: Option<String>,
 }
 
 impl XwaylandProof {
@@ -147,6 +157,13 @@ pub enum X11AppsDisabledReason {
     NotQualified,
     /// The qualification record says Xwayland did not work.
     QualificationFailed,
+    /// A shared socket directory is unsafe now ([`SocketDirFault`]).
+    SocketDirectory(SocketDirFault),
+    /// The qualification did not try Xwayland because a host precondition
+    /// failed then; it holds now, but nothing has proved Xwayland yet. The
+    /// trigger of an automatic re-qualification
+    /// (`wayland_qualification::precondition_requalify_decision`).
+    PreconditionCleared,
 }
 
 impl X11AppsDisabledReason {
@@ -158,6 +175,8 @@ impl X11AppsDisabledReason {
             Self::XwaylandNotInstalled => "xwayland_not_installed",
             Self::NotQualified => "not_qualified",
             Self::QualificationFailed => "qualification_failed",
+            Self::SocketDirectory(fault) => fault.token(),
+            Self::PreconditionCleared => "x11_precondition_cleared",
         }
     }
 
@@ -172,6 +191,10 @@ impl X11AppsDisabledReason {
             Self::NotQualified => "requalify with `arcen-pier wayland qualify --write`",
             Self::QualificationFailed => {
                 "read the qualification's x11_apps failure, fix it, then requalify with `arcen-pier wayland qualify --write`"
+            }
+            Self::SocketDirectory(fault) => fault.remedy(),
+            Self::PreconditionCleared => {
+                "the X11 socket directory is sound again; the Pier re-proves X11 applications itself at start (capture.wayland_auto_requalify, once per boot), or requalify with `arcen-pier wayland qualify --write`"
             }
         }
     }
@@ -230,6 +253,12 @@ impl std::error::Error for X11AppsRefusal {}
 /// unproven X server (Mutter ends the whole compositor when its Xwayland
 /// fails). `on` makes the same requirement a refusal; `off` always wins.
 ///
+/// A record whose X11 proof was skipped for a host precondition is not a
+/// failed proof: `x11_unix_dir` (the live state of [`X11_UNIX_DIR`]) says
+/// whether the precondition still fails ([`X11AppsDisabledReason::SocketDirectory`])
+/// or only a requalification is missing
+/// ([`X11AppsDisabledReason::PreconditionCleared`]).
+///
 /// # Errors
 ///
 /// [`X11AppsRefusal`] for `on` when a requirement is missing.
@@ -237,6 +266,7 @@ pub fn resolve_x11_apps(
     setting: X11AppsSetting,
     xwayland_installed: bool,
     proof: Option<&XwaylandProof>,
+    x11_unix_dir: Result<(), SocketDirFault>,
 ) -> Result<X11AppsPlan, X11AppsRefusal> {
     let missing = if setting == X11AppsSetting::Off {
         return Ok(X11AppsPlan::Disabled(X11AppsDisabledReason::OperatorOff));
@@ -245,6 +275,10 @@ pub fn resolve_x11_apps(
     } else {
         match proof {
             None => X11AppsDisabledReason::NotQualified,
+            Some(proof) if proof.host_precondition.is_some() => match x11_unix_dir {
+                Err(fault) => X11AppsDisabledReason::SocketDirectory(fault),
+                Ok(()) => X11AppsDisabledReason::PreconditionCleared,
+            },
             Some(proof) if !proof.proven() => X11AppsDisabledReason::QualificationFailed,
             Some(_) => return Ok(X11AppsPlan::Enabled),
         }
@@ -498,6 +532,177 @@ pub fn removable_lock(
     kind == ArtifactType::Regular && owner_uid == uid && lock_pid == Some(compositor_pid)
 }
 
+/// A shared socket directory in `/tmp` that every user's X11 session binds
+/// in: X11 display sockets, and the ICE sockets of X session management.
+///
+/// Each must be root-owned, world-writable and sticky (`root:root 1777`, as
+/// systemd-tmpfiles creates them at boot, `x11.conf`): only then can no
+/// user delete or replace another user's socket. Mutter creates
+/// `/tmp/.X11-unix` as the session user when it is missing (`mkdir 01777`
+/// under the user's umask, typically `1755`), after which every other
+/// user's GNOME Shell refuses it and aborts at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedSocketDir {
+    /// [`X11_UNIX_DIR`].
+    X11Unix,
+    /// [`ICE_UNIX_DIR`].
+    IceUnix,
+}
+
+impl SharedSocketDir {
+    /// Both, in the order they are checked and repaired.
+    pub const ALL: [Self; 2] = [Self::X11Unix, Self::IceUnix];
+
+    /// The absolute path.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::X11Unix => X11_UNIX_DIR,
+            Self::IceUnix => ICE_UNIX_DIR,
+        }
+    }
+
+    /// The name inside `/tmp`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::X11Unix => ".X11-unix",
+            Self::IceUnix => ".ICE-unix",
+        }
+    }
+}
+
+/// What `lstat` (never following a symlink) says about a
+/// [`SharedSocketDir`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketDirFact {
+    /// A real directory, not a symlink or anything else.
+    pub directory: bool,
+    /// The owning uid.
+    pub owner: u32,
+    /// `st_mode` permission bits (`0o7777`).
+    pub mode: u32,
+}
+
+/// What is wrong with a [`SharedSocketDir`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketDirProblem {
+    /// It does not exist.
+    Missing,
+    /// A symlink or a non-directory stands at the path.
+    NotADirectory,
+    /// Owned by a user other than root.
+    ForeignOwner {
+        /// The uid that owns it.
+        owner: u32,
+    },
+    /// Not sticky, or not writable by every user.
+    NotShared {
+        /// Its permission bits.
+        mode: u32,
+    },
+}
+
+/// Why a [`SharedSocketDir`] may not hold a new desktop's sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketDirFault {
+    /// Which directory.
+    pub dir: SharedSocketDir,
+    /// What is wrong with it.
+    pub problem: SocketDirProblem,
+}
+
+impl SocketDirFault {
+    /// Stable token for logs and the qualification record.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        use SharedSocketDir as D;
+        use SocketDirProblem as P;
+        match (self.dir, self.problem) {
+            (D::X11Unix, P::Missing) => "x11_unix_dir_missing",
+            (D::X11Unix, P::NotADirectory) => "x11_unix_dir_not_a_directory",
+            (D::X11Unix, P::ForeignOwner { .. }) => "x11_unix_dir_foreign_owner",
+            (D::X11Unix, P::NotShared { .. }) => "x11_unix_dir_not_shared",
+            (D::IceUnix, P::Missing) => "ice_unix_dir_missing",
+            (D::IceUnix, P::NotADirectory) => "ice_unix_dir_not_a_directory",
+            (D::IceUnix, P::ForeignOwner { .. }) => "ice_unix_dir_foreign_owner",
+            (D::IceUnix, P::NotShared { .. }) => "ice_unix_dir_not_shared",
+        }
+    }
+
+    /// What an operator can do about it. `arcen-pier repair-x11-unix-dir`
+    /// runs the distribution's own boot entry
+    /// (`systemd-tmpfiles --boot --create --prefix=…`), which sets owner,
+    /// mode and `SELinux` label through a descriptor and never follows a
+    /// symlink; the manual commands are the fallback without systemd.
+    #[must_use]
+    pub const fn remedy(self) -> &'static str {
+        match (self.dir, self.problem) {
+            (SharedSocketDir::X11Unix, SocketDirProblem::NotADirectory) => {
+                "remove what stands at /tmp/.X11-unix (`rm /tmp/.X11-unix`, which does not follow a symlink), then run `arcen-pier repair-x11-unix-dir` as root"
+            }
+            (SharedSocketDir::IceUnix, SocketDirProblem::NotADirectory) => {
+                "remove what stands at /tmp/.ICE-unix (`rm /tmp/.ICE-unix`, which does not follow a symlink), then run `arcen-pier repair-x11-unix-dir` as root"
+            }
+            (SharedSocketDir::X11Unix, _) => {
+                "run `arcen-pier repair-x11-unix-dir` as root (systemd-tmpfiles --boot --create --prefix=/tmp/.X11-unix); without systemd-tmpfiles: `chown -h root:root /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && restorecon /tmp/.X11-unix`; a user's stale sockets inside are left for you to remove once none of that user's X servers runs"
+            }
+            (SharedSocketDir::IceUnix, _) => {
+                "run `arcen-pier repair-x11-unix-dir` as root (systemd-tmpfiles --boot --create --prefix=/tmp/.ICE-unix); without systemd-tmpfiles: `chown -h root:root /tmp/.ICE-unix && chmod 1777 /tmp/.ICE-unix && restorecon /tmp/.ICE-unix`"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SocketDirFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.dir.path();
+        match self.problem {
+            SocketDirProblem::Missing => write!(formatter, "{path} is missing")?,
+            SocketDirProblem::NotADirectory => write!(formatter, "{path} is not a directory")?,
+            SocketDirProblem::ForeignOwner { owner } => {
+                write!(formatter, "{path} is owned by uid {owner}, not root")?;
+            }
+            SocketDirProblem::NotShared { mode } => write!(
+                formatter,
+                "{path} has mode {mode:04o}, not world-writable and sticky"
+            )?,
+        }
+        write!(formatter, " ({}): {}", self.token(), self.remedy())
+    }
+}
+
+impl std::error::Error for SocketDirFault {}
+
+/// Whether `dir` is safe for new sockets: a real directory owned by `owner`
+/// (root in production) that every user may create entries in (`o+wx`)
+/// and nobody may delete others' entries from (sticky).
+///
+/// # Errors
+///
+/// The first [`SocketDirFault`] found.
+pub fn assess_socket_dir(
+    dir: SharedSocketDir,
+    fact: Option<SocketDirFact>,
+    owner: u32,
+) -> Result<(), SocketDirFault> {
+    const STICKY_AND_OTHERS_WX: u32 = 0o1003;
+    let fault = |problem| SocketDirFault { dir, problem };
+    let fact = fact.ok_or(fault(SocketDirProblem::Missing))?;
+    if !fact.directory {
+        return Err(fault(SocketDirProblem::NotADirectory));
+    }
+    if fact.owner != owner {
+        return Err(fault(SocketDirProblem::ForeignOwner { owner: fact.owner }));
+    }
+    if fact.mode & STICKY_AND_OTHERS_WX != STICKY_AND_OTHERS_WX {
+        return Err(fault(SocketDirProblem::NotShared {
+            mode: fact.mode & 0o7777,
+        }));
+    }
+    Ok(())
+}
+
 /// Where Xwayland's glamor renders, from `/proc/<pid>/maps` text.
 #[must_use]
 pub fn glamor_route_from_maps(maps: &str) -> GlamorRoute {
@@ -547,6 +752,7 @@ mod tests {
             glamor: GlamorRoute::NvidiaGbm,
             xwayland_version: Some("24.1.9".into()),
             failure: None,
+            host_precondition: None,
         }
     }
 
@@ -555,21 +761,21 @@ mod tests {
         let proven = proof(true, true);
         let failed = proof(true, false);
         assert_eq!(
-            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&proven)),
+            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&proven), Ok(())),
             Ok(X11AppsPlan::Enabled)
         );
         assert_eq!(
-            resolve_x11_apps(X11AppsSetting::Auto, false, Some(&proven)),
+            resolve_x11_apps(X11AppsSetting::Auto, false, Some(&proven), Ok(())),
             Ok(X11AppsPlan::Disabled(
                 X11AppsDisabledReason::XwaylandNotInstalled
             ))
         );
         assert_eq!(
-            resolve_x11_apps(X11AppsSetting::Auto, true, None),
+            resolve_x11_apps(X11AppsSetting::Auto, true, None, Ok(())),
             Ok(X11AppsPlan::Disabled(X11AppsDisabledReason::NotQualified))
         );
         assert_eq!(
-            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&failed)),
+            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&failed), Ok(())),
             Ok(X11AppsPlan::Disabled(
                 X11AppsDisabledReason::QualificationFailed
             ))
@@ -580,7 +786,7 @@ mod tests {
     fn on_refuses_what_auto_would_disable_and_off_always_wins() {
         let proven = proof(true, true);
         assert_eq!(
-            resolve_x11_apps(X11AppsSetting::On, true, Some(&proven)),
+            resolve_x11_apps(X11AppsSetting::On, true, Some(&proven), Ok(())),
             Ok(X11AppsPlan::Enabled)
         );
         for (installed, record) in [
@@ -588,13 +794,13 @@ mod tests {
             (true, None),
             (true, Some(&proof(false, true))),
         ] {
-            let refusal = resolve_x11_apps(X11AppsSetting::On, installed, record)
+            let refusal = resolve_x11_apps(X11AppsSetting::On, installed, record, Ok(()))
                 .expect_err("on must refuse");
             assert!(refusal.to_string().contains("wayland_x11_apps is on"));
         }
         for (installed, record) in [(true, Some(&proven)), (false, None)] {
             assert_eq!(
-                resolve_x11_apps(X11AppsSetting::Off, installed, record),
+                resolve_x11_apps(X11AppsSetting::Off, installed, record, Ok(())),
                 Ok(X11AppsPlan::Disabled(X11AppsDisabledReason::OperatorOff))
             );
         }
@@ -882,5 +1088,127 @@ mod tests {
         assert_eq!(parse_xwayland_version(banner).as_deref(), Some("24.1.9"));
         assert_eq!(parse_xwayland_version("Xwayland Version x;rm\n"), None);
         assert_eq!(parse_xwayland_version("nothing"), None);
+    }
+
+    #[test]
+    fn shared_socket_dirs_must_be_root_owned_sticky_world_writable_directories() {
+        use SharedSocketDir::{IceUnix, X11Unix};
+        let dir = |owner, mode| {
+            Some(SocketDirFact {
+                directory: true,
+                owner,
+                mode,
+            })
+        };
+        let fault = |dir, problem| Err(SocketDirFault { dir, problem });
+        assert_eq!(assess_socket_dir(X11Unix, dir(0, 0o1777), 0), Ok(()));
+        assert_eq!(
+            assess_socket_dir(X11Unix, None, 0),
+            fault(X11Unix, SocketDirProblem::Missing)
+        );
+        let link = SocketDirFact {
+            directory: false,
+            owner: 0,
+            mode: 0o1777,
+        };
+        assert_eq!(
+            assess_socket_dir(IceUnix, Some(link), 0),
+            fault(IceUnix, SocketDirProblem::NotADirectory)
+        );
+        // What Mutter leaves when it creates the directory itself under a
+        // user's umask (the 0.18.0 qualification host's state).
+        assert_eq!(
+            assess_socket_dir(X11Unix, dir(88_601_122, 0o1755), 0),
+            fault(
+                X11Unix,
+                SocketDirProblem::ForeignOwner { owner: 88_601_122 }
+            )
+        );
+        assert_eq!(
+            assess_socket_dir(IceUnix, dir(0, 0o1755), 0),
+            fault(IceUnix, SocketDirProblem::NotShared { mode: 0o1755 })
+        );
+        assert_eq!(
+            assess_socket_dir(X11Unix, dir(0, 0o0777), 0),
+            fault(X11Unix, SocketDirProblem::NotShared { mode: 0o0777 })
+        );
+        let foreign = SocketDirFault {
+            dir: X11Unix,
+            problem: SocketDirProblem::ForeignOwner { owner: 1000 },
+        };
+        let text = foreign.to_string();
+        assert!(text.contains("uid 1000") && text.contains("x11_unix_dir_foreign_owner"));
+        // The remedy is the distribution's own entry, through the Pier.
+        assert!(
+            foreign
+                .remedy()
+                .starts_with("run `arcen-pier repair-x11-unix-dir`")
+        );
+        assert!(foreign.remedy().contains("--prefix=/tmp/.X11-unix"));
+        let ice = SocketDirFault {
+            dir: IceUnix,
+            problem: SocketDirProblem::Missing,
+        };
+        assert_eq!(ice.token(), "ice_unix_dir_missing");
+        assert!(ice.remedy().contains("--prefix=/tmp/.ICE-unix"));
+    }
+
+    #[test]
+    fn a_proof_skipped_for_a_host_precondition_is_rechecked_not_failed() {
+        let skipped = XwaylandProof {
+            display_proven: false,
+            window_manager: false,
+            pointer: false,
+            glamor: GlamorRoute::Unknown,
+            xwayland_version: Some("24.1.9".into()),
+            failure: Some("/tmp/.X11-unix is owned by uid 1000, not root".into()),
+            host_precondition: Some("x11_unix_dir_foreign_owner".into()),
+        };
+        let still = SocketDirFault {
+            dir: SharedSocketDir::X11Unix,
+            problem: SocketDirProblem::ForeignOwner { owner: 1000 },
+        };
+        assert_eq!(
+            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&skipped), Err(still)),
+            Ok(X11AppsPlan::Disabled(
+                X11AppsDisabledReason::SocketDirectory(still)
+            ))
+        );
+        let cleared = resolve_x11_apps(X11AppsSetting::Auto, true, Some(&skipped), Ok(()));
+        assert_eq!(
+            cleared,
+            Ok(X11AppsPlan::Disabled(
+                X11AppsDisabledReason::PreconditionCleared
+            ))
+        );
+        assert_ne!(
+            cleared,
+            Ok(X11AppsPlan::Disabled(
+                X11AppsDisabledReason::QualificationFailed
+            ))
+        );
+        assert_eq!(
+            resolve_x11_apps(X11AppsSetting::On, true, Some(&skipped), Err(still)),
+            Err(X11AppsRefusal {
+                reason: X11AppsDisabledReason::SocketDirectory(still)
+            })
+        );
+        // A proven record is not second-guessed here: the launcher checks
+        // the directory before every desktop.
+        let mut proven = skipped.clone();
+        proven.display_proven = true;
+        proven.window_manager = true;
+        proven.pointer = true;
+        proven.host_precondition = None;
+        assert_eq!(
+            resolve_x11_apps(X11AppsSetting::Auto, true, Some(&proven), Err(still)),
+            Ok(X11AppsPlan::Enabled)
+        );
+        // Written only when set, so records without it read as before.
+        let json = serde_json::to_string(&proven).expect("json");
+        assert!(!json.contains("host_precondition"));
+        let back: XwaylandProof =
+            serde_json::from_str(&serde_json::to_string(&skipped).expect("json")).expect("parse");
+        assert_eq!(back, skipped);
     }
 }

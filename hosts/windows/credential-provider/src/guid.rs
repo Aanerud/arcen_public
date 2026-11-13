@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The pinned class id as a windows-rs `GUID`, kept byte-for-byte in sync with
 //! [`crate::registration::CLSID_STRING`].
 

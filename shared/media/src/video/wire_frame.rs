@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Framing one encoded access unit for the video wire.
 //!
 //! Every Pier does the same five things to a frame before it leaves: pick the

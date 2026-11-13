@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Client display enumeration.
 //!
 //! The host adapts to the client: on accepted auth it reads the client's real
@@ -66,6 +68,46 @@ pub fn any_display_is_hdr() -> bool {
         .filter_map(|monitor| monitor.color)
         .collect();
     arcen_media::display_color::any_display_is_hdr(&colors)
+}
+
+/// The top of a display a standard fullscreen window does not get, in
+/// points.
+///
+/// On a notched panel AppKit reports the notch as `safeAreaInsets.top`, but
+/// a fullscreen window starts below the menu bar, which is a point taller.
+/// Measured on a 14-inch MacBook Pro (1800x1169 points) with a small AppKit
+/// probe reading these properties, windowed, fullscreen and with the menu bar set to
+/// hide automatically: safe-area top 38, the notch strips
+/// (`auxiliaryTopLeftArea`/`RightArea`) 38, the main menu's `menuBarHeight`
+/// 39 in every state, `visibleFrame`'s top gap 39 or 38 depending on whether
+/// the menu bar shows, and the fullscreen window always 1800x1130 below a
+/// 39-point gap. Sizing a Retina stream from the notch asked for 3600x2262
+/// pixels on that 3600x2260 viewport, which the Deck shrank by 0.1%.
+///
+/// So the inset is the fullscreen window's own top gap when one is on the
+/// display — the truth — and otherwise the larger of the notch and the menu
+/// bar's height, which does not follow the menu bar's visibility. Nothing
+/// that changes when the menu bar hides is an input. It is rounded up so the
+/// stream is never taller than the viewport. A display without a notch keeps
+/// no inset: its menu bar hides in fullscreen.
+#[must_use]
+pub(crate) fn fullscreen_top_inset(
+    safe_top: f64,
+    menu_bar_height: f64,
+    fullscreen_window_top_gap: Option<f64>,
+) -> u32 {
+    if safe_top.is_nan() || safe_top <= 0.0 {
+        return 0;
+    }
+    let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
+    let inset = match fullscreen_window_top_gap.map(finite) {
+        Some(gap) if gap > 0.0 => safe_top.max(gap),
+        _ => safe_top.max(finite(menu_bar_height)),
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        inset.ceil().min(f64::from(u32::MAX)) as u32
+    }
 }
 
 /// The macOS fullscreen safe-area insets for `display_id`, in points.
@@ -368,7 +410,9 @@ mod macos {
     use super::SafeAreaInsets;
     use crate::protocol::messages::ClientMonitor;
     use core_graphics::display::CGDisplay;
-    use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions, NSScreen};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationPresentationOptions, NSScreen, NSWindowStyleMask,
+    };
     use objc2_foundation::{MainThreadMarker, NSNumber, NSString};
 
     /// One display's live reading: its validated metrics plus, when AppKit
@@ -566,6 +610,27 @@ mod macos {
             // can never leave the stream taller than the viewport.
             let insets = screen.safeAreaInsets();
             let frame = screen.frame();
+            let app = NSApplication::sharedApplication(mtm);
+            let menu_bar_height = app.mainMenu().map_or(0.0, |menu| menu.menuBarHeight());
+            // A standard fullscreen window of this app on this display shows
+            // exactly what macOS gives fullscreen; the borderless notch-area
+            // window is not one (it lacks the full-screen style).
+            let fullscreen_window_top_gap = app.windows().iter().find_map(|window| {
+                if !window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+                    return None;
+                }
+                let on_this_screen = window
+                    .screen()
+                    .and_then(|on| on.deviceDescription().objectForKey(&key))
+                    .and_then(|number| number.downcast::<NSNumber>().ok())
+                    .is_some_and(|number| number.as_u32() == id);
+                on_this_screen.then(|| {
+                    let content = window.contentRectForFrameRect(window.frame());
+                    (frame.origin.y + frame.size.height) - (content.origin.y + content.size.height)
+                })
+            });
+            let top =
+                super::fullscreen_top_inset(insets.top, menu_bar_height, fullscreen_window_top_gap);
             let localized_name = screen.localizedName().to_string();
             let color = arcen_protocol::messages::DisplayColorMsg {
                 gamut: if screen.canRepresentDisplayGamut(objc2_app_kit::NSDisplayGamut::P3) {
@@ -592,7 +657,7 @@ mod macos {
                 name: (!localized_name.trim().is_empty()).then_some(localized_name),
                 color: Some(color),
                 insets: SafeAreaInsets {
-                    top: insets.top.max(0.0).ceil() as u32,
+                    top,
                     bottom: insets.bottom.max(0.0).ceil() as u32,
                     left: insets.left.max(0.0).ceil() as u32,
                     right: insets.right.max(0.0).ceil() as u32,
@@ -981,6 +1046,64 @@ mod macos {
 mod tests {
     use super::*;
     use arcen_media::Rotation;
+
+    #[test]
+    fn a_notched_panel_loses_the_menu_bar_not_just_the_notch_in_fullscreen() {
+        // The 14-inch MacBook Pro as AppKit reports it: notch 38, menu bar 39.
+        let top = fullscreen_top_inset(38.0, 39.0, None);
+        assert_eq!(top, 39);
+        let metrics = metrics_of(
+            (1800, 1169),
+            (3600, 2338),
+            SafeAreaInsets {
+                top,
+                ..SafeAreaInsets::ZERO
+            },
+        );
+        // Exactly the 1800x1130-point fullscreen viewport, at both scales.
+        assert_eq!(
+            metrics.presentation_stream_extent(false, true).as_array(),
+            [3600, 2260]
+        );
+        assert_eq!(
+            metrics.presentation_stream_extent(false, false).as_array(),
+            [1800, 1130]
+        );
+        // Before: sized from the notch alone, two rows too tall.
+        let notch_only = metrics_of(
+            (1800, 1169),
+            (3600, 2338),
+            SafeAreaInsets {
+                top: 38,
+                ..SafeAreaInsets::ZERO
+            },
+        );
+        assert_eq!(
+            notch_only
+                .presentation_stream_extent(false, true)
+                .as_array(),
+            [3600, 2262]
+        );
+    }
+
+    #[test]
+    fn the_fullscreen_top_inset_does_not_follow_the_menu_bar_being_hidden() {
+        // Measured with the menu bar hidden (fullscreen, or auto-hide
+        // "Always"): visibleFrame's gap drops to the 38-point notch, but it
+        // is not an input; menuBarHeight still reads 39.
+        assert_eq!(fullscreen_top_inset(38.0, 39.0, None), 39);
+        // A real fullscreen window on the display is the truth, even when
+        // the menu bar's height cannot be read.
+        assert_eq!(fullscreen_top_inset(38.0, 0.0, Some(39.0)), 39);
+        assert_eq!(fullscreen_top_inset(38.0, f64::NAN, Some(39.0)), 39);
+        // Never less than the notch, rounded up.
+        assert_eq!(fullscreen_top_inset(37.5, 0.0, None), 38);
+        assert_eq!(fullscreen_top_inset(38.0, 39.0, Some(0.0)), 39);
+        // No notch: the menu bar hides in fullscreen, nothing is lost.
+        assert_eq!(fullscreen_top_inset(0.0, 24.0, Some(24.0)), 0);
+        assert_eq!(fullscreen_top_inset(f64::NAN, 39.0, None), 0);
+        assert_eq!(fullscreen_top_inset(38.0, f64::INFINITY, None), 38);
+    }
 
     /// Metrics for one display at the desktop origin: `logical` points backed
     /// by `backing` pixels, with `insets` reserved by macOS.

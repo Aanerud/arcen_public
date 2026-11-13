@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Off-hot-path snapshots over registered atomic counters.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -26,6 +28,8 @@ pub struct CallerQosSnapshot {
     pub fps_actual: Option<u32>,
     /// Requested frames per second.
     pub fps_target: Option<u32>,
+    /// Changed-content frames per second the source offered, when provable.
+    pub fps_content: Option<u32>,
     /// Estimated path bandwidth.
     pub bandwidth_mbps: Option<u32>,
     /// Host capture time.
@@ -64,6 +68,7 @@ impl<'a> QosSampler<'a> {
             timestamp_ms,
             fps_actual: caller.fps_actual,
             fps_target: caller.fps_target,
+            fps_content: caller.fps_content,
             bandwidth_mbps: caller.bandwidth_mbps,
             frames_sent: Some(self.counters.frames_sent.load(Ordering::Relaxed)),
             frames_dropped: Some(self.counters.frames_dropped.load(Ordering::Relaxed)),

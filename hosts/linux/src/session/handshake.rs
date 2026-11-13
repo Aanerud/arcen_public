@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! WS handshake: build the `server_hello` the client reads first.
 //!
 //! The host sends `server_hello` only after capenc has emitted authoritative
@@ -71,6 +73,9 @@ pub fn build_server_hello(
         os_user: session.map_or_else(String::new, |session| session.username.clone()),
         session_id: session.map_or_else(String::new, |session| session.session_id.clone()),
         session_type: session.map_or_else(String::new, |session| session.session_type.clone()),
+        platform: arcen_protocol::messages::HostPlatform::Linux
+            .token()
+            .map(str::to_owned),
         desktop: session.map_or_else(String::new, |session| session.desktop.clone()),
         screen_width: plan.width,
         screen_height: plan.height,
@@ -102,7 +107,8 @@ pub fn build_server_hello(
         // Like Hard USB, a uhid device would reach the physical seat, never a
         // seatless (Wayland) session.
         experimental_raw_hid: crate::input::experimental_raw_hid_runtime_enabled()
-            && crate::usb_bridge::session_admission(session).is_ok(),
+            && crate::usb_bridge::session_admission(session).is_ok()
+            && session.is_none_or(|session| session.native_seat.is_none()),
         // A seatless (Wayland) session never offers Hard USB: the bridged
         // device would reach the machine's physical seat, not this session.
         usb_hard_v1: usb_hard_offered,
@@ -199,6 +205,9 @@ pub fn build_server_hello(
             // session's uinput keyboard types key positions only.
             text_commit: InputCapabilityAvailability::Unavailable,
             text_commit_unicode: InputCapabilityAvailability::Unavailable,
+            // AltGr is KEY_RIGHTALT and the ISO key KEY_102ND (input/keymap.rs).
+            extended_keys: InputCapabilityAvailability::Available,
+            meta_pointer_mask: InputCapabilityAvailability::Unavailable,
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: input_availability(pen.pen),
@@ -712,6 +721,7 @@ mod tests {
             wayland: None,
             requested_outputs: None,
             x11_desktop_depth: None,
+            native_seat: None,
         };
         let plan = native_plan(VideoCodec::H264, false);
         let hello = build_server_hello(

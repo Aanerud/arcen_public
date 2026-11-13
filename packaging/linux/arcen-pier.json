@@ -49,6 +49,9 @@
   "redirection": {
     "timezone": true
   },
+  "usb": {
+    "native_tablet": "disabled"
+  },
   "logging": {
     "level": 0,
     "retention_days": 30,

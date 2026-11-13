@@ -7,6 +7,11 @@ settings. The service paths are:
 - Linux: `/etc/arcen/pier.json`
 - macOS: `/Library/Application Support/Arcen/pier.json`
 
+This page explains how the configuration is organised and the policies that
+need more than a line. Every individual key — type, default, meaning, when it
+takes effect and the release that introduced it — is in the
+[Pier configuration reference](config-reference.md).
+
 ## Defaults: everything on, turn off what you don't want
 
 Every installer writes the same values for every common section, and each of
@@ -145,6 +150,38 @@ Linux and Windows installers add `18444/UDP` and remove the legacy
 `18443/TCP` rule (the old WSS TCP port) on recognized firewalls. If you are
 upgrading from a pre-QUIC deployment, verify the TCP rule is absent. Administrators must audit custom
 ports and unrecognized firewall products explicitly.
+
+### Congestion control and video backlog (environment)
+
+These transport choices are read from the Pier's environment at start, not
+from `pier.json`:
+
+| Variable | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `ARCEN_QUIC_CONGESTION` | `bbr`, `bbr-guarded`, `cubic`, `newreno` | `bbr` | The QUIC congestion controller that paces everything the Pier sends, video included. `bbr-guarded` caps BBR's window after repeated lossy round trips; it helps behind a shallow bottleneck slower than the video (8 Mbit/s: 12 % loss and 0.77 s frame age instead of 54 % and 1.36 s) and behaves like `bbr` under random loss. An unknown value keeps the default. |
+| `ARCEN_QUIC_MTU_DISCOVERY` | `on`, `off` | `off` | `on` lets QUIC probe for packets larger than 1200 bytes (up to 1452) and fall back to 1200 when larger packets are lost. Leave it off on VPN and IPsec paths: a tunnel that fragments oversize packets lets the probe succeed and then loses data in bursts. The Deck's Connection Health `Path:` row shows the MTU the Pier is using. |
+| `ARCEN_VIDEO_BACKLOG` | `legacy` | unset | `legacy` restores the send queue without the backlog budget: the Linux Pier's eight-frame queue, and on Windows the broker's relay backlog without the agent's one-frame-in-flight limit. Set it on the service; the service hands it to each session agent, which runs with the user's environment. |
+| `ARCEN_RATE_CONTROL` | `0` | unset | `0` keeps the encoder at its start bitrate instead of following the path. |
+
+The Deck's Session → Connection Health overlay shows the controller in use on
+its `Path:` row, with the RTT, loss and wire rate the Pier measured.
+
+- Linux: `systemctl edit arcen-pier`, add
+  `[Service]` / `Environment=ARCEN_QUIC_CONGESTION=cubic`, then
+  `systemctl restart arcen-pier`.
+- Windows: set the service's `Environment` value (one `NAME=value` per line)
+  and restart it:
+  `reg add HKLM\SYSTEM\CurrentControlSet\Services\ArcenPier /v Environment /t REG_MULTI_SZ /d ARCEN_QUIC_CONGESTION=cubic /f`,
+  then `Restart-Service ArcenPier`. Delete the value to return to the default.
+- Deck: the same variable sets the controller for what the Deck sends (input,
+  microphone, clipboard), which is rarely the bottleneck. For the app, run
+  `launchctl setenv ARCEN_QUIC_CONGESTION cubic` and relaunch it; the command-line
+  Deck reads it from its environment.
+
+Change the default only with measurements from your own path: plain `bbr`
+ignores loss and can flood a shallow-buffered bottleneck; `cubic` and
+`newreno` read random Wi-Fi or VPN loss as congestion and can fall to a few
+Mbit/s.
 
 ## Validation and reload
 

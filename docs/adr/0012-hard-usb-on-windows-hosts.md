@@ -2,11 +2,16 @@
 
 **Status:** Proposed 2026-08-25. Not yet decided.
 
+> **Status note (2026-11-09):** not taken.
+> [ADR 0017](0017-forward-only-pen-input.md) decides that Native tablet is
+> not offered on Windows hosts: the signing pipeline below is not funded,
+> and Tablet support is the Windows pen. This record is kept unchanged as
+> the route to revisit if that changes.
+
 > Recorded so the mechanism question is answered once and the cost is visible
-> before anyone starts. Needs Shared/Architecture sign-off for the driver
-> boundary and Release/Security sign-off for the signing and distribution
-> consequences. The physical-pen gate cleared on 2026-08-25; the remaining
-> conditions are in [Sequencing](#sequencing).
+> before anyone starts. It touches the driver boundary and the signing and
+> distribution of a kernel driver. The physical-pen gate cleared on
+> 2026-08-25; the remaining conditions are in [Sequencing](#sequencing).
 
 ## Context
 
@@ -57,7 +62,7 @@ Three facts are worth having:
 
 ### The two modes are permanent, and they are not competing
 
-Stated by the owner on 2026-08-25. This is product intent, not an implementation
+Stated on 2026-08-25. This is product intent, not an implementation
 detail, and it is what the mechanism below has to serve:
 
 - **Tablet support** is the mode for Wi-Fi, 5G, and working away from the
@@ -125,8 +130,7 @@ of that pipeline; `arcen-microphone` is.
 until the physical Linux pen retest passed. It passed on 2026-08-25: a live GUI
 session against pier-linux.example.internal bridged the real `056a:0317` and the operator confirmed
 the pen drives the pointer, with the host log showing the typed device released
-and one tablet on the seat. See
-[`../operations/hard-usb-lab.md`](../operations/hard-usb-lab.md).
+and one tablet on the seat. (The lab record itself is not published.)
 
 That removes the reason to defer the *decision*. It does not by itself justify
 starting the *work*, for two remaining reasons:
@@ -162,10 +166,3 @@ starting the *work*, for two remaining reasons:
   attach/detach lifecycle, not a second protocol.
 - The `usb-hard-lab` feature gate and its exclusion from release artifacts
   continue to apply on both platforms until the boundary is approved.
-
-## Sign-off
-
-| Role | Decision | Who | Date |
-| --- | --- | --- | --- |
-| Shared/Architecture (items 1 and 2) | Not yet sought | — | — |
-| Release/Security (item 3) | Not yet sought | — | — |

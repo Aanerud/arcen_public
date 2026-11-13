@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -514,6 +517,65 @@ pub const EDID_HDR10_LEN: usize = 256;
 /// only 8 bpc. The base interface and CTA HDMI blocks must agree.
 const VIDEO_INPUT_10BPC_HDMI: u8 = 0x80 | (0b011 << 4) | 0b0010;
 
+/// The maximum TMDS character rate both HDMI blocks of the HDR10 EDID
+/// declare, in MHz.
+pub const HDR10_MAX_TMDS_CHARACTER_RATE_MHZ: u32 = 550;
+
+/// Whether `timing` fits the link the HDR10 EDID declares at ten bits per
+/// component.
+///
+/// HDMI deep colour raises the TMDS character rate to pixel clock × bpc / 8,
+/// so a 10-bit RGB mode needs 1.25× its pixel clock. A mode past the declared
+/// ceiling is still offered as an 8-bit SDR mode, but the driver cannot carry
+/// it at 10 bpc and Windows never engages HDR on it (measured on a GRID host:
+/// 3600x2260@60, 524.5 MHz → 655.6 MHz, stayed SDR with HDR switched on).
+#[must_use]
+pub fn hdr10_link_fits(timing: DetailedTiming) -> bool {
+    let character_rate_10_khz = u64::from(timing.pixel_clock_10_khz) * 10 / 8;
+    character_rate_10_khz <= u64::from(HDR10_MAX_TMDS_CHARACTER_RATE_MHZ) * 100
+}
+
+/// The refresh an HDR10 display of `width`x`height` can run at.
+///
+/// Keeps `requested_hz` when its 10-bit timing fits the declared link.
+/// Otherwise steps down through whole multiples of `stream_fps` (so a paced
+/// stream still samples every frame evenly), never below `stream_fps`
+/// itself. An error means no refresh at or above the stream rate fits: the
+/// caller must refuse HDR at this size before touching any display, rather
+/// than wait for an HDR state Windows will never publish.
+pub fn hdr10_refresh_hz(
+    width: u32,
+    height: u32,
+    requested_hz: u32,
+    stream_fps: u32,
+) -> Result<u32, String> {
+    let stream_fps = stream_fps.max(1);
+    let candidates = std::iter::once(requested_hz).chain(
+        (1..=requested_hz / stream_fps)
+            .rev()
+            .map(|multiple| multiple * stream_fps)
+            .filter(|hz| *hz < requested_hz),
+    );
+    let mut last_error = None;
+    for refresh_hz in candidates {
+        match cvt_reduced_blanking(width, height, refresh_hz) {
+            Ok(timing) if hdr10_link_fits(timing) => return Ok(refresh_hz),
+            Ok(timing) => {
+                last_error = Some(format!(
+                    "{width}x{height}@{refresh_hz} needs {:.1} MHz at 10 bpc, above the \
+                     {HDR10_MAX_TMDS_CHARACTER_RATE_MHZ} MHz HDR10 link",
+                    f64::from(timing.pixel_clock_10_khz) * 1.25 / 100.0
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "HDR10 cannot be shown at {width}x{height} at or above {stream_fps} Hz: {}",
+        last_error.unwrap_or_else(|| "no refresh was requested".to_string())
+    ))
+}
+
 /// Build a 256-byte EDID that advertises HDR10, from the ordinary base block.
 ///
 /// Why this exists: capture bit depth is decided by what the *desktop* is
@@ -538,6 +600,17 @@ const VIDEO_INPUT_10BPC_HDMI: u8 = 0x80 | (0b011 << 4) | 0b0010;
 /// SDR content widened into a float buffer, are separate questions — the second
 /// is what `capenc color-probe` measures.
 pub fn generate_hdr10(request: EdidRequest) -> Result<[u8; EDID_HDR10_LEN], String> {
+    let timing = cvt_reduced_blanking(request.width, request.height, request.refresh_hz)?;
+    if !hdr10_link_fits(timing) {
+        return Err(format!(
+            "{}x{}@{} needs {:.1} MHz at 10 bpc, above the {HDR10_MAX_TMDS_CHARACTER_RATE_MHZ} \
+             MHz HDR10 link; choose the refresh with hdr10_refresh_hz",
+            request.width,
+            request.height,
+            request.refresh_hz,
+            f64::from(timing.pixel_clock_10_khz) * 1.25 / 100.0
+        ));
+    }
     let base = generate(request)?;
     let mut edid = [0u8; EDID_HDR10_LEN];
     edid[..EDID_LEN].copy_from_slice(&base);
@@ -563,7 +636,7 @@ pub fn generate_hdr10(request: EdidRequest) -> Result<[u8; EDID_HDR10_LEN], Stri
     ext[5..8].copy_from_slice(&[0x03, 0x0c, 0x00]);
     ext[8..10].copy_from_slice(&[0x00, 0x00]);
     ext[10] = 0x10; // DC_30: 10 bpc / 30-bit deep colour.
-    ext[11] = 0x6e; // 550 MHz in 5 MHz units.
+    ext[11] = (HDR10_MAX_TMDS_CHARACTER_RATE_MHZ / 5) as u8; // 5 MHz units.
 
     // Colorimetry Data Block: BT.2020 RGB and YCC.
     ext[12] = (7 << 5) | 3;
@@ -577,7 +650,12 @@ pub fn generate_hdr10(request: EdidRequest) -> Result<[u8; EDID_HDR10_LEN], Stri
     // inferred from the legacy VSDB alone.
     ext[16] = (3 << 5) | 7;
     ext[17..20].copy_from_slice(&[0xd8, 0x5d, 0xc4]);
-    ext[20..24].copy_from_slice(&[0x01, 0x6e, 0x80, 0x00]);
+    ext[20..24].copy_from_slice(&[
+        0x01,
+        (HDR10_MAX_TMDS_CHARACTER_RATE_MHZ / 5) as u8,
+        0x80,
+        0x00,
+    ]);
 
     // Video Capability Data Block. RGB and YCC quantization ranges are
     // selectable; the remaining scan-behaviour bits mirror a proven HDR
@@ -879,5 +957,50 @@ mod hdr10_tests {
     #[test]
     fn the_result_fits_the_nvapi_edid_buffer() {
         assert_eq!(EDID_HDR10_LEN, 256);
+    }
+
+    #[test]
+    fn a_retina_hdr10_display_steps_down_to_a_refresh_its_link_can_carry() {
+        // 3600x2260@60 needs 524.5 MHz, 655.6 MHz at 10 bpc: past the 550 MHz
+        // the EDID declares, so Windows offered it only as SDR.
+        let at_60 = cvt_reduced_blanking(3600, 2260, 60).unwrap();
+        assert!(!hdr10_link_fits(at_60));
+        let mut retina = request();
+        (retina.width, retina.height) = (3600, 2260);
+        let error = generate_hdr10(retina).unwrap_err();
+        assert!(error.contains("10 bpc"), "{error}");
+
+        assert_eq!(hdr10_refresh_hz(3600, 2260, 60, 30), Ok(30));
+        retina.refresh_hz = 30;
+        let edid = generate_hdr10(retina).unwrap();
+        validate(&edid[..EDID_LEN], 3600, 2260).unwrap();
+        // A ProMotion request walks the multiples of the stream rate.
+        assert_eq!(hdr10_refresh_hz(3600, 2260, 120, 30), Ok(30));
+        assert_eq!(hdr10_refresh_hz(3200, 2000, 120, 30), Ok(60));
+    }
+
+    #[test]
+    fn a_mode_whose_link_fits_keeps_its_refresh() {
+        assert_eq!(hdr10_refresh_hz(1800, 1130, 60, 30), Ok(60));
+        assert_eq!(hdr10_refresh_hz(1800, 1130, 120, 30), Ok(120));
+        assert_eq!(hdr10_refresh_hz(3024, 1964, 60, 30), Ok(60));
+        // A refresh below the stream rate is never raised.
+        assert_eq!(hdr10_refresh_hz(3600, 2260, 24, 30), Ok(24));
+    }
+
+    #[test]
+    fn a_size_no_stream_rate_refresh_can_carry_is_refused() {
+        let error = hdr10_refresh_hz(4095, 4095, 60, 30).unwrap_err();
+        assert!(error.contains("4095x4095"), "{error}");
+        assert!(hdr10_refresh_hz(7680, 4320, 60, 30).is_err());
+    }
+
+    #[test]
+    fn both_hdmi_blocks_declare_the_link_the_refresh_rule_assumes() {
+        let edid = generate_hdr10(request()).unwrap();
+        let ext = &edid[EDID_LEN..];
+        let code = (HDR10_MAX_TMDS_CHARACTER_RATE_MHZ / 5) as u8;
+        assert_eq!(vendor_block(ext, [0x03, 0x0c, 0x00])[3], code);
+        assert_eq!(vendor_block(ext, [0xd8, 0x5d, 0xc4])[1], code);
     }
 }

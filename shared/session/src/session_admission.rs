@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared capacity-one Pier admission and bounded reconnect hold.
 
 use std::fmt::{Debug, Display, Formatter};

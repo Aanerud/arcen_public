@@ -11,11 +11,11 @@ contract in `shared/media/src/encoder_admission.rs`; see "Amendment
 ## Context
 
 Arcen Deck, Pier-Linux, and Pier-Windows currently behave as primary-display
-products even when the client can enumerate more than one display. The approved
+products even when the client can enumerate more than one display. The
 multi-monitor plan needs a frozen shared contract before any Deck or host
 implementation can safely change product behaviour.
 
-This ADR records only the first approved tranche: shared topology/admission
+This ADR records only the first tranche: shared topology/admission
 types, additive protocol-v3 negotiation fields, and the measurement gate that
 must exist before carrier selection or release claims. It is not evidence that
 any current product can yet stream more than one monitor.
@@ -148,7 +148,7 @@ any current product can yet stream more than one monitor.
 
 ### Context
 
-This ADR's original tranche (`d484da9`) landed two things in the same commit:
+This ADR's original tranche landed two things in the same commit:
 `shared/media/src/multi_monitor.rs`'s `PerMonitorMediaPlan`,
 `AggregateMediaBudget`, and `AggregateMediaPlan` — a declared/summed budget
 model where a caller supplies `cpu_millis_per_second` and `vram_bytes` and the
@@ -181,7 +181,7 @@ and `encoder-runtime-validation` work implemented and validated.
 Auditing the current tree confirms `AggregateMediaPlan`, `AggregateMediaBudget`,
 and `PerMonitorMediaPlan` are constructed and consumed only inside
 `shared/media/src/multi_monitor.rs` itself (their own constructors and their
-`#[cfg(test)]` module). No host, client, gateway, or `arcen-protocol` wire type
+`#[cfg(test)]` module). No host, client, or `arcen-protocol` wire type
 anywhere in the workspace names any of the three, and none of them was ever
 placed on the wire. The measured `encoder_admission.rs` path is built entirely
 on `RegionMediaPlan`/`RegionMediaRoster`, not on `PerMonitorMediaPlan`; no code
@@ -212,7 +212,7 @@ Reasons:
 3. Zero product, protocol, or cross-crate code constructs or consumes any of
    the three types today; they are reachable only from their own definitions
    and tests. There is no existing composition to preserve.
-4. The already-approved forward roadmap (`add-region-bitrate-budget`) adds an
+4. The forward roadmap (the region bitrate budget) adds an
    explicit validated bitrate budget directly onto `RegionMediaPlan` and its
    wire `AppliedMonitorMediaPlanMsg` mapping, explicitly to delete duplicated
    nominal-bitrate helpers — confirming `RegionMediaPlan` plus measured
@@ -238,14 +238,14 @@ Reasons:
   `RegionActivityProfile(s)`, `EncoderSetCandidate`,
   `EncoderMeasurementAdapter`, `admit_encoder_sets`, and
   `EncoderSetDecision` from `shared/media/src/encoder_admission.rs` instead.
-- **Removal is out of scope here** and is deferred to a dedicated,
-  separately reviewed Shared/Architecture follow-up change that must, at a
+- **Removal is out of scope here** and is deferred to a dedicated
+  Shared/Architecture follow-up change that must, at a
   minimum: (a) re-confirm zero product/protocol consumption at removal time;
   (b) delete the three types and their dedicated tests in
   `shared/media/src/multi_monitor.rs`; (c) update `shared/media/ARCHITECTURE.md`
-  and this ADR's status accordingly; and (d) get Shared/Architecture sign-off
-  as a public shared-crate API change per `shared/AGENTS.md`, notifying any
-  product owner found to depend on them by that time.
+  and this ADR's status accordingly; and (d) treat it as a public shared-crate
+  API change per `shared/AGENTS.md`, notifying the maintainers of any
+  consumer found to depend on them by that time.
 - **No wire/protocol migration is required.** None of the three types was
   ever serialized on the wire; `arcen-protocol` has no reference to any of
   them, so this decision has no wire-compatibility surface to manage.
@@ -271,8 +271,7 @@ Reasons:
 
 ## Amendment (2026-10-18): virtual-output hosts and in-place reattach
 
-Recorded with `wp-multimon` (Linux headless Wayland sessions). Needs
-Shared/Architecture review.
+Recorded with Wayland multi-monitor (Linux headless Wayland sessions).
 
 1. **Virtual-output planning is shared.** A host whose monitors are
    compositor virtual outputs created on demand has no head inventory: every

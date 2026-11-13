@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Reversible NVIDIA NV-CONTROL ViewPortIn resize via `nvidia-settings`.
 
 use std::path::PathBuf;
@@ -882,54 +884,40 @@ mod tests {
         directory
     }
 
-    /// Write an executable stub and wait until the kernel will actually run it.
+    /// Write an executable stub through a child shell.
     ///
-    /// Writing a file and immediately exec'ing it races with `fork` in a
-    /// multi-threaded process: any thread that forks while the write descriptor
-    /// is still open leaves the child holding a copy, and the kernel answers
-    /// the exec with ETXTBSY (26). The whole suite runs in one such process, so
-    /// this surfaced as `explicit_restore_emits_display_restored_on_success`
-    /// failing under load while passing every time in isolation — the most
-    /// expensive kind of test failure, because it looks like the change under
-    /// review.
-    ///
-    /// Probing with `spawn` rather than `output` matters: several stubs
-    /// `exec sleep 999`, so waiting for one to finish would hang the suite.
-    /// A successful `spawn` already proves the exec went through.
+    /// The whole suite runs in one multi-threaded process. Had this process
+    /// written the stub itself, a child another test forked meanwhile would
+    /// hold a copy of the write descriptor until it execs, and running the
+    /// stub would fail with ETXTBSY (26): `explicit_restore_emits_display_restored_on_success`
+    /// failed under load that way while passing every time in isolation.
+    /// With the shell as the only writer, the stub is complete and closed when
+    /// this returns. Nothing probes it by running it: a probe is a real call,
+    /// and a recording stub's probe left an empty record behind that a test
+    /// then read as the restore's.
     #[cfg(unix)]
     fn write_executable_stub(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).unwrap();
-        settle_executable(path);
+        let written = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 700 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(written.success(), "stub {}", path.display());
     }
 
-    /// Make `path` executable and wait until the kernel will actually run it.
-    ///
-    /// Probing with `spawn` rather than `output` matters: several stubs
-    /// `exec sleep 999`, so waiting for one to finish would hang the suite.
-    /// A successful `spawn` already proves the exec went through. The stubs
-    /// that redirect to a file all truncate rather than append, so an extra
-    /// no-argument invocation cannot corrupt what a test later asserts on.
+    /// A stub `nvidia-settings` that records its arguments in `output`. The
+    /// record is renamed into place, so a test polling for it never reads it
+    /// half written.
     #[cfg(unix)]
-    fn settle_executable(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        const ETXTBSY: i32 = 26;
-        for _ in 0..50 {
-            match std::process::Command::new(path).spawn() {
-                Ok(mut child) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-                Err(error) if error.raw_os_error() == Some(ETXTBSY) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Anything else is not this race; let the test itself report it.
-                Err(_) => return,
-            }
-        }
+    fn write_recording_stub(path: &std::path::Path, output: &std::path::Path) {
+        let output = output.display();
+        write_executable_stub(
+            path,
+            &format!("#!/bin/sh\nprintf '%s' \"$*\" > '{output}.part' && mv '{output}.part' '{output}'\n"),
+        );
     }
 
     #[test]
@@ -1059,18 +1047,13 @@ mod tests {
         let directory = test_directory("drop");
         let script = directory.join("nvidia-settings");
         let output = directory.join("args");
-        fs::write(
-            &script,
-            format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", output.display()),
-        )
-        .unwrap();
-        settle_executable(&script);
+        write_recording_stub(&script, &output);
         {
             let controller = NvControl {
                 display: ":0".to_string(),
                 xauthority: None,
                 binary: script,
-                command_timeout: Duration::from_secs(3),
+                command_timeout: Duration::from_secs(10),
                 reap_timeout: Duration::from_secs(1),
                 pid_observer: None,
             };
@@ -1100,15 +1083,13 @@ mod tests {
 
         let directory = test_directory("apply-armed");
         let script = directory.join("nvidia-settings");
-        fs::write(
+        write_executable_stub(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\ncase \"$*\" in\n  *--query*) printf '%s' \"{}\" ;;\n  *) exit 0 ;;\nesac\n",
                 QUERY
             ),
-        )
-        .unwrap();
-        settle_executable(&script);
+        );
         let controller = NvControl {
             display: ":0".to_string(),
             xauthority: None,
@@ -1145,15 +1126,13 @@ mod tests {
 
         let directory = test_directory("reassign");
         let script = directory.join("nvidia-settings");
-        fs::write(
+        write_executable_stub(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\ncase \"$*\" in\n  *--query*) printf '%s' \"{}\" ;;\n  *) exit 0 ;;\nesac\n",
                 QUERY
             ),
-        )
-        .unwrap();
-        settle_executable(&script);
+        );
         let controller = NvControl {
             display: ":0".to_string(),
             xauthority: None,
@@ -1295,19 +1274,14 @@ mod tests {
         let directory = test_directory("drop-watchdog");
         let script = directory.join("nvidia-settings");
         let output = directory.join("args");
-        fs::write(
-            &script,
-            format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", output.display()),
-        )
-        .unwrap();
-        settle_executable(&script);
+        write_recording_stub(&script, &output);
         let (recording_emitter, recorded) = LifecycleEmitter::recording();
         {
             let controller = NvControl {
                 display: ":0".to_string(),
                 xauthority: None,
                 binary: script,
-                command_timeout: Duration::from_secs(3),
+                command_timeout: Duration::from_secs(10),
                 reap_timeout: Duration::from_secs(1),
                 pid_observer: None,
             };
@@ -1325,7 +1299,7 @@ mod tests {
             };
         }
         wait_for_file(&output);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while crate::eventlog::test_support::recorded_events(&recorded).is_empty()
             && Instant::now() < deadline
         {
@@ -1491,12 +1465,7 @@ mod tests {
         let directory = test_directory("drop-spawn-failure");
         let script = directory.join("nvidia-settings");
         let output = directory.join("args");
-        fs::write(
-            &script,
-            format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", output.display()),
-        )
-        .unwrap();
-        settle_executable(&script);
+        write_recording_stub(&script, &output);
         struct RestoreHold(Arc<AtomicBool>);
         impl Drop for RestoreHold {
             fn drop(&mut self) {

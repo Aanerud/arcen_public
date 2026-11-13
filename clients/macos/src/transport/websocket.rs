@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_session::network_reachability::{
     classify_reachability_error, should_preflight_local_network, ReachabilityFailure,
 };
@@ -53,9 +56,8 @@ use crate::protocol::messages::{
     MicrophoneStreamConfigMsg, MicrophoneStreamReason, MicrophoneStreamResultMsg,
     MicrophoneStreamStopMsg, NetworkInterfaceKind, NetworkScopeMsg, QualitySettings,
     ResumeErrorCode, ServerHelloMsg, TabletModeCapabilitiesMsg, TabletModeMsg,
-    VideoSelectionIntent, AUTH_REQUEST, AUTH_RESULT, BROKER_HELLO, CLIPBOARD_DATA,
-    CLIPBOARD_PROTOCOL_VERSION, HEALTH_PONG, MICROPHONE_STREAM_RESULT,
-    REGION_INPUT_PROTOCOL_VERSION, SERVER_HELLO,
+    VideoSelectionIntent, AUTH_REQUEST, AUTH_RESULT, CLIPBOARD_DATA, CLIPBOARD_PROTOCOL_VERSION,
+    HEALTH_PONG, MICROPHONE_STREAM_RESULT, REGION_INPUT_PROTOCOL_VERSION, SERVER_HELLO,
 };
 use crate::protocol::wire::{
     decode_clipboard_chunk, encode_clipboard_chunk, encode_microphone_header, ClipboardChunkHeader,
@@ -220,10 +222,10 @@ impl DisabledHidEventReceiver {
     }
 }
 
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 struct DisabledUsbHardResponder;
 
-#[cfg(feature = "usb-hard-lab")]
+#[cfg(feature = "native-tablet")]
 async fn next_usb_hard_completion(
     responder: &mut Option<crate::usb_bridge::UsbHardResponder>,
 ) -> Result<Vec<u8>, String> {
@@ -233,7 +235,7 @@ async fn next_usb_hard_completion(
     }
 }
 
-#[cfg(not(feature = "usb-hard-lab"))]
+#[cfg(not(feature = "native-tablet"))]
 async fn next_usb_hard_completion(
     _responder: &mut Option<DisabledUsbHardResponder>,
 ) -> Result<Vec<u8>, String> {
@@ -547,7 +549,6 @@ impl ConnectOptions {
 pub struct ConnectSmokeResult {
     pub uri: String,
     pub server_hello: Option<ServerHelloMsg>,
-    pub broker_hello: Option<Value>,
     pub fsm_state: &'static str,
 }
 
@@ -557,11 +558,13 @@ pub enum SessionEvent {
     AuthRequired(AuthRequest),
     Authenticated(SessionAuthentication),
     ServerHello(ServerHelloMsg),
-    BrokerHello(Value),
     Json(Value),
     /// A host cursor image record (`FrameType::CursorUpdate`) from the
     /// input/cursor lane, in lane order.
     CursorUpdate(Vec<u8>),
+    /// A host pointer position record (`FrameType::CursorPosition`) from
+    /// the input/cursor lane, in lane order.
+    CursorPosition(Vec<u8>),
     /// The input/cursor lane was reopened: the host's cursor images start
     /// again from an empty cache.
     CursorLaneReset,
@@ -1643,7 +1646,7 @@ async fn connect_smoke_correlated(
             )
             .await
         }
-        SERVER_HELLO | BROKER_HELLO => {
+        SERVER_HELLO => {
             options.password.zeroize();
             handle_hello(
                 uri.as_str(),
@@ -1965,7 +1968,7 @@ async fn run_session_correlated(
             )
             .await?
         }
-        SERVER_HELLO | BROKER_HELLO => {
+        SERVER_HELLO => {
             if matches!(auth, SessionAuth::Resume(_)) {
                 return Err(ConnectSmokeError::ResumeProtocol(
                     "resume attempt bypassed the resume authentication exchange",
@@ -1982,11 +1985,11 @@ async fn run_session_correlated(
         session_auth_method(&auth),
     );
 
-    let mut clipboard_policy = None;
-    let mut clipboard_reassembler = None;
-    #[cfg(feature = "usb-hard-lab")]
+    let mut clipboard_policy;
+    let mut clipboard_reassembler;
+    #[cfg(feature = "native-tablet")]
     let mut usb_hard_responder: Option<crate::usb_bridge::UsbHardResponder> = None;
-    #[cfg(not(feature = "usb-hard-lab"))]
+    #[cfg(not(feature = "native-tablet"))]
     let mut usb_hard_responder: Option<DisabledUsbHardResponder> = None;
     // SEC-raw-hid: captured from the host's ServerHelloMsg before it is
     // moved into `tx.send(SessionEvent::ServerHello(..))` below. This is
@@ -2003,7 +2006,7 @@ async fn run_session_correlated(
             ));
             validate_server_transport(&options, &server_hello)?;
             validate_server_region_input(&options, &server_hello)?;
-            #[cfg(feature = "usb-hard-lab")]
+            #[cfg(feature = "native-tablet")]
             if options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge {
                 if !server_hello.usb_hard_v1 {
                     tracing::warn!(
@@ -2027,11 +2030,11 @@ async fn run_session_correlated(
                 let _ = fsm.send(ClientEvent::AuthOk);
             }
             let _ = fsm.send(ClientEvent::HelloReceived);
-            #[cfg(feature = "usb-hard-lab")]
+            #[cfg(feature = "native-tablet")]
             let usb_hard_device = usb_hard_responder
                 .as_ref()
                 .map(crate::usb_bridge::UsbHardResponder::device);
-            #[cfg(not(feature = "usb-hard-lab"))]
+            #[cfg(not(feature = "native-tablet"))]
             let usb_hard_device = None;
             send_client_ready(
                 &mut ws,
@@ -2066,9 +2069,6 @@ async fn run_session_correlated(
                 host_experimental_raw_hid = server_hello.experimental_raw_hid;
             }
             let _ = tx.send(SessionEvent::ServerHello(server_hello));
-        }
-        BROKER_HELLO => {
-            let _ = tx.send(SessionEvent::BrokerHello(hello));
         }
         other => return Err(ConnectSmokeError::UnexpectedFirstMessage(other.to_string())),
     }
@@ -2204,16 +2204,16 @@ async fn run_session_correlated(
                         }
                     }
                     SessionCommand::HardUsbPen(event) => {
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         if let Some(responder) = usb_hard_responder.as_mut() {
                             responder.update_pen(event);
                         }
-                        #[cfg(not(feature = "usb-hard-lab"))]
+                        #[cfg(not(feature = "native-tablet"))]
                         {
                             let _ = event;
                             tracing::warn!(
                                 target: crate::logging::target::USB,
-                                "Hard USB pen state ignored because this Deck lacks usb-hard-lab",
+                                "Hard USB pen state ignored because this Deck lacks native-tablet",
                             );
                         }
                     }
@@ -2354,7 +2354,7 @@ async fn run_session_correlated(
                         // Clipboard and Hard USB are off for the rest of the
                         // session; the session itself goes on.
                         bulk_disabled = true;
-                        #[cfg(feature = "usb-hard-lab")]
+                        #[cfg(feature = "native-tablet")]
                         if let Some(responder) = usb_hard_responder.take() {
                             responder.shutdown().await;
                         }
@@ -2458,7 +2458,7 @@ async fn run_session_correlated(
                         if msg_type(&value) == Some(arcen_protocol::messages::TABLET_MODE_RESULT) {
                             // A Pier that stopped Hard USB mid-session (its
                             // bulk stream failed) says so here.
-                            #[cfg(feature = "usb-hard-lab")]
+                            #[cfg(feature = "native-tablet")]
                             if let Ok(result) = serde_json::from_value::<
                                 arcen_protocol::messages::TabletModeResultMsg,
                             >(value.clone())
@@ -2552,7 +2552,7 @@ async fn run_session_correlated(
                             continue;
                         }
                         if bytes.first().copied() == Some(FrameType::UsbBridgeUrbSubmit as u8) {
-                            #[cfg(feature = "usb-hard-lab")]
+                            #[cfg(feature = "native-tablet")]
                             {
                                 let Some(responder) = usb_hard_responder.as_mut() else {
                                     return Err(ConnectSmokeError::TransportUnavailable(
@@ -2584,16 +2584,16 @@ async fn run_session_correlated(
                                 }
                                 continue;
                             }
-                            #[cfg(not(feature = "usb-hard-lab"))]
+                            #[cfg(not(feature = "native-tablet"))]
                             {
                                 return Err(ConnectSmokeError::TransportUnavailable(
-                                    "host sent a Hard USB URB to a Deck without usb-hard-lab"
+                                    "host sent a Hard USB URB to a Deck without native-tablet"
                                         .to_owned(),
                                 ));
                             }
                         }
                         if bytes.first().copied() == Some(FrameType::UsbBridgeUrbCancel as u8) {
-                            #[cfg(feature = "usb-hard-lab")]
+                            #[cfg(feature = "native-tablet")]
                             {
                                 let (generation, urb_id) =
                                     arcen_protocol::decode_usb_urb_cancel(&bytes).map_err(|error| {
@@ -3056,7 +3056,7 @@ async fn run_session_correlated(
             errors,
         );
     }
-    #[cfg(feature = "usb-hard-lab")]
+    #[cfg(feature = "native-tablet")]
     if let Some(responder) = usb_hard_responder.take() {
         responder.shutdown().await;
     }
@@ -3991,12 +3991,18 @@ where
 /// draw it into the video.
 pub(crate) const DECK_DRAWS_CURSOR_IMAGES: bool = true;
 
+/// The Deck draws its cursor where the host reports its pointer
+/// (`arcen_protocol::cursor_position`) when the host pointer moves for a
+/// reason the Deck did not cause, such as a USB-bridged tablet.
+pub(crate) const DECK_FOLLOWS_HOST_POINTER: bool = true;
+
 fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions) -> AuthResponse {
     let mut response = response
         .with_displays(options.monitors.clone(), &options.displays_mode)
         .with_optional_timezone(options.timezone.clone())
         .with_cursor_preference(options.cursor_preference)
-        .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES);
+        .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
+        .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER);
     let capabilities = probe_decode_capabilities();
     let quality = rust_viewer_quality_settings(&options.profile);
     // The first link of the HDR chain, stated where the ask is actually made.
@@ -4031,6 +4037,7 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
             identity_matrix: capabilities.identity_matrix,
             bt601_matrix: capabilities.bt601_matrix,
             bt2020_ncl_matrix: capabilities.bt2020_ncl_matrix,
+            srgb_transfer: PRESENTS_SRGB_TRANSFER,
         },
         pipeline: options.profile.pipeline.clone(),
     });
@@ -4086,16 +4093,9 @@ where
             Ok(ConnectSmokeResult {
                 uri: uri.to_string(),
                 server_hello: Some(server_hello),
-                broker_hello: None,
                 fsm_state: fsm.state_id(),
             })
         }
-        BROKER_HELLO => Ok(ConnectSmokeResult {
-            uri: uri.to_string(),
-            server_hello: None,
-            broker_hello: Some(hello),
-            fsm_state: fsm.state_id(),
-        }),
         other => Err(ConnectSmokeError::UnexpectedFirstMessage(other.to_string())),
     }
 }
@@ -4155,6 +4155,13 @@ fn client_hello_with_metadata(
 /// older `supports_h264`/`supports_h265`/`supports_av1`/`supports_yuv444`
 /// flags, which were always unconditional capability claims, rather than
 /// the narrower, request-conditioned guess this replaces.
+/// This Deck tags an `srgb` stream with CoreMedia's sRGB transfer function
+/// and presents every SDR transfer on an sRGB (or Display P3) layer
+/// (`video_render::presentation_colorspace_for`), so a host may serve the
+/// desktop's own sRGB code values instead of re-encoding them as BT.709.
+/// It is a presentation fact of this build, not a per-machine decode probe.
+const PRESENTS_SRGB_TRANSFER: bool = true;
+
 fn apply_decode_capabilities(
     mut hello: ClientHelloMsg,
     capabilities: DecodeCapabilities,
@@ -4169,6 +4176,7 @@ fn apply_decode_capabilities(
     hello.supports_identity_matrix = capabilities.identity_matrix;
     hello.supports_bt601_matrix = capabilities.bt601_matrix;
     hello.supports_bt2020_ncl_matrix = capabilities.bt2020_ncl_matrix;
+    hello.supports_srgb_transfer = PRESENTS_SRGB_TRANSFER;
     hello.decoder_backend = capabilities.decoder_backend_label().to_string();
     hello
 }
@@ -4233,6 +4241,7 @@ fn client_hello_with_usb_device(
             .with_optional_timezone(options.timezone.clone())
             .with_cursor_preference(options.cursor_preference)
             .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
+            .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER)
             .with_network_snapshot(network)
     };
     let hello = apply_decode_capabilities(hello, probe_decode_capabilities());
@@ -4329,6 +4338,11 @@ fn macos_input_capabilities(tablet_input_enabled: bool) -> InputCapabilitiesMsg 
         // host reports it could not type.
         text_commit: InputCapabilityAvailability::Available,
         text_commit_unicode: InputCapabilityAvailability::Available,
+        // The Deck sends AltGr and the ISO key as their own keys to a host
+        // that accepts them.
+        extended_keys: InputCapabilityAvailability::Available,
+        // A host capability.
+        meta_pointer_mask: InputCapabilityAvailability::Unknown,
     }
 }
 
@@ -4355,7 +4369,7 @@ fn macos_tablet_mode_capabilities(tablet_input_enabled: bool) -> TabletModeCapab
         // typed-pen setting. A feature build advertises this capability only
         // after capture succeeds and exact device metadata is attached to the
         // same ClientHello.
-        usb_tablet_bridge: if cfg!(feature = "usb-hard-lab") {
+        usb_tablet_bridge: if cfg!(feature = "native-tablet") {
             InputCapabilityAvailability::Available
         } else {
             InputCapabilityAvailability::Unavailable
@@ -5167,18 +5181,9 @@ fn health_threshold(
     let targets = arcen_telemetry::QosTargets::default();
     let critical = state == HealthState::Critical;
     match cause {
-        HealthCause::Fps => {
-            let percent = if critical {
-                targets.fps_critical_percent()
-            } else {
-                targets.fps_degraded_percent()
-            };
-            sample
-                .fps_target
-                .unwrap_or(0)
-                .saturating_mul(u32::from(percent))
-                / 100
-        }
+        // Judged against what arrived, not the target: a still desktop
+        // arrives as a keepalive a second (`arcen_telemetry::fps_expected`).
+        HealthCause::Fps => arcen_telemetry::fps_threshold(sample, &targets, state).unwrap_or(0),
         HealthCause::Rtt => {
             if critical {
                 targets.rtt_critical_ms()
@@ -5202,26 +5207,17 @@ fn health_threshold(
     }
 }
 
-/// Fraction of decoded frames that never reached the screen, in basis points.
+/// Fraction of decoded frames that never reached the screen, in basis points,
+/// from the shared policy that judged it.
 ///
 /// **This is not transport loss**, despite feeding `HealthCause::Loss`. Every
 /// frame counted here arrived intact and decoded successfully; it was then
-/// superseded by a newer frame before the UI presented it, which is the normal
-/// consequence of a client that always shows the latest frame. A session can
+/// superseded by a newer frame before the UI presented it. A session can
 /// report a large value here with zero packet drops — one did, and the
 /// resulting `loss=2602` sent a tester looking for a network fault that did
-/// not exist.
-///
-/// It is still a useful health signal, because a viewer genuinely sees fewer
-/// frames than arrived. It is simply a *presentation* signal, not a network
-/// one; real packet loss is reported separately as loss epochs.
+/// not exist. Real packet loss is reported separately as loss epochs.
 fn unpresented_basis_points(sample: &arcen_telemetry::QosSample) -> u32 {
-    let decoded = sample.frames_decoded.unwrap_or(0);
-    if decoded == 0 {
-        return 0;
-    }
-    let missed = decoded.saturating_sub(sample.frames_presented.unwrap_or(0));
-    u32::try_from(missed.saturating_mul(10_000) / decoded).unwrap_or(u32::MAX)
+    arcen_telemetry::unpresented_basis_points(sample).unwrap_or(0)
 }
 
 fn emit_health_snapshot(
@@ -5642,7 +5638,7 @@ fn rust_viewer_quality_settings(profile: &StreamProfile) -> QualitySettings {
     }
 }
 
-async fn recv_json<S>(ws: &mut S, wait: Duration) -> Result<Value, ConnectSmokeError>
+pub(crate) async fn recv_json<S>(ws: &mut S, wait: Duration) -> Result<Value, ConnectSmokeError>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -6377,6 +6373,10 @@ mod tests {
         assert!(!hello.supports_identity_matrix);
         assert!(hello.supports_bt601_matrix);
         assert!(hello.supports_bt2020_ncl_matrix);
+        assert!(
+            hello.supports_srgb_transfer,
+            "every SDR transfer is presented as sRGB, so the Deck claims srgb"
+        );
         assert_eq!(hello.decoder_backend, "videotoolbox-hw");
     }
 
@@ -7677,7 +7677,7 @@ mod tests {
     }
 
     /// The reviewed regression: on a Mac whose HID registry describes no pen
-    /// tablet (this test machine has none attached) and before any pen sample,
+    /// tablet (this test uses no physical tablet) and before any pen sample,
     /// the hello still offers typed pen, so a tablet used later in the
     /// session gets pressure without a reconnect.
     #[test]
@@ -7792,7 +7792,7 @@ mod tests {
     fn hard_usb_capability_does_not_depend_on_local_typed_pen_setting() {
         assert_eq!(
             macos_tablet_mode_capabilities(false).usb_tablet_bridge,
-            if cfg!(feature = "usb-hard-lab") {
+            if cfg!(feature = "native-tablet") {
                 InputCapabilityAvailability::Available
             } else {
                 InputCapabilityAvailability::Unavailable
@@ -7831,7 +7831,10 @@ mod tests {
         assert_eq!(auth.timezone, options.timezone);
         assert_eq!(hello.timezone, auth.timezone);
         assert_eq!(auth.cursor_preference, CursorMode::Host);
-        let initial_video = auth.initial_video.expect("auth-time video request");
+        let initial_video = auth
+            .initial_video
+            .as_ref()
+            .expect("auth-time video request");
         assert_eq!(
             initial_video.quality,
             rust_viewer_quality_settings(&options.profile)
@@ -7839,6 +7842,10 @@ mod tests {
         assert_eq!(
             initial_video.capabilities.av1, hello.supports_av1,
             "auth-time and ClientHello codec claims come from the same cached probe"
+        );
+        assert!(
+            initial_video.capabilities.srgb_transfer && hello.supports_srgb_transfer,
+            "the host decides the transfer before ServerHello, so the claim rides auth too"
         );
         assert_eq!(hello.cursor_preference, auth.cursor_preference);
     }
@@ -8732,8 +8739,7 @@ mod tests {
                 | SessionEvent::AuthRequired(_)
                 | SessionEvent::Authenticated(_)
                 | SessionEvent::MicrophoneActive(_)
-                | SessionEvent::ConnectionStatusHint(_)
-                | SessionEvent::BrokerHello(_) => {}
+                | SessionEvent::ConnectionStatusHint(_) => {}
             }
         }
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 set -euo pipefail
 
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,5 +87,24 @@ if ARCEN_TEST_LEGACY_TCP=1 PATH="$FAKE_BIN:$PATH" \
 fi
 grep -q 'legacy WSS TCP port 18443 is still listening' "$WORK/legacy-tcp.err" ||
   fail "legacy WSS listener failure was not explained"
+
+: >"$SSH_LOG"
+PATH="$FAKE_BIN:$PATH" HOST=root@example KEY="$WORK/key" \
+  bash "$DEPLOY" >"$WORK/install.out" 2>"$WORK/install.err"
+grep -q 'install -m 0644 packaging/linux/arcen-pier.tmpfiles /etc/tmpfiles.d/arcen-pier.conf' \
+  "$SSH_LOG" || fail "deployment did not install the tmpfiles rule"
+
+: >"$SSH_LOG"
+PATH="$FAKE_BIN:$PATH" HOST=root@example KEY="$WORK/key" \
+  bash "$DEPLOY" --uninstall >"$WORK/uninstall.out" 2>"$WORK/uninstall.err"
+for removed in /etc/tmpfiles.d/arcen-pier.conf /etc/logrotate.d/arcen-pier \
+  /etc/systemd/system/arcen-pier.service /opt/arcen/bin/arcen-pier; do
+  grep -qF "rm -f $removed" "$SSH_LOG" || fail "uninstall did not remove $removed"
+done
+grep -q 'disable --now arcen-pier.service' "$SSH_LOG" ||
+  fail "uninstall did not stop the service"
+if grep -qE 'rm -[a-z]*r[a-z]* .*/etc/arcen|cargo build' "$SSH_LOG"; then
+  fail "uninstall removed configuration or built the Pier"
+fi
 
 echo "deploy-pier tests passed"

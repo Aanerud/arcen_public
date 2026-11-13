@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Assembles the macOS Pier into a signed application bundle.
 #
 # Usage: packaging/macos/build-pier-app.sh [--identity "Developer ID Application: ..."]
 #                                         [--notary-profile NAME]
 #                                         [--with-driverkit-hid --provisioning-profile FILE]
 #                                         [--with-virtual-hid --provisioning-profile FILE]
+#
+# Native tablet (ADR 0022) is a default feature of the Pier and is in every
+# build; it is offered only when the Pier is signed --with-virtual-hid.
+# ARCEN_PIER_LAB_FEATURES (environment) builds lab-only Cargo features, for
+# example `lab-pen-probe`. A lab build is never notarized: the script refuses
+# the combination with --notary-profile.
 #
 # --with-virtual-hid signs the Pier with com.apple.developer.hid.virtual.device,
 # which lets it present a keyboard and pointer macOS treats as hardware — the
@@ -105,8 +113,18 @@ fi
 # was written, tested, packaged, installed, and then measured still failing,
 # because the binary in the package predated it. The Deck script has always
 # built its own binary; this one only looked.
-echo "==> cargo build --locked --release -p arcen-pier-macos"
-( cd "$REPO" && cargo build --locked --release -p arcen-pier-macos )
+LAB_FEATURES="${ARCEN_PIER_LAB_FEATURES:-}"
+if [[ -n "$LAB_FEATURES" && -n "$NOTARY_PROFILE" ]]; then
+  echo "error: ARCEN_PIER_LAB_FEATURES builds are lab-only and are never notarized" >&2
+  exit 2
+fi
+if [[ -n "$LAB_FEATURES" ]]; then
+  echo "==> cargo build --locked --release -p arcen-pier-macos --features $LAB_FEATURES (lab)"
+  ( cd "$REPO" && cargo build --locked --release -p arcen-pier-macos --features "$LAB_FEATURES" )
+else
+  echo "==> cargo build --locked --release -p arcen-pier-macos"
+  ( cd "$REPO" && cargo build --locked --release -p arcen-pier-macos )
+fi
 
 [[ -f "$BIN" ]] || {
   echo "error: $BIN is missing after a successful build" >&2
@@ -158,7 +176,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSMicrophoneUsageDescription</key>
     <string>Arcen carries a connected user's microphone into applications running on this Mac.</string>
     <key>NSHumanReadableCopyright</key>
-    <string>AGPL-3.0-only. Arcen comes with ABSOLUTELY NO WARRANTY.</string>
+    <string>Copyright (C) 2026 TUTTIFRUTTI AS. Free software under AGPL-3.0-only. Arcen comes with ABSOLUTELY NO WARRANTY.</string>
 </dict>
 </plist>
 PLIST
@@ -173,10 +191,11 @@ chmod 755 "$APP/Contents/MacOS/arcen-pier-macos"
 mkdir -p "$APP/Contents/Resources"
 cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
-# The licence and the third-party notices travel with the program, byte for
-# byte, as they do in the Deck app and the Linux and Windows installers. They
-# are copied before signing so the seal covers them.
-for notice in LICENSE legal/THIRD_PARTY_NOTICES.md; do
+# The licence set (the AGPL, the store exception, the notice, the trademark
+# policy and the third-party notices) travels with the program, byte for byte,
+# as it does in the Deck app and the Linux and Windows installers. It is
+# copied before signing so the seal covers it.
+for notice in LICENSE LICENSE-EXCEPTION.md NOTICE TRADEMARKS.md legal/THIRD_PARTY_NOTICES.md; do
   [[ -f "$REPO/$notice" ]] || { echo "error: $REPO/$notice is missing" >&2; exit 1; }
   cp "$REPO/$notice" "$APP/Contents/Resources/$(basename "$notice")"
   chmod 644 "$APP/Contents/Resources/$(basename "$notice")"
@@ -242,7 +261,7 @@ cat > "$HELPER/Contents/Info.plist" <<HPLIST
     <key>NSMicrophoneUsageDescription</key>
     <string>Arcen carries a connected user's microphone into applications running on this Mac.</string>
     <key>NSHumanReadableCopyright</key>
-    <string>AGPL-3.0-only. Arcen comes with ABSOLUTELY NO WARRANTY.</string>
+    <string>Copyright (C) 2026 TUTTIFRUTTI AS. Free software under AGPL-3.0-only. Arcen comes with ABSOLUTELY NO WARRANTY.</string>
 </dict>
 </plist>
 HPLIST

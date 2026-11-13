@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Enforce the one rule: policy lives in shared/, and hosts use it.
 
 A shared type nobody calls is a proposal, not parity, and a host that grows
@@ -352,6 +355,25 @@ PATH_ATTR = re.compile(r'#\[path\s*=\s*"(?P<path>[^"]+)"\s*\]')
 GLOBAL_BUILD_INPUTS = re.compile(r"^(?:rust-toolchain(?:\.toml)?|\.cargo/.*)$")
 
 Reader = Callable[[str], "str | None"]
+
+
+def check_operations_references(root: Path, report: Report) -> None:
+    """The configuration and error-code references list every key and code.
+
+    Each check runs whenever the source it reads is present, so a missing or
+    renamed reference fails; only a tree without that source (a test fixture)
+    skips it.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import error_code_reference
+    import pier_config_reference
+
+    if pier_config_reference.sources_present(root):
+        for problem in pier_config_reference.check_repository(root):
+            report.failures.append(f"config reference: {problem}")
+    if error_code_reference.sources_present(root):
+        for problem in error_code_reference.check_repository(root):
+            report.failures.append(f"error codes: {problem}")
 
 
 def fs_reader(root: Path) -> Reader:
@@ -2341,6 +2363,7 @@ def run(
     check_forbidden(root, contracts, report)
     check_ratchet(root, contracts, report, write_baseline)
     check_default_configs(root, contracts, report)
+    check_operations_references(root, report)
     return report
 
 

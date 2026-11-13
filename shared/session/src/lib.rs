@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared session state and crash-safe restore leases.
 
 #![forbid(unsafe_code)]
@@ -6,6 +8,7 @@
 pub mod agent_relay;
 pub mod auth_throttle;
 pub mod compositor_prefix;
+pub mod connection_diagnostics;
 pub mod deskside;
 pub mod desktop_provider;
 pub mod desktop_session;
@@ -22,6 +25,7 @@ pub mod polkit_remote;
 pub mod restore_lease;
 pub mod session_admission;
 pub mod session_locale;
+pub mod setup_budget;
 pub mod wayland_outputs;
 pub mod wayland_qualification;
 pub mod wayland_session;

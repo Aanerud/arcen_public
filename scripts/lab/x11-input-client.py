@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Core-protocol X11 test client for the headless session lab harness.
 
 The plain-Xlib counterpart of ``wayland-input-client.py`` for X11

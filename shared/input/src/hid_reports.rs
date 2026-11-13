@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! HID reports for a host that presents input as hardware.
 //!
 //! A host that injects through a virtual HID device — `IOHIDUserDevice` on

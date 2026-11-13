@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -47,6 +50,15 @@ pub struct InputController {
     pen_state: PenToolState,
     pen_proximity_timeout: arcen_input::virtual_device::ProximityTimeoutDisarm,
     stats: Arc<InputStats>,
+    /// Committed text, typed through this keyboard on the session's own X
+    /// server; `None` until attached (or when it could not connect).
+    x11_text: Option<Box<super::x11_text::X11Text>>,
+    /// Text results for the Deck: the sender, and the receiver until the
+    /// session takes it.
+    text_notices: Option<(
+        tokio::sync::mpsc::Sender<String>,
+        Option<tokio::sync::mpsc::Receiver<String>>,
+    )>,
 }
 
 struct PenInjection {
@@ -195,6 +207,8 @@ impl InputController {
                 pen_state: PenToolState::default(),
                 pen_proximity_timeout: Default::default(),
                 stats: stats.clone(),
+                x11_text: None,
+                text_notices: None,
             },
             stats,
         ))
@@ -719,6 +733,97 @@ impl InputController {
     #[must_use]
     pub const fn region_input_available(&self) -> bool {
         self.region_input.is_some()
+    }
+
+    /// Connects committed text to the session's X server (`display`, with
+    /// the `xauthority` cookie), so the hello can offer it.
+    ///
+    /// # Errors
+    ///
+    /// When the X server cannot be reached; the session then types key
+    /// positions only, as before.
+    pub fn attach_x11_text(
+        &mut self,
+        display: &str,
+        xauthority: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        let text = super::x11_text::X11Text::connect(display, xauthority)?;
+        self.x11_text = Some(Box::new(text));
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        self.text_notices = Some((sender, Some(receiver)));
+        Ok(())
+    }
+
+    /// Whether this session types committed text (any character).
+    #[must_use]
+    pub const fn text_available(&self) -> bool {
+        self.x11_text.is_some()
+    }
+
+    /// The Deck-bound text results, once.
+    pub fn take_text_notices(&mut self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        self.text_notices
+            .as_mut()
+            .and_then(|(_, receiver)| receiver.take())
+    }
+
+    /// Types committed text on the session's X server through this
+    /// keyboard. Never logs the text.
+    ///
+    /// # Errors
+    ///
+    /// [`InputError::TextUnavailable`] without an X connection or when it
+    /// fails.
+    pub fn text_commit(
+        &mut self,
+        message: &arcen_protocol::messages::TextCommitMsg,
+    ) -> Result<(), InputError> {
+        use arcen_protocol::messages::{TextCommitResultMsg, TextRefusalReason};
+        let Some(text) = self.x11_text.as_mut() else {
+            return Err(InputError::TextUnavailable);
+        };
+        if message.validate().is_err() {
+            return Err(InputError::TextUnavailable);
+        }
+        let keys_held = !self.held_keys.is_empty();
+        let device = &mut self.absolute_device;
+        let mut emit = |(code, pressed): super::x11_text::KeyEdge| {
+            device
+                .emit(&[InputEvent::new(EventType::KEY.0, code, i32::from(pressed))])
+                .map_err(|error| error.to_string())
+        };
+        let report = match text.type_text(&message.text, keys_held, &mut emit) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(target: "input", %error, "committed text not typed: X server");
+                self.x11_text = None;
+                return Err(InputError::TextUnavailable);
+            }
+        };
+        tracing::debug!(
+            target: "input",
+            sequence = message.sequence,
+            by_key = report.by_key,
+            borrowed = report.borrowed,
+            refused = report.refused,
+            keys_held,
+            "text_commit"
+        );
+        if report.refused > 0 {
+            if let Some((sender, _)) = &self.text_notices {
+                let notice = TextCommitResultMsg {
+                    sequence: message.sequence,
+                    delivered_chars: report.by_key + report.borrowed,
+                    refused_chars: report.refused,
+                    reason: TextRefusalReason::NotInSessionLayout,
+                    ..TextCommitResultMsg::default()
+                };
+                if let Ok(json) = serde_json::to_string(&notice) {
+                    let _ = sender.try_send(json);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn sync_lock_states(&mut self, message: &KeyEventMsg) -> Result<(), InputError> {

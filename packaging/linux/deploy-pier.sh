@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Deploy Arcen Pier (Linux) to a workstation host over SSH.
 #
 # Builds on the target box (needs its GPU + NVENC), installs the binaries under
@@ -11,17 +13,25 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: HOST=user@ip packaging/linux/deploy-pier.sh
+Usage: HOST=user@ip packaging/linux/deploy-pier.sh [--uninstall]
 
+      --uninstall            Stop the service and remove what this script
+                             installed (binaries, unit, logrotate and tmpfiles
+                             rules, notices, SELinux module). /etc/arcen,
+                             /var/lib/arcen and /var/log/arcen are kept.
   -h, --help                 Show this help.
 EOF
 }
 
+UNINSTALL=0
 while (($#)); do
   case "$1" in
     -h | --help)
       usage
       exit 0
+      ;;
+    --uninstall)
+      UNINSTALL=1
       ;;
     *)
       echo "deploy-pier.sh: unknown argument: $1" >&2
@@ -37,10 +47,30 @@ KEY="${KEY:-$HOME/.ssh/id_ecdsa}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SSH="ssh -i $KEY -o BatchMode=yes"
 
+if ((UNINSTALL)); then
+  echo "==> uninstall Arcen Pier from $HOST (configuration, state and logs kept)"
+  $SSH "$HOST" 'set -e
+    systemctl disable --now arcen-pier.service 2>/dev/null || true
+    rm -f /etc/systemd/system/arcen-pier.service
+    rm -f /etc/logrotate.d/arcen-pier
+    rm -f /etc/tmpfiles.d/arcen-pier.conf
+    rm -f /opt/arcen/bin/arcen-pier /opt/arcen/bin/arcen-new-host-cert
+    rm -f /usr/share/doc/arcen/THIRD_PARTY_NOTICES.md
+    if [ -e /sys/fs/selinux/enforce ] && semodule -l | grep -qx arcen; then
+      semodule -r arcen
+    fi
+    rm -f /usr/share/arcen/selinux/arcen.cil
+    rmdir /opt/arcen/bin /opt/arcen /usr/share/doc/arcen /usr/share/arcen/selinux /usr/share/arcen 2>/dev/null || true
+    systemctl daemon-reload'
+  echo "==> done. Arcen Pier removed from $HOST"
+  exit 0
+fi
+
 echo "==> rsync source → $HOST:/root/arcen/"
-rsync -az -e "$SSH" \
-  --exclude target --exclude .git --exclude 'Arcen Deck.app' --exclude .disk-guardian.log \
-  "$REPO/" "$HOST:/root/arcen/"
+# Only the git source allowlist (tracked files and new files git does not
+# ignore) is copied; ignored local material stays on this machine.
+git -C "$REPO" ls-files -co --exclude-standard |
+  rsync -az -e "$SSH" --files-from=- "$REPO/" "$HOST:/root/arcen/"
 
 echo "==> build fused Pier on $HOST"
 $SSH "$HOST" 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/arcen &&
@@ -87,6 +117,7 @@ $SSH "$HOST" 'set -e; cd /root/arcen
   rm -f /etc/arcen/logging.json
   /opt/arcen/bin/arcen-pier validate-config --config /etc/arcen/pier.json
   install -m 0644 packaging/linux/arcen-pier.logrotate /etc/logrotate.d/arcen-pier
+  install -m 0644 packaging/linux/arcen-pier.tmpfiles /etc/tmpfiles.d/arcen-pier.conf
   install -m 0644 packaging/linux/arcen-pier.service /etc/systemd/system/arcen-pier.service
   install -m 0644 legal/THIRD_PARTY_NOTICES.md /usr/share/doc/arcen/THIRD_PARTY_NOTICES.md
   # SELinux hosts: the launcher may enter the user'"'"'s PAM context only with

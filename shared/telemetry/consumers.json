@@ -351,6 +351,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "health",
         "lifecycle",
         "lifecycle_fields",
         "log_policy",

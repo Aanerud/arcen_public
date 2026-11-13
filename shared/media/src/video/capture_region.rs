@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which part of a damage-gated copying capture to read again.
 //!
 //! A host that reads its frame back from the GPU (Xorg `XShmGetImage` of a

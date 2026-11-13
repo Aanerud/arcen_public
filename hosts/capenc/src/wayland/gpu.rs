@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! GPU identity for the compositor and the encoder, as shared data.
 //!
 //! The encoder GPU is the CUDA device capenc opened (the Pier names it by PCI

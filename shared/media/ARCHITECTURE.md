@@ -282,8 +282,8 @@ truth that every platform must use.
 | Source representation | Shared conversion |
 | --- | --- |
 | 8-bit BGRA | BGRA → NV12/I420/I444 for the negotiated matrix, range, and depth |
-| Packed depth-30 RGB | Visual-mask-derived RGB10 → P010 or planar I444 P16 |
-| FP16 linear scRGB, SDR contract | Clamp to SDR reference range → BT.709/sRGB OETF → planar I444 P16 |
+| Packed depth-30 RGB | Visual-mask-derived RGB10 → P010 or planar I444 P16; SDR codes untouched (`Rgb10Signal::Direct`), a PQ desktop's SDR session converted on the served SDR curve (`PqBt2020ToSdrSrgb` for `srgb`, `PqBt2020ToSdrBt709` otherwise; `PqBt2020ToSdrGamma22`, stated `srgb`, when the capture evidence says the compositor decoded its SDR content with a 2.2 power, as Mutter does in HDR) |
+| FP16 linear scRGB, SDR contract | Clamp to SDR reference range → served SDR transfer (sRGB keeps desktop codes; `sdr_desktop_transfer`/`serve_sdr_desktop` pick it for a capable client, BT.709 OETF otherwise) → planar I444 P16 |
 | FP16 linear scRGB, HDR contract | Target-primary conversion → absolute ST 2084 PQ using 80-nit scRGB reference white → planar I444 P16 |
 
 These functions are intentionally separate. A wider destination buffer is not
@@ -301,6 +301,20 @@ request to Grading unless the operator declared the desktop Rec.2100 PQ
 Wayland provider may retain PQ. Windows
 retains PQ only after exact-target HDR proof. Those platform decisions consume
 the shared contract rather than redefining it.
+
+### Colour check (`colour_check.rs`)
+
+The colourist's checklist behind the Deck's **Colour check**. A platform
+adapter gathers `HostFacts` (from the hello and `served_pipeline`),
+`FrameFacts` (decoded frame headers), `DeckFacts` (display, presentation layer,
+scale) and an `Exactness` reading; `assess` owns every rule, verdict, sentence,
+stable `colour.*` code and one-click `ColourFix`, and `render_text` the
+report. Fixes only change the Deck (preset, Retina-resolution streaming,
+fullscreen) or measure; none changes a host setting. The capture source is
+stated as implied by the served pipeline, because no host reports it.
+`test_pattern::measure_biplanar` measures a decoded two-plane Y′CbCr picture
+against a pattern in RGB and, for 4:4:4, in coded samples at the stream's
+depth; `TestPattern::render_png` writes the pattern the host shows.
 
 ### Pipeline contracts
 

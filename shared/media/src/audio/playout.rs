@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! How much audio a client holds before it plays, chosen from the path.
 //!
 //! A fixed playout target is wrong on any path but the one it was tuned for.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Remote desktops stay remote to polkit.
 //!
 //! polkit's systemd backend counts a subject as *local* when its logind
@@ -663,7 +665,7 @@ pub const fn needs_checks(state: PolkitState, seat: DesktopSeat) -> bool {
 /// polkit treats its session as remote whatever its tools do, so a tool that
 /// does not answer admits it ([`Admission::AdmitUnverified`]).
 /// On polkit < 0.106 a console-seat (X11) desktop is admitted unprotected
-/// rather than refused (an owner decision; see the administration guide),
+/// rather than refused (refusing would end X11 service; see the administration guide),
 /// and an Arcen-seat desktop is refused.
 #[must_use]
 pub fn admission(state: PolkitState, seat: DesktopSeat, checks: &[PolkitCheck]) -> Admission {

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-transport"
 version.workspace = true
@@ -5,6 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 
 [features]
@@ -15,6 +19,7 @@ quic = [
     "dep:futures-core",
     "dep:futures-sink",
     "dep:quinn",
+    "dep:quinn-proto",
     "dep:tokio",
     "dep:tokio-util",
 ]
@@ -31,6 +36,10 @@ bytes = { workspace = true, optional = true }
 futures-core = { version = "0.3.33", optional = true }
 futures-sink = { version = "0.3.33", optional = true }
 quinn = { workspace = true, optional = true }
+# Same crate and version quinn already builds; named only because quinn's
+# congestion::Controller trait takes quinn_proto::RttEstimator, which quinn
+# does not re-export (see quic/loss_guard.rs).
+quinn-proto = { version = "=0.11.16", default-features = false, optional = true }
 rustls.workspace = true
 sha2.workspace = true
 subtle.workspace = true

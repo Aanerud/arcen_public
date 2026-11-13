@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The native-seat pen proof: a Wayland client of the desktop's compositor
 //! that watches `zwp_tablet_manager_v2` (see [`arcen_session::native_seat`]).
 //!

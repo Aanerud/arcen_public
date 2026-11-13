@@ -1,6 +1,8 @@
 # ADR 0013: One Ordered Session Stream, Keyframe Recovery, No FEC
 
-**Status:** Accepted 2026-09-27 by the project owner.
+**Status:** Accepted 2026-09-27. Historical transport design: ADR 0014
+replaced the single ordered stream with isolated QUIC lanes; its keyframe
+recovery and no-FEC reasoning still apply.
 
 > Records why Arcen keeps every display's video on the one ordered session
 > stream, recovers from loss with keyframes rather than forward error

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Guarded NVIDIA headless-output activation proof.
 //!
 //! This module is intentionally narrower than a product output provider. It
@@ -68,7 +70,7 @@ pub(crate) struct ProbeRequest {
     /// whose EDID does not claim it, and without Advanced Color the desktop is
     /// never composited wider than 8-bit — which is what every capture backend
     /// then faithfully reports. This makes that first link testable.
-    /// See `docs/internal/ten-bit-source-capture.md`.
+    /// See `docs/architecture/color-fidelity.md`.
     pub hdr10: bool,
 }
 

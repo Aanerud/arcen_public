@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+name: Feature or device integration
+description: Propose a feature or an integration with a device (tablet, control surface, colour probe …).
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A short design discussion before you build saves work. This issue is public: do not include private or customer data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do, and why
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: Which Deck and Pier platforms it concerns, and where you think it belongs (shared/ first).
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware you can test on

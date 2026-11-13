@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Install-time desktop-provider plan for the Linux Pier installer.
 //!
 //! The installer decides, before it writes anything, which desktop this

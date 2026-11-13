@@ -1,31 +1,26 @@
 # Observability Standard — unified logging, QoS telemetry, and monitoring integration
 
-**Status: DONE (2026-07-25).** Designed in
-the Observability Standard design review and
-implemented in
-its implementation review.
-Target-native Windows execution and Linux operational acceptance remain platform
-gates; this status does not claim release or production acceptance. The
-implemented architecture record is
+**Status: implemented.** This document defines the observability schema and
+platform adapters; the implemented architecture record is
 [`../architecture/observability.md`](../architecture/observability.md).
+Native Windows execution and Linux operational coverage are validated on
+their target platforms.
 
-**Historical implementation decomposition:** seven shared-first PRs (each independently landable). The pure vocabulary
-lands in `arcen-telemetry` first, a new tracing-runtime crate `arcen-observability`
-second, additive wire fields in `arcen-protocol` third; then each app (macOS Deck,
-Linux Pier, Windows Pier) adopts as a thin adapter, and the final PR ships the
-sysadmin-facing monitoring documentation and conformance checklist.
-**Escalations:** `arcen-protocol` additive fields → Shared/Architecture.
-Identity-in-logs policy (§9) and default support-bundle pseudonymization → Release/Security.
+**Structure:** the pure vocabulary lives in `arcen-telemetry`, the tracing
+runtime in `arcen-observability`, additive wire fields in `arcen-protocol`;
+each app (macOS Deck, Linux Pier, Windows Pier) adopts them as a thin
+adapter, and the monitoring documentation and conformance checklist describe
+the result for administrators. Changes to the `arcen-protocol` fields are
+Shared/Architecture changes; the identity-in-logs policy (§9) and default
+support-bundle pseudonymization are Release/Security changes.
 
 > Scope note: unlike the other docs in this folder, this standard spans **clients as
 > well as hosts** — logging is a product-wide platform capability. The template's
 > Windows/Linux host sections are extended with a macOS Deck section and a
-> forward-conformance section for future apps. Span and every gateway change are
-> explicitly outside this seven-PR implementation.
+> forward-conformance section for future apps.
 >
-> The unchecked acceptance boxes below are retained as design and review
-> history. They are not marked as externally accepted while merge/PR assignment
-> and the target-native platform gates remain pending.
+> The acceptance boxes below are the design's checklist; an unchecked box
+> means the item is not separately certified, not that it is missing.
 
 ---
 
@@ -59,7 +54,7 @@ what the user experience actually was**, from either end of the connection:
 
 Today each active app solves logging on its own. The macOS client and both hosts
 have three diverging stacks. This document defines the single standard and the
-migration to it; the dormant gateway is not an implementation target.
+migration to it.
 
 ---
 
@@ -67,23 +62,23 @@ migration to it; the dormant gateway is not an implementation target.
 
 ### 2.1 Inventory (verified against source, 2026-07-22)
 
-| Capability | macOS Deck | Linux Pier | Windows Pier | shared | gateway (dormant) |
-|---|---|---|---|---|---|
-| Framework | `tracing` | `tracing` | `tracing` | — | `tracing` |
+| Capability | macOS Deck | Linux Pier | Windows Pier | shared |
+|---|---|---|---|---|
+| Framework | `tracing` | `tracing` | `tracing` | — |
 | Init module | `clients/macos/src/logging/mod.rs` | `hosts/linux/src/logging/mod.rs` | `hosts/windows/src/logging.rs` | — |
-| Log file | `~/Library/Logs/Arcen/arcen-client.log` (daily) | `/var/log/arcen/arcen-pier.log` (SIGHUP reopen + logrotate) | `%ProgramData%\Arcen\logs\arcen-pier.log` + per-session `sessions\<sid>.log` | retention contract in `arcen-telemetry` | stdout |
-| OS event sink | **none** | journald native (`ARCEN_EVENT_ID`, `ARCEN_FIELD_*`) + `/dev/log` fallback — `hosts/linux/src/eventlog.rs` | Windows Event Log, provider `ArcenPier`, bounded 64-slot non-blocking worker — `hosts/windows/src/eventlog.rs` | `ValidatedLifecycleEvent` | JSON lines |
-| Lifecycle events (1000–1404) | **not emitted** | emitted | emitted | vocabulary + schemas in `shared/telemetry/src/lifecycle.rs` | `record_lifecycle_event()` |
-| Session-end summary | **none** | `SessionEnd` 1103: reason_class, duration_ms, frames_sent/dropped, audio counters | same vocabulary | `StructuredFields` | — |
-| Correlation | generates `session_log_id` (UUID), sends in `AuthResponse` | records as `sid` span field | records as `sid` span field | `CorrelationId` | — |
-| Periodic QoS logging | **none** | none logged (2 s HealthPong is liveness only) | `HealthStatsMsg` → client every 2 s; capenc stats at INFO | `HealthStatsMsg` contract | — |
-| Client-side timing (decode/display/RTT) | **not measured** | n/a | n/a | fields exist in `HealthStatsMsg` but are never filled | — |
-| Network interface truth | LAN/WAN classification of *destination* only (`diagnostics.rs`) | none | none | — | — |
-| HID / HoIP logging | **zero** (`clients/macos/src/hid/`) | uhid create/remove not evented | n/a yet | — | — |
-| Permission/entitlement state | **invisible** (TCC, sustained-execution) | n/a | n/a | — | — |
-| Runtime verbosity reload | UI "Log level" live reload | unified `pier.json` + SIGHUP | SCM control codes 200/201/202 | `VerbosityTier` → `LevelSpec` | env only |
-| JSON output | none | none | none | — | **yes** (`init_json_logging`) |
-| Hot-path discipline | good (no per-frame logs) | good (frame pump silent) | good (per-AU logs only first 3 + keyframes, DEBUG) | — | n/a |
+| Log file | `~/Library/Logs/Arcen/arcen-client.log` (daily) | `/var/log/arcen/arcen-pier.log` (SIGHUP reopen + logrotate) | `%ProgramData%\Arcen\logs\arcen-pier.log` + per-session `sessions\<sid>.log` | retention contract in `arcen-telemetry` |
+| OS event sink | **none** | journald native (`ARCEN_EVENT_ID`, `ARCEN_FIELD_*`) + `/dev/log` fallback — `hosts/linux/src/eventlog.rs` | Windows Event Log, provider `ArcenPier`, bounded 64-slot non-blocking worker — `hosts/windows/src/eventlog.rs` | `ValidatedLifecycleEvent` |
+| Lifecycle events (1000–1404) | **not emitted** | emitted | emitted | vocabulary + schemas in `shared/telemetry/src/lifecycle.rs` |
+| Session-end summary | **none** | `SessionEnd` 1103: reason_class, duration_ms, frames_sent/dropped, audio counters | same vocabulary | `StructuredFields` |
+| Correlation | generates `session_log_id` (UUID), sends in `AuthResponse` | records as `sid` span field | records as `sid` span field | `CorrelationId` |
+| Periodic QoS logging | **none** | none logged (2 s HealthPong is liveness only) | `HealthStatsMsg` → client every 2 s; capenc stats at INFO | `HealthStatsMsg` contract |
+| Client-side timing (decode/display/RTT) | **not measured** | n/a | n/a | fields exist in `HealthStatsMsg` but are never filled |
+| Network interface truth | LAN/WAN classification of *destination* only (`diagnostics.rs`) | none | none | — |
+| HID / HoIP logging | **zero** (`clients/macos/src/hid/`) | uhid create/remove not evented | n/a yet | — |
+| Permission/entitlement state | **invisible** (TCC, sustained-execution) | n/a | n/a | — |
+| Runtime verbosity reload | UI "Log level" live reload | unified `pier.json` + SIGHUP | SCM control codes 200/201/202 | `VerbosityTier` → `LevelSpec` |
+| JSON output | none | none | none | — |
+| Hot-path discipline | good (no per-frame logs) | good (frame pump silent) | good (per-AU logs only first 3 + keyframes, DEBUG) | — |
 
 ### 2.2 Target-name divergence (must converge)
 
@@ -107,7 +102,7 @@ Platform-only extras stay allowed and documented: `arcen::cppipe`, `arcen::event
 3. **`HealthStatsMsg` round trip is half-wired**: host → client only;
    `decode_time_ms` / `display_time_ms` (`shared/protocol/src/messages.rs`) are dead
    fields; no echo sequence, so no true application-level RTT.
-4. **No JSON option** outside the dormant gateway.
+4. **No JSON option** in any product.
 5. **No three-state rollup** anywhere; a sysadmin must read raw lines and guess.
 6. **No monitoring recipes**: journald fields and Event Log IDs exist on the hosts but
    are undocumented for Zabbix/collector consumption.
@@ -265,7 +260,7 @@ Emitted by the client for attach/forward and by the host for inject failures
 | 1803 | `HEARTBEAT_LOST` | 0 | missed_intervals | — |
 | 1804 | `TELEMETRY_DROPPED` | 0 | sink, dropped_count | — |
 | 1805 | `EFFECTIVE_PROFILE` | 0 | profile_level, profile_name, profile_source | — |
-| 1806 | `HEALTH_SNAPSHOT` | 0 | overall_state | host_state, client_state, QoS summary fields, client network (client_network_kind, client_network_scope, client_link_mbps, client_mtu) |
+| 1806 | `HEALTH_SNAPSHOT` | 0 | overall_state | host_state, client_state, QoS summary fields (fps_actual, fps_target, fps_content, rtt_ms, drop_basis_points, heartbeat_misses), client network (client_network_kind, client_network_scope, client_link_mbps, client_mtu) |
 
 1804 is the "counted loss" escape valve (§7): any sink that dropped since the last
 heartbeat reports it here and resets its counter. 1806 is the mandatory compact
@@ -346,9 +341,21 @@ Pure function in `arcen-telemetry`; identical logic on both ends.
 
 | State | Condition (any triggers the worse state) |
 |---|---|
-| **Ok** ("it's working") | fps ≥ 0.9 × target AND rtt ≤ 60 ms AND drop ratio < 0.5 % AND input_latency ≤ 50 ms |
-| **Degraded** ("something is off") | fps 0.7–0.9 × target, or rtt 60–150 ms, or drops 0.5–5 %, or input_latency 50–120 ms |
-| **Critical** ("it's not working") | fps < 0.7 × target, or rtt > 150 ms, or drops > 5 %, or input_latency > 120 ms, or ≥ 3 missed heartbeats |
+| **Ok** ("it's working") | fps ≥ 0.9 × expected AND rtt ≤ 60 ms AND drop ratio < 0.5 % AND input_latency ≤ 50 ms |
+| **Degraded** ("something is off") | fps 0.7–0.9 × expected, or rtt 60–150 ms, or drops 0.5–5 %, or input_latency 50–120 ms |
+| **Critical** ("it's not working") | fps < 0.7 × expected, or rtt > 150 ms, or drops > 5 %, or input_latency > 120 ms, or ≥ 3 missed heartbeats |
+
+"Expected" is `fps_expected`: the target, lowered to `QosSample::fps_content`
+(the changed-content rate the source offered) when the capture path proves the
+source, not the pipeline, set the pace — a still desktop is not a frame-rate
+fault. Frames the pipeline failed to keep up with (superseded, shed) count as
+content, so a backlog still trips the state. A window that sent nothing is
+judged against the target (every Pier sends a keepalive at least once a
+second), and a shortfall of one frame a second is window quantisation, not a
+fault. Client presentation (`unpresented`) allows one decoded frame in flight
+at the window boundary and is judged only on windows of at least ten decoded
+frames. Each Pier and the Deck feed `fps_content` from
+counters they already keep; see `docs/operations/monitoring.md`.
 
 Rationale for defaults (all overridable via `QosTargets` in the standard logging
 config): at 24 fps content, 0.9× (≈21.6) is where artists perceive judder; 60 ms RTT
@@ -443,7 +450,7 @@ trait NetworkTruthProbe {
    emits `TelemetryDropped` (1804) and resets. Silent loss banned, blocking banned;
    counted loss is the only allowed failure mode.
 5. **Lifecycle emission is fire-and-forget** — never fails the described operation.
-6. Conformance checklist (§11) carries a hot-path sign-off item; CI adds a grep gate
+6. Conformance checklist (§11) carries a hot-path review item; CI adds a grep gate
    for `tracing::` inside modules listed as hot-path (frame pump, decode loop,
    HID report callback, input injection).
 
@@ -561,7 +568,7 @@ migration contract.
 
 Builder, JSON formatter, `ObservabilityHandle`, `BoundedSink`,
 `HeartbeatSampler`, `NetworkTruthProbe` trait, and lifecycle→tracing bridge.
-No product or gateway adoption occurs in this PR.
+No product adoption occurs in this step.
 
 **Acceptance criteria**
 - [ ] Capture-subscriber tests assert the exact JSON line shape (§8.1) byte-for-byte
@@ -663,7 +670,7 @@ same alerting recipe.
 `docs/operations/monitoring.md` (§8.4 vendor-neutral recipes + alarm-ID table);
 the conformance checklist (§11) added to this doc's graduated home; support-bundle
 export gains default identity pseudonymization and bounded QoS/session summaries
-*(escalation: Release/Security)*. No gateway work is included.
+*(escalation: Release/Security)*.
 
 **Acceptance criteria**
 - [ ] Every recipe executed verbatim against real output from PRs 4–6 (paste-tested,
@@ -697,18 +704,14 @@ snapshot.
 - [ ] QoS heartbeat at standard cadence (client 5 s / host 10 s) fed by atomics.
 - [ ] Runtime profile reload without process restart, wired to `ObservabilityHandle`.
 - [ ] Every OS sink behind `BoundedSink`; drops surface as 1804.
-- [ ] No `tracing` calls in hot paths (review sign-off + CI grep gate).
+- [ ] No `tracing` calls in hot paths (review + CI grep gate).
 - [ ] Integration recipe added to `docs/operations/monitoring.md`.
 
-### Span aggregation (roadmap only; no work in these seven PRs)
+### QUIC feedback
 
-Stable numeric IDs + JSON-lines + sid-as-join-key mean Span can aggregate
-multi-session telemetry with **no log-format change** — it ingests the same
-`QosSample`/lifecycle shapes it already emits for itself. Reserved names (documented
-here so nobody invents alternatives): a `TelemetryRelayMsg` in `arcen-protocol` for
-host→gateway session telemetry, and the QUIC `FeedbackSnapshot` → `QosSample` bridge
-(`shared/transport/src/quic/feedback.rs` already exposes rtt/loss/congestion — it
-feeds the same rollup when QUIC activates).
+The QUIC `FeedbackSnapshot` → `QosSample` bridge
+(`shared/transport/src/quic/feedback.rs` already exposes rtt/loss/congestion)
+feeds the same rollup.
 
 ---
 

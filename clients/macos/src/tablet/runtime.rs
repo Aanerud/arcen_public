@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Cross-platform-safe wrapper around the macOS-only [`super::monitor`].
 //!
 //! `ui/app.rs` is otherwise OS-agnostic (its few genuinely macOS-only needs

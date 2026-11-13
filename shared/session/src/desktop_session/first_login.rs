@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The operator's first-login policy and GNOME's own completion markers.
 //!
 //! On a user's first GNOME login, GNOME runs its initial-setup assistant

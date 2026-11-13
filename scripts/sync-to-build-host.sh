@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Copy the working tree to a build host that has no git checkout.
 #
-# The Windows build host builds from a copied source tree rather than a clone.
-# Doing that by hand is how private material escapes: this repository keeps lab
-# inventories in .claude/, a third-party reference corpus in refference/, key
-# material in keys/, and built artefacts in dist/. None of it may be copied to
-# another machine, and none of it may end up in a build directory that someone
-# later archives. The exclusions belong in a script, not in whoever is typing.
+# Only the source allowlist is copied: files git tracks, plus new files git
+# does not ignore (`git ls-files -co --exclude-standard`). Everything ignored —
+# build output, local key material, built artefacts and any other excluded
+# local or private material — stays on this machine, so nothing outside the
+# source tree can end up in a build directory that someone later archives.
 #
 # It also disables AppleDouble metadata. macOS bsdtar writes a `._name`
 # sidecar for every file carrying extended attributes, and extracting those on
@@ -35,23 +36,13 @@ remote_path=$2
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 
-# Never copied. `.git` and `target` are merely large; the rest are private or
-# are build output that must be produced on the target, not carried to it.
-excludes=(
-    --exclude=./.git
-    --exclude=./target
-    --exclude=./refference
-    --exclude=./keys
-    --exclude=./dist
-    --exclude=./dist-installers
-    --exclude=./.claude
-    --exclude=./.local
-    --exclude="./Arcen Deck.app"
-    --exclude="./*.private.md"
-)
+# The source allowlist, NUL-separated so names with spaces survive.
+file_list=$(mktemp "${TMPDIR:-/tmp}/arcen-sync.XXXXXX")
+trap 'rm -f "$file_list"' EXIT
+git -C "$repo" ls-files -z -co --exclude-standard >"$file_list"
 
 echo "==> syncing $repo -> $destination:$remote_path"
-echo "    excluded: .git target refference keys dist dist-installers .claude .local 'Arcen Deck.app'"
+echo "    copying $(tr -cd '\0' <"$file_list" | wc -c | tr -d ' ') files from the git source allowlist; ignored files stay local"
 
 # Detect the remote shell instead of assuming PowerShell. `uname -s` is a
 # builtin-free POSIX probe; PowerShell has no `uname`, so a non-zero exit or
@@ -69,16 +60,7 @@ else
     stray_cmd="Get-ChildItem -LiteralPath '$remote_path' -Recurse -Force -Filter '._*' -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"
 fi
 
-# Refuse to run if the private paths would somehow be included, rather than
-# trusting the exclude list to be correct.
-staged=$(COPYFILE_DISABLE=1 tar -cz "${excludes[@]}" -C "$repo" . | tar -tz)
-if printf '%s\n' "$staged" | grep -qE '^\./(refference|keys|\.claude|\.local|dist)/'; then
-    echo "error: private paths present in the archive; refusing to transfer" >&2
-    printf '%s\n' "$staged" | grep -E '^\./(refference|keys|\.claude|\.local|dist)/' | head >&2
-    exit 1
-fi
-
-COPYFILE_DISABLE=1 tar -cz "${excludes[@]}" -C "$repo" . |
+COPYFILE_DISABLE=1 tar -cz -C "$repo" --null -T "$file_list" |
     ssh -o BatchMode=yes "$destination" "$extract_cmd"
 
 # AppleDouble suppression is the point of COPYFILE_DISABLE, so verify it worked

@@ -9,12 +9,16 @@
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
+        "backend",
         "crate",
         "descriptor_fixtures",
+        "exporter",
         "hid_digitizer",
         "synthetic",
+        "synthetic_device",
         "tablet_claim",
-        "types"
+        "types",
+        "wacom_intuos5"
       ],
       "paths": [
         {
@@ -25,13 +29,20 @@
           "owner": "macOS Client"
         },
         {
-          "id": "macos-deck-usb-hard-lab",
+          "id": "macos-deck-native-tablet",
           "entry_points": [
             "clients/macos/src/usb_bridge.rs",
             "clients/macos/src/usb_helper_client.rs"
           ],
-          "build_profiles": ["macos-deck-usb-hard-lab"],
-          "validation": ["macos-deck-usb-hard-lab-test", "macos-deck-usb-lab"],
+          "build_profiles": ["macos-deck-native-tablet"],
+          "validation": ["macos-deck-native-tablet-test", "macos-deck-usb-lab"],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-usb-emulate-lab",
+          "entry_points": ["clients/macos/src/usb_emulate.rs"],
+          "build_profiles": ["macos-deck-usb-emulate-lab"],
+          "validation": ["macos-deck-usb-emulate-lab-test", "macos-deck-usb-emulated-wacom-lab"],
           "owner": "macOS Client"
         }
       ]
@@ -40,15 +51,19 @@
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
       "contracts": [
+        "bridge_seat",
         "bridged_device_guard",
         "crate",
         "descriptor_fixtures",
         "hid_digitizer",
+        "kernel_package",
         "raw_hid",
         "session_seat",
+        "state_replay",
         "synthetic",
         "tablet_claim",
-        "types"
+        "types",
+        "usbip"
       ],
       "paths": [
         {
@@ -59,13 +74,15 @@
           "owner": "Linux Host"
         },
         {
-          "id": "linux-usb-hard-lab",
+          "id": "linux-native-tablet",
           "entry_points": [
             "hosts/linux/src/usb_bridge/mod.rs",
-            "hosts/linux/src/usb_bridge/vhci.rs"
+            "hosts/linux/src/usb_bridge/seat.rs",
+            "hosts/linux/src/usb_bridge/vhci.rs",
+            "hosts/linux/src/session/launcher.rs"
           ],
-          "build_profiles": ["linux-pier-usb-hard-lab"],
-          "validation": ["linux-pier-usb-hard-lab-test", "linux-usb-lab"],
+          "build_profiles": ["linux-pier-native-tablet"],
+          "validation": ["linux-pier-native-tablet-test", "linux-usb-lab"],
           "owner": "Linux Host"
         }
       ]
@@ -79,25 +96,73 @@
       "package": "arcen-usb-helper",
       "dependency_kind": "normal",
       "contracts": [
+        "backend",
         "crate",
         "descriptor",
         "descriptor_fixtures",
+        "exporter",
         "hid_digitizer",
         "policy",
+        "synthetic",
+        "synthetic_device",
         "tablet_claim",
         "types"
       ],
       "paths": [
         {
           "id": "macos-deck-usb-helper",
-          "entry_points": ["clients/macos/usb-helper/src/capture.rs"],
+          "entry_points": [
+            "clients/macos/usb-helper/src/capture.rs",
+            "clients/macos/usb-helper/src/iousbhost.rs"
+          ],
           "build_profiles": ["macos-usb-helper-apple-silicon", "macos-usb-helper-intel"],
           "validation": [
             "macos-usb-helper-test",
             "macos-usb-helper-build-intel",
+            "macos-usb-helper-iousbhost-test",
+            "macos-usb-iousbhost-test",
             "macos-deck-usb-lab"
           ],
           "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-iousbhost",
+      "dependency_kind": "normal",
+      "contracts": ["backend", "crate", "descriptor", "exporter", "policy", "tablet_claim", "types"],
+      "paths": [
+        {
+          "id": "macos-iousbhost-backend",
+          "entry_points": [
+            "clients/macos/usb-iousbhost/src/lib.rs",
+            "clients/macos/usb-iousbhost/src/platform.rs"
+          ],
+          "build_profiles": ["macos-usb-iousbhost-apple-silicon", "macos-usb-iousbhost-intel"],
+          "validation": [
+            "macos-usb-iousbhost-test",
+            "macos-usb-iousbhost-clippy",
+            "macos-usb-iousbhost-build-intel",
+            "macos-usb-iousbhost-hardware"
+          ],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-linux-installer",
+      "dependency_kind": "normal",
+      "contracts": ["bridge_seat", "crate", "kernel_package"],
+      "paths": [
+        {
+          "id": "linux-installer-native-tablet",
+          "entry_points": [
+            "packaging/linux/installer/src/main.rs",
+            "packaging/linux/installer/src/native_tablet.rs"
+          ],
+          "build_profiles": ["linux-pier-installer"],
+          "validation": ["linux-pier-installer-build"],
+          "owner": "Linux Host"
         }
       ]
     },
@@ -134,6 +199,43 @@
           "build_profiles": ["windows-pier-installer"],
           "validation": ["windows-pier-installer-build"],
           "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-pier-macos",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate",
+        "exporter",
+        "hid_device_ipc",
+        "hid_host",
+        "hid_publish",
+        "synthetic_device",
+        "tablet_claim",
+        "types",
+        "wacom_intuos5",
+        "wacom_intuos_pen"
+      ],
+      "paths": [
+        {
+          "id": "macos-pier-session",
+          "entry_points": ["hosts/macos/src/bridged_tablet.rs", "hosts/macos/src/session.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-native-tablet",
+          "entry_points": [
+            "hosts/macos/src/bridged_tablet.rs",
+            "hosts/macos/src/input/bridged_hid.rs",
+            "hosts/macos/src/bridged_hid_probe.rs",
+            "hosts/macos/src/stream.rs"
+          ],
+          "build_profiles": ["macos-pier-native-tablet"],
+          "validation": ["macos-pier-native-tablet-test", "macos-pier-native-tablet-lab"],
+          "owner": "macOS Host"
         }
       ]
     }

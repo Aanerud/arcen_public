@@ -129,10 +129,10 @@
           "owner": "macOS Client"
         },
         {
-          "id": "macos-deck-usb-hard-lab",
+          "id": "macos-deck-native-tablet",
           "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-usb-hard-lab"],
-          "validation": ["macos-deck-usb-hard-lab-test"],
+          "build_profiles": ["macos-deck-native-tablet"],
+          "validation": ["macos-deck-native-tablet-test"],
           "owner": "macOS Client"
         }
       ]

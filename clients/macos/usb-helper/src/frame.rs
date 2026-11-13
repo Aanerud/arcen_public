@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Length-prefixed framing for the Deck↔helper privilege boundary.
 //!
 //! Deliberately tiny and dependency-free: this code runs as root, so it must be
@@ -18,6 +20,12 @@ pub const TAG_CANCEL: u8 = 0x03;
 pub const TAG_COMPLETE: u8 = 0x04;
 /// Helper → Deck: a bounded UTF-8 diagnostic.
 pub const TAG_ERROR: u8 = 0x05;
+/// Helper → Deck: facts about the helper itself, sent once right after
+/// [`TAG_HELLO`] (see [`encode_info`]). A Deck that predates it skips the
+/// frame: its completion reader ignores tags it does not know.
+pub const TAG_INFO: u8 = 0x06;
+/// Upper bound for a [`TAG_INFO`] payload.
+pub const MAX_INFO_BYTES: usize = 256;
 
 /// Upper bound for one framed message.
 ///
@@ -130,6 +138,15 @@ pub fn encode_hello(
         out.extend_from_slice(descriptor);
     }
     Ok(out)
+}
+
+/// Encodes the [`TAG_INFO`] payload: `key=value` lines, today only
+/// `backend=<name>`, the capture backend this session uses.
+#[must_use]
+pub fn encode_info(backend: &str) -> Vec<u8> {
+    let mut info = format!("backend={backend}").into_bytes();
+    info.truncate(MAX_INFO_BYTES);
+    info
 }
 
 /// Bytes of a [`TAG_HELLO`] payload carrying `descriptor_lengths`: the
@@ -273,6 +290,25 @@ mod tests {
         assert_eq!(encoded.len(), hello_len([4000; 3]));
         let mut framed = Vec::new();
         write_frame(&mut framed, TAG_HELLO, &encoded).expect("fits one frame");
+    }
+
+    #[test]
+    fn the_info_frame_names_the_backend_and_follows_the_hello() {
+        let mut stream = Vec::new();
+        write_frame(
+            &mut stream,
+            TAG_HELLO,
+            &encode_hello(1, 2, 3, 0, 1, &[]).unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut stream, TAG_INFO, &encode_info("iousbhost")).unwrap();
+        let mut reader = stream.as_slice();
+        assert_eq!(read_frame(&mut reader).unwrap().0, TAG_HELLO);
+        assert_eq!(
+            read_frame(&mut reader).unwrap(),
+            (TAG_INFO, b"backend=iousbhost".to_vec())
+        );
+        assert!(encode_info(&"x".repeat(1000)).len() <= MAX_INFO_BYTES);
     }
 
     #[test]

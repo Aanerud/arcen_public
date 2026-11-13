@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The TLS/WebSocket listener and per-connection relay — the Rust port of
 //! `server/main.py::run_server` + `handle_client` + the `SessionRuntime` frame
 //! pump/dispatch, minus the Python.
@@ -524,11 +526,25 @@ where
 /// width is a multiple of four and the height even; on the software encoder
 /// a Wayland output is fitted to OpenH264's limits (aspect kept, width a
 /// multiple of four), while an Xorg MetaMode keeps its 1920x1080 ceiling.
-fn resize_target(width: u32, height: u32, software: bool, wayland: bool) -> Option<(u32, u32)> {
+/// A `host_converted` (ten-bit Xorg XShm) session is fitted to that path's
+/// pixel budget, aspect kept.
+fn resize_target(
+    width: u32,
+    height: u32,
+    software: bool,
+    wayland: bool,
+    host_converted: bool,
+) -> Option<(u32, u32)> {
     if width % 4 != 0 || height % 2 != 0 {
         return None;
     }
     match (software, wayland) {
+        (false, false) if host_converted => {
+            let (fitted_width, fitted_height) =
+                arcen_media::video::fit_host_converted_capture(width, height);
+            let fitted = (fitted_width & !3, fitted_height & !1);
+            (fitted.0 > 0 && fitted.1 > 0).then_some(fitted)
+        }
         (false, _) => Some((width, height)),
         (true, true) => {
             let (fitted_width, fitted_height) =
@@ -2283,6 +2299,31 @@ fn speed_guard_for(
     })
 }
 
+/// The live capture's per-second content proofs, followed across capture
+/// restarts so the health tick judges frame rate against the content the
+/// current capture saw over the whole health window.
+type ContentStatsCell = Arc<Mutex<Option<capenc::ContentWindowCell>>>;
+
+/// Points the health tick at `handle`'s stats. A multi-monitor supervisor's
+/// sent count spans every output while each child reports only its own, so it
+/// proves nothing and frame rate is judged against the target as before.
+fn follow_content_stats(cell: &ContentStatsCell, handle: Option<&CapencHandle>) {
+    let stats = match handle {
+        Some(CapencHandle::Single(session)) => Some(session.content_window()),
+        Some(CapencHandle::Multi(_)) | None => None,
+    };
+    *lock_recover(cell) = stats;
+}
+
+/// The changed-content rate the live capture proved over the health window
+/// since the last tick — only when every stats second in it did
+/// (`arcen_telemetry::ContentWindow`) — for `QosSample::fps_content`.
+fn current_content_fps(cell: &ContentStatsCell) -> Option<u32> {
+    lock_recover(cell)
+        .as_ref()
+        .and_then(|content| lock_recover(content).take_fps())
+}
+
 /// The guard's verdict, once the epoch's counts give one; pending without a
 /// guard or once the epoch stops reporting.
 async fn next_speed_guard_verdict(
@@ -3088,6 +3129,7 @@ pub async fn serve(
         }
     }
     state.session_registry.shutdown().await;
+    crate::usb_bridge::shutdown_bridges().await;
     #[cfg(target_os = "linux")]
     {
         if let Some(reload_task) = reload_task {
@@ -4205,8 +4247,13 @@ async fn run_ws(
                 // accept now, because there is no second modeset later: arming
                 // 1800x1168 and only then discovering OpenH264 tops out at
                 // 1920x1080 leaves capenc capturing a rectangle it must reject.
-                let (fitted_width, fitted_height) = crate::media::capenc::fit_to_encoder_limits(
+                // A ten-bit session is fitted the same way to the depth-30
+                // XShm path's pixel budget (a 5K Deck display is served at
+                // 3840x2160 rather than refused).
+                let capture_bit_depth = session_config.capture_bit_depth();
+                let (fitted_width, fitted_height) = crate::media::capenc::fit_to_capture_limits(
                     session_config.encoder,
+                    capture_bit_depth,
                     resolution.width,
                     resolution.height,
                 );
@@ -4217,7 +4264,8 @@ async fn run_ws(
                         requested_h = resolution.height,
                         session_w = fitted_width,
                         session_h = fitted_height,
-                        "session display fitted to the software encoder's limits"
+                        bit_depth = capture_bit_depth.token(),
+                        "session display fitted to the encoder's and capture path's limits"
                     );
                 }
                 session_config.width = fitted_width;
@@ -4708,10 +4756,9 @@ fn admitted_multi_monitor_topology_was_discarded(
 /// `AuthResponse::replace_incompatible_desktop` -- instead of showing the
 /// user a dead end.
 ///
-/// Deliberately no longer instructs the user to sign out of the remote
-/// desktop by hand: that was the only recovery offered on 2026-08-11, when a
-/// desktop created 85 minutes earlier without a committed topology refused a
-/// Match My Layout connect and left no in-app path forward.
+/// It does not tell the user to sign out of the remote desktop by hand: a
+/// desktop created without a committed topology must leave an in-app path
+/// forward when it refuses a Match My Layout connect.
 const MULTI_MONITOR_REATTACH_REFUSAL: &str =
     arcen_protocol::messages::MULTI_MONITOR_TOPOLOGY_CONFLICT_REASON;
 
@@ -5845,7 +5892,19 @@ async fn run_attachment(
                     }
                 };
                 match InputController::new(device_w, device_h, region_input, identity) {
-                    Ok((controller, stats)) => {
+                    Ok((mut controller, stats)) => {
+                        // Committed text is typed on this session's own X
+                        // server; without it the session types key
+                        // positions only, as before.
+                        match controller.attach_x11_text(
+                            input_display,
+                            cfg.xauthority.as_deref().map(std::path::Path::new),
+                        ) {
+                            Ok(()) => info!(target: INPUT, "committed text available on Xorg"),
+                            Err(error) => {
+                                warn!(target: INPUT, %error, "committed text unavailable on Xorg");
+                            }
+                        }
                         info!(
                             target: INPUT,
                             device_w, device_h,
@@ -5976,7 +6035,7 @@ async fn run_attachment(
     let lane_grant = match arcen_transport::quic::grant_attachment(
         &lanes,
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::all(),
+        arcen_protocol::lanes::LaneRoleSet::BASE,
     )
     .map_err(|error| error.to_string())
     .and_then(|grant| serde_json::to_string(&grant).map_err(|error| error.to_string()))
@@ -6791,6 +6850,27 @@ async fn run_attachment(
         _ => None,
     };
     let deck_cursor_images = client_hello.cursor_image_v1;
+    // A headless Wayland session has no X display: the XFixes watcher would
+    // watch whatever X server the configuration names, not this session.
+    // Its cursor belongs to the capture provider: a desktop that records
+    // its cursor as metadata reports it through capenc to the desktop's
+    // cursor hub, which the input lane follows.
+    let wayland_session = session_lease.is_some_and(|lease| {
+        lease.metadata.wayland.is_some() || lease.metadata.session_type == "wayland"
+    });
+    // An Xorg desktop's own cursor images come from the XFixes watcher.
+    let x11_cursor_watcher = wayland_cursor_hub.is_none()
+        && media_plan.cursor_mode == CursorMode::Local
+        && !wayland_session
+        && cfg!(target_os = "linux");
+    // Where the pointer is, for a Deck that draws its cursor at
+    // host-reported positions (a USB-bridged tablet moves only the host
+    // pointer): an Xorg desktop's watcher reads it; a Wayland metadata
+    // stream carries it. A multi-output Wayland desktop's streams are not
+    // yet matched to their video monitors, so it does not report positions.
+    let deck_cursor_positions = client_hello.cursor_position_v1
+        && (x11_cursor_watcher
+            || (wayland_cursor_hub.is_some() && multi_monitor_committed.is_none()));
     let cursor_result = CursorModeResultMsg {
         requested: cursor_preference,
         active: media_plan.cursor_mode,
@@ -6800,7 +6880,8 @@ async fn run_attachment(
             media_plan.cursor_mode,
             wayland_stream_cursor.as_ref().map(|(mode, _)| *mode),
         ),
-        cursor_images: wayland_cursor_hub.is_some() && deck_cursor_images,
+        cursor_images: (wayland_cursor_hub.is_some() || x11_cursor_watcher) && deck_cursor_images,
+        cursor_positions: deck_cursor_positions,
         ..CursorModeResultMsg::default()
     };
     if let Some((mode, _)) = &wayland_stream_cursor {
@@ -6898,78 +6979,102 @@ async fn run_attachment(
                 TabletModeReason::try_from(denial.reason().to_owned()).unwrap_or_default();
         }
     }
-    // When the backend exists but the device itself was refused, say why
-    // rather than blaming a missing backend.
-    if let Err(refusal) = &usb_hard_authorization {
-        if client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
-            && !tablet_mode_result.accepted
-            && usb_hard_session.is_ok()
-            && client_hello.usb_hard_v1
-            && crate::usb_bridge::runtime_available()
-        {
-            tablet_mode_result.reason = TabletModeReason::try_from(format!(
-                "Native tablet (USB bridged) refused: {refusal}. Use Tablet support instead."
-            ))
-            .unwrap_or_default();
-        }
+    // A host that has not enabled Native tablet, or has no controller,
+    // says which, rather than the generic backend sentence.
+    if let Some(reason) = usb_hard_host_reason(
+        client_hello.tablet_mode_requested,
+        tablet_mode_result.accepted,
+        usb_hard_session.is_ok(),
+        crate::usb_bridge::runtime_unavailable_reason().as_deref(),
+    ) {
+        tablet_mode_result.reason = reason;
     }
-    #[cfg(feature = "usb-hard-lab")]
+    // When the backend exists but the device is absent or refused, say why
+    // rather than blaming a missing backend.
+    if let Some(reason) = usb_hard_device_reason(
+        &client_hello,
+        usb_hard_authorization.as_ref().err().map(String::as_str),
+        tablet_mode_result.accepted,
+        usb_hard_session.is_ok(),
+        crate::usb_bridge::runtime_available(),
+    ) {
+        tablet_mode_result.reason = reason;
+    }
+    // Lab (Hard USB). Every attachment gets its own bridge, which ends with
+    // the attachment. A native-seat Wayland desktop's bridge is on its own
+    // seat, and Mutter adds the tablet through logind. A dedicated Xorg
+    // desktop's bridge stays on seat0, tagged for that desktop's X server
+    // alone, which hot-adds it on this first connection; every other X
+    // server ignores it (ADR 0021). The device never reaches seat0's
+    // consoles either way.
+    // Lab (Hard USB, X11): yields once the bridged tablet's nodes are
+    // verified (`Ok`) or refused (`Err(reason)`, Native tablet then stops).
+    #[allow(unused_mut)]
+    let mut usb_verdict: Option<mpsc::Receiver<Result<(), String>>> = None;
+    // Where the desktop's pointer is, for a Deck that draws its cursor at
+    // host positions: a Wayland desktop's lives in its cursor hub; an Xorg
+    // desktop's is this attachment's, read by its cursor watcher. A bridged
+    // pen feeds the same pointer from its own evdev node (ADR 0023): its
+    // position the moment each report arrives, while it is in proximity
+    // and the desktop maps the whole tablet. The reader ends with the
+    // attachment.
+    let desktop_pointer: Option<std::sync::Arc<crate::media::desktop_pointer::DesktopPointer>> =
+        if !deck_cursor_positions {
+            None
+        } else if let Some(hub) = wayland_cursor_hub.as_ref() {
+            Some(hub.desktop_pointer())
+        } else {
+            x11_cursor_watcher.then(|| {
+                std::sync::Arc::new(crate::media::desktop_pointer::DesktopPointer::new(
+                    arcen_input::tablet_pointer::PenMapping::Unknown,
+                ))
+            })
+        };
+    #[cfg(feature = "native-tablet")]
+    let mut _usb_pen_position: Option<crate::usb_bridge::tablet_pointer::TabletPointerReader> =
+        None;
+    #[cfg(feature = "native-tablet")]
     let mut usb_bridge = if tablet_mode_result.accepted
         && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge
     {
-        match (
-            crate::current_pier_exe(),
-            crate::usb_bridge::fresh_attachment_generation(),
-        ) {
-            (Some(binary), Ok(generation)) => {
-                let tablet = usb_hard_authorization
-                    .as_ref()
-                    .expect("accepted Hard USB mode has an authorized tablet");
-                match crate::usb_bridge::BridgeProcess::spawn(
-                    &binary,
-                    generation,
-                    tablet.speed,
-                    tablet.guard(),
-                )
-                .await
-                {
-                    Ok(process) => Some(process),
-                    Err(error) => {
-                        warn!(target: NET, %error, "failed to start Hard USB helper");
-                        tablet_mode_result.accepted = false;
-                        tablet_mode_result.active = TabletModeMsg::DisabledMouseCompat;
-                        tablet_mode_result.reason = TabletModeReason::try_from(
-                            "Hard USB helper failed to start; mouse compatibility remains active"
-                                .to_owned(),
-                        )
-                        .unwrap_or_default();
-                        None
-                    }
+        let tablet = usb_hard_authorization
+            .as_ref()
+            .expect("accepted Hard USB mode has an authorized tablet");
+        let outcome = match (crate::current_pier_exe(), current_metadata.as_ref()) {
+            (Some(binary), Some(metadata)) if metadata.native_seat.is_some() => {
+                crate::usb_bridge::attach_native_seat(&binary, metadata, tablet)
+                    .await
+                    .map(|(attachment, port)| (attachment, None, port))
+            }
+            (Some(binary), Some(metadata)) => {
+                crate::usb_bridge::attach_x11_desktop(&binary, metadata, tablet)
+                    .await
+                    .map(|(attachment, verdict, port)| (attachment, Some(verdict), port))
+            }
+            (None, _) => Err("Hard USB helper binary is unavailable".to_owned()),
+            (_, None) => Err(arcen_usb_bridge::HardUsbSessionDenial::ConsoleSeatSession
+                .reason()
+                .to_owned()),
+        };
+        match outcome {
+            Ok((attachment, verdict, port)) => {
+                usb_verdict = verdict;
+                if let Some(pointer) = desktop_pointer.as_ref() {
+                    _usb_pen_position = port.report_pen_position(std::sync::Arc::clone(pointer));
                 }
+                Some(attachment)
             }
-            (None, _) => {
-                tablet_mode_result.accepted = false;
-                tablet_mode_result.active = TabletModeMsg::DisabledMouseCompat;
-                tablet_mode_result.reason =
-                    TabletModeReason::try_from("Hard USB helper binary is unavailable".to_owned())
-                        .unwrap_or_default();
-                None
-            }
-            (_, Err(error)) => {
-                warn!(target: NET, %error, "failed to create Hard USB attachment generation");
-                tablet_mode_result.accepted = false;
-                tablet_mode_result.active = TabletModeMsg::DisabledMouseCompat;
-                tablet_mode_result.reason =
-                    TabletModeReason::try_from("Hard USB generation is unavailable".to_owned())
-                        .unwrap_or_default();
+            Err(reason) => {
+                warn!(target: NET, %reason, "Hard USB refused for this attachment");
+                tablet_mode_result = usb_bridge_ended(&tablet_mode_result, &reason);
                 None
             }
         }
     } else {
         None
     };
-    #[cfg(not(feature = "usb-hard-lab"))]
-    let mut usb_bridge: Option<crate::usb_bridge::BridgeProcess> = None;
+    #[cfg(not(feature = "native-tablet"))]
+    let mut usb_bridge: Option<crate::usb_bridge::BridgeAttachment> = None;
     // Hard USB is now settled, including any downgrade the helper spawn above
     // forced. A Hard USB session must present exactly one tablet to the seat:
     // the operator's real device, arriving on the virtual USB controller with
@@ -6993,20 +7098,20 @@ async fn run_attachment(
             }
         }
     }
+    // What the Deck is told when its tablet is refused after it connected
+    // (its nodes did not verify, or no X11 driver can serve it): Native
+    // tablet stops, with the reason, and the session goes on.
+    let usb_refused_notice = usb_verdict.as_ref().map(|_| tablet_mode_result.clone());
     // What the Deck is told if Hard USB has to stop mid-session because the
     // bulk lane became unavailable (ADR 0014).
     let usb_stopped_notice = (tablet_mode_result.accepted
         && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge)
         .then(|| {
-            let mut stopped = tablet_mode_result.clone();
-            stopped.accepted = false;
-            stopped.active = TabletModeMsg::DisabledMouseCompat;
-            stopped.reason = TabletModeReason::try_from(
-                "Hard USB stopped: the bulk stream is unavailable; mouse compatibility remains active"
-                    .to_owned(),
-            )
-            .unwrap_or_default();
-            serde_json::to_string(&stopped).ok()
+            serde_json::to_string(&usb_bridge_ended(
+                &tablet_mode_result,
+                "Hard USB stopped: the bulk stream is unavailable; mouse compatibility remains active",
+            ))
+            .ok()
         })
         .flatten();
     info!(
@@ -7034,29 +7139,47 @@ async fn run_attachment(
         return AttachmentEnd::terminal(SessionEndReason::WriterEnded);
     }
 
-    // Cursor shape streaming: only active in Local cursor mode. The watcher
-    // runs in a dedicated OS thread and sends CursorShapeMsg JSON strings
-    // whenever the X11 cursor changes. Old clients that don't understand the
-    // message type ignore it.
-    //
-    // A headless Wayland session has no X display: the XFixes watcher would
-    // watch whatever X server the configuration names, not this session.
-    // Its cursor belongs to the capture provider: a desktop that records
-    // its cursor as metadata reports it through capenc to the desktop's
-    // cursor hub, which the input lane follows.
-    let wayland_session = session_lease.is_some_and(|lease| {
-        lease.metadata.wayland.is_some() || lease.metadata.session_type == "wayland"
-    });
+    // Cursor streaming: only active in Local cursor mode. An Xorg desktop's
+    // watcher runs in a dedicated OS thread and reports the X cursor's image
+    // and name whenever it changes; the input lane sends a Deck that
+    // declared `cursor_image_v1` the image, and any other Deck its named
+    // shape (`cursor_shape`), as before.
     let cursor_feed = if let Some(hub) = wayland_cursor_hub.as_ref() {
         Some(lane_workers::CursorFeed::Images {
             facts: hub.subscribe(),
             deck_draws_images: deck_cursor_images,
+            pointer: desktop_pointer
+                .as_ref()
+                .map(|pointer| lane_workers::PointerFeed {
+                    samples: pointer.subscribe(),
+                    outputs: None,
+                }),
         })
-    } else if media_plan.cursor_mode == CursorMode::Local && !wayland_session {
+    } else if x11_cursor_watcher {
         #[cfg(target_os = "linux")]
         {
-            crate::cursor_watcher::spawn(cfg.session_display.clone(), cfg.xauthority.clone())
-                .map(lane_workers::CursorFeed::Shapes)
+            let (display, xauthority) = x11_cursor_display(
+                session_lease.map(|lease| {
+                    (
+                        lease.metadata.display.as_str(),
+                        lease.execution.environment.get("XAUTHORITY"),
+                    )
+                }),
+                // Without a session this is the display being captured (`--display`)
+                // and its own authority file, the same pair capture and input use.
+                (cfg.display.as_str(), cfg.xauthority.as_deref()),
+            );
+            let samples = desktop_pointer.as_ref().map(|pointer| pointer.subscribe());
+            crate::cursor_watcher::spawn(display, xauthority, desktop_pointer.clone()).map(
+                |watcher| lane_workers::CursorFeed::Images {
+                    facts: watcher.facts,
+                    deck_draws_images: deck_cursor_images,
+                    pointer: samples.map(|samples| lane_workers::PointerFeed {
+                        samples,
+                        outputs: multi_monitor_committed.map(|(plan, _)| x11_pointer_layout(plan)),
+                    }),
+                },
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -7382,7 +7505,7 @@ async fn run_attachment(
     // One-time bounded network-path probe (sysfs/procfs; no packet capture,
     // no SSID/RSSI disclosure). Absent entirely when no usable interface is
     // found, rather than reporting fabricated facts. The result seeds the
-    // health tick's own off-hot-path re-probe below (f5) so a later
+    // health tick's own off-hot-path re-probe below so a later
     // change/loss/restoration is diffed against the path actually active at
     // session start, not a stale default.
     let initial_network = crate::netinfo::snapshot(remote_host, remote_scope_id);
@@ -7403,6 +7526,7 @@ async fn run_attachment(
 
     // 4. Backpressure queue + control channel (health_pong / Pong).
     let queue = Arc::new(FrameQueue::new(idr.clone()));
+    queue.apply_backlog_budget(media_plan.fps);
     // Every applied monitor's own `IdrRequester`: just the primary's for a
     // legacy single-monitor session (unchanged behavior), or primary +
     // every secondary's for a committed multi-monitor plan (populated
@@ -7499,6 +7623,7 @@ async fn run_attachment(
                 all_monitor_idrs.push(source.idr.clone());
                 all_monitor_bitrates.push(source.bitrate.clone());
                 let secondary_queue = Arc::new(FrameQueue::new(source.idr));
+                secondary_queue.apply_backlog_budget(source.plan.fps);
                 rate_queues.push(secondary_queue.clone());
                 mux_queues.push((source.session_monitor_id, secondary_queue.clone()));
                 pending_secondaries.push(PendingSecondaryPump {
@@ -7713,6 +7838,7 @@ async fn run_attachment(
     let disp_microphone_summary_reported = Arc::clone(&microphone_transport_summary_reported);
     let disp_microphone_telemetry = microphone_transport_telemetry.clone();
     let disp_usb_bridge = usb_bridge.take();
+    let disp_usb_verdict = usb_verdict.take();
     // SEC-raw-hid. Mutual, explicit negotiation for the quarantined
     // experimental raw-HID passthrough: this host must have its own runtime
     // opt-in AND the connecting client must have explicitly asserted the
@@ -7749,6 +7875,8 @@ async fn run_attachment(
                     )
                     .ok()
                 });
+            // One desktop copy can reach the Pier twice, from either bridge.
+            let mut host_copy_repeats = arcen_media::clipboard::RepeatedCopyFilter::new();
             let mut clipboard_expiry = tokio::time::interval(Duration::from_secs(1));
             let mut microphone_stats_tick = tokio::time::interval(MICROPHONE_STATS_INTERVAL);
             clipboard_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7769,6 +7897,7 @@ async fn run_attachment(
             let mut hid_admission =
                 arcen_usb_bridge::RawHidAdmission::new(MAX_EXPERIMENTAL_RAW_HID_DEVICES);
             let mut usb_bridge = disp_usb_bridge;
+            let mut usb_verdict = disp_usb_verdict;
             let mut bulk_unavailable_rx = bulk_unavailable_rx;
             let usb_out = usb_out_tx;
             let reason = loop {
@@ -7849,6 +7978,7 @@ async fn run_attachment(
                                     clipboard_negotiation,
                                     agent_reassembler.as_mut(),
                                     &disp_clipboard_queue,
+                                    &mut host_copy_repeats,
                                 );
                                 None
                             }
@@ -7915,6 +8045,39 @@ async fn run_attachment(
                             _ => {}
                         }
                     }
+                    Some(outcome) = async {
+                        match usb_verdict.as_mut() {
+                            Some(verdict) => verdict.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if usb_verdict.is_some() => {
+                        usb_verdict = None;
+                        match outcome {
+                            Ok(()) => info!(
+                                target: NET,
+                                "the bridged tablet is verified and belongs to this desktop alone"
+                            ),
+                            Err(reason) => {
+                                if let Some(bridge) = usb_bridge.take() {
+                                    warn!(
+                                        target: NET,
+                                        %reason,
+                                        "the bridged tablet was refused; Native tablet stops, the session goes on"
+                                    );
+                                    bridge.shutdown().await;
+                                    if let Some(accepted) = usb_refused_notice.as_ref() {
+                                        let notice = usb_bridge_ended(accepted, &reason);
+                                        if let Ok(notice) = serde_json::to_string(&notice) {
+                                            disp_ctrl.send_best_effort(
+                                                Message::Text(notice),
+                                                arcen_protocol::messages::TABLET_MODE_RESULT,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Some(()) = bulk_unavailable_rx.recv() => {
                         // Clipboard and Hard USB are off for the session; the
                         // session itself goes on.
@@ -7945,6 +8108,15 @@ async fn run_attachment(
                         });
                         match usb_frame {
                             Some(Ok(_)) => {}
+                            Some(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                                warn!(
+                                    target: NET,
+                                    event = "usb_hard_device_refused",
+                                    reason = %error,
+                                    "Hard USB device refused: a descriptor it served contradicts its authorization; detaching"
+                                );
+                                break SessionEndReason::ProtocolError;
+                            }
                             Some(Err(error)) => {
                                 let diagnostic = usb_bridge
                                     .as_mut()
@@ -8085,9 +8257,11 @@ async fn run_attachment(
                                 ) {
                                     // Handed to the bridge's own writer:
                                     // this loop never waits on the helper.
-                                    if let Some(agent) = clipboard_agent.as_ref() {
-                                        agent.offer(item);
-                                    }
+                                    crate::clipboard::offer_deck_item(
+                                        &mut host_copy_repeats,
+                                        clipboard_agent.as_ref(),
+                                        item,
+                                    );
                                 }
                             }
                             #[cfg(all(target_os = "linux", feature = "experimental-raw-hid"))]
@@ -8222,6 +8396,7 @@ async fn run_attachment(
     );
 
     let rate_control_enabled = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
+    let health_path_connection = path_signal_connection.clone();
     let mut rate_task = path_signal_connection.map(|connection| {
         let bitrate_senders = all_monitor_bitrates.clone();
         let rate_queues = rate_queues.clone();
@@ -8382,6 +8557,9 @@ async fn run_attachment(
     // 3d. Health beat: periodic health_pong (server_state), like health_loop.py.
     let health_ctrl = ctrl_tx.clone();
     let health_span = tracing::Span::current();
+    let content_stats = ContentStatsCell::default();
+    follow_content_stats(&content_stats, Some(&capenc));
+    let health_content_stats = Arc::clone(&content_stats);
     let health_queue = queue.clone();
     let health_input_stats = input_stats.clone();
     let health_session_health = Arc::clone(&session_health);
@@ -8409,7 +8587,7 @@ async fn run_attachment(
             let mut window_input_events: u64 = 0;
             let mut window_worst_overall: Option<arcen_telemetry::HealthState> = None;
             let mut window_ticks: u32 = 0;
-            // Off-hot-path network-path monitor (f5): re-probed only at the
+            // Off-hot-path network-path monitor: re-probed only at the
             // same bounded 10s cadence as the Level2 aggregation window
             // below, never per-tick/per-frame. Tracks the last known path so
             // a change/loss/restoration is only ever emitted on an actual
@@ -8417,6 +8595,7 @@ async fn run_attachment(
             // can report a real outage duration.
             let mut network_last = health_initial_network;
             let mut network_lost_at_ms: Option<u64> = None;
+            let mut path_quality = arcen_transport::PathQualityTracker::default();
             loop {
                 ticker.tick().await;
                 seq += 1;
@@ -8459,6 +8638,7 @@ async fn run_attachment(
                     // a documented scoped gap rather than a fabricated value.
                     last_input_sequence: 0,
                     last_input_type: "",
+                    content_fps: current_content_fps(&health_content_stats),
                 };
                 // SIGHUP may have replaced the validated thresholds since the
                 // last tick; apply the shared cell's current value before
@@ -8492,7 +8672,7 @@ async fn run_attachment(
                          not silently swallowed"
                     );
                 }
-                let stats = crate::observability::SessionHealth::health_stats(
+                let mut stats = crate::observability::SessionHealth::health_stats(
                     &observation,
                     counters,
                     health_media_plan.fps,
@@ -8500,6 +8680,27 @@ async fn run_attachment(
                     health_media_plan.chroma_token(),
                     format!("{}x{}", health_media_plan.width, health_media_plan.height),
                 );
+                stats.path = health_path_connection
+                    .as_ref()
+                    .map(|connection| path_quality.sample(health_started_at.elapsed(), connection));
+                if let Some(path) = &stats.path {
+                    debug!(
+                        target: HEALTH,
+                        sid = %health_session_log_id,
+                        congestion_control = %path.congestion_control,
+                        rtt_us = path.rtt_us,
+                        min_rtt_us = path.min_rtt_us,
+                        cwnd_bytes = path.cwnd_bytes,
+                        sent_packets = path.sent_packets,
+                        lost_packets = path.lost_packets,
+                        congestion_events = path.congestion_events,
+                        wire_bytes = path.wire_bytes,
+                        window_ms = path.window_ms,
+                        mtu_bytes = path.mtu_bytes,
+                        black_holes = path.black_holes,
+                        "quic path sample"
+                    );
+                }
                 if let Ok(j) = serde_json::to_string(&stats) {
                     health_ctrl.send_best_effort(Message::Text(j), "health_stats");
                 }
@@ -8604,7 +8805,7 @@ async fn run_attachment(
                     window_worst_overall = None;
                     window_ticks = 0;
 
-                    // Off-hot-path network-path re-probe (f5): bounded
+                    // Off-hot-path network-path re-probe: bounded
                     // sysfs/procfs read at the same 10s cadence as the
                     // summary above, diffed against the last known path.
                     let network_context = health_emitter.session_context(
@@ -8802,6 +9003,7 @@ async fn run_attachment(
                 };
                 pump = replacement_pump;
                 capenc = Some(CapencHandle::Single(session));
+                follow_content_stats(&content_stats, capenc.as_ref());
                 speed_guard = speed_guard_for(capenc.as_ref(), &epoch_config);
                 if let (Some(ready), Some(previous), Some(lease), Some(retarget)) = (
                     epoch_ready.as_ref(),
@@ -8908,6 +9110,7 @@ async fn run_attachment(
                     arcen_protocol::messages::ServedStreamPipeline::Auto
                 });
                 capenc = Some(CapencHandle::Single(session));
+                follow_content_stats(&content_stats, capenc.as_ref());
                 current_plan = plan;
                 active_capenc_config = epoch_config;
                 if !queue.activate_generation() {
@@ -8984,6 +9187,10 @@ async fn run_attachment(
                             resolution.height,
                             current_plan.backend == EncoderBackend::OpenH264,
                             wayland_resizable,
+                            wayland_now.is_none()
+                                && arcen_capenc::linux_capture_is_host_converted(
+                                    current_plan.video.bit_depth,
+                                ),
                         )
                     })
                     .and_then(|(width, height)| nvctrl::Resolution::new(width, height).ok())
@@ -8997,7 +9204,7 @@ async fn run_attachment(
                                 requested_h = request.height,
                                 served_w = resolution.width,
                                 served_h = resolution.height,
-                                "display_update fitted to the software encoder's limits"
+                                "display_update fitted to the encoder's and capture path's limits"
                             );
                         }
                         resolution
@@ -9234,6 +9441,7 @@ async fn run_attachment(
                         break SessionEndReason::MediaEnded;
                     }
                     capenc = Some(CapencHandle::Single(session));
+                    follow_content_stats(&content_stats, capenc.as_ref());
                     speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
                     if served_before != served_after {
                         // Speed at a size this host has no evidence for:
@@ -9474,6 +9682,7 @@ async fn run_attachment(
                     break SessionEndReason::MediaEnded;
                 }
                 capenc = Some(CapencHandle::Single(session));
+                follow_content_stats(&content_stats, capenc.as_ref());
                 speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
 
                 // Keep the replacement IDR paused until the accepted result is
@@ -9735,6 +9944,54 @@ fn authoritative_display_update_result_json(
     serde_json::to_string(&result).ok()
 }
 
+/// The host-side reason for a refused Native tablet request in an admitted
+/// session: the administrator has not enabled it (`usb.native_tablet`), or
+/// the virtual host controller is missing. `None` when the reason does not
+/// fit the wire bound: the generic one stays.
+fn usb_hard_host_reason(
+    requested: TabletModeMsg,
+    accepted: bool,
+    session_admitted: bool,
+    runtime_refusal: Option<&str>,
+) -> Option<TabletModeReason> {
+    let refusal = runtime_refusal?;
+    if requested != TabletModeMsg::UsbTabletBridge || accepted || !session_admitted {
+        return None;
+    }
+    TabletModeReason::try_from(format!(
+        "{}. Use Tablet support instead.",
+        refusal.trim_end_matches('.')
+    ))
+    .ok()
+}
+
+/// The specific reason for a refused Native tablet request on a host that has
+/// the USB backend and admits the session: the device is absent or refused.
+///
+/// A Deck that captured nothing advertises `usb_hard_v1: false`, so this does
+/// not depend on that flag; otherwise an absent tablet was reported as a
+/// missing host backend. `None` keeps the host reason
+/// ([`usb_hard_host_reason`]) or the generic one.
+fn usb_hard_device_reason(
+    client_hello: &ClientHelloMsg,
+    device_refusal: Option<&str>,
+    tablet_mode_accepted: bool,
+    session_admitted: bool,
+    runtime_available: bool,
+) -> Option<TabletModeReason> {
+    let refusal = device_refusal?;
+    (client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
+        && !tablet_mode_accepted
+        && session_admitted
+        && runtime_available)
+        .then(|| {
+            TabletModeReason::try_from(format!(
+                "Native tablet (USB bridged) refused: {refusal}. Use Tablet support instead."
+            ))
+            .unwrap_or_default()
+        })
+}
+
 fn resolve_linux_tablet_mode_result(
     requested: TabletModeMsg,
     client_capabilities: TabletModeCapabilitiesMsg,
@@ -9781,6 +10038,25 @@ fn resolve_linux_tablet_mode_result(
         reconnect_required: requested == TabletModeMsg::UsbTabletBridge && !negotiation.accepted,
         ..TabletModeResultMsg::default()
     }
+}
+
+/// The tablet-mode result telling the Deck that Native tablet (requested as
+/// the USB bridge) is not, or no longer, active: mouse compatibility with the
+/// reason, and `reconnect_required`, which the Deck's consistency check
+/// demands for every unaccepted bridge request.
+fn usb_bridge_ended(result: &TabletModeResultMsg, reason: &str) -> TabletModeResultMsg {
+    let mut ended = result.clone();
+    ended.accepted = false;
+    ended.active = TabletModeMsg::DisabledMouseCompat;
+    ended.reconnect_required = ended.requested == TabletModeMsg::UsbTabletBridge;
+    ended.reason = TabletModeReason::try_from(reason.to_owned())
+        .ok()
+        .filter(|reason| !reason.as_str().is_empty())
+        .unwrap_or_else(|| {
+            TabletModeReason::try_from("Native tablet stopped on the host".to_owned())
+                .unwrap_or_default()
+        });
+    ended
 }
 
 const fn tablet_mode_to_input(mode: TabletModeMsg) -> InputTabletMode {
@@ -9980,7 +10256,7 @@ fn spawn_frame_pump(
                 let frame = media::build_video_frame(
                     &plan,
                     &au,
-                    now_ms_u32(),
+                    wall_ms_u32_at(au.read_at),
                     monitor_id,
                     topology_generation,
                     stream_epoch,
@@ -10316,6 +10592,7 @@ fn handle_agent_clipboard_message(
     negotiation: Option<ClipboardNegotiation>,
     reassembler: Option<&mut arcen_protocol::clipboard::ClipboardReassembler>,
     outbound: &ClipboardWriterQueue,
+    repeats: &mut arcen_media::clipboard::RepeatedCopyFilter,
 ) {
     let (Some(negotiation), Some(reassembler)) = (negotiation, reassembler) else {
         return;
@@ -10370,7 +10647,8 @@ fn handle_agent_clipboard_message(
                     completed.take_bytes(),
                     completed.truncated,
                 ) {
-                    let _ = outbound.enqueue(item);
+                    let _ =
+                        crate::clipboard::send_host_copy(repeats, outbound, item, Instant::now());
                 }
             }
         }
@@ -10849,6 +11127,33 @@ fn handle_control_json(
 /// Region messages carry their topology generation, so the shared region
 /// state refuses a stale one whatever order the control and input lanes
 /// delivered in.
+/// Where a committed multi-head Xorg desktop's streamed monitors are, for
+/// host pointer positions. A rotated monitor's stream does not map by scale
+/// alone, so it is left out (a pointer there leaves the Deck its own).
+fn x11_pointer_layout(
+    plan: &crate::display::topology::LinuxTopologyPlan,
+) -> arcen_input::host_pointer::HostPointerLayout {
+    let generation = u32::try_from(plan.generation.get()).unwrap_or(u32::MAX);
+    arcen_input::host_pointer::HostPointerLayout::new(
+        plan.monitors
+            .iter()
+            .filter(|monitor| monitor.rotation == arcen_media::Rotation::Degrees0)
+            .map(|monitor| arcen_input::host_pointer::HostPointerOutput {
+                monitor_id: monitor.session_monitor_id.get(),
+                // One X screen: its cursor images are output 0 too.
+                output: 0,
+                generation,
+                desktop_x: monitor.x,
+                desktop_y: monitor.y,
+                desktop_width: monitor.width,
+                desktop_height: monitor.height,
+                stream_width: u16::try_from(monitor.width).unwrap_or(u16::MAX),
+                stream_height: u16::try_from(monitor.height).unwrap_or(u16::MAX),
+            })
+            .collect(),
+    )
+}
+
 fn handle_input_json(
     text: &str,
     input: Option<&mut PierInput>,
@@ -11288,8 +11593,26 @@ fn now_ms_u32() -> u32 {
     (now_ms_u64() & 0xFFFF_FFFF) as u32
 }
 
+/// The wall clock, in wire milliseconds, at the monotonic instant `at`.
+fn wall_ms_u32_at(at: std::time::Instant) -> u32 {
+    let age = u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    (now_ms_u64().saturating_sub(age) & 0xFFFF_FFFF) as u32
+}
+
 /// Why a Wayland attachment's cursor authority differs from the Deck's
 /// request: its desktop fixed how the cursor is reported when it opened.
+/// The X display and authority file the XFixes cursor watcher reads: the
+/// attachment's own desktop and its `XAUTHORITY` whenever the attachment has
+/// a session, so it can never read another display's cursor; the
+/// configured display only for an attachment without one (`--no-auth`).
+fn x11_cursor_display(
+    session: Option<(&str, Option<&str>)>,
+    configured: (&str, Option<&str>),
+) -> (String, Option<String>) {
+    let (display, xauthority) = session.unwrap_or(configured);
+    (display.to_owned(), xauthority.map(str::to_owned))
+}
+
 fn wayland_cursor_reason(
     requested: CursorMode,
     active: CursorMode,
@@ -11314,6 +11637,30 @@ fn wayland_cursor_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_x11_cursor_watcher_reads_the_attachments_own_display() {
+        assert_eq!(
+            x11_cursor_display(
+                Some((":62", Some("/run/arcen/sessions/7/Xauthority"))),
+                (":11", Some("/etc/arcen/Xauthority")),
+            ),
+            (
+                ":62".to_owned(),
+                Some("/run/arcen/sessions/7/Xauthority".to_owned())
+            )
+        );
+        // A session without its own authority never borrows the configured one.
+        assert_eq!(
+            x11_cursor_display(Some((":62", None)), (":11", Some("/etc/arcen/Xauthority"))),
+            (":62".to_owned(), None)
+        );
+        // Without a session: the captured display and its own authority file.
+        assert_eq!(
+            x11_cursor_display(None, (":0", Some("/etc/arcen/Xauthority"))),
+            (":0".to_owned(), Some("/etc/arcen/Xauthority".to_owned()))
+        );
+    }
 
     #[test]
     fn only_a_depth_downgrade_tells_the_deck_how_to_get_a_ten_bit_desktop() {
@@ -11538,6 +11885,134 @@ mod tests {
             reason.contains("Tablet support"),
             "a rejection must name the mode the operator should use instead: {reason}"
         );
+    }
+
+    #[test]
+    fn an_absent_tablet_is_named_when_the_backend_exists() {
+        // A Deck whose helper captured nothing sends no device and
+        // `usb_hard_v1: false`; the host has the backend.
+        let hello = ClientHelloMsg {
+            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
+            usb_hard_v1: false,
+            usb_hard_device: None,
+            ..ClientHelloMsg::default()
+        };
+        let absent = "the Deck did not capture a USB device";
+        #[cfg(feature = "native-tablet")]
+        assert_eq!(
+            crate::usb_bridge::authorize_device(hello.usb_hard_device.as_ref()).err(),
+            Some(absent.to_owned())
+        );
+        let reason = usb_hard_device_reason(&hello, Some(absent), false, true, true)
+            .expect("the device refusal is the reason");
+        assert!(
+            reason.as_str().contains("did not capture"),
+            "{}",
+            reason.as_str()
+        );
+        assert!(reason.as_str().ends_with("Use Tablet support instead."));
+        assert_reason_reaches_the_operator(reason.as_str());
+
+        // Without the backend (no Native tablet build, not enabled, no
+        // vhci-hcd), a
+        // seatless session, an accepted bridge or another request keep the
+        // generic reason.
+        assert!(usb_hard_device_reason(&hello, Some(absent), false, true, false).is_none());
+        assert!(usb_hard_device_reason(&hello, Some(absent), false, false, true).is_none());
+        assert!(usb_hard_device_reason(&hello, Some(absent), true, true, true).is_none());
+        assert!(usb_hard_device_reason(&hello, None, false, true, true).is_none());
+        let light = ClientHelloMsg {
+            tablet_mode_requested: TabletModeMsg::LocalTermination,
+            ..hello
+        };
+        assert!(usb_hard_device_reason(&light, Some(absent), false, true, true).is_none());
+    }
+
+    #[test]
+    fn a_host_without_native_tablet_enabled_tells_the_deck_how_to_enable_it() {
+        let not_enabled = arcen_session::pier_config::NativeTabletPolicy::resolve(None)
+            .disabled_reason()
+            .expect("off by default");
+        let reason = usb_hard_host_reason(
+            TabletModeMsg::UsbTabletBridge,
+            false,
+            true,
+            Some(not_enabled),
+        )
+        .expect("the administrator's switch is the reason");
+        assert!(
+            reason.as_str().contains("usb.native_tablet"),
+            "{}",
+            reason.as_str()
+        );
+        assert!(reason.as_str().ends_with("Use Tablet support instead."));
+        assert_reason_reaches_the_operator(reason.as_str());
+        // An accepted bridge, another request, a refused session or an
+        // available backend keep their own reasons.
+        assert!(usb_hard_host_reason(
+            TabletModeMsg::UsbTabletBridge,
+            true,
+            true,
+            Some(not_enabled)
+        )
+        .is_none());
+        assert!(usb_hard_host_reason(
+            TabletModeMsg::LocalTermination,
+            false,
+            true,
+            Some(not_enabled)
+        )
+        .is_none());
+        assert!(usb_hard_host_reason(
+            TabletModeMsg::UsbTabletBridge,
+            false,
+            false,
+            Some(not_enabled)
+        )
+        .is_none());
+        assert!(usb_hard_host_reason(TabletModeMsg::UsbTabletBridge, false, true, None).is_none());
+        // A reason past the wire bound leaves the generic sentence.
+        assert!(usb_hard_host_reason(
+            TabletModeMsg::UsbTabletBridge,
+            false,
+            true,
+            Some(&"x".repeat(300))
+        )
+        .is_none());
+    }
+
+    /// The Deck (`tablet_mode_result_is_consistent`) accepts an unaccepted
+    /// Native tablet request only as mouse compatibility with a reason and
+    /// `reconnect_required`; otherwise it shows "inconsistent tablet mode
+    /// result" and hides the reason. Every way Native tablet ends on the host
+    /// (refused at attach, refused after its nodes were checked, stopped with
+    /// the bulk lane) is built by `usb_bridge_ended`.
+    #[test]
+    fn every_ended_native_tablet_result_meets_the_decks_contract() {
+        let available = TabletModeCapabilitiesMsg {
+            local_termination: InputCapabilityAvailability::Available,
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
+            disabled_mouse_compat: InputCapabilityAvailability::Available,
+        };
+        let accepted =
+            resolve_linux_tablet_mode_result(TabletModeMsg::UsbTabletBridge, available, available);
+        assert!(accepted.accepted && !accepted.reconnect_required);
+        for reason in [
+            arcen_usb_bridge::HardUsbSessionDenial::X11IsolationNotInForce.reason(),
+            arcen_usb_bridge::HardUsbSessionDenial::X11DeviceNotVerified.reason(),
+            "Hard USB stopped: the bulk stream is unavailable; mouse compatibility remains active",
+            "",
+        ] {
+            let ended = usb_bridge_ended(&accepted, reason);
+            assert_eq!(ended.requested, TabletModeMsg::UsbTabletBridge);
+            assert_eq!(ended.active, TabletModeMsg::DisabledMouseCompat);
+            assert!(!ended.accepted);
+            assert!(ended.reconnect_required, "{reason}");
+            assert!(!ended.reason.as_str().is_empty());
+            if !reason.is_empty() {
+                assert_eq!(ended.reason.as_str(), reason);
+            }
+        }
     }
 
     #[test]
@@ -12461,6 +12936,19 @@ mod tests {
                 head(3, "third", 3840, false),
             ],
         }
+    }
+
+    #[test]
+    fn host_pointer_positions_land_on_the_heads_stream_and_skip_rotated_heads() {
+        let mut plan = three_head_topology_plan();
+        plan.monitors[2].rotation = arcen_media::Rotation::Degrees90;
+        let layout = x11_pointer_layout(&plan);
+        let second = layout.locate(1920 + 100, 200).expect("located");
+        assert!(second.on_stream);
+        assert_eq!((second.monitor_id, second.x, second.y), (2, 100, 200));
+        assert_eq!(second.generation, 1);
+        let rotated = layout.locate(3840 + 10, 10).expect("located");
+        assert!(!rotated.on_stream, "a rotated head leaves the Deck its own");
     }
 
     #[test]
@@ -15194,8 +15682,8 @@ mod tests {
             "arcen-deck-macos",
             "0.17.0",
             arcen_protocol::build_identity::BuildEnvironment {
-                build_id: Some("20261019T2200Z-0.17.0-ed28caf0"),
-                source_revision: Some("ed28caf0"),
+                build_id: Some("20261019T2200Z-0.17.0-0a1b2c3d"),
+                source_revision: Some("0a1b2c3d"),
                 feature_profile: Some("quic-default"),
                 signing_state: Some("developer-id"),
                 debug: false,
@@ -15205,7 +15693,7 @@ mod tests {
         let hello = ClientHelloMsg::default().with_build_identity(identity);
         assert_eq!(
             peer_deck_build(&hello),
-            "arcen-deck-macos 0.17.0 build 20261019T2200Z-0.17.0-ed28caf0 rev ed28caf0 (release, quic-default, developer-id)"
+            "arcen-deck-macos 0.17.0 build 20261019T2200Z-0.17.0-0a1b2c3d rev 0a1b2c3d (release, quic-default, developer-id)"
         );
     }
 
@@ -15820,20 +16308,49 @@ mod software_resize_tests {
     #[test]
     fn a_software_wayland_resize_is_fitted_and_xorg_keeps_its_ceiling() {
         // Hardware: served as asked.
-        assert_eq!(resize_target(2560, 1440, false, true), Some((2560, 1440)));
+        assert_eq!(
+            resize_target(2560, 1440, false, true, false),
+            Some((2560, 1440))
+        );
         // Software on Wayland: fitted to OpenH264, aspect kept, width % 4.
-        assert_eq!(resize_target(2560, 1440, true, true), Some((1920, 1080)));
+        assert_eq!(
+            resize_target(2560, 1440, true, true, false),
+            Some((1920, 1080))
+        );
         // The shared resolver keeps the aspect, so this one lands just under.
-        assert_eq!(resize_target(2880, 1800, true, true), Some((1916, 1198)));
-        assert_eq!(resize_target(1800, 1130, true, true), Some((1800, 1130)));
-        let (width, height) = resize_target(3024, 1890, true, true).unwrap();
+        assert_eq!(
+            resize_target(2880, 1800, true, true, false),
+            Some((1916, 1198))
+        );
+        assert_eq!(
+            resize_target(1800, 1130, true, true, false),
+            Some((1800, 1130))
+        );
+        let (width, height) = resize_target(3024, 1890, true, true, false).unwrap();
         assert!(width <= 1920 && height <= 1200 && width % 4 == 0 && height % 2 == 0);
         // Software on Xorg: the MetaMode ceiling, unchanged.
-        assert_eq!(resize_target(2560, 1440, true, false), None);
-        assert_eq!(resize_target(1920, 1080, true, false), Some((1920, 1080)));
+        assert_eq!(resize_target(2560, 1440, true, false, false), None);
+        assert_eq!(
+            resize_target(1920, 1080, true, false, false),
+            Some((1920, 1080))
+        );
         // Malformed geometry is refused either way.
-        assert_eq!(resize_target(1922, 1080, true, true), None);
-        assert_eq!(resize_target(1920, 1081, false, true), None);
+        assert_eq!(resize_target(1922, 1080, true, true, false), None);
+        // A ten-bit Xorg session: within the pixel budget unchanged, larger
+        // fitted with its aspect kept (the depth-30 XShm path).
+        assert_eq!(
+            resize_target(3600, 2262, false, false, true),
+            Some((3600, 2262))
+        );
+        assert_eq!(
+            resize_target(5120, 2880, false, false, true),
+            Some((3840, 2160))
+        );
+        assert_eq!(
+            resize_target(5120, 2880, false, false, false),
+            Some((5120, 2880))
+        );
+        assert_eq!(resize_target(1920, 1081, false, true, false), None);
     }
 
     #[test]

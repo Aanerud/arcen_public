@@ -16,16 +16,16 @@
     <key>CFBundleDisplayName</key>
     <string>Arcen Deck</string>
     <key>CFBundleVersion</key>
-    <string>0.17.0</string>
+    <string>0.19.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.17.0</string>
+    <string>0.19.0</string>
     <!-- Shown by the standard About panel. Arcen is remote-access software, so
          AGPL-3.0 section 13 matters: a user who only ever receives this built
          bundle must still be able to find the corresponding source. The About
          box and `--help` are where a person actually looks. Keep this in step
          with SOURCE_URL in clients/macos/src/lib.rs. -->
     <key>NSHumanReadableCopyright</key>
-    <string>Free software under the GNU AGPL-3.0. NO WARRANTY. Source: https://github.com/Aanerud/arcen_public</string>
+    <string>Copyright (C) 2026 TUTTIFRUTTI AS. Free software under the GNU AGPL-3.0. NO WARRANTY. Source: https://github.com/Aanerud/arcen_public</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

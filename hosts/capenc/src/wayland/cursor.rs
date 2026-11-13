@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Cursor metadata (`SPA_META_Cursor`) as plain data.
 //!
 //! Mutter (GNOME 40 and 49) writes one of four things into a buffer's

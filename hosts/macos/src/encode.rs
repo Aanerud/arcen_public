@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(unsafe_code)]
 
 //! `VideoToolbox` encoding for the macOS Pier.
@@ -171,7 +174,10 @@ impl EncodeColour {
 ///
 /// The capture fixes the colour space — `ScreenCaptureKit` is told which one
 /// to deliver — so the tags follow it rather than being chosen separately
-/// and drifting. The 8-bit fast path stays untagged, exactly as it was.
+/// and drifting. An SDR high-precision capture holds sRGB code values and
+/// states the plan's SDR transfer for them
+/// ([`crate::capture::CaptureConfig::sdr_transfer`]). The 8-bit fast path
+/// stays untagged, exactly as it was.
 #[must_use]
 pub const fn colour_for_capture(capture: &crate::capture::CaptureConfig) -> Option<EncodeColour> {
     use crate::capture::{CaptureDynamicRange, CapturePixelFormat};
@@ -182,7 +188,10 @@ pub const fn colour_for_capture(capture: &crate::capture::CaptureConfig) -> Opti
         ) => None,
         (_, CaptureDynamicRange::Sdr) => Some(EncodeColour {
             primaries: "ITU_R_709_2",
-            transfer: "ITU_R_709_2",
+            transfer: match capture.sdr_transfer {
+                arcen_media::TransferCharacteristics::Srgb => "IEC_sRGB",
+                _ => "ITU_R_709_2",
+            },
             matrix: "ITU_R_709_2",
         }),
         (_, CaptureDynamicRange::HdrLocalDisplay | CaptureDynamicRange::HdrCanonicalDisplay) => {
@@ -1767,11 +1776,22 @@ mod tests {
         }
     }
 
-    /// Encodes a Grading keyframe with the real `VideoToolbox`, decodes it
-    /// with the real decoder, and reads the pixels back: the proof that the
-    /// stream is ten bits and 4:4:4, not just labelled so.
-    #[test]
-    fn a_grading_round_trip_keeps_ten_bits_and_single_pixel_chroma() {
+    /// What one Grading keyframe looks like after the real `VideoToolbox`
+    /// encoder and decoder.
+    struct GradingRoundTrip {
+        /// Distinct luma codes along a 1024-code ramp.
+        levels: usize,
+        /// Largest luma error against the ramp, in ten-bit codes.
+        worst_luma: u16,
+        /// Largest single-pixel chroma error, in ten-bit codes.
+        worst_chroma: u16,
+        /// The stream's own SPS.
+        truth: arcen_media::hevc_sps::HevcStreamTruth,
+    }
+
+    /// Encodes a Grading keyframe tagged with the plan's `transfer` token,
+    /// decodes it with the real decoder, and reads the pixels back.
+    fn grading_round_trip(transfer: &str) -> GradingRoundTrip {
         const WIDTH: usize = 1024;
         const HEIGHT: usize = 64;
         let surface = ten_bit_probe_surface(WIDTH, HEIGHT, true).expect("surface");
@@ -1807,7 +1827,7 @@ mod tests {
             arcen_media::ChromaSubsampling::Yuv444,
             arcen_media::BitDepth::Ten,
         )
-        .with_colour(EncodeColour::from_plan_tokens("bt709", "bt709", "bt709"));
+        .with_colour(EncodeColour::from_plan_tokens("bt709", transfer, "bt709"));
         // Generous, so the one frame is not starved of bits.
         let config = EncoderConfig {
             bitrate_bps: 40_000_000,
@@ -1815,11 +1835,15 @@ mod tests {
             ..config
         };
         let mut encoder = Encoder::new(config).expect("Grading session");
+        let truth = encoder
+            .prove_with_surface(&surface)
+            .expect("encodes")
+            .expect("a keyframe with an SPS");
         let sample = encoder
             .encode_frame(
                 &surface,
                 None,
-                0,
+                1,
                 30,
                 Some(force_keyframe_options().expect("options")),
                 "test",
@@ -1885,22 +1909,69 @@ mod tests {
             worst_luma = worst_luma.max(luma_code.abs_diff(u16::try_from(x).expect("fits")));
             worst_chroma = worst_chroma.max(cb.abs_diff(chroma_code(x)));
         }
+        GradingRoundTrip {
+            levels: levels.len(),
+            worst_luma,
+            worst_chroma,
+            truth,
+        }
+    }
+
+    /// The proof that the stream is ten bits and 4:4:4, not just labelled so.
+    #[test]
+    fn a_grading_round_trip_keeps_ten_bits_and_single_pixel_chroma() {
+        let trip = grading_round_trip("bt709");
         eprintln!(
             "grading round trip: {} distinct luma levels of 1024, worst luma error \
-             {worst_luma}, worst single-pixel chroma error {worst_chroma}",
-            levels.len()
+             {}, worst single-pixel chroma error {}",
+            trip.levels, trip.worst_luma, trip.worst_chroma
         );
         // Eight bits cannot hold more than 256 levels.
         assert!(
-            levels.len() > 700,
+            trip.levels > 700,
             "only {} distinct luma levels survived",
-            levels.len()
+            trip.levels
         );
-        assert!(worst_luma <= 8, "luma drifted by {worst_luma} codes");
+        assert!(
+            trip.worst_luma <= 8,
+            "luma drifted by {} codes",
+            trip.worst_luma
+        );
         // 4:2:0 would average each pair to 512, an error of 192.
         assert!(
-            worst_chroma <= 32,
-            "single-pixel chroma drifted by {worst_chroma} codes"
+            trip.worst_chroma <= 32,
+            "single-pixel chroma drifted by {} codes",
+            trip.worst_chroma
+        );
+    }
+
+    /// `srgb` Grading is a tag, not a conversion: the SPS says H.273 13 and
+    /// the decoded codes are the source's, exactly as close as a `bt709`
+    /// stream's. A colour conversion between the two curves would move the
+    /// ramp by up to 64 ten-bit codes.
+    #[test]
+    fn srgb_grading_is_tagged_in_the_sps_and_keeps_the_codes() {
+        let srgb = grading_round_trip("srgb");
+        let colour = srgb.truth.colour.expect("tagged");
+        assert_eq!(
+            (colour.primaries, colour.transfer, colour.matrix),
+            (1, 13, 1),
+            "{}",
+            srgb.truth.summary()
+        );
+        assert!(colour.full_range);
+        assert!(srgb.levels > 700, "{} levels", srgb.levels);
+        assert!(srgb.worst_luma <= 8, "luma drifted by {}", srgb.worst_luma);
+        assert!(
+            srgb.worst_chroma <= 32,
+            "chroma drifted by {}",
+            srgb.worst_chroma
+        );
+        let bt709 = grading_round_trip("bt709");
+        assert_eq!(bt709.truth.colour.expect("tagged").transfer, 1);
+        eprintln!(
+            "srgb vs bt709 tag: worst luma {} vs {}, levels {} vs {}",
+            srgb.worst_luma, bt709.worst_luma, srgb.levels, bt709.levels
         );
     }
 

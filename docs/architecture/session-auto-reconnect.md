@@ -1,14 +1,13 @@
 # Direct-QUIC Session Auto-Reconnect
 
-**Status (2026-07-21):** implemented in the current draft branch for macOS Deck
-and the Windows and Linux Piers; pending Shared/Architecture,
-Release/Security, macOS Client, Windows Host, and Linux Host review, plus
-target-OS interruption/crash validation.
+**Status:** the Deck and the Linux and Windows Piers implement bounded
+automatic reconnection.
+Interruption and crash behaviour is validated per target OS.
 
 ## Scope
 
 This feature is only macOS Arcen Deck connecting directly to a Windows or Linux
-Arcen Pier over QUIC/TLS 1.3 on UDP 18444. It adds no Arcen Span/Gateway,
+Arcen Pier over QUIC/TLS 1.3 on UDP 18444. It adds no
 network fetch, persistence, cross-host state, OIDC, entitlement, licensing,
 mTLS, or 0-RTT behavior, and does not bump protocol version 3.
 
@@ -44,7 +43,8 @@ zone. A mutex-protected one-slot compare-and-rotate permits only the exact
 current generation+nonce; one concurrent attempt wins.
 
 Each claim lifetime is `2W`, where the configured post-loss window `W` defaults
-to 1200 seconds and must be in `0..=7200`; the maximum accepted claim lifetime
+to 180 seconds (`DEFAULT_RECONNECT_WINDOW_SECONDS`)
+and must be in `0..=7200`; the maximum accepted claim lifetime
 is therefore 14,400 seconds. An opted-in attached session rotates its one slot
 and sends a successor every `W/2`, using millisecond precision for odd and
 one-second windows. Deck stores the grant/window while connected but no

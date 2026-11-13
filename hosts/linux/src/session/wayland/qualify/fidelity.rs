@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Grading and HDR part of `arcen-pier wayland qualify`.
 //!
 //! Decides from the stack's facts whether a wide composition route exists

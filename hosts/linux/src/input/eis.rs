@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host-local libei/EIS provider seam and pure region mapping.
 //!
 //! The model mirrors the EIS region contract: unsigned desktop-wide logical

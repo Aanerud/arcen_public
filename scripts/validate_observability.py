@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Validate bounded canonical observability JSONL and synthetic lifecycles."""
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ MIN_FRAME_TOLERANCE = 5
 
 PROFILE_NAMES = {0: "critical", 1: "error", 2: "info", 3: "debug"}
 SEVERITIES = {"debug", "info", "warn", "error"}
-ROLES = {"host", "client", "gateway"}
+ROLES = {"host", "client"}
 PLATFORMS = {"linux", "macos", "windows"}
 HEALTH_STATES = {"ok", "degraded", "critical"}
 IDENTITY_KEYS = {"sid", "user", "host", "peer_addr"}

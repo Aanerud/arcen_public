@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Lab-only edit of mutter 49.4 src/backends/native/meta-seat-impl.c, after
 # GNOME/mutter!5224 ("seat/native: Enable libinput in headless"), plus an
 # explicit seat: only when ARCEN_LAB_HEADLESS_INPUT_SEAT is set does a headless

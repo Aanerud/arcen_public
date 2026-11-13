@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Whether this host can present an input device macOS did not get from
 //! hardware.
 //!
@@ -186,6 +188,328 @@ pub fn probe() -> VirtualHidSupport {
 #[must_use]
 pub fn probe() -> VirtualHidSupport {
     VirtualHidSupport::Refused
+}
+
+/// Product id, under the "no vendor" id the virtual keyboard and pointer use,
+/// for the probe's pen digitizer.
+const PEN_PRODUCT_ID: u32 = 0xA2C2;
+
+/// What macOS made of a virtual pen digitizer.
+///
+/// Gathered by [`probe_pen`] from the events the HID system produced, not
+/// from what was sent, because the question is what an application receives.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct PenHidEvidence {
+    /// Why nothing could be measured, when nothing could.
+    pub refusal: Option<String>,
+    /// Tablet proximity events seen while the probe pen was in range.
+    pub proximity_events: u32,
+    /// `-[NSEvent capabilityMask]` of the last proximity event: what macOS
+    /// claims the pen carries.
+    pub capability_mask: i64,
+    /// Pointer events with the tablet-point subtype: the events `AppKit`
+    /// hands an application, whose `tilt` and `rotation` it reads.
+    pub pointer_events: u32,
+    /// Largest |tilt|, normalized, carried by those pointer events.
+    pub pointer_max_tilt: f64,
+    /// Largest rotation, degrees, carried by those pointer events.
+    pub pointer_max_rotation: f64,
+    /// Standalone tablet-point events (`kCGEventTabletPointer`). The window
+    /// server posts these beside the pointer events; an `AppKit` window was
+    /// measured not to receive them.
+    pub tablet_point_events: u32,
+    /// Largest |tilt|, normalized, in the standalone events.
+    pub tablet_point_max_tilt: f64,
+    /// Largest rotation, degrees, in the standalone events.
+    pub tablet_point_max_rotation: f64,
+    /// The largest tilt the probe pen sent, normalized as `CoreGraphics`
+    /// defines it (1.0 is 90 degrees), to compare the two above against.
+    pub sent_max_tilt: f64,
+    /// The largest rotation the probe pen sent, degrees.
+    pub sent_max_rotation: f64,
+}
+
+impl PenHidEvidence {
+    /// Whether the measurement saw the device at all.
+    #[must_use]
+    pub const fn observed(&self) -> bool {
+        self.refusal.is_none() && self.proximity_events > 0 && self.pointer_events > 0
+    }
+
+    /// Whether the tablet surface reaches applications: the probe pen reported
+    /// tilt and rotation on every sample, so pointer events without them mean
+    /// the HID system dropped them on the way.
+    #[must_use]
+    pub fn carries_tablet_surface(&self) -> bool {
+        self.observed() && self.pointer_max_tilt > 0.0 && self.pointer_max_rotation > 0.0
+    }
+}
+
+/// Asks macOS what a generic HID pen digitizer delivers to applications.
+///
+/// Creates `arcen_input::hid_digitizer::PEN_DESCRIPTOR` as a virtual device,
+/// puts the pointer on the main display (macOS maps an absolute digitizer
+/// onto whichever display the pointer is on), hovers the pen there with tilt
+/// and rotation, and reads back what the HID system posted through a
+/// listen-only event tap. Then it takes the pen out of range and puts the
+/// pointer back.
+///
+/// It only ever hovers. A tip on the desktop is a click on whatever is under
+/// it, and hover is enough to see whether the surface survives: tilt and
+/// rotation are carried in range, touching or not.
+///
+/// Measured on macOS 26.7.2 with the entitlement: proximity arrives with a
+/// capability mask claiming pressure, tilt and rotation; the pointer events
+/// an application receives carry none of them; the window server's separate
+/// tablet-point events carry tilt and rotation mis-scaled (raw / 32767 and
+/// raw / 64) and never pressure, and an `AppKit` window did not receive them.
+/// That is why Basic Tablet stays on `CGEvent`. The probe exists so the
+/// answer can be re-asked of each macOS.
+///
+/// Needs what the injector needs — the entitlement in the signature and
+/// Accessibility for the app responsible for the process — plus permission
+/// to observe events. The device lives until the process exits.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn probe_pen() -> PenHidEvidence {
+    use arcen_input::hid_digitizer::{PenReport, PenSample};
+
+    let device = match crate::input::virtual_keyboard::native::VirtualDevice::new(
+        arcen_input::hid_digitizer::PEN_DESCRIPTOR,
+        PEN_PRODUCT_ID,
+        "Arcen Pen",
+    ) {
+        Ok(device) => device,
+        Err(reason) => {
+            return PenHidEvidence {
+                refusal: Some(reason),
+                ..PenHidEvidence::default()
+            };
+        }
+    };
+    // The HID system attaches a device asynchronously; a report sent at once
+    // is dropped, as it is for the keyboard.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let display = objc2_core_graphics::CGDisplayBounds(objc2_core_graphics::CGMainDisplayID());
+    let centre = (
+        display.origin.x + display.size.width / 2.0,
+        display.origin.y + display.size.height / 2.0,
+    );
+    let original = crate::input::current_pointer_position();
+
+    let observed = std::sync::Mutex::new(PenHidEvidence::default());
+    let (ready_sender, ready) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let observed = &observed;
+        scope.spawn(move || tap::observe(observed, &ready_sender));
+        if ready.recv().unwrap_or(false) {
+            crate::input::warp_pointer(centre);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut last = PenReport::default();
+            let (mut sent_tilt, mut sent_rotation) = (0.0_f32, 0.0_f32);
+            for step in 0..12_u8 {
+                let progress = f32::from(step) / 11.0;
+                let sample = PenSample {
+                    tool: arcen_input::PenTool::Tip,
+                    in_proximity: true,
+                    touching: false,
+                    buttons: 0,
+                    x: 0.5 + f64::from(progress) * 0.02,
+                    y: 0.5,
+                    pressure: 0.0,
+                    tilt_x_degrees: 10.0 + 40.0 * progress,
+                    tilt_y_degrees: -20.0,
+                    rotation_degrees: 30.0 + 200.0 * progress,
+                };
+                sent_tilt = sent_tilt.max(sample.tilt_x_degrees.abs());
+                sent_rotation = sent_rotation.max(sample.rotation_degrees);
+                let report = PenReport::from_sample(&sample);
+                if device.send(&report.bytes()).is_err() {
+                    break;
+                }
+                last = report;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Ok(mut evidence) = observed.lock() {
+                evidence.sent_max_tilt = arcen_input::pen_axes::tilt_degrees_to_unit(sent_tilt);
+                evidence.sent_max_rotation = f64::from(sent_rotation);
+            }
+            let _ = device.send(&last.released().bytes());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Some(position) = original {
+                crate::input::warp_pointer(position);
+            }
+        } else if let Ok(mut evidence) = observed.lock() {
+            evidence.refusal = Some(
+                "could not observe events: an event tap needs Input Monitoring \
+                 (or Accessibility) for the app that started this probe"
+                    .to_owned(),
+            );
+        }
+    });
+    observed.into_inner().unwrap_or_default()
+}
+
+/// Off macOS there is nothing to ask.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn probe_pen() -> PenHidEvidence {
+    PenHidEvidence {
+        refusal: Some("virtual HID is a macOS API".to_owned()),
+        ..PenHidEvidence::default()
+    }
+}
+
+/// A listen-only event tap that records tablet events into [`PenHidEvidence`].
+#[cfg(target_os = "macos")]
+mod tap {
+    #![allow(unsafe_code)]
+
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    use super::PenHidEvidence;
+
+    type CGEventRef = *mut c_void;
+    type CFMachPortRef = *mut c_void;
+    type CFRunLoopSourceRef = *mut c_void;
+    type CFRunLoopRef = *mut c_void;
+    type CFStringRef = *const c_void;
+    type TapCallback =
+        unsafe extern "C" fn(*mut c_void, u32, CGEventRef, *mut c_void) -> CGEventRef;
+
+    const SESSION_EVENT_TAP: u32 = 1;
+    const HEAD_INSERT: u32 = 0;
+    const LISTEN_ONLY: u32 = 1;
+    const MOUSE_MOVED: u32 = 5;
+    const LEFT_MOUSE_DRAGGED: u32 = 6;
+    const TABLET_POINTER: u32 = 23;
+    const TABLET_PROXIMITY: u32 = 24;
+    /// `kCGMouseEventSubtype`, and its tablet-point value.
+    const SUBTYPE_FIELD: u32 = 7;
+    const SUBTYPE_TABLET_POINT: i64 = 1;
+    const TILT_X: u32 = 20;
+    const TILT_Y: u32 = 21;
+    const ROTATION: u32 = 22;
+    const CAPABILITY_MASK: u32 = 36;
+    /// How long the tap listens: the probe's samples take about a third of it.
+    const LISTEN_SECONDS: f64 = 1.5;
+
+    // SAFETY: signatures match `CGEvent.h`, `CGEventTypes.h`, `CFMachPort.h`
+    // and `CFRunLoop.h`; every reference is an opaque pointer. None of these
+    // symbols is declared anywhere else in this crate.
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: TapCallback,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+        fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+        fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+        fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFRunLoopDefaultMode: CFStringRef;
+        fn CFMachPortCreateRunLoopSource(
+            allocator: *const c_void,
+            port: CFMachPortRef,
+            order: isize,
+        ) -> CFRunLoopSourceRef;
+        fn CFMachPortInvalidate(port: CFMachPortRef);
+        fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+        fn CFRunLoopAddSource(
+            run_loop: CFRunLoopRef,
+            source: CFRunLoopSourceRef,
+            mode: CFStringRef,
+        );
+        fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
+    }
+
+    unsafe extern "C" fn record(
+        _proxy: *mut c_void,
+        event_type: u32,
+        event: CGEventRef,
+        user_info: *mut c_void,
+    ) -> CGEventRef {
+        // SAFETY: `user_info` is the `Mutex` `observe` passed in, which
+        // outlives the run loop this callback runs on.
+        let observed = unsafe { &*user_info.cast::<Mutex<PenHidEvidence>>() };
+        let Ok(mut evidence) = observed.lock() else {
+            return event;
+        };
+        // SAFETY: `event` is live for the duration of the callback, and these
+        // only read its fields.
+        unsafe {
+            if event_type == TABLET_PROXIMITY {
+                evidence.proximity_events += 1;
+                evidence.capability_mask = CGEventGetIntegerValueField(event, CAPABILITY_MASK);
+                return event;
+            }
+            let tilt = CGEventGetDoubleValueField(event, TILT_X)
+                .abs()
+                .max(CGEventGetDoubleValueField(event, TILT_Y).abs());
+            let rotation = CGEventGetDoubleValueField(event, ROTATION);
+            if event_type == TABLET_POINTER {
+                evidence.tablet_point_events += 1;
+                evidence.tablet_point_max_tilt = evidence.tablet_point_max_tilt.max(tilt);
+                evidence.tablet_point_max_rotation =
+                    evidence.tablet_point_max_rotation.max(rotation);
+            } else if CGEventGetIntegerValueField(event, SUBTYPE_FIELD) == SUBTYPE_TABLET_POINT {
+                evidence.pointer_events += 1;
+                evidence.pointer_max_tilt = evidence.pointer_max_tilt.max(tilt);
+                evidence.pointer_max_rotation = evidence.pointer_max_rotation.max(rotation);
+            }
+        }
+        event
+    }
+
+    /// Listens for [`LISTEN_SECONDS`], telling `ready` whether it could.
+    pub(super) fn observe(observed: &Mutex<PenHidEvidence>, ready: &std::sync::mpsc::Sender<bool>) {
+        let mask = [
+            MOUSE_MOVED,
+            LEFT_MOUSE_DRAGGED,
+            TABLET_POINTER,
+            TABLET_PROXIMITY,
+        ]
+        .iter()
+        .fold(0_u64, |mask, kind| mask | 1 << kind);
+        // SAFETY: a listen-only tap with a callback that only reads; the
+        // user-info pointer is valid for as long as this function runs, which
+        // is as long as the run loop that calls back.
+        let port = unsafe {
+            CGEventTapCreate(
+                SESSION_EVENT_TAP,
+                HEAD_INSERT,
+                LISTEN_ONLY,
+                mask,
+                record,
+                std::ptr::from_ref(observed).cast_mut().cast(),
+            )
+        };
+        if port.is_null() {
+            let _ = ready.send(false);
+            return;
+        }
+        // SAFETY: `port` is a live tap; the source and the run loop are this
+        // thread's, and both references are released before returning.
+        unsafe {
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0);
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+            CGEventTapEnable(port, true);
+            let _ = ready.send(true);
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, LISTEN_SECONDS, 0);
+            CGEventTapEnable(port, false);
+            CFMachPortInvalidate(port);
+            crate::input::release_core_foundation(source.cast_const());
+            crate::input::release_core_foundation(port.cast_const());
+        }
+    }
 }
 
 #[cfg(test)]

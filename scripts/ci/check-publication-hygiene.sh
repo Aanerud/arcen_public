@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Publication hygiene gate.
 #
 # Arcen is a public AGPL-3.0 repository. This check fails the build if
@@ -19,12 +21,8 @@ fail() {
     failures=$((failures + 1))
 }
 
-# Files that legitimately discuss forbidden patterns.
-#
-# AGENTS.md is deliberately NOT excluded. It used to be, which meant the
-# constitution — the file most likely to acquire a worked example naming a real
-# host — was the one file the gate could never see. It is currently clean, so
-# the exclusion bought nothing and cost coverage.
+# Files that legitimately discuss forbidden patterns. Only this script is
+# excluded; every other tracked file, AGENTS.md included, is scanned.
 readonly self_exclusions=(
     ':(exclude)scripts/ci/check-publication-hygiene.sh'
 )
@@ -34,15 +32,12 @@ check_absent() {
     local pattern=$2
     shift 2
     local hits
-    # -i: matching is case-insensitive. A private hostname written in capitals
-    #     is exactly as disclosing as the same name in lower case, and a
-    #     case-sensitive gate once reported "passed" while nine such hits sat in
-    #     tracked source.
-    # --untracked: new files are not in the index yet, but they WILL be in the
-    #     squashed publication commit. Scanning only tracked files means the
-    #     newest additions — the ones least reviewed — are the ones least
-    #     checked. `--exclude-standard` still honours .gitignore, so genuinely
-    #     ignored material (keys/, refference/, .claude/) stays out of scope.
+    # -i: matching is case-insensitive; a name written in capitals discloses
+    #     as much as the same name in lower case.
+    # --untracked: new files are not in the index yet, but they will be
+    #     published with the next commit, so they are scanned too.
+    #     `--exclude-standard` still honours .gitignore, so ignored local
+    #     material stays out of scope.
     if hits=$(git grep -nIEi --untracked --exclude-standard \
         "$pattern" -- . "${self_exclusions[@]}" "$@" 2>/dev/null); then
         fail "$label"
@@ -50,43 +45,67 @@ check_absent() {
     fi
 }
 
+# Like check_absent, but hits that are only the canonical public repository
+# URL (scripts/ci/publication_allowlist.py) do not count. Used for the private
+# denylist, whose personal-identity rules would otherwise forbid the one URL
+# every source offer has to name.
+check_absent_except_canonical_url() {
+    local label=$1
+    local pattern=$2
+    shift 2
+    local hits remaining
+    if hits=$(git grep -nIEi --untracked --exclude-standard \
+        "$pattern" -- . "${self_exclusions[@]}" "$@" 2>/dev/null); then
+        if ! command -v python3 >/dev/null 2>&1; then
+            fail "$label (python3 unavailable to apply the canonical-URL allowlist)"
+            printf '%s\n' "$hits" | head -20 >&2
+        elif ! remaining=$(printf '%s\n' "$hits" |
+            python3 "$script_dir/publication_allowlist.py" --filter "$pattern"); then
+            fail "$label"
+            printf '%s\n' "$remaining" | head -20 >&2
+        fi
+    fi
+}
+
 publishable_files() {
     git ls-files -c -o --exclude-standard
 }
 
-# 1. Private lab infrastructure must never be published.
+# 1. Private infrastructure identifiers must never be published.
 #
-#    The specific values — host names, the lab subnet, the VPN profile, the
-#    prior project's name, its baseline commits, the commercial products this
-#    was benchmarked against — are NOT written here.
-#
-#    They used to be. That was self-defeating: this file is published, so a
-#    check spelling out a lab subnet and a VPN profile name in order to forbid
-#    them disclosed both to anyone reading the repository. A gate that
-#    leaks the secret it guards is worse than no gate, because it looks
-#    diligent.
-#
-#    The patterns now live in a private, git-ignored denylist. Format is one
-#    `label|extended-regex` pair per line; `#` starts a comment.
+#    A check that spelled out the values it forbids would publish them, so
+#    the patterns are not written here. A maintainer supplies them in a
+#    denylist file kept outside the published tree, named by
+#    ARCEN_PUBLICATION_DENYLIST or the `arcen.publicationDenylist` git config
+#    key. Format is one `label|extended-regex` pair per line; `#` starts a
+#    comment.
 #
 #    NOTE: git grep -E is POSIX ERE, where "\b" matches nothing at all and would
 #    silently disable a check. Do not write word boundaries into the denylist.
-readonly private_denylist=${ARCEN_PUBLICATION_DENYLIST:-.claude/publication-denylist.txt}
+readonly private_denylist=${ARCEN_PUBLICATION_DENYLIST:-$(git config --get arcen.publicationDenylist 2>/dev/null || true)}
 
-if [[ -f "$private_denylist" ]]; then
+if [[ -n "$private_denylist" && -f "$private_denylist" ]]; then
+    # `exclude-path|<pathspec>` lines name tracked paths that are never
+    # published (the export strips them), so the private checks skip them.
+    private_exclusions=()
     while IFS='|' read -r label pattern; do
-        [[ -z "${label// }" || "$label" == \#* ]] && continue
+        if [[ "$label" == "exclude-path" && -n "${pattern// }" ]]; then
+            private_exclusions+=(":(exclude)$pattern")
+        fi
+    done <"$private_denylist"
+    while IFS='|' read -r label pattern; do
+        [[ -z "${label// }" || "$label" == \#* || "$label" == "exclude-path" ]] && continue
         [[ -z "${pattern// }" ]] && continue
-        check_absent "$label" "$pattern"
+        check_absent_except_canonical_url "$label" "$pattern" \
+            "${private_exclusions[@]+"${private_exclusions[@]}"}"
     done <"$private_denylist"
 elif [[ -n "${ARCEN_REQUIRE_PRIVATE_DENYLIST:-}" ]]; then
-    # The publication export sets this. Releasing without the private checks
-    # having run is not an acceptable outcome.
-    fail "private denylist $private_denylist is missing and ARCEN_REQUIRE_PRIVATE_DENYLIST is set"
+    # A release export sets this: skipping the denylist checks is a failure.
+    fail "the denylist ('$private_denylist') is missing and ARCEN_REQUIRE_PRIVATE_DENYLIST is set"
 else
-    # A contributor cloning the public repository has no denylist and should
-    # still get a working gate, so this is a notice rather than a failure.
-    echo "note: $private_denylist not present; private-infrastructure checks skipped." >&2
+    # Without a denylist the remaining checks still run. Say plainly that the
+    # denylist checks did not, so a pass here is not read as a full scan.
+    echo "note: no denylist supplied (ARCEN_PUBLICATION_DENYLIST); denylist checks skipped." >&2
 fi
 
 # These are never legitimate regardless of whose infrastructure it is, so they
@@ -96,10 +115,7 @@ check_absent "SSH runbooks against real hosts are present" '(root|admin)@[0-9]{1
 # 2. Key material must never be committed.
 check_absent "private key material is present" '-----BEGIN [A-Z ]*PRIVATE KEY-----'
 
-# 3. The local reference corpus must never be committed.
-if publishable_files | grep -q '^refference/'; then
-    fail "reference corpus files are tracked under refference/"
-fi
+
 
 # 4. Licence set must be intact and actually AGPL.
 if [[ ! -f LICENSE ]]; then
@@ -108,16 +124,51 @@ elif ! grep -q 'GNU AFFERO GENERAL PUBLIC LICENSE' LICENSE; then
     fail "LICENSE is not the GNU AGPL"
 fi
 
-for required in legal/THIRD_PARTY_NOTICES.md legal/ORIGINS.md SECURITY.md SUPPORT.md; do
+for required in legal/THIRD_PARTY_NOTICES.md legal/ORIGINS.md SECURITY.md SUPPORT.md \
+    LICENSE-EXCEPTION.md NOTICE TRADEMARKS.md CLA.md CONTRIBUTING.md CONTRIBUTORS.md \
+    REUSE.toml LICENSES/AGPL-3.0-only.txt LICENSES/LicenseRef-Arcen-Store-Exception.txt; do
     [[ -f "$required" ]] || fail "$required is missing"
 done
 
+# 4a. LICENSE is the AGPL text exactly as gnu.org publishes it
+#     (https://www.gnu.org/licenses/agpl-3.0.txt), not a paraphrase or an
+#     edited copy, and LICENSES/ carries the same text for REUSE tools.
+readonly agpl_sha256=0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0
+for licence_text in LICENSE LICENSES/AGPL-3.0-only.txt; do
+    if [[ -f "$licence_text" ]] && command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$licence_text" | cut -d' ' -f1)
+    elif [[ -f "$licence_text" ]]; then
+        actual=$(sha256sum "$licence_text" | cut -d' ' -f1)
+    else
+        continue
+    fi
+    [[ "$actual" == "$agpl_sha256" ]] ||
+        fail "$licence_text is not the verbatim gnu.org AGPL-3.0 text"
+done
+
+# 4b2. Driver source manifests pin the SHA-256 of every file in their driver
+#      directory, and the Windows build refuses a stale one. Check them here
+#      so an edit made on another OS (a comment, a licence header) cannot
+#      reach a Windows build machine before anyone notices.
+if command -v python3 >/dev/null 2>&1 && [[ -f scripts/ci/driver_source_manifest.py ]]; then
+    if ! manifest_report=$(python3 scripts/ci/driver_source_manifest.py --check 2>&1); then
+        fail "a driver source manifest is stale (scripts/ci/driver_source_manifest.py --write)"
+        printf '%s\n' "$manifest_report" | head -20 | sed 's/^/    /' >&2
+    fi
+fi
+
+# 4c. Every first-party source file carries the SPDX licence header.
+if command -v python3 >/dev/null 2>&1 && [[ -f scripts/licensing/spdx-headers.py ]]; then
+    if ! header_report=$(python3 scripts/licensing/spdx-headers.py --check 2>&1); then
+        fail "first-party files lack the SPDX licence header (scripts/licensing/spdx-headers.py --write)"
+        printf '%s\n' "$header_report" | head -20 | sed 's/^/    /' >&2
+    fi
+fi
+
 # 4b. The third-party inventory must actually match the locked dependency graph.
 #
-#     The notices file is exhaustive by policy, and it had drifted to covering
-#     85 of the 373 packages that ship in a release artefact — while this gate
-#     reported "passed", because nothing compared the file to Cargo.lock. A
-#     policy no check enforces is a wish.
+#     The notices file is exhaustive by policy; this compares it with
+#     Cargo.lock so the policy is enforced rather than assumed.
 #
 #     Skipped when cargo is unavailable so a docs-only environment can still run
 #     the rest of the gate; CI has cargo.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Where SDR white sits inside a PQ stream, and how to move it.
 //!
 //! PQ is absolute: a code is a luminance in nits, not a fraction of the

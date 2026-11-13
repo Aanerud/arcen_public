@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 /target/
 # Scratch directories some crate tests create beside their manifest.
 /hosts/*/target/
@@ -9,10 +12,6 @@
 *.tmp
 __pycache__/
 *.py[cod]
-# Runtime log of the disk guardian (.claude/disk-guardian.sh)
-.disk-guardian.log
-# Local reference corpus is never source input and must never be committed.
-refference/
 # macOS bundles now build into dist/macos/; these cover older checkouts and
 # worktrees whose scripts still write them to the repository root.
 Arcen Deck.app/
@@ -33,28 +32,20 @@ Arcen Agent Helper.app/
 dist/*
 !dist/README.md
 
-# Retired lab installer output directory; installers now go to dist/<platform>/.
+# Retired installer output directory; installers now go to dist/<platform>/.
 /dist-installers/
 
 # ---------------------------------------------------------------------------
-# Private, never-published working material.
+# Local working material that is never committed.
 #
-# This repository is public. Anything that names real infrastructure, accounts
-# or credentials belongs in one of the paths below, NOT in tracked files:
-#   - test-host inventories and lab addresses
-#   - notary profile names, certificate common names, signing private keys
-#   - deployment runbooks against real machines
+# Anything that names real infrastructure, accounts or credentials belongs in
+# an ignored path, not in tracked files: test-host inventories, notary profile
+# names, certificate common names, signing private keys, deployment runbooks.
+# The signing procedure is documented in docs/operations/macos-signing.md;
+# only the values stay local. Ignored paths are not backed up by git.
 #
-# The signing/notarisation PROCEDURE is documented and tracked in
-# docs/operations/macos-signing.md; only the VALUES live here.
-#
-# Note: these paths are not backed up by git. Keep a second copy of anything
-# you cannot regenerate (certificates and private keys especially).
-#
-# .github/ is deliberately NOT ignored: CODEOWNERS, FUNDING.yml, release.yml and
-# workflows/ are functional configuration that GitHub reads from the repository,
-# so ignoring it would silently disable CI, review routing and the funding link.
+# .github/ is deliberately NOT ignored: release.yml and workflows/ are
+# functional configuration that GitHub reads from the repository.
 # ---------------------------------------------------------------------------
-.claude/
 .local/
 *.private.md

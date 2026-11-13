@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use crate::{BLOCK_SIZE, BlockGrid, DamageMap, DamageSummary, KeelError};
 
 const WORD_BITS: usize = u64::BITS as usize;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Carrying the clipboard between a client and this desktop.
 //!
 //! The pasteboard adapter and the shared policy already existed; this joins

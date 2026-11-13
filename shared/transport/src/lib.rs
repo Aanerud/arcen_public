@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Bounded, transport-neutral peer admission and envelope contracts.
 //!
 //! This crate defines a product-neutral transport contract (payload caps,
@@ -25,8 +27,13 @@ pub mod quic;
 pub mod tls;
 
 #[cfg(feature = "quic")]
+pub use path_signal::PathQualityTracker;
+#[cfg(feature = "quic")]
 pub use path_signal::observe_quinn_path_signal;
-pub use path_signal::{PathSignal, PathSignalCounters, PathSignalState};
+pub use path_signal::{
+    PathGrade, PathSignal, PathSignalCounters, PathSignalState, path_quality_message,
+    path_quality_summary,
+};
 
 use arcen_identity::{
     ActiveHostSessionId, ConsumedSessionGrant, HostIdentity, ValidatedDirectResumeGrant,
@@ -166,20 +173,27 @@ pub fn reliability_class_for_frame_byte(frame_type_byte: u8) -> ReliabilityClass
             | FrameType::RegionVideoH264
             | FrameType::RegionVideoH265
             | FrameType::RegionVideoAv1
+            | FrameType::RefineFence
+            | FrameType::RefineBarrier
             | FrameType::Audio
             | FrameType::AudioUpstream,
         ) => ReliabilityClass::MediaLowLatency,
         Ok(
             FrameType::Clipboard
+            | FrameType::RefineTiles
+            | FrameType::RefineDigest
             | FrameType::HidDeviceAdded
             | FrameType::HidDeviceRemoved
             | FrameType::UsbBridgeUrbSubmit
             | FrameType::UsbBridgeUrbCancel,
         )
         | Err(_) => ReliabilityClass::Control,
-        Ok(FrameType::HidReport | FrameType::UsbBridgeUrbComplete | FrameType::CursorUpdate) => {
-            ReliabilityClass::InputLowLatency
-        }
+        Ok(
+            FrameType::HidReport
+            | FrameType::UsbBridgeUrbComplete
+            | FrameType::CursorUpdate
+            | FrameType::CursorPosition,
+        ) => ReliabilityClass::InputLowLatency,
     }
 }
 
@@ -242,8 +256,6 @@ pub enum PeerRole {
     Client,
     /// Target Host.
     Host,
-    /// Gateway relay or service peer.
-    Gateway,
 }
 
 /// Explicit transport admission authorization state.
@@ -275,7 +287,7 @@ impl ConnectionId {
     }
 }
 
-/// Direct-session replacement-connection binding, distinct from Gateway admission.
+/// Direct-session replacement-connection binding, distinct from first admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectResumeTransportBinding {
     connection_id: ConnectionId,
@@ -741,7 +753,7 @@ pub(crate) fn validate_peer_grant_binding(
         PeerRole::Host if peer.identity != grant.host_identity().as_str() => {
             Err(TransportContractError::RoleIdentityMismatch)
         }
-        PeerRole::Client | PeerRole::Host | PeerRole::Gateway => Ok(()),
+        PeerRole::Client | PeerRole::Host => Ok(()),
     }
 }
 
@@ -756,7 +768,7 @@ fn validate_peer_grant_evidence(
         PeerRole::Host if peer.identity != grant.host_identity => {
             Err(TransportContractError::RoleIdentityMismatch)
         }
-        PeerRole::Client | PeerRole::Host | PeerRole::Gateway => Ok(()),
+        PeerRole::Client | PeerRole::Host => Ok(()),
     }
 }
 
@@ -1750,7 +1762,7 @@ mod tests {
             claims: SessionGrantClaims {
                 version: SESSION_GRANT_VERSION_V1,
                 issuer: "arcen".to_owned(),
-                audience: "gateway".to_owned(),
+                audience: "arcen-pier".to_owned(),
                 subject: "human-1".to_owned(),
                 tenant: Some("tenant-1".to_owned()),
                 client_identity: client.clone(),
@@ -1769,7 +1781,7 @@ mod tests {
             &grant,
             GrantValidationContext {
                 issuer: "arcen",
-                audience: "gateway",
+                audience: "arcen-pier",
                 expected_subject: "human-1",
                 expected_tenant: Some("tenant-1"),
                 expected_client_identity: &client,

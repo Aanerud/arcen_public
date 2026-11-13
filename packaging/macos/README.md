@@ -60,7 +60,7 @@ requested: it is an undocumented key, not a code-signing entitlement Apple
 publishes, and Input Monitoring is a TCC permission that default in-window
 AppKit tablet capture never needs — it is relevant only to the quarantined,
 non-default experimental raw-HID path. See
-`clients/macos/CERTIFICATES.md` and `clients/macos/APPLE_ENTITLEMENT_REQUESTS.md`
+`clients/macos/CERTIFICATES.md` and `clients/macos/ENTITLEMENTS.md`
 for the full rationale and the real provisioning profile's contents.
 
 On macOS the native tests always compile the verifier and distinguish malformed
@@ -72,7 +72,7 @@ certificates, or keys.
 
 The Deck is a decoder and does not enable OpenH264. Bundle checks reject dynamic
 or nested Opus/OpenH264 dylibs, frameworks, static archives, or import
-libraries. No codec payload may be added to preserve the PR #43/#44 packaging
+libraries. No codec payload may be added to preserve the packaging
 shape. `NSMicrophoneUsageDescription` and explicit runtime consent cover the
 default-off, explicitly negotiated microphone feature. Hosted CI can assemble
 and inspect the bundle but does not claim a
@@ -115,7 +115,7 @@ Developer ID provisioning profile carrying the Deck's entitlements (Hard USB
 and virtual HID included); the profile must list every certificate that signs
 with it. The consequence: macOS treats the two apps as one application. Install
 and run one of them per Mac. They share settings and saved connections
-(`~/Library/Application Support/Arcen`), keychain items, and privacy (TCC)
+(`~/Library/Application Support/Arcen`) and privacy (TCC)
 grants such as Microphone, and with both installed Launch Services may open
 either copy. An Intel Deck run under Rosetta on Apple
 silicon works but logs a warning to install `Arcen Deck` instead.
@@ -177,4 +177,4 @@ permission onboarding, and uninstall cleanup. Do not describe the Deck package
 as a Pier installer, and do not use this development package as evidence that
 pre-login operation is shipped. It must not run the network or media stack as
 root, and it must preserve the FileVault pre-boot boundary documented in
-`docs/todo/macos-pier.md`.
+the [README](../../docs/features.md#what-works-today).

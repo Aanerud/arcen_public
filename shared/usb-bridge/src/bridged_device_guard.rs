@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Runtime proof that a bridged device keeps telling the truth about itself.
 //!
 //! A Pier authorizes a Hard USB device from claims
@@ -209,16 +211,25 @@ pub fn validate_device_descriptor(
             return Err(DeviceDescriptorViolation::Class(class));
         }
     }
-    if payload.len() == DEVICE_DESCRIPTOR_LENGTH {
-        let field = |offset: usize| u16::from_le_bytes([payload[offset], payload[offset + 1]]);
-        if field(8) != identity.vendor_id
-            || field(10) != identity.product_id
-            || field(12) != identity.bcd_device
-        {
+    // Every identity field present in a prefix is checked, not only in a
+    // complete descriptor: a 14-17-byte answer carries the whole identity.
+    let field = |offset: usize| {
+        payload
+            .get(offset..offset + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    for (offset, authorized) in [
+        (8, identity.vendor_id),
+        (10, identity.product_id),
+        (12, identity.bcd_device),
+    ] {
+        if field(offset).is_some_and(|served| served != authorized) {
             return Err(DeviceDescriptorViolation::Identity);
         }
-        if payload[17] != 1 {
-            return Err(DeviceDescriptorViolation::ConfigurationCount(payload[17]));
+    }
+    if let Some(&count) = payload.get(17) {
+        if count != 1 {
+            return Err(DeviceDescriptorViolation::ConfigurationCount(count));
         }
     }
     Ok(())

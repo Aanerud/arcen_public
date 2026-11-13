@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // Linux host implementation: NvFBC Shared CUDA capture + NVENC CUDA encode.
 //
 // This mirrors win.rs' process contract: stdout is Annex-B H.264/HEVC,
@@ -1670,6 +1672,8 @@ unsafe fn run_wide_encode(
     mut encoder: crate::nvenc_cuda::Encoder,
     options: EncodeOptions<'_>,
     regions: crate::linux_policy::WideRegionOptions,
+    refine_args: Option<arcen_media::refine::CapencRefineArgs>,
+    framed_v2: bool,
 ) -> i32 {
     let EncodeOptions {
         codec,
@@ -1698,6 +1702,36 @@ unsafe fn run_wide_encode(
     ));
     let control = crate::spawn_control_thread("NVENC-XShm");
     let mut stdout = std::io::stdout();
+    // Lossless refinement (ADR 0016), only with `refine=on` and a build
+    // with `lossless-refine`. Access units then travel as framed-v2 records.
+    let mut refine = match refine_args {
+        None => None,
+        Some(args) => match arcen_media::refine::runtime::RefineRuntime::start(
+            &args,
+            arcen_media::refine::runtime::RefineStream {
+                depth: color.bit_depth,
+                chroma: color.chroma,
+                transfer: color.transfer,
+                primaries: color.primaries,
+            },
+            width,
+            height,
+            capture.wide_layout(),
+            encoder.wide_signal(),
+        ) {
+            Ok(runtime) => {
+                log(&format!(
+                    "lossless refinement on: scope={:?} still_ms={} max_mbps={}",
+                    args.scope, args.still_ms, args.max_mbps
+                ));
+                Some(runtime)
+            }
+            Err(error) => {
+                log(&format!("lossless refinement off: {error}"));
+                None
+            }
+        },
+    };
     let mut target_dt = crate::frame_interval_from_fps(fps);
     let mut next = Instant::now();
     let mut submission_gate = SubmissionGate::new(IDLE_KEEPALIVE);
@@ -1818,6 +1852,16 @@ unsafe fn run_wide_encode(
                     };
                     stats.record_capture(capture_started.elapsed().as_secs_f64() * 1000.0);
                     capture_counts.0 = capture_counts.0.saturating_add(1);
+                    if let Some(refine) = refine.as_mut() {
+                        refine.observe_rect(
+                            frame.bytes,
+                            frame.stride,
+                            region.x,
+                            region.y,
+                            region.width,
+                            region.height,
+                        );
+                    }
                     let stage_started = Instant::now();
                     if let Err(error) = encoder.stage_wide_host_region(
                         frame.bytes,
@@ -1895,6 +1939,23 @@ unsafe fn run_wide_encode(
                         precision_attempts = precision_attempts.saturating_add(1);
                     }
 
+                    if let Some(refine) = refine.as_mut() {
+                        match bound {
+                            Some(None) => {}
+                            Some(Some(changed)) => {
+                                let start = changed.y * frame.stride + changed.x * 4;
+                                refine.observe_rect(
+                                    &frame.bytes[start..],
+                                    frame.stride,
+                                    changed.x,
+                                    changed.y,
+                                    changed.width,
+                                    changed.height,
+                                );
+                            }
+                            None => refine.observe_whole(frame.bytes, frame.stride),
+                        }
+                    }
                     let stage_started = Instant::now();
                     let staged = match bound {
                         Some(None) => {
@@ -1987,6 +2048,11 @@ unsafe fn run_wide_encode(
                 let force = mode == SubmissionMode::FirstFrame || requested_idr;
                 if requested_idr && mode != SubmissionMode::FirstFrame {
                     log("consuming IDR request");
+                    // A requested keyframe is a recovery: refinement starts
+                    // a new generation behind its barrier (ADR 0016 R3).
+                    if let Some(refine) = refine.as_mut() {
+                        refine.recovery();
+                    }
                 }
                 if let Some(fps) = control.take_framerate_fps() {
                     target_dt = crate::frame_interval_from_fps(fps);
@@ -2050,8 +2116,26 @@ unsafe fn run_wide_encode(
                                 ready_announced = true;
                             }
                             stream_truth.observe(&access_unit);
-                            if crate::write_access_unit(&mut stdout, &access_unit, framed).is_err()
-                            {
+                            let written = match refine.as_mut() {
+                                Some(refine) => {
+                                    refine.before_access_unit(&mut stdout).and_then(|()| {
+                                        arcen_media::capenc_stream::write_record(
+                                            &mut stdout,
+                                            arcen_media::capenc_stream::CapencRecordKind::AccessUnit,
+                                            &access_unit,
+                                        )
+                                    })
+                                }
+                                // framed-v2 was asked for: every access unit
+                                // is a tagged record, refined or not.
+                                None => crate::write_access_unit_as_requested(
+                                    &mut stdout,
+                                    &access_unit,
+                                    framed,
+                                    framed_v2,
+                                ),
+                            };
+                            if written.is_err() {
                                 return 0;
                             }
                             stats.record_emitted(access_unit.len());
@@ -2066,6 +2150,11 @@ unsafe fn run_wide_encode(
             next += target_dt;
             if next < now {
                 next = now + target_dt;
+            }
+        }
+        if let Some(runtime) = refine.as_mut() {
+            if runtime.pump(&mut stdout).is_err() {
+                return 0;
             }
         }
 
@@ -2085,10 +2174,14 @@ unsafe fn run_wide_encode(
                 Some(encoder.take_qp_map_stats()),
             );
             log(&format!(
-                "{summary}{}{}{}",
+                "{summary}{}{}{}{}",
                 encoder.take_wide_stage_stats().fields(),
                 region_window.fields(),
                 pacing.verdict_fields(fps, target_fps, busy, elapsed),
+                refine.as_ref().map_or_else(
+                    String::new,
+                    arcen_media::refine::runtime::RefineRuntime::log_fields
+                ),
             ));
             pacing = crate::linux_policy::PacingWindow::default();
             region_window = crate::linux_policy::RegionWindow::default();
@@ -2840,6 +2933,13 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
             std::process::exit(2);
         }
     };
+    let refine_args = match arcen_media::refine::capenc_refine_args(&args) {
+        Ok(refine) => refine,
+        Err(error) => {
+            log_error(&error);
+            std::process::exit(2);
+        }
+    };
     let admission_probe = match crate::admission_probe::options_from_args(&args) {
         Ok(options) => options,
         Err(error) => {
@@ -2849,6 +2949,23 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
     };
     let selftest_index = args.iter().position(|value| value == "selftest");
     let selftest = selftest_index.is_some();
+    // framed-v2 and lossless refinement are written only by the depth-30
+    // XShm streaming loop; every other route here refuses them up front.
+    let wide_streaming = capture_backend == LinuxCaptureBackend::XShm
+        && admission_probe.is_none()
+        && !selftest
+        && !args.iter().any(|arg| arg.starts_with("rgb10-pipe="));
+    crate::refuse_unsupported_output(
+        &args,
+        if wide_streaming {
+            arcen_media::capenc_stream::CapencRoute::XorgWide
+        } else {
+            arcen_media::capenc_stream::CapencRoute::XorgOther
+        },
+    );
+    let framed_v2 = args
+        .iter()
+        .any(|arg| arg == arcen_media::capenc_stream::FRAMED_OUTPUT_V2);
     let (st_w, st_h) = selftest_index
         .and_then(|index| args.get(index + 1))
         .and_then(|s| {
@@ -3054,7 +3171,15 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
                         }
                     }
                 };
-                run_wide_encode(cuda_ctx, capture, encoder, options, wide_regions)
+                run_wide_encode(
+                    cuda_ctx,
+                    capture,
+                    encoder,
+                    options,
+                    wide_regions,
+                    refine_args,
+                    framed_v2,
+                )
             }
         };
         std::process::exit(code);
@@ -3187,14 +3312,15 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
                 drop(capture);
             }
             LinuxCaptureBackend::XShm => {
-                let mut capture = match crate::linux_x11::X11Capture::connect_wide(output_index) {
-                    Ok(capture) => capture,
-                    Err(error) => {
-                        drop(cuda_context);
-                        log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
-                        std::process::exit(2);
-                    }
-                };
+                let mut capture =
+                    match crate::linux_x11::X11Capture::connect_wide_probe(output_index) {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            drop(cuda_context);
+                            log_unavailable(BackendUnavailableReason::UnsupportedDisplay, &error);
+                            std::process::exit(2);
+                        }
+                    };
                 // A colour-managed pipe source is probed as what the live
                 // session will encode, not as the Xorg framebuffer it bypasses.
                 let pipe_source = args.iter().any(|arg| arg.starts_with("rgb10-pipe="));

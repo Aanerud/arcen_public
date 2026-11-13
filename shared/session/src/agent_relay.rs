@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The contract between a Pier's network service and its desktop agents.
 //!
 //! A Pier that has to survive logout, user switching and a reboot with nobody
@@ -116,6 +118,23 @@ pub enum ServiceMessage {
         /// Latest transport sample.
         signal: PathSignal,
     },
+    /// The service's lane relay has released `released` video frames of this
+    /// attachment in total, into the video lane or dropped under its own
+    /// policy. A running count, never a delta, so the agent's
+    /// `sent - released` stays exact whatever the reports' timing. The agent
+    /// keeps at most
+    /// `arcen_media::video::RELAYED_VIDEO_FRAMES_IN_FLIGHT` frames
+    /// unreleased, so a slow network holds frames in the agent's budgeted
+    /// queue instead of the relay's. Old agents ignore it; an agent that
+    /// never receives one never limits its frames in flight. Sent only once
+    /// the agent is streaming; a handshake passes over a late one.
+    VideoReleased {
+        /// This session's id.
+        #[serde(default)]
+        session: u64,
+        /// Frames this attachment's relay has released so far.
+        released: u64,
+    },
     /// The registration was refused; the service closes the connection.
     Refused {
         /// Why, in words an operator can act on.
@@ -125,7 +144,13 @@ pub enum ServiceMessage {
 
 impl ServiceMessage {
     /// Every `type` this enum is tagged with.
-    pub const TYPES: [&'static str; 4] = ["registered", "attach", "path_signal", "refused"];
+    pub const TYPES: [&'static str; 5] = [
+        "registered",
+        "attach",
+        "path_signal",
+        "video_released",
+        "refused",
+    ];
 
     /// Whether a message `type` belongs to the service's own vocabulary to its
     /// agent. Only the service speaks it: a relay must never forward such a
@@ -324,6 +349,10 @@ mod tests {
                     lost_bytes_delta: 0,
                     sent_packets_delta: 10,
                 },
+            },
+            ServiceMessage::VideoReleased {
+                session: 7,
+                released: 2,
             },
             ServiceMessage::Refused {
                 reason: "no".to_string(),

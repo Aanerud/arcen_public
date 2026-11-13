@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """macOS packages and zips ship without AppleDouble ("._") entries.
 
 On macOS 26 every file a build writes carries `com.apple.provenance`, which

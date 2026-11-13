@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Redaction-safe structured telemetry contracts.
 
 #![forbid(unsafe_code)]
@@ -21,8 +23,10 @@ mod stream_stats;
 mod support_bundle;
 
 pub use health::{
-    HealthAssessment, HealthCause, HealthSide, HealthState, HealthTracker, HealthTrackerError,
-    HealthTransition, QosSample, QosTargetError, QosTargets, assess_health,
+    ContentWindow, HOST_FPS_WARMUP_MS, HealthAssessment, HealthCause, HealthSide, HealthState,
+    HealthTracker, HealthTrackerError, HealthTransition, HostCounterTotals, HostWindow,
+    HostWindowTracker, QosSample, QosTargetError, QosTargets, assess_health, fps_expected,
+    fps_threshold, unpresented_basis_points,
 };
 pub use lifecycle::{
     LIFECYCLE_EVENT_DEFINITIONS, LifecycleEventDefinition, LifecycleEventKind,
@@ -46,8 +50,9 @@ pub use schema::{
     TelemetryTarget,
 };
 pub use stream_stats::{
-    DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SnapshotCadence, StageAverages,
-    StageTotals, WireDelayEstimator, rate_per_second, rounded_percentiles_ms, stage_averages,
+    DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SnapshotCadence, SnapshotRates,
+    StageAverages, StageTotals, WireDelayEstimator, rate_per_second, rounded_percentiles_ms,
+    stage_averages,
 };
 pub use support_bundle::{
     BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey,

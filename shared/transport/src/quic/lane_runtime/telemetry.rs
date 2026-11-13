@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Lane lifecycle events (`LANE_REFUSED`, `LANE_FAILED`, `LANE_STARVED`)
 //! and the bounded, non-blocking path that delivers them.
 

@@ -1,14 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Committed text into a headless Wayland session.
 //!
-//! The session types a commit by keysym through Mutter `RemoteDesktop`,
-//! which types only keysyms its active layout group holds (at levels 0–2) and
-//! drops any other silently. So the session first reads the compositor's
-//! keymap (as a Wayland client, [`super::wl_keymap`]) and indexes it
-//! ([`super::xkb`]), works out which group is active, and types only what
-//! the index proves typeable; the rest is committed through the
-//! compositor's input method when it offers one (`ei_text`), or refused and
-//! reported. The planning is the shared [`arcen_input::text`] code; this
-//! module holds the session's live state.
+//! The session reads the compositor's keymap (as a Wayland client,
+//! [`super::wl_keymap`]), indexes it and proves which key strokes type which
+//! characters ([`super::xkb`]), works out which group is active, and types
+//! a commit by keycode through Mutter `RemoteDesktop` — Shift, `AltGr` or
+//! both held by their own keys — only where the keymap proves the
+//! character. It no longer types by keysym: Mutter's keysym lookup takes the
+//! first key listing the keysym at any level but presses only levels 0–2,
+//! so on `gb`/`us` a keysym `<` (listed first on `<AB01>` level 3) typed
+//! `z`. The rest is committed through the compositor's input method when it
+//! offers one (`ei_text`), or refused and reported; a session whose keymap
+//! is unknown types nothing it cannot prove. The planning is the shared
+//! [`arcen_input::text`] code; this module holds the session's live state.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -352,6 +357,9 @@ impl SessionText {
         if keymap.index.group_count() <= 1 {
             return GroupResolution::Single;
         }
+        if keymap.index.groups_alike() {
+            return GroupResolution::GroupsAlike;
+        }
         let Some((sources, mru)) = self.input_sources() else {
             return GroupResolution::Unknown;
         };
@@ -401,9 +409,10 @@ impl SessionText {
         }
     }
 
-    /// Plans `text` over what the session knows now. Without a keymap the
-    /// session cannot prove anything: it types by keysym unverified (as a
-    /// compositor without a readable keymap leaves no better choice).
+    /// Plans `text` over what the session knows now. Only what the keymap
+    /// proves is typed by key; with the active group unknown or only
+    /// inferred from the input-source settings, only strokes that type the
+    /// same character in every group; without a keymap, nothing by key.
     #[must_use]
     pub fn plan(&self, text: &str) -> (TextPlan, TextOutcome) {
         let keymap = self.keymap();
@@ -412,21 +421,21 @@ impl SessionText {
             .map_or(GroupResolution::Unknown, |keymap| self.active_group(keymap));
         let utf8 = self.utf8_route() == Utf8Route::Offered && self.utf8_committer().is_some();
         let routes = TextRoutes {
+            // Group-specific strokes only on a live group; a group inferred
+            // from the input-source settings types only what every group
+            // agrees on.
             keymap: keymap
                 .as_deref()
-                .zip(resolution.group())
+                .zip(resolution.group().filter(|_| resolution.is_live()))
                 .map(|(keymap, group)| (&keymap.index, group)),
-            unverified_keysyms: true,
+            unresolved_keymap: keymap
+                .as_deref()
+                .filter(|_| !resolution.is_live())
+                .map(|keymap| &keymap.index),
+            unverified_keysyms: false,
             utf8,
         };
-        let mut plan = plan_text(text, &routes, fallback_keysym);
-        // A known keymap whose active group is not: characters typed through
-        // it are not proven.
-        if keymap.is_some() && resolution.group().is_none() {
-            plan.report.reason = plan.report.reason.or_else(|| {
-                (plan.report.unverified_chars > 0).then_some(TextRefusalReason::KeymapUnknown)
-            });
-        }
+        let plan = plan_text(text, &routes, fallback_keysym);
         let report = &plan.report;
         let outcome = TextOutcome {
             keymap_chars: report.keymap_chars,
@@ -544,7 +553,7 @@ impl InputSourceReader for GsettingsInputSources {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arcen_input::text::KeymapEntry;
+    use arcen_input::text::{KeymapEntry, TextRun};
 
     #[test]
     fn the_parts_of_one_commit_add_up_to_one_outcome() {
@@ -630,32 +639,60 @@ mod tests {
     }
 
     #[test]
-    fn without_a_keymap_text_goes_unverified() {
+    fn without_a_keymap_nothing_is_typed_by_key() {
         let text = SessionText::default();
         assert!(!text.facts().keymap_known);
-        let (plan, outcome) = text.plan("æ");
-        assert!(plan.types_keysyms());
-        assert_eq!(outcome.unverified_chars, 1);
+        let (plan, outcome) = text.plan("æ<");
+        assert!(plan.runs.is_empty());
+        assert_eq!(outcome.unverified_chars, 0);
+        assert_eq!(outcome.refused_text, "æ<");
+        assert_eq!(outcome.reason, Some(TextRefusalReason::KeymapUnknown));
         assert_eq!(outcome.group, "unknown");
         assert!(text.session_keymap().is_none());
     }
 
+    /// `two_groups` with its strokes: group 0 Norwegian-shaped (<AC11> æ
+    /// Æ), group 1 US-shaped (<AC11> ' "), <AC01> a in both.
+    fn two_groups_with_strokes() -> KeymapIndex {
+        let proven =
+            |group, keycode, shift: bool, character: char| arcen_input::text::StrokeEntry {
+                group,
+                stroke: stroke(keycode, shift),
+                keysym: u32::from(character),
+                character,
+            };
+        two_groups().with_strokes([
+            proven(0, 38, false, 'a'),
+            proven(0, 48, false, 'æ'),
+            proven(0, 48, true, 'Æ'),
+            proven(1, 38, false, 'a'),
+            proven(1, 48, false, '\''),
+            proven(1, 48, true, '"'),
+        ])
+    }
+
     #[test]
-    fn the_active_group_decides_what_is_typeable() {
+    fn a_group_inferred_from_input_sources_types_only_what_every_group_agrees_on() {
+        // The settings name `no` (group 0), but GNOME may not have updated
+        // `mru-sources`: group 1 (`us`) can be live, where <AC11> types `'`.
+        let text = SessionText::new(Some(Box::new(Sources(
+            vec![xkb("no"), xkb("us")],
+            vec![xkb("no")],
+        ))));
+        assert_eq!(text.set_keymap(TWO_GROUPS, two_groups_with_strokes()), 1);
+        assert_eq!(text.facts().layouts, ["no", "us"]);
+        let (plan, outcome) = text.plan("aæ'");
+        assert_eq!(outcome.group, "input_sources");
+        assert_eq!(outcome.keymap_chars, 1);
+        assert_eq!(outcome.refused_text, "æ'");
+        assert_eq!(outcome.reason, Some(TextRefusalReason::KeymapUnknown));
+        assert_eq!(plan.runs, [TextRun::Strokes(vec![stroke(38, false)])]);
+        // The Deck's layout notice still names the inferred layout.
         let text = SessionText::new(Some(Box::new(Sources(
             vec![xkb("no"), xkb("us")],
             vec![xkb("us")],
         ))));
-        assert_eq!(text.set_keymap(TWO_GROUPS, two_groups()), 1);
-        assert_eq!(text.facts().layouts, ["no", "us"]);
-        let (_, outcome) = text.plan("aæ");
-        assert_eq!(outcome.keymap_chars, 1);
-        assert_eq!(outcome.refused_text, "æ");
-        assert_eq!(
-            outcome.reason,
-            Some(TextRefusalReason::CompositorLacksTextInput)
-        );
-        assert_eq!(outcome.group, "input_sources");
+        text.set_keymap(TWO_GROUPS, two_groups_with_strokes());
         let keymap = text.session_keymap().unwrap();
         assert_eq!(keymap.active_layout.as_deref(), Some("us"));
         assert!(keymap.keys.contains(&KeyPositionChars {
@@ -666,25 +703,78 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_group_types_unverified_and_says_so() {
+    fn an_unknown_group_types_nothing_unproven_and_says_so() {
         let text = SessionText::default();
         text.set_keymap(TWO_GROUPS, two_groups());
         let (plan, outcome) = text.plan("æ");
-        assert!(plan.types_keysyms());
-        assert_eq!(outcome.unverified_chars, 1);
+        assert!(plan.runs.is_empty());
+        assert_eq!(outcome.unverified_chars, 0);
         assert_eq!(outcome.reason, Some(TextRefusalReason::KeymapUnknown));
         assert!(text.session_keymap().unwrap().keys.is_empty());
+    }
+
+    fn stroke(keycode: u32, shift: bool) -> arcen_input::text::TextStroke {
+        arcen_input::text::TextStroke {
+            keycode,
+            shift: shift.then_some(50),
+            level3: None,
+        }
+    }
+
+    /// GNOME on a `gb` locale for a `gb` user: `gb,gb`, both groups named
+    /// "English (UK)" (regression case: an English (UK) keymap).
+    fn gb_twice() -> KeymapIndex {
+        let mut strokes = Vec::new();
+        for group in 0..2 {
+            for (keycode, shift, character) in [
+                (52, false, 'z'),
+                (59, false, ','),
+                (59, true, '<'),
+                (60, true, '>'),
+            ] {
+                strokes.push(arcen_input::text::StrokeEntry {
+                    group,
+                    stroke: stroke(keycode, shift),
+                    keysym: u32::from(character),
+                    character,
+                });
+            }
+        }
+        two_groups().with_strokes(strokes)
+    }
+
+    #[test]
+    fn alike_groups_need_no_active_group_and_type_by_stroke() {
+        const GB_TWICE: &str = "xkb_keymap {\nxkb_symbols {\n    name[Group1]=\"English (UK)\";\n    name[Group2]=\"English (UK)\";\n};\n};";
+        let text = SessionText::default();
+        text.set_keymap(GB_TWICE, gb_twice());
+        let (plan, outcome) = text.plan("z<>é");
+        assert_eq!(outcome.group, "groups_alike");
+        assert_eq!(outcome.keymap_chars, 3);
+        assert_eq!(outcome.unverified_chars, 0);
+        assert_eq!(outcome.refused_text, "é");
+        assert_eq!(
+            plan.runs,
+            [TextRun::Strokes(vec![
+                stroke(52, false),
+                stroke(59, true),
+                stroke(60, true)
+            ])]
+        );
+        assert!(!text.session_keymap().unwrap().keys.is_empty());
     }
 
     #[test]
     fn the_input_method_takes_what_the_layout_lacks() {
         let text = SessionText::new(Some(Box::new(Sources(vec![xkb("no")], vec![]))));
-        text.set_keymap(TWO_GROUPS, two_groups());
         let recorder = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
         text.set_utf8(Utf8Route::Offered, Some(recorder.clone()));
-        let (plan, outcome) = text.plan("æ😀");
+        text.set_keymap(TWO_GROUPS, two_groups_with_strokes());
+        // `no` is only inferred: `æ` is not proven by key, so it goes
+        // through the input method with the emoji; `a` by key.
+        let (plan, outcome) = text.plan("aæ😀");
         assert_eq!(outcome.keymap_chars, 1);
-        assert_eq!(outcome.utf8_chars, 1);
+        assert_eq!(outcome.utf8_chars, 2);
         assert_eq!(outcome.refused_chars, 0);
         assert_eq!(plan.runs.len(), 2);
         text.commit_utf8("😀").unwrap();
@@ -704,10 +794,12 @@ mod tests {
         .with_registry(registry);
         text.set_keymap(NAMED_GROUPS, two_groups());
         // Group 1 of `two_groups` is the US-shaped one; the names put
-        // Norwegian second, so the active source `no` is group 1.
-        let (_, outcome) = text.plan("'");
+        // Norwegian second, so the active source `no` is group 1 — for the
+        // layout notice; by key only what both groups agree on is typed.
+        let (_, outcome) = text.plan("'a");
         assert_eq!(outcome.group, "input_sources");
-        assert_eq!(outcome.keymap_chars, 1);
+        assert_eq!(outcome.keymap_chars, 0);
+        assert_eq!(outcome.reason, Some(TextRefusalReason::KeymapUnknown));
         assert_eq!(
             text.session_keymap().unwrap().active_layout.as_deref(),
             Some("Norwegian")

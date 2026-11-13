@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The clipboard of a headless Wayland session, carried for the Pier.
 //!
 //! Mutter exposes the selection on a `RemoteDesktop` session:

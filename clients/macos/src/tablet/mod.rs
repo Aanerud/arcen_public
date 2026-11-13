@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Typed tablet/pen capture surface for Arcen Deck.
 //!
 //! This module is the local-termination capture boundary for any pen tablet:

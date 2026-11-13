@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Session-bound input socket of a headless Wayland session.
 //!
 //! Newline-delimited JSON [`InputCommand`]s on
@@ -134,7 +136,14 @@ pub struct InputService {
     locks: Mutex<LockState>,
     uid: u32,
     text: Arc<SessionText>,
+    keyboard_woken: std::sync::atomic::AtomicBool,
 }
+
+/// `KEY_LEFTSHIFT`: pressed alone it types nothing.
+const WAKE_KEYCODE: u32 = 42;
+
+/// How long a commit waits for the keymap after waking the keyboard.
+const KEYMAP_WAIT: Duration = Duration::from_millis(1500);
 
 struct Connection {
     reader: BoundedLineReader<BufReader<OwnedReadHalf>>,
@@ -157,6 +166,7 @@ impl InputService {
             locks: Mutex::new(LockState::default()),
             uid,
             text: Arc::new(SessionText::default()),
+            keyboard_woken: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -333,6 +343,7 @@ impl InputService {
     /// while keysyms are typed (the compositor would otherwise type other
     /// characters or shortcuts), then restored.
     async fn type_text<B: CompositorInput>(&self, text: &str, backend: &B) -> InputReply {
+        self.await_keymap(backend).await;
         let (plan, mut outcome) = self.text.plan(text);
         let mut released = Vec::new();
         let mut caps_toggled = false;
@@ -371,6 +382,14 @@ impl InputService {
                                     failure = Some(error);
                                     break 'runs;
                                 }
+                            }
+                        }
+                    }
+                    TextRun::Strokes(strokes) => {
+                        for stroke in strokes {
+                            if let Err(error) = self.type_stroke(*stroke, backend).await {
+                                failure = Some(error);
+                                break 'runs;
                             }
                         }
                     }
@@ -420,6 +439,84 @@ impl InputService {
             text: Some(outcome),
             ..InputReply::accepted()
         }
+    }
+
+    /// A headless Mutter seat has no keyboard, and sends no keymap, until a
+    /// virtual keyboard has pressed a key; a commit then could prove
+    /// nothing, and would type nothing. So the first commit on a session
+    /// whose keymap is unknown, with no key held, presses and releases
+    /// Shift alone (it types nothing) and waits briefly for the keymap.
+    /// Once per session: a compositor that never sends one is not woken
+    /// again.
+    async fn await_keymap<B: CompositorInput>(&self, backend: &B) {
+        if self.text.keymap().is_some() || !self.held.lock().await.is_empty() {
+            return;
+        }
+        if self
+            .keyboard_woken
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        for pressed in [true, false] {
+            let key = InputCommand::Key {
+                keycode: WAKE_KEYCODE,
+                pressed,
+            };
+            if self.inject(key, backend).await.is_err() {
+                return;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + KEYMAP_WAIT;
+        while self.text.keymap().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tracing::info!(
+            target: target::INPUT,
+            keymap_known = self.text.keymap().is_some(),
+            "woke the session keyboard for committed text"
+        );
+    }
+
+    /// Types one proven stroke by keycode: its modifier keys down, the key
+    /// down and up, the modifier keys up in reverse. A failed press still
+    /// releases what was pressed.
+    async fn type_stroke<B: CompositorInput>(
+        &self,
+        stroke: arcen_input::text::TextStroke,
+        backend: &B,
+    ) -> Result<(), String> {
+        let evdev = |keycode: u32| keycode.saturating_sub(8);
+        let mut down = Vec::new();
+        let mut result = Ok(());
+        for keycode in stroke.modifiers().chain([stroke.keycode]) {
+            let key = InputCommand::Key {
+                keycode: evdev(keycode),
+                pressed: true,
+            };
+            match self.inject(key, backend).await {
+                Ok(()) => down.push(keycode),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        for keycode in down.into_iter().rev() {
+            let release = self
+                .inject(
+                    InputCommand::Key {
+                        keycode: evdev(keycode),
+                        pressed: false,
+                    },
+                    backend,
+                )
+                .await;
+            if result.is_ok() {
+                result = release;
+            }
+        }
+        result
     }
 
     async fn toggle_caps<B: CompositorInput>(&self, backend: &B) -> Result<(), String> {
@@ -889,7 +986,12 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(&dir).unwrap().uid()
         };
-        let service = Arc::new(InputService::bind(&path, uid).unwrap());
+        let text = Arc::new(SessionText::default());
+        let service = Arc::new(
+            InputService::bind(&path, uid)
+                .unwrap()
+                .with_text(Arc::clone(&text)),
+        );
         let backend = Arc::new(Recording::default());
         let serving = tokio::spawn({
             let service = Arc::clone(&service);
@@ -914,30 +1016,61 @@ mod tests {
         assert!(client.send(&caps_on).await.unwrap().ok);
         backend.0.lock().unwrap().clear();
 
+        // No keymap read: nothing is typed by key, and the client is told.
+        let unknown = client
+            .send(&InputCommand::Text {
+                text: "a<".to_owned(),
+                sequence: 2,
+            })
+            .await
+            .unwrap();
+        let outcome = unknown.text.unwrap();
+        assert_eq!((outcome.unverified_chars, outcome.refused_chars), (0, 2));
+        assert!(backend.0.lock().unwrap().is_empty());
+
+        // `<` is proven as Shift + <AB08>, as on `gb`, where Mutter's own
+        // keysym lookup would have typed `z`.
+        let stroke = |keycode, shift: bool, character: char| arcen_input::text::StrokeEntry {
+            group: 0,
+            stroke: arcen_input::text::TextStroke {
+                keycode,
+                shift: shift.then_some(50),
+                level3: None,
+            },
+            keysym: u32::from(character),
+            character,
+        };
+        text.set_keymap(
+            "xkb_keymap {}",
+            arcen_input::text::KeymapIndex::default().with_strokes([
+                stroke(38, false, 'a'),
+                stroke(52, false, 'z'),
+                stroke(59, true, '<'),
+            ]),
+        );
         let reply = client
             .send(&InputCommand::Text {
-                text: "a".to_owned(),
+                text: "a<".to_owned(),
                 sequence: 3,
             })
             .await
             .unwrap();
         assert!(reply.ok);
         let outcome = reply.text.unwrap();
-        // No keymap read: typed, but unproven.
-        assert_eq!(outcome.unverified_chars, 1);
+        assert_eq!((outcome.keymap_chars, outcome.unverified_chars), (2, 0));
         let key = |keycode, pressed| InputCommand::Key { keycode, pressed };
-        let keysym = |pressed| InputCommand::Keysym {
-            keysym: 0x61,
-            pressed,
-        };
         assert_eq!(
             backend.0.lock().unwrap().as_slice(),
             &[
                 key(42, false),
                 key(58, true),
                 key(58, false),
-                keysym(true),
-                keysym(false),
+                key(30, true),
+                key(30, false),
+                key(42, true),
+                key(51, true),
+                key(51, false),
+                key(42, false),
                 key(58, true),
                 key(58, false),
                 key(42, true),
@@ -952,7 +1085,87 @@ mod tests {
             .unwrap();
         assert_eq!(refused.error.as_deref(), Some("invalid committed text"));
         let layout = client.send(&InputCommand::Keymap).await.unwrap();
-        assert!(layout.ok && layout.keymap.is_none());
+        assert!(layout.ok && layout.keymap.is_some());
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_first_commit_wakes_the_keyboard_once_for_its_keymap() {
+        let dir = std::env::current_exe()
+            .unwrap()
+            .with_file_name(format!("arcen-input-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("arcen-input.sock");
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&dir).unwrap().uid()
+        };
+        let text = Arc::new(SessionText::default());
+        let service = Arc::new(
+            InputService::bind(&path, uid)
+                .unwrap()
+                .with_text(Arc::clone(&text)),
+        );
+        let backend = Arc::new(Recording::default());
+        let serving = tokio::spawn({
+            let service = Arc::clone(&service);
+            let backend = Arc::clone(&backend);
+            async move { service.serve(&*backend, &facts().into()).await }
+        });
+        // The compositor sends its keymap once the keyboard exists.
+        let keymap = tokio::spawn({
+            let text = Arc::clone(&text);
+            let backend = Arc::clone(&backend);
+            async move {
+                let released = InputCommand::Key {
+                    keycode: 42,
+                    pressed: false,
+                };
+                while !backend.0.lock().unwrap().contains(&released) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                text.set_keymap(
+                    "xkb_keymap {}",
+                    arcen_input::text::KeymapIndex::default().with_strokes([
+                        arcen_input::text::StrokeEntry {
+                            group: 0,
+                            stroke: arcen_input::text::TextStroke {
+                                keycode: 59,
+                                shift: Some(50),
+                                level3: None,
+                            },
+                            keysym: 0x3c,
+                            character: '<',
+                        },
+                    ]),
+                );
+            }
+        });
+        let mut client = Client::connect(&path).await;
+        let commit = |sequence| InputCommand::Text {
+            text: "<".to_owned(),
+            sequence,
+        };
+        let outcome = client.send(&commit(1)).await.unwrap().text.unwrap();
+        assert_eq!((outcome.keymap_chars, outcome.refused_chars), (1, 0));
+        let key = |keycode, pressed| InputCommand::Key { keycode, pressed };
+        assert_eq!(
+            backend.0.lock().unwrap().as_slice(),
+            &[
+                key(42, true),
+                key(42, false),
+                key(42, true),
+                key(51, true),
+                key(51, false),
+                key(42, false),
+            ]
+        );
+        keymap.await.unwrap();
+        backend.0.lock().unwrap().clear();
+        client.send(&commit(2)).await.unwrap();
+        assert_eq!(backend.0.lock().unwrap().len(), 4, "no second wake");
         serving.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arithmetic every host does to report what its stream did.
 //!
 //! Frame rate over a window, and per-stage averages over a session. Neither
@@ -164,7 +166,20 @@ pub fn rate_per_second(count: u64, elapsed: Duration) -> f64 {
 pub struct SnapshotCadence {
     elapsed_at_last: Duration,
     frames_at_last: u64,
+    offered_at_last: u64,
     interval: Duration,
+}
+
+/// Rates over one snapshot window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotRates {
+    /// Frames sent in the window.
+    pub sent_frames: u64,
+    /// Frames per second sent.
+    pub sent_fps: u32,
+    /// Frames per second of changed content the source offered; see
+    /// [`crate::QosSample::fps_content`].
+    pub offered_fps: u32,
 }
 
 impl SnapshotCadence {
@@ -180,6 +195,7 @@ impl SnapshotCadence {
         Self {
             elapsed_at_last: Duration::ZERO,
             frames_at_last: 0,
+            offered_at_last: 0,
             interval: Duration::from_secs(interval_secs),
         }
     }
@@ -195,20 +211,41 @@ impl SnapshotCadence {
     /// host that assumed the interval would report the rate it would have had
     /// if nothing had gone wrong.
     pub fn due(&mut self, elapsed: Duration, frames_sent: u64) -> Option<u32> {
+        self.due_rates(elapsed, frames_sent, 0)
+            .map(|rates| rates.sent_fps)
+    }
+
+    /// Like [`Self::due`], and also the rate of `frames_offered`: a running
+    /// count of frames carrying changed content that the source handed to the
+    /// pipeline, whether or not they were then sent.
+    pub fn due_rates(
+        &mut self,
+        elapsed: Duration,
+        frames_sent: u64,
+        frames_offered: u64,
+    ) -> Option<SnapshotRates> {
         let window = elapsed.saturating_sub(self.elapsed_at_last);
         if window < self.interval {
             return None;
         }
         let sent = frames_sent.saturating_sub(self.frames_at_last);
+        let offered = frames_offered.saturating_sub(self.offered_at_last);
         self.elapsed_at_last = elapsed;
         self.frames_at_last = frames_sent;
+        self.offered_at_last = frames_offered;
 
         // Integer throughout. A frame count large enough to lose precision as
         // an `f64` is a bug better seen as a wrong number than as one silently
         // rounded into looking plausible.
         let millis = window.as_millis().max(1);
-        let rate = u128::from(sent).saturating_mul(1_000) / millis;
-        Some(u32::try_from(rate).unwrap_or(u32::MAX))
+        let rate = |count: u64| {
+            u32::try_from(u128::from(count).saturating_mul(1_000) / millis).unwrap_or(u32::MAX)
+        };
+        Some(SnapshotRates {
+            sent_frames: sent,
+            sent_fps: rate(sent),
+            offered_fps: rate(offered),
+        })
     }
 }
 
@@ -353,6 +390,27 @@ mod tests {
         assert_eq!(cadence.due(Duration::from_secs(5), 300), Some(60));
         // The second window sent 150 more, not 450.
         assert_eq!(cadence.due(Duration::from_secs(10), 450), Some(30));
+    }
+
+    #[test]
+    fn offered_content_is_rated_over_the_same_window_as_sent_frames() {
+        let mut cadence = SnapshotCadence::new();
+        assert_eq!(
+            cadence.due_rates(Duration::from_secs(5), 45, 40),
+            Some(SnapshotRates {
+                sent_frames: 45,
+                sent_fps: 9,
+                offered_fps: 8
+            })
+        );
+        assert_eq!(
+            cadence.due_rates(Duration::from_secs(10), 120, 340),
+            Some(SnapshotRates {
+                sent_frames: 75,
+                sent_fps: 15,
+                offered_fps: 60
+            })
+        );
     }
 
     #[test]

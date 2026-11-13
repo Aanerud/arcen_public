@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 """Generate the third-party dependency inventory from the locked dependency graph.
 
 `legal/THIRD_PARTY_NOTICES.md` is exhaustive by policy, and the hand-maintained
@@ -59,12 +62,19 @@ ARTEFACTS: dict[str, list[str]] = {
 # Optional dependencies are only in the resolution when their feature is on, so
 # a release feature missing here silently drops its packages from the notices.
 # Keep in step with the release build commands (the Linux Pier is built with
-# `--features wayland-provider`; see packaging/linux/installer/README.md; the
-# Deck embeds the USB helper by default, which turns on `usb-hard-lab`; see
-# packaging/macos/build-deck-app.sh).
+# `--features wayland-provider` and its default `native-tablet`; see
+# packaging/linux/installer/README.md; the Deck embeds the USB helper by
+# default, which turns on `native-tablet`, and builds the helper with its
+# IOUSBHost backend; see packaging/macos/build-deck-app.sh).
 RELEASE_FEATURES: dict[str, list[str]] = {
-    "aarch64-apple-darwin": ["arcen-deck-macos/usb-hard-lab"],
-    "x86_64-apple-darwin": ["arcen-deck-macos/usb-hard-lab"],
+    "aarch64-apple-darwin": [
+        "arcen-deck-macos/native-tablet",
+        "arcen-usb-helper/iousbhost",
+    ],
+    "x86_64-apple-darwin": [
+        "arcen-deck-macos/native-tablet",
+        "arcen-usb-helper/iousbhost",
+    ],
     "x86_64-unknown-linux-gnu": ["arcen-pier-linux/wayland-provider"],
 }
 

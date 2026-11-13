@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The locale a host-started desktop session runs in.
 //!
 //! A display manager gives a session its user's language (GDM reads the

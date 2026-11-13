@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Removes Arcen Pier, the way an administrator expects: everything it
 # installed, in every session, and then proof that nothing is left running.
 #

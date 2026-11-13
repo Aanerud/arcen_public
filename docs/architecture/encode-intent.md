@@ -1,6 +1,5 @@
 # Encode intent: interactive versus grading
 
-**Branch.** `feat/nvenc-grading-quality`, off hardware-golden `2c8e5c7`.
 **Status.** Implemented on both hosts and the macOS Deck. Interactive and
 Quality paths have been built on their target platforms; P6/HIGH_QUALITY is
 hardware-proven on L40S and V100-class NVENC.
@@ -37,7 +36,7 @@ While investigating Blackwell's 4:2:2 support (see
 
 | | Requires | Delivers |
 | --- | --- | --- |
-| Blackwell 4:2:2 | SDK 13.0 headers + Release/Security intake + new GPU | *Less* chroma than the 4:4:4 already golden |
+| Blackwell 4:2:2 | SDK 13.0 headers + a recorded header update + new GPU | *Less* chroma than the 4:4:4 already proven |
 | Grading intent | Nothing. Already in NVENCAPI 12.1 | More bits spent on the image the grader is judging |
 
 `NV_ENC_TUNING_INFO_HIGH_QUALITY` and presets P5–P7 have been sitting in the
@@ -78,7 +77,7 @@ warns that presets P3+ for H.264 and P2+ for HEVC enable B-frames by default
 Arcen therefore keeps P4 with `ULTRA_LOW_LATENCY`, then explicitly clears
 B-frames/lookahead/zero-reorder fields, rather than dropping to P1-P3 on
 documentation alone: Speed is motion-first but still used for video editors
-and 3D artists, and no lab measurement on this branch proved a lower preset
+and 3D artists, and no measurement proved a lower preset
 reduced end-to-end frame age without a visible quality cost. Its bitrate
 controller starts at the proven safe cap and probes to the true 60 fps shape
 ceiling on a clean path; the Deck mirrors that contract by setting
@@ -207,9 +206,9 @@ interactive one. Capenc likewise rejects an unknown argv token.
 | `argv_emits_the_intent_token_only_when_it_is_not_the_default` (Linux host) | Default intent leaves the shipped argv byte-identical |
 | `build_args_emits_the_intent_token_only_when_it_is_not_the_default` (Windows host) | Same, for the Windows argv builder |
 
-Counts on this branch: `arcen-media` 190 (golden 188), `arcen-capenc` 177 with
-`nvenc,mf` (golden 174). `cargo clippy -p arcen-media -p arcen-protocol -D warnings`
-is clean.
+Run them with `cargo test --locked -p arcen-media` and, on each host, the
+host crate's tests; `cargo clippy --locked -p arcen-media -p arcen-protocol -- -D warnings`
+must stay clean.
 
 ## 6. Validation status
 
@@ -220,31 +219,11 @@ Current multi-monitor clients carry the derived Quality intent into every
 pipeline before spawn; legacy late changes are rejected visibly rather than
 being claimed as applied.
 
-### What the test machine should check
+### Open measurements
 
-**Test this on the Linux host.** That is not a preference — Windows resolves
-and reports intent but cannot yet apply it (§4), so a Windows session will
-always encode interactive no matter what the Deck asks for. The colour work
-was proven on a Windows NVENC host, so the natural instinct is to retest here;
-for this feature that instinct produces a false negative.
-
-1. It builds — on Linux, on Windows, and on macOS.
-2. A session with intent `quality` actually initialises. **P6 + HIGH_QUALITY is
-   a combination that has never been trialled in this codebase**, and NVENC
-   caps are independent booleans: only a real `NvEncInitializeEncoder` proves a
-   combination works. Confirm it does not fall back or fail, especially at
-   4:4:4 10-bit.
-3. **Measure both halves of the trade**, because both are the point:
-   - Latency: interactive vs quality, same content. Expect quality to be
-     worse; find out by how much and whether it is tolerable for a grader.
-   - Image: at a fixed bitrate on hard content (film grain, fine text, a
-     gradient), does quality visibly improve? The round-trip error metric in
-     the probe matrix will read 0 for both on synthetic patterns — that metric
-     answers colour correctness, not compression quality, so judge this one on
-     real content and real bitrates.
-4. Whether P7 is worth offering as a third option, or whether it is as slow as
-   expected for no visible gain.
-
-If the latency cost turns out to be small, the more interesting question opens
-up: whether `Quality` should engage automatically when the desktop is static,
-rather than being a mode the user has to remember to select.
+Windows resolves and reports intent but does not yet apply it (§4), so intent
+is measured on a Linux NVENC host. Still to be measured there: the latency
+cost of `quality` against `interactive` on the same content, the visible
+image gain at a fixed bitrate on hard content (film grain, fine text,
+gradients; the probe matrix's round-trip error measures colour correctness,
+not compression quality), and whether P7 is worth offering as a third option.

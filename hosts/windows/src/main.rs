@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure-Rust Arcen Windows host.
 
 mod advanced_color;
@@ -461,15 +463,27 @@ impl HostConfig {
         &mut self,
         active: crate::capenc::EncoderSelection,
     ) -> Result<(), String> {
+        self.apply_software_h264_backend_after(active, None)
+    }
+
+    /// [`Self::apply_software_h264_backend`] once the hardware encoder has
+    /// reported why it is unavailable (`cause`; `None` when none was tried):
+    /// a Grading, HDR or colour-fidelity refusal leads with the shared
+    /// `FidelityRefusal` code and names that cause.
+    pub(crate) fn apply_software_h264_backend_after(
+        &mut self,
+        active: crate::capenc::EncoderSelection,
+        cause: Option<arcen_media::video::BackendUnavailableReason>,
+    ) -> Result<(), String> {
         if active != crate::capenc::EncoderSelection::SoftwareH264 {
             return Ok(());
         }
-        let software_decision = arcen_media::video::software_fallback_decision(
+        if let Some(refusal) = arcen_media::video::coded_fidelity_refusal(
             self.requested_pipeline,
             self.video_selection,
-        );
-        if software_decision.is_refusal() {
-            return Err(software_decision.reason().to_string());
+            cause,
+        ) {
+            return Err(refusal);
         }
         if self.variant_pinned && !self.exact_pins_allow_software_h264() {
             return Err(
@@ -487,6 +501,16 @@ impl HostConfig {
         self.bit_depth = BitDepth::Eight;
         if self.color_matrix.is_identity() {
             self.color_matrix = ColorMatrix::Bt709;
+        }
+        // An eight-bit capture hands over code values and re-encodes nothing,
+        // so the `srgb` answer to a linear-light Grading source no longer
+        // applies: serve the `bt709` the Deck asked for, as before.
+        let requested_bt709 = self.auth_video_request.as_ref().is_some_and(|request| {
+            arcen_media::TransferCharacteristics::from_token(&request.quality.transfer)
+                == Some(arcen_media::TransferCharacteristics::Bt709)
+        });
+        if requested_bt709 && self.transfer == arcen_media::TransferCharacteristics::Srgb {
+            self.transfer = arcen_media::TransferCharacteristics::Bt709;
         }
         self.fps = self.fps.min(
             arcen_media::video::EncoderBackend::OpenH264
@@ -523,8 +547,19 @@ impl HostConfig {
         request: &InitialVideoRequestMsg,
         encoder: crate::capenc::EncoderSelection,
     ) -> Result<(), String> {
+        self.apply_initial_video_request_for_encoder_after(request, encoder, None)
+    }
+
+    /// [`Self::apply_initial_video_request_for_encoder`] for a session whose
+    /// hardware encoder was found unavailable for `cause` before it started.
+    pub(crate) fn apply_initial_video_request_for_encoder_after(
+        &mut self,
+        request: &InitialVideoRequestMsg,
+        encoder: crate::capenc::EncoderSelection,
+        cause: Option<arcen_media::video::BackendUnavailableReason>,
+    ) -> Result<(), String> {
         self.apply_initial_video_request(request)?;
-        self.apply_software_h264_backend(encoder)
+        self.apply_software_h264_backend_after(encoder, cause)
     }
 
     pub(crate) fn apply_initial_video_request(
@@ -553,6 +588,16 @@ impl HostConfig {
             },
         )
         .map_err(|error| format!("initial video request: {error}"))?;
+        let mut resolved = resolved;
+        // Every stream above eight bits is captured as WGC FP16 scRGB, linear
+        // light the encoder must re-encode. For a Deck that presents `srgb`,
+        // re-encode with the curve DWM linearised with, so the stream keeps
+        // the desktop's own code values. Administrator pins stay exact.
+        resolved.video = arcen_media::video::serve_sdr_desktop(
+            resolved.video,
+            client.capabilities.srgb_transfer,
+            self.variant_pinned,
+        );
         self.auth_video_request = Some(request.clone());
         self.requested_pipeline = resolved.pipeline;
         self.active_pipeline = Some(arcen_media::video::served_pipeline(
@@ -3073,10 +3118,14 @@ where
     let quic_bind = quic::resolve_bind_addr(&args.host, args.direct_quic_port()).await?;
     let quic_config = quic::build_quic_server_config(&tls_lifecycle)?;
     let quic_endpoint = quic::bind_endpoint(quic_bind, quic_config)?;
+    let build = session::windows_build_identity();
     tracing::info!(
         target: NET,
         addr = %quic_bind,
         version = env!("CARGO_PKG_VERSION"),
+        build_id = %build.build_id,
+        revision = %build.source_revision,
+        profile = %build.build_profile,
         license = "AGPL-3.0-only",
         source = SOURCE_URL,
         capenc = %args.config.capenc_bin,
@@ -4400,6 +4449,87 @@ mod tests {
         assert!(pinned.auth_video_request.is_some());
     }
 
+    fn grading_request(srgb_transfer: bool) -> arcen_protocol::messages::InitialVideoRequestMsg {
+        let mut request = initial_video_request(VideoSelectionIntent::ColorFidelity);
+        request.quality.codec = "h265".to_string();
+        request.quality.chroma = "yuv444".to_string();
+        request.quality.bit_depth = "10".to_string();
+        request.quality.color_range = "full".to_string();
+        request.quality.max_fps = 30;
+        request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Grading);
+        request.capabilities.srgb_transfer = srgb_transfer;
+        request
+    }
+
+    fn unpinned_config() -> HostConfig {
+        parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+                "--bit-depth",
+                "10",
+                "--color-range",
+                "full",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .config
+    }
+
+    /// Ten-bit Windows capture is linear scRGB, so a Deck that presents
+    /// `srgb` is served the desktop's own code values, tagged as such and
+    /// still named Grading; an older Deck keeps the BT.709 it asked for.
+    #[test]
+    fn ten_bit_grading_keeps_desktop_srgb_codes_only_for_a_capable_deck() {
+        let mut capable = unpinned_config();
+        capable
+            .apply_initial_video_request(&grading_request(true))
+            .unwrap();
+        assert_eq!(capable.bit_depth, BitDepth::Ten);
+        assert_eq!(capable.transfer, arcen_media::TransferCharacteristics::Srgb);
+        assert_eq!(
+            capable.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
+
+        let mut legacy = unpinned_config();
+        legacy
+            .apply_initial_video_request(&grading_request(false))
+            .unwrap();
+        assert_eq!(legacy.transfer, arcen_media::TransferCharacteristics::Bt709);
+
+        let mut speed = unpinned_config();
+        let mut eight_bit = initial_video_request(VideoSelectionIntent::AdaptivePerformance);
+        eight_bit.capabilities.srgb_transfer = true;
+        speed.apply_initial_video_request(&eight_bit).unwrap();
+        assert_eq!(
+            speed.transfer,
+            arcen_media::TransferCharacteristics::Bt709,
+            "eight-bit capture hands over code values and is never re-tagged"
+        );
+
+        let mut software = unpinned_config();
+        software
+            .apply_initial_video_request(&grading_request(true))
+            .unwrap();
+        software.requested_pipeline = None;
+        software.video_selection = VideoSelectionIntent::Exact;
+        software
+            .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
+            .expect("an exact request may fall back to software");
+        assert_eq!(software.bit_depth, BitDepth::Eight);
+        assert_eq!(
+            software.transfer,
+            arcen_media::TransferCharacteristics::Bt709,
+            "an eight-bit software fallback re-encodes nothing"
+        );
+    }
+
     #[test]
     fn speed_pipeline_contract_drives_motion_priority() {
         let mut config = parse_args_from(
@@ -4551,12 +4681,38 @@ mod tests {
             .expect_err("Grading requires hardware");
         assert_eq!(
             error,
-            arcen_media::video::software_fallback_decision(
-                Some(arcen_media::video::PipelineId::Grading),
-                VideoSelectionIntent::ColorFidelity,
+            format!(
+                "software_encoder_only: {}",
+                arcen_media::video::software_fallback_decision(
+                    Some(arcen_media::video::PipelineId::Grading),
+                    VideoSelectionIntent::ColorFidelity,
+                )
+                .reason()
             )
-            .reason()
         );
+        for (cause, code) in [
+            (
+                arcen_media::video::BackendUnavailableReason::SessionLimit,
+                "gpu_sessions_in_use: Grading refused: every GPU encoder session is in use",
+            ),
+            (
+                arcen_media::video::BackendUnavailableReason::UnsupportedConfiguration,
+                "gpu_format_unsupported: Grading refused: the GPU encoder lacks this 10-bit format",
+            ),
+            (
+                arcen_media::video::BackendUnavailableReason::RuntimeMissing,
+                "gpu_runtime_missing: Grading refused:",
+            ),
+        ] {
+            let error = software
+                .apply_initial_video_request_for_encoder_after(
+                    &request,
+                    crate::capenc::EncoderSelection::SoftwareH264,
+                    Some(cause),
+                )
+                .expect_err("Grading still requires hardware");
+            assert!(error.starts_with(code), "{error}");
+        }
     }
 
     #[test]

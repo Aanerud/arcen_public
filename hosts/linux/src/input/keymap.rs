@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Protocol-v3 Qt key identifiers to Linux evdev key codes.
 
 pub const MOD_SHIFT: u32 = 0x01;
@@ -92,6 +94,8 @@ pub fn qt_key_to_evdev(qt_key: u32, modifiers: u32) -> Option<u16> {
         0x0100_0021 => 29,
         0x0100_0022 => 125,
         0x0100_0023 => 56,
+        // `AltGr` (right Alt): the layout's third level, not Alt.
+        arcen_protocol::keys::KEY_ALTGR => 100,
         // Navigation.
         0x0100_0013 => 103,
         0x0100_0015 => 108,
@@ -121,6 +125,8 @@ pub fn qt_key_to_evdev(qt_key: u32, modifiers: u32) -> Option<u16> {
         0x2C => 51,
         0x2E => 52,
         0x2F => 53,
+        // The ISO key between left Shift and Z.
+        arcen_protocol::keys::KEY_INTL_BACKSLASH => 86,
         // Locks / print / pause.
         0x0100_0024 => 58,
         0x0100_0025 => 69,
@@ -182,6 +188,19 @@ mod tests {
         assert_eq!(qt_key_to_evdev(0x0100_0038, 0), Some(67));
         assert_eq!(qt_key_to_evdev(0x0100_0012, MOD_SHIFT), Some(105));
         assert_eq!(qt_key_to_evdev(0xDEAD_BEEF, 0), None);
+    }
+
+    #[test]
+    fn extended_keys_are_right_alt_and_the_iso_key() {
+        assert_eq!(
+            qt_key_to_evdev(arcen_protocol::keys::KEY_ALTGR, 0),
+            Some(100)
+        );
+        assert!(MODIFIER_CODES.contains(&100));
+        assert_eq!(
+            qt_key_to_evdev(arcen_protocol::keys::KEY_INTL_BACKSLASH, 0),
+            Some(86)
+        );
     }
 
     #[test]

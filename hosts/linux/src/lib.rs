@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen native Linux host — Rust control plane.
 //!
 //! This crate is the staged replacement for the Python `server/*.py` on the
@@ -58,7 +60,10 @@ pub const SOURCE_OFFER: &str =
      You may redistribute it under the terms of that licence. If you run a modified version \
      that others connect to over a network, you must offer them its corresponding source.";
 
-pub(crate) fn build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
+/// This build of the Linux Pier, as its hello advertises it and its start-up
+/// line logs it.
+#[must_use]
+pub fn build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
     arcen_protocol::build_identity::this_build("arcen-pier-linux", VERSION)
 }
 

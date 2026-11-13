@@ -1,5 +1,7 @@
 # macOS Pier Ownership
 
+**Owner role:** macOS Pier (packaging co-owned with Release/Security)
+
 Own only irreducible macOS host integration here: LoginWindow/Aqua session
 activation, ScreenCaptureKit/VideoToolbox, CoreGraphics/AppKit input, native
 pasteboard access, AudioServerPlugIn, USB host-controller integration, and
@@ -26,18 +28,16 @@ cargo build --locked --release -p arcen-pier-macos
 Measured from a Deck on another Mac against the installed Pier, not inferred
 from code:
 
-| Contract | Host served | Deck decoded |
-| --- | --- | --- |
 | Preset | Encoded (read from the SPS at both ends) | Deck decoded |
 | --- | --- | --- |
 | Auto / Speed | HEVC Main 4:2:0 8-bit, `420v` capture | `420v` → `Yuv420` |
-| Grading | HEVC RExt 4:4:4 10-bit, BT.709, full range, `xf44` capture | `xf44` → `Yuv444` 10-bit |
+| Grading | HEVC RExt 4:4:4 10-bit, BT.709 (transfer `srgb`, H.273 13, for a Deck that claims `srgb_transfer`; the SCK surface is sRGB either way), full range, `xf44` capture | `xf44` → `Yuv444` 10-bit |
 | HDR (proven headroom) | HEVC RExt 4:4:4 10-bit, PQ/BT.2020/BT.2020, full range | `xf44`, Deck presents HDR10 (EDR) |
 
-An earlier version of this table said Grading was served as `yuv444p10le`
-from `x444`. That was the plan, not the stream: the bitstream was Main 4:2:0
-8-bit, because no profile was set. Check the `encoded stream truth` and
-`received stream truth` lines, not the hello.
+Verify the encoded SPS at both ends: read the `encoded stream truth` and
+`received stream truth` lines, not the hello. A requested format is a plan,
+not the stream: without an explicit profile, a session asked for 4:4:4
+10-bit is encoded as Main 4:2:0 8-bit.
 
 Grading is precision and chroma resolution, not a wider gamut. HDR is a
 different transfer, and is claimed only when the captured display reports
@@ -53,12 +53,11 @@ remote desktop appears and keeps streaming — 3.5 minutes continuous, and a
 both directions during that session: a marker copied on the host arrived on the
 client, and one copied on the client arrived on the host.
 
-Interactive testing found two things four evenings of smoke commands had not.
-Every smoke command authenticates as whoever owns the console, so none of them
-could ever produce a console mismatch; the GUI, connecting as a different
-account, timed out for ten minutes instead of saying so. And killing the GUI
-mid-session showed `SESSION_END` reporting `frames_sent = 0` for a session that
-had streamed for minutes. Run the GUI.
+GUI tests must cover what smoke commands cannot. Every smoke command
+authenticates as whoever owns the console, so none of them can produce a
+console mismatch; the GUI, connecting as a different account, must be told so
+rather than time out. And a GUI killed mid-session must still leave a
+`SESSION_END` with the nonzero `frames_sent` it streamed. Run the GUI.
 
 **Displays.** `single_primary` and `windowed` complete. Multi-monitor now has
 the wire path as well as capture: `AuthMultiMonitorOfferMsg`, requested topology
@@ -68,11 +67,11 @@ admitted monitor. `platform.multi_monitor.advertise_enabled` still defaults
 off, and the host also requires more than one attached display before it
 advertises.
 
-This is implemented, not qualified. The lab Mac used tonight has one display
-attached, so the multi-display capture test skips and no real Deck has drawn a
-two-display macOS Pier session. Do not call `match_layout` proven until a Mac
-with two attached displays captures, negotiates, sends region frames, and the
-Deck presents both.
+This is implemented, not qualified: physical multi-display qualification
+remains outstanding. The multi-display capture test skips on a Mac with one
+display, and no real Deck has drawn a two-display macOS Pier session yet. Do
+not call `match_layout` proven until a Mac with two attached displays
+captures, negotiates, sends region frames, and the Deck presents both.
 
 Capture is one session per display, deliberately separate from the
 single-display path. Most sessions are one screen, that is the path whose cost
@@ -89,10 +88,83 @@ Keyboard is proven where the grant exists — `probe-keyboard` reports
 state rather than inferred from the injection returning. On a machine without
 the grant the same probe fails, which is the correct and visible outcome.
 
-Pen is proven end to end: a full stroke sent as a Deck would send it in light
-mode produced 6 samples and 2 proximity edges with 0 rejected. The Deck's own
-`input-smoke` cannot exercise this — it sends pen only in Hard USB mode, which
-this host refuses — so Basic Tablet has its own test here instead.
+Pen is proven end to end, and the proof is what an application received, not
+what the host counted. The ignored end-to-end test
+`pen_samples_sent_by_a_client_are_injected_as_tablet_events` sends a stroke,
+a barrel click and an eraser pass as a Deck sends them in Tablet support mode;
+run with an AppKit window under the stroke that logs its `NSEvent`s, it
+showed tablet proximity for pen and eraser (capability mask `0x25c7`),
+pressure 0.247/0.898 and eraser 0.498, tilt (0.333, -0.167), rotation 12 and a
+right-button barrel click. The counters had read "6 samples, 2 proximity
+edges, 0 rejected" while every stroke reached applications at
+pressure 1.0 and no application saw the pen arrive — `-[NSEvent pressure]`
+reads `kCGMouseEventPressure`, and a proximity edge must be its own
+`kCGEventTabletProximity` event. Counting what was posted is not evidence.
+
+One behaviour of macOS is visible in that log and is not a host bug: when two
+pen drags are queued before the window server delivers them, it merges them
+into one event at the newer position that keeps the older tablet fields
+(measured: the 0.42 position carried the 0.41 sample's pressure). Real tablet
+drivers' events are merged the same way.
+
+The same log showed `buttonMask=0` on every tip-down drag and `0x1` (the tip
+bit) on a barrel click: `-[NSEvent buttonMask]` returns
+`kCGTabletEventPointButtons` verbatim and uses AppKit's layout (tip bit 0,
+barrel buttons bits 1 and 2), not the wire's (barrel buttons from bit 0).
+`pen::tablet_button_mask` converts. `arcen-pier-macos probe-pen` (lab builds
+only: `--features lab-pen-probe`, which no packaging script enables, because
+inside the Agent Helper it posts clicks under the agent's Accessibility
+approval) re-measures all of it — proximity, capability mask, pen and eraser,
+tilt, rotation, and with `--strokes` pressure and the button mask — from a
+global `NSEvent` monitor, through the same `InputSession::apply` a session
+uses. Run it as the installed agent's identity in the Aqua session: posted
+from a process whose responsible app holds no Accessibility approval (anything
+started over SSH), the pointer still moves — the pen path warps it — and no
+application receives a single event. Measured on a macOS 26.5.2 test host with
+the console user's screen locked, a dev package's `arcen-agent-helper
+probe-pen --strokes` as a one-shot launchd job in that user's `gui/<uid>`
+domain: proximity for pen and eraser with mask `0x25c7`, tilt 0.444 (40°),
+rotation 90, pressure 0.098 → 1.0 and `buttonMask` `0x1` (tip), `0x2` (first
+barrel, a right click) and `0x4` (second barrel, button 2), confirmed by a
+separate AppKit app's global monitor. A locked screen delivers to
+`loginwindow`, so that is global-monitor evidence, not a window drawing; the
+window path is the loopback run above.
+
+**Committed text.** A Deck's `text_commit` (input method, Characters mode,
+Paste as Keystrokes) is typed as Unicode key events: a key-down and key-up
+whose `CGEventKeyboardSetUnicodeString` carries at most 20 UTF-16 units
+(`arcen_input::text::utf16_chunks` keeps surrogate pairs, emoji sequences,
+flags and combining marks whole), keycode 0, no modifier flags (a held
+Command must not turn text into a shortcut), posted at the HID tap like every
+key. Applications read the string, not the keycode, so the Mac's layout does
+not matter. It needs what keys need — Accessibility — and cannot exist at the
+login window (no `CGEvent` may be created there), so the hello advertises
+`text_commit`/`text_commit_unicode` from exactly that (`text_input` in
+`AdvertisedCapabilities`). Proven with the ignored end-to-end test
+`committed_text_is_typed_and_health_stats_carry_the_path`, run with a probe
+app's text view frontmost (the harness checks the frontmost pid before every
+commit): 337 characters in four commits, 20 key events, read back from the
+text view as exactly the string sent. Do not run that test without the
+target pid: the events go to whatever is in front.
+
+**Host health for the Deck.** Every two seconds the stream sends
+`health_stats` built from `arcen_telemetry::HostWindowTracker` and
+`assess_health`. ScreenCaptureKit is damage-driven, so the frame rate is
+judged against what capture offered (a still desktop is not a fault); a
+window in which nothing was sent at all, keepalive included, is judged
+against the full target and reads as critical. The `path` is measured on the
+QUIC connection by `arcen_transport::PathQualityTracker`: by the stream when
+it owns the connection (`serve`, tests) and otherwise by the network service,
+which fills it into the agent's `health_stats` as it relays them
+(`relay.rs`, `with_service_path`).
+
+**Cursor images are not sent, by necessity.** Linux and Windows Piers send
+the application's cursor bitmap (`cursor_image_v1`); this host sends named
+shapes only (`cursor_probe.rs`). No public API reports another process's
+cursor image — `NSCursor.currentSystemCursor` returns the caller's own
+cursor, measured — and ScreenCaptureKit carries no cursor metadata. A Deck
+that wants the exact cursor uses host-cursor mode, where the compositor draws
+it into the picture.
 
 **Audio negotiates and no longer blocks the desktop.** Measured end to end:
 102 audio packets reached a client alongside 45 video frames. The current
@@ -100,12 +172,12 @@ end-to-end test `host_audio_reaches_the_client_when_capture_is_available`
 asserts both sides of that claim: the host counted packets and the client
 received audio frames.
 
-Two things about it are not obvious and cost a day between them:
+Two things about it are not obvious:
 
 * Apple raises the **system audio recording consent prompt inside**
   `AudioDeviceCreateIOProcIDWithBlock`, and the call does not return until it
-  is answered. On the lab Mac, telemetry reached `stage=ioproc` at 23:36:53 and
-  `stage=device_start` at 23:37:53: `AudioDeviceStart` took sixty seconds.
+  is answered. Measured: telemetry reached `stage=ioproc` and then
+  `stage=device_start` sixty seconds later, `AudioDeviceStart` waiting on the prompt.
   Capture therefore starts on its own thread under a 1500 ms budget and is
   collected only if it arrives in time. **Audio must never gate the desktop.**
 * `supports_audio` is now advertised from the Screen Recording consent grant,
@@ -153,16 +225,14 @@ was heard. A session can authenticate, bind the right desktop, negotiate
 
 ## Test the binary you built, not the one that was lying around
 
-`packaging/macos/build-pier-app.sh` used to *check* that
-`target/release/arcen-pier-macos` existed and package whatever it found. A
-telemetry fix was written, unit-tested, packaged, signed, installed on the lab
-Mac and then measured still failing — because the binary inside the package
-predated the fix by forty minutes. Every step in between was honest: the
-signature verified, the installer succeeded, launchd restarted the agent on
-the new file. The file was simply old.
+`packaging/macos/build-pier-app.sh` builds the executable it packages; a
+script that only checked that `target/release/arcen-pier-macos` existed would
+package whatever it found. A signature that verifies, an installer that
+succeeds and launchd restarting the agent on the new file say nothing about
+whether that file contains the change.
 
-The script now builds. When something you just fixed still misbehaves on the
-lab, confirm the artefact before you re-read the code:
+When something you just fixed still misbehaves on a test host, confirm the
+artefact before you re-read the code:
 
 ```sh
 strings "Arcen Pier.app/Contents/MacOS/arcen-pier-macos" | grep -c <a-new-string>
@@ -173,7 +243,7 @@ change.
 
 ## Audio, end to end
 
-Proven on the lab Mac after a clean uninstall and install, with sound playing:
+Proven on a test Mac after a clean uninstall and install, with sound playing:
 
 ```
 media-smoke complete
@@ -255,6 +325,10 @@ arcen-pier-macos probe-input        # pointer placement, read back and restored
 arcen-pier-macos probe-keyboard     # key delivery via HID system key state
 arcen-pier-macos probe-clipboard    # pasteboard round-trip and change tracking
 arcen-pier-macos probe-audio        # tap, format, mute evidence, samples heard
+arcen-pier-macos probe-virtual-hid  # may this signature create a HID device
+arcen-pier-macos probe-pen          # lab builds only: Tablet support pen, read back from AppKit (hovers unless --strokes)
+arcen-pier-macos probe-pen-hid      # what a virtual pen digitizer delivers (hovers only)
+arcen-pier-macos probe-bridged-hid  # lab builds only (lab-bridged-hid-probe): bridged tablet devices as the HID system sees them
 arcen-pier-macos new-host-cert      # certificate material, shared policy
 ```
 
@@ -287,9 +361,9 @@ require Release/Security review.
 
 ## Streaming evidence lives in STREAMING.md
 
-What the pipeline measures at, and which theories about it turned out to be
-wrong, are in [`STREAMING.md`](STREAMING.md). The short version, because each
-of these was believed and is false:
+What the pipeline measures at, and what the measurements rule out, are in
+[`STREAMING.md`](STREAMING.md). The short version, because each of these is
+a plausible belief that is false:
 
 - VideoToolbox **already uses hardware**, measured by read-back at every size
   and both codecs. Not requesting hardware proves nothing; hardware has been
@@ -305,9 +379,8 @@ of these was believed and is false:
 ## Packaging and install traps live in PACKAGING.md
 
 Building a signed and notarized `.pkg`, and the install-time traps that
-produced an afternoon of "it installed fine and the client times out", are
-written up in [`PACKAGING.md`](PACKAGING.md). The short version, because each
-of these cost real time:
+make "it installed fine and the client times out", are written up in
+[`PACKAGING.md`](PACKAGING.md). The short version:
 
 - Signing the installer needs a **different certificate** from signing the
   apps inside it.
@@ -332,11 +405,11 @@ of these cost real time:
   its own side channel and from there onto the audio lane. Do not route media
   onto the control lane or reintroduce a single Deck stream.
 
-## The lab Mac is a delivery target, not a workstation
+## Validate installers on a clean target
 
-Mac-S-08 exists to answer one question: does the shipped package install,
-run and uninstall on a machine that never built it. That is only worth
-anything while it stays a machine that never built it.
+Installer qualification answers one question: does the shipped package
+install, run and uninstall on a machine that never built it. That is only
+worth anything while the target stays a machine that never built it.
 
 So nothing developer-side runs there. No `xcrun`, no `cargo`, no `clang`, no
 toolchain install, no compiling a scratch probe in `/tmp`. Invoking `xcrun`
@@ -344,10 +417,10 @@ alone is enough to raise the Command Line Tools installer on the console,
 which both interrupts whoever is sitting there and quietly turns the clean
 machine into a dirty one.
 
-Build and compile here, on the development Mac. Copy the finished artefact
+Build and compile probes on a development Mac. Copy the finished artefact
 across and run it. If something can only be measured by compiling on the
-target, that is worth saying out loud rather than working around, because it
-usually means the test is measuring the toolchain rather than the product.
+target, say so rather than working around it, because it usually means the
+test is measuring the toolchain rather than the product.
 
 ## Virtual HID, and what it gates
 
@@ -358,7 +431,7 @@ in the current SDK. It needs no DriverKit extension, no system extension, no
 user approval dialog and no reboot.
 
 It needs `com.apple.developer.hid.virtual.device`, and that requirement was
-measured rather than read. On Mac-S-08, macOS 26.5.2, a probe carrying no
+measured rather than read. On a macOS 26.5.2 test host, a probe carrying no
 entitlement:
 
 | Run | `IOHIDUserDeviceCreateWithProperties` | `errno` |
@@ -385,15 +458,140 @@ behaviour, not a stub.
 is permission to interact with *hardware*; Arcen's pen samples arrive over a
 network. They are the wrong axis entirely.
 
-`IOUSBHostControllerInterface` is the alternative and is the worse one. It needs
-its own managed entitlement, and the reference material — a commercial product
-that solved this same problem — does not use it: an exhaustive `nm -u` scan
-across its 172 Mach-O files found no `IOUSBHost*` user, no `.dext`, no
-`.systemextension` and no kext. Its session binary imports
-`IOHIDUserDeviceCreateWithProperties` and carries
-`com.apple.developer.hid.virtual.device` under a Developer ID signature, which
-also settles the distribution question: this entitlement is obtainable outside
-the Mac App Store.
+`IOUSBHostControllerInterface` is the alternative and is the worse one: it
+needs its own managed entitlement, a user-mode host controller, and none of
+it is required to present a HID device. The virtual HID entitlement, by
+contrast, is granted to Developer ID applications, so it is obtainable
+outside the Mac App Store (the Pier's own profile carries it).
+
+## A virtual pen digitizer, measured
+
+The obvious design for a pen on a macOS host is a virtual HID digitizer: a
+generic pen (`arcen_input::hid_digitizer::PEN_DESCRIPTOR`, Digitizers page,
+tip/barrel/invert/eraser/in-range, 16-bit X/Y, 8192 pressure levels, tilt and
+twist) published through `IOHIDUserDevice` with the entitlement, so macOS's own
+HID stack would produce tablet events for every application. With the
+tablet maker's driver installed on the host, that driver is what turns the
+reports into pressure.
+
+Without a vendor driver it does not work, and that is measured, not read. On
+macOS 26.7.2, entitled, with an AppKit window and a listen-only event tap
+reading back what the window server posted:
+
+| | Generic HID digitizer | CoreGraphics tablet events (what the Pier posts) |
+| --- | --- | --- |
+| Tablet proximity event, pen/eraser type | yes, capability mask `0x2587` | yes, mask `0x25c7` |
+| Pointer events with the tablet subtype | yes | yes |
+| `NSEvent` pressure / tilt / rotation | **0 / 0 / 0, always** | the values sent |
+| Separate tablet-point events | posted, tilt mis-scaled (raw / 32767), rotation raw / 64, pressure 0; **an AppKit window received none** | not needed |
+| When the tip goes down | at 75 % pressure (`kIOHIDDigitizerTipThresholdKey`), not the Tip Switch | at the Deck's touch edge |
+| Where it lands | the display under the pointer, whichever that is | the exact point asked for |
+
+So Tablet support on a macOS Pier stays on CoreGraphics. Nothing about it needs
+the entitlement or root; pointer injection does not even need Accessibility.
+`arcen-pier-macos probe-pen-hid` re-asks the question on whatever macOS it runs
+on — it creates the digitizer, puts the pointer on the main display, hovers the
+pen with tilt and rotation, never presses, and prints what arrived — so the
+decision can be revisited when Apple's answer changes. It needs the same
+signature and Accessibility as the injector, plus permission to observe events.
+
+Two facts from that work are worth having before anyone touches the login
+window's pointer: macOS maps an absolute HID pointer or digitizer onto **the
+display the pointer is on** at each report (warp first, then report), and a
+device created with tip pressure decides contact from the pressure threshold
+whatever its Tip Switch says.
+
+## Native tablet: one path
+
+One Native tablet way on this host: the Pier reads a known model's pen
+itself (`arcen_usb_bridge::IntuosPenReader`). An unknown model is refused in
+`bridged_tablet::authorize` with its ids (ADR 0022 §14.2);
+there is no proximity-only fallback and no vendor-driver detection. Where the
+pen points is the shared path of
+[ADR 0023](../../docs/adr/0023-one-native-tablet-pen-position-path.md):
+`bridged_tablet::host_pen_sample` is the adapter (device units →
+`arcen_input::tablet_pointer::PenSample`), `HostPenPointer` is glue over the
+shared `PenPointerLead` and `HostPointerFeed`. Never map pen fractions to
+pixels here; the injected event and the reported position use the same
+scaling. The Deck draws the same pen dot as for a Linux Pier. Proofs: unit
+tests here, and a real tablet in Chrome (Safari reports every pen as a
+mouse).
+
+## Native tablet: the Pier as USB host driver
+
+[ADR 0022](../../docs/adr/0022-macos-pier-native-tablet-hid-adapter.md)
+(Proposed). With the default feature `native-tablet` the session runs the shared USB
+host driver (`arcen_usb_bridge::HidHostAdapter`) over the Deck's bridged
+tablet and the existing `hid-injector` child, started as
+`hid-injector --bridged-usb`, presents one `IOHIDUserDevice` per HID
+interface. `bridged_tablet.rs` is the session side, `input/bridged_hid.rs`
+the child. Since 0.19.0 release Piers carry it and offer it when signed
+`--with-virtual-hid` (the entitlement is the gate). A known model (Intuos5
+touch L) is read by the Pier and posted as CoreGraphics tablet events with
+pressure (ADR 0022 §14.1); other models get buttons and proximity only.
+`probe-bridged-hid` writes the Wacom mode switch, so it is built
+only with `--features lab-bridged-hid-probe`.
+
+- **First connection.** Devices hot-plug into the running Aqua session, the
+  Deck names its tablet in the same connection's client hello, and the hello
+  waits (≤ 3 s) for a capability probe still running instead of refusing.
+  Keep all three: a hello that says "still checking" is a lost first
+  connection.
+- **Creation needs the responsible app's Accessibility**, measured again: the
+  same signed binary creates devices when started from a terminal that holds
+  it, and is refused as its own launchd job on a Mac where the app has no
+  grant. In the product the responsible app is the Agent Helper.
+- **Published devices are system-wide.** There is no seat to confine an
+  `IOHIDUserDevice` to, so only pen digitizer and vendor interfaces are
+  published (`bridged_tablet::PUBLISH_POLICY`, shared `publishable`), never a
+  keyboard, keypad or mouse, nor anything on Apple's own vendor pages
+  (`APPLE_EVENT_PAGES`: vendor keyboard `0xFF01` is Spotlight, Launchpad, Fn
+  and brightness), and `SessionTablet` kills the device owner the
+  moment the console leaves this agent's account (`ConsoleWatch`, re-read
+  every 100 ms and before forwarding USB traffic). Keep both: without them a
+  Fast User Switch hands the next account a live keyboard.
+- **macOS rewrites `Transport` to `"Virtual"`** for an unprivileged creator,
+  and the tablet maker's driver (Wacom Tablet 6.4.9) does not open the
+  bridged devices, so pressure comes only from the Pier's own reader below.
+- **Pressure: the Pier reads a known pen itself (2026-11-12;
+  ADR 0022 §14).** Part of Native tablet, no extra feature. For a
+  model the shared reader knows (`arcen_usb_bridge::IntuosPenReader`,
+  `HOST_DECODED_INTUOS_MODELS`, today the Intuos5 touch L only) the session
+  reads the pen's Wacom mode (`GET_REPORT(Feature 2)`), switches it
+  (`[2,2]`), reads the pen interface's packets instead of handing them to
+  the published device, and posts CoreGraphics tablet events through
+  `InputSession::apply_host_pen` — the route Wacom's own driver uses (its
+  `com.wacom.IOManager` imports `CGEventPost`). When the attachment ends with
+  the Deck still connected it puts back the mode it read (the request is
+  left to finish, not cancelled); the Deck's hand-back reset restores the
+  power-on mode in any case. Any other model keeps the published HID device
+  and the no-pressure notices. The Deck is told `HOST_PEN_NOTICE`.
+- **The cursor follows the pen on the Deck.** A bridged tablet moves only
+  this host's pointer, so for a Deck that declared `cursor_position_v1` with
+  a local cursor the single-display stream reports where each posted pen
+  sample put the pointer (`bridged_tablet::HostPenPointer`, shared
+  `HostPointerReporter`: first rest position never sent, ≤ 120 Hz, newest
+  wins) as `CursorPosition` records; the Deck draws its cursor there until
+  its own mouse moves. `cursor_mode_result.cursor_positions` says so.
+  The daemon relays them through the shared `CursorPositionRelay`
+  (`PierLaneRelay`). Multi-display sessions report none yet. Measured on
+  the lab Pier with the emulated stroke: `NSEvent` pressure 0.059 → 1.000
+  in an AppKit window, 74 of 74 positions at the Deck (ADR 0022 §14.1).
+- The ignored end-to-end tests drive the emulated Intuos5: with the host pen
+  reader they **post pen events with pressure on the Mac that runs them**.
+  Never run them on a Mac someone is using; `probe-pen --intuos5` presses
+  too — run it only with a window you own proven topmost under the middle
+  half of the main display.
+- Prove it with the ignored end-to-end test
+  `a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down`
+  (`ARCEN_E2E_PIER_PROGRAM=<signed lab Pier binary>`, run from a terminal
+  with Accessibility; `ARCEN_E2E_TABLET_HOLD=1` holds the devices for 60 s;
+  `ARCEN_E2E_TABLET_CONSOLE=login-window|other-user` then hands the console
+  away in-process and asserts the devices go)
+  and look from outside with `ioreg -r -c IOHIDUserDevice -l`, `hidutil
+  list` and `arcen-pier-macos probe-bridged-hid [--mode-switch] [--count S]`
+  (a Pier built with `--features lab-bridged-hid-probe`).
+  The test hovers the emulated pen and never clicks.
 
 ## The login window: what is measured, and what is not claimed
 
@@ -417,9 +615,8 @@ takes four things together:
    backend is therefore `InputBackend::VirtualHidOnly`, whatever
    `input_backend` says. The `hid-injector` child owns a boot keyboard and an
    absolute pointer, both described in `arcen_input::hid_reports`. The absolute
-   pointer measured exact, with no acceleration. The reference does the same
-   split: its log says *"login window closed, switching to CG mouse input"*,
-   and it creates a virtual mouse next to its keyboard.
+   pointer measured exact, with no acceleration. A signed-in desktop's
+   agent uses its configured `input_backend` again.
 4. **An authorization plug-in**, in `/Library/Security/SecurityAgentPlugins`,
    for single sign-on into the login exchange. This one is *not* built.
    Signing in means typing the password into the streamed login window, which
@@ -436,8 +633,8 @@ make the Deck keep credentials it should have dropped.
 **Consent is not headless.** Screen capture at the login window raises a
 consent prompt in the root context. Until someone at the machine answers it,
 ScreenCaptureKit delivers a few frames and then stalls. TCC consent is per user,
-and the login window has none. The reference's installer restarts its agent to
-raise these prompts while somebody is still logged in, for the same reason.
+and the login window has none. Consent prompts must therefore be raised and
+answered while somebody is logged in.
 
 **Apple publishes no contract that third-party code may capture the login
 window.** Every piece above is documented on its own, but the combination is

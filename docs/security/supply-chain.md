@@ -117,6 +117,5 @@ Future platform signing hooks and the detached release-manifest signing hook
 are mandatory and must fail closed on missing hooks or outputs. Signing keys,
 and notarization credentials belong only in
 reviewer-protected, least-privilege environments and must never be exposed to
-pull-request code.
-See [Release automation](../operations/release-automation.md) for the current
-account limitations and enablement checklist.
+pull-request code. Releases are built, signed and notarised by hand until
+then; see [Versioning and releases](../operations/versioning-and-releases.md).

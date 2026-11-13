@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! COM server plumbing shared by every object in the DLL: a fail-closed panic
 //! guard for the FFI boundary, an honest DLL reference counter that backs
 //! `DllCanUnloadNow`, and the two required DLL exports.

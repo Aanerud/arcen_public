@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Vendor-neutral pen-tablet classification from HID report descriptors.
 //!
 //! A drawing tablet is recognised by what its HID report descriptor says it

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Native macOS Pier control-plane foundation.
 //!
 //! The crate deliberately starts with the OS-free admission and diagnostics
@@ -27,6 +29,11 @@ pub mod auth;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod blocking;
+/// What the HID system sees of a bridged tablet. Lab builds only
+/// (`--features lab-bridged-hid-probe`): it writes the Wacom mode switch.
+#[cfg(all(target_os = "macos", feature = "lab-bridged-hid-probe"))]
+pub mod bridged_hid_probe;
+pub mod bridged_tablet;
 #[cfg(target_os = "macos")]
 pub mod capture;
 pub mod clipboard;
@@ -52,6 +59,10 @@ pub mod multi_capture;
 pub mod multi_monitor;
 pub mod net;
 pub mod observability;
+/// Whether a Deck's Tablet support pen reaches applications here. Lab builds
+/// only (`--features lab-pen-probe`): it injects input.
+#[cfg(all(target_os = "macos", feature = "lab-pen-probe"))]
+pub mod pen_probe;
 pub mod permissions;
 #[cfg(target_os = "macos")]
 pub mod relay;
@@ -70,6 +81,22 @@ pub mod virtual_display;
 pub mod virtual_hid;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// This build of the macOS Pier, as its hello advertises it.
+#[must_use]
+pub fn build_identity() -> arcen_protocol::messages::BuildIdentityMsg {
+    arcen_protocol::build_identity::this_build("arcen-pier-macos", VERSION)
+}
+
+/// The start-up line that names the exact build serving, so a log answers
+/// "which build was this" the way the Deck's own log does.
+#[must_use]
+pub fn startup_build_line(build: &arcen_protocol::messages::BuildIdentityMsg) -> String {
+    format!(
+        "{} {} build {} rev {} ({})",
+        build.product, build.version, build.build_id, build.source_revision, build.build_profile
+    )
+}
 
 /// Whether a test may click, type, scroll or write the pasteboard on the
 /// desktop it runs on.
@@ -323,6 +350,7 @@ pub fn default_config() -> PierFileConfig {
         redirection: arcen_session::pier_config::RedirectionConfig::default(),
         logging: arcen_session::pier_config::LoggingConfig::default(),
         wayland: arcen_session::pier_config::WaylandConfig::default(),
+        usb: arcen_session::pier_config::UsbConfig::default(),
         platform: MacOsPlatformConfig::default(),
     }
 }
@@ -612,6 +640,25 @@ pub fn run(config: &PierFileConfig, startup: &StartupConfig) -> Result<(), Strin
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+
+    #[test]
+    fn the_start_up_line_names_the_stamped_build() {
+        let build = arcen_protocol::build_identity::from_environment(
+            "arcen-pier-macos",
+            "0.19.0",
+            arcen_protocol::build_identity::BuildEnvironment {
+                build_id: Some("20261109T1400Z-0.19.0-0123abcd"),
+                source_revision: Some("0123abcd"),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            super::startup_build_line(&build),
+            "arcen-pier-macos 0.19.0 build 20261109T1400Z-0.19.0-0123abcd rev 0123abcd (release)"
+        );
+        assert_eq!(super::build_identity().product, "arcen-pier-macos");
+    }
 
     #[test]
     fn a_missing_configuration_is_not_a_broken_one() {

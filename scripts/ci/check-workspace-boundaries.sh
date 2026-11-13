@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
 # Prove the dependency direction the architecture relies on.
 #
 # - Every package is named arcen-*.
@@ -24,6 +26,9 @@ hosts/windows hosts/windows/cp-ipc
 hosts/windows hosts/windows/iddcx-provider
 hosts/windows/credential-provider hosts/windows/cp-ipc
 clients/macos clients/macos/usb-helper
+clients/macos/usb-helper clients/macos/usb-iousbhost
+clients/macos/usb-helper clients/macos/secure-dir
+clients/macos/usb-iousbhost clients/macos/secure-dir
 '
 
 jq -e 'all(.packages[]; .name | startswith("arcen-"))' <<< "$metadata" >/dev/null ||
@@ -40,7 +45,7 @@ while IFS=$'\t' read -r package manifest dependency path; do
             echo "shared crate $package ($from) depends on $dependency ($to)" >&2
             status=1
             ;;
-        hosts/* | clients/* | gateway/* | tests/*)
+        hosts/* | clients/* | tests/*)
             [[ "$to" == shared/* ]] && continue
             if grep -qxF "$from $to" <<< "$allowed_edges"; then
                 continue

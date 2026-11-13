@@ -39,7 +39,8 @@ Arcen Deck build `1d6af87` or later.
 
 Bridge mode operational note: Native tablet (USB bridged) — wire token
 `wacom_usb_bridge`, a legacy name for a vendor-neutral mode — is visible in Deck settings,
-but hosts without a complete USB bridge backend return explicit
+but hosts without a complete USB bridge backend (every Windows Pier, by
+decision: [ADR 0017](../adr/0017-forward-only-pen-input.md)) return explicit
 `tablet_mode_result.accepted = false` plus a reason; operators should expect
 `active = disabled_mouse_compat`. Native mode is explicit and never causes an
 implicit switch to Tablet support.
@@ -174,15 +175,26 @@ sudo evtest
    reports `PT_PEN` pointer type, continuously varying pressure (mapped to
    the documented `0..=1024` range — do not expect or claim 8192 levels),
    tilt, and rotation where the drawing tool provides it.
-3. Flip to the eraser end; confirm the surface reports the eraser flag.
-   Press a barrel button; confirm the surface reports it as the pen barrel
-   button.
+3. Flip to the eraser end; confirm the surface reports it inverted
+   (`PEN_FLAG_INVERTED`) while it hovers, without a click, and adds the
+   eraser flag only when it touches. Press either barrel button; confirm the
+   surface reports the pen barrel (Windows Ink has one, reported as the
+   second pointer button).
 4. Confirm hover (in-range, not in contact) is visually distinct from
    contact (tip down), and that the injected coordinates land at the
-   correct point on the session's selected display.
+   correct point on the session's selected display — including, in a
+   multi-monitor session, a Deck display placed left of or above the
+   primary.
+
+   Without a physical pen, `arcen-deck input-smoke … --pen-full` sends a
+   fixed script (hover row, tip stroke with a pressure ramp and tilt, barrel
+   stroke, eraser hover and rub, second-button tap, corner taps) whose
+   values a `WM_POINTER` logger in the session can check one by one.
 5. Confirm **no Wintab-only application** is expected to receive input here
-   — this backend is Windows Ink/`WM_POINTER` only; Wintab support is not
-   claimed.
+   — this backend is Windows Ink/`WM_POINTER` only, and Arcen does not
+   support Wintab ([ADR 0017](../adr/0017-forward-only-pen-input.md)). Set
+   each drawing application to Windows Ink as in
+   [section 4a](#4a-windows-applications-choose-windows-ink).
 6. Force `CreateSyntheticPointerDevice` to fail (e.g. run on an
    unsupported/older Windows build, or with Windows Ink disabled via Group
    Policy) and confirm the Pier advertises every pen capability as
@@ -191,6 +203,93 @@ sudo evtest
 7. Disconnect mid-contact; confirm proximity/contact is released (no stuck
    pointer state) and a subsequent reconnect creates a fresh, clean
    `PenInjector`.
+
+## 4a. Windows applications: choose Windows Ink
+
+> **Wintab is not supported.** Arcen gives a Windows host a Windows Ink pen
+> and nothing else. Windows itself has no Wintab: `wintab32.dll` comes with a
+> tablet maker's driver, and Arcen does not install one, ship its own, or
+> pretend to be a tablet maker's device. An application set to Wintab sees no
+> tablet over Arcen and draws with mouse pressure; switch it to Windows Ink.
+> Native tablet (USB bridged), which would let the host's own tablet driver
+> provide Wintab, is not offered on Windows hosts either. Why:
+> [ADR 0017](../adr/0017-forward-only-pen-input.md).
+
+A Windows Pier gives the session a Windows Ink pen
+(`CreateSyntheticPointerDevice` / `InjectSyntheticPointerInput`, pressure
+`0..=1024`, tilt, rotation, eraser, barrel button). Most drawing applications
+offer both Wintab and Windows Ink; set them to Windows Ink (or pointer input,
+or Real-Time Stylus — the same Windows path under other names):
+
+| Application | Setting |
+| --- | --- |
+| Photoshop | Windows Ink is the default. If `PSUserConfig.txt` contains `UseSystemStylus 0`, remove that line (it selects Wintab) and restart. |
+| Krita | Settings › Configure Krita › Tablet settings: **Windows 8+ Pointer Input**. |
+| Blender | Preferences › Input › Tablet API: **Windows Ink**. |
+| ZBrush | Preferences › Tablet › Tablet Driver API: **Stylus** (WinTab is ZBrush's default). |
+| Toon Boom Harmony | Preferences › Advanced: clear **Use Qt Wintab Tablet Support**, then restart Harmony. |
+| TVPaint Animation | Preferences › Drawing: choose **Ink** instead of Wintab. |
+| Corel Painter | Preferences › Tablet: **RTS-compatible (Real-Time Stylus)**. |
+| Rebelle | Preferences › Tablet: **Microsoft Ink** or **Windows Pointer Device**. |
+| Clip Studio Paint | Preferences › Tablet: **Tablet PC**. |
+| Maya | Preferences › Interface › Tablet API: **Windows Ink** (or Automatic). |
+| Substance 3D Painter | Uses Windows Ink since 2019.3; nothing to change. Adobe documents Windows Ink as unsupported in virtual machines, so a Pier that is a VM may give it no pressure. |
+| Houdini 21 | Uses Windows Ink unless `HOUDINI_ENABLE_WINTAB=1` is set in its environment; leave that unset. |
+| Mari 4.7 and earlier | Wintab only: not supported, no pressure through Arcen. Mari 4.8 and later support Windows Ink. |
+
+The settings come from each application's own documentation and were not all
+tried with Arcen; check pressure with a light and a heavy stroke after
+changing one. Pressure has 1,025 steps on Windows whatever the tablet offers.
+An application with no Windows Ink mode gets no pressure on a Windows Pier;
+no Wintab route is planned.
+
+## 4b. macOS Pier: CoreGraphics tablet events
+
+A macOS Pier posts the tablet events a Mac tablet driver posts: a
+`kCGEventTabletProximity` event (pen or eraser, capability mask `0x25c7`) when
+the tool arrives and leaves, and pointer events with the tablet-point subtype
+carrying pressure in both `kCGMouseEventPressure` (what `-[NSEvent pressure]`
+reads, 256 levels) and `kCGTabletEventPointPressure` (full precision), tilt,
+rotation and barrel buttons (first barrel = right button, second = middle).
+No entitlement and no driver on the host is needed for it.
+
+1. Open a pressure-aware application on the host (Krita, Photoshop, or any
+   AppKit canvas) in a session with Tablet support negotiated.
+2. Draw a stroke with varying pressure; confirm the width or opacity follows
+   it. Before 0.19.0 every stroke arrived at full pressure.
+3. Tilt and rotate the pen where the brush uses them; flip to the eraser end
+   and confirm the application switches to its eraser (it is told through
+   `tabletProximity:`).
+4. Press a barrel button while hovering; confirm a right click.
+5. At the login window the pen is a plain pointer (tip and barrel buttons
+   only), and the hello says so.
+
+**Browsers on the host.** Use Chrome, not Safari, for a browser pen test such
+as a stylus test page. Safari reports every pen on macOS as a mouse with
+pressure 0.5 whenever a button is down, whichever tablet and whatever driver
+posts the events: WebKit's macOS mouse events take no tablet subtype, pressure
+or tilt from `NSEvent`, and `WebMouseEvent::pointerType()` returns `mouse` on
+macOS (WebKit `Source/WebKit/Shared/WebMouseEvent.h` and
+`Source/WebKit/Shared/mac/WebEventFactory.mm`, main `69595416`, read
+2026-11-12). Chrome takes the pen type from the proximity event and pressure,
+tilt and rotation from each tablet-point event; measured through a macOS Pier
+in Tablet support on 2026-11-12 (Chrome 153): `pointerType` pen, pressure
+0.047–0.984, tilt X 40 to −30, rotation 0–180, eraser `buttons` 32. Chrome
+reports `tiltY` with the opposite sign to `-[NSEvent tilt]` (its view is not
+flipped, `components/input/web_input_event_builders_mac.mm`), so a pen
+reported tilted towards the user by AppKit reads negative there; the host
+passes AppKit's value through unchanged, as a local tablet driver does.
+
+Without a person at the host, the loopback end-to-end test drives the Pier's
+real stream and input path:
+`cargo test -p arcen-pier-macos --test end_to_end pen_samples_sent_by_a_client_are_injected_as_tablet_events -- --ignored`.
+It injects real events at 40–44 % of the main display, so put a window you own
+there first, or nothing, and never run it on a desktop someone is using.
+
+`arcen-pier-macos probe-pen-hid` (a signed build with the virtual HID
+entitlement, run from the Aqua session) records why a virtual HID digitizer is
+not used: on macOS 26.7.2 it reports `pointer_max_tilt: 0.0` and
+`pointer_max_rotation: 0.0` for a pen that sent 50° and 230°.
 
 ## 5. Old-peer fallback and default-disabled raw-HID
 
@@ -244,12 +343,10 @@ A `/dev/uhid` device created with Wacom's vendor ID binds **no driver at all**
 on RHEL 9, so no input device appears and there is no pen. `wacom.ko` is a USB
 driver and a uhid device is not a USB device.
 
-This is not a defect to fix here. It is the answer to the open empirical
-question in
-[`../todo/input-only-usb-bridging.md`](../todo/input-only-usb-bridging.md),
-which already separates the implemented typed path ("Light") from the future
-native USB bridge ("Hard") and already states that the experimental raw-HID
-path is lab scaffolding that must not grow into the bridge. The full
+This is not a defect to fix here. It answers the open empirical question of
+input-only USB bridging: the design already separates the implemented typed
+path ("Light") from the native USB bridge ("Hard"), and the experimental
+raw-HID path is lab scaffolding that must not grow into the bridge. The full
 measurement, the reference's `usb-vhci` architecture, the out-of-tree kernel
 module cost, and the reopened client entitlement question are all recorded
 there — that document is authoritative; do not re-derive it from this one.
@@ -262,7 +359,7 @@ typed pen path, which is the supported configuration.
 ## 5b. Tilt reaches the Linux host but is not observed by applications
 
 Reported 2026-08-12: pen tilt works on a Windows Pier and not on a Linux Pier.
-Not investigated further at the owner's direction; this records the measurement
+Not investigated further; this records the measurement
 so the client side does not get re-examined needlessly.
 
 **Update 2026-10-19 (real-screen stylus tests, Firefox 140 and Chrome 155 on
@@ -306,7 +403,22 @@ enough to have cost a diagnosis.
 
 ## 5c. Native tablet (USB bridged) with any tablet
 
-Lab-only (`usb-hard-lab` builds of the Deck and the Linux Pier). The privileged
+Every release Deck carries Native tablet and its privileged helper (IOUSBHost
+capture, [ADR 0019](../adr/0019-iousbhost-usb-backend.md)); it needs macOS 13
+on the Deck, and on an Intel Deck it is untested on hardware. A Linux Pier offers it only when the administrator has enabled it
+(`usb.native_tablet = "enabled"`, `install-arcen-pier --native-tablet`; see
+[Native tablet in the administration guide](pier-administration.md#native-tablet-usbnative_tablet)),
+and refuses with "Native tablet is not enabled on this host…" otherwise. A
+macOS Pier offers it when signed with the virtual-HID entitlement: with
+pressure, tilt, eraser and barrel buttons for a model the Pier reads itself
+(the Wacom Intuos5 touch L; measured with an emulated Intuos5, pressure 0.059
+to 1.000, a real tablet not yet measured), buttons and proximity only for
+models Arcen does not know yet
+([ADR 0022 §14.1](../adr/0022-macos-pier-native-tablet-hid-adapter.md)).
+Windows Piers never offer it ([ADR 0017](../adr/0017-forward-only-pen-input.md)).
+Keep the Deck's cursor rendering on **Local**: the Pier reports where the
+host's pointer is and the Deck draws it there. When the session ends the
+helper hands the tablet back to macOS like an unplug and replug. The privileged
 `arcen-usb-helper` picks the first attached device whose interfaces are all HID
 and whose report descriptors classify as a pen tablet. It reads them from the
 I/O Registry (`IOHIDDevice` `ReportDescriptor`), so keyboards and mice it
@@ -336,6 +448,181 @@ Deck, which forwards them in `client_hello.usb_hard_device`.
    (`dmesg`, `libinput list-devices`). A device that serves a descriptor
    contradicting its authorization ends the session with
    `event=usb_hard_device_refused` and the reason in the Pier log.
+5. **X11 (dedicated Xorg desktop):** the tablet works on the first
+   connection ([ADR 0021](../adr/0021-bridged-usb-devices-on-their-own-seat.md)).
+   It stays on `seat0`, tagged for this desktop's X server alone, which
+   hot-adds it when it connects and drops it when the Deck disconnects. The
+   Pier logs `Hard USB bridge up for this X11 desktop only` and `bridged
+   tablet nodes verified`; the desktop's `Xorg.log` shows `config/udev:
+   Adding input device Wacom …` and `Applying InputClass
+   "arcen-bridged-usb-session"`. Only tablets the kernel `wacom` driver
+   serves, with xf86-input-wacom installed, are taken; others are refused
+   with a reason (Native tablet stops, the session goes on). Preconditions:
+   `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` (installed by the
+   installer) and every running X server started after it; otherwise the
+   Deck is told "Native tablet is not ready on this host…" and the Pier logs
+   the X server's pid. Restart the display manager once after installing
+   (`systemctl restart gdm` while nobody is signed in at the console), or
+   reboot. A desktop an earlier Pier started does not admit the tablet.
+   The desktop's class turns xf86-input-wacom's `PressureRecalibration`
+   off: over a network round trip a pen often arrives already touching the
+   tablet, and the driver would otherwise take that contact as zero pressure
+   and press no button (pages show pressure but draw nothing). `xinput
+   list-props "<tablet> Pen stylus"` shows `Wacom Pressure Recalibration
+   (…): 0`.
+6. **Isolation checks:** `udevadm info /dev/input/eventN` of each bridged node
+   shows `ID_INPUT.tags=arcen_bridge,arcen_bridge_<display>`,
+   `LIBINPUT_IGNORE_DEVICE=1`, no `ID_SEAT` other than `seat0`, and neither
+   a `uaccess` nor a `seat` tag; `getfacl` shows no user ACL; GDM's `/var/log/Xorg.0.log`
+   shows only `Adding input device …` followed by `Ignoring device from
+   InputClass "arcen-bridged-usb-ignore"` (no driver loaded, no `got fd`);
+   `ls /run/udev/rules.d` shows one `72-arcen-usb-bridge-x11-<display>-….rules`
+   per bridge. After the Deck disconnects, the port, the rule and the nodes
+   are gone.
+7. **Upgrade and rollback:** the rules are volatile. A starting Pier removes
+   rules whose helper has ended, and `install-arcen-pier --uninstall` removes
+   any that remain and the Xorg ignore file. After rolling back to a Pier
+   without this support, remove leftovers with
+   `rm /run/udev/rules.d/72-arcen-usb-bridge-*.rules && udevadm control
+   --reload`; the ignore file only ever matches devices Arcen tagged.
+
+### Linux host: the virtual host controller
+
+The Linux Pier presents the tablet on the distribution's in-tree USB/IP
+virtual host controller, `vhci-hcd` ([ADR 0020](../adr/0020-linux-native-tablet-in-tree-vhci-hcd.md)).
+On Rocky Linux and RHEL it ships only in `kernel-modules-internal`, which the
+installer installs for the running kernel when Native tablet is enabled (opt
+out with `--no-native-tablet-modules`). The out-of-tree `usb-vhci`
+(`/dev/usb-vhci`) is used only as a development fallback when `vhci-hcd`
+cannot be loaded. An enabled Pier loads `vhci-hcd` once, when it starts; connections only check that
+it is present. After installing `kernel-modules-internal` on a running host,
+restart the Pier (or run `modprobe vhci-hcd`) before Native tablet is offered.
+
+1. `arcen-pier validate-config` prints `Native tablet: off: …` while
+   `usb.native_tablet` is not `"enabled"`; otherwise `Native tablet: vhci-hcd is loaded
+   for kernel …`, says it is installed but needs a Pier restart (or
+   `modprobe vhci-hcd`), or gives the reason it is missing with the exact
+   command, for example
+   `dnf --enablerepo=devel install kernel-modules-internal-6.12.0-211.66.1.el10_2.x86_64`.
+   `modinfo -F signer vhci-hcd` names the distribution's kernel signing key.
+2. While a Deck bridges a tablet: `dmesg` shows `vhci_hcd vhci_hcd.0: … Device
+   attached` and the tablet's own driver (for example `wacom`) on
+   `usb-vhci_hcd.0-<port>`; `/sys/devices/platform/vhci_hcd.0/status` shows the
+   port in use; `/run/udev/rules.d/72-arcen-usb-bridge-*.rules` names the seat.
+3. On a native-seat Wayland desktop the bridged nodes belong to the
+   desktop's own seat, never `seat0`: `udevadm info /dev/input/eventN` shows
+   `ID_SEAT=seat-arcen-pen-…` and no `uaccess` tag, and `loginctl
+   seat-status seat0` does not list them (for X11 see step 6 above). On a
+   native-seat Wayland desktop the desktop's `gnome-shell` holds the nodes
+   (`ls -l /proc/<pid>/fd`), and `libinput debug-events --udev <seat>` shows
+   `TABLET_TOOL_TIP` with pressure. A pen that lands already pressing (one
+   bridged report per network round trip, about 41 ms) is still a full
+   stroke there: libinput detects a pressure offset only on a proximity-in
+   that hovers above half the distance range, and a pressing pen reports
+   distance 0.
+   With a Local cursor the Deck draws its pen dot where the pen is, on X11
+   and Wayland alike, from the pen's own evdev reports (see
+   [Native tablet: one path](#native-tablet-one-path)). The Pier log
+   (`logging.level` 2) says `reporting the bridged pen's position from its
+   own node` when the attachment starts and `bridged pen position reader
+   ended` when the tablet goes; on X11 the cursor watcher also logs `the
+   bridged pen's mapping on this desktop` (`WholeArea`, or the remap that
+   hands the cursor back to the X pointer). A multi-output Wayland desktop
+   reports no host positions yet.
+4. After the Deck disconnects, the port is free again in `status`, the rule
+   is gone, and the tablet's devices are gone.
+
+## 5d. Native tablet with an emulated Wacom (no pen in hand)
+
+A Deck built with the lab-only `usb-emulate-lab` feature replaces the
+captured tablet with an emulated Wacom Intuos5 touch L (Linux names `0x0317`
+"Intuos Pro L") that plays a scripted
+pen stroke (`arcen-deck input-smoke … --usb-emulate wacom-intuos5`). The Pier
+negotiates and presents it exactly like a captured Wacom, so the host's own
+`wacom` driver binds it. `scripts/lab/wacom-replay/verify-pen.py`, run as root
+on the host, records the pen's evdev events and asserts position, pressure,
+proximity and the barrel button for every stroke; its README also gives the
+X11-level check for the session. `--usb-emulate-stroke landing` plays strokes
+whose first pen packet already presses (no hover first), as a bridged pen put
+down between two polls arrives; `alternate` mixes both kinds; `realistic`
+plays a stroke shaped like a hand on a bridged tablet (in-range packets, the
+KP-501E Grip Pen's tool id, a hovering descent, a landing already pressing,
+varying pressure and a held tilt); `tilted` plays the scripted stroke with
+both tilt axes sweeping through both signs; `rest` and `hover-rest` end with
+the pen still pressing or still hovering in proximity and hold it there for
+eight seconds, so a lab can cut or end the session while the pen rests;
+`upper-held` plays `realistic` with the upper side switch held throughout.
+None of them is a recording of a real pen: an emulated proof never stands in
+for the physical test. A lab Deck also takes these flags after `--connect
+HOST PORT`, so the GUI plays the emulated pen and its host-led cursor can be
+checked on screen. The emulated
+smoke prints the `cursor_mode_result` and every host cursor position it
+receives (`cursor-position …`). This proves the bridge and the host driver
+without a person; it does not replace the physical test below.
+
+## Native tablet: one path
+
+Native tablet means one thing on every Pier: the tablet itself is attached
+to the host, the host's driver (Linux) or the Pier's own pen reader (macOS)
+interprets it, and the Deck shows where the pen is. Since 0.19.0 there is
+one implementation of "where the pen is"
+([ADR 0023](../adr/0023-one-native-tablet-pen-position-path.md)):
+
+| Step | Linux Pier (X11 and Wayland) | macOS Pier |
+| --- | --- | --- |
+| Read the pen | the bridged pen's own evdev node, read-only, never grabbed, opened `O_NOFOLLOW` and proven to be the verified device | the Pier's Intuos pen reader, from the tablet's own packets |
+| Shared sample | `arcen_input::tablet_pointer::PenSample` (device units, ranges, tool, time) | the same |
+| Who leads | the pen while it is in proximity and the desktop maps the whole tablet to the whole desktop; otherwise the X pointer or GNOME's core pointer | the pen |
+| To the Deck | `CursorPosition` the moment each report arrives (shared `HostPointerFeed`) | the same |
+
+**Enabling it.** On Linux an administrator sets `usb.native_tablet` to
+`"enabled"` in `/etc/arcen/pier.json` (or runs `install-arcen-pier
+--native-tablet`) and restarts the Pier; nothing else enables it (the 0.18
+`ARCEN_USB_HARD_LAB=1` service environment is no longer read). A macOS Pier
+offers it when its signed build holds the virtual-HID entitlement. On the
+Deck, choose **Native tablet (USB bridged)** for the connection.
+
+**What you see.** While the pen is near the tablet, the Deck draws a small
+white dot with a dark ring where the pen points, on every host, whatever
+cursor the host application shows. Move the Mac's mouse and the Mac's own
+cursor takes over at once. When the pen leaves the tablet the dot stays
+where it left.
+
+**Remapped tablets on X11.** The dot is computed for
+`xf86-input-wacom`'s defaults: the whole tablet area, no rotation, an
+identity "Coordinate Transformation Matrix", absolute mode. The Pier reads
+those properties from the session's X server once a second; if any differs
+(you mapped the tablet to part of the screen, rotated it, or switched it to
+mouse mode) the dot follows the X pointer instead, a little later. On GNOME
+Wayland the default mapping is assumed; reading a remap from GNOME Settings
+is a follow-up.
+
+**A held side switch looks like "pen but no ink".** If the upper side
+switch of the pen is held (or reported held by a worn switch), GNOME on X11
+treats it as a held right button: browsers see the tip as a chorded move,
+pressure shows but nothing draws. Lift the pen out of range and put it back
+(reseat), check the switch, or remap the upper switch in the desktop's tablet
+settings. On a Mac, Wacom's preferences may map the same switch to
+double-click.
+
+**Safari on macOS reports every pen as a mouse.** WebKit on the Mac gives
+pages `pointerType: "mouse"` and no pressure for any pen, local or remote.
+Test pen pages in Chrome (or Firefox) on a macOS Pier.
+
+### Lessons (do not forget)
+
+1. **Emulated pens passed while the real tablet failed.** In November 2026
+   every emulated Intuos5 proof passed on X11, Wayland and macOS while the
+   real Wacom failed on all three. Every pen change needs a real-tablet or
+   real-browser proof.
+2. **A hung or held side switch looks exactly like "pen but no ink".** Read
+   `BTN_STYLUS`/`BTN_STYLUS2` on the evdev node and the X button state before
+   theorising about timing or grabs.
+3. **Event-driven evdev positions beat X polling for perceived latency.**
+   The X11 dot used to follow `XQueryPointer` read every 8 ms after
+   `xf86-input-wacom` had processed the event and felt laggy, while the
+   Wayland path, which already read the pen's own reports, did not. The
+   numbers are in ADR 0023.
 
 ## 6. Teardown and logs/privacy
 

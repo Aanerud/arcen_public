@@ -4,11 +4,12 @@ Concurrent capture of several displays exists in
 `hosts/macos/src/multi_capture.rs`, and the wire path now exists in
 `hosts/macos/src/multi_monitor.rs` and `hosts/macos/src/stream.rs`.
 
-That is not the same as a qualified feature. The lab Mac currently has one
-display attached. The multi-display capture test therefore skips itself, and no
-run tonight proved that a Deck can draw two macOS Pier monitors. Until a
-two-display Mac proves capture, negotiation, region frames, and Deck
-presentation together, this remains implemented-but-unqualified.
+That is not the same as a qualified feature: physical multi-display
+qualification remains outstanding. On a Mac with one display the
+multi-display capture test skips itself, and no run has yet proved that a Deck
+can draw two macOS Pier monitors. Until a two-display Mac proves capture,
+negotiation, region frames, and Deck presentation together, this remains
+implemented-but-unqualified.
 
 ## The exchange
 
@@ -98,6 +99,6 @@ media plan per monitor, and reports `TopologyBackendKindMsg::PhysicalOutputs`.
 
 Multi-monitor cannot be qualified on a single-display machine. The test suite
 must be run on a Mac with at least two attached displays, and a real Deck must
-show both regions. Passing on the one-display lab Mac is only evidence that the
+show both regions. Passing on a one-display Mac is only evidence that the
 single-display path still works and that the multi-monitor tests skipped for
 the right reason.

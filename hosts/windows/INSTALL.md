@@ -3,7 +3,7 @@
 This is the focused direct-connection delivery path for x64 Windows 10 1809+/11
 Pro or Enterprise and Windows Server 2022+. It installs one LocalSystem
 Windows service and one additive Credential Provider. It does not install or
-configure Arcen Span, Entra, MFA, or brokered Kerberos.
+configure Entra, MFA, or brokered Kerberos.
 
 ## Build the artifacts
 

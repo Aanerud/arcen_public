@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Loopback proof of the lane carrier's peer liveness (`arcen_transport::
 //! liveness`): a live Deck is heard through keep-alives on an idle
 //! connection, a Deck whose packets stop arriving is proven silent and its

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen shared output lifecycle primitives.
 //!
 //! This crate owns the host-independent half of "give this session the
@@ -79,8 +81,8 @@ pub use applied::{
 };
 pub use atomic_start::{AtomicStartFailure, RollbackFailure, start_all_or_rollback};
 pub use edid::{
-    DetailedTiming, EDID_HDR10_LEN, EdidRequest, cvt_reduced_blanking, generate, generate_hdr10,
-    validate,
+    DetailedTiming, EDID_HDR10_LEN, EdidRequest, HDR10_MAX_TMDS_CHARACTER_RATE_MHZ,
+    cvt_reduced_blanking, generate, generate_hdr10, hdr10_link_fits, hdr10_refresh_hz, validate,
 };
 pub use fairness::{FairRoster, RosterError, ServiceOrder};
 pub use nvidia_heads::{

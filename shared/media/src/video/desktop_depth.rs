@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The colour depth of a desktop whose depth is fixed when it is created.
 //!
 //! An X11 server has one depth for every client, chosen when it starts, and

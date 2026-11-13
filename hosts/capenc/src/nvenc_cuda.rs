@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 // NVENC encoder — CUDA zero-copy path (Linux). Same pipelined design as the
 // Windows D3D11 variant (nvenc.rs): DEPTH slots, submit frame N then lock
 // frame N-1 so CPU staging overlaps GPU encode (this is what sustains 4K60;
@@ -901,6 +903,12 @@ pub(crate) enum WideSource {
     /// (`arcen_media::video::convert_rgba_f16_pq_to_packed_rgb10`): only the
     /// matrix is left, and only an SDR contract may carry it.
     NormalisedSdr,
+    /// A colour-managed compositor's ten-bit PQ / BT.2020 stream with the
+    /// conversion its shared capture admission chose
+    /// (`arcen_media::video::admit_grading`): the shared desktop rule's, or
+    /// the 2.2-power inverse of a compositor that decoded its SDR content
+    /// that way, which the same `srgb` contract states.
+    AdmittedPq(Rgb10Signal),
 }
 
 impl WideSource {
@@ -920,7 +928,7 @@ impl WideSource {
             Self::XorgDepth30 | Self::NormalisedSdr => {
                 arcen_media::video::DesktopSignalEncoding::Sdr
             }
-            Self::ColorManagedPq | Self::XorgDeclaredPq => {
+            Self::ColorManagedPq | Self::XorgDeclaredPq | Self::AdmittedPq(_) => {
                 arcen_media::video::DesktopSignalEncoding::Rec2100Pq
             }
         }
@@ -949,6 +957,25 @@ fn wide_transform(
             color.transfer, color.primaries, color.matrix
         ),
     })?;
+    let signal = match source {
+        WideSource::AdmittedPq(admitted)
+            if admitted == signal
+                || (admitted == Rgb10Signal::PqBt2020ToSdrGamma22
+                    && signal == Rgb10Signal::PqBt2020ToSdrSrgb) =>
+        {
+            admitted
+        }
+        WideSource::AdmittedPq(admitted) => {
+            return Err(NativeStartupError::Unavailable {
+                reason: BackendUnavailableReason::UnsupportedConfiguration,
+                detail: format!(
+                    "the admitted {admitted:?} does not encode as {:?} / {:?} / {:?}",
+                    color.transfer, color.primaries, color.matrix
+                ),
+            });
+        }
+        _ => signal,
+    };
     Ok((
         ColorTransform::for_input_max(
             color.matrix,
@@ -1814,6 +1841,12 @@ impl Encoder {
         self.wide_stage
             .record(convert, upload_started.elapsed(), self.frame_bytes);
         Ok(())
+    }
+
+    /// What the wide source's codes mean relative to the session contract
+    /// (the stage lossless refinement copies, ADR 0016 R1).
+    pub fn wide_signal(&self) -> Rgb10Signal {
+        self.wide_signal
     }
 
     /// Keep the ten-bit frame on the GPU so later pictures may upload only
@@ -3025,6 +3058,56 @@ mod pixel_format_tests {
             signal(grading, WideSource::XorgDeclaredPq).ok(),
             Some(Rgb10Signal::PqBt2020ToSdrBt709),
             "an SDR session on a PQ desktop is converted, not shown as dim SDR"
+        );
+        // An `srgb` Grading stream keeps a depth-30 desktop's codes untouched
+        // and converts a declared PQ desktop on the sRGB curve.
+        let srgb = crate::ColorSpec {
+            transfer: TransferCharacteristics::Srgb,
+            ..grading
+        };
+        assert_eq!(
+            signal(srgb, WideSource::XorgDepth30).ok(),
+            Some(Rgb10Signal::Direct)
+        );
+        assert_eq!(
+            signal(srgb, WideSource::XorgDeclaredPq).ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrSrgb)
+        );
+        // So does a Wayland Grading epoch: ten-bit compositor PQ is converted
+        // on the sRGB curve, and half floats already normalised on it by the
+        // shared conversion are only matrixed.
+        assert_eq!(
+            signal(srgb, WideSource::ColorManagedPq).ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrSrgb)
+        );
+        assert_eq!(
+            signal(srgb, WideSource::NormalisedSdr).ok(),
+            Some(Rgb10Signal::Direct)
+        );
+        // The admitted conversion is kept when the contract states it: the
+        // 2.2-power inverse is an `srgb` conversion, never a `bt709` one.
+        let admitted = WideSource::AdmittedPq(Rgb10Signal::PqBt2020ToSdrGamma22);
+        assert_eq!(
+            signal(srgb, admitted).ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrGamma22)
+        );
+        assert!(wide_transform(grading, admitted).is_err());
+        assert!(wide_transform(hdr, admitted).is_err());
+        assert_eq!(
+            signal(hdr, WideSource::AdmittedPq(Rgb10Signal::Direct)).ok(),
+            Some(Rgb10Signal::Direct)
+        );
+        assert_eq!(
+            signal(
+                grading,
+                WideSource::AdmittedPq(Rgb10Signal::PqBt2020ToSdrBt709)
+            )
+            .ok(),
+            Some(Rgb10Signal::PqBt2020ToSdrBt709)
+        );
+        assert_eq!(
+            vui_parameters(srgb).transferCharacteristics,
+            nvenc_transfer_characteristics(TransferCharacteristics::Srgb)
         );
         assert!(wide_transform(hlg, WideSource::XorgDeclaredPq).is_err());
         assert_eq!(

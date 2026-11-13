@@ -25,6 +25,6 @@ Arcen applies only `arcen-macos12.patch`, so a binary using
 The Arcen patch has SHA-256
 `f54c13a96f17f2c4248b61bff4cf15301849678c3e6754a880953bcebddcea4c`.
 
-The source, licenses and authorship records must remain intact. Release/Security
-owner approval is required before release. See `legal/ORIGINS.md` and
-`legal/THIRD_PARTY_NOTICES.md`.
+The upstream licence, source checksum and patch accompany this source; the
+source, licences and authorship records must remain intact. See
+`legal/ORIGINS.md` and `legal/THIRD_PARTY_NOTICES.md`.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Shared client-side region input emitter: ordered state, derived focus
 //! transitions, sequence allocation, and encoding in one place.
 

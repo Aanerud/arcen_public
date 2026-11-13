@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Platform-neutral decision logic for the remote first-login flow.
 //!
 //! When an authenticated remote account has **no** existing interactive Windows

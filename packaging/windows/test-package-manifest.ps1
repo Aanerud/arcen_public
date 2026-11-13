@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 $ErrorActionPreference = "Stop"
 
 $manifest = Join-Path $PSScriptRoot "verify-package-manifest.ps1"
@@ -8,7 +11,11 @@ $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("arcen-package-manifest-" + [G
 $temp = Join-Path $tempRoot "arcen-windows-x64"
 $names = @(
     "INSTALL.md"
+    "LICENSE"
+    "LICENSE-EXCEPTION.md"
+    "NOTICE"
     "THIRD_PARTY_NOTICES.md"
+    "TRADEMARKS.md"
     "arcen-cp-harness.exe"
     "arcen-pier.exe"
     "arcen_credential_provider.dll"

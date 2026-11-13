@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure client-side applied-topology validation for multi-monitor-v1.
 //!
 //! Every client that opens a multi-monitor session has to turn the host's

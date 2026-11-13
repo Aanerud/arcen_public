@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-usb-iousbhost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "IOUSBHost capture backend for Arcen Native tablet bridging on macOS (ADR 0019)."
+
+# Linked into the root USB helper (ADR 0011): keep the set minimal. Apple's
+# system frameworks through objc2 bindings only — no async runtime, no
+# transport, no serialization framework, no C library build.
+[dependencies]
+arcen-secure-dir = { path = "../secure-dir" }
+arcen-usb-bridge.workspace = true
+# `sysctlbyname` for the boot session, in the macOS-only platform module.
+libc = "0.2"
+# Descriptor-relative (`*at`) file operations for the captured marker.
+rustix = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["std", "objc2"] }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFData", "CFNumber", "CFString"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSData", "NSError", "NSString"] }
+objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc", "objc2", "usb", "AppleUSBDefinitions", "IOUSBHostFamilyDefinitions"] }
+objc2-io-usb-host = { version = "=0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "objc2-io-kit", "IOUSBHostDefinitions", "IOUSBHostDevice", "IOUSBHostInterface", "IOUSBHostIOSource", "IOUSBHostObject", "IOUSBHostPipe"] }
+
+[lints]
+workspace = true

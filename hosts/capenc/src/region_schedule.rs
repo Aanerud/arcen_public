@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Thin capture-loop binding for the shared per-region activity scheduler.
 //!
 //! Every `capenc` child serves exactly one region (one applied monitor), so

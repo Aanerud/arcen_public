@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pure, allocation-light native tablet sample types.
 //!
 //! Everything in this file is `#![forbid(unsafe_code)]`-safe and has no
@@ -80,6 +82,16 @@ impl TabletButtonMask {
     #[must_use]
     pub const fn barrel_bits(self) -> u16 {
         self.0 & Self::BARREL_MASK
+    }
+
+    /// The barrel buttons in the wire's `PenEventMsg::buttons` layout: bit 0
+    /// the first (lower side) barrel button, bit 1 the second (upper side).
+    /// AppKit keeps bit 0 for the tip, so its barrel bits sit one higher;
+    /// forwarded unshifted, a host read the lower button as the second barrel
+    /// button and dropped the upper one.
+    #[must_use]
+    pub const fn wire_barrel_buttons(self) -> u16 {
+        self.barrel_bits() >> 1
     }
 }
 
@@ -410,6 +422,8 @@ mod tests {
             everything.barrel_bits(),
             TabletButtonMask::LOWER_SIDE | TabletButtonMask::UPPER_SIDE
         );
+        assert_eq!(everything.wire_barrel_buttons(), 0b11);
+        assert_eq!(tip_only.wire_barrel_buttons(), 0);
     }
 
     #[test]

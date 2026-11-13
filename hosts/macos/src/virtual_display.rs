@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A display that exists only so a Deck can be sent the desktop it asked for.
 //!
 //! A headless Mac has one framebuffer, whatever size macOS decided to

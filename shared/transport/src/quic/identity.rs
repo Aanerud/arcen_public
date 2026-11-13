@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! TLS peer identity and session/role authorization hook.
 //!
 //! This module intentionally ships no permissive default implementation
@@ -17,16 +19,14 @@ use rustls::pki_types::CertificateDer;
 
 use crate::PeerRole;
 
-/// Product-neutral peer role, usable by Host, Client, and Gateway adapters
-/// without this crate depending on any of those product crates.
+/// Product-neutral peer role, usable by Host and Client adapters without this
+/// crate depending on either product crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuicRole {
     /// Streaming host workstation agent.
     Host,
     /// Desktop client application.
     Client,
-    /// Stateless connection/policy gateway.
-    Gateway,
 }
 
 impl Display for QuicRole {
@@ -34,7 +34,6 @@ impl Display for QuicRole {
         let label = match self {
             Self::Host => "host",
             Self::Client => "client",
-            Self::Gateway => "gateway",
         };
         formatter.write_str(label)
     }
@@ -45,7 +44,6 @@ impl From<QuicRole> for PeerRole {
         match role {
             QuicRole::Host => Self::Host,
             QuicRole::Client => Self::Client,
-            QuicRole::Gateway => Self::Gateway,
         }
     }
 }
@@ -55,7 +53,6 @@ impl From<PeerRole> for QuicRole {
         match role {
             PeerRole::Host => Self::Host,
             PeerRole::Client => Self::Client,
-            PeerRole::Gateway => Self::Gateway,
         }
     }
 }

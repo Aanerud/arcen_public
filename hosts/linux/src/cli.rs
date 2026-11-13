@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Command-line configuration for `arcen-host`.
 //!
 //! Manual argument parsing (no `clap`), matching the client's dependency-light
@@ -196,6 +198,9 @@ pub struct Config {
     pub disconnected_idle_lifetime: Option<Duration>,
     /// Opt-in per-desktop process time-zone redirection.
     pub timezone_redirection: bool,
+    /// `usb.native_tablet`, the administrator's Native tablet choice
+    /// (`None`: the key is absent).
+    pub native_tablet: Option<arcen_session::pier_config::NativeTabletSetting>,
     /// Trusted system time-zone database used for semantic validation.
     pub zoneinfo_root: PathBuf,
     pub disclaimer: Option<Arc<arcen_identity::PreparedDisclaimer>>,
@@ -382,6 +387,13 @@ impl Config {
         crate::current_pier_exe()
     }
 
+    /// The bit depth capture starts at for this configuration, before any
+    /// client request: the colour policy resolved against an absent request.
+    #[must_use]
+    pub fn capture_bit_depth(&self) -> arcen_media::BitDepth {
+        self.color_policy.resolve_bit_depth(self.bit_depth, None)
+    }
+
     /// Build the capenc spawn config for this host configuration.
     pub fn capenc_config(
         &self,
@@ -424,7 +436,7 @@ impl Config {
             // exactly the ceiling/baseline default `ColorPolicy::resolve_*`
             // defines for that case. A later client request that differs is
             // honoured by the `quality_settings` respawn in `net::server`.
-            bit_depth: self.color_policy.resolve_bit_depth(self.bit_depth, None),
+            bit_depth: self.capture_bit_depth(),
             color_range: self
                 .color_policy
                 .resolve_color_range(self.color_range, None),
@@ -1102,8 +1114,13 @@ impl Config {
         } else {
             self.desktop_encoding
         };
+        // An Xorg desktop holds sRGB code values (or PQ, converted to SDR on
+        // the sRGB curve), and a Wayland Grading epoch converts its
+        // compositor's PQ on the curve its `transfer=` names (capenc's shared
+        // admission reads it): a Deck that presents `srgb` is told so.
         let plan = arcen_media::video::resolve_desktop_plan(resolved.video, desktop)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .serving_sdr_desktop(client.capabilities.srgb_transfer, self.variant_pinned);
         self.active_pipeline = Some(arcen_media::video::served_pipeline(
             self.requested_pipeline,
             plan.video,
@@ -1116,12 +1133,13 @@ impl Config {
                     || self.requested_pipeline.is_none(),
             },
         ));
-        if plan.conversion != arcen_media::video::Rgb10Signal::Direct {
+        if let Some(curve) = plan.conversion.sdr_transfer() {
             tracing::info!(
                 target: crate::logging::target::MEDIA,
                 desktop_encoding = plan.source.token(),
                 conversion = ?plan.conversion,
-                "the desktop carries Rec.2100 PQ; this SDR session converts it to BT.709"
+                transfer = curve.token(),
+                "the desktop carries Rec.2100 PQ; this SDR session converts it to SDR"
             );
         }
         // This per-session copy carries the source the plan was resolved
@@ -1256,6 +1274,7 @@ impl Default for Config {
                 arcen_session::direct_reconnect::DEFAULT_RECONNECT_WINDOW_SECONDS,
             disconnected_idle_lifetime: None,
             timezone_redirection: false,
+            native_tablet: None,
             zoneinfo_root: PathBuf::from("/usr/share/zoneinfo"),
             disclaimer: None,
             disclaimer_settings: arcen_session::pier_config::DisclaimerConfig::default(),
@@ -2057,6 +2076,7 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     if let Some(value) = file.redirection.timezone {
         cfg.timezone_redirection = value;
     }
+    cfg.native_tablet = file.usb.native_tablet;
     // `LoggingConfig::deserialize` already validated the canonical/legacy
     // fields; `resolved_profile` is called here only as defense-in-depth so
     // a manually constructed conflict fails fast with a clear message.
@@ -2512,6 +2532,7 @@ mod tests {
                 x11_apps: None,
                 cursor_metadata: CapabilityFact::Unknown,
                 native_seat: None,
+                automatic_requalification: None,
                 multi_output: None,
                 fidelity: None,
                 encoder: None,
@@ -2805,6 +2826,7 @@ mod tests {
                 encoder: None,
                 cursor_metadata: CapabilityFact::Unknown,
                 native_seat: None,
+                automatic_requalification: None,
             },
         };
         let proof = FidelityProof {
@@ -2875,6 +2897,73 @@ mod tests {
                     "wide-proven=xbgr2101010@dmabuf,rgba-f16@dmabuf",
                     "sdr-white=203"
                 ]
+            );
+        }
+        // A Wayland Grading epoch converts the compositor's PQ on the curve
+        // capenc is told: `srgb` for a Deck that presents it, `bt709` for an
+        // older one. HDR keeps PQ either way.
+        for (pipeline, capable, transfer) in [
+            (
+                PipelineId::Grading,
+                true,
+                arcen_media::TransferCharacteristics::Srgb,
+            ),
+            (
+                PipelineId::Grading,
+                false,
+                arcen_media::TransferCharacteristics::Bt709,
+            ),
+            (
+                PipelineId::Hdr,
+                true,
+                arcen_media::TransferCharacteristics::Pq,
+            ),
+        ] {
+            let mut wayland = Config {
+                bit_depth: arcen_media::BitDepth::Ten,
+                color_range: arcen_media::ColorRange::Full,
+                chroma: "yuv444".to_string(),
+                ..session(proven.clone(), pipeline)
+            };
+            let mut request = initial_video(
+                VideoSelectionIntent::ColorFidelity,
+                "h265",
+                "yuv444",
+                "10",
+                "full",
+            );
+            request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Grading);
+            if pipeline == PipelineId::Hdr {
+                request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Hdr);
+                request.quality.color_matrix = "bt2020ncl".to_string();
+                request.quality.color_primaries = "bt2020".to_string();
+                request.quality.transfer = "pq".to_string();
+                request.quality.max_fps = 30;
+            }
+            request.capabilities.srgb_transfer = capable;
+            wayland
+                .apply_initial_video_request(&request)
+                .expect("a fidelity session on a proven Wayland host");
+            let case = format!("{pipeline:?} capable={capable}");
+            assert_eq!(
+                wayland.wayland_fidelity_route(),
+                Some("force-hdr"),
+                "{case}"
+            );
+            assert_eq!(wayland.transfer, transfer, "{case}");
+            let argv = wayland
+                .capenc_config(
+                    PathBuf::from("arcen-pier"),
+                    None,
+                    arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+                    arcen_protocol::messages::CursorMode::Local,
+                )
+                .argv();
+            let token = format!("transfer={}", transfer.token());
+            assert_eq!(
+                argv.iter().any(|arg| *arg == token),
+                transfer != arcen_media::TransferCharacteristics::Bt709,
+                "{case}: {argv:?}"
             );
         }
         // Auto and Speed sessions keep the compositor's default colour state.
@@ -3034,6 +3123,7 @@ mod tests {
                 identity_matrix: false,
                 bt601_matrix: true,
                 bt2020_ncl_matrix: true,
+                srgb_transfer: false,
             },
             pipeline: None,
         }
@@ -3318,6 +3408,95 @@ mod tests {
             "pq",
             "the original request stays available for degradation telemetry"
         );
+    }
+
+    /// An Xorg desktop holds sRGB code values: a ten-bit session for a Deck
+    /// that presents `srgb` says so (codes untouched, or a declared PQ desktop
+    /// converted on the sRGB curve), and nothing else changes.
+    #[test]
+    fn xorg_grading_is_served_as_srgb_only_for_a_capable_deck() {
+        use arcen_media::video::DesktopSignalEncoding;
+        use arcen_media::TransferCharacteristics::{Bt709, Srgb};
+        let argv = |config: &Config| {
+            config
+                .capenc_config(
+                    PathBuf::from("arcen-pier"),
+                    None,
+                    arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+                    arcen_protocol::messages::CursorMode::Local,
+                )
+                .argv()
+        };
+        let grading = |srgb: bool| {
+            let mut request = initial_video(
+                VideoSelectionIntent::ColorFidelity,
+                "h265",
+                "yuv444",
+                "10",
+                "full",
+            );
+            request.quality.max_fps = 30;
+            request.pipeline = Some(arcen_protocol::messages::StreamPipeline::Grading);
+            request.capabilities.srgb_transfer = srgb;
+            request
+        };
+        for desktop in [DesktopSignalEncoding::Sdr, DesktopSignalEncoding::Rec2100Pq] {
+            for (capable, transfer) in [(true, Srgb), (false, Bt709)] {
+                let mut config = Config {
+                    bit_depth: arcen_media::BitDepth::Ten,
+                    color_range: arcen_media::ColorRange::Full,
+                    chroma: "yuv444".to_string(),
+                    desktop_encoding: desktop,
+                    ..Config::default()
+                };
+                config
+                    .apply_initial_video_request(&grading(capable))
+                    .unwrap();
+                let case = format!("{desktop:?} capable={capable}");
+                assert_eq!(config.transfer, transfer, "{case}");
+                assert_eq!(config.bit_depth, arcen_media::BitDepth::Ten, "{case}");
+                assert_eq!(
+                    config.color_primaries,
+                    arcen_media::ColorPrimaries::Bt709,
+                    "{case}"
+                );
+                assert_eq!(
+                    config.active_pipeline,
+                    Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
+                    "{case}"
+                );
+                assert_eq!(
+                    argv(&config).iter().any(|arg| arg == "transfer=srgb"),
+                    capable,
+                    "{case}"
+                );
+            }
+        }
+
+        // The eight-bit fast path and an administrator's pinned variant keep
+        // the transfer they always signalled.
+        let mut auto = initial_video(
+            VideoSelectionIntent::AdaptivePerformance,
+            "h264",
+            "yuv420",
+            "8",
+            "limited",
+        );
+        auto.capabilities.srgb_transfer = true;
+        let mut eight = Config::default();
+        eight.apply_initial_video_request(&auto).unwrap();
+        assert_eq!(eight.transfer, Bt709);
+        let mut pinned = Config {
+            variant_pinned: true,
+            bit_depth: arcen_media::BitDepth::Ten,
+            color_range: arcen_media::ColorRange::Full,
+            chroma: "yuv444".to_string(),
+            codec: "h265".to_string(),
+            ..Config::default()
+        };
+        pinned.apply_initial_video_request(&grading(true)).unwrap();
+        assert_eq!(pinned.bit_depth, arcen_media::BitDepth::Ten);
+        assert_eq!(pinned.transfer, Bt709);
     }
 
     #[test]

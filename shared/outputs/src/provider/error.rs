@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Typed lifecycle errors.
 //!
 //! Section 4 of ADR 0010. Two rules are structural, not stylistic:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Which Option keys are held, and Option keys that act as Alt.
 //!
 //! macOS composes characters with Option (Option+o types ø, Option+u starts

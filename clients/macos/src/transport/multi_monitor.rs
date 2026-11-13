@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Converts the local requested multi-monitor-v1 topology plus a host's
 //! pre-auth `AuthRequest.multi_monitor_v1` offer into a validated
 //! `AuthResponse.multi_monitor_v1` sidecar.
@@ -387,6 +389,7 @@ mod tests {
         .expect("negotiation succeeds");
         let attached = response
             .multi_monitor_v1
+            .as_ref()
             .expect("sidecar attached")
             .carriers()
             .to_vec();
@@ -408,7 +411,7 @@ mod tests {
             &[selected],
         )
         .expect("negotiation succeeds");
-        let sidecar = response.multi_monitor_v1.expect("sidecar");
+        let sidecar = response.multi_monitor_v1.as_ref().expect("sidecar");
         let requested = sidecar.requested_topology();
         assert_eq!(
             requested.monitors()[0].quality_intent,

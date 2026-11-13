@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Media pipeline: `capenc` supervision + Annex-B access-unit framing +
 //! wire-frame construction.
 
 pub mod annexb;
 pub mod audio;
 pub mod capenc;
+pub mod desktop_pointer;
 pub mod encoder_admission;
 pub mod local_playback;
 pub mod multi_capenc;
@@ -127,10 +130,7 @@ mod tests {
 
     #[test]
     fn h265_yuv444_keyframe_header_is_byte_exact() {
-        let au = AccessUnit {
-            data: vec![0xAA, 0xBB, 0xCC],
-            is_keyframe: true,
-        };
+        let au = AccessUnit::new(vec![0xAA, 0xBB, 0xCC], true);
         let frame = build_video_frame(
             &plan(arcen_media::VideoCodec::H265, true),
             &au,
@@ -156,10 +156,7 @@ mod tests {
 
     #[test]
     fn h264_yuv420_pframe_has_no_keyframe_flag() {
-        let au = AccessUnit {
-            data: vec![1, 2],
-            is_keyframe: false,
-        };
+        let au = AccessUnit::new(vec![1, 2], false);
         let frame = build_video_frame(&plan(arcen_media::VideoCodec::H264, false), &au, 7, 0, 0, 0);
         assert_eq!(frame[0], 0x03, "frame_type VIDEO_H264");
         assert_eq!(frame[1], 0x01, "codec H264");
@@ -169,10 +166,7 @@ mod tests {
 
     #[test]
     fn av1_yuv420_keyframe_uses_the_av1_wire_identity() {
-        let au = AccessUnit {
-            data: vec![0x0a, 0x01, 0x00],
-            is_keyframe: true,
-        };
+        let au = AccessUnit::new(vec![0x0a, 0x01, 0x00], true);
         let frame = build_video_frame(&plan(arcen_media::VideoCodec::Av1, false), &au, 9, 0, 0, 0);
         let header = decode_video_header(&frame).expect("AV1 video header");
         assert_eq!(header.frame_type, FrameType::VideoAv1);
@@ -182,10 +176,7 @@ mod tests {
 
     #[test]
     fn region_frame_carries_generation_and_epoch() {
-        let au = AccessUnit {
-            data: vec![1, 2],
-            is_keyframe: true,
-        };
+        let au = AccessUnit::new(vec![1, 2], true);
         let frame = build_video_frame(
             &plan(arcen_media::VideoCodec::H264, false),
             &au,
@@ -204,10 +195,7 @@ mod tests {
 
     #[test]
     fn every_frame_carries_the_resolved_color_contract() {
-        let au = AccessUnit {
-            data: vec![1, 2],
-            is_keyframe: false,
-        };
+        let au = AccessUnit::new(vec![1, 2], false);
         let mut plan = plan(arcen_media::VideoCodec::H265, true);
         plan.video = VideoConfiguration::grading_reference();
         let frame = build_video_frame(&plan, &au, 7, 0, 0, 0);

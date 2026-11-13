@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Reads the host's PCI functions from sysfs for the shared Xorg GPU decision.
 //!
 //! The decision itself — which GPU an NVIDIA `Device` section must name — is

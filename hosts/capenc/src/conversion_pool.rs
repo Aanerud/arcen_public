@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! A persistent set of conversion threads for the ten-bit host staging.
 //!
 //! The RGB10 to I444P16 conversion splits each frame into row bands. Spawning

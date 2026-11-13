@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Linux network-path probing for the shared observability network schema.
 //!
 //! Bounded `/sys/class/net` and `/proc/net/route` reads only: no packet
@@ -136,7 +138,7 @@ fn parse_ipv4_routes(content: &str) -> Vec<Ipv4Route> {
             let mut columns = line.split_whitespace();
             let interface = columns.next()?;
             let destination_hex = columns.next()?;
-            let _gateway = columns.next()?;
+            let _next_hop = columns.next()?;
             let _flags = columns.next()?;
             let _refcnt = columns.next()?;
             let _use = columns.next()?;

@@ -1,0 +1,65 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception -->
+<!-- Copyright (C) 2026 TUTTIFRUTTI AS -->
+<!-- Cursor image test page for the real-screen harness (`--url
+     http://127.0.0.1:<port>/cursors.html`, driver phase `cursors`): eight
+     horizontal bands, each with its own CSS cursor. Custom cursors are drawn
+     here at load time, so the page carries no binary assets. On load and on
+     every band the pointer enters, it posts a line to the page server, so
+     page.jsonl says which cursor the host showed when. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Arcen cursor bands</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 20px sans-serif; }
+  body { display: flex; flex-direction: column; }
+  .band { flex: 1; display: flex; align-items: center; padding-left: 2em; color: #111; }
+  .band:nth-child(odd) { background: #e8e8e8; }
+  .band:nth-child(even) { background: #3a3a3a; color: #eee; }
+</style>
+</head>
+<body>
+<div class="band" id="b0">0 · custom brush ring 96×96, hotspot 48,48</div>
+<div class="band" id="b1" style="cursor: crosshair">1 · crosshair</div>
+<div class="band" id="b2">2 · custom colour picker 32×32, hotspot 3,28</div>
+<div class="band" id="b3" style="cursor: text">3 · text</div>
+<div class="band" id="b4">4 · custom 128×128 soft square, hotspot 0,0</div>
+<div class="band" id="b5" style="cursor: ew-resize">5 · ew-resize</div>
+<div class="band" id="b6" style="cursor: none">6 · none (hidden)</div>
+<div class="band" id="b7" style="cursor: pointer">7 · pointer</div>
+<script>
+function draw(size, paint) {
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  paint(c.getContext("2d"), size);
+  return c.toDataURL("image/png");
+}
+const ring = draw(96, (g, s) => {
+  g.lineWidth = 3; g.strokeStyle = "#000"; g.beginPath(); g.arc(s / 2, s / 2, s / 2 - 3, 0, 7); g.stroke();
+  g.lineWidth = 1; g.strokeStyle = "#fff"; g.beginPath(); g.arc(s / 2, s / 2, s / 2 - 5, 0, 7); g.stroke();
+  g.fillStyle = "#f00"; g.fillRect(s / 2 - 1, s / 2 - 1, 3, 3);
+});
+const picker = draw(32, (g) => {
+  g.fillStyle = "#0a0"; g.beginPath(); g.moveTo(3, 28); g.lineTo(20, 11); g.lineTo(24, 15); g.lineTo(7, 32); g.closePath(); g.fill();
+  g.fillStyle = "#00c"; g.fillRect(20, 2, 10, 10);
+});
+const soft = draw(128, (g, s) => {
+  const grad = g.createLinearGradient(0, 0, s, s);
+  grad.addColorStop(0, "rgba(255,128,0,1)"); grad.addColorStop(1, "rgba(0,0,255,0.15)");
+  g.fillStyle = grad; g.fillRect(0, 0, s, s);
+});
+document.getElementById("b0").style.cursor = `url(${ring}) 48 48, crosshair`;
+document.getElementById("b2").style.cursor = `url(${picker}) 3 28, crosshair`;
+document.getElementById("b4").style.cursor = `url(${soft}) 0 0, default`;
+function post(entry) {
+  entry.t = performance.now();
+  fetch("/log", { method: "POST", body: JSON.stringify({ cursors: [entry] }) }).catch(() => {});
+}
+for (const band of document.querySelectorAll(".band")) {
+  band.addEventListener("pointerenter", () => post({ band: band.id, cursor: band.style.cursor.slice(0, 40) }));
+}
+post({ ready: true, ua: navigator.userAgent, dpr: devicePixelRatio, w: innerWidth, h: innerHeight });
+</script>
+</body>
+</html>

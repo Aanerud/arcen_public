@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 use arcen_usb_bridge::{TransferDirection, TransferKind, UsbSpeed, MAX_TRANSFER_BYTES};
 use nix::errno::Errno;
 use std::fmt::{Display, Formatter};

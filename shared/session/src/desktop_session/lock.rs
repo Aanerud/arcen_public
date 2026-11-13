@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Whether the screen of a remote session may lock.
 //!
 //! GNOME Shell unlocks through GDM's reauthentication channel; without a

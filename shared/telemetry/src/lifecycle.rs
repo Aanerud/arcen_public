@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Stable, append-only lifecycle event vocabulary.
 
 use std::error::Error;
@@ -653,6 +655,7 @@ const HEALTH_SNAPSHOT_FIELDS: &[LifecycleFieldSpec] = &[
     optional("client_network_scope", LifecycleFieldType::String),
     optional("client_link_mbps", LifecycleFieldType::Integer),
     optional("client_mtu", LifecycleFieldType::Integer),
+    optional("fps_content", LifecycleFieldType::Integer),
 ];
 const PERMISSION_FIELDS: &[LifecycleFieldSpec] = &[
     required("permission", LifecycleFieldType::String),

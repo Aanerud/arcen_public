@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+
 #![allow(unsafe_code)]
 
 //! macOS input injection through `CoreGraphics` events.
@@ -13,6 +16,8 @@
 //! a clean state, and it is the input half of the readiness evidence a Pier
 //! needs before it may advertise a usable session.
 
+#[cfg(feature = "native-tablet")]
+pub mod bridged_hid;
 pub mod keymap;
 pub mod pen;
 pub mod virtual_keyboard;
@@ -143,11 +148,13 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
+    fn CGEventSetType(event: CGEventRef, event_type: u32);
     fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -232,6 +239,8 @@ pub struct InputStats {
     pub pen_samples: u64,
     /// Pen proximity transitions posted.
     pub pen_proximity_edges: u64,
+    /// Committed-text characters typed.
+    pub text_chars: u64,
 }
 
 /// The pixel rectangle that normalized coordinates map onto.
@@ -389,6 +398,9 @@ unsafe fn annotate_tablet_point(event: CGEventRef, point: pen::TabletPoint) {
             pen::K_CG_TABLET_EVENT_ROTATION,
             point.rotation_degrees,
         );
+        // What `-[NSEvent pressure]` reads. Left alone it is 1.0 on every
+        // press and drag, which made every stroke full pressure.
+        CGEventSetDoubleValueField(event, pen::K_CG_MOUSE_EVENT_PRESSURE, point.pressure);
     }
 }
 
@@ -431,6 +443,15 @@ static INPUT_BACKEND: std::sync::OnceLock<InputBackend> = std::sync::OnceLock::n
 /// Anything that never sets it — tests, probes, `serve` — posts `CGEvent`s.
 pub fn set_input_backend(backend: InputBackend) {
     let _ = INPUT_BACKEND.set(backend);
+}
+
+/// Whether committed text can be typed in this process: the backend posts
+/// `CGEvent`s (the login window's does not) and the process holds the
+/// Accessibility grant that keyboard events need.
+#[must_use]
+pub fn text_injection_available() -> bool {
+    !matches!(input_backend(), InputBackend::VirtualHidOnly(_))
+        && crate::permissions::probe().capabilities().keyboard_input
 }
 
 fn input_backend() -> InputBackend {
@@ -728,6 +749,64 @@ impl InputController {
             CGEventSetFlags(event, flags);
             CGEventPost(K_CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
+        }
+        Ok(())
+    }
+
+    /// Whether committed text can be typed: it goes as `CGEvent`s, which the
+    /// HID-only login window cannot create.
+    #[must_use]
+    pub const fn types_text(&self) -> bool {
+        !self.hid_only && !self.source.is_null()
+    }
+
+    /// Types committed text (already validated as a commit) as Unicode key
+    /// events: each string of at most [`MAX_UTF16_CHUNK_UNITS`] UTF-16 units
+    /// rides one key press and release, posted where every key is posted.
+    /// The host's layout and the keys held do not change the characters, and
+    /// no key-event state (held keys) is touched. Never logs the text.
+    ///
+    /// Returns the characters typed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::VirtualHidUnavailable`] where only virtual HID
+    /// may be used, and [`InputError::EventCreationFailed`] when
+    /// `CoreGraphics` refuses an event.
+    ///
+    /// [`MAX_UTF16_CHUNK_UNITS`]: arcen_input::text::MAX_UTF16_CHUNK_UNITS
+    pub fn text_commit(&mut self, text: &str) -> Result<usize, InputError> {
+        if !self.types_text() {
+            return Err(InputError::VirtualHidUnavailable);
+        }
+        let mut typed = 0;
+        for chunk in arcen_input::text::utf16_chunks(text, arcen_input::text::MAX_UTF16_CHUNK_UNITS)
+        {
+            let units: Vec<u16> = chunk.encode_utf16().collect();
+            self.post_unicode(&units)?;
+            typed += chunk.chars().count();
+        }
+        self.stats.text_chars += u64::try_from(typed).unwrap_or(u64::MAX);
+        Ok(typed)
+    }
+
+    fn post_unicode(&self, units: &[u16]) -> Result<(), InputError> {
+        for pressed in [true, false] {
+            // SAFETY: the source is live for the controller's lifetime.
+            let event = unsafe { CGEventCreateKeyboardEvent(self.source, 0, pressed) };
+            if event.is_null() {
+                return Err(InputError::EventCreationFailed("text"));
+            }
+            // SAFETY: `event` is a live event we own; `units` outlives the
+            // call, which copies the string into the event.
+            unsafe {
+                // No modifiers: a held Command or Control would turn the
+                // characters into a shortcut.
+                CGEventSetFlags(event, 0);
+                CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                CGEventPost(K_CG_HID_EVENT_TAP, event);
+                CFRelease(event.cast_const());
+            }
         }
         Ok(())
     }
@@ -1185,6 +1264,10 @@ impl InputController {
         }
         // SAFETY: `event` is a live event we own and release below.
         unsafe {
+            // A proximity edge is its own event type. Posted as a mouse move
+            // with the proximity subtype, AppKit delivered it as a plain move
+            // and `tabletProximity:` never ran.
+            CGEventSetType(event, pen::K_CG_EVENT_TABLET_PROXIMITY);
             CGEventSetIntegerValueField(
                 event,
                 pen::K_CG_MOUSE_EVENT_SUBTYPE,
@@ -1204,6 +1287,23 @@ impl InputController {
                 event,
                 pen::K_CG_TABLET_PROXIMITY_EVENT_SYSTEM_TABLET_ID,
                 pen::ARCEN_TABLET_DEVICE_ID,
+            );
+            CGEventSetIntegerValueField(
+                event,
+                pen::K_CG_TABLET_PROXIMITY_EVENT_TABLET_ID,
+                pen::ARCEN_TABLET_DEVICE_ID,
+            );
+            CGEventSetIntegerValueField(
+                event,
+                pen::K_CG_TABLET_PROXIMITY_EVENT_POINTER_ID,
+                pen::ARCEN_TABLET_DEVICE_ID,
+            );
+            // Without it a toolkit that sizes its tablet support from
+            // `-[NSEvent capabilityMask]` sees a pen with no pressure or tilt.
+            CGEventSetIntegerValueField(
+                event,
+                pen::K_CG_TABLET_PROXIMITY_EVENT_CAPABILITY_MASK,
+                pen::TABLET_CAPABILITIES,
             );
             CGEventSetIntegerValueField(
                 event,
@@ -1478,6 +1578,21 @@ fn whole_desktop(fallback: DesktopBounds) -> DesktopBounds {
 #[must_use]
 pub fn current_pointer_position() -> Option<(f64, f64)> {
     current_pointer_point().map(|point| (point.x, point.y))
+}
+
+/// Puts the pointer at a global position without posting an event.
+///
+/// For probes that need the pointer on a particular display first: macOS maps
+/// an absolute digitizer onto whichever display the pointer is on.
+pub fn warp_pointer(position: (f64, f64)) {
+    // SAFETY: warping takes a plain point and has no preconditions.
+    unsafe {
+        CGWarpMouseCursorPosition(NativePoint {
+            x: position.0,
+            y: position.1,
+        });
+        CGAssociateMouseAndMouseCursorPosition(true);
+    }
 }
 
 fn current_pointer_point() -> Option<CGPoint> {

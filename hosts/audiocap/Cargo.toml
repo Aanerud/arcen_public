@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-audiocap"
-version = "0.17.0"
+version = "0.19.0"
 edition = "2021"
 description = "Arcen Linux audio capture helper — PulseAudio/PipeWire monitor -> 48 kHz stereo PCM."
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "arcen_audiocap"

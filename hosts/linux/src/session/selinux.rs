@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The SELinux context PAM assigns to a desktop session, and where it applies.
 //!
 //! `pam_selinux open` (in the stock `login`, `sshd` and `gdm-*` stacks) sets

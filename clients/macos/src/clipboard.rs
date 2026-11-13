@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Bounded Deck clipboard state and the UI-thread AppKit adapter.
 
 #[cfg(target_os = "macos")]
@@ -672,6 +674,39 @@ fn tiff_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
     } else {
         u32::from_be_bytes(value)
     })
+}
+
+/// Whether a host's clipboard policy lets text go from this Mac to it, which
+/// Paste as Keystrokes honours too: an administrator who keeps the Mac's
+/// clipboard out of a host keeps it out typed as well. A host that announced
+/// no policy (an older Pier) allows it; an unreadable policy does not.
+#[must_use]
+pub fn policy_allows_typed_paste(policy: Option<ClipboardPolicyMsg>) -> bool {
+    policy.is_none_or(|policy| {
+        media_policy(policy).is_some_and(|policy| {
+            policy.allows(
+                arcen_media::clipboard::ClipboardFlow::ClientToHost,
+                arcen_media::clipboard::ClipboardKind::TextUtf8,
+            )
+        })
+    })
+}
+
+/// The general pasteboard's plain text, if it holds any. Wrapped so it is
+/// wiped when dropped: it may be a password.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn read_plain_text() -> Option<zeroize::Zeroizing<String>> {
+    let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+    let text = pasteboard.stringForType(pasteboard_string_type())?;
+    Some(zeroize::Zeroizing::new(text.to_string()))
+}
+
+/// No pasteboard off macOS.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn read_plain_text() -> Option<zeroize::Zeroizing<String>> {
+    None
 }
 
 #[cfg(target_os = "macos")]

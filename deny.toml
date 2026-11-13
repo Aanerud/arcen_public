@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [graph]
 all-features = true
 
@@ -5,17 +8,23 @@ all-features = true
 ignore = []
 
 [licenses]
-# All entries must be one-way compatible INTO AGPL-3.0-only, which is the
-# licence of every first-party Arcen crate. Permissive licences qualify.
-# MPL-2.0 qualifies via its own section 3.3, which explicitly permits
-# distribution of a Larger Work under a GPL/LGPL/AGPL "Secondary License".
+# Policy: every third-party licence must (1) combine one-way INTO
+# AGPL-3.0-only, the licence of every first-party Arcen crate, and (2) let
+# Arcen be distributed through app stores under the Arcen Store Distribution
+# Exception (LICENSE-EXCEPTION.md). Permissive licences satisfy both. MPL-2.0
+# qualifies via its section 3.3 and is file-level copyleft only.
+#
+# GPL, AGPL and LGPL are deliberately NOT allowed for third-party crates:
+# their authors have not granted Arcen's store exception, so a copyleft
+# dependency can make a store build of the artefact containing it
+# non-distributable. A copyleft dependency must be flagged here, decided by
+# Release/Security, and listed under [[licenses.exceptions]] with the reason;
+# the publication pipeline reports every exception as a store blocker.
+#
+# First-party crates are `publish = false`, so `[licenses.private]` exempts
+# them; that is why AGPL-3.0-only is no longer in the global allow list, where
+# it would also have admitted third-party AGPL crates.
 allow = [
-    # Arcen's own licence. Its absence made `cargo deny check licenses` fail on
-    # this workspace's own crates, so the check could never pass and therefore
-    # was never run — which is a good part of why third-party notices were left
-    # to drift. `[licenses.private] ignore = true` does not cover these, because
-    # that only exempts crates marked `publish = false`.
-    "AGPL-3.0-only",
     "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -34,6 +43,16 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.93
+
+# libusb1-sys says MIT, but with the `vendored` feature (used by rusb in the
+# macOS Deck's `native-tablet` feature and in arcen-usb-helper, which release
+# Decks embed) it compiles and statically links libusb 1.0, which is
+# LGPL-2.1-or-later. Without this clarification the LGPL code would be
+# invisible to this check.
+[[licenses.clarify]]
+crate = "libusb1-sys"
+expression = "MIT AND LGPL-2.1-or-later"
+license-files = []
 
 [licenses.private]
 ignore = true

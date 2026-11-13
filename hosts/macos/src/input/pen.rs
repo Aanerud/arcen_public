@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Pen injection: Basic Tablet termination on macOS.
 //!
 //! In Basic Tablet the Deck's own tablet driver reads the pen and sends
@@ -18,6 +20,29 @@
 //!   and `arcen-input` carry degrees. Passing degrees through unconverted
 //!   would report every sample as fully tilted.
 //!
+//! Three more were measured with an `AppKit` window reading the events back
+//! (macOS 26.7), and each had been wrong while every counter said the pen
+//! worked:
+//!
+//! * `-[NSEvent pressure]` reads the *mouse* pressure field,
+//!   `kCGMouseEventPressure` (2), not `kCGTabletEventPointPressure`.
+//!   `CGEventCreateMouseEvent` sets it to 1.0 for a press or drag, so with
+//!   only the tablet field set every stroke read as full pressure. Both are
+//!   set now: the mouse field carries 256 levels, which is all `NSEvent`
+//!   offers, and the tablet field the full-precision value for applications
+//!   that read it from the `CGEvent`.
+//! * A proximity edge must be its own event type, `kCGEventTabletProximity`
+//!   (24). A mouse-moved event with the proximity subtype reaches `AppKit` as
+//!   an ordinary move, so `tabletProximity:` never ran and an application
+//!   never learnt a pen — or an eraser — had arrived.
+//! * The proximity event must carry a capability mask. With none, a toolkit
+//!   that sizes its tablet support from `-[NSEvent capabilityMask]` concludes
+//!   the pen has no pressure or tilt.
+//!
+//! A virtual HID digitizer does not replace any of this on macOS: measured,
+//! the HID system delivers its proximity but empties pressure, tilt and
+//! rotation (`arcen-pier-macos probe-pen-hid`).
+//!
 //! Anything about *when* an edge happens — that a tool leaving the tablet
 //! releases what it held, that entering asserts the tool before a press — is
 //! shared policy in [`arcen_input::plan_pen_edges`], because it is identical
@@ -34,6 +59,13 @@ pub const K_CG_MOUSE_EVENT_SUBTYPE: u32 = 7;
 pub const K_CG_MOUSE_SUBTYPE_TABLET_POINT: i64 = 1;
 /// `kCGEventMouseSubtypeTabletProximity`.
 pub const K_CG_MOUSE_SUBTYPE_TABLET_PROXIMITY: i64 = 2;
+
+/// `kCGMouseEventPressure`, a double in 0.0..=1.0. What `-[NSEvent pressure]`
+/// returns, for tablet events too.
+pub const K_CG_MOUSE_EVENT_PRESSURE: u32 = 2;
+
+/// `kCGEventTabletProximity`, the event type of a proximity edge.
+pub const K_CG_EVENT_TABLET_PROXIMITY: u32 = 24;
 
 /// `kCGTabletEventPointPressure`, a double in 0.0..=1.0.
 pub const K_CG_TABLET_EVENT_POINT_PRESSURE: u32 = 19;
@@ -57,6 +89,33 @@ pub const K_CG_TABLET_PROXIMITY_EVENT_ENTER_PROXIMITY: u32 = 38;
 pub const K_CG_TABLET_PROXIMITY_EVENT_VENDOR_ID: u32 = 28;
 /// `kCGTabletProximityEventSystemTabletID`.
 pub const K_CG_TABLET_PROXIMITY_EVENT_SYSTEM_TABLET_ID: u32 = 32;
+/// `kCGTabletProximityEventTabletID`.
+pub const K_CG_TABLET_PROXIMITY_EVENT_TABLET_ID: u32 = 29;
+/// `kCGTabletProximityEventPointerID`.
+pub const K_CG_TABLET_PROXIMITY_EVENT_POINTER_ID: u32 = 30;
+/// `kCGTabletProximityEventCapabilityMask`.
+pub const K_CG_TABLET_PROXIMITY_EVENT_CAPABILITY_MASK: u32 = 36;
+
+/// `NX_TABLET_CAPABILITY_*` bits from `IOLLEvent.h`, for the fields this
+/// host fills on every tablet point: device id, absolute X and Y, buttons,
+/// both tilts, pressure and rotation. Not Z, and not tangential pressure,
+/// which no wire sample carries.
+pub const TABLET_CAPABILITIES: i64 = NX_TABLET_CAPABILITY_DEVICEID
+    | NX_TABLET_CAPABILITY_ABSX
+    | NX_TABLET_CAPABILITY_ABSY
+    | NX_TABLET_CAPABILITY_BUTTONS
+    | NX_TABLET_CAPABILITY_TILTX
+    | NX_TABLET_CAPABILITY_TILTY
+    | NX_TABLET_CAPABILITY_PRESSURE
+    | NX_TABLET_CAPABILITY_ROTATION;
+const NX_TABLET_CAPABILITY_DEVICEID: i64 = 0x0001;
+const NX_TABLET_CAPABILITY_ABSX: i64 = 0x0002;
+const NX_TABLET_CAPABILITY_ABSY: i64 = 0x0004;
+const NX_TABLET_CAPABILITY_BUTTONS: i64 = 0x0040;
+const NX_TABLET_CAPABILITY_TILTX: i64 = 0x0080;
+const NX_TABLET_CAPABILITY_TILTY: i64 = 0x0100;
+const NX_TABLET_CAPABILITY_PRESSURE: i64 = 0x0400;
+const NX_TABLET_CAPABILITY_ROTATION: i64 = 0x2000;
 
 /// `NX_TABLET_POINTER_PEN`, from `IOLLEvent.h`.
 pub const NX_TABLET_POINTER_PEN: i64 = 1;
@@ -97,7 +156,8 @@ pub struct TabletPoint {
     pub tilt_y: f64,
     /// Rotation in degrees, 0.0..360.0.
     pub rotation_degrees: f64,
-    /// Barrel buttons held.
+    /// `kCGTabletEventPointButtons`, in the layout `-[NSEvent buttonMask]`
+    /// returns: see [`tablet_button_mask`].
     pub buttons: i64,
     /// `NX_TABLET_POINTER_*` for the tool in use.
     pub pointer_type: i64,
@@ -119,9 +179,40 @@ pub fn tablet_point(event: &PenEventMsg) -> TabletPoint {
         rotation_degrees: f64::from(pen_axes::wrap_rotation_degrees(f64::from(
             event.rotation_degrees,
         ))),
-        buttons: i64::from(event.buttons),
+        buttons: tablet_button_mask(event.touching, event.buttons),
         pointer_type: pointer_type(event.tool),
     }
+}
+
+/// `NSEventButtonMaskPenTip`: the tip (or eraser) is on the surface.
+pub const PEN_BUTTON_MASK_TIP: i64 = 1 << 0;
+/// `NSEventButtonMaskPenLowerSide`: the first barrel button.
+pub const PEN_BUTTON_MASK_LOWER_SIDE: i64 = 1 << 1;
+/// `NSEventButtonMaskPenUpperSide`: the second barrel button.
+pub const PEN_BUTTON_MASK_UPPER_SIDE: i64 = 1 << 2;
+
+/// The tablet button field for one sample.
+///
+/// `-[NSEvent buttonMask]` returns `kCGTabletEventPointButtons` unchanged, and
+/// `AppKit`'s layout is not the wire's: bit 0 is tip contact and the barrel
+/// buttons are bits 1 and 2, while the wire's `buttons` carries only barrel
+/// buttons from bit 0. Copied across verbatim, every stroke read as no button
+/// and the first barrel button as the tip (measured on macOS 26.7: a tip-down
+/// drag `buttonMask=0`, a barrel click `buttonMask=0x1`). Barrel buttons past
+/// the second have no `AppKit` bit and are left out, as they are for clicks.
+#[must_use]
+pub const fn tablet_button_mask(touching: bool, wire_buttons: u16) -> i64 {
+    let mut mask = 0;
+    if touching {
+        mask |= PEN_BUTTON_MASK_TIP;
+    }
+    if wire_buttons & 0b01 != 0 {
+        mask |= PEN_BUTTON_MASK_LOWER_SIDE;
+    }
+    if wire_buttons & 0b10 != 0 {
+        mask |= PEN_BUTTON_MASK_UPPER_SIDE;
+    }
+    mask
 }
 
 /// Annotations for a tool that is leaving the tablet.
@@ -253,6 +344,31 @@ mod tests {
             event.pressure = pressure;
             assert!((tablet_point(&event).pressure - f64::from(pressure)).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn the_tablet_button_field_uses_appkits_pen_layout_not_the_wires() {
+        let mut event = sample();
+        assert_eq!(tablet_point(&event).buttons, PEN_BUTTON_MASK_TIP);
+
+        event.touching = false;
+        event.buttons = 0b01;
+        assert_eq!(tablet_point(&event).buttons, PEN_BUTTON_MASK_LOWER_SIDE);
+
+        event.buttons = 0b10;
+        assert_eq!(tablet_point(&event).buttons, PEN_BUTTON_MASK_UPPER_SIDE);
+
+        event.touching = true;
+        event.buttons = 0b1111;
+        assert_eq!(
+            tablet_point(&event).buttons,
+            PEN_BUTTON_MASK_TIP | PEN_BUTTON_MASK_LOWER_SIDE | PEN_BUTTON_MASK_UPPER_SIDE
+        );
+
+        event.touching = false;
+        event.buttons = 0;
+        assert_eq!(tablet_point(&event).buttons, 0);
+        assert_eq!(tablet_point_away(NX_TABLET_POINTER_PEN).buttons, 0);
     }
 
     #[test]

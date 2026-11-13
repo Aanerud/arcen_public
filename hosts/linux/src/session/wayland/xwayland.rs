@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Xwayland inside a headless session: finding the displays the compositor
 //! locked, proving X11 clients are served, and removing the session's own
 //! X11 sockets and lock files when the compositor could not.

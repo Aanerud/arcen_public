@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Real Quinn loopback tests for the QUIC multi-monitor carrier benchmark
 //! foundation (`arcen_transport::quic::{run_carrier_a, run_carrier_b}`).
 //!

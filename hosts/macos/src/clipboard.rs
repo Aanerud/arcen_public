@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! macOS pasteboard access for the Pier.
 //!
 //! This is the native adapter only. Direction, content limits, size caps,

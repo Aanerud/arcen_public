@@ -1,10 +1,18 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Host cursor images between a Pier and a Deck.
 //!
-//! The Pier turns its capture process's cursor events into the current
-//! cursor ([`CursorAggregate`], one per desktop), gives every distinct image
-//! a stable id ([`CursorImageRegistry`], one per desktop) and sends the
-//! newest state on the input/cursor lane ([`CursorLaneOutbox`], one per
-//! attachment). The Deck applies those records ([`DeckCursorState`]).
+//! The Pier turns its desktop's cursor into the current cursor — from a
+//! Wayland capture process's per-output events ([`CursorAggregate`]) or from
+//! a host that reads its one pointer directly, X11 or Windows
+//! ([`HostCursor`]) — gives every distinct image a stable id
+//! ([`CursorImageRegistry`], one per desktop) and sends the newest state on
+//! the input/cursor lane: itself ([`CursorLaneOutbox`], one per attachment)
+//! or, from a session agent, through its relay
+//! ([`agent_cursor_record`] → `arcen_protocol::cursor::CursorRecordRelay`).
+//! The Deck applies those records ([`DeckCursorState`]). Named host shapes
+//! ([`shape_for_x_cursor_name`]) are the fallback for a Deck that does not
+//! draw images.
 //!
 //! An image crosses the link once. Both ends keep the same deterministic
 //! [`CursorImageCache`]: every delivered record touches or inserts exactly
@@ -15,107 +23,21 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arcen_media::capenc_stream::{CapencCursorEvent, CapencCursorSprite};
 use arcen_media::cursor::{CursorImage, CursorImageError, WireCursorImage};
+pub use arcen_protocol::cursor::{CURSOR_CACHE_BYTES, CURSOR_CACHE_ENTRIES, CursorImageCache};
 use arcen_protocol::cursor::{
     CursorAppearance, CursorImageId, CursorImageRef, CursorUpdate, CursorUpdateError,
     decode_cursor_update, encode_cursor_update,
 };
 use arcen_protocol::messages::CursorShapeKind;
 
-/// Images either end holds for one lane.
-pub const CURSOR_CACHE_ENTRIES: usize = 32;
-/// Decoded bytes either end holds for one lane.
-pub const CURSOR_CACHE_BYTES: usize = 2 * 1024 * 1024;
 /// Distinct images a Pier remembers for one desktop.
 pub const CURSOR_REGISTRY_ENTRIES: usize = 128;
 /// Source and PNG bytes a Pier remembers for one desktop.
 pub const CURSOR_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
-
-/// A deterministic least-recently-used cache of cursor image ids.
-///
-/// Each entry weighs `width * height * 4` bytes of the wire image. Inserting
-/// evicts the least recently used entries until at most
-/// [`CURSOR_CACHE_ENTRIES`] remain and their weight is within
-/// [`CURSOR_CACHE_BYTES`]; the newest entry always stays.
-#[derive(Debug, Clone)]
-pub struct CursorImageCache<V> {
-    entries: VecDeque<(CursorImageId, usize, V)>,
-    bytes: usize,
-}
-
-impl<V> Default for CursorImageCache<V> {
-    fn default() -> Self {
-        Self {
-            entries: VecDeque::new(),
-            bytes: 0,
-        }
-    }
-}
-
-impl<V> CursorImageCache<V> {
-    /// The weight of an image of this size.
-    #[must_use]
-    pub fn weight(width: u16, height: u16) -> usize {
-        usize::from(width) * usize::from(height) * 4
-    }
-
-    /// Whether `id` is held.
-    #[must_use]
-    pub fn contains(&self, id: CursorImageId) -> bool {
-        self.entries.iter().any(|(entry, _, _)| *entry == id)
-    }
-
-    /// Marks `id` most recently used and returns its value.
-    pub fn touch(&mut self, id: CursorImageId) -> Option<&V> {
-        let index = self.entries.iter().position(|(entry, _, _)| *entry == id)?;
-        let entry = self.entries.remove(index)?;
-        self.entries.push_back(entry);
-        self.entries.back().map(|(_, _, value)| value)
-    }
-
-    /// Inserts `id` as most recently used, replacing an existing entry.
-    pub fn insert(&mut self, id: CursorImageId, weight: usize, value: V) {
-        if let Some(index) = self.entries.iter().position(|(entry, _, _)| *entry == id) {
-            if let Some((_, old, _)) = self.entries.remove(index) {
-                self.bytes -= old;
-            }
-        }
-        self.entries.push_back((id, weight, value));
-        self.bytes += weight;
-        while self.entries.len() > 1
-            && (self.entries.len() > CURSOR_CACHE_ENTRIES || self.bytes > CURSOR_CACHE_BYTES)
-        {
-            if let Some((_, weight, _)) = self.entries.pop_front() {
-                self.bytes -= weight;
-            }
-        }
-    }
-
-    /// Forgets everything.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.bytes = 0;
-    }
-
-    /// Ids from least to most recently used.
-    pub fn ids(&self) -> impl Iterator<Item = CursorImageId> + '_ {
-        self.entries.iter().map(|(id, _, _)| *id)
-    }
-
-    /// Number of entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the cache is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
 
 struct RegisteredImage {
     wire: Arc<WireCursorImage>,
@@ -208,6 +130,12 @@ impl CursorImageRegistry {
         }
     }
 
+    /// Whether `image` already has an id (registering it again is cheap).
+    #[must_use]
+    pub fn contains(&self, image: &CursorImage) -> bool {
+        self.by_source.contains_key(image)
+    }
+
     /// Number of images remembered.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -241,6 +169,9 @@ pub enum CursorFacts {
         id: CursorImageId,
         /// The image as it travels.
         wire: Arc<WireCursorImage>,
+        /// The named shape closest to the image, for a client that cannot
+        /// show images (`default` when the host cannot name it).
+        fallback: CursorShapeKind,
     },
 }
 
@@ -250,7 +181,7 @@ impl CursorFacts {
     pub const fn fallback_shape(&self) -> CursorShapeKind {
         match self {
             Self::Hidden { .. } => CursorShapeKind::Hidden,
-            Self::Image { .. } => CursorShapeKind::Default,
+            Self::Image { fallback, .. } => *fallback,
         }
     }
 }
@@ -355,6 +286,7 @@ impl CursorAggregate {
                         generation: cursor.generation,
                         id: *id,
                         wire: Arc::clone(wire),
+                        fallback: CursorShapeKind::Default,
                     },
                 },
             )
@@ -395,6 +327,175 @@ impl CursorAggregate {
         if self.active == Some(output) {
             self.active = None;
         }
+    }
+
+    /// Distinct images remembered for this desktop.
+    #[must_use]
+    pub fn registered_images(&self) -> usize {
+        self.registry.len()
+    }
+}
+
+/// New cursor images a host fits to the wire in any one second.
+///
+/// Fitting an image (trim, resample, PNG) is the expensive step and an
+/// image travels at most once per lane, so this bounds what an application
+/// that churns cursor images (an animated cursor's first cycle, or a
+/// misbehaving one) can cost the host and the link. Known images are not
+/// counted: an animated cursor that repeats costs ids only.
+pub const MAX_NEW_CURSOR_IMAGES_PER_SECOND: usize = 30;
+
+/// What a host reads from its desktop's pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostCursorSample {
+    /// The pointer is hidden.
+    Hidden,
+    /// The pointer shows `image`.
+    Image {
+        /// The image, in the stream's pixels.
+        image: CursorImage,
+        /// Its closest named shape, for a Deck that cannot show images
+        /// (`default` when the host cannot name it).
+        fallback: CursorShapeKind,
+    },
+}
+
+/// What [`HostCursor::offer`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCursorOutcome {
+    /// The current cursor changed.
+    Changed,
+    /// Nothing visible changed.
+    Unchanged,
+    /// Too many new images this second: the newest sample waits for
+    /// [`HostCursor::poll`] at [`HostCursor::retry_at`].
+    Deferred,
+    /// The image could not be fitted to the wire; the current cursor stays.
+    ImageRefused(CursorImageError),
+}
+
+/// The cursor of a desktop with one pointer source, read directly from the
+/// host (X11 `XFixes`, Windows `GetCursorInfo`): every sample is the whole
+/// pointer state, so it needs none of [`CursorAggregate`]'s per-output
+/// reasoning. Keeps the desktop's image ids stable, ignores samples that
+/// change nothing, and rate-limits new images
+/// ([`MAX_NEW_CURSOR_IMAGES_PER_SECOND`]), keeping only the newest sample
+/// while it waits.
+#[derive(Debug, Default)]
+pub struct HostCursor {
+    registry: CursorImageRegistry,
+    output: u32,
+    generation: u32,
+    current: Option<CursorFacts>,
+    pending: Option<HostCursorSample>,
+    new_images: VecDeque<Instant>,
+    samples: u64,
+    deferred: u64,
+    refused: u64,
+}
+
+impl HostCursor {
+    /// The pixel space of later samples: the host's output number and its
+    /// generation (0 and 0 for a single desktop).
+    pub fn set_output(&mut self, output: u32, generation: u32) {
+        self.output = output;
+        self.generation = generation;
+    }
+
+    /// Applies one sample read at `now`.
+    pub fn offer(&mut self, sample: HostCursorSample, now: Instant) -> HostCursorOutcome {
+        self.samples += 1;
+        self.pending = None;
+        let next = match &sample {
+            HostCursorSample::Hidden => CursorFacts::Hidden {
+                output: self.output,
+                generation: self.generation,
+            },
+            HostCursorSample::Image { image, fallback } => {
+                if !self.registry.contains(image) {
+                    let window = std::time::Duration::from_secs(1);
+                    while self
+                        .new_images
+                        .front()
+                        .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+                    {
+                        self.new_images.pop_front();
+                    }
+                    if self.new_images.len() >= MAX_NEW_CURSOR_IMAGES_PER_SECOND {
+                        self.deferred += 1;
+                        self.pending = Some(sample);
+                        return HostCursorOutcome::Deferred;
+                    }
+                    self.new_images.push_back(now);
+                }
+                match self.registry.register(image) {
+                    Ok(Some((id, wire))) => CursorFacts::Image {
+                        output: self.output,
+                        generation: self.generation,
+                        id,
+                        wire,
+                        fallback: *fallback,
+                    },
+                    Ok(None) => CursorFacts::Hidden {
+                        output: self.output,
+                        generation: self.generation,
+                    },
+                    Err(error) => {
+                        self.refused += 1;
+                        return HostCursorOutcome::ImageRefused(error);
+                    }
+                }
+            }
+        };
+        if self.current.as_ref() == Some(&next) {
+            HostCursorOutcome::Unchanged
+        } else {
+            self.current = Some(next);
+            HostCursorOutcome::Changed
+        }
+    }
+
+    /// Applies a deferred sample once its turn came.
+    pub fn poll(&mut self, now: Instant) -> HostCursorOutcome {
+        match self.retry_at() {
+            Some(at) if now >= at => match self.pending.take() {
+                Some(sample) => self.offer(sample, now),
+                None => HostCursorOutcome::Unchanged,
+            },
+            _ => HostCursorOutcome::Unchanged,
+        }
+    }
+
+    /// When a deferred sample may be applied, if one waits.
+    #[must_use]
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.pending.as_ref()?;
+        let oldest = self.new_images.front()?;
+        Some(*oldest + std::time::Duration::from_secs(1))
+    }
+
+    /// The current cursor, once a sample was applied.
+    #[must_use]
+    pub const fn current(&self) -> Option<&CursorFacts> {
+        self.current.as_ref()
+    }
+
+    /// Samples offered.
+    #[must_use]
+    pub const fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Samples that had to wait for the new-image budget.
+    #[must_use]
+    pub const fn deferred(&self) -> u64 {
+        self.deferred
+    }
+
+    /// Images that could not be fitted to the wire.
+    #[must_use]
+    pub const fn refused_images(&self) -> u64 {
+        self.refused
     }
 
     /// Distinct images remembered for this desktop.
@@ -501,6 +602,73 @@ pub struct PreparedCursorUpdate {
     image: Option<(CursorImageId, usize)>,
 }
 
+/// The record for `facts` and, for an image, its id and cache weight.
+fn cursor_update_for(
+    facts: &CursorFacts,
+    sequence: u64,
+    inline: bool,
+) -> Result<(CursorUpdate, Option<(CursorImageId, usize)>), CursorUpdateError> {
+    Ok(match facts {
+        CursorFacts::Hidden { output, generation } => (
+            CursorUpdate {
+                sequence,
+                output: *output,
+                generation: *generation,
+                fallback: CursorShapeKind::Hidden,
+                appearance: CursorAppearance::Hidden,
+            },
+            None,
+        ),
+        CursorFacts::Image {
+            output,
+            generation,
+            id,
+            wire,
+            fallback,
+        } => {
+            let dimension =
+                |value: u32| u16::try_from(value).map_err(|_| CursorUpdateError::Dimensions);
+            let width = dimension(wire.image.width())?;
+            let height = dimension(wire.image.height())?;
+            let (hotspot_x, hotspot_y) = wire.image.hotspot();
+            (
+                CursorUpdate {
+                    sequence,
+                    output: *output,
+                    generation: *generation,
+                    fallback: *fallback,
+                    appearance: CursorAppearance::Image(CursorImageRef {
+                        id: *id,
+                        width,
+                        height,
+                        hotspot_x: dimension(hotspot_x)?,
+                        hotspot_y: dimension(hotspot_y)?,
+                        inline_png: inline.then(|| wire.png.clone()),
+                    }),
+                },
+                Some((*id, CursorImageCache::<()>::weight(width, height))),
+            )
+        }
+    })
+}
+
+/// The record a session agent hands its Pier's relay
+/// ([`arcen_protocol::cursor::CursorRecordRelay`]): the whole state with
+/// any image inline, because the agent cannot see which images the Deck
+/// holds.
+///
+/// # Errors
+///
+/// [`CursorUpdateError`] only when a registered image breaks the wire
+/// contract, which the registry prevents.
+pub fn agent_cursor_record(
+    facts: &CursorFacts,
+    sequence: u64,
+) -> Result<Vec<u8>, CursorUpdateError> {
+    let (update, _) = cursor_update_for(facts, sequence, true)?;
+    encode_cursor_update(&update)
+}
+
 /// The newest cursor state for one attachment's input/cursor lane.
 ///
 /// Only the latest state is kept: a newer state replaces one that has not
@@ -548,50 +716,11 @@ impl CursorLaneOutbox {
             return Ok(None);
         };
         let sequence = self.sequence + 1;
-        let (update, image, inline_image) = match &facts {
-            CursorFacts::Hidden { output, generation } => (
-                CursorUpdate {
-                    sequence,
-                    output: *output,
-                    generation: *generation,
-                    fallback: CursorShapeKind::Hidden,
-                    appearance: CursorAppearance::Hidden,
-                },
-                None,
-                false,
-            ),
-            CursorFacts::Image {
-                output,
-                generation,
-                id,
-                wire,
-            } => {
-                let dimension =
-                    |value: u32| u16::try_from(value).map_err(|_| CursorUpdateError::Dimensions);
-                let width = dimension(wire.image.width())?;
-                let height = dimension(wire.image.height())?;
-                let (hotspot_x, hotspot_y) = wire.image.hotspot();
-                let inline = !self.mirror.contains(*id);
-                (
-                    CursorUpdate {
-                        sequence,
-                        output: *output,
-                        generation: *generation,
-                        fallback: CursorShapeKind::Default,
-                        appearance: CursorAppearance::Image(CursorImageRef {
-                            id: *id,
-                            width,
-                            height,
-                            hotspot_x: dimension(hotspot_x)?,
-                            hotspot_y: dimension(hotspot_y)?,
-                            inline_png: inline.then(|| wire.png.clone()),
-                        }),
-                    },
-                    Some((*id, CursorImageCache::<()>::weight(width, height))),
-                    inline,
-                )
-            }
+        let inline_image = match &facts {
+            CursorFacts::Hidden { .. } => false,
+            CursorFacts::Image { id, .. } => !self.mirror.contains(*id),
         };
+        let (update, image) = cursor_update_for(&facts, sequence, inline_image)?;
         Ok(Some(PreparedCursorUpdate {
             bytes: encode_cursor_update(&update)?,
             inline_image,
@@ -840,6 +969,51 @@ impl LocalPenCursor {
     /// A new connection: nothing is known about the host's cursor.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// The named shape closest to an X cursor name (Xcursor theme, core
+/// cursor font or CSS name), matched case-insensitively. An empty or
+/// unknown name is `default`: whether a cursor is invisible is decided from
+/// its pixels, not its name, except for the explicitly blank names.
+#[must_use]
+pub fn shape_for_x_cursor_name(name: &str) -> CursorShapeKind {
+    match name.to_ascii_lowercase().as_str() {
+        "n-resize" | "s-resize" | "ns-resize" | "size_ver" | "top_side" | "bottom_side"
+        | "v_double_arrow" | "row-resize" | "sb_v_double_arrow" => CursorShapeKind::ResizeNs,
+        "e-resize" | "w-resize" | "ew-resize" | "size_hor" | "right_side" | "left_side"
+        | "h_double_arrow" | "col-resize" | "sb_h_double_arrow" => CursorShapeKind::ResizeEw,
+        "nw-resize"
+        | "se-resize"
+        | "nwse-resize"
+        | "size_fdiag"
+        | "top_left_corner"
+        | "bottom_right_corner"
+        | "fd_double_arrow"
+        | "ul_angle"
+        | "lr_angle" => CursorShapeKind::ResizeNwse,
+        "ne-resize" | "sw-resize" | "nesw-resize" | "size_bdiag" | "top_right_corner"
+        | "bottom_left_corner" | "bd_double_arrow" | "ur_angle" | "ll_angle" => {
+            CursorShapeKind::ResizeNesw
+        }
+        "move" | "size_all" | "fleur" | "all-scroll" => CursorShapeKind::ResizeAll,
+        "text" | "xterm" | "ibeam" | "vertical-text" => CursorShapeKind::Text,
+        "pointer" | "hand" | "hand1" | "hand2" | "pointing_hand" => CursorShapeKind::Pointer,
+        "crosshair" | "cross" | "tcross" | "cross_reverse" | "diamond_cross" => {
+            CursorShapeKind::Crosshair
+        }
+        "grab" | "openhand" | "hand3" => CursorShapeKind::Grab,
+        "grabbing" | "closedhand" | "hand4" | "dnd-move" => CursorShapeKind::Grabbing,
+        "zoom-in" | "zoom_in" => CursorShapeKind::ZoomIn,
+        "zoom-out" | "zoom_out" => CursorShapeKind::ZoomOut,
+        "wait" | "watch" | "clock" => CursorShapeKind::Wait,
+        "progress" | "left_ptr_watch" | "half-busy" => CursorShapeKind::Progress,
+        "help" | "question_arrow" | "whats_this" => CursorShapeKind::Help,
+        "not-allowed" | "forbidden" | "circle" | "no-drop" | "dnd-no-drop" | "crossed_circle" => {
+            CursorShapeKind::NotAllowed
+        }
+        "none" | "blank_cursor" | "nil_cursor" => CursorShapeKind::Hidden,
+        _ => CursorShapeKind::Default,
     }
 }
 
@@ -1183,5 +1357,153 @@ mod tests {
             pen.shown_shape(CursorShapeKind::Hidden, true),
             CursorShapeKind::Text
         );
+    }
+
+    fn sample(seed: u8, fallback: CursorShapeKind) -> HostCursorSample {
+        HostCursorSample::Image {
+            image: image(seed, 8),
+            fallback,
+        }
+    }
+
+    #[test]
+    fn host_cursor_keeps_ids_and_fallbacks_and_ignores_repeats() {
+        let now = Instant::now();
+        let mut host = HostCursor::default();
+        assert_eq!(
+            host.offer(sample(1, CursorShapeKind::Crosshair), now),
+            HostCursorOutcome::Changed
+        );
+        let current = host.current().cloned().unwrap();
+        assert_eq!(current.fallback_shape(), CursorShapeKind::Crosshair);
+        assert_eq!(
+            host.offer(sample(1, CursorShapeKind::Crosshair), now),
+            HostCursorOutcome::Unchanged
+        );
+        // The same image under another name is a change for an old Deck.
+        assert_eq!(
+            host.offer(sample(1, CursorShapeKind::Text), now),
+            HostCursorOutcome::Changed
+        );
+        assert_eq!(host.registered_images(), 1);
+        assert_eq!(
+            host.offer(HostCursorSample::Hidden, now),
+            HostCursorOutcome::Changed
+        );
+        assert_eq!(
+            host.current().map(CursorFacts::fallback_shape),
+            Some(CursorShapeKind::Hidden)
+        );
+        // A fully transparent image hides the pointer.
+        let clear = CursorImage::from_straight_rgba(4, 4, (0, 0), vec![0; 64]).unwrap();
+        host.offer(sample(1, CursorShapeKind::Default), now);
+        assert_eq!(
+            host.offer(
+                HostCursorSample::Image {
+                    image: clear,
+                    fallback: CursorShapeKind::Default
+                },
+                now
+            ),
+            HostCursorOutcome::Changed
+        );
+        assert!(matches!(host.current(), Some(CursorFacts::Hidden { .. })));
+    }
+
+    #[test]
+    fn host_cursor_rate_limits_new_images_but_not_known_ones() {
+        let start = Instant::now();
+        let mut host = HostCursor::default();
+        for seed in 0..MAX_NEW_CURSOR_IMAGES_PER_SECOND {
+            let seed = u8::try_from(seed).unwrap();
+            let outcome = host.offer(sample(seed, CursorShapeKind::Default), start);
+            assert_eq!(outcome, HostCursorOutcome::Changed);
+        }
+        let later = start + std::time::Duration::from_millis(300);
+        assert_eq!(
+            host.offer(sample(200, CursorShapeKind::Default), later),
+            HostCursorOutcome::Deferred
+        );
+        // A newer sample replaces the waiting one; a known image is free.
+        assert_eq!(
+            host.offer(sample(201, CursorShapeKind::Default), later),
+            HostCursorOutcome::Deferred
+        );
+        assert_eq!(
+            host.offer(sample(3, CursorShapeKind::Default), later),
+            HostCursorOutcome::Changed
+        );
+        assert!(host.retry_at().is_none(), "a known image cleared the wait");
+        host.offer(sample(202, CursorShapeKind::Default), later);
+        let retry = host.retry_at().unwrap();
+        assert_eq!(retry, start + std::time::Duration::from_secs(1));
+        assert_eq!(host.poll(later), HostCursorOutcome::Unchanged);
+        assert_eq!(host.poll(retry), HostCursorOutcome::Changed);
+        assert!(host.retry_at().is_none());
+        assert_eq!(host.deferred(), 3);
+        assert_eq!(
+            host.registered_images(),
+            MAX_NEW_CURSOR_IMAGES_PER_SECOND + 1
+        );
+    }
+
+    #[test]
+    fn agent_records_always_carry_their_image_and_fallback() {
+        let mut host = HostCursor::default();
+        host.set_output(2, 7);
+        host.offer(sample(9, CursorShapeKind::ZoomIn), Instant::now());
+        let facts = host.current().cloned().unwrap();
+        let record = agent_cursor_record(&facts, 5).unwrap();
+        let update = decode_cursor_update(&record).unwrap();
+        assert_eq!(
+            (
+                update.sequence,
+                update.output,
+                update.generation,
+                update.fallback
+            ),
+            (5, 2, 7, CursorShapeKind::ZoomIn)
+        );
+        let CursorAppearance::Image(reference) = update.appearance else {
+            panic!("expected an image");
+        };
+        assert!(reference.inline_png.is_some());
+        // Through the relay the Deck shows it, and only once inline.
+        let mut relay = arcen_protocol::cursor::CursorRecordRelay::default();
+        let mut deck = DeckCursorState::default();
+        relay.offer(&record).unwrap();
+        let prepared = relay.prepare(1).unwrap();
+        assert!(prepared.inline_image);
+        assert!(deck.apply(&prepared.bytes).unwrap());
+        relay.commit(prepared);
+        assert!(matches!(deck.current(), DeckCursor::Image { .. }));
+        relay
+            .offer(&agent_cursor_record(&facts, 6).unwrap())
+            .unwrap();
+        let prepared = relay.prepare(1).unwrap();
+        assert!(!prepared.inline_image);
+        deck.apply(&prepared.bytes).unwrap();
+        assert_eq!(deck.unknown_images(), 0);
+    }
+
+    #[test]
+    fn x_cursor_names_map_to_shapes() {
+        for (name, shape) in [
+            ("left_ptr", CursorShapeKind::Default),
+            ("", CursorShapeKind::Default),
+            ("XTERM", CursorShapeKind::Text),
+            ("hand2", CursorShapeKind::Pointer),
+            ("crosshair", CursorShapeKind::Crosshair),
+            ("ul_angle", CursorShapeKind::ResizeNwse),
+            ("ll_angle", CursorShapeKind::ResizeNesw),
+            ("fleur", CursorShapeKind::ResizeAll),
+            ("left_ptr_watch", CursorShapeKind::Progress),
+            ("watch", CursorShapeKind::Wait),
+            ("not-allowed", CursorShapeKind::NotAllowed),
+            ("blank_cursor", CursorShapeKind::Hidden),
+            ("some_unknown_cursor_2099", CursorShapeKind::Default),
+        ] {
+            assert_eq!(shape_for_x_cursor_name(name), shape, "{name}");
+        }
     }
 }

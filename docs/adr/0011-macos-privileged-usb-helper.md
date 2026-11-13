@@ -2,27 +2,31 @@
 
 **Status:** Accepted 2026-08-20.
 
-> Signed off by the repository owner (@aaanerud_microsoft), who holds both the
-> Shared/Architecture and Release/Security roles for this repository, on the
-> instruction *"You have all the necessary tools to sign things"* given
-> 2026-08-20 after reviewing the design and the Apple DTS response.
+> **Status note (0.19.0):** [ADR 0019](0019-iousbhost-usb-backend.md) moves
+> this helper's capture from libusb to `IOUSBHost.framework`. Since 0.19.0
+> every release helper is built with the `iousbhost` feature and captures
+> with `IOUSBHost` `DeviceCapture`; a release build refuses a helper that
+> does not link `IOUSBHost.framework`. libusb is still linked and remains
+> selectable with `--backend libusb`. Every helper follows its hello with one
+> info frame (tag `0x06`, `backend=<name>`) so the Deck can log which backend
+> captured the device; older Decks skip it. The privilege boundary below is
+> unchanged.
 
 ## Context
 
 Hard USB currently works only when the whole Arcen Deck app is launched as root.
 That is a lab shortcut, not a shippable model.
 
-Apple Developer Technical Support closed the alternative on 2026-08-20 (Case-ID
-21584866): `com.apple.vm.device-access` is reserved for Mac App Store hypervisor
-apps supporting systems before macOS 27, exists solely because such apps may not
-escalate privileges, and every operation it gates also admits a privileged
-process. A Developer-ID-signed Deck therefore neither needs nor can obtain it.
-Apple's directed replacement is to split the privileged code into a separate
-helper tool, run only that as root, and reach it over IPC.
+The alternative entitlement does not apply: `com.apple.vm.device-access` is
+reserved for Mac App Store hypervisor apps supporting systems before macOS 27,
+and every operation it gates also admits a privileged process. A
+Developer-ID-signed Deck therefore neither needs nor can obtain it. The
+supported route is to split the privileged code into a separate helper tool,
+run only that as root, and reach it over IPC (see Apple's
+[Service Management](https://developer.apple.com/documentation/servicemanagement)
+documentation for `SMAppService` daemons).
 
-The full design is in
-[`../todo/macos-privileged-usb-helper.md`](../todo/macos-privileged-usb-helper.md).
-This ADR records only the parts that need owner authority.
+This ADR records the helper design: what runs as root and how it is reached.
 
 ## Decision
 
@@ -121,6 +125,37 @@ peer pid — pid reuse being the specific race this must avoid — and the socke
 root-created, mode `0600`, owned by the single authorized uid. Peer-uid remains a weaker statement than a code-signing
 requirement, which is what tranche 3 addresses.
 
+*Amended 2026-11-09 (security fix).* The socket was `/var/run/arcen-usb-helper.sock`,
+and the helper set its mode and owner with `chmod`/`chown` on that path after
+`bind`. On macOS `/var/run` is `root:daemon` 0775 without the sticky bit, so a
+member of group `daemon` could race a symbolic link onto the path and have the
+root helper change the mode and owner of an arbitrary file. The Deck also never
+checked who was listening. Now:
+
+- The socket is `/private/var/db/arcen/run/usb-helper.sock`. Every ancestor is
+  `root:wheel` 0755 and `run` is root's 0755, so only root can change anything
+  on the path; the Deck can still reach the socket. The helper creates and
+  verifies the directory at start from `/` down, opening each component with
+  `O_DIRECTORY | O_NOFOLLOW` relative to its parent and checking owner and mode
+  on the descriptor (`clients/macos/secure-dir`), and refuses to serve from any
+  other directory.
+- A stale entry is removed only if `fstatat(AT_SYMLINK_NOFOLLOW)` shows a
+  socket. After `bind`, the mode (0600) and owner (the authorized uid) are set
+  with `fchmodat`/`fchownat` and `AT_SYMLINK_NOFOLLOW` relative to the pinned
+  directory descriptor, and checked again. The helper runs with umask 0077, set
+  before any thread starts, so the socket is never connectable by others even
+  before its mode is set.
+- The Deck checks the helper with `getpeereid` right after connecting and
+  refuses, with a logged reason, any peer that is not root.
+- The helper's own `getpeereid` check of the client is unchanged.
+
+`/private/var/db/arcen` survives a restart and is not removed when the Deck is
+deleted; it holds only this empty `run` directory (and the IOUSBHost marker
+directory, ADR 0019). After a Deck update, a helper that launchd started from
+the previous version keeps listening on the old path until launchd restarts it
+(restart the Mac, or turn the helper off and on in System Settings > General >
+Login Items).
+
 ## Consequences
 
 The user sees **one administrator prompt**, at helper registration, presented by
@@ -130,15 +165,15 @@ It is worth being explicit about what that prompt is *not*, because the obvious
 alternative is tempting and wrong. A prompt that escalates the **whole Deck app**
 to root — the `AuthorizationExecuteWithPrivileges` shape — is deprecated since
 macOS 10.7, performs no signature check on what it launches, and is precisely
-what Apple rejected in the case above. The prompt in this design authorizes
+the model Apple's guidance steers away from. The prompt in this design authorizes
 *installing a small root daemon*, not running Deck as root. There is no
 per-session password dialog: once approved, the daemon persists and Deck reaches
 it over an authenticated XPC boundary.
 
-### Measured cost of the interim `sudo` workaround, 2026-08-20
+### Measured cost of running the Deck as root
 
 Running the whole app as root is not merely inelegant; it was measured breaking
-things on the development machine during a Hard USB attempt:
+things during a Hard USB attempt:
 
 - `~/Library/Application Support/Arcen/settings.json` and `connections.json`
   were rewritten as `root:staff`, mode `0600`. A subsequent non-root Deck can no
@@ -149,10 +184,8 @@ things on the development machine during a Hard USB attempt:
   root-launched GUI does not inherit the user's normal graphics and audio
   session context.
 
-This is exactly the class of breakage Apple's "problematic for all sorts of
-reasons" refers to, and it is first-hand evidence that the helper is required
-rather than merely preferred. `sudo` must remain a lab-only expedient and must
-never be documented as a user-facing workflow.
+This is first-hand evidence that the helper is required rather than merely
+preferred. `sudo` must never be documented as a user-facing workflow.
 
 Deck must degrade to the typed Light path, not fail, when the helper is absent or
 unapproved, and must route `SMAppService.Status.requiresApproval` to
@@ -165,26 +198,15 @@ than delete it: Deck opens the accessory with user consent and hands it to a
 helper via `createXPCRepresentation()`, at which point the helper no longer needs
 to be root. Keeping the XPC boundary and URB contract identical now is what makes
 that migration cheap. Whether `AAUSBAccessory.open()` actually pre-empts the
-in-kernel HID driver for a HID-class tablet is still unanswered and is the
-subject of a drafted DTS follow-up.
+in-kernel HID driver for a HID-class tablet is not yet established.
 
 ## Alternatives rejected
 
 | Alternative | Why rejected |
 | --- | --- |
-| Request `com.apple.vm.device-access` | Refused by Apple; Mac App Store hypervisors only |
-| Run the whole Deck app as root | Rejected by Apple and unacceptable for distribution |
+| Request `com.apple.vm.device-access` | Reserved for Mac App Store hypervisors |
+| Run the whole Deck app as root | Breaks per-user state (above) and unacceptable for distribution |
 | Prompt for admin at every launch and escalate the app | `AuthorizationExecuteWithPrivileges` is deprecated since 10.7 and validates nothing about the binary it runs |
 | Fused multicall subcommand, matching Linux | Mechanically possible, but puts the GUI, renderer, decoder and transport in a root process image |
 | Unix domain socket instead of XPC | Would require hand-rolling peer authentication, the one part that must not be hand-rolled |
 | Wait for macOS 27 Accessory Access | Does not help any currently supported release, and its HID pre-emption behavior is still unconfirmed |
-
-## Sign-off
-
-| Role | Decision | Who | Date |
-| --- | --- | --- | --- |
-| Shared/Architecture (item 1) | Accepted | @aaanerud_microsoft | 2026-08-20 |
-| Release/Security (items 2 and 3) | Accepted | @aaanerud_microsoft | 2026-08-20 |
-
-Recorded by the agent on the owner's explicit instruction; the owner holds both
-roles in this repository.

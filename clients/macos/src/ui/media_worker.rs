@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Media worker — owns the streaming hot path on its own OS thread.
 //!
 //! The session's receive/decode/audio pipeline must NOT live on the egui UI
@@ -298,9 +300,10 @@ pub struct SharedMediaState {
     /// The host's cursor image state, when it changed since the UI last
     /// took it (`arcen_input::cursor::DeckCursorState`).
     pub pending_host_cursor: Option<arcen_input::cursor::DeckCursor>,
+    /// The newest host pointer position not yet taken by the UI.
+    pub pending_host_pointer: Option<arcen_protocol::cursor_position::CursorPosition>,
     pub microphone_active: bool,
     pub display_update_result: Option<DisplayUpdateResultMsg>,
-    pub broker_hello: bool,
     pub host_health: Option<HealthStatsMsg>,
     pub last_health_pong: Option<HealthPongMsg>,
     pub video_frames_seen: u64,
@@ -458,6 +461,7 @@ pub fn spawn_media_worker(
             }
             let mut full_frame_requests = FullFrameRequestGate::default();
             let mut host_cursor = arcen_input::cursor::DeckCursorState::default();
+            let mut host_pointer = arcen_input::host_pointer::DeckHostPointer::default();
             let mut pending_ingress_idr = false;
             let mut last_heartbeat = Instant::now();
             let mut monitor_rate_snapshots: BTreeMap<
@@ -588,14 +592,6 @@ pub fn spawn_media_worker(
                         let _ = full_frame_requests.send_due(&commands);
                         repaint.request_repaint();
                     }
-                    SessionEvent::BrokerHello(_) => {
-                        tracing::info!(
-                            target: crate::logging::target::SESSION,
-                            "broker hello",
-                        );
-                        shared.lock().expect("media state poisoned").broker_hello = true;
-                        repaint.request_repaint();
-                    }
                     SessionEvent::Json(value) => {
                         let mut state = shared.lock().expect("media state poisoned");
                         // Results the UI acts on wake it; health samples
@@ -694,7 +690,25 @@ pub fn spawn_media_worker(
                             "host cursor record dropped"
                         ),
                     },
-                    SessionEvent::CursorLaneReset => host_cursor.reset_lane(),
+                    SessionEvent::CursorPosition(bytes) => match host_pointer.apply(&bytes) {
+                        Ok(Some(position)) => {
+                            shared
+                                .lock()
+                                .expect("media state poisoned")
+                                .pending_host_pointer = Some(position);
+                            repaint.request_repaint();
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::debug!(
+                            target: crate::logging::target::SESSION,
+                            %error,
+                            "host pointer record dropped"
+                        ),
+                    },
+                    SessionEvent::CursorLaneReset => {
+                        host_cursor.reset_lane();
+                        host_pointer.reset_lane();
+                    }
                     SessionEvent::MicrophoneActive(active) => {
                         shared
                             .lock()

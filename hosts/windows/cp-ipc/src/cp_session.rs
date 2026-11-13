@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! The provider side of the credential pipe: the single-use decryption gate and
 //! the transport-generic serve loop.
 //!

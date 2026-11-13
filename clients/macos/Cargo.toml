@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
 [package]
 name = "arcen-deck-macos"
-version = "0.17.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
 publish.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "arcen_deck"
@@ -21,11 +25,19 @@ path = "src/lib.rs"
 # This is a raw-input passthrough quarantined behind this feature — it is not
 # USB bridging (no USB transport/enumeration is involved).
 experimental-raw-hid = []
-# Lab-only Hard USB responder: connects to the privileged `arcen-usb-helper`,
-# which captures whichever attached device classifies as a pen tablet, or
-# (with ARCEN_USB_HARD_SYNTHETIC=1) answers as an independently authored
-# synthetic USB tablet. Not a production bridge.
-usb-hard-lab = ["dep:rusb", "dep:objc2-service-management"]
+# Native tablet: connects to the privileged `arcen-usb-helper` (embedded and
+# registered with SMAppService), which captures whichever attached device
+# classifies as a pen tablet, or (with ARCEN_USB_HARD_SYNTHETIC=1) answers as
+# an independently authored synthetic USB tablet. `build-deck-app.sh` turns
+# it on whenever it embeds the helper, which release builds always do.
+native-tablet = ["dep:rusb", "dep:objc2-service-management"]
+# Lab-only: `--usb-emulate wacom-intuos5` on the CLI smokes feeds an emulated
+# Wacom Intuos5 (real descriptors, scripted pen strokes) through the shared
+# USB exporter into the Hard USB negotiation instead of the privileged
+# helper, to prove a host's tablet path with no pen in hand. No packaging
+# script enables it, and `build-deck-app.sh --release` refuses it and any
+# binary carrying its ARCEN_DECK_USB_EMULATE_FEATURE_MARKER_DO_NOT_SHIP string.
+usb-emulate-lab = ["native-tablet"]
 # Developer-only tooling. Default-off and never enabled in release/package
 # builds: it compiles in `crate::ui::virtual_monitor_lab`, the
 # `virtual-monitor-lab` CLI subcommand, and the env-gated
@@ -98,7 +110,7 @@ apple-cf = "0.9.3"
 block2 = "0.6.2"
 core-graphics = "0.25.0"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSCell", "NSCursor", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSDate", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
 # w4-dedicated-metal-layer: the dedicated 10-bit `CAMetalLayer` video path
 # (`src/ui/video_metal_layer.rs`). Pinned to the exact versions/feature

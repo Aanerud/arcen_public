@@ -167,19 +167,19 @@ bounded lifecycle metadata present in approved logs/events.
 - ACME, SCEP, and ADCS enrollment
 - persistent Deck trust bookmarks
 - mTLS and protocol-advertised pins/messages
-- multi-stream/datagram QUIC optimization and Arcen Span
+- multi-stream/datagram QUIC optimization
 - OIDC and licensing integration
 - 0-RTT and runtime certificate fetch
 
 ## Validation and limitations
 
 Shared policy, host adapters, helper transaction behavior, Deck trust
-decisions, and reload state have automated unit/portable coverage. This
-worktree does **not** establish native acceptance for the macOS UI/system trust
+decisions, and reload state have automated unit/portable coverage. That
+coverage does **not** establish native acceptance for the macOS UI/system trust
 path; Linux `openat`, systemd, journal, or installed-helper behavior; Windows
 installed DACL, SCM control, Event Log, or service reload; real concurrent QUIC
-renewal; old-binary upgrade behavior; or cross-host lab operation. Those
-platform/lab checks remain required and must not be reported as passed.
+renewal; old-binary upgrade behavior; or cross-host operation. Those are
+validated on the target platforms and are not claimed by the automated suite.
 
 The implementation and this document are original Arcen work; no source intake
 or provenance row accompanies this milestone.

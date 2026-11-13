@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
 //! Direct product QUIC stream used by Pier and Deck.
 //!
 //! This is a transport carrier, not an admission decision. It establishes one

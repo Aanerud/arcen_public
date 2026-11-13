@@ -59,9 +59,8 @@ a Ctrl-Alt-Del at the occupied console before failing.
 down at the machine between the decision and the action. Arcen re-reads the target session's state
 immediately before moving it and aborts if it has become `Active`.
 
-## Future gateway behavior
+## Scope
 
-A future Arcen Gateway may provide an explicit administrator "kick out" workflow with audit and
-operator confirmation. This local Pier policy is narrower: it only handles the
-inactive/disconnected console case needed to make a single-console Windows host reachable without
-RDS.
+This local Pier policy is deliberately narrow: it only handles the inactive/disconnected console
+case needed to make a single-console Windows host reachable without RDS. It never offers an
+administrator "kick out" of an active console user.
