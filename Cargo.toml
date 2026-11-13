@@ -94,7 +94,7 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 zstd = { version = "0.14.3", default-features = false }
 ring = "=0.17.14"
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tracing = "0.1"
