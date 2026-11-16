@@ -1,0 +1,27 @@
+{
+  "clipboard_enabled": false,
+  "color_fidelity": "standard",
+  "cursor_preference": "local",
+  "displays_mode": "match_layout",
+  "encode_intent": "interactive",
+  "exact_still_image": true,
+  "full_color_display_mask": 0,
+  "fullscreen_uses_notch_area": false,
+  "future_setting": {
+    "kept": true
+  },
+  "hidpi_display_mask": 0,
+  "hidpi_streaming": true,
+  "log_level": 3,
+  "option_key_mode": "left_alt_right_characters",
+  "option_keys": "automatic",
+  "paste_chars_per_second": 25,
+  "paste_confirm_above": 2000,
+  "performance_mode": "standard",
+  "remembered_username": "AD\\artist.user",
+  "remote_ui_scale_percent": 0,
+  "security_mode": "high",
+  "tablet_input_enabled": true,
+  "tablet_mode_requested": "local_termination",
+  "typing_mode": "auto"
+}

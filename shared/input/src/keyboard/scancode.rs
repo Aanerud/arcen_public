@@ -150,6 +150,46 @@ pub fn set1_scancode(qt_key: u32, modifiers: u32) -> Option<Set1Scancode> {
     })
 }
 
+/// The identifiers [`set1_scancode`] accepts besides a position's own:
+/// the US shifted characters a Windows host always took for their key, and
+/// `Qt::Key_Backtab` for Tab.
+pub const SHIFTED_ALIASES: &[u32] = &[
+    0x21,
+    0x22,
+    0x23,
+    0x24,
+    0x25,
+    0x26,
+    0x28,
+    0x29,
+    0x2A,
+    0x2B,
+    0x3A,
+    0x3C,
+    0x3E,
+    0x3F,
+    0x40,
+    0x5E,
+    0x5F,
+    0x7B,
+    0x7C,
+    0x7D,
+    0x7E,
+    0x0100_0002,
+];
+
+/// [`set1_scancode`] of a position's own identifier only (no
+/// [`SHIFTED_ALIASES`]), ignoring the keypad flag: the main-block key a
+/// position identifier names on every host. The evdev code of a non-`E0`
+/// result is its `code`.
+#[must_use]
+pub fn set1_position(qt_key: u32) -> Option<Set1Scancode> {
+    if SHIFTED_ALIASES.contains(&qt_key) {
+        return None;
+    }
+    set1_scancode(qt_key, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +241,29 @@ mod tests {
             // Aliases share a position only with a US shifted character.
             assert!(keys.len() <= 2, "{code:?} has {keys:x?}");
         }
+    }
+
+    #[test]
+    fn a_position_has_one_identifier_and_every_alias_names_one() {
+        let mut owners = std::collections::BTreeMap::new();
+        for qt_key in (0..0x1_0000_u32).chain(0x0100_0000..0x0100_2000) {
+            if let Some(code) = set1_position(qt_key) {
+                assert!(
+                    owners.insert(code, qt_key).is_none(),
+                    "{code:?} has two identifiers"
+                );
+            }
+        }
+        for alias in SHIFTED_ALIASES {
+            let code = set1_scancode(*alias, 0).expect("an alias names a key");
+            assert!(owners.contains_key(&code), "{alias:#x} names no position");
+            assert_eq!(set1_position(*alias), None);
+        }
+        assert_eq!(set1_position(0x31), Some(Set1Scancode::plain(0x02)));
+        assert_eq!(set1_position(0x31), set1_scancode(0x31, 0));
+        assert_eq!(
+            set1_position(0x0100_0012),
+            Some(Set1Scancode::extended(0x4B))
+        );
     }
 }

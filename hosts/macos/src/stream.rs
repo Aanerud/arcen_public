@@ -475,6 +475,46 @@ async fn send_audio(
 ///
 /// Returns the sender audio is handed to, and the task, which ends when the
 /// sender is dropped or the channel closes.
+/// Starts exact still image for a session whose plan is on, over the
+/// surface this capture encodes. A refusal is logged and the session
+/// streams without it: the Deck then simply never sees a verdict.
+fn start_refine(
+    plan: arcen_media::refine::RefinePlan,
+    capture: &CaptureConfig,
+) -> (
+    Option<crate::refine::MacRefine>,
+    Option<crate::refine::MacRefineSession>,
+) {
+    let arcen_media::refine::RefinePlan::On { contract, .. } = plan else {
+        return (None, None);
+    };
+    let matrix = crate::encode::colour_for_capture(capture)
+        .and_then(|colour| crate::refine::matrix_from_core_video(colour.matrix));
+    let started = matrix
+        .ok_or_else(|| "the capture's encoder matrix has no Y′CbCr refinement".to_owned())
+        .and_then(|matrix| {
+            crate::refine::MacRefine::start(
+                plan,
+                capture.width,
+                capture.height,
+                contract.transfer,
+                contract.primaries,
+                matrix,
+            )
+        });
+    match started {
+        Ok((refine, session)) => (Some(refine), Some(session)),
+        Err(error) => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::MEDIA,
+                %error,
+                "exact still image did not start; the session streams without it"
+            );
+            (None, None)
+        }
+    }
+}
+
 fn spawn_audio_channel(
     channel: Option<tokio::net::UnixStream>,
 ) -> (
@@ -836,6 +876,14 @@ enum Incoming {
     PathSignal(arcen_telemetry::PathSignal),
     /// Handled, and the client is owed this answer.
     Reply(String),
+    /// A `health_ping`: the client is owed the pong, and the client
+    /// telemetry it carried feeds the session's health.
+    HealthPing {
+        /// The `health_pong`.
+        reply: String,
+        /// The Deck's QoS and network facts, when it sent any.
+        telemetry: Option<arcen_protocol::messages::ClientTelemetrySnapshotMsg>,
+    },
     /// The client is gone.
     PeerLeft,
 }
@@ -851,9 +899,22 @@ fn handle_control(
     stats: &mut StreamStats,
     keyframe_requests: Option<&std::sync::atomic::AtomicU64>,
     full_frame_requests: Option<&mut arcen_media::video::FullFrameRequestCoalescer>,
+    refine: Option<&std::sync::mpsc::SyncSender<arcen_protocol::refine::RefineControlMsg>>,
 ) -> Option<Incoming> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str)? {
+        // Exact still image controls (the Deck's, or the relay's own when its
+        // refine backlog overflowed). Ignored when this session does not
+        // refine: never counted as input.
+        "refine_reset" | "refine_control" => {
+            if let (Some(refine), Ok(command)) = (
+                refine,
+                serde_json::from_value::<arcen_protocol::refine::RefineControlMsg>(value),
+            ) {
+                let _ = refine.try_send(command);
+            }
+            Some(Incoming::Continue)
+        }
         arcen_protocol::messages::HEALTH_PING => {
             let health_ping =
                 serde_json::from_value::<arcen_protocol::messages::HealthPingMsg>(value).ok()?;
@@ -866,7 +927,10 @@ fn handle_control(
             };
             serde_json::to_string(&health_reply)
                 .ok()
-                .map(Incoming::Reply)
+                .map(|reply| Incoming::HealthPing {
+                    reply,
+                    telemetry: health_ping.client_telemetry,
+                })
         }
         "path_signal" => {
             serde_json::from_value::<arcen_session::agent_relay::ServiceMessage>(value)
@@ -892,6 +956,46 @@ fn handle_control(
     }
 }
 
+/// The session's keyboard-layout watcher, for a Deck told `host_keymap`.
+/// A watcher that cannot start leaves the Deck assuming the layouts match,
+/// as before, and says so.
+fn start_keymap_watch(host_keymap: bool) -> Option<crate::input::layout::KeymapWatch> {
+    if !host_keymap {
+        return None;
+    }
+    match std::env::current_exe()
+        .and_then(|program| crate::input::layout::KeymapWatch::start(&program))
+    {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::HID,
+                %error,
+                "cannot watch the keyboard layout; the Deck sends keys by position"
+            );
+            None
+        }
+    }
+}
+
+/// The watcher's next notice (`None`: it stopped).
+async fn next_keymap_notice(
+    watch: Option<&mut crate::input::layout::KeymapWatch>,
+) -> Option<String> {
+    let notice = watch?.next().await?;
+    if let Ok(notice) = serde_json::from_str::<arcen_protocol::messages::HostKeymapMsg>(&notice) {
+        tracing::info!(
+            target: arcen_telemetry::names::target::HID,
+            generation = notice.generation,
+            layouts = ?notice.layouts,
+            active_layout = ?notice.active_layout,
+            positions = notice.keys.len(),
+            "session keyboard layout read"
+        );
+    }
+    Some(notice)
+}
+
 /// Applies one message from the client.
 ///
 /// Text is either a clipboard offer or input; binary is dispatched by frame
@@ -914,6 +1018,7 @@ fn handle_incoming(
     input: Option<&mut crate::input_session::InputSession>,
     keyframe_requests: Option<&std::sync::atomic::AtomicU64>,
     full_frame_requests: Option<&mut arcen_media::video::FullFrameRequestCoalescer>,
+    refine: Option<&std::sync::mpsc::SyncSender<arcen_protocol::refine::RefineControlMsg>>,
 ) -> Result<Incoming, StreamError> {
     let (reassembler, worker) = match clipboard {
         Some((reassembler, worker)) => (Some(reassembler), Some(worker)),
@@ -937,7 +1042,7 @@ fn handle_incoming(
                 (Some(_), None) => stats.clipboard_rejected += 1,
                 (None, _) => {
                     if let Some(outcome) =
-                        handle_control(&text, stats, keyframe_requests, full_frame_requests)
+                        handle_control(&text, stats, keyframe_requests, full_frame_requests, refine)
                     {
                         return Ok(outcome);
                     }
@@ -1152,6 +1257,7 @@ fn spawn_producer(
     requested_pipeline: Option<arcen_media::video::PipelineId>,
     served_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     frame_budget: Option<u64>,
+    refine: Option<crate::refine::MacRefine>,
 ) -> Producer {
     // Two, not eight. Encoded frames cannot be dropped to catch up — a P-frame
     // whose reference never arrived is corruption until the next keyframe — so
@@ -1196,6 +1302,7 @@ fn spawn_producer(
                 rate: &producer_rate,
                 detail_fps: &producer_detail_fps,
             },
+            refine,
         )
     });
     Producer {
@@ -1426,12 +1533,9 @@ fn health_verdict(
         frames_sent: Some(rates.sent_frames),
         ..arcen_telemetry::QosSample::default()
     };
-    match arcen_telemetry::assess_health(&sample, &arcen_telemetry::QosTargets::default()).overall {
-        Some(arcen_telemetry::HealthState::Ok) => "ok",
-        Some(arcen_telemetry::HealthState::Degraded) => "degraded",
-        Some(arcen_telemetry::HealthState::Critical) => "critical",
-        None => "unavailable",
-    }
+    arcen_observability::session_health::state_name(
+        arcen_telemetry::assess_health(&sample, &arcen_telemetry::QosTargets::default()).overall,
+    )
 }
 
 /// Frames carrying changed content that capture handed this session so far:
@@ -1480,21 +1584,32 @@ impl IdleEvidence {
 }
 
 /// The Deck's view of this host: one `health_stats` per
-/// [`HEALTH_STATS_WINDOW`], built by the shared window tracker and health
-/// assessment, with the QUIC path measured by the shared tracker.
+/// [`HEALTH_STATS_WINDOW`], built by the shared session health every Pier
+/// runs (`arcen_observability::SessionHealth`: window, assessment of host
+/// delivery and the Deck's client telemetry, two-window hysteresis), with the
+/// QUIC path measured by the shared tracker.
 ///
 /// The path is measured where the connection is: by this process when it
 /// owns it, and otherwise by the network service, which fills `path` into
 /// this message as it relays it (`relay.rs`).
 struct HealthStatsReporter {
-    window: arcen_telemetry::HostWindowTracker,
+    health: arcen_observability::SessionHealth,
     path: arcen_transport::PathQualityTracker,
-    targets: arcen_telemetry::QosTargets,
     codec: &'static str,
     chroma: &'static str,
     resolution: String,
     fps_target: u32,
     idle: IdleEvidence,
+}
+
+/// One health window: the message for the Deck, and the state change to log
+/// when the hysteresis committed one.
+struct HealthReport {
+    message: arcen_protocol::messages::HealthStatsMsg,
+    transition: Option<(
+        arcen_telemetry::LifecycleEventKind,
+        arcen_telemetry::StructuredFields,
+    )>,
 }
 
 impl HealthStatsReporter {
@@ -1506,9 +1621,10 @@ impl HealthStatsReporter {
         fps_target: u32,
     ) -> Self {
         Self {
-            window: arcen_telemetry::HostWindowTracker::default(),
+            health: arcen_observability::SessionHealth::new_with_fps_warmup(
+                arcen_telemetry::QosTargets::default(),
+            ),
             path: arcen_transport::PathQualityTracker::default(),
-            targets: arcen_telemetry::QosTargets::default(),
             codec: match codec {
                 EncoderCodec::H264 => "h264",
                 EncoderCodec::Hevc => "h265",
@@ -1520,64 +1636,90 @@ impl HealthStatsReporter {
         }
     }
 
+    /// Records the client telemetry a `health_ping` carried, on the same
+    /// session clock [`Self::report`] uses.
+    fn record_client(
+        &mut self,
+        elapsed: Duration,
+        telemetry: Option<arcen_protocol::messages::ClientTelemetrySnapshotMsg>,
+    ) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.health.record_client_at(elapsed_ms, telemetry);
+    }
+
     fn report(
         &mut self,
         elapsed: Duration,
         stats: &StreamStats,
         connection: Option<&quinn::Connection>,
-    ) -> arcen_protocol::messages::HealthStatsMsg {
+    ) -> HealthReport {
         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         // `ScreenCaptureKit` is damage-driven, so a still desktop is judged
         // against the content that changed (`frames_offered`), not the
-        // target. The keepalive owes a frame a second even then, and the
-        // shared policy judges a window that sent nothing at all — early or
-        // late tick alike — against the full target.
-        let mut window = self.window.observe(
-            elapsed_ms,
-            self.fps_target,
-            arcen_telemetry::HostCounterTotals {
-                frames_sent: stats.frames_sent,
-                frames_dropped: stats.frames_dropped,
-                bytes_sent: stats.bytes_sent,
-                input_events: stats.input.applied,
-                frames_offered: Some(frames_offered(stats)),
+        // target, in a window that proved the screen still. The keepalive
+        // owes a frame a second even then, and the shared policy judges a
+        // window that sent nothing at all — early or late tick alike —
+        // against the full target.
+        let counters = arcen_observability::HostCounters {
+            frames_sent: stats.frames_sent,
+            frames_dropped: stats.frames_dropped,
+            bytes_sent: stats.bytes_sent,
+            input_events: stats.input.applied,
+            content: arcen_observability::ContentEvidence::Offered {
+                total: frames_offered(stats),
+                proven: self.idle.proven(&stats.unchanged_per_display),
             },
-            u64::try_from(HEALTH_STATS_WINDOW.as_millis()).unwrap_or(u64::MAX),
-        );
-        if !self.idle.proven(&stats.unchanged_per_display) {
-            window.sample.fps_content = None;
+            ..arcen_observability::HostCounters::default()
+        };
+        let observation = self.health.observe(elapsed_ms, self.fps_target, counters);
+        if let Some(error) = &observation.clock_error {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::HEALTH,
+                %error,
+                "health tracker rejected a non-monotonic tick; assessment skipped"
+            );
         }
-        let assessment = arcen_telemetry::assess_health(&window.sample, &self.targets);
-        arcen_protocol::messages::HealthStatsMsg {
-            fps_actual: f64::from(window.sample.fps_actual.unwrap_or(0)),
-            fps_target: f64::from(self.fps_target),
-            bandwidth_mbps: window.bandwidth_mbps,
-            frames_sent: window.sample.frames_sent.unwrap_or(0),
-            frames_dropped: window.sample.frames_dropped.unwrap_or(0),
-            encode_time_ms: stats.mean_encode_ms,
-            capture_time_ms: stats.mean_capture_wait_ms,
-            input_events: window.sample.input_events.unwrap_or(0),
-            codec: self.codec.to_owned(),
-            chroma: self.chroma.to_owned(),
-            resolution: self.resolution.clone(),
-            clients_connected: 1,
-            health_state: assessment.host_delivery.state.map(|state| match state {
-                arcen_telemetry::HealthState::Ok => arcen_protocol::messages::HealthStateMsg::Ok,
-                arcen_telemetry::HealthState::Degraded => {
-                    arcen_protocol::messages::HealthStateMsg::Degraded
-                }
-                arcen_telemetry::HealthState::Critical => {
-                    arcen_protocol::messages::HealthStateMsg::Critical
-                }
-            }),
-            sample_window_secs: arcen_protocol::messages::SampleWindowSecs::try_from(
-                u32::try_from(HEALTH_STATS_WINDOW.as_secs()).unwrap_or(u32::MAX),
-            )
-            .ok(),
-            path: connection.map(|connection| self.path.sample(elapsed, connection)),
-            ..arcen_protocol::messages::HealthStatsMsg::default()
+        let mut message = arcen_observability::SessionHealth::health_stats(
+            &observation,
+            counters,
+            self.fps_target,
+            self.codec,
+            self.chroma,
+            self.resolution.clone(),
+        );
+        message.encode_time_ms = stats.mean_encode_ms;
+        message.capture_time_ms = stats.mean_capture_wait_ms;
+        message.path = connection.map(|connection| self.path.sample(elapsed, connection));
+        HealthReport {
+            message,
+            transition: observation.transition,
         }
     }
+}
+
+/// Logs a committed health state change (`HEALTH_OK`, `HEALTH_DEGRADED`,
+/// `HEALTH_CRITICAL`), with the fields the shared session health built.
+fn emit_health_transition(
+    telemetry: &crate::observability::HostTelemetry,
+    session_id: &arcen_telemetry::CorrelationId,
+    transition: Option<(
+        arcen_telemetry::LifecycleEventKind,
+        arcen_telemetry::StructuredFields,
+    )>,
+) {
+    let Some((kind, fields)) = transition else {
+        return;
+    };
+    if !telemetry.is_enabled() {
+        return;
+    }
+    telemetry.emit(
+        kind,
+        &crate::observability::SessionScope::service(session_id.clone()),
+        fields,
+        arcen_telemetry::names::target::HEALTH,
+        "health state changed",
+    );
 }
 
 /// Emits one `HEALTH_SNAPSHOT` for a live session.
@@ -1715,6 +1857,10 @@ pub struct StreamSession<'a> {
     /// Direct QUIC connection for path sampling. Relayed agents receive the
     /// same signal as local control messages injected by the service relay.
     pub path_signal_connection: Option<quinn::Connection>,
+    /// Exact still image: the shared plan the hello stated (ADR 0016).
+    pub refine: arcen_media::refine::RefinePlan,
+    /// Tell the Deck this session's keyboard layout (`host_keymap`).
+    pub host_keymap: bool,
 }
 
 /// How a session's audio is encoded for the wire.
@@ -1819,6 +1965,8 @@ pub struct MultiStreamSession<'a> {
     /// Direct QUIC connection for path sampling. Relayed agents receive the
     /// same signal as local control messages injected by the service relay.
     pub path_signal_connection: Option<quinn::Connection>,
+    /// Tell the Deck this session's keyboard layout (`host_keymap`).
+    pub host_keymap: bool,
 }
 
 /// A stream that stopped before the client left cleanly.
@@ -1873,11 +2021,24 @@ pub async fn stream(
         motion_priority,
         requested_pipeline,
         served_pipeline,
+        refine: refine_plan,
+        host_keymap,
     } = session;
     let operational_motion_priority =
         arcen_media::video::operational_motion_priority(served_pipeline.as_ref(), motion_priority);
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     let (side_audio, side_audio_writer) = spawn_audio_channel(audio_channel);
+    let (refine, mut refine_session) = start_refine(refine_plan, &capture);
+    // The refinement budget from the link (ADR 0016 R6), only while the
+    // session refines: what the writer handed on, and whether it holds.
+    let mut refine_budget = match refine_plan {
+        arcen_media::refine::RefinePlan::On { max_mbps, .. } if refine_session.is_some() => Some(
+            arcen_media::refine::budget::RefineBudgetSampler::new(max_mbps),
+        ),
+        _ => None,
+    };
+    let mut refine_written = 0_u64;
+    let mut refine_held = false;
     let Producer {
         frames: mut frames_rx,
         cancelled,
@@ -1896,6 +2057,7 @@ pub async fn stream(
         requested_pipeline,
         served_pipeline.clone(),
         frame_budget,
+        refine,
     );
     // What the path carries decides how fast to encode; see
     // `arcen_media::rate_control`. The ceiling is what this session was sized
@@ -2059,6 +2221,8 @@ pub async fn stream(
         // while the lane is full the encoder waits, and capture's latest-frame
         // slot replaces the picture it would have encoded next.
         let mut pending_frame: Option<Produced> = None;
+        let mut pending_tile: Option<Vec<u8>> = None;
+        let mut keymap_watch = start_keymap_watch(host_keymap);
         let streaming = async {
         loop {
             let host_pen_pointer_due = host_pen_pointer
@@ -2087,6 +2251,7 @@ pub async fn stream(
                         input.as_mut(),
                         Some(&keyframe_requests),
                         Some(&mut full_frame_requests),
+                        refine_session.as_ref().map(|refine| &refine.controls),
                     )? {
                         Incoming::Continue => continue,
                         Incoming::PathSignal(signal) => {
@@ -2097,11 +2262,23 @@ pub async fn stream(
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
                         }
+                        Incoming::HealthPing { reply, telemetry } => {
+                            health_stats.record_client(started.elapsed(), telemetry);
+                            enqueue(&priority, Message::Text(reply)).await?;
+                            continue;
+                        }
                         Incoming::PeerLeft => break,
                     }
                 }
                 output = native_tablet.next(), if native_tablet.is_active() => {
                     send_tablet_output(&priority, output, input.as_mut(), host_pen_pointer.as_mut()).await?;
+                }
+                notice = next_keymap_notice(keymap_watch.as_mut()), if keymap_watch.is_some() => {
+                    match notice {
+                        Some(json) => enqueue(&priority, Message::Text(json)).await?,
+                        None => keymap_watch = None,
+                    }
+                    continue;
                 }
                 () = sleep_until_due(host_pen_pointer_due), if host_pen_pointer_due.is_some() => {
                     if let Some(pointer) = host_pen_pointer.as_mut() {
@@ -2142,6 +2319,14 @@ pub async fn stream(
                 permit = writer.reserve(), if pending_frame.is_some() => {
                     let permit = permit
                         .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))?;
+                    // Exact still image: the frame's fence (and a barrier)
+                    // go first, one message each, on the same ordered queue.
+                    if let Some(frame) = pending_frame.as_mut()
+                        && !frame.refine_before.is_empty()
+                    {
+                        permit.send(Message::Binary(frame.refine_before.remove(0)));
+                        continue;
+                    }
                     if let Some(frame) = pending_frame.take() {
                         let accumulators = Accumulators {
                             total_queue: &mut total_queue,
@@ -2178,12 +2363,13 @@ pub async fn stream(
                             total_encode,
                         },
                     );
-                    let message = health_stats.report(
+                    let report = health_stats.report(
                         started.elapsed(),
                         &stats,
                         path_signal_connection.as_ref(),
                     );
-                    if let Ok(text) = serde_json::to_string(&message) {
+                    emit_health_transition(&telemetry, &session_id, report.transition);
+                    if let Ok(text) = serde_json::to_string(&report.message) {
                         enqueue(&priority, Message::Text(text)).await?;
                         stats.health_stats_sent += 1;
                     }
@@ -2266,8 +2452,63 @@ pub async fn stream(
                         path,
                     };
                     rate_mark = (stats.bytes_sent, stats.frames_sent, total_queue);
+                    let refine_tick = match (refine_budget.as_mut(), refine_session.as_ref()) {
+                        (Some(sampler), Some(session)) => {
+                            let tick = sampler.window(arcen_media::refine::budget::RefineBudgetInputs {
+                                elapsed: RATE_TICK,
+                                path: sample.path,
+                                interactive_bytes: sample.delivered_bytes,
+                                refine_bytes_total: refine_written,
+                                video_backlog: pending_frame.is_some(),
+                                video_frame_wait: sample.mean_frame_wait,
+                                video_target_bps: rate_controller.target_bps(),
+                            });
+                            refine_held = tick.decision.hold.is_some();
+                            if let Some(
+                                arcen_media::capenc_control::CapencControlCommand::RefineRate {
+                                    bps,
+                                    hold,
+                                },
+                            ) = tick.decision.capenc_command()
+                            {
+                                session.set_link_rate(bps, hold);
+                            }
+                            let summary = sampler.summary(&tick);
+                            if tick.changed {
+                                tracing::info!(
+                                    target: arcen_telemetry::names::target::MEDIA,
+                                    "{} {summary}",
+                                    arcen_telemetry::names::refine::BUDGET
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: arcen_telemetry::names::target::MEDIA,
+                                    "{} {summary}",
+                                    arcen_telemetry::names::refine::BUDGET
+                                );
+                            }
+                            Some(tick)
+                        }
+                        _ => None,
+                    };
                     if rate_control {
-                        if let Some(change) = rate_controller.observe(sample) {
+                        let hints = arcen_media::rate_control::RateHints {
+                            refine_active: refine_tick
+                                .is_some_and(|tick| tick.decision.refine_active),
+                            ..arcen_media::rate_control::RateHints::default()
+                        };
+                        let change = rate_controller.observe_with(sample, hints);
+                        if let Some(reason) = rate_controller.last_refine_deferral() {
+                            if let Some(sampler) = refine_budget.as_mut() {
+                                sampler.note_video_deferral();
+                            }
+                            tracing::debug!(
+                                target: arcen_telemetry::names::target::MEDIA,
+                                reason = reason.token(),
+                                "encoder rate waits: refinement pauses first"
+                            );
+                        }
+                        if let Some(change) = change {
                             encode_rate.store(change.target_bps, std::sync::atomic::Ordering::Relaxed);
                             tracing::info!(
                                 target: arcen_telemetry::names::target::MEDIA,
@@ -2356,6 +2597,31 @@ pub async fn stream(
                 }
                 _ = clipboard_send_tick.tick(), if clipboard_sender.has_work() => {
                     clipboard_sender.send_one(&writer).await?;
+                    continue;
+                }
+                // Exact still image: tiles and digests, behind every video
+                // frame on the same writer; the relay puts them on the
+                // refine lane.
+                record = async {
+                    match refine_session.as_mut() {
+                        Some(refine) => refine.tiles.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if pending_tile.is_none() && pending_frame.is_none() && !refine_held => {
+                    match record {
+                        Some(record) => pending_tile = Some(record),
+                        // The worker is gone; the frame path reports why.
+                        None => refine_session = None,
+                    }
+                    continue;
+                }
+                permit = writer.reserve(), if pending_tile.is_some() && pending_frame.is_none() => {
+                    let permit = permit
+                        .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))?;
+                    if let Some(record) = pending_tile.take() {
+                        refine_written = refine_written.saturating_add(record.len() as u64);
+                        permit.send(Message::Binary(record));
+                    }
                     continue;
                 }
             }
@@ -2457,6 +2723,7 @@ pub async fn stream_multi(
         mut input_mode_results,
         audio_encoding,
         path_signal_connection,
+        host_keymap,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     // Counted before the plans are moved into the producer.
@@ -2635,6 +2902,7 @@ pub async fn stream_multi(
         // while the lane is full the encoder waits, and capture's latest-frame
         // slot replaces the picture it would have encoded next.
         let mut pending_frame: Option<Produced> = None;
+        let mut keymap_watch = start_keymap_watch(host_keymap);
         let streaming = async {
         loop {
             tokio::select! {
@@ -2658,6 +2926,7 @@ pub async fn stream_multi(
                         input.as_mut(),
                         Some(&keyframe_requests),
                         Some(&mut full_frame_requests),
+                        None,
                     )? {
                         Incoming::Continue => continue,
                         Incoming::PathSignal(signal) => {
@@ -2668,11 +2937,23 @@ pub async fn stream_multi(
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
                         }
+                        Incoming::HealthPing { reply, telemetry } => {
+                            health_stats.record_client(started.elapsed(), telemetry);
+                            enqueue(&priority, Message::Text(reply)).await?;
+                            continue;
+                        }
                         Incoming::PeerLeft => break,
                     }
                 }
                 output = native_tablet.next(), if native_tablet.is_active() => {
                     send_tablet_output(&priority, output, input.as_mut(), None).await?;
+                }
+                notice = next_keymap_notice(keymap_watch.as_mut()), if keymap_watch.is_some() => {
+                    match notice {
+                        Some(json) => enqueue(&priority, Message::Text(json)).await?,
+                        None => keymap_watch = None,
+                    }
+                    continue;
                 }
                 _ = full_frame_tick.tick() => {
                     if full_frame_requests.poll(Instant::now()).deliver_now {
@@ -2780,12 +3061,13 @@ pub async fn stream_multi(
                             total_encode,
                         },
                     );
-                    let message = health_stats.report(
+                    let report = health_stats.report(
                         started.elapsed(),
                         &stats,
                         path_signal_connection.as_ref(),
                     );
-                    if let Ok(text) = serde_json::to_string(&message) {
+                    emit_health_transition(&telemetry, &session_id, report.transition);
+                    if let Ok(text) = serde_json::to_string(&report.message) {
                         enqueue(&priority, Message::Text(text)).await?;
                         stats.health_stats_sent += 1;
                     }
@@ -3139,12 +3421,20 @@ struct Produced {
     encode_took: Duration,
     monitor_id: Option<arcen_media::SessionMonitorId>,
     served_pipeline: Option<arcen_protocol::messages::ServedPipelineMsg>,
+    /// Exact still image: the video-lane records (barrier, fence) that must
+    /// reach the Deck immediately before this access unit (ADR 0016 R2).
+    refine_before: Vec<Vec<u8>>,
 }
 
 struct EncodeCounters<'a> {
     captured: &'a mut u64,
     encoded: &'a mut u64,
     encoded_keyframe_request: &'a mut u64,
+    /// Exact still image, when this session refines: every encoded surface
+    /// is compared while it is encoded, and its fence precedes it.
+    refine: Option<&'a mut crate::refine::MacRefine>,
+    /// The encoder's current target, which refinement never exceeds.
+    rate_bps: u64,
 }
 
 fn encode_single_frame(
@@ -3160,11 +3450,25 @@ fn encode_single_frame(
     let encode_started = Instant::now();
     let requested_keyframe = keyframe_requests.load(std::sync::atomic::Ordering::Relaxed);
     let force_keyframe = requested_keyframe != *counters.encoded_keyframe_request;
+    if let Some(refine) = counters.refine.as_deref_mut() {
+        // A keyframe the Deck asked for is a recovery: nothing refined
+        // before it inherits validity (ADR 0016 R3).
+        refine
+            .observe(frame, force_keyframe, counters.rate_bps)
+            .map_err(StreamError::Encode)?;
+    }
     let Some(unit) = encoder
         .encode_with_keyframe_request(frame, force_keyframe)
         .map_err(|error| StreamError::Encode(error.to_string()))?
     else {
+        if let Some(refine) = counters.refine.as_deref_mut() {
+            refine.skip_fence();
+        }
         return Ok(None);
+    };
+    let refine_before = match counters.refine.as_deref_mut() {
+        Some(refine) => refine.fence_records().map_err(StreamError::Encode)?,
+        None => Vec::new(),
     };
     if force_keyframe {
         *counters.encoded_keyframe_request = requested_keyframe;
@@ -3187,6 +3491,7 @@ fn encode_single_frame(
         encode_took,
         monitor_id: None,
         served_pipeline: None,
+        refine_before,
     }))
 }
 
@@ -3330,6 +3635,7 @@ fn produce(
     frame_budget: Option<u64>,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
     signals: ProducerSignals<'_>,
+    refine: Option<crate::refine::MacRefine>,
 ) -> Result<(), StreamError> {
     let ProducerSignals {
         cancelled,
@@ -3363,6 +3669,7 @@ fn produce(
                     health,
                     rate,
                     detail_fps,
+                    refine,
                 },
             );
             // Whatever ended the encode side, the capture side must stop
@@ -3549,7 +3856,6 @@ fn capture_loop(
 }
 
 /// What the encode stage needs that is not the encoder or the frame source.
-#[derive(Clone)]
 struct EncodeLoopContext<'a> {
     capture: CaptureConfig,
     codec: EncoderCodec,
@@ -3564,6 +3870,8 @@ struct EncodeLoopContext<'a> {
     health: &'a CaptureHealthCounters,
     rate: &'a std::sync::atomic::AtomicU64,
     detail_fps: &'a std::sync::atomic::AtomicU32,
+    /// Exact still image, when this session refines.
+    refine: Option<crate::refine::MacRefine>,
 }
 
 /// Whether the encode stage has nothing left to do.
@@ -3927,6 +4235,7 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
         motion_priority,
         requested_pipeline,
         served_pipeline,
+        mut refine,
     } = context;
     let mut applied_rate = 0_u64;
     let (start, max) = arcen_media::video::operational_encoder_bitrate_bounds(
@@ -4047,6 +4356,8 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
                 captured: &mut capture_count,
                 encoded: &mut encode_count,
                 encoded_keyframe_request: &mut encoded_keyframe_request,
+                refine: refine.as_mut(),
+                rate_bps: applied_rate,
             };
             let mut produced = encode_pending_recovery_point(
                 &mut encoder,
@@ -4177,6 +4488,8 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
                 captured: &mut capture_count,
                 encoded: &mut encode_count,
                 encoded_keyframe_request: &mut encoded_keyframe_request,
+                refine: refine.as_mut(),
+                rate_bps: applied_rate,
             },
             codec,
             WireShape::of(&capture),
@@ -4576,6 +4889,7 @@ fn produce_multi(
                             encode_took,
                             monitor_id: Some(encoder.plan.monitor_id),
                             served_pipeline: served_pipeline_update.take(),
+                            refine_before: Vec::new(),
                         };
                         if frames.blocking_send(Ok(produced)).is_err() {
                             return Ok(());
@@ -4636,6 +4950,7 @@ fn produce_multi(
                 encode_took,
                 monitor_id: Some(encoder.plan.monitor_id),
                 served_pipeline: served_pipeline_update.take(),
+                refine_before: Vec::new(),
             };
             if frames.blocking_send(Ok(produced)).is_err() {
                 return Ok(());
@@ -4800,7 +5115,9 @@ mod tests {
             bytes_sent: 5_000_000,
             ..Default::default()
         };
-        let first = reporter.report(std::time::Duration::from_secs(10), &stats, None);
+        let first = reporter
+            .report(std::time::Duration::from_secs(10), &stats, None)
+            .message;
         assert_eq!(first.msg_type, arcen_protocol::messages::HEALTH_STATS);
         assert_eq!(first.codec, "h265");
         assert_eq!(first.chroma, "yuv444");
@@ -4821,22 +5138,30 @@ mod tests {
         stats.frames_sent += 2;
         stats.unchanged_per_display =
             vec![stats.unchanged_per_display.first().copied().unwrap_or(0) + 20];
-        let still = reporter.report(std::time::Duration::from_secs(22), &stats, None);
+        let still = reporter
+            .report(std::time::Duration::from_secs(22), &stats, None)
+            .message;
         assert_eq!(still.frames_sent, 2);
         assert_eq!(still.health_state, Some(HealthStateMsg::Ok));
         // Nothing sent, keepalive included, over a tick that came a
         // millisecond early: still a stall.
-        let stalled = reporter.report(std::time::Duration::from_millis(23_999), &stats, None);
+        let stalled = reporter
+            .report(std::time::Duration::from_millis(23_999), &stats, None)
+            .message;
         assert_eq!(stalled.frames_sent, 0);
         assert_eq!(stalled.health_state, Some(HealthStateMsg::Critical));
         // And over a late one.
-        let late = reporter.report(std::time::Duration::from_millis(26_013), &stats, None);
+        let late = reporter
+            .report(std::time::Duration::from_millis(26_013), &stats, None)
+            .message;
         assert_eq!(late.health_state, Some(HealthStateMsg::Critical));
         // Sending again: back to judging what the desktop offered.
         stats.frames_sent += 2;
         stats.unchanged_per_display =
             vec![stats.unchanged_per_display.first().copied().unwrap_or(0) + 20];
-        let resumed = reporter.report(std::time::Duration::from_millis(28_001), &stats, None);
+        let resumed = reporter
+            .report(std::time::Duration::from_millis(28_001), &stats, None)
+            .message;
         assert_eq!(resumed.health_state, Some(HealthStateMsg::Ok));
     }
 
@@ -5012,6 +5337,7 @@ mod tests {
                 "hardware",
                 None,
             )),
+            refine_before: Vec::new(),
         };
         let mut pending = None;
 
@@ -5948,7 +6274,9 @@ mod tests {
             "sequence": 7_u64,
         })
         .to_string();
-        let Some(Incoming::Reply(reply)) = handle_control(&request, &mut stats, None, None) else {
+        let Some(Incoming::HealthPing { reply, .. }) =
+            handle_control(&request, &mut stats, None, None, None)
+        else {
             panic!("a health_ping must be answered");
         };
         let response: arcen_protocol::messages::HealthPongMsg =
@@ -5972,7 +6300,8 @@ mod tests {
                 &request,
                 &mut stats,
                 Some(&requests),
-                Some(&mut full_frame_requests)
+                Some(&mut full_frame_requests),
+                None
             ),
             Some(Incoming::Continue)
         ));
@@ -5987,7 +6316,8 @@ mod tests {
                 &request,
                 &mut stats,
                 Some(&requests),
-                Some(&mut full_frame_requests)
+                Some(&mut full_frame_requests),
+                None
             ),
             Some(Incoming::Continue)
         ));
@@ -6017,7 +6347,7 @@ mod tests {
             "sequence": 1, "timestamp_ns": 0,
         })
         .to_string();
-        assert!(handle_control(&move_event, &mut stats, None, None).is_none());
+        assert!(handle_control(&move_event, &mut stats, None, None, None).is_none());
     }
 
     #[test]

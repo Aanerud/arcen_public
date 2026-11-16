@@ -46,6 +46,7 @@ subtle.workspace = true
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 x509-parser.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "=0.14.8"

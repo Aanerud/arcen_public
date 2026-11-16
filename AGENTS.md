@@ -44,7 +44,7 @@ port would replace. A second client is mostly a decoder and a window.
 [`STRUCTURE.md`](STRUCTURE.md) describes every top-level file and folder,
 including the local-only ones git ignores.
 
-**`shared/` — eleven crates, no OS calls, compiled and tested everywhere.**
+**`shared/` — twelve crates, no OS calls, compiled and tested everywhere.**
 
 | Crate | Owns |
 | --- | --- |
@@ -59,6 +59,7 @@ including the local-only ones git ignores.
 | `telemetry` | The event vocabulary. |
 | `observability` | Structured logging that cannot block a video thread. |
 | `usb-bridge` | USB passthrough policy and state. |
+| `deck-core` | The portable Deck: the platform seams (`DeckServices`, `VideoDecoderBackend`, `VideoPresenterSink`), settings and, behind features, the session runtime and shared screens. |
 
 **Products — thin by design.**
 
@@ -70,6 +71,7 @@ including the local-only ones git ignores.
 | `hosts/capenc/` | Capture and encode: NvFBC/XShm/PipeWire/DXGI/WGC → explicit conversion → NVENC/MF/OpenH264 |
 | `hosts/audiocap/`, `hosts/input-helper/` | Linux audio capture and input helpers |
 | `clients/macos/` | macOS Deck: VideoToolbox decode, egui window |
+| `clients/windows/` | Windows Deck (ADR 0024): D3D11 decode and presentation, Win32 window |
 | `packaging/` | Installers, signing, release metadata |
 
 **Dependency direction is one way, and CI proves it:**
@@ -112,6 +114,7 @@ resolved plan, READY/hello truth, frame headers, and Deck presentation.
 | How a bridged USB tablet is admitted, tagged for a desktop, or read | `shared/usb-bridge`: `tablet_claim`/`bridged_device_guard` (admission), `bridge_seat` (udev rules, Xorg classes), `wacom_intuos_pen` (pen reader for known models), `exporter`/`hid_host` (the bridge itself) |
 | A new log event | `shared/telemetry`, emitted through `shared/observability` |
 | A product path that uses a shared crate, or a new dependency on one | a record in that crate's `shared/<crate>/consumers.json` |
+| A difference between products: a feature, behaviour, `cfg(target_os…)` in `shared/` or `platform` config key that not every product has | a row in `scripts/ci/platform-differences.toml`: a `PD` row naming the OS API that forces it, or a `GAP` row with an owner ([`docs/architecture/platform-differences.md`](docs/architecture/platform-differences.md)) |
 | Calling a platform API to capture, encode, inject or authenticate | the relevant `hosts/` or `clients/` directory, and nothing more |
 
 A platform module should read as a thin adapter: gather what the OS gives you,
@@ -196,11 +199,13 @@ Reference projects remain learn-only: research them, never copy from them.
 | Windows Host | `hosts/windows/`, `packaging/windows/` |
 | macOS Pier | `hosts/macos/`, the Pier half of `packaging/macos/` |
 | macOS Client | `clients/macos/`, `packaging/macos/` |
+| Windows Client | `clients/windows/`, `packaging/windows-deck/` |
 | Release/Security | `.github/`, `legal/`, `docs/operations/`, `docs/security/`, `packaging/` (with each platform), dependency and release policy |
 
 Local detail is in `shared/AGENTS.md`, `hosts/linux/AGENTS.md` (which also
 covers `capenc`, `audiocap` and `input-helper`), `hosts/windows/AGENTS.md`,
-`hosts/macos/AGENTS.md`, `clients/macos/AGENTS.md`, `packaging/AGENTS.md`,
+`hosts/macos/AGENTS.md`, `clients/macos/AGENTS.md`,
+`clients/windows/AGENTS.md`, `packaging/AGENTS.md`,
 `docs/AGENTS.md` and `tests/AGENTS.md`. Read the one for the area you are
 changing.
 
@@ -219,16 +224,21 @@ macOS-only, the Windows host is Windows-only, the Linux host is Linux-only.
 
 ```sh
 python3 -m unittest scripts/test_validate_observability.py
+python3 -m unittest scripts/test_platform_differences.py
 cargo fmt --all --check
-cargo test --locked -p arcen-identity -p arcen-input -p arcen-keel \
-  -p arcen-media -p arcen-observability -p arcen-outputs -p arcen-protocol \
-  -p arcen-session -p arcen-telemetry -p arcen-transport -p arcen-usb-bridge
-cargo clippy --locked -p arcen-identity -p arcen-input -p arcen-keel \
-  -p arcen-media -p arcen-observability -p arcen-outputs -p arcen-protocol \
-  -p arcen-session -p arcen-telemetry -p arcen-transport -p arcen-usb-bridge \
-  -- -D warnings
+cargo test --locked -p arcen-deck-core -p arcen-identity -p arcen-input \
+  -p arcen-keel -p arcen-media -p arcen-observability -p arcen-outputs \
+  -p arcen-protocol -p arcen-session -p arcen-telemetry -p arcen-transport \
+  -p arcen-usb-bridge
+cargo clippy --locked -p arcen-deck-core -p arcen-identity -p arcen-input \
+  -p arcen-keel -p arcen-media -p arcen-observability -p arcen-outputs \
+  -p arcen-protocol -p arcen-session -p arcen-telemetry -p arcen-transport \
+  -p arcen-usb-bridge -- -D warnings
 cargo test --locked -p arcen-media --features software-h264-source
 cargo test --locked -p arcen-transport --features quic
+cargo test --locked -p arcen-deck-core --features runtime,egui,wgpu-presenter
+cargo clippy --locked -p arcen-deck-core --features runtime,egui,wgpu-presenter \
+  -- -D warnings
 python3 scripts/check_shared_contracts.py
 scripts/ci/check-publication-hygiene.sh
 ```
@@ -244,14 +254,33 @@ its own tests: `python3 scripts/check_shared_contracts.py --impact --base main
 **Dependency purity proofs.** `cargo tree --locked -p arcen-transport -e normal`
 must show no `quinn`, `tokio`, `tokio-util` or `bytes` line, and
 `cargo tree --locked -p arcen-media -e all` must show no `openh264`,
-`openh264-sys2`, `wide`, `nasm-rs`, `cc` or `walkdir` line.
+`openh264-sys2`, `wide`, `nasm-rs`, `cc` or `walkdir` line, and
+`cargo tree --locked -p arcen-deck-core -e all` (default features) must show
+no `tokio`, `quinn`, `bytes`, `egui`, `epaint`, `eframe`, `wgpu` or `winit`
+line, nor any `hosts/`, `clients/` or `packaging/` package.
+
+**Windows type-check from a Mac.** The Deck code is type-checked for
+Windows with `cargo-xwin`
+(validations `macos-deck-windows-typecheck`, `windows-deck-typecheck`,
+`shared-deck-core-windows-typecheck`):
+
+```sh
+cargo xwin check --locked --target x86_64-pc-windows-msvc -p arcen-deck-macos --lib
+cargo xwin check --locked --target x86_64-pc-windows-msvc -p arcen-deck-windows --all-targets
+cargo xwin check --locked --target x86_64-pc-windows-msvc -p arcen-deck-core \
+  --features runtime,egui,wgpu-presenter --all-targets
+```
+
+cargo-xwin downloads Microsoft's SDK and CRT under Microsoft's licence on
+first use, so it runs on developer machines, not in CI.
 
 **On the target OS**, for platform work: macOS (`-p arcen-deck-macos`, and
 `-p arcen-pier-macos` for the macOS Pier), Linux
 (`-p arcen-pier-linux`, needs `libpam0g-dev` and `libpulse-dev`; release
 builds add `--features wayland-provider`, which needs the PipeWire development
 headers and libclang), Windows/MSVC
-(`-p arcen-pier-windows -p arcen-capenc -p arcen-credential-provider`).
+(`-p arcen-pier-windows -p arcen-capenc -p arcen-credential-provider`; the
+Windows Deck is `-p arcen-deck-windows`).
 
 **CI does not build the platform crates.** It is manual (`workflow_dispatch`)
 and Linux-only. Platform builds are yours to run, so say plainly what you built
@@ -274,4 +303,5 @@ through a dedicated Metal layer and enables EDR only for PQ. The macOS Pier
 ships as a signed preview package and serves a logged-in Aqua desktop to a
 real Deck, but it is not a supported host release: cold-boot LoginWindow
 operation, multi-monitor hardware qualification and Release/Security review
-remain open, and it has no committed-text route or cursor images yet. A Linux Deck and a Windows Deck do not exist. `README.md` is the current status in detail.
+remain open, and it has no committed-text route or cursor images yet. The Windows Deck (`clients/windows`, ADR 0024) ships from 0.20.0 as two
+unsigned MSIs; a Linux Deck does not exist. `README.md` is the current status in detail.

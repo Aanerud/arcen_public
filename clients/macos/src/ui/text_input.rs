@@ -22,10 +22,10 @@ use arcen_protocol::messages::{
     InputCapabilityAvailability, TextCommitResultMsg, TextRefusalReason,
 };
 
+use arcen_deck_core::screens::text_input::NOTICE_DURATION;
+
 use super::keyboard::egui_key_to_qt;
 
-/// How long a refusal notice stays on screen.
-const NOTICE_DURATION: Duration = Duration::from_secs(5);
 /// Most refused characters a notice quotes.
 const NOTICE_CHARS: usize = 16;
 
@@ -314,67 +314,21 @@ impl DeckTextInput {
     /// Draws the composition, the keyboard mode when it is Characters, and
     /// the latest notice over the video.
     pub fn show(&mut self, ctx: &egui::Context, video: egui::Rect) {
-        if self.policy.active() && self.policy.mode() == TypingMode::Characters {
-            // Characters mode changes what games and shortcuts-by-letter
-            // see; it stays visible for as long as it is on.
-            egui::Area::new(egui::Id::new("arcen-keyboard-mode"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(video.right() - 150.0, video.top() + 8.0))
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_black_alpha(150))
-                        .corner_radius(6.0)
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("Keyboard: Characters")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_gray(230)),
-                            );
-                        });
-                });
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(shown_at, _)| shown_at.elapsed() > NOTICE_DURATION)
+        {
+            self.notice = None;
         }
-        if let Some(preedit) = self.preedit.as_deref().filter(|text| !text.is_empty()) {
-            egui::Area::new(egui::Id::new("arcen-text-preedit"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(video.center().x - 120.0, video.bottom() - 72.0))
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_black_alpha(220))
-                        .corner_radius(8.0)
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(preedit)
-                                    .size(18.0)
-                                    .underline()
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                });
-        }
-        if let Some((shown_at, text)) = &self.notice {
-            if shown_at.elapsed() > NOTICE_DURATION {
-                self.notice = None;
-                return;
-            }
-            egui::Area::new(egui::Id::new("arcen-text-notice"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_black_alpha(210))
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::symmetric(16, 10))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(text)
-                                    .size(14.0)
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                });
+        arcen_deck_core::screens::text_input::paint_text_input_overlays(
+            ctx,
+            video,
+            self.policy.active() && self.policy.mode() == TypingMode::Characters,
+            self.preedit.as_deref(),
+            self.notice.as_ref().map(|(_, text)| text.as_str()),
+        );
+        if self.notice.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }

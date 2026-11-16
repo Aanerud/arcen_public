@@ -51,9 +51,9 @@ pub enum HardUsbSessionDenial {
     /// The session reads only the console seat; see
     /// [`HardUsbSessionSeat::ConsoleSeat`].
     ConsoleSeatSession,
-    /// The tablet cannot be used by a dedicated Xorg desktop: no pen node of
-    /// it is served by the kernel `wacom` driver with xf86-input-wacom
-    /// installed.
+    /// The tablet cannot be used by a dedicated Xorg desktop: no node of it
+    /// is a pen, or xf86-input-wacom (the X driver for every bridged pen) is
+    /// not installed.
     X11TabletUnsupported,
     /// A bridged device would not be confined to the desktop: the host's
     /// Xorg ignore class is missing, or an X server (such as the login
@@ -85,9 +85,9 @@ impl HardUsbSessionDenial {
                  screen instead of your desktop. Use Tablet support instead."
             }
             Self::X11TabletUnsupported => {
-                "Native tablet on an X11 desktop needs a tablet the host's wacom driver serves, \
-                 with xf86-input-wacom installed (installing it takes effect at the next \
-                 connection). Use Tablet support."
+                "Native tablet on an X11 desktop needs xf86-input-wacom on the host (it drives \
+                 any pen tablet; installing it takes effect at the next connection), and a \
+                 tablet the host's kernel shows as a pen. Use Tablet support."
             }
             Self::X11IsolationNotInForce => {
                 "Native tablet is not ready on this host: an X server (such as the login \

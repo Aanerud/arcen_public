@@ -12,6 +12,19 @@
   ],
   "consumers": [
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "quic",
+        "tls"
+      ],
+      "forwarded_features": {
+        "runtime": [
+          "quic"
+        ]
+      }
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
@@ -27,11 +40,6 @@
         "tls"
       ],
       "features": ["quic"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "paths": [
         {
           "id": "macos-deck-session",
@@ -49,7 +57,7 @@
           "entry_points": [
             "clients/macos/src/transport/connector.rs",
             "clients/macos/src/transport/tls.rs",
-            "clients/macos/src/transport/websocket.rs"
+            "clients/macos/src/ui/app.rs"
           ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
@@ -129,9 +137,9 @@
         {
           "id": "linux-transport",
           "entry_points": [
-            "hosts/linux/src/net/quic.rs",
             "hosts/linux/src/net/server.rs",
-            "hosts/linux/src/net/tls.rs"
+            "hosts/linux/src/net/tls.rs",
+            "hosts/linux/src/host_cert.rs"
           ],
           "build_profiles": ["linux-pier"],
           "validation": ["linux-pier-test", "linux-session-lab"],
@@ -231,7 +239,9 @@
           "entry_points": [
             "hosts/macos/src/net.rs",
             "hosts/macos/src/relay.rs",
-            "hosts/macos/src/main.rs"
+            "hosts/macos/src/main.rs",
+            "hosts/macos/src/tls_material.rs",
+            "hosts/macos/src/host_cert.rs"
           ],
           "build_profiles": ["macos-pier"],
           "validation": ["macos-pier-test", "macos-pier-session-lab"],
@@ -321,7 +331,6 @@
         {
           "id": "windows-transport",
           "entry_points": [
-            "hosts/windows/src/quic.rs",
             "hosts/windows/src/tls.rs",
             "hosts/windows/src/main.rs"
           ],

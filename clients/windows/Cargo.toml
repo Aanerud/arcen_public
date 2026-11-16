@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-deck-windows"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcen Deck for Windows: a thin Win32/D3D11 shell around arcen-deck-core."
+
+[lib]
+name = "arcen_deck_windows"
+path = "src/lib.rs"
+
+# `arcen-deck.exe`: the GUI and the headless smokes, like the macOS Deck's
+# binary. Off Windows it builds as an empty program that says so.
+[[bin]]
+name = "arcen-deck"
+path = "src/main.rs"
+
+[dependencies]
+# ui: the shared screens and the session engine (platform: the log runtime).
+arcen-deck-core = { workspace = true, features = ["egui", "runtime"] }
+# present: the shared presenter uniform, refinement compositor and hub.
+arcen-media = { workspace = true, features = ["refine-zstd-decode"] }
+arcen-protocol.workspace = true
+# input: the PC keyboard policy, pen and wheel mapping.
+arcen-input.workspace = true
+# usb: the Arcen USB component's Deck side (state, actions, verified pipe
+# client); approved by core 2026-11-14.
+arcen-usb-client = { path = "usb/client" }
+# platform: DeckServices, audio, clipboard, displays, logging. Every package
+# below is already in Cargo.lock through the macOS Deck.
+arcen-telemetry.workspace = true
+tracing.workspace = true
+# core: `show` wipes the credentials it read.
+zeroize.workspace = true
+# support: the support bundle's Windows facts (GPUs, drivers, WER).
+serde_json.workspace = true
+
+[dev-dependencies]
+# present: the GPU end-to-end Exact still image test encodes real tiles.
+arcen-media = { workspace = true, features = ["refine-zstd-decode", "refine-zstd-encode"] }
+
+# Every Win32 feature a stream needs is listed here, grouped by owner, so
+# streams do not edit this manifest in parallel. Ask the owner of this
+# manifest for an addition. windows 0.58 is the version the Windows Pier
+# already builds with; no new package version enters Cargo.lock.
+[target.'cfg(windows)'.dependencies]
+# platform: WASAPI output and microphone through cpal (the macOS Deck's
+# audio library, already in Cargo.lock).
+cpal = "0.15"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    # main: the windows-subsystem Deck writes CLI output to its parent's console.
+    "Win32_System_Console",
+    # decode: D3D11 video decoder (DXVA picture parameters; MF namespace
+    # holds the DXVA structure definitions only, no Media Foundation use).
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    # present: DirectComposition, flip-model swapchains, DWM.
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D_Fxc",
+    # input: raw input, keyboard, pointer/pen, IME/TSF, cursors.
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_TextServices",
+    # input: precision touchpad pan and pinch (REFERENCE-INPUT.md Q-9).
+    "Win32_Graphics_DirectManipulation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Devices_HumanInterfaceDevice",
+    # audio: WASAPI render and capture, MMCSS.
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    # clipboard.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    # display: topology, DPI, colour facts.
+    "Win32_Devices_Display",
+    # platform: known folders, identity, network facts, time zone, WER.
+    "Win32_UI_Shell",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Registry",
+    "Win32_System_ErrorReporting",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    # platform: pen presence (GetPointerDevices), the user's region for the
+    # time zone (GetUserDefaultGeoName).
+    "Win32_UI_Controls",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+] }
+# ui (shell): the window, egui and its wgpu (DX12) renderer on the
+# composition tree's overlay visual. Same versions as the macOS Deck's
+# eframe; no new package enters Cargo.lock.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+egui = "0.35"
+egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links"] }
+egui-wgpu = { version = "0.35", default-features = false }
+wgpu = { version = "29", default-features = false, features = ["dx12", "wgsl", "std"] }
+pollster = "0.4"
+tokio.workspace = true
+
+[lints]
+workspace = true

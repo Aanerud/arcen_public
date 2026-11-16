@@ -11,16 +11,8 @@
 //! nearby substitute. A wrong key is worse than a refused one, and the caller
 //! counts unmapped keys so the gap is visible instead of silent.
 
-/// Shift modifier.
-pub const MOD_SHIFT: u32 = 0x01;
-/// Control modifier.
-pub const MOD_CTRL: u32 = 0x02;
-/// Alt/Option modifier.
-pub const MOD_ALT: u32 = 0x04;
-/// Meta/Command modifier.
-pub const MOD_META: u32 = 0x08;
-/// Keypad modifier.
-pub const MOD_KEYPAD: u32 = 0x10;
+/// The wire's compact modifier bits, from the one protocol definition.
+pub use arcen_protocol::keys::{MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
 
 /// Virtual key codes for the modifiers, used to release stuck modifiers.
 pub const MODIFIER_CODES: [u16; 5] = [0x38, 0x3B, 0x3A, 0x37, 0x39];

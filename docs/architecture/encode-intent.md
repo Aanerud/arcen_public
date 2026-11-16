@@ -82,6 +82,9 @@ reduced end-to-end frame age without a visible quality cost. Its bitrate
 controller starts at the proven safe cap and probes to the true 60 fps shape
 ceiling on a clean path; the Deck mirrors that contract by setting
 VideoToolbox real-time decode for Speed sessions.
+On the Deck side, Auto and Speed also present each frame the moment it is
+decoded (Speed may tear) while Grading and HDR wait for the refresh: see
+[deck presentation timing](deck-presentation-timing.md).
 
 ### Output ordering is never intent-dependent
 

@@ -149,11 +149,17 @@ pub struct HostPenSample {
     pub device_x: u32,
     /// The row in device units, `0..=max_y` of the model.
     pub device_y: u32,
+    /// The largest column and row this pen reports (the model's, or the
+    /// descriptor's logical span for a generic pen).
+    pub device_max_x: u32,
+    pub device_max_y: u32,
     /// 0.0 ..= 1.0.
     pub pressure: f32,
     /// -64 ..= 63, about one degree per unit.
     pub tilt_x_degrees: f32,
     pub tilt_y_degrees: f32,
+    /// Barrel rotation, `0.0..360.0`; zero for a pen that reports none.
+    pub rotation_degrees: f32,
     pub eraser: bool,
     pub in_proximity: bool,
     pub touching: bool,
@@ -242,9 +248,12 @@ impl IntuosPenReader {
             y: unit(state.y, self.model.max_y),
             device_x: state.x.min(self.model.max_x),
             device_y: state.y.min(self.model.max_y),
+            device_max_x: self.model.max_x,
+            device_max_y: self.model.max_y,
             pressure: f32::from(pressure) / f32::from(self.model.max_pressure.max(1)),
             tilt_x_degrees: f32::from(state.tilt_x),
             tilt_y_degrees: f32::from(state.tilt_y),
+            rotation_degrees: 0.0,
             eraser: self.eraser,
             in_proximity: true,
             touching: pressure > INTUOS_TOUCH_THRESHOLD,

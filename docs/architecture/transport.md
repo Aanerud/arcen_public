@@ -5,11 +5,12 @@
 > product (Linux, Windows and macOS Piers, the
 > macOS Deck) runs every session on isolated QUIC lanes (protocol v5, see
 > "QUIC lanes" below); a released single-stream peer is refused with the
-> shared "update the Deck and the Pier to the same release" message. WSS
-> network code is dormant
-> source behind the default-off `wss-compat` feature and is excluded from
-> product builds. `arcen-transport` remains dependency-light by default;
-> product crates opt into its Quinn feature.
+> shared "update the Deck and the Pier to the same release" message. The
+> Decks have no WSS code at all (removed 2026-11-15); a connection an older
+> Deck saved as WSS opens over QUIC. The Piers' WSS listener is dormant source
+> behind the default-off `wss-compat` feature and is excluded from product
+> builds. `arcen-transport` remains dependency-light by default; product
+> crates opt into its Quinn feature.
 
 **Owner:** Shared/Architecture. See
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
@@ -21,8 +22,9 @@ The default `arcen-transport` build supplies the shared rustls posture,
 certificate validation, typed certificate/SPKI pins, atomic reload resolver,
 and product-neutral contract: payload caps, reliability classes, delivery
 mechanisms, bounded queues, and lifecycle events. Its default-off
-`wss-compat` surface preserves dormant migration policy without placing a WSS
-network path in product binaries. The opt-in `arcen_transport::quic` module
+`wss-compat` surface, used only by the Piers' dormant listener, preserves
+dormant migration policy without placing a WSS network path in product
+binaries. The opt-in `arcen_transport::quic` module
 supplies both the active direct carrier and a richer stream/datagram adapter
 that direct sessions do not yet use.
 

@@ -209,6 +209,7 @@ pub struct GpuEntry {
     pub vbios_version: Option<String>,
     pub pci: Option<PciIdentifiers>,
     pub physical_framebuffer_kib: Option<u32>,
+    #[serde(default, with = "crate::nvapi::optional_adapter_luid")]
     pub adapter_luid: Option<AdapterLuid>,
     pub all_outputs_mask: Option<u32>,
     pub connected_outputs_mask: Option<u32>,
@@ -230,6 +231,7 @@ pub struct NvapiConfigTarget {
 pub struct NvapiConfigPathEntry {
     pub source_id: u32,
     pub non_nvidia_adapter: bool,
+    #[serde(default, with = "crate::nvapi::optional_adapter_luid")]
     pub os_adapter_luid: Option<AdapterLuid>,
     pub width: u32,
     pub height: u32,
@@ -242,8 +244,10 @@ pub struct NvapiConfigPathEntry {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CcdPathEntry {
+    #[serde(with = "crate::nvapi::AdapterLuidSerde")]
     pub source_adapter_luid: AdapterLuid,
     pub source_id: u32,
+    #[serde(with = "crate::nvapi::AdapterLuidSerde")]
     pub target_adapter_luid: AdapterLuid,
     pub target_id: u32,
     pub active: bool,
@@ -304,6 +308,7 @@ pub struct SpareOutputId {
 /// can light it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SpareCcdTarget {
+    #[serde(with = "crate::nvapi::AdapterLuidSerde")]
     pub adapter_luid: AdapterLuid,
     pub target_id: u32,
     pub target_available: bool,

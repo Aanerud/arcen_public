@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arcen_keel::SubmissionMode;
-use arcen_media::annexb::{annex_b_is_keyframe, NalCodec};
+use arcen_media::annexb::{access_unit_is_keyframe, NalCodec};
 use arcen_media::video::{
     AdmissionReason, AdmissionRequest, BackendUnavailableReason, CaptureAdmissionNotice,
     CaptureBackend, CaptureLease, CapturePixelFormat, CaptureTakeError, ConversionBackend,
@@ -133,6 +133,19 @@ pub fn run(args: &[String]) -> i32 {
         handoff.cursor_mode().token(),
         backend.ready_token(),
     ));
+    // Exact still image: the wide composition decides it from its served
+    // contract; every other composition writes framed-v2 and never refines.
+    if request.refine.is_some() && (backend == EncoderBackend::OpenH264 || !pipeline.is_wide()) {
+        log(&format!(
+            "lossless refinement off: {} (the linux-wayland-{} composition never refines)",
+            arcen_media::refine::RefineOffReason::EightBit.token(),
+            if backend == EncoderBackend::OpenH264 {
+                "software"
+            } else {
+                pipeline.id().token()
+            },
+        ));
+    }
     if backend == EncoderBackend::OpenH264 {
         // `linux-wayland-software`: no CUDA, no NVENC, shared memory only.
         #[cfg(feature = "software-h264")]
@@ -1100,7 +1113,7 @@ unsafe fn run_native(
                             }
                             ready_announced = true;
                         }
-                        if nal_codec.is_some_and(|nal| annex_b_is_keyframe(&access_unit, nal)) {
+                        if nal_codec.is_some_and(|nal| access_unit_is_keyframe(&access_unit, nal)) {
                             stats.keyframes += 1;
                         }
                         stream_truth.observe(&access_unit);

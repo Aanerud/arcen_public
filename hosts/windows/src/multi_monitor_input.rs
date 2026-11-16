@@ -29,7 +29,7 @@ use arcen_protocol::messages::{
 };
 
 use crate::display::DesktopRect;
-use crate::multi_monitor_topology::{WindowsTopologyError, WindowsTopologyPlan};
+use arcen_outputs::windows_topology::{WindowsTopologyError, WindowsTopologyPlan};
 
 const SEND_INPUT_AXIS_MAX: i128 = 65_535;
 
@@ -553,8 +553,8 @@ mod tests {
         REGION_POINTER_SCROLL,
     };
 
-    use crate::multi_monitor_topology::WindowsMonitorPlan;
     use crate::nvapi::AdapterLuid;
+    use arcen_outputs::windows_topology::WindowsMonitorPlan;
 
     const CROSS_COMPONENT_BASELINE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),

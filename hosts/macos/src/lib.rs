@@ -65,6 +65,8 @@ pub mod observability;
 pub mod pen_probe;
 pub mod permissions;
 #[cfg(target_os = "macos")]
+pub mod refine;
+#[cfg(target_os = "macos")]
 pub mod relay;
 #[cfg(target_os = "macos")]
 pub mod service;
@@ -75,6 +77,7 @@ pub mod stream;
 pub mod support_bundle;
 #[cfg(target_os = "macos")]
 pub mod timezone;
+pub mod tls_material;
 pub mod virtual_display;
 /// Whether this host may present an input device macOS did not get from
 /// hardware, which is what Native Tablet needs.

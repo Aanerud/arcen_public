@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception -->
+<!-- Copyright (C) 2026 TUTTIFRUTTI AS -->
+<!--
+  Arcen USB Component.msi: the optional component behind the Windows Deck's
+  Native tablet (ADR 0024). Separate from the Deck so
+  an ordinary Deck install carries no privileged process at all.
+
+  Installs arcen-usb-service.exe as the LocalSystem service ArcenUsbComponent
+  (automatic start: the Deck greys Native out while it is stopped, and its
+  start-up recovery gives a tablet its own driver back after a crash) and
+  arcen-usb-prepare.exe (requireAdministrator; the Deck starts it once per
+  tablet model). Nothing is put in the driver store and no certificate is
+  trusted at install time: the service stages a prepared package only for the
+  length of a session.
+
+  Uninstall stops the service, then runs "arcen-usb-service.exe uninstall" as
+  SYSTEM before any file is removed. That command restores any claimed
+  tablet, deletes every arcen_usb_* driver-store package, removes every Arcen
+  USB component certificate from LocalMachine\Root and TrustedPublisher,
+  deletes %ProgramData%\Arcen\USB, checks again and fails on any leftover. A
+  failure rolls the uninstall back, so trust can never be left behind
+  silently. A major upgrade skips it: the new build keeps prepared tablets.
+
+  Built with WiX v5.0.2 and no WiX extension. The only custom actions run
+  our own installed executable and Windows' sc.exe (verify-msi.ps1 checks
+  the tables).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Arcen USB component"
+      Manufacturer="TUTTIFRUTTI AS"
+      Version="$(var.ArcenMsiVersion)"
+      UpgradeCode="652B4B54-163A-4D12-8DCC-53B868E76B4F"
+      Scope="perMachine"
+      Language="1033"
+      InstallerVersion="500"
+      Compressed="yes">
+    <SummaryInformation
+        Description="Arcen USB component $(var.ArcenVersion) (build $(var.ArcenBuildId))"
+        Manufacturer="TUTTIFRUTTI AS" />
+
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        Schedule="afterInstallValidate"
+        DowngradeErrorMessage="A newer Arcen USB component is already installed. Uninstall it first to install this older build." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARCENWINDOWSBUILD">
+      <RegistrySearch
+          Id="ArcenWindowsBuildSearch"
+          Root="HKLM"
+          Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+          Name="CurrentBuildNumber"
+          Type="raw"
+          Bitness="always64" />
+    </Property>
+    <Launch
+        Condition="Installed OR (VersionNT64 AND ARCENWINDOWSBUILD &gt;= 22000)"
+        Message="The Arcen USB component needs 64-bit Windows 11." />
+
+    <Icon Id="ArcenDeck.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="ArcenDeck.ico" />
+    <?if $(var.ArcenReleaseCandidate) = 1 ?>
+    <Property Id="ARPCOMMENTS" Value="Optional Native tablet support for Arcen Deck. Build $(var.ArcenBuildId). Free software under the AGPL-3.0." />
+    <?else?>
+    <!-- build.ps1 -LabPreview, or a tree that is not one clean, named revision. -->
+    <Property Id="ARPCOMMENTS" Value="Lab preview, not a release candidate. Optional Native tablet support for Arcen Deck. Build $(var.ArcenBuildId). Free software under the AGPL-3.0." />
+    <?endif?>
+    <Property Id="ARCENRELEASECANDIDATE" Value="$(var.ArcenReleaseCandidate)" />
+    <Property Id="ARPURLINFOABOUT" Value="$(var.ArcenSourceUrl)" />
+    <Property Id="ARPHELPLINK" Value="$(var.ArcenSourceUrl)" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARCENBUILDID" Value="$(var.ArcenBuildId)" />
+    <Property Id="ARCENSOURCEREVISION" Value="$(var.ArcenSourceRevision)" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[UsbInstallFolder]" After="CostFinalize" Sequence="execute" />
+
+    <StandardDirectory Id="System64Folder" />
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataArcenFolder" Name="Arcen" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ArcenVendorFolder" Name="Arcen">
+        <!-- A private Id (lower-case letters): it cannot be set on the
+             msiexec command line, so the LocalSystem service can never be
+             installed into a folder that inherits user write access. -->
+        <Directory Id="UsbInstallFolder" Name="USB" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="UsbComponent" Title="Arcen USB component" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="UsbProgram" />
+      <ComponentGroupRef Id="UsbLegal" />
+      <ComponentRef Id="UsbProgramDataCleanup" />
+    </Feature>
+
+    <!-- The service creates %ProgramData%\Arcen when no Pier did. After the
+         uninstall step has deleted Arcen\USB, Windows Installer removes
+         Arcen too, but only if it is empty: a Pier's files keep it. -->
+    <Component Id="UsbProgramDataCleanup" Directory="ProgramDataArcenFolder" Guid="D1D2A71E-9A9E-46A4-8895-90E9584439BD" KeyPath="yes">
+      <RemoveFolder Id="RemoveProgramDataArcenIfEmpty" On="uninstall" />
+    </Component>
+
+    <ComponentGroup Id="UsbProgram" Directory="UsbInstallFolder">
+      <Component Id="UsbServiceExe">
+        <File Id="ArcenUsbServiceExe" Source="$(var.StageDir)\arcen-usb-service.exe" KeyPath="yes" />
+        <ServiceInstall
+            Id="ArcenUsbComponentService"
+            Name="ArcenUsbComponent"
+            DisplayName="Arcen USB component"
+            Description="Lends a prepared pen tablet to Arcen Deck for a Native tablet session and gives it back afterwards."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Vital="yes" />
+        <ServiceControl
+            Id="ArcenUsbComponentControl"
+            Name="ArcenUsbComponent"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+      <Component Id="UsbPrepareExe">
+        <File Id="ArcenUsbPrepareExe" Source="$(var.StageDir)\arcen-usb-prepare.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="UsbLegal" Directory="UsbInstallFolder">
+      <Component Id="UsbLicense">
+        <File Id="UsbLicenseFile" Source="$(var.StageDir)\LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="UsbLicenseException">
+        <File Id="UsbLicenseExceptionFile" Source="$(var.StageDir)\LICENSE-EXCEPTION.md" KeyPath="yes" />
+      </Component>
+      <Component Id="UsbNotice">
+        <File Id="UsbNoticeFile" Source="$(var.StageDir)\NOTICE" KeyPath="yes" />
+      </Component>
+      <Component Id="UsbTrademarks">
+        <File Id="UsbTrademarksFile" Source="$(var.StageDir)\TRADEMARKS.md" KeyPath="yes" />
+      </Component>
+      <Component Id="UsbThirdPartyNotices">
+        <File Id="UsbThirdPartyNoticesFile" Source="$(var.StageDir)\THIRD_PARTY_NOTICES.md" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Failure actions: restart twice, then stay stopped. A restart is safe:
+         start-up recovery puts any half-claimed tablet back. Windows
+         Installer's own MsiServiceConfigFailureActions table fails here with
+         error 5 and error 1939 (seen on Windows 11 26200; the Installer SDK
+         documents that it does not work as expected), and WiX's
+         util:ServiceConfig would embed a WiX custom-action DLL, so the in-box
+         sc.exe sets them, as SYSTEM, after the service is created and before
+         it starts. Fresh installs and upgrades only: a repair keeps the
+         service and its failure actions, so it runs no console program as
+         SYSTEM. -->
+    <CustomAction
+        Id="ArcenUsbServiceFailureActions"
+        Directory="System64Folder"
+        ExeCommand="&quot;[System64Folder]sc.exe&quot; failure ArcenUsbComponent reset= 86400 actions= restart/5000/restart/30000//0"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <!-- Deferred, as SYSTEM (no impersonation), after StopServices and before
+         DeleteServices/RemoveFiles, whenever the service executable is being
+         removed (an uninstall in any form) except by a major upgrade. -->
+    <CustomAction
+        Id="ArcenUsbUninstallCleanup"
+        FileRef="ArcenUsbServiceExe"
+        ExeCommand="uninstall"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+    <InstallExecuteSequence>
+      <Custom
+          Action="ArcenUsbServiceFailureActions"
+          After="InstallServices"
+          Condition="NOT Installed" />
+      <Custom
+          Action="ArcenUsbUninstallCleanup"
+          After="StopServices"
+          Condition="($UsbServiceExe=2) AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

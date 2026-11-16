@@ -1,0 +1,116 @@
+{
+  "bundle_id": "ARC-WH64-AV6C",
+  "component": {
+    "arch": "<arch>",
+    "name": "arcen-pier-linux",
+    "os": "linux",
+    "version": "<version>"
+  },
+  "entries": [
+    {
+      "included_size_bytes": 289,
+      "original_size_bytes": 289,
+      "path": "config/pier.json",
+      "sha256": "24d3bf7c98e95474db6d6ebd673d4a44e94c3613d36d7bae004ea790da0fa1f7",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 182,
+      "original_size_bytes": 182,
+      "path": "config/xorg.conf",
+      "sha256": "cc0c01f18d17899386a2a22fc7b68f1b6c69f2499aee51e60839b6dc9e3dbdb0",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 1246,
+      "original_size_bytes": 757,
+      "path": "logs/arcen-pier.log",
+      "sha256": "d969be9505985df6a72102de2153a31ad5019f500668f683cf93d728a7f6a176",
+      "source": "log",
+      "truncation": null
+    }
+  ],
+  "generated_at_unix_seconds": 1794726245,
+  "notices": [
+    {
+      "code": "certificate_excluded",
+      "kind": "omitted",
+      "source": "config/tls/cert"
+    },
+    {
+      "code": "private_key_excluded",
+      "kind": "omitted",
+      "source": "config/tls/key"
+    },
+    {
+      "code": "crash_reports_not_requested",
+      "kind": "omitted",
+      "source": "crash"
+    },
+    {
+      "code": "diagnostic_unavailable",
+      "kind": "unavailable",
+      "source": "diagnostics/nv-control"
+    },
+    {
+      "code": "xorg_log_excluded",
+      "kind": "omitted",
+      "source": "logs/Xorg.log"
+    },
+    {
+      "code": "canonical_log_record_invalid",
+      "kind": "invalid",
+      "source": "logs/arcen-pier.log"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/sessions"
+    }
+  ],
+  "redactions": [
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/auth/password",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/cert",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/expected_sans",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/key",
+      "reason": "private_key_policy"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/fields/ssid",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/host",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/peer_addr",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/user",
+      "reason": "identity_pseudonymized"
+    }
+  ],
+  "schema_version": 1
+}

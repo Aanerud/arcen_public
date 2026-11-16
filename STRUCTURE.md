@@ -87,9 +87,12 @@ them. Nothing in them is ever committed or published.
 | `telemetry` (`arcen-telemetry`) | The event vocabulary. |
 | `observability` (`arcen-observability`) | Structured logging that cannot block a video thread. |
 | `usb-bridge` (`arcen-usb-bridge`) | USB passthrough policy and state machines. |
+| `deck-core` (`arcen-deck-core`) | The portable Deck: settings, saved connections and pins, screens (egui), session engine, reconnect flow, presentation and input routing shared by the macOS and Windows Decks. |
 
 Each crate lists its product consumers in `consumers.json`
 (see [`docs/architecture/shared-consumers.md`](docs/architecture/shared-consumers.md)).
+Every difference between products is earned by an OS API or recorded as a gap
+in [`docs/architecture/platform-differences.md`](docs/architecture/platform-differences.md).
 
 ### `hosts/` — the Piers
 
@@ -107,6 +110,7 @@ Each crate lists its product consumers in `consumers.json`
 | Path | Is | Owner |
 | --- | --- | --- |
 | `macos/` | macOS Deck (`arcen-deck-macos`): VideoToolbox decode, Metal/egui window, input capture; `usb-helper/` is the privileged USB capture helper; `usb-iousbhost/` is its IOUSBHost capture backend (ADR 0019, not yet used by release builds); `secure-dir/` verifies and pins the root-only directories the helper keeps state in; `SETTINGS.md` documents every setting. | macOS Client |
+| `windows/` | Windows Deck (`arcen-deck-windows`, Windows 11 x64): D3D11 decode, DirectComposition presentation, Win32 window and input; `usb/` is the optional USB component (`arcen-usb-service`, `arcen-usb-prepare`) for Native tablet. | Windows Client (see `clients/windows/AGENTS.md`) |
 
 ### `packaging/` — installers and release inputs
 
@@ -115,7 +119,8 @@ Each crate lists its product consumers in `consumers.json`
 | `common/` | Staging, promotion and checksum scripts shared by all platforms. | Release/Security |
 | `linux/` | Single-file Linux installer crate, systemd unit, default `pier.json`, logrotate, Xorg config, SELinux policy, certificate and deploy scripts, and `tools/gnome-prefix/` (lab-only GNOME build recipes). | Linux Host, Release/Security |
 | `macos/` | Deck and Pier app/package build scripts, entitlements, Info.plist, PAM file, icon, release-input validation and tests. | macOS Client, Release/Security |
-| `windows/` | Windows installer crate, default `pier.json`, event-log source, package and driver-source checks, MSVC wrapper; `client/` is a dormant scaffold for a future Windows Deck. | Windows Host, Release/Security |
+| `windows/` | Windows installer crate, default `pier.json`, event-log source, package and driver-source checks, MSVC wrapper; `client/` is a dormant legacy scaffold; the Windows Deck is packaged by `windows-deck/`. | Windows Host, Release/Security |
+| `windows-deck/` | Windows Deck packaging: `build.ps1` builds the Deck MSI and the optional USB component MSI (WiX 5.0.2, unsigned), `verify-msi.ps1`, icon and tests. | Windows Client, Release/Security |
 | `quic_config_migration.rs` | Shared installer code that migrates older Pier configuration to the QUIC product port, included by the Linux installer. | Release/Security |
 
 ### `docs/` — documentation (Shared/Architecture and Release/Security)
@@ -137,7 +142,7 @@ Each crate lists its product consumers in `consumers.json`
 | `ci/` | CI gates: publication hygiene, workspace boundaries, action pins, component matrix, supply chain and release manifest generation, validation profiles. |
 | `review/` | Local review hooks: `doc-guard.sh`, secret scan, redaction, pre-commit hook installer. |
 | `lab/` | Lab-only harnesses: the real-screen latency harness (`realscreen/`), Wayland and X11 probes, and the virtual USB host controller lab driver (`usb-vhci/`). Never run against production. |
-| `check_shared_contracts.py`, `shared_adoption_index.py` | Shared-crate consumer and impact checks. |
+| `check_shared_contracts.py`, `platform_differences.py`, `rust_scan.py`, `shared_adoption_index.py` | Shared-crate consumer and impact checks, the earned-differences ledger, and the Shared Adoption Index. |
 | `error_code_reference.py`, `pier_config_reference.py` | Extract every error code and every `pier.json` key from the code, so the check fails when [Error codes](docs/operations/error-codes.md) or the [configuration reference](docs/operations/config-reference.md) misses one. |
 | `validate_observability.py`, `observability_event_definitions.py` | Observability event schema validation. |
 | `generate-third-party-notices.py` | Regenerates `legal/THIRD_PARTY_NOTICES.md`. |

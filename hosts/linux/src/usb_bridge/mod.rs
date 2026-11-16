@@ -831,7 +831,7 @@ pub async fn attach_x11_desktop(
                     target: "arcen::usb",
                     x_display,
                     drivers = ?nodes.iter().map(|node| node.kernel_driver.as_str()).collect::<Vec<_>>(),
-                    "no pen node of this tablet is served by the kernel wacom driver; refused on X11"
+                    "no node of this tablet is a pen, or xf86-input-wacom is missing; refused on X11"
                 );
                 Err(HardUsbSessionDenial::X11TabletUnsupported
                     .reason()

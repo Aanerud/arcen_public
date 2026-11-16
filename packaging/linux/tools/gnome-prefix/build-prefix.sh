@@ -95,8 +95,17 @@ if [ ! -f $S/stamps/mutter-patched ]; then
   python3 /src/patch-headless-seat-51.py $d/src/backends/native/meta-seat-impl.c > $S/logs/patch-seat.log 2>&1 || { cat $S/logs/patch-seat.log; exit 1; }
   touch $S/stamps/mutter-patched
 fi
+# GNOME/mutter#5077: the pressure curve's value is the pressure (not the pressure times it).
+# Added after the first 51 build: on an existing tree it rebuilds Mutter once.
+if [ ! -f $S/stamps/mutter-pressure-curve-source ]; then
+  python3 /src/patch-pressure-curve-51.py $d > $S/logs/patch-pressure-curve.log 2>&1 || { cat $S/logs/patch-pressure-curve.log; exit 1; }
+  rm -f $S/stamps/mutter $S/stamps/mutter-pressure-curve
+  touch $S/stamps/mutter-pressure-curve-source
+fi
 mesonb mutter $d -Dprofiler=false -Dtests=disabled -Dinstalled_tests=false -Dcogl_tests=false -Dclutter_tests=false -Dmutter_tests=false \
   -Ddocs=false -Dxwayland_path=/usr/bin/Xwayland -Dbash_completion=false -Ddevkit=disabled -Dcatch=false -Dkvm_tests=false -Dtty_tests=false
+# The digest of the library this patched build installed: write-pressure-marker.sh vouches only for it.
+[ -f $S/stamps/mutter-pressure-curve ] || sha256sum $P/lib64/libmutter-51.so.0.0.0 | cut -d' ' -f1 > $S/stamps/mutter-pressure-curve
 # 14 gnome-shell
 d=$(unpack $(fetch $G/gnome-shell/51/gnome-shell-51.1.tar.xz) gnome-shell-51.1)
 mesonb gnome-shell $d -Dextensions_tool=false -Dman=false -Dtests=false -Dportal_helper=false -Dcamera_monitor=false -Dgtk_doc=false

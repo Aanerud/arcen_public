@@ -33,7 +33,7 @@ const DEV_TOOLS_USAGE: &str = "";
 #[cfg(not(feature = "usb-emulate-lab"))]
 const USB_EMULATE_USAGE: &str = "";
 #[cfg(feature = "usb-emulate-lab")]
-const USB_EMULATE_USAGE: &str = "arcen-client input-smoke <host> [port] ... --usb-emulate wacom-intuos5 [--usb-emulate-strokes N] [--usb-emulate-lead-in-ms MS] [--usb-emulate-stroke scripted|landing|alternate|realistic|tilted|rest|hover-rest|upper-held]   (lab-only; implies --tablet-mode hard; plays a scripted pen stroke through an emulated Wacom Intuos5 instead of capturing a tablet; the same flags after `--connect HOST PORT` give the GUI the emulated pen)\n";
+const USB_EMULATE_USAGE: &str = "arcen-client input-smoke <host> [port] ... --usb-emulate wacom-intuos5|generic-pen [--usb-emulate-strokes N] [--usb-emulate-lead-in-ms MS] [--usb-emulate-stroke scripted|landing|alternate|realistic|tilted|rest|hover-rest|upper-held|ladder|eraser|barrel]   (lab-only; implies --tablet-mode hard; plays a scripted pen stroke through an emulated Wacom Intuos5 (or, with generic-pen, a standard HID pen no host has a dedicated reader for, which plays its own stroke for every script but ladder; ladder plays one stroke per pressure level 0.1/0.25/0.5/0.75/1.0 on either pen) instead of capturing a tablet; the same flags after `--connect HOST PORT` give the GUI the emulated pen)\n";
 #[cfg(feature = "dev-tools")]
 const DEV_TOOLS_USAGE: &str = "arcen-client virtual-monitor-lab [2|4] [--timeout-secs N]   (developer-only; requires ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1)\narcen-client probe-matrix [--parameter-sets <dir>] [--output <path>]   (developer-only; see docs/testing/color-matrix-results.json)\n";
 
@@ -91,6 +91,16 @@ async fn main() {
         print_platform_report();
         arcen_deck::logging::shutdown();
         return;
+    }
+    if subcommand == Some("support-bundle") {
+        let code = arcen_deck_core::support_bundle::run_command(
+            &args[2..],
+            arcen_deck::platform_services::services().as_ref(),
+            arcen_deck::display::enumerate(),
+            arcen_deck::platform_services::support_bundle_component(),
+        );
+        arcen_deck::logging::shutdown();
+        std::process::exit(code);
     }
     if subcommand == Some("multi-monitor-harness") {
         run_multi_monitor_harness_subcommand(&args);
@@ -390,6 +400,7 @@ async fn main() {
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                   arcen-client platform-report\n\
+                  arcen-client support-bundle [--out DIR]   (redacted .zip of logs, settings and facts; default: Desktop)\n\
                   arcen-client diagnose <host[:port]> [port] [--pin-sha256 FP | --pin-spki FP] [--ignore-remembered]   (connection test; sends no credentials)\n\
                 {}{}transport: QUIC/TLS 1.3 over UDP; default port 18444\n\
                 \n\
@@ -1041,7 +1052,6 @@ fn connect_options_from_parts_with_monitors(
     port: u16,
     live_monitors: Vec<ClientMonitor>,
 ) -> Result<ConnectOptions, String> {
-    let use_quic = true;
     let use_tls = true;
     if port == 0 {
         return Err("direct QUIC connections require a nonzero UDP port".to_string());
@@ -1201,6 +1211,7 @@ fn connect_options_from_parts_with_monitors(
         }
     };
     Ok(ConnectOptions {
+        services: arcen_deck::platform_services::services(),
         host,
         port,
         use_tls,
@@ -1222,7 +1233,7 @@ fn connect_options_from_parts_with_monitors(
         tablet_input_enabled: !matches!(tablet_mode_requested, TabletModeMsg::DisabledMouseCompat),
         tablet_mode_requested,
         telemetry: std::sync::Arc::new(arcen_deck::observability::ClientTelemetry::default()),
-        quic_enabled: use_quic,
+        exact_still_image: false,
     })
 }
 
@@ -1378,7 +1389,9 @@ async fn input_smoke(
                     );
                 }
                 if hard_mode && !hello.usb_hard_v1 {
-                    return Err("host did not advertise Hard USB v1".to_string());
+                    // The host's own refusal (its tablet_mode_result) is
+                    // what a person sees; wait for it rather than stop here.
+                    println!("input-smoke host did not advertise Hard USB v1");
                 }
                 text_capabilities = Some((
                     hello.input_capabilities.text_commit,
@@ -2588,6 +2601,14 @@ async fn media_smoke(
     let requested_multi_monitor_topology = options.multi_monitor_topology.clone();
     let microphone_requested = options.microphone_enabled;
     let tablet_input_requested = options.tablet_input_enabled;
+    // ARCEN_MEDIA_SMOKE_EXACT=1 asks for exact still image; the smoke treats
+    // each decoded frame as presented (no compositor: level 1 at most) and
+    // prints every change of the exact-still-image status.
+    let exact_smoke = std::env::var("ARCEN_MEDIA_SMOKE_EXACT").is_ok_and(|value| value == "1");
+    if exact_smoke {
+        options.exact_still_image = true;
+    }
+    let mut exact_status = String::new();
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
         password: std::mem::take(&mut options.password),
@@ -2601,6 +2622,46 @@ async fn media_smoke(
     } else {
         spawn_session(options)
     };
+    if exact_smoke {
+        // Polls the hub every 20 ms, so the timeline does not depend on the
+        // frame cadence of a still screen.
+        let hub = session.media.refine().clone();
+        let polled_from = Instant::now();
+        std::thread::spawn(move || {
+            let mut last = None;
+            let mut printed = Instant::now();
+            loop {
+                let status = hub.status(arcen_media::refine::PRIMARY_MONITOR);
+                let stats = hub.stats();
+                let key = (
+                    status.refined_permille / 50,
+                    status
+                        .verdict
+                        .as_ref()
+                        .map(|verdict| (verdict.coverage_permille(), verdict.level as u8)),
+                    stats.blocks_invalidated / 1000,
+                );
+                if last != Some(key) || printed.elapsed() >= Duration::from_secs(1) {
+                    last = Some(key);
+                    printed = Instant::now();
+                    let wall_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_millis());
+                    println!(
+                        "exact-poll elapsed_ms={} wall_ms={wall_ms} refined_permille={} verified={:?} payload_bytes={} tiles={} blocks_invalidated={} text={:?}",
+                        polled_from.elapsed().as_millis(),
+                        status.refined_permille,
+                        key.1,
+                        stats.payload_bytes,
+                        stats.tiles_admitted,
+                        stats.blocks_invalidated,
+                        status.text
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
     let result: Result<(), String> = async {
     let mut decoders = BTreeMap::<u16, NativeVideoDecoder>::new();
     let mut expected_monitor_ids = BTreeSet::<u16>::new();
@@ -2683,6 +2744,17 @@ async fn media_smoke(
         Err(_) => None,
     };
     let mut dumped_aus = 0_u32;
+    // ARCEN_MEDIA_DUMP_AFTER_SECONDS=<s>: start the dump at the first keyframe
+    // after <s> seconds (one is requested then), so a recorded test vector
+    // holds only what the desktop shows once a test picture is up.
+    let dump_after = std::env::var("ARCEN_MEDIA_DUMP_AFTER_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(Duration::from_secs_f64);
+    let mut dump_first_packet: Option<Instant> = None;
+    let mut dump_keyframe_requested = false;
+    let mut dump_started = dump_after.is_none();
     // ARCEN_MEDIA_SMOKE_STATS=<path>: write one JSON line per received video
     // packet (wall-clock receive time, host timestamp, size), per health
     // ping/pong and per host health_stats, for offline path measurements.
@@ -2898,6 +2970,22 @@ async fn media_smoke(
                 return Err("server certificate requires interactive trust".to_string());
             }
             SessionEvent::ServerHello(hello) => {
+                if exact_smoke {
+                    println!(
+                        "exact-offer {}",
+                        match hello.lossless_refine.as_ref() {
+                            None => "Exact: not offered by this host".to_owned(),
+                            Some(offer) if !offer.is_on() => format!(
+                                "Exact: {} (reason={})",
+                                arcen_media::refine::off_reason_text(
+                                    offer.reason.as_deref().unwrap_or("off")
+                                ),
+                                offer.reason.as_deref().unwrap_or("off")
+                            ),
+                            Some(offer) => format!("on {offer:?}"),
+                        }
+                    );
+                }
                 println!(
                     "server={} codec={} bit_depth={} range={} matrix={} primaries={} transfer={} \
                      pixel_format={} encoder={} encoder_class={} active_pipeline={} size={}x{} supports_audio={} \
@@ -3226,6 +3314,21 @@ async fn media_smoke(
                         validated_wire_profiles.insert(monitor_id);
                     }
                     let is_keyframe = header.is_keyframe();
+                    if dump_file.is_some() && !dump_started {
+                        let first = *dump_first_packet.get_or_insert_with(Instant::now);
+                        if dump_after.is_some_and(|after| first.elapsed() < after) {
+                            continue;
+                        }
+                        if !is_keyframe {
+                            if !dump_keyframe_requested {
+                                dump_keyframe_requested = true;
+                                full_frame_requests.request();
+                                let _ = full_frame_requests.send_due(&session.commands);
+                            }
+                            continue;
+                        }
+                        dump_started = true;
+                    }
                     if dump_file.is_some() {
                         use std::io::Write as _;
                         dump_file
@@ -3269,6 +3372,37 @@ async fn media_smoke(
                     if let Some(frame) = decoded {
                         if is_keyframe {
                             full_frame_requests.cancel_pending();
+                        }
+                        if exact_smoke {
+                            let hub = session.media.refine().clone();
+                            if let Some((monitor, fence)) = hub.frame_tag(frame.timestamp_ms) {
+                                hub.presented(monitor, fence);
+                            }
+                            let status = hub.status(arcen_media::refine::PRIMARY_MONITOR);
+                            if status.text != exact_status {
+                                let stats = hub.stats();
+                                println!(
+                                    "exact-status elapsed_ms={} text={:?} refined_permille={} tiles={} payload_bytes={} blocks_invalidated={} generations={} digest_matches={} digest_mismatches={} dropped={}",
+                                    started.elapsed().as_millis(),
+                                    status.text,
+                                    status.refined_permille,
+                                    stats.tiles_admitted,
+                                    stats.payload_bytes,
+                                    stats.blocks_invalidated,
+                                    stats.generations,
+                                    stats.digest_matches,
+                                    stats.digest_mismatches,
+                                    stats.dropped,
+                                );
+                                exact_status = status.text;
+                            }
+                            for message in hub.take_control_messages() {
+                                if let Ok(value) = serde_json::to_value(&message) {
+                                    let _ = session
+                                        .commands
+                                        .send(arcen_deck::transport::websocket::SessionCommand::Json(value));
+                                }
+                            }
                         }
                         decoded_resolution = Some((frame.width, frame.height));
                         if last_decoded_size != Some((frame.width, frame.height)) {
@@ -4214,7 +4348,6 @@ mod tests {
         ];
         let options = connect_options_from_cli_args(&args).expect("secure QUIC options");
         assert!(options.use_tls);
-        assert!(options.quic_enabled);
     }
 
     #[test]
@@ -4229,7 +4362,6 @@ mod tests {
         let options = connect_options_from_cli_args(&args).expect("custom QUIC port");
         assert_eq!(options.port, 8443);
         assert!(options.use_tls);
-        assert!(options.quic_enabled);
     }
 
     #[test]
@@ -4238,7 +4370,6 @@ mod tests {
         args[3] = "18444".to_string();
         args.push("--quic".to_string());
         let options = connect_options_from_cli_args(&args).unwrap();
-        assert!(options.quic_enabled);
         assert!(options.use_tls);
         assert_eq!(options.port, 18_444);
     }
@@ -4254,7 +4385,6 @@ mod tests {
         let options = connect_options_from_cli_args(&args).unwrap();
         assert_eq!(options.port, 18_444);
         assert!(options.use_tls);
-        assert!(options.quic_enabled);
     }
 
     #[test]
@@ -4268,7 +4398,6 @@ mod tests {
         let options = quick_connect_options_from_cli_args(&args).unwrap().unwrap();
         assert_eq!(options.port, 18_444);
         assert!(options.use_tls);
-        assert!(options.quic_enabled);
     }
 
     #[test]
@@ -4278,7 +4407,6 @@ mod tests {
         args.push("--quic".to_string());
         let options = connect_options_from_cli_args(&args).unwrap();
         assert_eq!(options.port, 19_444);
-        assert!(options.quic_enabled);
         assert!(options.use_tls);
     }
 

@@ -148,16 +148,34 @@ weeks.
 
 When changing one path's privilege or ACL handling, check the other.
 
-### No Wintab and no Native tablet on this host (ADR 0017)
+### The session's layout (`host_keymap`)
+
+A Deck that types committed text is told what the foreground window's
+keyboard layout types at each printable position, at attach and on every
+change (`keymap_watcher.rs`: `GetKeyboardLayout` of the foreground thread,
+the user's default input language while no window has the keyboard,
+`ToUnicodeEx` with the keyboard state untouched on the shared `set1_position`
+scan codes, read every second). Positions, validation, layout names (KLID,
+variants through `Keyboard Layouts\<KLID>\Layout Id`) and when a notice is
+due are the shared `arcen_input::text::host_layout` contract every Pier uses.
+
+### Pens: Windows Ink only, no Wintab (ADR 0017); Native tablet without a driver (ADR 0023)
 Pens reach Windows through Windows Ink only: `PenInjector` in `src/input.rs`
 (`CreateSyntheticPointerDevice` / `InjectSyntheticPointerInput`). Do not add a
 `wintab32.dll`, DLL injection, or an emulated tablet maker's device.
 
 Native tablet (`wacom_usb_bridge` on the wire, a legacy name for the
-vendor-neutral mode) is not offered: it needs a signed kernel driver (UDE/VHF;
-EV certificate, attestation, WHQL/HLK) the project does not fund. The Pier
-advertises `usb_tablet_bridge: Unavailable` and refuses a request with a
-reason (`resolve_windows_tablet_mode_result` in `src/session.rs`). Keep Windows
-connections on Tablet support. See
-[ADR 0017](../../docs/adr/0017-forward-only-pen-input.md); ADR 0012 records the
-route that is not taken.
+vendor-neutral mode) needs no driver here: the Pier publishes no device
+(`HidPublishPolicy::Nothing`), reads the bridged pen itself with the shared
+readers and injects every sample through the same `PenInjector` (ADR 0023
+amendment). It is offered exactly when the session's Windows Ink pen device
+exists (`usb_hard_v1`, `usb_tablet_bridge`). Everything but the injection is
+shared: authorization, the attachment, the Deck's wording and the host
+pointer are `arcen_input::bridged_pen` (`NativeTabletAttachment`), the USB
+host driver and readers `arcen_usb_bridge::HostPenBridge`; the Pier's part is
+`negotiate_native_tablet` / `start_native_tablet` / `send_native_tablet_output`
+in `src/session.rs`. The pen lands only in the agent's own session
+(`InjectSyntheticPointerInput` delivers to the calling session's input desktop;
+the secure desktop refuses it), and the broker ends the attachment when the
+session stops being the bound, unlocked one. Never add a virtual USB host
+controller, VHF or UDE driver: ADR 0012 records that route as not taken.

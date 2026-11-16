@@ -6,14 +6,23 @@
   "validation": ["shared-usb-bridge-test", "shared-usb-bridge-clippy", "workspace-boundaries"],
   "consumers": [
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate"
+      ]
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
         "backend",
+        "component_ipc",
         "crate",
         "descriptor_fixtures",
         "exporter",
         "hid_digitizer",
+        "native_component",
         "synthetic",
         "synthetic_device",
         "tablet_claim",
@@ -32,7 +41,8 @@
           "id": "macos-deck-native-tablet",
           "entry_points": [
             "clients/macos/src/usb_bridge.rs",
-            "clients/macos/src/usb_helper_client.rs"
+            "clients/macos/src/usb_helper_client.rs",
+            "clients/macos/src/usb_helper_install.rs"
           ],
           "build_profiles": ["macos-deck-native-tablet"],
           "validation": ["macos-deck-native-tablet-test", "macos-deck-usb-lab"],
@@ -93,10 +103,68 @@
       "contracts": ["crate", "hid_digitizer", "synthetic", "tablet_claim", "types"]
     },
     {
+      "package": "arcen-input",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "descriptor_fixtures", "generic_pen_tablet", "hid_host", "hid_publish", "host_pen", "host_pen_bridge", "synthetic_device", "tablet_claim", "types", "wacom_intuos5", "wacom_intuos_pen"]
+    },
+    {
+      "package": "arcen-usb-prepare",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "winusb_package"],
+      "paths": [
+        {
+          "id": "windows-usb-component-prepare",
+          "entry_points": [
+            "clients/windows/usb/prepare/src/win.rs"
+          ],
+          "build_profiles": ["windows-usb-component"],
+          "validation": [
+            "windows-usb-component-typecheck",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-service",
+      "dependency_kind": "normal",
+      "contracts": [
+        "backend",
+        "captured_facts",
+        "component_ipc",
+        "component_lease",
+        "component_session",
+        "crate",
+        "exporter",
+        "generic_pen_tablet",
+        "types",
+        "winusb_package"
+      ],
+      "paths": [
+        {
+          "id": "windows-usb-component",
+          "entry_points": [
+            "clients/windows/usb/service/src/win/runtime.rs",
+            "clients/windows/usb/service/src/win/claim.rs",
+            "clients/windows/usb/service/src/win/winusb.rs"
+          ],
+          "build_profiles": ["windows-usb-component"],
+          "validation": [
+            "windows-usb-component-typecheck",
+            "windows-usb-component-test",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
       "package": "arcen-usb-helper",
       "dependency_kind": "normal",
       "contracts": [
         "backend",
+        "component_ipc",
         "crate",
         "descriptor",
         "descriptor_fixtures",
@@ -113,6 +181,7 @@
           "id": "macos-deck-usb-helper",
           "entry_points": [
             "clients/macos/usb-helper/src/capture.rs",
+            "clients/macos/usb-helper/src/frame.rs",
             "clients/macos/usb-helper/src/iousbhost.rs"
           ],
           "build_profiles": ["macos-usb-helper-apple-silicon", "macos-usb-helper-intel"],
@@ -130,7 +199,8 @@
     {
       "package": "arcen-usb-iousbhost",
       "dependency_kind": "normal",
-      "contracts": ["backend", "crate", "descriptor", "exporter", "policy", "tablet_claim", "types"],
+      "contracts": ["backend",
+        "captured_facts", "crate", "descriptor", "exporter", "policy", "tablet_claim", "types"],
       "paths": [
         {
           "id": "macos-iousbhost-backend",
@@ -203,14 +273,32 @@
       ]
     },
     {
+      "package": "arcen-pier-windows",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "descriptor_fixtures", "hid_host", "hid_publish", "host_pen_bridge", "types", "wacom_intuos5"],
+      "paths": [
+        {
+          "id": "windows-native-tablet",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test", "windows-pier-native-tablet-lab"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
       "package": "arcen-pier-macos",
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "descriptor_fixtures",
         "exporter",
+        "generic_pen",
+        "generic_pen_tablet",
         "hid_device_ipc",
         "hid_host",
         "hid_publish",
+        "host_pen",
         "synthetic_device",
         "tablet_claim",
         "types",
@@ -236,6 +324,32 @@
           "build_profiles": ["macos-pier-native-tablet"],
           "validation": ["macos-pier-native-tablet-test", "macos-pier-native-tablet-lab"],
           "owner": "macOS Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-client",
+      "dependency_kind": "normal",
+      "contracts": [
+        "hid_digitizer",
+        "native_component",
+        "winusb_package"
+      ],
+      "paths": [
+        {
+          "id": "windows-usb-client",
+          "entry_points": [
+            "clients/windows/usb/client/src/lib.rs",
+            "clients/windows/usb/client/src/win/pipe.rs",
+            "clients/windows/usb/client/src/win/mod.rs"
+          ],
+          "build_profiles": ["windows-usb-client"],
+          "validation": [
+            "windows-usb-client-typecheck",
+            "windows-usb-client-test",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
         }
       ]
     }

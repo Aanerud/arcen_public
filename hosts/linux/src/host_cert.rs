@@ -4,8 +4,9 @@
 //!
 //! The decision of what to do — create, keep, renew, rekey or adopt — comes
 //! from [`arcen_transport::cert_provisioning`], the same module the macOS host
-//! uses, so both answer the question identically. Ownership and pins come from
-//! [`arcen_transport::cert_marker`]. Only generation is Linux-specific, and it
+//! uses, so both answer the question identically. The directory's file names,
+//! what is in it, and the pin and ownership files come from
+//! [`arcen_transport::cert_store`]. Only generation is Linux's own, and it
 //! shells out to `openssl` so material produced here is indistinguishable from
 //! what `packaging/linux/new-host-cert.sh` produces.
 //!
@@ -18,22 +19,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arcen_transport::cert_marker::{self, OwnershipMarker};
-use arcen_transport::cert_provisioning::{
-    plan, MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRequest,
-};
+use arcen_transport::cert_provisioning::{plan, ProvisioningAction, ProvisioningRequest};
+use arcen_transport::cert_store::{self, InspectContext, MaterialPaths, PinFiles};
 
+/// Where the Linux Pier keeps its material (the FHS configuration directory).
 const DEFAULT_DIRECTORY: &str = "/etc/arcen";
-/// Ownership marker name, shared with the helper script and the macOS host.
-const MARKER_FILE: &str = "host.generated-by-arcen";
-/// Whole-certificate pin file.
-const CERT_PIN_FILE: &str = "host.cert-sha256";
-/// Subject public key pin file.
-const SPKI_PIN_FILE: &str = "host.spki-sha256";
-/// Certificate lifetime in days.
-const VALIDITY_DAYS: &str = "825";
-/// How close to expiry counts as due for renewal.
-const RENEW_WITHIN_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 pub fn main(args: &[String]) -> ExitCode {
     match run(args) {
@@ -44,27 +34,6 @@ pub fn main(args: &[String]) -> ExitCode {
         Err(error) => {
             eprintln!("new-host-cert: {error}");
             ExitCode::FAILURE
-        }
-    }
-}
-
-/// Paths to the managed material.
-struct MaterialPaths {
-    certificate: PathBuf,
-    key: PathBuf,
-    marker: PathBuf,
-    certificate_pin: PathBuf,
-    spki_pin: PathBuf,
-}
-
-impl MaterialPaths {
-    fn in_directory(directory: &Path) -> Self {
-        Self {
-            certificate: directory.join("host.crt"),
-            key: directory.join("host.key"),
-            marker: directory.join(MARKER_FILE),
-            certificate_pin: directory.join(CERT_PIN_FILE),
-            spki_pin: directory.join(SPKI_PIN_FILE),
         }
     }
 }
@@ -84,7 +53,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
         .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
         .as_secs();
 
-    let state = inspect(&paths, now);
+    // The helper script owns transaction recovery on this platform, so this
+    // path does not claim to detect its staging files.
+    let state = cert_store::inspect(&paths, now, InspectContext::default())
+        .map_err(|error| format!("read {}: {error}", paths.certificate.display()))?;
     let decided = plan(request, state)
         .map_err(|refusal| format!("{}: {}", refusal.as_str(), refusal.guidance()))?;
 
@@ -112,82 +84,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 paths.certificate.display()
             ))
         }
-    }
-}
-
-/// Reads the directory into the shared decision input.
-fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> MaterialState {
-    let certificate_present = paths.certificate.is_file();
-    let key_present = paths.key.is_file();
-    if !certificate_present && !key_present {
-        return MaterialState::absent();
-    }
-
-    let certificate_bytes = std::fs::read(&paths.certificate).ok();
-    let ownership = certificate_bytes.as_ref().map(|bytes| {
-        if !paths.marker.exists() {
-            MaterialOwnership::Foreign
-        } else if marker_matches(paths, bytes) {
-            MaterialOwnership::Owned
-        } else {
-            MaterialOwnership::Ambiguous
-        }
-    });
-
-    let now = i64::try_from(now_epoch_secs).unwrap_or(i64::MAX);
-    let (certificate_valid, expiring_or_expired) = certificate_bytes
-        .as_ref()
-        .and_then(|bytes| cert_marker::validity_from_pem(bytes))
-        .map_or((false, false), |window| {
-            (
-                window.is_current(now),
-                window.is_due_for_renewal(now, RENEW_WITHIN_SECONDS),
-            )
-        });
-
-    MaterialState {
-        certificate_present,
-        key_present,
-        ownership,
-        certificate_valid,
-        expiring_or_expired,
-        // The helper script owns transaction recovery on this platform, so
-        // this path does not claim to detect its staging files.
-        stale_staging_present: false,
-        legacy_arcen_self_signed: certificate_bytes.as_ref().is_some_and(|bytes| {
-            cert_marker::is_legacy_arcen_self_signed_pem(bytes, legacy_arcen_evidence(paths, bytes))
-        }),
-    }
-}
-
-/// Returns whether the ownership marker describes the certificate on disk.
-fn marker_matches(paths: &MaterialPaths, certificate_bytes: &[u8]) -> bool {
-    let Ok(recorded) = std::fs::read_to_string(&paths.marker) else {
-        return false;
-    };
-    let Ok(marker) = OwnershipMarker::parse(&recorded) else {
-        return false;
-    };
-    let Some(pins) = cert_marker::pins_from_pem(certificate_bytes) else {
-        return false;
-    };
-    marker.matches(&pins.certificate, &pins.spki)
-}
-
-fn legacy_arcen_evidence(
-    paths: &MaterialPaths,
-    certificate_bytes: &[u8],
-) -> cert_marker::LegacyArcenEvidence {
-    let companion_pins_match = std::fs::read_to_string(&paths.certificate_pin)
-        .ok()
-        .zip(std::fs::read_to_string(&paths.spki_pin).ok())
-        .is_some_and(|(certificate_pin, spki_pin)| {
-            cert_marker::companion_pins_match_pem(certificate_bytes, &certificate_pin, &spki_pin)
-        });
-    cert_marker::LegacyArcenEvidence {
-        arcen_tls_directory: true,
-        companion_pins_match,
-        machine_sans_match: false,
     }
 }
 
@@ -232,7 +128,8 @@ fn issue(paths: &MaterialPaths, reuse_key: bool, sans: &[String]) -> Result<(), 
     };
 
     let status = std::process::Command::new("openssl")
-        .args(["req", "-x509", "-new", "-sha256", "-days", VALIDITY_DAYS])
+        .args(["req", "-x509", "-new", "-sha256", "-days"])
+        .arg(cert_store::VALIDITY_DAYS.to_string())
         .arg("-key")
         .arg(&key_for_cert)
         .arg("-out")
@@ -266,20 +163,11 @@ fn issue(paths: &MaterialPaths, reuse_key: bool, sans: &[String]) -> Result<(), 
 fn write_pins_and_marker(paths: &MaterialPaths) -> Result<(), String> {
     let bytes = std::fs::read(&paths.certificate)
         .map_err(|error| format!("read {}: {error}", paths.certificate.display()))?;
-    let pins = cert_marker::pins_from_pem(&bytes)
-        .ok_or_else(|| "cannot pin the generated certificate".to_owned())?;
-    let marker = OwnershipMarker::new(&pins.certificate, &pins.spki)
-        .map_err(|error| format!("ownership marker: {error}"))?;
-
-    write_file(
-        &paths.certificate_pin,
-        &format!(
-            "sha256 Fingerprint={}\n",
-            cert_marker::colon_hex(&pins.certificate)
-        ),
-    )?;
-    write_file(&paths.spki_pin, &format!("{}\n", pins.spki))?;
-    write_file(&paths.marker, &marker.render())
+    let pins = PinFiles::for_certificate(&bytes)?;
+    for (path, contents) in pins.files(paths) {
+        write_file(path, contents)?;
+    }
+    Ok(())
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<(), String> {
@@ -371,6 +259,8 @@ fn chmod(path: &Path, mode: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use arcen_transport::cert_provisioning::MaterialState;
+
     use super::*;
 
     #[test]

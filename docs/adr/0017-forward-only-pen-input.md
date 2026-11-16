@@ -8,6 +8,15 @@ as the record of the route that is not taken.
 > pointer and pen APIs. It does not reimplement a 1990s tablet API, and it
 > does not offer a mode that would need a signed Windows kernel driver.
 
+> **Proposed amendment (2026-11-14), not decided:** Native tablet on a
+> Windows host through an operator-installed, unchanged copy of usbip-win2
+> (BSD-2-Clause), whose release drivers are Microsoft-signed, attached to a
+> USB/IP server in the Pier built on the shared `arcen_usb_bridge` codec.
+> Arcen would build, ship and sign no kernel driver, so decision 2's reason
+> would not apply; a third-party kernel driver on the host is still a
+> Release/Security review. See
+> [ADR 0024](0024-windows-deck.md), Consequences.
+
 ## Context
 
 **Wintab is not part of Windows.** It is an early-1990s tablet API.
@@ -70,6 +79,11 @@ entitlements granted to the project, not drivers it must sign and service.
    (`hosts/windows/src/session.rs`) and refuses a request with a reason
    (`resolve_windows_tablet_mode_result`). **Tablet support** (the typed
    pen) is the Windows pen.
+   *Amended 2026-11-16 by [ADR 0023](0023-one-native-tablet-pen-position-path.md)'s
+   amendment:* a Windows Pier now offers Native tablet without a driver. It
+   presents no USB device; it reads the bridged pen itself and injects it
+   through the same Windows Ink pen, so this decision's substance (no
+   kernel driver, no Wintab, Windows Ink only) is unchanged.
 3. **Native tablet stays where the platform offers a supported route:**
    Linux lab builds (`usb-hard-lab`, `usb-vhci`) and macOS, through the two
    Apple entitlements above.

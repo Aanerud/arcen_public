@@ -467,6 +467,7 @@ mod tests {
             primaries: ColorPrimaries::Bt709,
             range: ColorRange::Full,
             chroma: ChromaSubsampling::Yuv444,
+            matrix: crate::ColorMatrix::Identity,
         };
         let grid = RefineGrid {
             width: 1024,

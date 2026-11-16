@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception -->
+<!-- Copyright (C) 2026 TUTTIFRUTTI AS -->
+<!--
+  Arcen Deck.msi: the Windows Deck, per machine, in Program Files\Arcen\Deck.
+
+  Built by packaging/windows-deck/build.ps1 with WiX v5.0.2 and NO WiX
+  extension: every table here is a native Windows Installer table, so the MSI
+  carries no WiX custom-action DLL, dialog or bitmap (verify-msi.ps1 checks
+  the Binary and CustomAction tables). Basic UI only: progress, UAC, done.
+
+  Upgrade: MajorUpgrade removes the previous build completely before the new
+  one is installed (afterInstallValidate), so equal file versions between two
+  builds of one release cannot leave an old exe behind. Same-version builds
+  upgrade each other; a newer installed Deck refuses the downgrade.
+
+  Uninstall removes exactly what this package installed: the files, the
+  Start-menu shortcut and the WER LocalDumps key. Per-user data is never
+  touched, as on the Mac: settings, saved connections and trusted pins in
+  %APPDATA%\Arcen\Deck, logs and crash dumps in %LOCALAPPDATA%\Arcen\Deck.
+
+  The Deck never runs elevated: the package does not launch it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Arcen Deck"
+      Manufacturer="TUTTIFRUTTI AS"
+      Version="$(var.ArcenMsiVersion)"
+      UpgradeCode="2DDC0F1A-DB47-42C2-AE74-EEFF30428FC4"
+      Scope="perMachine"
+      Language="1033"
+      InstallerVersion="500"
+      Compressed="yes">
+    <SummaryInformation
+        Description="Arcen Deck $(var.ArcenVersion) (build $(var.ArcenBuildId))"
+        Manufacturer="TUTTIFRUTTI AS" />
+
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        Schedule="afterInstallValidate"
+        DowngradeErrorMessage="A newer Arcen Deck is already installed. Uninstall it first to install this older build." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Windows 11 x64 only (ADR 0024). The installer engine reports
+         VersionNT 603 on every Windows 10/11, so read the real build. -->
+    <Property Id="ARCENWINDOWSBUILD">
+      <RegistrySearch
+          Id="ArcenWindowsBuildSearch"
+          Root="HKLM"
+          Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+          Name="CurrentBuildNumber"
+          Type="raw"
+          Bitness="always64" />
+    </Property>
+    <Launch
+        Condition="Installed OR (VersionNT64 AND ARCENWINDOWSBUILD &gt;= 22000)"
+        Message="Arcen Deck needs 64-bit Windows 11." />
+
+    <Icon Id="ArcenDeck.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="ArcenDeck.ico" />
+    <?if $(var.ArcenReleaseCandidate) = 1 ?>
+    <Property Id="ARPCOMMENTS" Value="Build $(var.ArcenBuildId). Free software under the AGPL-3.0." />
+    <?else?>
+    <!-- build.ps1 -LabPreview, or a tree that is not one clean, named revision. -->
+    <Property Id="ARPCOMMENTS" Value="Lab preview, not a release candidate. Build $(var.ArcenBuildId). Free software under the AGPL-3.0." />
+    <?endif?>
+    <Property Id="ARCENRELEASECANDIDATE" Value="$(var.ArcenReleaseCandidate)" />
+    <Property Id="ARPURLINFOABOUT" Value="$(var.ArcenSourceUrl)" />
+    <Property Id="ARPHELPLINK" Value="$(var.ArcenSourceUrl)" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARCENBUILDID" Value="$(var.ArcenBuildId)" />
+    <Property Id="ARCENSOURCEREVISION" Value="$(var.ArcenSourceRevision)" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[DeckInstallFolder]" After="CostFinalize" Sequence="execute" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ArcenVendorFolder" Name="Arcen">
+        <Directory Id="DeckInstallFolder" Name="Deck" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Deck" Title="Arcen Deck" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="DeckProgram" />
+      <ComponentGroupRef Id="DeckLegal" />
+      <ComponentRef Id="DeckCrashDumps" />
+    </Feature>
+
+    <ComponentGroup Id="DeckProgram" Directory="DeckInstallFolder">
+      <Component Id="DeckExe">
+        <File Id="ArcenDeckExe" Source="$(var.StageDir)\arcen-deck.exe" KeyPath="yes">
+          <Shortcut
+              Id="DeckStartMenuShortcut"
+              Directory="ProgramMenuFolder"
+              Name="Arcen Deck"
+              Description="Connect to an Arcen Pier and use its desktop."
+              WorkingDirectory="DeckInstallFolder"
+              Icon="ArcenDeck.ico"
+              Advertise="no" />
+        </File>
+      </Component>
+    </ComponentGroup>
+
+    <!-- The five legal files every Arcen artefact carries. -->
+    <ComponentGroup Id="DeckLegal" Directory="DeckInstallFolder">
+      <Component Id="DeckLicense">
+        <File Id="DeckLicenseFile" Source="$(var.StageDir)\LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="DeckLicenseException">
+        <File Id="DeckLicenseExceptionFile" Source="$(var.StageDir)\LICENSE-EXCEPTION.md" KeyPath="yes" />
+      </Component>
+      <Component Id="DeckNotice">
+        <File Id="DeckNoticeFile" Source="$(var.StageDir)\NOTICE" KeyPath="yes" />
+      </Component>
+      <Component Id="DeckTrademarks">
+        <File Id="DeckTrademarksFile" Source="$(var.StageDir)\TRADEMARKS.md" KeyPath="yes" />
+      </Component>
+      <Component Id="DeckThirdPartyNotices">
+        <File Id="DeckThirdPartyNoticesFile" Source="$(var.StageDir)\THIRD_PARTY_NOTICES.md" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- WER LocalDumps for arcen-deck.exe: minidumps only (DumpType 1), never
+         full dumps, which could hold a password between typing and zeroizing
+         (ADR 0024). WER expands DumpFolder for the user whose Deck
+         crashed. The key is ours alone and goes on uninstall. -->
+    <Component Id="DeckCrashDumps" Directory="DeckInstallFolder" Bitness="always64">
+      <RegistryKey
+          Root="HKLM"
+          Key="SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\arcen-deck.exe"
+          ForceDeleteOnUninstall="yes">
+        <RegistryValue Name="DumpType" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Name="DumpCount" Type="integer" Value="5" />
+        <RegistryValue Name="DumpFolder" Type="expandable" Value="%LOCALAPPDATA%\Arcen\Deck\CrashDumps" />
+      </RegistryKey>
+    </Component>
+  </Package>
+</Wix>

@@ -16,14 +16,17 @@
 
 pub mod cert_marker;
 pub mod cert_provisioning;
+pub mod cert_store;
 pub mod cert_transaction;
 #[cfg(feature = "wss-compat")]
 pub mod fallback;
+pub mod host_material;
 pub mod lanes;
 pub mod liveness;
 pub mod path_signal;
 #[cfg(feature = "quic")]
 pub mod quic;
+pub mod refine_meter;
 pub mod tls;
 
 #[cfg(feature = "quic")]
@@ -34,6 +37,7 @@ pub use path_signal::{
     PathGrade, PathSignal, PathSignalCounters, PathSignalState, path_quality_message,
     path_quality_summary,
 };
+pub use refine_meter::RefineLaneMeter;
 
 use arcen_identity::{
     ActiveHostSessionId, ConsumedSessionGrant, HostIdentity, ValidatedDirectResumeGrant,

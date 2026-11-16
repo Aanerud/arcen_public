@@ -38,29 +38,30 @@
 //! into, and it can never make session establishment less safe than today,
 //! only refuse to enable the new one.
 
+use arcen_media::video::EncoderRequest;
 use arcen_media::video::ResolvedMediaPlan;
 use arcen_media::{
     MediaContractError, RegionMediaRoster, RequestedMonitorTopology, Rotation, SessionMonitorId,
     TopologyGeneration, MAX_MULTI_MONITOR_COUNT,
 };
 use arcen_outputs::admission::{
-    admit_regions, AdmissionGates, AdmissionOutcome, DegradeReason, GateClosed,
-    RegionAdmissionPolicy,
+    admit_regions, offer_max_monitors, AdmissionGates, AdmissionOutcome, DegradeReason, GateClosed,
+    OfferEncoder, OfferPolicy, RegionAdmissionPolicy,
 };
 use arcen_outputs::applied::{
     assemble_applied_regions, AppliedRegion, AppliedRegionAssembler, OriginTranslation,
 };
 use arcen_protocol::messages::{
     AdvertisedMultiMonitorOffer, AppliedMonitorDescriptorMsg, AppliedMonitorMediaPlanMsg,
-    AppliedMonitorTopologyMsg, AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg, AuthRequest,
-    AuthRequestMultiMonitorOfferError, ClientDisplayId, ClientDisplayIdError,
-    MultiMonitorCarrierMsg, MultiMonitorValidationError, RequestedMonitorDescriptorMsg,
-    RequestedMonitorTopologyMsg, RotationMsg, ServerMultiMonitorMsg, TopologyBackendKindMsg,
+    AppliedMonitorTopologyMsg, AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg,
+    ClientDisplayId, ClientDisplayIdError, MultiMonitorCarrierMsg, MultiMonitorValidationError,
+    RequestedMonitorDescriptorMsg, RequestedMonitorTopologyMsg, RotationMsg, ServerMultiMonitorMsg,
+    TopologyBackendKindMsg,
 };
 
 use crate::config::WindowsMultiMonitorConfig;
 use crate::multi_monitor_capenc::MULTI_MONITOR_CARRIER_READY;
-use crate::multi_monitor_topology::{
+use arcen_outputs::windows_topology::{
     self, PhysicalOutputInventory, WindowsMonitorPlan, WindowsTopologyError, WindowsTopologyPlan,
 };
 
@@ -89,6 +90,10 @@ pub struct MultiMonitorGate {
     /// MAX_MULTI_MONITOR_COUNT)` so a host with a known smaller physical
     /// output count never offers a layout it cannot apply.
     pub max_monitors: Option<u8>,
+    /// The configured `video.encoder`; each session resolves `auto` before
+    /// admission (`EncoderRequest::resolve_auto`), so the offer judges the
+    /// request ([`OfferEncoder::PerSession`]).
+    pub encoder: EncoderRequest,
 }
 
 impl MultiMonitorGate {
@@ -98,13 +103,14 @@ impl MultiMonitorGate {
         Self {
             advertise_enabled: false,
             max_monitors: None,
+            encoder: EncoderRequest::Auto,
         }
     }
 
     /// Builds an operator gate from the validated `[platform.multi_monitor]`
-    /// config section.
+    /// config section and the configured `video.encoder`.
     #[must_use]
-    pub const fn from_config(config: &WindowsMultiMonitorConfig) -> Self {
+    pub const fn from_config(config: &WindowsMultiMonitorConfig, encoder: EncoderRequest) -> Self {
         let max_monitors = if config.nvidia_headless_effective() {
             Some(match config.max_monitors {
                 Some(configured) => {
@@ -122,6 +128,7 @@ impl MultiMonitorGate {
         Self {
             advertise_enabled: config.advertise_enabled,
             max_monitors,
+            encoder,
         }
     }
 }
@@ -204,26 +211,35 @@ impl std::error::Error for MultiMonitorDegradeReason {
 }
 
 /// Builds this host's pre-auth `multi_monitor_v1` offer for `AuthRequest`, or
-/// `None` when any gate is closed (operator gate disabled, no probed
-/// inventory supplied/empty, or the carrier gate is not yet open).
+/// `None` when the shared offer policy ([`offer_max_monitors`]) withholds it.
 ///
 /// The advertised `max_monitors` is [`MAX_MULTI_MONITOR_COUNT`] unless the
 /// operator declared a smaller [`MultiMonitorGate::max_monitors`] ceiling. It
 /// is deliberately not derived from a live probe: this offer is built before
 /// authentication, in session 0, where this host cannot see the interactive
 /// desktop's outputs at all (see the module documentation and
-/// `preauth_offer_does_not_require_session_zero_display_inventory`).
+/// `preauth_offer_does_not_require_session_zero_display_inventory`), so the
+/// outputs gate stays open here and admission checks the probed inventory.
 #[must_use]
 pub fn build_offer(gate: &MultiMonitorGate) -> Option<AuthMultiMonitorOfferMsg> {
-    if !MULTI_MONITOR_CARRIER_READY || !gate.advertise_enabled {
-        return None;
-    }
-    let protocol_ceiling = u8::try_from(MAX_MULTI_MONITOR_COUNT).ok()?;
-    let max_monitors = gate
-        .max_monitors
-        .map_or(protocol_ceiling, |operator| operator.min(protocol_ceiling));
-    let supported_rotations = RotationMsg::ALL.to_vec();
-    AuthMultiMonitorOfferMsg::new(max_monitors, supported_rotations, OFFERED_CARRIERS.to_vec()).ok()
+    let max_monitors = offer_max_monitors(&OfferPolicy {
+        gates: AdmissionGates {
+            carrier_ready: MULTI_MONITOR_CARRIER_READY,
+            operator_enabled: gate.advertise_enabled,
+            inventory_available: true,
+            offer_advertised: false,
+        },
+        encoder: OfferEncoder::PerSession(gate.encoder),
+        host_capacity: None,
+        operator_ceiling: gate.max_monitors,
+    })
+    .ok()?;
+    AuthMultiMonitorOfferMsg::new(
+        max_monitors,
+        RotationMsg::ALL.to_vec(),
+        OFFERED_CARRIERS.to_vec(),
+    )
+    .ok()
 }
 
 /// Admits (or degrades) an authenticated client's optional requested
@@ -293,14 +309,13 @@ enum WindowsPlanner {
 
 /// This host's implementation of the shared multi-region admission steps.
 ///
-/// Holds the `AuthRequest` wrapper for this connection's offer so the
-/// advertised-offer evidence is derived once, then borrowed by both the offer
-/// and carrier steps.
+/// Borrows this connection's offer; the offer and carrier steps both take
+/// their evidence from it (`AdvertisedMultiMonitorOffer::from_offer`).
 struct WindowsRegionAdmission<'a> {
     /// `Some` exactly when a non-empty probed inventory was supplied.
     inventory: Option<&'a PhysicalOutputInventory>,
     /// `Some` exactly when this host advertised an offer on this connection.
-    offer: Option<AuthRequest>,
+    offer: Option<&'a AuthMultiMonitorOfferMsg>,
     operator_enabled: bool,
     planner: WindowsPlanner,
 }
@@ -309,12 +324,12 @@ impl<'a> WindowsRegionAdmission<'a> {
     fn new(
         gate: &MultiMonitorGate,
         inventory: Option<&'a PhysicalOutputInventory>,
-        offer: Option<&AuthMultiMonitorOfferMsg>,
+        offer: Option<&'a AuthMultiMonitorOfferMsg>,
         planner: WindowsPlanner,
     ) -> Self {
         Self {
             inventory: inventory.filter(|inventory| !inventory.is_empty()),
-            offer: offer.map(offer_wrapper),
+            offer,
             operator_enabled: gate.advertise_enabled,
             planner,
         }
@@ -329,26 +344,15 @@ impl<'a> WindowsRegionAdmission<'a> {
         }
     }
 
-    /// The only public way to obtain `AdvertisedMultiMonitorOffer` evidence is
-    /// through `AuthRequest::required_multi_monitor_v1_offer()`; the stored
-    /// wrapper always carries `Some(offer)`, and the shared `offer_advertised`
-    /// gate already refused a connection without one, so neither `None` here
-    /// nor `Missing` below actually triggers (kept as typed, non-panicking
-    /// fallbacks rather than an `unreachable!()` in case that invariant ever
-    /// changes upstream).
+    /// The offer's evidence. The shared `offer_advertised` gate already
+    /// refused a connection without an offer, so `None` here is a typed,
+    /// non-panicking fallback.
     fn advertised(&self) -> Result<AdvertisedMultiMonitorOffer<'_>, MultiMonitorDegradeReason> {
-        let Some(wrapper) = self.offer.as_ref() else {
+        let Some(offer) = self.offer else {
             return Err(MultiMonitorDegradeReason::NotAdvertised);
         };
-        match wrapper.required_multi_monitor_v1_offer() {
-            Ok(advertised) => Ok(advertised),
-            Err(AuthRequestMultiMonitorOfferError::Missing) => {
-                Err(MultiMonitorDegradeReason::NotAdvertised)
-            }
-            Err(AuthRequestMultiMonitorOfferError::Invalid(error)) => {
-                Err(MultiMonitorDegradeReason::ExceedsAdvertisedOffer(error))
-            }
-        }
+        AdvertisedMultiMonitorOffer::from_offer(offer)
+            .map_err(MultiMonitorDegradeReason::ExceedsAdvertisedOffer)
     }
 }
 
@@ -397,10 +401,10 @@ impl RegionAdmissionPolicy for WindowsRegionAdmission<'_> {
         };
         match self.planner {
             WindowsPlanner::Requested => {
-                multi_monitor_topology::plan_topology(topology, generation, inventory)
+                windows_topology::plan_topology(topology, generation, inventory)
             }
             WindowsPlanner::Current => {
-                multi_monitor_topology::plan_current_topology(topology, generation, inventory)
+                windows_topology::plan_current_topology(topology, generation, inventory)
             }
         }
         .map_err(MultiMonitorDegradeReason::PlanningFailed)
@@ -440,25 +444,6 @@ impl From<SharedAdmissionOutcome> for MultiMonitorOutcome {
 /// The shared outcome this host's [`MultiMonitorOutcome`] is built from.
 type SharedAdmissionOutcome =
     AdmissionOutcome<WindowsTopologyPlan, MultiMonitorCarrierMsg, MultiMonitorDegradeReason>;
-
-/// Wraps a validated pre-auth offer in the minimal [`AuthRequest`] shape
-/// needed to obtain the shared protocol crate's
-/// [`AdvertisedMultiMonitorOffer`] evidence type (the only public
-/// constructor for it), mirroring the exact `AuthRequest` this host already
-/// sends to the client for this connection (see
-/// `session::build_auth_request`) without re-deriving the shared crate's own
-/// max-monitors/rotation/carrier validation here.
-fn offer_wrapper(offer: &AuthMultiMonitorOfferMsg) -> AuthRequest {
-    AuthRequest {
-        msg_type: String::new(),
-        auth_methods: Vec::new(),
-        challenge: String::new(),
-        salt: String::new(),
-        auth_mode: None,
-        disclaimer: None,
-        multi_monitor_v1: Some(offer.clone()),
-    }
-}
 
 #[derive(Debug)]
 pub enum AppliedCapabilityError {
@@ -647,8 +632,8 @@ impl AppliedRegionAssembler for WindowsAppliedRegions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_monitor_topology::{AvailableOutput, OutputModeCapability};
     use crate::nvapi::AdapterLuid;
+    use arcen_outputs::windows_topology::{AvailableOutput, OutputModeCapability};
 
     const CROSS_HOST_OUTCOME_BASELINE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -730,6 +715,7 @@ mod tests {
         MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: None,
+            encoder: EncoderRequest::Auto,
         }
     }
 
@@ -948,10 +934,36 @@ mod tests {
     /// the pre-auth offer truthful, because this offer is built in session 0
     /// where the interactive desktop's outputs cannot be probed at all.
     #[test]
+    fn offer_judges_the_configured_encoder_each_session_resolves() {
+        for encoder in [
+            EncoderRequest::Auto,
+            EncoderRequest::NativeNvenc,
+            EncoderRequest::SoftwareH264,
+        ] {
+            let gate = MultiMonitorGate {
+                encoder,
+                ..enabled_gate()
+            };
+            assert!(build_offer(&gate).is_some(), "{encoder:?}");
+        }
+        for encoder in [
+            EncoderRequest::WindowsMediaFoundation,
+            EncoderRequest::SoftwareAv1,
+        ] {
+            let gate = MultiMonitorGate {
+                encoder,
+                ..enabled_gate()
+            };
+            assert!(build_offer(&gate).is_none(), "{encoder:?}");
+        }
+    }
+
+    #[test]
     fn operator_ceiling_caps_the_advertised_monitor_count() {
         let offer = build_offer(&MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: Some(2),
+            encoder: EncoderRequest::Auto,
         })
         .expect("offer");
         assert_eq!(offer.max_monitors(), 2);
@@ -966,26 +978,32 @@ mod tests {
             nvidia_headless_enabled: Some(true),
             ..WindowsMultiMonitorConfig::default()
         };
-        let gate = MultiMonitorGate::from_config(&config);
+        let gate = MultiMonitorGate::from_config(&config, EncoderRequest::Auto);
         assert_eq!(
             build_offer(&gate).unwrap().max_monitors(),
             MAX_NVIDIA_HEADLESS_MONITORS
         );
 
-        let lower = MultiMonitorGate::from_config(&WindowsMultiMonitorConfig {
-            advertise_enabled: true,
-            max_monitors: Some(1),
-            nvidia_headless_enabled: Some(true),
-            ..WindowsMultiMonitorConfig::default()
-        });
+        let lower = MultiMonitorGate::from_config(
+            &WindowsMultiMonitorConfig {
+                advertise_enabled: true,
+                max_monitors: Some(1),
+                nvidia_headless_enabled: Some(true),
+                ..WindowsMultiMonitorConfig::default()
+            },
+            EncoderRequest::Auto,
+        );
         assert_eq!(build_offer(&lower).unwrap().max_monitors(), 1);
 
-        let excessive = MultiMonitorGate::from_config(&WindowsMultiMonitorConfig {
-            advertise_enabled: true,
-            max_monitors: Some(4),
-            nvidia_headless_enabled: Some(true),
-            ..WindowsMultiMonitorConfig::default()
-        });
+        let excessive = MultiMonitorGate::from_config(
+            &WindowsMultiMonitorConfig {
+                advertise_enabled: true,
+                max_monitors: Some(4),
+                nvidia_headless_enabled: Some(true),
+                ..WindowsMultiMonitorConfig::default()
+            },
+            EncoderRequest::Auto,
+        );
         assert_eq!(
             build_offer(&excessive).unwrap().max_monitors(),
             MAX_NVIDIA_HEADLESS_MONITORS
@@ -997,6 +1015,7 @@ mod tests {
         let offer = build_offer(&MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: Some(u8::MAX),
+            encoder: EncoderRequest::Auto,
         })
         .expect("offer");
         assert_eq!(usize::from(offer.max_monitors()), MAX_MULTI_MONITOR_COUNT);
@@ -1007,6 +1026,7 @@ mod tests {
         assert!(build_offer(&MultiMonitorGate {
             advertise_enabled: false,
             max_monitors: Some(4),
+            encoder: EncoderRequest::Auto,
         })
         .is_none());
     }
@@ -1019,6 +1039,7 @@ mod tests {
         let gate = MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: Some(1),
+            encoder: EncoderRequest::Auto,
         };
         let offer = build_offer(&gate).expect("offer");
         let requested_topology = RequestedMonitorTopologyMsg::new(vec![
@@ -1486,6 +1507,7 @@ mod tests {
                 &MultiMonitorGate {
                     advertise_enabled: false,
                     max_monitors: None,
+                    encoder: EncoderRequest::Auto,
                 },
                 Some(&inventory),
                 Some(&offer),
@@ -1523,13 +1545,11 @@ mod tests {
             adapter_name: "Microsoft Basic Render Driver".to_owned(),
             global_index: 0,
             device_name: r"\\.\DISPLAY1".to_owned(),
-            mode_capability: OutputModeCapability::FixedModes(vec![
-                multi_monitor_topology::OutputMode {
-                    width: 1_920,
-                    height: 1_200,
-                    refresh_hz: 64,
-                },
-            ]),
+            mode_capability: OutputModeCapability::FixedModes(vec![windows_topology::OutputMode {
+                width: 1_920,
+                height: 1_200,
+                refresh_hz: 64,
+            }]),
             ccd_output_kind: arcen_outputs::WindowsCcdOutputKind::PhysicalPanel,
             supported_rotations: vec![Rotation::Degrees0],
             current_x: 0,
@@ -1576,6 +1596,7 @@ mod tests {
         let gate = MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: Some(1),
+            encoder: EncoderRequest::Auto,
         };
         let offer = build_offer(&gate).expect("offer");
         assert_eq!(offer.max_monitors(), 1);
@@ -1616,7 +1637,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
-            encoder: Some(crate::capenc::EncoderSelection::SoftwareH264),
+            encoder: Some(arcen_media::video::EncoderRequest::SoftwareH264),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: arcen_protocol::messages::CursorMode::Local,
             session_log_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([0; 16]),
@@ -1641,6 +1662,7 @@ mod tests {
         let gate = MultiMonitorGate {
             advertise_enabled: true,
             max_monitors: Some(1),
+            encoder: EncoderRequest::Auto,
         };
         let offer = build_offer(&gate).expect("offer");
         let outcome = admit_requested_topology(

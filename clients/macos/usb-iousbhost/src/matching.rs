@@ -6,17 +6,11 @@
 //! from the captured device, so it is tested on every operating system.
 
 use arcen_usb_bridge::{
-    CapturedDeviceFacts, DeviceSnapshot, EndpointAddress, InterfaceReportDescriptor,
-    MAX_CONFIGURATION_DESCRIPTOR_BYTES, ParsedConfiguration, UsbDeviceId, UsbSpeed,
-    parse_configuration_descriptor,
+    CapturedDeviceFacts, EndpointAddress, InterfaceReportDescriptor, ParsedConfiguration, UsbSpeed,
 };
 use std::fmt::{Display, Formatter};
 
-/// Bytes in a standard USB device descriptor.
-pub const DEVICE_DESCRIPTOR_LENGTH: usize = 18;
-const DESCRIPTOR_DEVICE: u8 = 0x01;
-const DESCRIPTOR_CONFIGURATION: u8 = 0x02;
-const CONFIGURATION_HEADER_LENGTH: usize = 9;
+pub use arcen_usb_bridge::captured_facts::DEVICE_DESCRIPTOR_LENGTH;
 
 /// One `IOUSBHostDevice` as the I/O Registry describes it.
 ///
@@ -207,39 +201,20 @@ pub const fn speed_from_registry(raw: i64) -> Option<UsbSpeed> {
 }
 
 /// The total length a configuration descriptor header announces, checked
-/// against the bridge bound before anything copies that many bytes.
+/// against the bridge bound before anything copies that many bytes
+/// (shared with every capture backend).
 ///
 /// # Errors
 ///
 /// Returns a reason when the header is short, of the wrong type, or announces
 /// an impossible or oversized length.
 pub fn configuration_total_length(header: &[u8]) -> Result<usize, String> {
-    if header.len() < 4 || header[1] != DESCRIPTOR_CONFIGURATION {
-        return Err("the device returned no configuration descriptor header".to_owned());
-    }
-    let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
-    if total < CONFIGURATION_HEADER_LENGTH {
-        return Err(format!(
-            "configuration descriptor length {total} is too short"
-        ));
-    }
-    if total > MAX_CONFIGURATION_DESCRIPTOR_BYTES {
-        return Err(format!(
-            "configuration descriptor length {total} exceeds the bridge limit \
-             {MAX_CONFIGURATION_DESCRIPTOR_BYTES}"
-        ));
-    }
-    Ok(total)
+    arcen_usb_bridge::captured_facts::configuration_total_length(header)
 }
 
 /// Builds the facts the shared engine verifies, from descriptors read from the
-/// captured device itself.
-///
-/// The device descriptor must still name the classified identity: a device
-/// that changed under the capture is refused here, before any transfer.
-/// `report_descriptors` are the HID report descriptors classification read
-/// from the registry; the shared engine re-runs the whole admission policy on
-/// them together with these descriptors.
+/// captured device itself (shared with every capture backend). The device
+/// must still be the classified `target`.
 ///
 /// # Errors
 ///
@@ -252,35 +227,13 @@ pub fn captured_facts(
     target: &CaptureTarget,
     report_descriptors: Vec<InterfaceReportDescriptor>,
 ) -> Result<CapturedDeviceFacts, String> {
-    if device_descriptor.len() < DEVICE_DESCRIPTOR_LENGTH
-        || usize::from(device_descriptor[0]) < DEVICE_DESCRIPTOR_LENGTH
-        || device_descriptor[1] != DESCRIPTOR_DEVICE
-    {
-        return Err("the captured device returned an invalid device descriptor".to_owned());
-    }
-    let id = UsbDeviceId {
-        vendor_id: u16::from_le_bytes([device_descriptor[8], device_descriptor[9]]),
-        product_id: u16::from_le_bytes([device_descriptor[10], device_descriptor[11]]),
-        bcd_device: u16::from_le_bytes([device_descriptor[12], device_descriptor[13]]),
-    };
-    if id.vendor_id != target.vendor_id || id.product_id != target.product_id {
-        return Err(format!(
-            "the captured device is {:04x}:{:04x}, not the classified {:04x}:{:04x}",
-            id.vendor_id, id.product_id, target.vendor_id, target.product_id
-        ));
-    }
-    let configuration = parse_configuration_descriptor(configuration_descriptor)
-        .map_err(|error| format!("captured configuration descriptor: {error}"))?;
-    let speed = speed.ok_or_else(|| "USB speed is outside input bridge v1".to_owned())?;
-    Ok(CapturedDeviceFacts {
-        snapshot: DeviceSnapshot {
-            id,
-            device_class: device_descriptor[4],
-            configuration,
-        },
+    arcen_usb_bridge::captured_facts::captured_facts_from_descriptors(
+        device_descriptor,
+        configuration_descriptor,
         speed,
+        (target.vendor_id, target.product_id),
         report_descriptors,
-    })
+    )
 }
 
 /// One `IOHIDDevice` and the report descriptor macOS published for it.
@@ -413,7 +366,8 @@ pub fn pipes_for(
 mod tests {
     use super::*;
     use arcen_usb_bridge::{
-        ARCEN_LAB_PRODUCT_ID, ARCEN_LAB_VENDOR_ID, SyntheticTabletDevice, verify_captured_tablet,
+        ARCEN_LAB_PRODUCT_ID, ARCEN_LAB_VENDOR_ID, SyntheticTabletDevice,
+        parse_configuration_descriptor, verify_captured_tablet,
     };
 
     fn device(registry_id: u64, location: Option<u32>, vid: u16, pid: u16) -> RegistryUsbDevice {

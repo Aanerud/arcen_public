@@ -1,0 +1,3 @@
+{"schema_version":1,"timestamp":"2026-07-24T16:00:01.000000Z","sequence":1,"profile_level":0,"profile_name":"critical","severity":"info","role":"host","component":"pier","platform":"macos","target":"arcen::session","sid":null,"user":"raw-artist","host":"raw-pier","peer_addr":"192.0.2.77:4444","health_state":null,"message":"fixture","fields":{"ssid":"raw-network"}}
+not a canonical record
+{"schema_version":1,"timestamp":"2026-07-24T16:00:02.000000Z","sequence":2,"profile_level":0,"profile_name":"critical","severity":"info","role":"host","component":"pier","platform":"macos","target":"arcen::session","sid":null,"user":"raw-artist","host":"raw-pier","peer_addr":"192.0.2.77:4444","health_state":null,"message":"fixture","fields":{"ssid":"raw-network"}}

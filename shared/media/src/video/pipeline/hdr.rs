@@ -27,6 +27,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keel: KEEL_IDLE_QP_OFF,
     queue: HDR_QUEUE_POLICY,
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
+    present_timing: super::PresentTiming::Vsync,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "proven HDR10 PQ/BT.2020 fidelity, up to 30 fps",
     gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer; falls back visibly when the host cannot prove HDR",

@@ -12,7 +12,8 @@ mod repeat;
 pub use repeat::{REPEATED_COPY_WINDOW, RepeatedCopyFilter};
 
 pub use image::{
-    ClipboardImageError, ImageInfo, ImageLimits, dibv5_to_png, png_to_dibv5, validate_png,
+    ClipboardImageError, ImageInfo, ImageLimits, dib_to_png, dibv5_to_png, png_to_dibv5,
+    validate_png,
 };
 
 use serde::{Deserialize, Serialize};

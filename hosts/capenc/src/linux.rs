@@ -1714,12 +1714,15 @@ unsafe fn run_wide_encode(
                 transfer: color.transfer,
                 primaries: color.primaries,
             },
-            width,
-            height,
-            capture.wide_layout(),
-            encoder.wide_signal(),
+            arcen_media::refine::source::PackedRgb10Source::new(
+                arcen_media::refine::tile::RefineGrid { width, height },
+                capture.wide_layout(),
+                encoder.wide_signal(),
+            ),
         ) {
-            Ok(runtime) => {
+            Ok(mut runtime) => {
+                // The floor until the Pier's link budget sets the rate.
+                runtime.cap_rate(encoder.average_bitrate_bps());
                 log(&format!(
                     "lossless refinement on: scope={:?} still_ms={} max_mbps={}",
                     args.scope, args.still_ms, args.max_mbps
@@ -2064,6 +2067,28 @@ unsafe fn run_wide_encode(
                 if let Some(bps) = control.take_bitrate_bps() {
                     if let Err(error) = encoder.reconfigure_bitrate(bps) {
                         log_error(&format!("live bitrate reconfigure failed: {error}"));
+                    }
+                    // The refinement floor until the link budget's first rate.
+                    if let Some(refine) = refine.as_mut() {
+                        refine.cap_rate(bps);
+                    }
+                }
+                if let Some((bps, hold)) = control.take_refine_rate() {
+                    // The Pier's link budget (ADR 0016 R6).
+                    if let Some(refine) = refine.as_mut() {
+                        refine.set_link_rate(bps, hold);
+                    }
+                }
+                if let Some(refine) = refine.as_mut() {
+                    if control.take_refine_reset() {
+                        log("lossless refinement: the Deck asked to start over");
+                        refine.reset_request();
+                    }
+                    if let Some(enabled) = control.take_refine_enabled() {
+                        log(&format!(
+                            "lossless refinement: the Deck set enabled={enabled}"
+                        ));
+                        refine.set_enabled(enabled);
                     }
                 }
 

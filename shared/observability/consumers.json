@@ -54,93 +54,28 @@
       ]
     },
     {
-      "package": "arcen-deck-macos",
+      "package": "arcen-deck-core",
       "dependency_kind": "normal",
-      "contracts": ["runtime"],
-      "paths": [
-        {
-          "id": "macos-deck-apple-silicon-sdr",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-app-apple-silicon"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-apple-silicon-10bit",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-app-apple-silicon"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-intel-sdr",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-intel"],
-          "validation": ["macos-deck-build-intel", "macos-deck-app-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-intel-10bit",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-intel"],
-          "validation": ["macos-deck-build-intel", "macos-deck-app-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-audio",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-microphone",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-input",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-clipboard",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-session",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-transport",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
-          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
-          "owner": "macOS Client"
-        },
-        {
-          "id": "macos-deck-native-tablet",
-          "entry_points": ["clients/macos/src/logging/mod.rs"],
-          "build_profiles": ["macos-deck-native-tablet"],
-          "validation": ["macos-deck-native-tablet-test"],
-          "owner": "macOS Client"
-        }
-      ]
+      "contracts": [
+        "crate",
+        "support_bundle"
+      ],
+      "optional": true,
+      "enabled_by": [
+        "runtime",
+        "support-bundle"
+      ],
+      "forwarded_features": {
+        "support-bundle": [
+          "support-bundle"
+        ]
+      }
     },
     {
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
-      "contracts": ["runtime", "sink"],
+      "contracts": ["runtime", "session_health", "sink", "support_bundle"],
+      "features": ["support-bundle"],
       "paths": [
         {
           "id": "linux-xorg-grading",
@@ -169,13 +104,28 @@
           "build_profiles": ["linux-pier"],
           "validation": ["linux-pier-test"],
           "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session-health",
+          "entry_points": ["hosts/linux/src/net/server.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-support-bundle",
+          "entry_points": ["hosts/linux/src/support_bundle.rs"],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
         }
       ]
     },
     {
       "package": "arcen-pier-macos",
       "dependency_kind": "normal",
-      "contracts": ["runtime", "sampler"],
+      "contracts": ["runtime", "sampler", "session_health", "support_bundle"],
+      "features": ["support-bundle"],
       "paths": [
         {
           "id": "macos-pier-session",
@@ -190,13 +140,28 @@
           "build_profiles": ["macos-pier"],
           "validation": ["macos-pier-test"],
           "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-session-health",
+          "entry_points": ["hosts/macos/src/stream.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test"],
+          "owner": "macOS Host"
+        },
+        {
+          "id": "macos-pier-support-bundle",
+          "entry_points": ["hosts/macos/src/support_bundle.rs"],
+          "build_profiles": ["macos-pier"],
+          "validation": ["macos-pier-test"],
+          "owner": "macOS Host"
         }
       ]
     },
     {
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
-      "contracts": ["runtime", "sink"],
+      "contracts": ["runtime", "session_health", "sink", "support_bundle"],
+      "features": ["support-bundle"],
       "paths": [
         {
           "id": "windows-grading",
@@ -229,6 +194,20 @@
         {
           "id": "windows-multi-monitor",
           "entry_points": ["hosts/windows/src/main.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-session-health",
+          "entry_points": ["hosts/windows/src/session.rs"],
+          "build_profiles": ["windows-pier"],
+          "validation": ["windows-pier-test"],
+          "owner": "Windows Host"
+        },
+        {
+          "id": "windows-support-bundle",
+          "entry_points": ["hosts/windows/src/support_bundle.rs"],
           "build_profiles": ["windows-pier"],
           "validation": ["windows-pier-test"],
           "owner": "Windows Host"

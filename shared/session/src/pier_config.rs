@@ -229,9 +229,37 @@ pub struct VideoConfig {
     /// `rec2100-pq`, 24 otherwise), `24`, or `30`. Fixed for the desktop's
     /// whole life. Other hosts ignore it.
     pub x11_desktop_depth: Option<String>,
+    /// Exact still image (lossless refinement, ADR 0016): `enabled` or
+    /// absent lets the Pier refine a still picture to the source's exact
+    /// pixels for a Deck that asks for it, on a contract that allows it;
+    /// `disabled`: never. See [`LosslessRefinementSetting`].
+    pub lossless_refinement: Option<LosslessRefinementSetting>,
     pub variant: Option<String>,
     pub fps: Option<u32>,
     pub encoder: Option<String>,
+}
+
+/// The administrator's exact-still-image choice (`video.lossless_refinement`).
+///
+/// On unless an administrator turns it off. It engages only when a Deck
+/// asks for it and the shared plan (`arcen_media::refine::resolve_refine_plan`)
+/// allows the session's contract (Grading or HDR, 4:4:4 ten-bit, a CPU
+/// refine source); it spends spare bandwidth only while the picture is
+/// still. Every other session reports why it is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LosslessRefinementSetting {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+impl LosslessRefinementSetting {
+    /// Resolves the optional key: absent means [`Self::Enabled`].
+    #[must_use]
+    pub fn resolve(setting: Option<Self>) -> bool {
+        matches!(setting.unwrap_or_default(), Self::Enabled)
+    }
 }
 
 /// Whether a remote session leaves the host's own speakers audible.
@@ -758,6 +786,42 @@ mod tests {
         let on = resolve(Some(NativeTabletSetting::Enabled));
         assert!(on.enabled);
         assert_eq!(on.disabled_reason(), None);
+    }
+
+    #[test]
+    fn exact_still_image_is_on_unless_the_administrator_turns_it_off() {
+        let parse = |video: &str| {
+            serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                r#"{{{video}"audio":{{"enabled":false,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "platform":{{"name":"test"}}}}"#
+            ))
+        };
+        let absent = parse("").expect("absent");
+        assert!(LosslessRefinementSetting::resolve(
+            absent.video.lossless_refinement
+        ));
+        let no_key = parse(r#""video":{},"#).expect("no key");
+        assert!(LosslessRefinementSetting::resolve(
+            no_key.video.lossless_refinement
+        ));
+        let on = parse(r#""video":{"lossless_refinement":"enabled"},"#).expect("enabled");
+        assert!(LosslessRefinementSetting::resolve(
+            on.video.lossless_refinement
+        ));
+        let off = parse(r#""video":{"lossless_refinement":"disabled"},"#).expect("disabled");
+        assert!(!LosslessRefinementSetting::resolve(
+            off.video.lossless_refinement
+        ));
+        for typo in [
+            r#""video":{"lossless_refinement":"on"},"#,
+            r#""video":{"lossless_refinement":true},"#,
+        ] {
+            assert!(
+                parse(typo).is_err(),
+                "{typo} must fail configuration loading"
+            );
+        }
     }
 
     #[test]

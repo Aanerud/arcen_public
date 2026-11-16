@@ -1,0 +1,924 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+//! Client-side derivation of "what is actually happening in this session",
+//! straight from a `ServerHelloMsg`, plus the live pixel-exactness readout
+//! against a declared `arcen_media::test_pattern::TestPattern`.
+//!
+//! Every function here is pure (plain data in, plain data out): no `egui`,
+//! no socket, no GPU, no `wgpu`. `app.rs` owns the two panels this feeds --
+//! `w5-negotiated-truth`'s session-info panel and `w4-exactness-readout`'s
+//! live per-channel error readout -- and is the only thing that keeps
+//! state: which pattern the user declared the host is streaming, and the
+//! last computed [`NegotiatedTruth`]/[`ExactnessReadout`].
+//!
+//! # Why a colourist cannot just trust `server_hello`
+//!
+//! A session can silently ask for one contract and be served another (a
+//! backend that cannot serve 4:4:4 falling back to 4:2:0, for instance), and
+//! it can be hardware-encoded while decoding entirely in software (or the
+//! reverse) -- two independent axes that neither the encode nor the decode
+//! side can see about the other. Nothing about either fact is visible from
+//! the video itself; both must be read back out and shown, not assumed.
+
+use arcen_media::VideoConfiguration;
+use arcen_media::test_pattern::{
+    ColorAccuracy, TestPattern, measure_rgb_roundtrip, measure_transform_roundtrip,
+};
+use arcen_media::video::{AcceleratorClass, ColorTransform, PlanDegradation};
+
+use arcen_protocol::messages::{ServedPipelineMsg, ServerHelloMsg, VideoSelectionIntent};
+
+// ============================================================================
+// w5-negotiated-truth: the negotiated colour/encode contract
+// ============================================================================
+
+/// Whether `encoder_backend` runs on dedicated silicon, preferring the class
+/// the host declares (`encoder_class`) and falling back to a name-based guess
+/// only for hosts that predate that field. Unknown stays unknown so a future
+/// backend is not silently displayed as either hardware or software.
+///
+/// Pulled out so the hello-arrival status line
+/// (`ArcenApp::sync_media_state`) and the negotiated-truth panel share one
+/// answer and can never disagree about which this session is.
+#[must_use]
+pub fn encoder_acceleration(encoder_backend: &str, encoder_class: &str) -> Option<bool> {
+    if let Some(class) = AcceleratorClass::from_token(encoder_class) {
+        Some(class == AcceleratorClass::Hardware)
+    } else {
+        let lowered = encoder_backend.to_ascii_lowercase();
+        if lowered.contains("native") || lowered.contains("capenc") {
+            Some(true)
+        } else if lowered.contains("sw") || lowered.contains("software") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// The fully-parsed "actual" colour contract read back out of the hello, in
+/// the same typed vocabulary the request uses. It lives in `arcen-media`
+/// (`colour_check::ColourAxes`) so the colour check and this panel read the
+/// host identically; any axis that did not parse is `None`, never guessed.
+pub use arcen_media::colour_check::ColourAxes as ActiveContract;
+
+/// Which axes changed between what was requested and what
+/// [`ActiveContract::from_hello`] read back, in the exact vocabulary
+/// `arcen_media::video::PlanDegradation` already defines server-side for
+/// backend-plan resolution -- reused here rather than inventing a parallel
+/// type, so this client's notion of "degraded" can never quietly drift from
+/// the one the resolver itself uses.
+///
+/// `fps_clamped`, `geometry_clamped` and `cursor_moved_to_local` are always
+/// `false` here: none of the three has a wire field in `server_hello` today
+/// (no requested-vs-resolved fps or geometry pair is transmitted), so this
+/// client cannot observe them independently of the colour axes. If a future
+/// wire change adds them, only this function needs to grow the extra
+/// comparison; [`PlanDegradation::is_exact`]/[`PlanDegradation::colour_degraded`]
+/// downstream already handle distinguishing them from a colour axis.
+#[must_use]
+pub fn negotiated_degradation(
+    requested: VideoConfiguration,
+    active: &ActiveContract,
+) -> PlanDegradation {
+    PlanDegradation {
+        codec_changed: active.codec.is_some_and(|codec| codec != requested.codec),
+        chroma_changed: active
+            .chroma
+            .is_some_and(|chroma| chroma != requested.chroma),
+        bit_depth_reduced: active
+            .bit_depth
+            .is_some_and(|depth| depth < requested.bit_depth),
+        range_changed: active.range.is_some_and(|range| range != requested.range),
+        matrix_changed: active
+            .matrix
+            .is_some_and(|matrix| matrix != requested.matrix),
+        primaries_changed: active
+            .primaries
+            .is_some_and(|primaries| primaries != requested.primaries),
+        transfer_changed: active
+            .transfer
+            .is_some_and(|transfer| !transfer.serves_request(requested.transfer)),
+        fps_clamped: false,
+        geometry_clamped: false,
+        cursor_moved_to_local: false,
+    }
+}
+
+/// Everything the negotiated-truth panel needs, computed once when
+/// `server_hello` arrives (`ArcenApp::sync_media_state`) and cached for the
+/// rest of the session: the request side
+/// (`ClientSettings`/`ColorFidelitySettings`) cannot change mid-session (the
+/// Settings screen is unreachable from `AppScreen::InSession`), so
+/// recomputing this every frame would be pure waste.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NegotiatedTruth {
+    /// The concrete colour axes and compatibility codec preference this
+    /// connection sent. `selection` determines whether codec differences are
+    /// authorized host ranking or a genuine degradation.
+    pub requested: VideoConfiguration,
+    pub selection: VideoSelectionIntent,
+    pub active: ActiveContract,
+    pub degradation: PlanDegradation,
+    pub pipeline_degradation: Option<String>,
+    /// `hello.encoder_backend`, or `"unknown"` when the host sent none.
+    pub encoder_backend: String,
+    pub encoder_hardware: Option<bool>,
+}
+
+impl NegotiatedTruth {
+    #[must_use]
+    pub fn from_hello_with_selection(
+        hello: &ServerHelloMsg,
+        requested: VideoConfiguration,
+        selection: VideoSelectionIntent,
+        requested_pipeline: Option<&arcen_protocol::messages::StreamPipeline>,
+    ) -> Self {
+        let active = ActiveContract::from_hello(hello);
+        let mut degradation = negotiated_degradation(requested, &active);
+        if selection == VideoSelectionIntent::AdaptivePerformance {
+            // Codec choice is the point of this intent: AV1/HEVC/H.264 are
+            // equivalent successful resolutions when the independently
+            // requested chroma/depth/range/matrix remain intact.
+            degradation.codec_changed = false;
+        }
+        let encoder_backend = if hello.encoder_backend.is_empty() {
+            "unknown".to_string()
+        } else {
+            hello.encoder_backend.clone()
+        };
+        let encoder_hardware = encoder_acceleration(&hello.encoder_backend, &hello.encoder_class);
+        let pipeline_degradation =
+            pipeline_degradation_summary(requested_pipeline, hello.active_pipeline.as_ref());
+        Self {
+            requested,
+            selection,
+            active,
+            degradation,
+            pipeline_degradation,
+            encoder_backend,
+            encoder_hardware,
+        }
+    }
+
+    pub fn update_served_pipeline(
+        &mut self,
+        requested: Option<&arcen_protocol::messages::StreamPipeline>,
+        served: Option<&ServedPipelineMsg>,
+    ) {
+        if let Some(served) = served {
+            self.encoder_backend.clone_from(&served.backend);
+            self.encoder_hardware = AcceleratorClass::from_token(&served.backend)
+                .map(|class| class == AcceleratorClass::Hardware);
+        }
+        self.pipeline_degradation = served_pipeline_degradation_summary(requested, served);
+    }
+}
+
+/// `"hardware"`/`"software"`/`"unknown"` label for an `Option<bool>`
+/// acceleration flag -- shared by the encode side (which may become unknown
+/// when the host reports an unknown `served_pipeline.backend`) and the decode side
+/// (`NativeVideoDecoder::is_hardware_accelerated`, genuinely `None` before
+/// any decode session has been created).
+#[must_use]
+pub const fn hardware_label(hardware: Option<bool>) -> &'static str {
+    match hardware {
+        Some(true) => "hardware",
+        Some(false) => "software",
+        None => "unknown",
+    }
+}
+
+/// One-line summary of a [`PlanDegradation`], naming every changed axis --
+/// used by both the always-on banner and the detail panel, so the two can
+/// never disagree. Distinguishes a colour downgrade
+/// ([`PlanDegradation::colour_degraded`]) from a non-colour one via the
+/// leading label: today the two happen to coincide for this client (see
+/// [`negotiated_degradation`]'s doc for why), but the distinction is kept
+/// live so a future fps/geometry wire signal only has to flip a bool here,
+/// not change this function's contract.
+#[must_use]
+pub fn degradation_summary(degradation: PlanDegradation) -> String {
+    if degradation.is_exact() {
+        return "negotiated exactly as requested".to_string();
+    }
+    let mut axes = Vec::new();
+    if degradation.codec_changed {
+        axes.push("codec");
+    }
+    if degradation.chroma_changed {
+        axes.push("chroma");
+    }
+    if degradation.bit_depth_reduced {
+        axes.push("bit depth");
+    }
+    if degradation.range_changed {
+        axes.push("range");
+    }
+    if degradation.matrix_changed {
+        axes.push("matrix");
+    }
+    if degradation.primaries_changed {
+        axes.push("primaries");
+    }
+    if degradation.transfer_changed {
+        axes.push("transfer");
+    }
+    if degradation.fps_clamped {
+        axes.push("fps");
+    }
+    if degradation.geometry_clamped {
+        axes.push("geometry");
+    }
+    if degradation.cursor_moved_to_local {
+        axes.push("cursor");
+    }
+    let label = if degradation.colour_degraded() {
+        "COLOUR DEGRADED"
+    } else {
+        "DEGRADED"
+    };
+    format!("{label}: {}", axes.join(", "))
+}
+
+/// Whether the viewer should reserve permanent on-video space for negotiation
+/// status. Exact sessions remain inspectable through the on-demand detail
+/// panel, while any observable downgrade stays permanently visible.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn should_show_degradation_badge(degradation: PlanDegradation) -> bool {
+    !degradation.is_exact()
+}
+
+#[must_use]
+pub fn should_show_truth_badge(truth: &NegotiatedTruth) -> bool {
+    !truth.degradation.is_exact() || truth.pipeline_degradation.is_some()
+}
+
+#[must_use]
+pub fn selection_summary(selection: VideoSelectionIntent, degradation: PlanDegradation) -> String {
+    if selection == VideoSelectionIntent::AdaptivePerformance && degradation.is_exact() {
+        "adaptive codec selected".to_string()
+    } else {
+        degradation_summary(degradation)
+    }
+}
+
+#[must_use]
+pub fn negotiated_truth_summary(truth: &NegotiatedTruth) -> String {
+    truth
+        .pipeline_degradation
+        .clone()
+        .unwrap_or_else(|| selection_summary(truth.selection, truth.degradation))
+}
+
+#[must_use]
+pub fn truth_badge_text(truth: &NegotiatedTruth, decoder_hardware: Option<bool>) -> String {
+    format!(
+        "{}  ·  encode {}  ·  decode {}",
+        negotiated_truth_summary(truth),
+        hardware_label(truth.encoder_hardware),
+        hardware_label(decoder_hardware),
+    )
+}
+
+#[must_use]
+pub fn pipeline_degradation_summary(
+    requested: Option<&arcen_protocol::messages::StreamPipeline>,
+    active: Option<&arcen_protocol::messages::ServedStreamPipeline>,
+) -> Option<String> {
+    match (requested, active) {
+        (Some(requested), Some(active)) if requested.token() != active.token() => Some(format!(
+            "PIPELINE DEGRADED: requested {}, host served {}",
+            requested.token(),
+            active.token()
+        )),
+        _ => None,
+    }
+}
+
+/// [`pipeline_degradation_summary`] for a host's `served_pipeline` update,
+/// naming the host's reason and, when the host gave one, what the user can
+/// do about it.
+#[must_use]
+pub fn served_pipeline_degradation_summary(
+    requested: Option<&arcen_protocol::messages::StreamPipeline>,
+    served: Option<&ServedPipelineMsg>,
+) -> Option<String> {
+    let mut summary = pipeline_degradation_summary(requested, served.map(|served| &served.served))?;
+    if let Some(reason) = served.and_then(|served| served.reason.as_deref()) {
+        summary.push_str(" (");
+        summary.push_str(reason);
+        summary.push(')');
+    }
+    if let Some(detail) = served.and_then(|served| served.detail.as_deref()) {
+        summary.push_str(". ");
+        summary.push_str(detail);
+    }
+    Some(summary)
+}
+
+// ============================================================================
+// w4-exactness-readout: live pixel-exactness against a declared test pattern
+// ============================================================================
+
+/// Cycles `None -> TestPattern::ALL[0] -> ... -> TestPattern::ALL[last] ->
+/// None`, matching `TestPattern::ALL`'s own declaration order so a
+/// maintainer adding a pattern there needs no second edit here.
+#[must_use]
+pub fn next_test_pattern(current: Option<TestPattern>) -> Option<TestPattern> {
+    match current {
+        None => TestPattern::ALL.first().copied(),
+        Some(pattern) => TestPattern::ALL
+            .iter()
+            .position(|candidate| *candidate == pattern)
+            .and_then(|index| TestPattern::ALL.get(index + 1))
+            .copied(),
+    }
+}
+
+/// Swaps the R/B byte of every pixel, adapting this crate's own
+/// `DecodedVideoFrame::rgba` (genuinely RGBA -- see
+/// `pipeline::video_decoder::copy_locked_pixels`'s explicit B<->R swap out
+/// of `CVPixelBuffer`'s native BGRA) to the BGRA layout
+/// `arcen_media::test_pattern::measure_rgb_roundtrip` requires. Allocates a
+/// fresh buffer rather than mutating in place: the caller's frame is a live
+/// decode result, not a scratch buffer this module owns.
+#[must_use]
+pub fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    out
+}
+
+/// The two distinct exactness claims for one decoded frame against a
+/// declared reference pattern. See the module doc and
+/// `arcen_media::test_pattern`'s own doc for why they must never be
+/// conflated: `colour_only` is pure colour-space maths with no codec
+/// involved at all (what `arcen-media`'s own unit tests already prove exact
+/// for 10-bit 4:4:4 full range); `end_to_end` is the same pattern compared
+/// against this session's actual decoded pixels, so it also carries
+/// whatever quantisation loss the negotiated codec added. Neither field
+/// being `Some` and exact implies anything about the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExactnessReadout {
+    pub pattern: TestPattern,
+    /// `None` when the active contract's matrix/range/bit-depth could not
+    /// all be parsed (see [`ActiveContract::color_transform`]), never
+    /// because the comparison merely found error.
+    pub colour_only: Option<ColorAccuracy>,
+    /// `None` when the decoded buffer was shorter than `width * height * 4`
+    /// bytes, never because the comparison merely found error.
+    pub end_to_end: Option<ColorAccuracy>,
+}
+
+/// Measures `pattern` against one decoded frame, for both claims described
+/// on [`ExactnessReadout`]. `decoded_rgba` must be this crate's own
+/// `DecodedVideoFrame::rgba` layout: interleaved RGBA, row-major, tightly
+/// packed (no row padding), at exactly `width * height * 4` bytes.
+#[must_use]
+pub fn measure_exactness(
+    pattern: TestPattern,
+    width: usize,
+    height: usize,
+    decoded_rgba: &[u8],
+    active_transform: Option<ColorTransform>,
+) -> ExactnessReadout {
+    let colour_only = active_transform
+        .map(|transform| measure_transform_roundtrip(pattern, transform, width, height));
+    let bgra = rgba_to_bgra(decoded_rgba);
+    let end_to_end = measure_rgb_roundtrip(pattern, width, height, &bgra);
+    ExactnessReadout {
+        pattern,
+        colour_only,
+        end_to_end,
+    }
+}
+
+/// One line for one claim, clearly labelled. Never states or implies a
+/// codec is lossless: callers must pass an `end_to_end`-style label
+/// something like "end-to-end (includes codec)" so this never reads as a
+/// pure-maths figure.
+#[must_use]
+pub fn format_accuracy(label: &str, accuracy: Option<ColorAccuracy>) -> String {
+    match accuracy {
+        None => format!("{label}: unavailable"),
+        Some(accuracy) if accuracy.is_exact() => {
+            format!("{label}: exact (0/255 over {} px)", accuracy.pixels)
+        }
+        Some(accuracy) => format!(
+            "{label}: max {}/255, mean {:.2}/255, worst px ({}, {}), over {} px",
+            accuracy.max_error,
+            accuracy.mean_error,
+            accuracy.worst_at.0,
+            accuracy.worst_at.1,
+            accuracy.pixels
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcen_media::{
+        BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange,
+        TransferCharacteristics, VideoCodec,
+    };
+
+    fn hello_with_color_caps(color_caps: serde_json::Value, codec: &str) -> ServerHelloMsg {
+        serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": codec,
+            "color_caps": color_caps,
+        }))
+        .expect("minimal server_hello with color_caps parses")
+    }
+
+    // ---- encoder_acceleration ----
+
+    #[test]
+    fn encoder_acceleration_prefers_the_declared_class() {
+        assert_eq!(
+            encoder_acceleration("some-unnamed-backend", "hardware"),
+            Some(true)
+        );
+        assert_eq!(
+            encoder_acceleration("native-nvenc", "software"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn encoder_acceleration_falls_back_to_name_guess_when_class_is_unknown() {
+        assert_eq!(encoder_acceleration("native-nvenc", ""), Some(true));
+        assert_eq!(
+            encoder_acceleration("host-capenc-thing", "not-a-real-class"),
+            Some(true)
+        );
+        assert_eq!(encoder_acceleration("openh264-sw-h264", ""), Some(false));
+        assert_eq!(encoder_acceleration("future-encoder", ""), None);
+    }
+
+    // ---- ActiveContract ----
+
+    #[test]
+    fn active_contract_parses_every_axis_from_a_real_hello() {
+        let hello = hello_with_color_caps(
+            serde_json::json!({
+                "active_bit_depth": "10",
+                "active_range": "full",
+                "active_matrix": "bt709",
+                "active_primaries": "bt709",
+                "active_transfer": "bt709",
+                "advertised_pix_fmt": "yuv444p10le",
+            }),
+            "h265",
+        );
+        let active = ActiveContract::from_hello(&hello);
+        assert_eq!(active.codec, Some(VideoCodec::H265));
+        assert_eq!(active.chroma, Some(ChromaSubsampling::Yuv444));
+        assert_eq!(active.bit_depth, Some(BitDepth::Ten));
+        assert_eq!(active.range, Some(ColorRange::Full));
+        assert_eq!(active.matrix, Some(ColorMatrix::Bt709));
+        assert_eq!(active.primaries, Some(ColorPrimaries::Bt709));
+        assert_eq!(active.transfer, Some(TransferCharacteristics::Bt709));
+        assert_eq!(
+            active.color_transform(),
+            Some(ColorTransform::new(
+                ColorMatrix::Bt709,
+                ColorRange::Full,
+                BitDepth::Ten
+            ))
+        );
+    }
+
+    #[test]
+    fn active_contract_color_transform_is_none_when_any_axis_is_unparseable() {
+        let hello = hello_with_color_caps(
+            serde_json::json!({
+                "active_bit_depth": "not-a-depth",
+                "active_range": "full",
+                "active_matrix": "bt709",
+            }),
+            "h265",
+        );
+        let active = ActiveContract::from_hello(&hello);
+        assert_eq!(active.bit_depth, None);
+        assert_eq!(active.color_transform(), None);
+    }
+
+    // ---- negotiated_degradation ----
+
+    #[test]
+    fn negotiated_degradation_is_exact_when_active_matches_requested() {
+        let requested = VideoConfiguration::grading_reference();
+        let active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(requested.chroma),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(requested.matrix),
+            primaries: Some(requested.primaries),
+            transfer: Some(requested.transfer),
+        };
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(degradation.is_exact());
+        assert!(!degradation.colour_degraded());
+    }
+
+    #[test]
+    fn negotiated_degradation_flags_a_chroma_fallback() {
+        let requested = VideoConfiguration::grading_reference(); // 4:4:4
+        let active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(ChromaSubsampling::Yuv420),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(requested.matrix),
+            primaries: Some(requested.primaries),
+            transfer: Some(requested.transfer),
+        };
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(!degradation.is_exact());
+        assert!(degradation.colour_degraded());
+        assert!(degradation.chroma_changed);
+        assert!(!degradation.bit_depth_reduced);
+    }
+
+    #[test]
+    fn negotiated_degradation_flags_hdr_to_sdr_transfer_and_primaries() {
+        let requested = VideoConfiguration {
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::Pq,
+            ..VideoConfiguration::grading_reference()
+        };
+        let active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(requested.chroma),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(ColorMatrix::Bt709),
+            primaries: Some(ColorPrimaries::Bt709),
+            transfer: Some(TransferCharacteristics::Bt709),
+        };
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(degradation.colour_degraded());
+        assert!(degradation.matrix_changed);
+        assert!(degradation.primaries_changed);
+        assert!(degradation.transfer_changed);
+    }
+
+    /// A Windows Grading host keeps the desktop's own sRGB code values and
+    /// says `srgb`; that is the exact answer to this Deck's `bt709` request,
+    /// not a colour change. The reverse would be a re-encoding.
+    #[test]
+    fn srgb_served_for_a_bt709_grading_request_is_exact() {
+        let requested = VideoConfiguration::grading_reference();
+        let mut active = ActiveContract {
+            codec: Some(requested.codec),
+            chroma: Some(requested.chroma),
+            bit_depth: Some(requested.bit_depth),
+            range: Some(requested.range),
+            matrix: Some(requested.matrix),
+            primaries: Some(requested.primaries),
+            transfer: Some(TransferCharacteristics::Srgb),
+        };
+        assert!(negotiated_degradation(requested, &active).is_exact());
+
+        active.transfer = Some(TransferCharacteristics::Bt709);
+        let srgb_request = VideoConfiguration {
+            transfer: TransferCharacteristics::Srgb,
+            ..requested
+        };
+        assert!(negotiated_degradation(srgb_request, &active).transfer_changed);
+    }
+
+    #[test]
+    fn a_served_downgrade_names_the_reason_and_what_to_do() {
+        let served = ServedPipelineMsg::new(
+            arcen_protocol::messages::ServedStreamPipeline::Auto,
+            "hardware",
+            Some("eight_bit_source".to_string()),
+        )
+        .with_detail(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL);
+        let note = served_pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Grading),
+            Some(&served),
+        )
+        .expect("a downgrade is visible");
+        assert!(note.starts_with("PIPELINE DEGRADED: requested grading, host served auto"));
+        assert!(note.contains("(eight_bit_source)"));
+        assert!(note.ends_with(arcen_protocol::messages::EIGHT_BIT_DESKTOP_DETAIL));
+
+        let mut truth_served = served.clone();
+        truth_served.detail = None;
+        truth_served.reason = None;
+        assert_eq!(
+            served_pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Grading),
+                Some(&truth_served),
+            ),
+            pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Grading),
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Auto),
+            )
+        );
+        assert!(
+            served_pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Auto),
+                Some(&served),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pipeline_degradation_summary_flags_requested_active_mismatch() {
+        let note = pipeline_degradation_summary(
+            Some(&arcen_protocol::messages::StreamPipeline::Hdr),
+            Some(&arcen_protocol::messages::ServedStreamPipeline::Grading),
+        )
+        .expect("mismatch is visible");
+        assert!(note.contains("requested hdr"));
+        assert!(note.contains("host served grading"));
+        assert!(
+            pipeline_degradation_summary(
+                Some(&arcen_protocol::messages::StreamPipeline::Auto),
+                Some(&arcen_protocol::messages::ServedStreamPipeline::Auto),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn negotiated_degradation_bit_depth_reduced_is_directional_not_just_changed() {
+        let requested = VideoConfiguration::legacy_h264(); // eight-bit
+        // Active came back *richer* than requested: never a "reduction".
+        let richer = ActiveContract {
+            bit_depth: Some(BitDepth::Ten),
+            ..ActiveContract::from_hello(&hello_with_color_caps(serde_json::json!({}), "h264"))
+        };
+        assert!(!negotiated_degradation(requested, &richer).bit_depth_reduced);
+
+        let requested_ten = VideoConfiguration::grading_reference(); // ten-bit
+        let reduced = ActiveContract {
+            bit_depth: Some(BitDepth::Eight),
+            ..ActiveContract::from_hello(&hello_with_color_caps(serde_json::json!({}), "h265"))
+        };
+        assert!(negotiated_degradation(requested_ten, &reduced).bit_depth_reduced);
+    }
+
+    #[test]
+    fn negotiated_degradation_never_claims_fps_or_geometry_or_cursor_axes() {
+        // Documented gap: server_hello carries no requested-vs-resolved fps
+        // or geometry pair, so this client can never observe them.
+        let requested = VideoConfiguration::legacy_h264();
+        let active = ActiveContract::default();
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(!degradation.fps_clamped);
+        assert!(!degradation.geometry_clamped);
+        assert!(!degradation.cursor_moved_to_local);
+    }
+
+    #[test]
+    fn negotiated_degradation_treats_unparseable_axes_as_not_shown_as_changed() {
+        // An axis this client could not parse must never itself manufacture
+        // a "degraded" claim -- see the module doc's honesty note.
+        let requested = VideoConfiguration::grading_reference();
+        let active = ActiveContract::default(); // every axis None
+        let degradation = negotiated_degradation(requested, &active);
+        assert!(degradation.is_exact());
+    }
+
+    #[test]
+    fn adaptive_performance_accepts_host_ranked_codec_but_not_colour_changes() {
+        let requested = VideoConfiguration::legacy_h264();
+        let hello = hello_with_color_caps(serde_json::json!({}), "av1");
+        let adaptive = NegotiatedTruth::from_hello_with_selection(
+            &hello,
+            requested,
+            VideoSelectionIntent::AdaptivePerformance,
+            None,
+        );
+        assert!(adaptive.degradation.is_exact());
+        assert_eq!(adaptive.active.codec, Some(VideoCodec::Av1));
+
+        let exact = NegotiatedTruth::from_hello_with_selection(
+            &hello,
+            requested,
+            VideoSelectionIntent::Exact,
+            None,
+        );
+        assert!(exact.degradation.codec_changed);
+
+        let changed_range = hello_with_color_caps(
+            serde_json::json!({
+                "active_range": "full",
+                "advertised_pix_fmt": "yuv420p"
+            }),
+            "av1",
+        );
+        let adaptive = NegotiatedTruth::from_hello_with_selection(
+            &changed_range,
+            requested,
+            VideoSelectionIntent::AdaptivePerformance,
+            None,
+        );
+        assert!(
+            adaptive.degradation.range_changed,
+            "adaptive applies only to codec choice, never to colour axes"
+        );
+    }
+
+    // ---- hardware_label ----
+
+    #[test]
+    fn hardware_label_covers_every_state() {
+        assert_eq!(hardware_label(Some(true)), "hardware");
+        assert_eq!(hardware_label(Some(false)), "software");
+        assert_eq!(hardware_label(None), "unknown");
+    }
+
+    // ---- degradation_summary ----
+
+    #[test]
+    fn degradation_summary_reports_exact() {
+        assert_eq!(
+            degradation_summary(PlanDegradation::default()),
+            "negotiated exactly as requested"
+        );
+    }
+
+    #[test]
+    fn only_degraded_sessions_need_a_permanent_badge() {
+        assert!(!should_show_degradation_badge(PlanDegradation::default()));
+        assert!(should_show_degradation_badge(PlanDegradation {
+            matrix_changed: true,
+            ..PlanDegradation::default()
+        }));
+    }
+
+    #[test]
+    fn pipeline_mismatch_also_needs_a_permanent_badge() {
+        let hello: ServerHelloMsg = serde_json::from_value(serde_json::json!({
+            "type": "server_hello",
+            "codec": "h264",
+            "active_pipeline": "software"
+        }))
+        .expect("hello");
+        let truth = NegotiatedTruth::from_hello_with_selection(
+            &hello,
+            VideoConfiguration::legacy_h264(),
+            VideoSelectionIntent::AdaptivePerformance,
+            Some(&arcen_protocol::messages::StreamPipeline::Speed),
+        );
+        assert!(truth.degradation.is_exact());
+        assert_eq!(
+            truth.pipeline_degradation.as_deref(),
+            Some("PIPELINE DEGRADED: requested speed, host served software")
+        );
+        assert!(should_show_truth_badge(&truth));
+        assert!(negotiated_truth_summary(&truth).contains("software"));
+    }
+
+    #[test]
+    fn degradation_summary_names_every_changed_colour_axis() {
+        let degradation = PlanDegradation {
+            chroma_changed: true,
+            bit_depth_reduced: true,
+            ..PlanDegradation::default()
+        };
+        let summary = degradation_summary(degradation);
+        assert!(summary.starts_with("COLOUR DEGRADED"));
+        assert!(summary.contains("chroma"));
+        assert!(summary.contains("bit depth"));
+        assert!(!summary.contains("matrix"));
+    }
+
+    #[test]
+    fn degradation_summary_distinguishes_non_colour_degradation() {
+        let degradation = PlanDegradation {
+            fps_clamped: true,
+            ..PlanDegradation::default()
+        };
+        let summary = degradation_summary(degradation);
+        assert!(summary.starts_with("DEGRADED"));
+        assert!(!summary.starts_with("COLOUR DEGRADED"));
+        assert!(summary.contains("fps"));
+    }
+
+    // ---- next_test_pattern ----
+
+    #[test]
+    fn next_test_pattern_cycles_through_every_pattern_and_back_to_none() {
+        let mut current = None;
+        let mut seen = Vec::new();
+        for _ in 0..TestPattern::ALL.len() {
+            current = next_test_pattern(current);
+            seen.push(current.expect("every step but the last stays Some"));
+        }
+        assert_eq!(seen, TestPattern::ALL.to_vec());
+        assert_eq!(next_test_pattern(current), None);
+    }
+
+    // ---- rgba_to_bgra ----
+
+    #[test]
+    fn rgba_to_bgra_swaps_only_red_and_blue() {
+        let rgba = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let bgra = rgba_to_bgra(&rgba);
+        assert_eq!(bgra, vec![30, 20, 10, 40, 70, 60, 50, 80]);
+        // Round-trips: swapping twice is the identity.
+        assert_eq!(rgba_to_bgra(&bgra), rgba);
+    }
+
+    // ---- measure_exactness / format_accuracy ----
+
+    /// `DecodedVideoFrame::rgba`'s own layout: interleaved RGBA, row-major.
+    fn render_rgba(pattern: TestPattern, width: usize, height: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let (r, g, b) = pattern.pixel(x, y, width, height);
+                out.extend_from_slice(&[r, g, b, 0xff]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn measure_exactness_is_exact_both_ways_for_an_untouched_frame_at_ten_bit_full_range() {
+        let pattern = TestPattern::SaturatedPrimaries;
+        let (width, height) = (64, 32);
+        let decoded = render_rgba(pattern, width, height);
+        let transform = ColorTransform::new(ColorMatrix::Bt709, ColorRange::Full, BitDepth::Ten);
+        let readout = measure_exactness(pattern, width, height, &decoded, Some(transform));
+        assert_eq!(readout.pattern, pattern);
+        assert!(readout.colour_only.expect("transform was Some").is_exact());
+        assert!(
+            readout
+                .end_to_end
+                .expect("buffer was correctly sized")
+                .is_exact()
+        );
+    }
+
+    #[test]
+    fn measure_exactness_end_to_end_detects_a_perturbed_pixel() {
+        let pattern = TestPattern::GreyRamp;
+        let (width, height) = (64, 32);
+        let mut decoded = render_rgba(pattern, width, height);
+        // Perturb one pixel's green channel by a known amount.
+        decoded[1] = decoded[1].wrapping_add(7);
+        let readout = measure_exactness(pattern, width, height, &decoded, None);
+        assert_eq!(readout.colour_only, None);
+        let end_to_end = readout.end_to_end.expect("buffer was correctly sized");
+        assert_eq!(end_to_end.max_error, 7);
+        assert!(!end_to_end.is_exact());
+    }
+
+    #[test]
+    fn measure_exactness_end_to_end_is_none_for_a_truncated_buffer() {
+        let pattern = TestPattern::GreyRamp;
+        let readout = measure_exactness(pattern, 64, 32, &[0u8; 4], None);
+        assert_eq!(readout.end_to_end, None);
+    }
+
+    #[test]
+    fn format_accuracy_never_hides_which_measurement_is_unavailable() {
+        assert_eq!(
+            format_accuracy("colour-only", None),
+            "colour-only: unavailable"
+        );
+    }
+
+    #[test]
+    fn format_accuracy_reports_exact_distinctly_from_measured_error() {
+        let exact = ColorAccuracy {
+            max_error: 0,
+            mean_error: 0.0,
+            pixels: 100,
+            worst_at: (0, 0),
+            outliers: 0,
+            outlier_bounds: None,
+        };
+        assert_eq!(
+            format_accuracy("end-to-end", Some(exact)),
+            "end-to-end: exact (0/255 over 100 px)"
+        );
+        let inexact = ColorAccuracy {
+            max_error: 5,
+            mean_error: 1.5,
+            pixels: 100,
+            worst_at: (3, 4),
+            outliers: 1,
+            outlier_bounds: Some([3, 4, 3, 4]),
+        };
+        let formatted = format_accuracy("end-to-end", Some(inexact));
+        assert!(formatted.contains("max 5/255"));
+        assert!(formatted.contains("worst px (3, 4)"));
+    }
+}

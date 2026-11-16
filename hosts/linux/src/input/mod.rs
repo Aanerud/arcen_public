@@ -5,6 +5,7 @@ pub mod edges;
 pub mod eis;
 pub mod keymap;
 pub mod pen;
+pub mod pressure_curve;
 pub mod region_adapter;
 pub mod wayland;
 

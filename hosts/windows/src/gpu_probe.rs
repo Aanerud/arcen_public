@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 const MAX_ENUMERATED_MODES: u32 = 4096;
 const INVENTORY_VERSION: u32 = 2;
-const ARCEN_EDID_MANUFACTURE_ID: u16 = 0x064e;
+use arcen_outputs::edid::EDID_MANUFACTURER_ID as ARCEN_EDID_MANUFACTURE_ID;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HostCapabilityReport {
@@ -651,7 +651,7 @@ fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
 /// Adapter eligibility is *capture* capability plus the operator allowlist —
 /// deliberately not NVENC candidacy. This host's capture path is DXGI/WGC on a
 /// D3D11 device, and its encode path is either direct NVENC or source-built
-/// OpenH264 (`capenc::EncoderSelection::resolve_auto`), so requiring an
+/// OpenH264 (`capenc::EncoderRequest::resolve_auto`), so requiring an
 /// NVENC-capable adapter here would exclude every software
 /// host from multi-monitor even when every gate downstream can serve it.
 /// Which encoder backend each planned region actually gets is decided later,
@@ -659,11 +659,11 @@ fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
 /// admission, not by this inventory.
 pub fn physical_output_inventory(
     allowed_adapters: &[String],
-) -> Result<crate::multi_monitor_topology::PhysicalOutputInventory, String> {
-    use crate::multi_monitor_topology::{
+) -> Result<arcen_outputs::windows_topology::PhysicalOutputInventory, String> {
+    use arcen_media::Rotation;
+    use arcen_outputs::windows_topology::{
         AvailableOutput, OutputMode, OutputModeCapability, PhysicalOutputInventory,
     };
-    use arcen_media::Rotation;
 
     let report = probe()?;
     if let Some(error) = report.topology_error {
@@ -905,14 +905,13 @@ fn monitor_is_primary(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> bool 
 }
 
 fn pier_owned_timing_output(output: &OutputCapability) -> bool {
-    output
-        .monitor_friendly_name
-        .as_deref()
-        .is_some_and(|name| name.trim().eq_ignore_ascii_case("Arcen IDD"))
-        || output.edid_manufacture_id.is_some_and(|manufacturer| {
-            manufacturer == ARCEN_EDID_MANUFACTURE_ID
-                || manufacturer.swap_bytes() == ARCEN_EDID_MANUFACTURE_ID
-        })
+    output.monitor_friendly_name.as_deref().is_some_and(|name| {
+        name.trim()
+            .eq_ignore_ascii_case(arcen_iddcx_provider::abi::MONITOR_NAME)
+    }) || output.edid_manufacture_id.is_some_and(|manufacturer| {
+        manufacturer == ARCEN_EDID_MANUFACTURE_ID
+            || manufacturer.swap_bytes() == ARCEN_EDID_MANUFACTURE_ID
+    })
 }
 
 pub fn nvenc_runtime_dll() -> bool {

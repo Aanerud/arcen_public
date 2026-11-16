@@ -112,6 +112,11 @@ use arcen_media::video::{VideoVariant, PROBE_MATRIX};
 use arcen_media::{BitDepth, ChromaSubsampling, ColorRange, VideoCodec};
 use serde::{Deserialize, Serialize};
 
+use arcen_media::annexb::{
+    nal_kind, nals_to_length_prefixed as nals_to_avcc, split_annex_b, NalCodec,
+    NalKind as ProbeNalKind,
+};
+
 use crate::pipeline::video_decoder::{av1, preferred_pixel_format};
 use crate::protocol::ChromaSubsampling as WireChroma;
 
@@ -656,115 +661,15 @@ impl ProbeCodec {
     }
 }
 
-/// What one Annex-B NAL unit is, for the purpose of building an access unit
-/// and a `CMVideoFormatDescription`. Slice/Keyframe are VCL (picture data);
-/// everything else is non-VCL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeNalKind {
-    Slice,
-    Keyframe,
-    Vps,
-    Sps,
-    Pps,
-    Other,
-}
-
-/// Classifies one NAL by its header byte(s). Mirrors
-/// `crate::pipeline::video_decoder::nal_kind` (private to that module's own
-/// `NalKind`/wire pipeline) since the same H.264/H.265 NAL header rules
-/// apply to a standalone capture file as to a wire access unit.
+/// Classifies one NAL by its header byte(s), with the same shared rules the
+/// wire decoder uses (`arcen_media::annexb::nal_kind`): a standalone capture
+/// file follows the same H.264/H.265 NAL header rules as a wire access unit.
 fn classify_nal(codec: ProbeCodec, nal: &[u8]) -> ProbeNalKind {
-    match codec {
-        ProbeCodec::H264 => match nal.first().map(|byte| byte & 0x1f) {
-            Some(1) => ProbeNalKind::Slice,
-            Some(5) => ProbeNalKind::Keyframe,
-            Some(7) => ProbeNalKind::Sps,
-            Some(8) => ProbeNalKind::Pps,
-            _ => ProbeNalKind::Other,
-        },
-        // H.265 NAL type lives in bits 6..1 of the first header byte.
-        ProbeCodec::H265 => match nal.first().map(|byte| (byte >> 1) & 0x3f) {
-            Some(32) => ProbeNalKind::Vps,
-            Some(33) => ProbeNalKind::Sps,
-            Some(34) => ProbeNalKind::Pps,
-            // IRAP pictures (BLA 16-18, IDR 19-20, CRA 21) are decoder entry
-            // points -- the H.265 analogue of an H.264 IDR.
-            Some(nal_type) if (16..=21).contains(&nal_type) => ProbeNalKind::Keyframe,
-            Some(nal_type) if nal_type <= 31 => ProbeNalKind::Slice,
-            _ => ProbeNalKind::Other,
-        },
-    }
-}
-
-/// Finds the next Annex-B start code (`00 00 01` or `00 00 00 01`) at or
-/// after `from`, returning its offset and length.
-fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut index = from;
-    while index + 3 <= data.len() {
-        if data[index..].starts_with(&[0, 0, 1]) {
-            return Some((index, 3));
-        }
-        if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some((index, 4));
-        }
-        index += 1;
-    }
-    None
-}
-
-/// Trims trailing zero padding (a NAL that ends right at EOF, or right
-/// before the next start code, often carries zero bytes that belong to
-/// that start code's own prefix) and pushes the remainder, unless trimming
-/// leaves nothing -- a NAL that is entirely zero padding is not a NAL.
-fn push_trimmed_nal<'a>(out: &mut Vec<&'a [u8]>, nal: &'a [u8]) {
-    let end = nal
-        .iter()
-        .rposition(|byte| *byte != 0)
-        .map_or(0, |index| index + 1);
-    if end != 0 {
-        out.push(&nal[..end]);
-    }
-}
-
-/// Splits a whole host-produced capture file into Annex-B NAL units.
-/// Mirrors `crate::pipeline::video_decoder`'s private `annex_b_nals`/
-/// `find_start_code` (that module parses one wire access unit at a time;
-/// this tool parses a whole file), reimplemented here rather than imported
-/// since those are private helpers of that module's own `platform`
-/// pipeline. A buffer with no start code at all is treated as one bare NAL
-/// (e.g. a lone raw parameter set with no Annex-B prefix) rather than
-/// nothing, matching that same convention.
-fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
-    let Some((mut start_code, mut start_code_len)) = find_start_code(data, 0) else {
-        return (!data.is_empty()).then_some(data).into_iter().collect();
+    let codec = match codec {
+        ProbeCodec::H264 => NalCodec::H264,
+        ProbeCodec::H265 => NalCodec::H265,
     };
-
-    let mut out = Vec::new();
-    loop {
-        let nal_start = start_code + start_code_len;
-        let Some((next_start_code, next_start_code_len)) = find_start_code(data, nal_start) else {
-            push_trimmed_nal(&mut out, &data[nal_start..]);
-            break;
-        };
-        push_trimmed_nal(&mut out, &data[nal_start..next_start_code]);
-        start_code = next_start_code;
-        start_code_len = next_start_code_len;
-    }
-
-    out
-}
-
-/// Length-prefixes each NAL with a big-endian `u32`, the AVCC/HVCC framing
-/// `VTDecompressionSessionDecodeFrame` expects for a
-/// `CMVideoFormatDescriptionCreateFrom*ParameterSets`-built session.
-fn nals_to_avcc(nals: &[&[u8]]) -> Vec<u8> {
-    let total = nals.iter().map(|nal| 4 + nal.len()).sum();
-    let mut out = Vec::with_capacity(total);
-    for nal in nals {
-        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-        out.extend_from_slice(nal);
-    }
-    out
+    nal_kind(codec, nal)
 }
 
 /// The most recently observed VPS/SPS/PPS across a whole input file.

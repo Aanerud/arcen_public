@@ -2,8 +2,12 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 
 fn main() {
-    println!("cargo:rustc-link-lib=framework=IOKit");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    // Frameworks exist only on Apple targets; a non-Apple type-check of the
+    // portable Deck (ADR 0024, step 0) must not ask for them.
+    if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+        println!("cargo:rustc-link-lib=framework=IOKit");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    }
     // The Swift 5.7 SDK of the last Xcode for macOS 12 links the Swift runtime
     // as `@rpath/libswiftCore.dylib`. A dependency's `rustc-link-arg` (apple-cf
     // sets this rpath) does not reach this package's binaries and test

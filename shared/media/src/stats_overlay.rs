@@ -25,7 +25,7 @@ pub struct StatsOverlayInputs<'a> {
     pub axes: Option<&'a ColourAxes>,
     /// The served pipeline's label (`Auto`, `Speed`, `Grading`, `HDR`).
     pub pipeline: Option<&'a str>,
-    /// Lossless refinement status line (scoped wording, ADR 0016 R4).
+    /// Exact still image status line (`Exact: …`, scoped wording, ADR 0016 R4).
     pub refine: Option<&'a str>,
 }
 
@@ -113,10 +113,10 @@ pub fn stats_overlay_lines(inputs: &StatsOverlayInputs<'_>) -> [String; 3] {
         dynamic_range_label(axes.transfer),
         primaries_label(axes.primaries),
     );
-    let refine = format!(
-        "Lossless: {}",
-        inputs.refine.unwrap_or("not negotiated with this Pier")
-    );
+    let refine = inputs
+        .refine
+        .unwrap_or("Exact: not offered by this host")
+        .to_owned();
     [path, stream, refine]
 }
 
@@ -160,7 +160,7 @@ mod tests {
             lines[1],
             "59.8/60 fps · HEVC 4:4:4 10-bit · Grading · SDR BT.709 · BT.709 primaries"
         );
-        assert_eq!(lines[2], "Lossless: not negotiated with this Pier");
+        assert_eq!(lines[2], "Exact: not offered by this host");
         assert_eq!(
             dynamic_range_label(Some(TransferCharacteristics::Pq)),
             "HDR PQ"

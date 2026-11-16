@@ -48,6 +48,20 @@ impl EncoderRequest {
         }
     }
 
+    /// Resolves `Auto` before a Pier spawns capenc, so display alignment,
+    /// the advertised hello and the concrete child agree: direct NVENC only
+    /// for an output whose adapter is NVIDIA with the encode runtime present,
+    /// the `OpenH264` software path otherwise. A concrete request passes
+    /// through unchanged.
+    #[must_use]
+    pub const fn resolve_auto(self, adapter_is_nvidia: bool, nvenc_runtime: bool) -> Self {
+        match self {
+            Self::Auto if adapter_is_nvidia && nvenc_runtime => Self::NativeNvenc,
+            Self::Auto => Self::SoftwareH264,
+            concrete => concrete,
+        }
+    }
+
     #[must_use]
     pub const fn accepts(self, backend: EncoderBackend) -> bool {
         matches!(self, Self::Auto)
@@ -1529,6 +1543,30 @@ pub fn parse_unavailable_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_resolves_to_nvenc_only_on_an_nvidia_adapter_with_the_runtime() {
+        assert_eq!(
+            EncoderRequest::Auto.resolve_auto(true, true),
+            EncoderRequest::NativeNvenc
+        );
+        for (nvidia, runtime) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                EncoderRequest::Auto.resolve_auto(nvidia, runtime),
+                EncoderRequest::SoftwareH264
+            );
+        }
+        for concrete in [
+            EncoderRequest::NativeNvenc,
+            EncoderRequest::WindowsMediaFoundation,
+            EncoderRequest::SoftwareH264,
+            EncoderRequest::SoftwareAv1,
+        ] {
+            for (nvidia, runtime) in [(true, true), (false, false)] {
+                assert_eq!(concrete.resolve_auto(nvidia, runtime), concrete);
+            }
+        }
+    }
 
     /// The NVENC contract must not advertise 4:2:2 while the vendored bindings
     /// are NVENCAPI 12.1, which has no 4:2:2 surface format to name. Claiming

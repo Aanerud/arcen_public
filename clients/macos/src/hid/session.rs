@@ -16,30 +16,9 @@ use tokio::sync::mpsc;
 /// silently dropped (counted as an error event where possible) once this
 /// capacity is exceeded, rather than growing an unbounded queue that a
 /// misbehaving/flooding device could use to exhaust memory.
-pub const HID_EVENT_CHANNEL_CAPACITY: usize = 256;
+pub use arcen_deck_core::runtime::raw_hid::HID_EVENT_CHANNEL_CAPACITY;
 
-/// Events produced by the IOHIDManager background thread.
-#[derive(Debug)]
-pub enum HidEvent {
-    DeviceAdded {
-        device_id: u8,
-        vendor_id: u16,
-        product_id: u16,
-        descriptor: Vec<u8>,
-    },
-    DeviceRemoved {
-        device_id: u8,
-    },
-    Report {
-        device_id: u8,
-        data: Vec<u8>,
-    },
-    PermissionGranted,
-    Error {
-        device_id: Option<u8>,
-        reason_class: &'static str,
-    },
-}
+pub use arcen_deck_core::runtime::raw_hid::HidEvent;
 
 /// Whether a HID interface may be offered to the host at all: its report
 /// descriptor must declare a digitizer (pen, touch, or vendor-mirrored

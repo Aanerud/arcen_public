@@ -65,7 +65,10 @@ Where each claim is enforced:
   `the_daemon_never_runs_as_root` checks it.
 - **The agent has no key and no port.** `run_agent` in
   `hosts/macos/src/main.rs`. The TLS directory is `_arcen:admin 750` and the key
-  is `600` (`hosts/macos/src/host_cert.rs`).
+  is `600` (`hosts/macos/src/host_cert.rs`); the service reads it through the
+  shared `arcen_transport::host_material` loader, which refuses a linked file,
+  a key with any mode other than `600` or an owner other than root or `_arcen`
+  (`hosts/macos/src/tls_material.rs`).
 - **Each side verifies the other.** The service checks the connecting agent's
   uid from the kernel, and its executable path, against the installed helper
   (`hosts/macos/src/relay.rs`, `expected_agent_program`). The agent refuses a

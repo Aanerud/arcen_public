@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-deck-core"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The portable Arcen Deck: platform seams, settings, session engine and shared screens behind features."
+
+[lib]
+name = "arcen_deck_core"
+path = "src/lib.rs"
+
+# The default graph is std, serde, zeroize, getrandom, tracing and other
+# shared crates (arcen-transport without QUIC). CI proves
+# that `cargo tree --locked -p arcen-deck-core -e all` (default features)
+# contains no tokio, quinn, egui, wgpu or product package
+# (`shared/AGENTS.md`, "deck-core purity proof").
+[features]
+default = []
+# The session engine, lanes, media worker and frame queue (extraction steps
+# 4-5): tokio and the QUIC adapter of arcen-transport.
+runtime = [
+    "arcen-media/audio-opus",
+    "arcen-media/refine-zstd-decode",
+    "dep:tokio",
+    "arcen-transport/quic",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:rustls-pki-types",
+    "dep:thiserror",
+    "dep:tokio-tungstenite",
+    "dep:x509-parser",
+    "dep:arcen-observability",
+    "dep:tracing-appender",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:quinn",
+    "dep:url",
+]
+# The shared Deck screens (extraction step 6): egui, no eframe, no wgpu;
+# Settings › Logs creates the support bundle, so the screens carry its writer.
+egui = ["dep:egui", "support-bundle"]
+# The portable wgpu paint callback (today `clients/macos/src/ui/video_render.rs`).
+wgpu-presenter = ["egui", "dep:egui-wgpu", "dep:wgpu"]
+# The support bundle writer (`support_bundle::create`), on the collector every
+# Pier and Deck shares (`arcen_observability::support_bundle`).
+support-bundle = ["dep:arcen-observability", "arcen-observability/support-bundle"]
+# Developer-only streaming overrides (the macOS Deck's `dev-tools`).
+dev-tools = []
+# Native tablet bridge (the macOS Deck's `native-tablet`; the Windows
+# Deck's optional USB component).
+native-tablet = ["runtime"]
+# SEC-raw-hid: the experimental raw-HID capture path (the macOS Deck's
+# `experimental-raw-hid`); never in production builds.
+experimental-raw-hid = ["runtime"]
+
+[dependencies]
+arcen-input.workspace = true
+arcen-media.workspace = true
+arcen-protocol = { workspace = true, default-features = false }
+arcen-session.workspace = true
+arcen-telemetry.workspace = true
+# TLS-only by default (pins); `runtime` adds the QUIC adapter.
+arcen-transport = { workspace = true, default-features = false }
+arcen-usb-bridge.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+tokio = { workspace = true, optional = true }
+arcen-observability = { workspace = true, optional = true }
+tracing-appender = { version = "0.2", optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
+quinn = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+# runtime: TLS trust (pins, TOFU, certificate facts) and the lane message type
+# (tungstenite's message framing, carried on the QUIC control lane; no
+# WebSocket network connection), at the versions the macOS Deck builds with.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+thiserror = { version = "1", optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, optional = true }
+x509-parser = { version = "0.18.1", optional = true }
+egui = { version = "0.35", default-features = false, optional = true }
+egui-wgpu = { version = "0.35", default-features = false, optional = true }
+wgpu = { version = "29", default-features = false, features = ["std", "wgsl"], optional = true }
+
+[dev-dependencies]
+rcgen = "0.14.8"
+zip.workspace = true
+
+[lints]
+workspace = true

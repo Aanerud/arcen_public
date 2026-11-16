@@ -152,7 +152,8 @@ pub struct TabletPoint {
     pub pressure: f64,
     /// Normalized horizontal tilt, -1.0..=1.0.
     pub tilt_x: f64,
-    /// Normalized vertical tilt, -1.0..=1.0.
+    /// Normalized vertical tilt, -1.0..=1.0, positive away from the user
+    /// as tablet drivers report it.
     pub tilt_y: f64,
     /// Rotation in degrees, 0.0..360.0.
     pub rotation_degrees: f64,
@@ -175,7 +176,9 @@ pub fn tablet_point(event: &PenEventMsg) -> TabletPoint {
     TabletPoint {
         pressure: f64::from(pen_axes::clamp_pressure(f64::from(event.pressure))),
         tilt_x: pen_axes::tilt_degrees_to_unit(event.tilt_x_degrees),
-        tilt_y: pen_axes::tilt_degrees_to_unit(event.tilt_y_degrees),
+        // Tablet drivers' `AppKit` tilt Y points away from the user; the
+        // wire's toward the user (see `pen_axes::appkit_tilt_y_unit`).
+        tilt_y: pen_axes::appkit_tilt_y_unit(event.tilt_y_degrees),
         rotation_degrees: f64::from(pen_axes::wrap_rotation_degrees(f64::from(
             event.rotation_degrees,
         ))),
@@ -296,7 +299,9 @@ mod tests {
         // maximum tilt, because CoreGraphics reads 1.0 as full scale.
         let point = tablet_point(&sample());
         assert!((point.tilt_x - 0.5).abs() < f64::EPSILON);
-        assert!((point.tilt_y + 1.0).abs() < f64::EPSILON);
+        // Toward the user on the wire, away from the top in `AppKit` terms:
+        // Chromium and Qt negate it back (measured: -20 arrived as 20).
+        assert!((point.tilt_y - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

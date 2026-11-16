@@ -3,7 +3,12 @@
 
 use std::sync::OnceLock;
 
-use thiserror::Error;
+use arcen_media::annexb::{
+    nal_kind, nals_to_length_prefixed, parse_access_unit, prepare_sample_nals, NalCodec, NalKind,
+    ParameterSetCache, SamplePreparationError,
+};
+use arcen_media::bitstream::synth::HevcProbeProfile;
+pub(crate) use arcen_media::obu as av1;
 
 use crate::protocol::wire;
 use crate::protocol::{ChromaSubsampling, FrameType, VideoCodec, VideoHeader};
@@ -316,91 +321,64 @@ fn validate_biplanar_layout(
     Ok(())
 }
 
+/// The decoder's native picture: a `CVPixelBuffer` on macOS.
 #[cfg(target_os = "macos")]
+pub type NativePixelBuffer = apple_cf::cv::CVPixelBuffer;
+
+/// Off macOS this crate has no native decoder, so no native picture can
+/// exist: the type is uninhabited and every path that would present one is
+/// unreachable (a Windows Deck has its own decoder and presenter).
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone)]
-pub struct NativeDecodedVideoFrame {
-    pub pixel_buffer: apple_cf::cv::CVPixelBuffer,
-    pub video: arcen_media::VideoConfiguration,
-}
+pub enum NativePixelBuffer {}
 
-/// The two colour axes a session negotiates once and a packet header never
-/// carries: colour primaries and transfer characteristics.
-///
-/// Read back from the host's own `ServerColorCaps` (`active_primaries` /
-/// `active_transfer`), so this is what the host says it is *actually*
-/// sending, not what the Deck asked for. `transfer` is the axis that
-/// decides whether presentation is HDR: see
-/// `crate::ui::video_render::presentation_colorspace_for`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionColor {
-    pub primaries: arcen_media::ColorPrimaries,
-    pub transfer: arcen_media::TransferCharacteristics,
-}
+#[cfg(not(target_os = "macos"))]
+impl NativePixelBuffer {
+    #[must_use]
+    pub fn width(&self) -> usize {
+        match *self {}
+    }
 
-impl Default for SessionColor {
-    /// BT.709 SDR -- `arcen_media::VideoConfiguration::legacy_h264`'s own
-    /// pair, and the correct assumption for any host that does not report
-    /// these axes at all.
-    fn default() -> Self {
-        Self {
-            primaries: arcen_media::ColorPrimaries::Bt709,
-            transfer: arcen_media::TransferCharacteristics::Bt709,
-        }
+    #[must_use]
+    pub fn height(&self) -> usize {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn pixel_format(&self) -> u32 {
+        match *self {}
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DecodedVideoFrame {
-    pub width: usize,
-    pub height: usize,
-    /// CPU-side RGBA fallback payload. Empty when the frame was deliberately
-    /// published for the zero-copy macOS layer path only; in that case
-    /// [`Self::native`] carries the real `CVPixelBuffer`.
-    pub rgba: Vec<u8>,
-    pub timestamp_ms: u32,
-    pub pixel_format: String,
-    pub backend: &'static str,
-    #[cfg(target_os = "macos")]
-    pub native: Option<NativeDecodedVideoFrame>,
-}
+/// A decoded `CVPixelBuffer` with its video configuration (the shared
+/// [`arcen_deck_core::decode::NativeDecodedVideoFrame`]).
+pub type NativeDecodedVideoFrame =
+    arcen_deck_core::decode::NativeDecodedVideoFrame<NativePixelBuffer>;
 
-#[derive(Debug, Error)]
-pub enum VideoDecodeError {
-    #[error("native VideoToolbox {0:?} decode path is not wired in this implementation pass yet")]
-    CodecPathNotWired(VideoCodec),
-    #[error("native VideoToolbox decoding is only implemented on macOS")]
-    UnsupportedPlatform,
-    #[error("invalid video wire colour metadata: {0:?}")]
-    InvalidWireColor(wire::ProtocolError),
-    #[error("{0}")]
-    Backend(String),
-}
+/// One decoded frame (the shared [`arcen_deck_core::decode::DecodedVideoFrame`]).
+pub type DecodedVideoFrame = arcen_deck_core::decode::DecodedVideoFrame<NativePixelBuffer>;
 
-/// Decode backend contract used by the media worker and per-monitor router.
-///
-/// Production uses [`NativeVideoDecoder`]. Tests can substitute a scripted
-/// backend below the real worker batch/router entry points without changing
-/// those entry points or the production decoder's behavior.
-pub trait VideoDecoderBackend {
-    fn set_session_color(&mut self, session_color: SessionColor);
-    fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool;
-    fn set_decode_latency_policy(&mut self, policy: arcen_media::video::DecodeLatencyPolicy);
-    fn decode(
-        &mut self,
-        header: &VideoHeader,
-        payload: &[u8],
-    ) -> Result<Option<DecodedVideoFrame>, VideoDecodeError>;
-    fn backend_name(&self) -> &'static str;
-    fn is_hardware_accelerated(&self) -> Option<bool>;
-    fn wants_keyframe(&self) -> bool;
-    fn notify_discontinuity(&mut self);
+pub use arcen_deck_core::decode::{
+    NativePictureFormat, SessionColor, VideoDecodeError, VideoDecoderBackend,
+};
+
+/// The shared layout name of a CoreVideo pixel format.
+#[must_use]
+pub fn native_picture_format(fourcc: u32) -> NativePictureFormat {
+    match &fourcc.to_be_bytes() {
+        b"420v" | b"420f" => NativePictureFormat::Nv12,
+        b"x420" => NativePictureFormat::P010,
+        b"xf44" => NativePictureFormat::BiPlanar444Ten,
+        b"BGRA" => NativePictureFormat::Bgra8,
+        _ => NativePictureFormat::Other(fourcc),
+    }
 }
 
 /// The wire codecs the native VideoToolbox path decodes today. H.264 is
 /// the 4:2:0 MVP stream; H.265 (HEVC Rext) carries the native 4:4:4 stream;
 /// AV1 carries the royalty-free 4:2:0 8/10-bit NVENC stream. AV1 uses OBU
 /// framing (see the [`av1`] module) rather than Annex-B NALs, so it takes
-/// its own decode path rather than the Annex-B/[`AnnexBCodec`] one below.
+/// its own decode path rather than the Annex-B/[`NalCodec`] one below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamCodec {
     H264,
@@ -443,29 +421,25 @@ impl VideoStreamKey {
     }
 }
 
-/// The two codecs that use ITU-T Annex-B NAL framing and a cached
-/// VPS/SPS/PPS-style parameter set ([`ParameterSetCache`]) -- a narrower
-/// type than [`StreamCodec`] so every function in that pipeline (`nal_kind`,
-/// `parse_annex_b_access_unit`, `ParameterSetCache`, `prepare_sample_nals`)
-/// stays exhaustively matched without a `StreamCodec::Av1 => unreachable!()`
-/// arm anywhere: AV1 uses OBU framing (see the [`av1`] module) and has no
-/// VPS/SPS/PPS-equivalent parameter set, so it never reaches this pipeline
-/// at all -- `PlatformVideoDecoder::decode` branches to its own AV1 path
-/// before any of these are called. Mirrors `probe_matrix.rs`'s own
-/// `ProbeCodec`, which draws exactly the same line for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnnexBCodec {
-    H264,
-    H265,
+/// The Annex-B NAL layout of a wire codec, or `None` for AV1, which uses OBU
+/// framing ([`av1`]) and has no VPS/SPS/PPS-equivalent parameter set, so it
+/// never reaches the Annex-B pipeline: `PlatformVideoDecoder::decode` branches
+/// to its own AV1 path first.
+const fn annex_b_codec(codec: StreamCodec) -> Option<NalCodec> {
+    match codec {
+        StreamCodec::H264 => Some(NalCodec::H264),
+        StreamCodec::H265 => Some(NalCodec::H265),
+        StreamCodec::Av1 => None,
+    }
 }
 
-impl AnnexBCodec {
-    fn from_stream_codec(codec: StreamCodec) -> Option<Self> {
-        match codec {
-            StreamCodec::H264 => Some(Self::H264),
-            StreamCodec::H265 => Some(Self::H265),
-            StreamCodec::Av1 => None,
-        }
+/// The wire chroma a synthetic probe profile declares.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const fn probe_profile_chroma(profile: HevcProbeProfile) -> ChromaSubsampling {
+    if profile.chroma_format_idc == 3 {
+        ChromaSubsampling::Yuv444
+    } else {
+        ChromaSubsampling::Yuv420
     }
 }
 
@@ -553,11 +527,13 @@ impl NativeVideoDecoder {
 }
 
 impl VideoDecoderBackend for NativeVideoDecoder {
+    type NativeFrame = NativePixelBuffer;
+
     fn set_session_color(&mut self, session_color: SessionColor) {
         Self::set_session_color(self, session_color);
     }
 
-    fn set_prefer_native_biplanar(&mut self, prefer: bool) -> bool {
+    fn set_prefer_native_frames(&mut self, prefer: bool) -> bool {
         Self::set_prefer_native_biplanar(self, prefer)
     }
 
@@ -588,129 +564,10 @@ impl VideoDecoderBackend for NativeVideoDecoder {
     fn notify_discontinuity(&mut self) {
         Self::notify_discontinuity(self);
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NalKind {
-    Slice,
-    Keyframe,
-    Vps,
-    Sps,
-    Pps,
-    Other,
-}
-
-fn nal_kind(codec: AnnexBCodec, nal: &[u8]) -> NalKind {
-    match codec {
-        AnnexBCodec::H264 => match nal.first().map(|byte| byte & 0x1f) {
-            Some(1) => NalKind::Slice,
-            Some(5) => NalKind::Keyframe,
-            Some(7) => NalKind::Sps,
-            Some(8) => NalKind::Pps,
-            _ => NalKind::Other,
-        },
-        // H.265 NAL type lives in bits 6..1 of the first header byte.
-        AnnexBCodec::H265 => match nal.first().map(|byte| (byte >> 1) & 0x3f) {
-            Some(32) => NalKind::Vps,
-            Some(33) => NalKind::Sps,
-            Some(34) => NalKind::Pps,
-            // IRAP pictures (BLA 16-18, IDR 19-20, CRA 21) are decoder
-            // entry points — the H.265 analogue of an H.264 IDR.
-            Some(nal_type) if (16..=21).contains(&nal_type) => NalKind::Keyframe,
-            Some(nal_type) if nal_type <= 31 => NalKind::Slice,
-            _ => NalKind::Other,
-        },
+    fn collapsed_decode_callbacks(&self) -> u64 {
+        Self::collapsed_decode_callbacks(self)
     }
-}
-
-fn annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
-    let Some((mut start_code, mut start_code_len)) = find_start_code(data, 0) else {
-        return (!data.is_empty()).then_some(data).into_iter().collect();
-    };
-
-    let mut out = Vec::new();
-    loop {
-        let nal_start = start_code + start_code_len;
-        let Some((next_start_code, next_start_code_len)) = find_start_code(data, nal_start) else {
-            push_trimmed_nal(&mut out, &data[nal_start..]);
-            break;
-        };
-        push_trimmed_nal(&mut out, &data[nal_start..next_start_code]);
-        start_code = next_start_code;
-        start_code_len = next_start_code_len;
-    }
-
-    out
-}
-
-fn parse_annex_b_access_unit(codec: AnnexBCodec, data: &[u8]) -> Result<Vec<&[u8]>, String> {
-    if data.is_empty() {
-        return Err("empty Annex-B access unit".to_string());
-    }
-    let Some((first_start_code, _)) = find_start_code(data, 0) else {
-        return Err("access unit is not Annex-B (missing leading start code)".to_string());
-    };
-    if data[..first_start_code].iter().any(|byte| *byte != 0) {
-        return Err(
-            "Annex-B access unit has non-zero data before its first start code".to_string(),
-        );
-    }
-    let nals = annex_b_nals(data);
-    if nals.is_empty() {
-        return Err("Annex-B access unit contains no NAL units".to_string());
-    }
-    for nal in &nals {
-        let min_header_len = match codec {
-            AnnexBCodec::H264 => 1,
-            AnnexBCodec::H265 => 2,
-        };
-        if nal.len() < min_header_len {
-            return Err(format!(
-                "truncated {:?} NAL header: {} byte(s)",
-                codec,
-                nal.len()
-            ));
-        }
-        if nal[0] & 0x80 != 0 {
-            return Err(format!("{codec:?} NAL has forbidden_zero_bit set"));
-        }
-    }
-    Ok(nals)
-}
-
-fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut index = from;
-    while index + 3 <= data.len() {
-        if data[index..].starts_with(&[0, 0, 1]) {
-            return Some((index, 3));
-        }
-        if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some((index, 4));
-        }
-        index += 1;
-    }
-    None
-}
-
-fn push_trimmed_nal<'a>(out: &mut Vec<&'a [u8]>, nal: &'a [u8]) {
-    let end = nal
-        .iter()
-        .rposition(|byte| *byte != 0)
-        .map_or(0, |index| index + 1);
-    if end != 0 {
-        out.push(&nal[..end]);
-    }
-}
-
-fn nals_to_avcc(nals: &[&[u8]]) -> Vec<u8> {
-    let total = nals.iter().map(|nal| 4 + nal.len()).sum();
-    let mut out = Vec::with_capacity(total);
-    for nal in nals {
-        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-        out.extend_from_slice(nal);
-    }
-
-    out
 }
 
 /// Reports what an HEVC stream's SPS says it carries, as it arrives.
@@ -785,1106 +642,6 @@ fn stream_contradicting_header(
         .is_none_or(|colour| colour.full_range == stream.full_range);
     (truth.chroma_format_idc != chroma_idc || truth.bit_depth_luma != depth || !range_matches)
         .then_some(truth)
-}
-
-#[derive(Debug, Default)]
-struct ParameterSetCache {
-    codec: Option<AnnexBCodec>,
-    vps: Option<Vec<u8>>,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
-impl ParameterSetCache {
-    fn reset(&mut self, codec: AnnexBCodec) {
-        self.codec = Some(codec);
-        self.vps = None;
-        self.sps = None;
-        self.pps = None;
-    }
-
-    fn observe(&mut self, codec: AnnexBCodec, nals: &[&[u8]]) -> bool {
-        let mut changed = false;
-        if self.codec != Some(codec) {
-            self.reset(codec);
-            changed = true;
-        }
-
-        let incoming_vps = nals
-            .iter()
-            .rev()
-            .find(|nal| nal_kind(codec, nal) == NalKind::Vps)
-            .copied();
-        let incoming_sps = nals
-            .iter()
-            .rev()
-            .find(|nal| nal_kind(codec, nal) == NalKind::Sps)
-            .copied();
-        let incoming_pps = nals
-            .iter()
-            .rev()
-            .find(|nal| nal_kind(codec, nal) == NalKind::Pps)
-            .copied();
-        let has_incoming =
-            incoming_vps.is_some() || incoming_sps.is_some() || incoming_pps.is_some();
-        let config_changed = incoming_vps
-            .is_some_and(|nal| self.vps.as_deref().is_some_and(|old| old != nal))
-            || incoming_sps.is_some_and(|nal| self.sps.as_deref().is_some_and(|old| old != nal))
-            || incoming_pps.is_some_and(|nal| self.pps.as_deref().is_some_and(|old| old != nal));
-
-        if config_changed && self.is_complete(codec) {
-            self.reset(codec);
-            changed = true;
-        }
-        if let Some(vps) = incoming_vps {
-            if self.vps.as_deref() != Some(vps) {
-                self.vps = Some(vps.to_vec());
-                changed = true;
-            }
-        }
-        if let Some(sps) = incoming_sps {
-            if self.sps.as_deref() != Some(sps) {
-                if codec == AnnexBCodec::H265 {
-                    log_received_stream_truth(sps);
-                }
-                self.sps = Some(sps.to_vec());
-                changed = true;
-            }
-        }
-        if let Some(pps) = incoming_pps {
-            if self.pps.as_deref() != Some(pps) {
-                self.pps = Some(pps.to_vec());
-                changed = true;
-            }
-        }
-        changed && has_incoming
-    }
-
-    fn is_complete(&self, codec: AnnexBCodec) -> bool {
-        match codec {
-            AnnexBCodec::H264 => self.sps.is_some() && self.pps.is_some(),
-            AnnexBCodec::H265 => self.vps.is_some() && self.sps.is_some() && self.pps.is_some(),
-        }
-    }
-
-    fn parameter_sets(&self, codec: AnnexBCodec) -> Option<Vec<&[u8]>> {
-        if self.codec != Some(codec) || !self.is_complete(codec) {
-            return None;
-        }
-        Some(match codec {
-            AnnexBCodec::H264 => vec![self.sps.as_deref()?, self.pps.as_deref()?],
-            AnnexBCodec::H265 => vec![
-                self.vps.as_deref()?,
-                self.sps.as_deref()?,
-                self.pps.as_deref()?,
-            ],
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SamplePreparationError {
-    MissingParameterSets,
-}
-
-fn prepare_sample_nals<'a>(
-    codec: AnnexBCodec,
-    cache: &'a ParameterSetCache,
-    nals: &'a [&'a [u8]],
-) -> Result<Option<Vec<&'a [u8]>>, SamplePreparationError> {
-    let has_keyframe = nals
-        .iter()
-        .any(|nal| nal_kind(codec, nal) == NalKind::Keyframe);
-    let slices: Vec<&[u8]> = nals
-        .iter()
-        .copied()
-        .filter(|nal| matches!(nal_kind(codec, nal), NalKind::Slice | NalKind::Keyframe))
-        .collect();
-    if slices.is_empty() {
-        return Ok(None);
-    }
-    if !has_keyframe {
-        return Ok(Some(slices));
-    }
-
-    let Some(parameter_sets) = cache.parameter_sets(codec) else {
-        return Err(SamplePreparationError::MissingParameterSets);
-    };
-    let mut prepared = Vec::with_capacity(parameter_sets.len() + slices.len());
-    // Inline parameter sets were cached above and stripped from `slices`, so
-    // every keyframe carries exactly one canonical complete set.
-    prepared.extend(parameter_sets);
-    prepared.extend(slices);
-    Ok(Some(prepared))
-}
-
-/// AV1 "Low Overhead Bitstream Format" (OBU) parsing, scoped to exactly
-/// what `av1C` (the AV1 Codec Configuration Box's
-/// `AV1CodecConfigurationRecord`) and `CMVideoFormatDescriptionCreate`
-/// need: locating a Sequence Header OBU within a Temporal Unit and reading
-/// out of it `seq_profile`/`seq_level_idx[0]`/`seq_tier[0]`/the
-/// colour-config bits/the coded dimensions. No unsafe, no FFI -- purely a
-/// byte-oriented parser, testable without any Apple API.
-///
-/// AV1 does not use H.264/HEVC-style VPS/SPS/PPS parameter sets, and the
-/// vendored `apple-cf`/`videotoolbox` bindings this codebase uses expose no
-/// `CMVideoFormatDescriptionCreateFromAV1ParameterSets`-equivalent (grep
-/// confirms no such symbol in either crate). VideoToolbox instead expects
-/// an `av1C` box supplied through the format description's
-/// `SampleDescriptionExtensionAtoms` extension -- see
-/// `platform::make_av1_format_description`, which this module feeds.
-///
-/// Every field, bit width and branch below is transcribed directly from
-/// the normative syntax tables in AOMediaCodec/av1-spec
-/// `06.bitstream.syntax.md` (`sequence_header_obu()`/`color_config()`/
-/// `obu_header()`/`open_bitstream_unit()`) and AOMediaCodec/av1-spec
-/// `04.conventions.md` (the `f(n)`/`leb128()` descriptors and their exact
-/// bit-parsing algorithms), cross-checked against
-/// AOMediaCodec/av1-spec `03.symbols.md` for the two named constants used
-/// in a control-flow decision (`SELECT_SCREEN_CONTENT_TOOLS` /
-/// `SELECT_INTEGER_MV`, both `2`, hence both always non-zero) and
-/// AOMediaCodec/av1-spec `07.bitstream.semantics.md` for the `obu_type`
-/// numeric table. The `av1C` byte layout is transcribed from
-/// AOMediaCodec/av1-isobmff `index.bs` section 2.3.3
-/// (`AV1CodecConfigurationRecord`) and independently cross-checked against
-/// three shipping decoders that build this same VideoToolbox
-/// `av1C`/`SampleDescriptionExtensionAtoms` extension: Chromium's
-/// `media/gpu/mac/vt_config_util.mm`, Firefox's
-/// `dom/media/platforms/apple/AppleVTDecoder.cpp`, and the from-scratch
-/// Swift implementation in `alvr-org/alvr-visionos`'s
-/// `ALVRClient/AV1Parser.swift` (which independently arrives at the exact
-/// same bit-packing this module uses).
-///
-/// One documented gap: `timing_info_present_flag == 1` is rejected rather
-/// than parsed (`timing_info()`/`decoder_model_info()`/
-/// `operating_parameters_info()` are not implemented). This is irrelevant
-/// to a live, low-latency remote-desktop stream with no container-level
-/// timing model -- AV1-in-ISOBMFF itself recommends
-/// `timing_info_present_flag` be `0` for exactly this reason ("The
-/// presentation times of AV1 samples are given by the ISOBMFF
-/// structures").
-pub(crate) mod av1 {
-    /// Big-endian, MSB-first bit reader for AV1's `f(n)` syntax elements
-    /// (av1-spec `04.conventions.md`: "Unsigned n-bit number appearing
-    /// directly in the bitstream. The bits are read from high to low
-    /// order.").
-    struct BitReader<'a> {
-        bytes: &'a [u8],
-        byte_pos: usize,
-        /// Next bit to read within `bytes[byte_pos]`, MSB-first, 0..=7.
-        bit_pos: u8,
-    }
-
-    impl<'a> BitReader<'a> {
-        const fn new(bytes: &'a [u8]) -> Self {
-            Self {
-                bytes,
-                byte_pos: 0,
-                bit_pos: 0,
-            }
-        }
-
-        fn read_bit(&mut self) -> Result<bool, String> {
-            let byte = *self
-                .bytes
-                .get(self.byte_pos)
-                .ok_or_else(|| "AV1 sequence header OBU is truncated".to_string())?;
-            let bit = (byte >> (7 - self.bit_pos)) & 1 != 0;
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-            Ok(bit)
-        }
-
-        /// `f(n)`: the next `n_bits`, most-significant-bit-first.
-        fn f(&mut self, n_bits: u32) -> Result<u32, String> {
-            debug_assert!(n_bits <= 32);
-            let mut value = 0u32;
-            for _ in 0..n_bits {
-                value = (value << 1) | u32::from(self.read_bit()?);
-            }
-            Ok(value)
-        }
-    }
-
-    /// `leb128()` (av1-spec `04.conventions.md`): up to 8 little-endian
-    /// base-128 bytes, continuation flagged by each byte's most
-    /// significant bit. Returns `(value, bytes_consumed)`.
-    fn read_leb128(bytes: &[u8]) -> Result<(u64, usize), String> {
-        let mut value: u64 = 0;
-        for (i, byte) in bytes.iter().copied().enumerate().take(8) {
-            value |= u64::from(byte & 0x7f) << (i * 7);
-            if byte & 0x80 == 0 {
-                return Ok((value, i + 1));
-            }
-        }
-        Err("AV1 leb128 does not terminate within 8 bytes".to_string())
-    }
-
-    /// `obu_type` (av1-spec `07.bitstream.semantics.md`'s numeric table).
-    /// Only [`ObuType::SequenceHeader`] is acted on here; every other kind
-    /// is passed through unmodified as part of the sample payload (see
-    /// `platform::decode_av1`) -- AV1 tolerates, and this codebase relies
-    /// on, VideoToolbox seeing whatever real mix of OBUs the encoder
-    /// produced.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum ObuType {
-        SequenceHeader,
-        TemporalDelimiter,
-        FrameHeader,
-        TileGroup,
-        Metadata,
-        Frame,
-        RedundantFrameHeader,
-        TileList,
-        Padding,
-        Reserved(u8),
-    }
-
-    const fn obu_type_from_bits(bits: u8) -> ObuType {
-        match bits {
-            1 => ObuType::SequenceHeader,
-            2 => ObuType::TemporalDelimiter,
-            3 => ObuType::FrameHeader,
-            4 => ObuType::TileGroup,
-            5 => ObuType::Metadata,
-            6 => ObuType::Frame,
-            7 => ObuType::RedundantFrameHeader,
-            8 => ObuType::TileList,
-            15 => ObuType::Padding,
-            other => ObuType::Reserved(other),
-        }
-    }
-
-    /// One parsed `open_bitstream_unit()` (av1-spec
-    /// `06.bitstream.syntax.md`): `obu_type` plus the byte ranges of the
-    /// whole OBU (header + `obu_size` leb128, if present, + payload) and
-    /// just its payload, both borrowed from the input so a Sequence Header
-    /// OBU can be re-embedded byte-for-byte into `av1C`'s `configOBUs` --
-    /// copying the real bytes makes "the values in configOBUs match the
-    /// AV1CodecConfigurationRecord" (av1-isobmff `index.bs`) a byte
-    /// identity, not a hope.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct Obu<'a> {
-        pub(crate) obu_type: ObuType,
-        pub(crate) whole: &'a [u8],
-        pub(crate) payload: &'a [u8],
-    }
-
-    /// Walks a "Low Overhead Bitstream Format" byte buffer (av1-spec's own
-    /// "Low overhead bitstream format" section; av1-isobmff `index.bs`'s
-    /// "AV1 Sample Format": one Temporal Unit's worth of concatenated
-    /// OBUs) into individual OBUs.
-    ///
-    /// Every OBU must set `obu_has_size_field`, except optionally the last
-    /// one in the buffer, whose size then defaults to "the rest of the
-    /// buffer" -- both are explicitly sanctioned by av1-isobmff's "AV1
-    /// Sample Format" section. `obu_extension_flag` (temporal/spatial layer
-    /// id) is skipped, not interpreted: Arcen has no scalable/multi-layer
-    /// AV1 use case.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for `obu_forbidden_bit` set, a header or `obu_size`
-    /// that runs past the end of `data`, or a claimed payload length that
-    /// would too.
-    pub(crate) fn parse_obus(data: &[u8]) -> Result<Vec<Obu<'_>>, String> {
-        let mut obus = Vec::new();
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let header_byte = data[offset];
-            if header_byte & 0x80 != 0 {
-                return Err(format!(
-                    "AV1 OBU at offset {offset} has obu_forbidden_bit set"
-                ));
-            }
-            let obu_type = obu_type_from_bits((header_byte >> 3) & 0x0f);
-            let extension_flag = (header_byte >> 2) & 1 != 0;
-            let has_size_field = (header_byte >> 1) & 1 != 0;
-            let header_len = if extension_flag { 2 } else { 1 };
-            if offset + header_len > data.len() {
-                return Err(format!(
-                    "AV1 OBU at offset {offset} is truncated in its header"
-                ));
-            }
-            let (payload_len, size_field_len) = if has_size_field {
-                let (size, consumed) = read_leb128(&data[offset + header_len..])?;
-                let size = usize::try_from(size)
-                    .map_err(|_| "AV1 obu_size overflows usize".to_string())?;
-                (size, consumed)
-            } else {
-                (data.len() - offset - header_len, 0)
-            };
-            let payload_start = offset + header_len + size_field_len;
-            let payload_end = payload_start
-                .checked_add(payload_len)
-                .ok_or_else(|| "AV1 OBU payload length overflow".to_string())?;
-            if payload_end > data.len() {
-                return Err(format!(
-                    "AV1 OBU at offset {offset} claims {payload_len} payload bytes but only {} \
-                     remain",
-                    data.len() - payload_start
-                ));
-            }
-            obus.push(Obu {
-                obu_type,
-                whole: &data[offset..payload_end],
-                payload: &data[payload_start..payload_end],
-            });
-            if !has_size_field {
-                // Sanctioned only for the last OBU in a sample (av1-isobmff
-                // `index.bs`: "it is assumed to fill the remainder of the
-                // sample"), so `payload_end` is already `data.len()` here --
-                // there is nothing left to walk.
-                break;
-            }
-            offset = payload_end;
-        }
-        Ok(obus)
-    }
-
-    /// The `av1C` (`AV1CodecConfigurationRecord`, av1-isobmff `index.bs`
-    /// section 2.3.3) fields, plus the coded dimensions
-    /// `CMVideoFormatDescriptionCreate` needs, extracted from a Sequence
-    /// Header OBU's payload (av1-spec `sequence_header_obu()`).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct SequenceHeaderFields {
-        pub(crate) seq_profile: u8,
-        pub(crate) seq_level_idx_0: u8,
-        pub(crate) seq_tier_0: u8,
-        pub(crate) high_bitdepth: bool,
-        pub(crate) twelve_bit: bool,
-        pub(crate) monochrome: bool,
-        pub(crate) chroma_subsampling_x: u8,
-        pub(crate) chroma_subsampling_y: u8,
-        pub(crate) chroma_sample_position: u8,
-        pub(crate) max_frame_width: u32,
-        pub(crate) max_frame_height: u32,
-    }
-
-    /// Parses a Sequence Header OBU payload (av1-spec
-    /// `06.bitstream.syntax.md`'s `sequence_header_obu()`/`color_config()`),
-    /// stopping as soon as every [`SequenceHeaderFields`] value has been
-    /// read -- `separate_uv_delta_q`, `film_grain_params_present` and
-    /// anything after them are never consulted, so they are never read
-    /// either (bit-reading is strictly sequential, so it is always correct
-    /// to stop once the fields a caller needs have all been read in the
-    /// exact order/width the spec lays out, which every field below is).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for a truncated buffer, or for
-    /// `timing_info_present_flag == 1` (see this module's doc).
-    #[allow(clippy::similar_names)]
-    pub(crate) fn parse_sequence_header(payload: &[u8]) -> Result<SequenceHeaderFields, String> {
-        let mut r = BitReader::new(payload);
-        let seq_profile = r.f(3)? as u8;
-        let _still_picture = r.f(1)?;
-        let reduced_still_picture_header = r.f(1)? != 0;
-
-        let mut seq_level_idx_0 = 0u8;
-        let mut seq_tier_0 = 0u8;
-        if reduced_still_picture_header {
-            seq_level_idx_0 = r.f(5)? as u8;
-            // seq_tier[0] = 0 (av1-spec).
-        } else {
-            let timing_info_present_flag = r.f(1)? != 0;
-            if timing_info_present_flag {
-                return Err("AV1 sequence header has timing_info_present_flag=1; \
-                     timing_info()/decoder_model_info()/operating_parameters_info() are not \
-                     implemented by this parser (irrelevant to a live remote-desktop stream \
-                     with no container-level timing model)"
-                    .to_string());
-            }
-            // decoder_model_info_present_flag = 0 is forced by the spec
-            // whenever timing_info_present_flag == 0 (the only case
-            // supported above), so decoder_model_present_for_this_op[i] is
-            // always 0 below and operating_parameters_info() is never
-            // present -- no bits to read for it.
-            let initial_display_delay_present_flag = r.f(1)? != 0;
-            let operating_points_cnt_minus_1 = r.f(5)?;
-            for i in 0..=operating_points_cnt_minus_1 {
-                let _operating_point_idc = r.f(12)?;
-                let seq_level_idx = r.f(5)? as u8;
-                let seq_tier = if seq_level_idx > 7 { r.f(1)? as u8 } else { 0 };
-                if i == 0 {
-                    seq_level_idx_0 = seq_level_idx;
-                    seq_tier_0 = seq_tier;
-                }
-                if initial_display_delay_present_flag {
-                    let present_for_this_op = r.f(1)? != 0;
-                    if present_for_this_op {
-                        let _initial_display_delay_minus_1 = r.f(4)?;
-                    }
-                }
-            }
-        }
-
-        let frame_width_bits_minus_1 = r.f(4)?;
-        let frame_height_bits_minus_1 = r.f(4)?;
-        let max_frame_width = r.f(frame_width_bits_minus_1 + 1)? + 1;
-        let max_frame_height = r.f(frame_height_bits_minus_1 + 1)? + 1;
-
-        let frame_id_numbers_present_flag = if reduced_still_picture_header {
-            false
-        } else {
-            r.f(1)? != 0
-        };
-        if frame_id_numbers_present_flag {
-            let _delta_frame_id_length_minus_2 = r.f(4)?;
-            let _additional_frame_id_length_minus_1 = r.f(3)?;
-        }
-
-        let _use_128x128_superblock = r.f(1)?;
-        let _enable_filter_intra = r.f(1)?;
-        let _enable_intra_edge_filter = r.f(1)?;
-
-        if !reduced_still_picture_header {
-            let _enable_interintra_compound = r.f(1)?;
-            let _enable_masked_compound = r.f(1)?;
-            let _enable_warped_motion = r.f(1)?;
-            let _enable_dual_filter = r.f(1)?;
-            let enable_order_hint = r.f(1)? != 0;
-            if enable_order_hint {
-                let _enable_jnt_comp = r.f(1)?;
-                let _enable_ref_frame_mvs = r.f(1)?;
-            }
-            let seq_choose_screen_content_tools = r.f(1)? != 0;
-            // SELECT_SCREEN_CONTENT_TOOLS = 2 (av1-spec `03.symbols.md`):
-            // always non-zero, so only whether the *explicit* value read
-            // below is zero matters to the next `if`.
-            let seq_force_screen_content_tools = if seq_choose_screen_content_tools {
-                2
-            } else {
-                r.f(1)?
-            };
-            if seq_force_screen_content_tools > 0 {
-                let seq_choose_integer_mv = r.f(1)? != 0;
-                if !seq_choose_integer_mv {
-                    let _seq_force_integer_mv = r.f(1)?;
-                }
-            }
-            if enable_order_hint {
-                let _order_hint_bits_minus_1 = r.f(3)?;
-            }
-        }
-
-        let _enable_superres = r.f(1)?;
-        let _enable_cdef = r.f(1)?;
-        let _enable_restoration = r.f(1)?;
-
-        // color_config() (av1-spec `06.bitstream.syntax.md`).
-        let high_bitdepth = r.f(1)? != 0;
-        let (twelve_bit, bit_depth) = if seq_profile == 2 && high_bitdepth {
-            let twelve_bit = r.f(1)? != 0;
-            (twelve_bit, if twelve_bit { 12 } else { 10 })
-        } else {
-            (false, if high_bitdepth { 10 } else { 8 })
-        };
-        let monochrome = if seq_profile == 1 {
-            false
-        } else {
-            r.f(1)? != 0
-        };
-        let color_description_present_flag = r.f(1)? != 0;
-        let (color_primaries, transfer_characteristics, matrix_coefficients) =
-            if color_description_present_flag {
-                (r.f(8)?, r.f(8)?, r.f(8)?)
-            } else {
-                (2, 2, 2) // CP_UNSPECIFIED, TC_UNSPECIFIED, MC_UNSPECIFIED.
-            };
-
-        let (chroma_subsampling_x, chroma_subsampling_y, chroma_sample_position) = if monochrome {
-            let _color_range = r.f(1)?;
-            (1u8, 1u8, 0u8) // CSP_UNKNOWN.
-        } else if color_primaries == 1 && transfer_characteristics == 13 && matrix_coefficients == 0
-        {
-            // CP_BT_709 && TC_SRGB && MC_IDENTITY: implied full-range,
-            // unsubsampled 4:4:4 (av1-spec `color_config()`).
-            (0u8, 0u8, 0u8)
-        } else {
-            let _color_range = r.f(1)?;
-            let (subsampling_x, subsampling_y) = match seq_profile {
-                0 => (1u8, 1u8),
-                1 => (0u8, 0u8),
-                _ if bit_depth == 12 => {
-                    let subsampling_x = r.f(1)? as u8;
-                    let subsampling_y = if subsampling_x != 0 { r.f(1)? as u8 } else { 0 };
-                    (subsampling_x, subsampling_y)
-                }
-                _ => (1u8, 0u8),
-            };
-            let chroma_sample_position = if subsampling_x != 0 && subsampling_y != 0 {
-                r.f(2)? as u8
-            } else {
-                0
-            };
-            (subsampling_x, subsampling_y, chroma_sample_position)
-        };
-
-        Ok(SequenceHeaderFields {
-            seq_profile,
-            seq_level_idx_0,
-            seq_tier_0,
-            high_bitdepth,
-            twelve_bit,
-            monochrome,
-            chroma_subsampling_x,
-            chroma_subsampling_y,
-            chroma_sample_position,
-            max_frame_width,
-            max_frame_height,
-        })
-    }
-
-    /// Builds the `av1C` box payload (`AV1CodecConfigurationRecord`,
-    /// av1-isobmff `index.bs` section 2.3.3): a fixed 4-byte header
-    /// followed verbatim by `sequence_header_obu` (the complete OBU --
-    /// header, `obu_size`, and payload -- exactly as it appeared on the
-    /// wire, per [`Obu::whole`]). `initial_presentation_delay_present` is
-    /// always signalled `0`: Arcen has no pre-buffered decode schedule to
-    /// describe (a live low-latency stream has no use for it), matching
-    /// the field's own semantics (a hint for how many samples to buffer
-    /// before starting presentation).
-    ///
-    /// Matches the approach independently taken by Chromium, Firefox,
-    /// WebKit and the ALVR/Moonlight community VideoToolbox AV1 clients
-    /// (see this module's doc): `configOBUs` is the real OBU bytes, not a
-    /// re-serialisation of them.
-    #[must_use]
-    pub(crate) fn build_av1c(fields: &SequenceHeaderFields, sequence_header_obu: &[u8]) -> Vec<u8> {
-        let mut record = Vec::with_capacity(4 + sequence_header_obu.len());
-        // marker(1)=1, version(7)=1.
-        record.push(0x80 | 0x01);
-        // seq_profile(3), seq_level_idx_0(5).
-        record.push((fields.seq_profile << 5) | (fields.seq_level_idx_0 & 0x1f));
-        // seq_tier_0(1), high_bitdepth(1), twelve_bit(1), monochrome(1),
-        // chroma_subsampling_x(1), chroma_subsampling_y(1),
-        // chroma_sample_position(2).
-        record.push(
-            ((fields.seq_tier_0 & 1) << 7)
-                | (u8::from(fields.high_bitdepth) << 6)
-                | (u8::from(fields.twelve_bit) << 5)
-                | (u8::from(fields.monochrome) << 4)
-                | ((fields.chroma_subsampling_x & 1) << 3)
-                | ((fields.chroma_subsampling_y & 1) << 2)
-                | (fields.chroma_sample_position & 0x03),
-        );
-        // reserved(3)=0, initial_presentation_delay_present(1)=0,
-        // reserved(4)=0.
-        record.push(0x00);
-        record.extend_from_slice(sequence_header_obu);
-        record
-    }
-
-    /// Renders a short `kind:length` summary of `obus`, for logging --
-    /// mirrors `summarize_nals`'s role for the Annex-B pipeline.
-    #[must_use]
-    pub(crate) fn summarize(obus: &[Obu<'_>]) -> String {
-        let parts = obus
-            .iter()
-            .map(|obu| {
-                let kind: std::borrow::Cow<'static, str> = match obu.obu_type {
-                    ObuType::SequenceHeader => "seq_header".into(),
-                    ObuType::TemporalDelimiter => "temporal_delimiter".into(),
-                    ObuType::FrameHeader => "frame_header".into(),
-                    ObuType::TileGroup => "tile_group".into(),
-                    ObuType::Metadata => "metadata".into(),
-                    ObuType::Frame => "frame".into(),
-                    ObuType::RedundantFrameHeader => "redundant_frame_header".into(),
-                    ObuType::TileList => "tile_list".into(),
-                    ObuType::Padding => "padding".into(),
-                    ObuType::Reserved(value) => format!("reserved({value})").into(),
-                };
-                format!("{kind}:{}", obu.whole.len())
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("obus=[{parts}]")
-    }
-}
-
-/// Minimal, from-scratch Annex-B parameter-set (VPS/SPS/PPS) bitstream
-/// construction for the runtime decode-capability probe (see
-/// [`DecodeCapabilities`] below). Every syntax element is written by an
-/// explicit bit writer against the exact ITU-T H.264/H.265 syntax tables
-/// (VPS/SPS `profile_tier_level` bit widths cross-checked against
-/// FFmpeg's `libavcodec/hevc/ps.c` parser, the most widely deployed
-/// independent implementation of this syntax), rather than copied from
-/// any hardcoded byte literal: a byte blob cannot be reviewed
-/// field-by-field, and this probe's whole purpose is to be an honest,
-/// inspectable substitute for parameter sets Arcen has no local encoder
-/// to produce on the Deck.
-mod bitstream {
-    /// Big-endian, MSB-first bit writer for Annex-B RBSP syntax elements.
-    #[derive(Debug, Default, Clone)]
-    pub(super) struct BitWriter {
-        bytes: Vec<u8>,
-        partial: u8,
-        /// Number of valid bits already shifted into `partial`, 0..=7.
-        bit_pos: u8,
-    }
-
-    impl BitWriter {
-        pub(super) fn new() -> Self {
-            Self::default()
-        }
-
-        /// Writes one bit, most-significant-bit-first within each byte.
-        pub(super) fn write_bit(&mut self, bit: bool) {
-            self.partial = (self.partial << 1) | u8::from(bit);
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bytes.push(self.partial);
-                self.partial = 0;
-                self.bit_pos = 0;
-            }
-        }
-
-        /// `n_bits` zero bits -- shorthand for a run of reserved/unused
-        /// flag bits.
-        pub(super) fn write_zeros(&mut self, n_bits: u32) {
-            for _ in 0..n_bits {
-                self.write_bit(false);
-            }
-        }
-
-        /// `u(n)`: the low `n_bits` of `value`, most-significant-bit-first.
-        pub(super) fn write_bits(&mut self, value: u32, n_bits: u32) {
-            debug_assert!(n_bits <= 32);
-            for i in (0..n_bits).rev() {
-                self.write_bit((value >> i) & 1 != 0);
-            }
-        }
-
-        /// `ue(v)`: unsigned Exp-Golomb code (ITU-T H.264/H.265 9.1).
-        pub(super) fn write_ue(&mut self, value: u32) {
-            let code_num = value + 1;
-            let leading_zero_bits = 31 - code_num.leading_zeros();
-            self.write_zeros(leading_zero_bits);
-            self.write_bits(code_num, leading_zero_bits + 1);
-        }
-
-        /// `se(v)`: signed Exp-Golomb code (ITU-T H.264/H.265 9.1.1's
-        /// mapping from a signed value to the `ue(v)` `codeNum`).
-        pub(super) fn write_se(&mut self, value: i32) {
-            let doubled = i64::from(value) * 2;
-            let code_num = if value <= 0 { -doubled } else { doubled - 1 };
-            self.write_ue(code_num as u32);
-        }
-
-        /// `rbsp_trailing_bits()`: a single `1` stop bit, then zero
-        /// padding to the next byte boundary.
-        pub(super) fn rbsp_trailing_bits(&mut self) {
-            self.write_bit(true);
-            while self.bit_pos != 0 {
-                self.write_bit(false);
-            }
-        }
-
-        /// Number of bits written so far, including any not-yet-flushed
-        /// partial byte. Test-only: every production caller finishes with
-        /// [`Self::rbsp_trailing_bits`], which always leaves this
-        /// byte-aligned.
-        #[cfg(test)]
-        pub(super) fn bit_len(&self) -> usize {
-            self.bytes.len() * 8 + usize::from(self.bit_pos)
-        }
-
-        /// Consumes the writer, returning the byte-aligned RBSP.
-        pub(super) fn into_rbsp(self) -> Vec<u8> {
-            debug_assert_eq!(self.bit_pos, 0, "RBSP must be byte-aligned before use");
-            self.bytes
-        }
-    }
-
-    /// Applies Annex-B "emulation prevention": inserts `0x03` after any
-    /// two consecutive zero bytes immediately followed by a byte `<=
-    /// 0x03`, so the result never contains a real start-code prefix
-    /// (`0x000000`, `0x000001`, `0x000002`) or an unescaped `0x000003`
-    /// once wrapped in a NAL header.
-    pub(super) fn escape_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(rbsp.len());
-        let mut zero_run = 0u8;
-        for &byte in rbsp {
-            if zero_run >= 2 && byte <= 3 {
-                out.push(0x03);
-                zero_run = 0;
-            }
-            out.push(byte);
-            zero_run = if byte == 0 { zero_run + 1 } else { 0 };
-        }
-        out
-    }
-
-    /// Removes Annex-B emulation-prevention bytes before test-only RBSP
-    /// parsing. The production decoder passes the escaped NAL to
-    /// VideoToolbox, which performs this step itself.
-    #[cfg(test)]
-    pub(super) fn unescape_emulation_prevention(ebsp: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(ebsp.len());
-        let mut zero_run = 0u8;
-        for (index, &byte) in ebsp.iter().enumerate() {
-            if zero_run >= 2
-                && byte == 0x03
-                && ebsp.get(index + 1).is_some_and(|next| *next <= 0x03)
-            {
-                zero_run = 0;
-                continue;
-            }
-            out.push(byte);
-            zero_run = if byte == 0 { zero_run + 1 } else { 0 };
-        }
-        out
-    }
-
-    /// Minimal companion bit reader, used only by tests to confirm the
-    /// writer above actually placed fields where the SPS/PPS/VPS builders
-    /// below believe they are.
-    #[cfg(test)]
-    #[derive(Debug, Clone, Copy)]
-    pub(super) struct BitReader<'a> {
-        bytes: &'a [u8],
-        byte_pos: usize,
-        /// Next bit to read within `bytes[byte_pos]`, MSB-first, 0..=7.
-        bit_pos: u8,
-    }
-
-    #[cfg(test)]
-    impl<'a> BitReader<'a> {
-        pub(super) fn new(bytes: &'a [u8]) -> Self {
-            Self {
-                bytes,
-                byte_pos: 0,
-                bit_pos: 0,
-            }
-        }
-
-        pub(super) fn read_bit(&mut self) -> bool {
-            let byte = self.bytes[self.byte_pos];
-            let bit = (byte >> (7 - self.bit_pos)) & 1 != 0;
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-            bit
-        }
-
-        pub(super) fn read_bits(&mut self, n_bits: u32) -> u32 {
-            let mut value = 0u32;
-            for _ in 0..n_bits {
-                value = (value << 1) | u32::from(self.read_bit());
-            }
-            value
-        }
-
-        pub(super) fn skip(&mut self, n_bits: u32) {
-            for _ in 0..n_bits {
-                self.read_bit();
-            }
-        }
-
-        pub(super) fn read_ue(&mut self) -> u32 {
-            let mut leading_zero_bits = 0u32;
-            while !self.read_bit() {
-                leading_zero_bits += 1;
-            }
-            let remainder = self.read_bits(leading_zero_bits);
-            (1u32 << leading_zero_bits) - 1 + remainder
-        }
-    }
-}
-
-/// One synthetic HEVC stream variant the runtime capability probe (see
-/// [`DecodeCapabilities`]) builds a real `CMFormatDescription`/
-/// `VTDecompressionSession` for. Chroma is restricted to 4:2:0 or 4:4:4 --
-/// the only two Arcen's own wire protocol needs this probe to
-/// distinguish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HevcProbeProfile {
-    /// `chroma_format_idc`: `1` for 4:2:0, `3` for 4:4:4.
-    chroma_format_idc: u8,
-    /// Luma and chroma bit depth (this probe never separates them): `8`,
-    /// `10`, or `12`.
-    bit_depth: u8,
-}
-
-impl HevcProbeProfile {
-    fn chroma(self) -> ChromaSubsampling {
-        if self.chroma_format_idc == 3 {
-            ChromaSubsampling::Yuv444
-        } else {
-            ChromaSubsampling::Yuv420
-        }
-    }
-
-    fn ten_bit(self) -> bool {
-        self.bit_depth >= 10
-    }
-}
-
-/// The synthetic picture size every probe builds. One CTU
-/// (`log2_diff_max_min_luma_coding_block_size` in [`build_hevc_sps`] picks
-/// a 64-sample CTU) at exactly the picture size avoids any
-/// boundary/partial-CTU edge case a still-tinier picture would introduce.
-const PROBE_DIMENSION: u16 = 64;
-
-/// HEVC level to declare in every probed `profile_tier_level` -- Level
-/// 1.0, comfortably above what a single `PROBE_DIMENSION` x
-/// `PROBE_DIMENSION` picture needs.
-const PROBE_HEVC_LEVEL_IDC: u8 = 30;
-
-/// `general_profile_idc` a real encoder would choose for `profile`,
-/// matching x265/NVENC convention: Main (1) for 8-bit 4:2:0, Main 10 (2)
-/// for 10-bit 4:2:0, and Format Range Extensions ("Rext", 4) for
-/// everything else this probe exercises (4:4:4 at any depth, or 12-bit
-/// 4:2:0 -- "Main 12"). This is the exact axis the whole probe cares
-/// about: whether VideoToolbox accepts profile 4 (Rext) at all is the
-/// only way to learn whether this Mac decodes HEVC Rext, since
-/// `chroma_format_idc`/`bit_depth_luma_minus8` alone would still parse
-/// even against hardware that only implements a plain Main/Main10
-/// decoder.
-fn hevc_general_profile_idc(profile: HevcProbeProfile) -> u8 {
-    match (profile.chroma_format_idc, profile.bit_depth) {
-        (1, 8) => 1,
-        (1, 10) => 2,
-        _ => 4,
-    }
-}
-
-/// Writes `profile_tier_level(profilePresentFlag=1, maxNumSubLayersMinus1=0)`
-/// (ITU-T H.265 7.3.3): a fixed 96 bits (12 bytes) for the single-layer,
-/// no-sub-layers case every VPS/SPS this probe builds uses -- 8
-/// (space/tier/idc) + 32 (compatibility flags) + 4 (source/constraint
-/// flags) + 43 (profile-dependent constraint/reserved bits, the same
-/// total on every branch) + 1 (`inbld`/reserved) + 8 (`level_idc`). Bit
-/// widths cross-checked against FFmpeg's `decode_profile_tier_level`
-/// (`libavcodec/hevc/ps.c`), independent of and predating this probe.
-fn write_profile_tier_level(w: &mut bitstream::BitWriter, profile: HevcProbeProfile) {
-    let general_profile_idc = hevc_general_profile_idc(profile);
-    w.write_bits(0, 2); // general_profile_space
-    w.write_bit(false); // general_tier_flag (Main tier)
-    w.write_bits(u32::from(general_profile_idc), 5);
-    for compat_idc in 0..32u32 {
-        // A profile is always compatible with itself; no other profile's
-        // claim applies to a stream synthesised purely to probe one.
-        w.write_bit(compat_idc == u32::from(general_profile_idc));
-    }
-    w.write_bit(true); // general_progressive_source_flag
-    w.write_bit(false); // general_interlaced_source_flag
-    w.write_bit(true); // general_non_packed_constraint_flag
-    w.write_bit(true); // general_frame_only_constraint_flag
-    match general_profile_idc {
-        4..=10 => {
-            // Format Range Extensions ("Rext") family: nine explicit
-            // constraint flags, set from this profile's *actual*
-            // chroma/bit-depth ceiling -- not copied from any real
-            // encoder's stream, since declaring itself accurately is this
-            // probe's only job.
-            w.write_bit(profile.bit_depth <= 12); // general_max_12bit_constraint_flag
-            w.write_bit(profile.bit_depth <= 10); // general_max_10bit_constraint_flag
-            w.write_bit(profile.bit_depth <= 8); // general_max_8bit_constraint_flag
-            w.write_bit(profile.chroma_format_idc <= 2); // general_max_422chroma_constraint_flag
-            w.write_bit(profile.chroma_format_idc <= 1); // general_max_420chroma_constraint_flag
-            w.write_bit(false); // general_max_monochrome_constraint_flag
-            w.write_bit(false); // general_intra_constraint_flag
-            w.write_bit(false); // general_one_picture_only_constraint_flag
-            w.write_bit(false); // general_lower_bit_rate_constraint_flag
-            w.write_zeros(34); // XXX_reserved_zero_34bits[0..33]
-        }
-        2 => {
-            w.write_zeros(7);
-            w.write_bit(false); // general_one_picture_only_constraint_flag
-            w.write_zeros(35); // XXX_reserved_zero_35bits[0..34]
-        }
-        _ => w.write_zeros(43), // XXX_reserved_zero_43bits[0..42] (Main / Main Still Picture)
-    }
-    w.write_bit(false); // general_inbld_flag / general_reserved_zero_bit
-    w.write_bits(u32::from(PROBE_HEVC_LEVEL_IDC), 8);
-}
-
-/// Prepends a two-byte HEVC NAL header (`nuh_layer_id = 0`,
-/// `nuh_temporal_id_plus1 = 1`) and Annex-B-escapes `rbsp`.
-fn hevc_nal(nal_unit_type: u8, rbsp: &[u8]) -> Vec<u8> {
-    let escaped = bitstream::escape_emulation_prevention(rbsp);
-    let mut nal = Vec::with_capacity(2 + escaped.len());
-    nal.push(nal_unit_type << 1);
-    nal.push(1);
-    nal.extend_from_slice(&escaped);
-    nal
-}
-
-/// Builds a complete, spec-valid `video_parameter_set_rbsp` NAL for
-/// `profile`: single layer, single sub-layer, no timing/extension data --
-/// the minimum `CMVideoFormatDescriptionCreateFromHEVCParameterSets`
-/// needs a VPS for at all.
-fn build_hevc_vps(profile: HevcProbeProfile) -> Vec<u8> {
-    let mut w = bitstream::BitWriter::new();
-    w.write_bits(0, 4); // vps_video_parameter_set_id
-    w.write_bit(true); // vps_base_layer_internal_flag
-    w.write_bit(true); // vps_base_layer_available_flag
-    w.write_bits(0, 6); // vps_max_layers_minus1
-    w.write_bits(0, 3); // vps_max_sub_layers_minus1
-    w.write_bit(true); // vps_temporal_id_nesting_flag
-    w.write_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
-    write_profile_tier_level(&mut w, profile);
-    w.write_bit(false); // vps_sub_layer_ordering_info_present_flag
-    w.write_ue(0); // vps_max_dec_pic_buffering_minus1[0]
-    w.write_ue(0); // vps_max_num_reorder_pics[0]
-    w.write_ue(0); // vps_max_latency_increase_plus1[0]
-    w.write_bits(0, 6); // vps_max_layer_id
-    w.write_ue(0); // vps_num_layer_sets_minus1
-    w.write_bit(false); // vps_timing_info_present_flag
-    w.write_bit(false); // vps_extension_flag
-    w.rbsp_trailing_bits();
-    hevc_nal(32, &w.into_rbsp())
-}
-
-/// Builds a complete `seq_parameter_set_rbsp` NAL for `profile` at a
-/// fixed `PROBE_DIMENSION` x `PROBE_DIMENSION` picture: one CTU, no
-/// scaling lists, no PCM, no reference-picture sets, no VUI, no SPS
-/// extension -- nothing this probe's capability question (does
-/// `chroma_format_idc`/`bit_depth_*_minus8` under this
-/// `general_profile_idc` even build a session) depends on.
-fn build_hevc_sps(profile: HevcProbeProfile) -> Vec<u8> {
-    let mut w = bitstream::BitWriter::new();
-    w.write_bits(0, 4); // sps_video_parameter_set_id
-    w.write_bits(0, 3); // sps_max_sub_layers_minus1
-    w.write_bit(true); // sps_temporal_id_nesting_flag
-    write_profile_tier_level(&mut w, profile);
-    w.write_ue(0); // sps_seq_parameter_set_id
-    w.write_ue(u32::from(profile.chroma_format_idc)); // chroma_format_idc
-    if profile.chroma_format_idc == 3 {
-        w.write_bit(false); // separate_colour_plane_flag
-    }
-    w.write_ue(u32::from(PROBE_DIMENSION)); // pic_width_in_luma_samples
-    w.write_ue(u32::from(PROBE_DIMENSION)); // pic_height_in_luma_samples
-    w.write_bit(false); // conformance_window_flag
-    w.write_ue(u32::from(profile.bit_depth - 8)); // bit_depth_luma_minus8
-    w.write_ue(u32::from(profile.bit_depth - 8)); // bit_depth_chroma_minus8
-    w.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
-    w.write_bit(false); // sps_sub_layer_ordering_info_present_flag
-    w.write_ue(0); // sps_max_dec_pic_buffering_minus1[0]
-    w.write_ue(0); // sps_max_num_reorder_pics[0]
-    w.write_ue(0); // sps_max_latency_increase_plus1[0]
-    w.write_ue(0); // log2_min_luma_coding_block_size_minus3 (min CB = 8)
-    w.write_ue(3); // log2_diff_max_min_luma_coding_block_size (CTU = 64)
-    w.write_ue(0); // log2_min_luma_transform_block_size_minus2 (min TB = 4)
-    w.write_ue(3); // log2_diff_max_min_transform_block_size (max TB = 32)
-    w.write_ue(0); // max_transform_hierarchy_depth_inter
-    w.write_ue(0); // max_transform_hierarchy_depth_intra
-    w.write_bit(false); // scaling_list_enabled_flag
-    w.write_bit(false); // amp_enabled_flag
-    w.write_bit(false); // sample_adaptive_offset_enabled_flag
-    w.write_bit(false); // pcm_enabled_flag
-    w.write_ue(0); // num_short_term_ref_pic_sets
-    w.write_bit(false); // long_term_ref_pics_present_flag
-    w.write_bit(false); // sps_temporal_mvp_enabled_flag
-    w.write_bit(false); // strong_intra_smoothing_enabled_flag
-    w.write_bit(false); // vui_parameters_present_flag
-    w.write_bit(false); // sps_extension_present_flag
-    w.rbsp_trailing_bits();
-    hevc_nal(33, &w.into_rbsp())
-}
-
-/// Builds a `pic_parameter_set_rbsp` NAL. Profile-independent: nothing
-/// this probe cares about (chroma/bit-depth/profile) lives in the PPS.
-fn build_hevc_pps() -> Vec<u8> {
-    let mut w = bitstream::BitWriter::new();
-    w.write_ue(0); // pps_pic_parameter_set_id
-    w.write_ue(0); // pps_seq_parameter_set_id
-    w.write_bit(false); // dependent_slice_segments_enabled_flag
-    w.write_bit(false); // output_flag_present_flag
-    w.write_bits(0, 3); // num_extra_slice_header_bits
-    w.write_bit(false); // sign_data_hiding_enabled_flag
-    w.write_bit(false); // cabac_init_present_flag
-    w.write_ue(0); // num_ref_idx_l0_default_active_minus1
-    w.write_ue(0); // num_ref_idx_l1_default_active_minus1
-    w.write_se(0); // init_qp_minus26
-    w.write_bit(false); // constrained_intra_pred_flag
-    w.write_bit(false); // transform_skip_enabled_flag
-    w.write_bit(false); // cu_qp_delta_enabled_flag
-    w.write_se(0); // pps_cb_qp_offset
-    w.write_se(0); // pps_cr_qp_offset
-    w.write_bit(false); // pps_slice_chroma_qp_offsets_present_flag
-    w.write_bit(false); // weighted_pred_flag
-    w.write_bit(false); // weighted_bipred_flag
-    w.write_bit(false); // transquant_bypass_enabled_flag
-    w.write_bit(false); // tiles_enabled_flag
-    w.write_bit(false); // entropy_coding_sync_enabled_flag
-    w.write_bit(true); // pps_loop_filter_across_slices_enabled_flag
-    w.write_bit(false); // deblocking_filter_control_present_flag
-    w.write_bit(false); // pps_scaling_list_data_present_flag
-    w.write_bit(false); // lists_modification_present_flag
-    w.write_ue(0); // log2_parallel_merge_level_minus2
-    w.write_bit(false); // slice_segment_header_extension_present_flag
-    w.write_bit(false); // pps_extension_present_flag
-    w.rbsp_trailing_bits();
-    hevc_nal(34, &w.into_rbsp())
-}
-
-/// Prepends a one-byte H.264 NAL header (`nal_ref_idc = 3`, the
-/// conventional highest-importance value for parameter sets) and
-/// Annex-B-escapes `rbsp`.
-fn h264_nal(nal_unit_type: u8, rbsp: &[u8]) -> Vec<u8> {
-    let escaped = bitstream::escape_emulation_prevention(rbsp);
-    let mut nal = Vec::with_capacity(1 + escaped.len());
-    nal.push((3 << 5) | nal_unit_type);
-    nal.extend_from_slice(&escaped);
-    nal
-}
-
-/// Builds a minimal Baseline-profile `seq_parameter_set_rbsp` NAL: fixed
-/// `PROBE_DIMENSION` x `PROBE_DIMENSION`, implicitly 4:2:0 eight-bit (the
-/// high-profile-only chroma/bit-depth fields do not exist in a Baseline
-/// SPS at all -- ITU-T H.264 7.3.2.1.1 gates them on `profile_idc`).
-/// `pic_order_cnt_type = 2` sidesteps every optional POC field.
-fn build_h264_sps() -> Vec<u8> {
-    let mut w = bitstream::BitWriter::new();
-    w.write_bits(66, 8); // profile_idc = Baseline
-    w.write_bit(true); // constraint_set0_flag (obeys Annex A.2.1, Baseline)
-    w.write_zeros(5); // constraint_set1_flag .. constraint_set5_flag
-    w.write_bits(0, 2); // reserved_zero_2bits
-    w.write_bits(10, 8); // level_idc = 1.0
-    w.write_ue(0); // seq_parameter_set_id
-    w.write_ue(0); // log2_max_frame_num_minus4
-    w.write_ue(2); // pic_order_cnt_type = 2 (sidesteps every optional POC field)
-    w.write_ue(1); // max_num_ref_frames
-    w.write_bit(false); // gaps_in_frame_num_value_allowed_flag
-    w.write_ue(u32::from(PROBE_DIMENSION / 16 - 1)); // pic_width_in_mbs_minus1
-    w.write_ue(u32::from(PROBE_DIMENSION / 16 - 1)); // pic_height_in_map_units_minus1
-    w.write_bit(true); // frame_mbs_only_flag
-    w.write_bit(true); // direct_8x8_inference_flag
-    w.write_bit(false); // frame_cropping_flag
-    w.write_bit(false); // vui_parameters_present_flag
-    w.rbsp_trailing_bits();
-    h264_nal(7, &w.into_rbsp())
-}
-
-/// Builds a minimal `pic_parameter_set_rbsp` NAL (CAVLC, one slice
-/// group).
-fn build_h264_pps() -> Vec<u8> {
-    let mut w = bitstream::BitWriter::new();
-    w.write_ue(0); // pic_parameter_set_id
-    w.write_ue(0); // seq_parameter_set_id
-    w.write_bit(false); // entropy_coding_mode_flag (CAVLC)
-    w.write_bit(false); // bottom_field_pic_order_in_frame_present_flag
-    w.write_ue(0); // num_slice_groups_minus1
-    w.write_ue(0); // num_ref_idx_l0_default_active_minus1
-    w.write_ue(0); // num_ref_idx_l1_default_active_minus1
-    w.write_bit(false); // weighted_pred_flag
-    w.write_bits(0, 2); // weighted_bipred_idc
-    w.write_se(0); // pic_init_qp_minus26
-    w.write_se(0); // pic_init_qs_minus26
-    w.write_se(0); // chroma_qp_index_offset
-    w.write_bit(false); // deblocking_filter_control_present_flag
-    w.write_bit(false); // constrained_intra_pred_flag
-    w.write_bit(false); // redundant_pic_cnt_present_flag
-    w.rbsp_trailing_bits();
-    h264_nal(8, &w.into_rbsp())
 }
 
 /// Real, empirically-probed decode capability for this process, backing
@@ -1987,10 +744,10 @@ mod platform {
 
     use super::{
         av1, classify_pixel_buffer_format, color_extension_plan, fourcc_string, nal_kind,
-        nals_to_avcc, parse_annex_b_access_unit, preferred_pixel_format, prepare_sample_nals,
-        validate_biplanar_layout, wants_ten_bit_pixel_format, wire, AnnexBCodec, BufferDepth,
-        ChromaSubsampling, ColorExtensionPlan, ColorPrimariesToken, ColorRange, DecodedVideoFrame,
-        NalKind, NativeDecodedVideoFrame, ParameterSetCache, PixelBufferFormat, PlaneLayout,
+        nals_to_length_prefixed, parse_access_unit, preferred_pixel_format, prepare_sample_nals,
+        validate_biplanar_layout, wants_ten_bit_pixel_format, wire, BufferDepth, ChromaSubsampling,
+        ColorExtensionPlan, ColorPrimariesToken, ColorRange, DecodedVideoFrame, NalCodec, NalKind,
+        NativeDecodedVideoFrame, ParameterSetCache, PixelBufferFormat, PlaneLayout,
         SamplePreparationError, SessionColor, StreamCodec, TransferFunctionToken, VideoDecodeError,
         VideoHeader, VideoStreamKey, YCbCrMatrixToken, BGRA_PIXEL_FORMAT, RGBA_PIXEL_FORMAT,
     };
@@ -2007,7 +764,7 @@ mod platform {
     /// alongside the fields parsed out of it. AV1's analogue of
     /// `ParameterSetCache`, kept as a separate field rather than folded
     /// into it because AV1 has no VPS/SPS/PPS and does not go through the
-    /// Annex-B pipeline `ParameterSetCache` serves (see [`AnnexBCodec`]).
+    /// Annex-B pipeline `ParameterSetCache` serves (see [`NalCodec`]).
     struct Av1SequenceCache {
         obu: Vec<u8>,
         fields: av1::SequenceHeaderFields,
@@ -2086,7 +843,7 @@ mod platform {
             let stream = VideoStreamKey::from_header(codec, header)?;
             if stream.requires_session_rebuild(self.stream) {
                 self.stream = Some(stream);
-                match AnnexBCodec::from_stream_codec(codec) {
+                match super::annex_b_codec(codec) {
                     Some(annex_b_codec) => self.parameter_sets.reset(annex_b_codec),
                     None => self.av1_sequence = None,
                 }
@@ -2097,18 +854,23 @@ mod platform {
                 self.waiting_for_keyframe = true;
             }
 
-            let Some(annex_b_codec) = AnnexBCodec::from_stream_codec(codec) else {
+            let Some(annex_b_codec) = super::annex_b_codec(codec) else {
                 return self.decode_av1(codec, header, payload);
             };
 
-            let nals = parse_annex_b_access_unit(annex_b_codec, payload).map_err(|error| {
+            let nals = parse_access_unit(annex_b_codec, payload).map_err(|error| {
                 self.waiting_for_keyframe = true;
-                VideoDecodeError::Backend(error)
+                VideoDecodeError::Backend(error.to_string())
             })?;
-            let format_changed = self.parameter_sets.observe(annex_b_codec, &nals);
-            if format_changed && annex_b_codec == AnnexBCodec::H265 {
-                if let (Some(stream), Some(sps)) = (self.stream, self.parameter_sets.sps.as_deref())
-                {
+            let update = self.parameter_sets.observe(annex_b_codec, &nals);
+            if update.new_sps && annex_b_codec == NalCodec::H265 {
+                if let Some(sps) = self.parameter_sets.sps() {
+                    super::log_received_stream_truth(sps);
+                }
+            }
+            let format_changed = update.changed;
+            if format_changed && annex_b_codec == NalCodec::H265 {
+                if let (Some(stream), Some(sps)) = (self.stream, self.parameter_sets.sps()) {
                     super::warn_when_the_stream_contradicts_its_header(stream, sps);
                 }
             }
@@ -2144,7 +906,7 @@ mod platform {
                     return Ok(None);
                 }
             };
-            let sample_payload = nals_to_avcc(&decode_nals);
+            let sample_payload = nals_to_length_prefixed(&decode_nals);
             let unit_summary = summarize_nals(annex_b_codec, &decode_nals);
             let Some(format) = &self.format else {
                 self.waiting_for_keyframe = true;
@@ -2171,7 +933,7 @@ mod platform {
 
         /// AV1's decode path: OBU-framed, not Annex-B NAL-framed, and with
         /// no VPS/SPS/PPS-style parameter set, so it cannot go through
-        /// [`Self::decode`]'s Annex-B pipeline above (see [`AnnexBCodec`]).
+        /// [`Self::decode`]'s Annex-B pipeline above (see [`NalCodec`]).
         /// Reuses [`Self::rebuild_session_if_ready`] (session creation,
         /// colour-extension stamping, pixel-format request,
         /// hardware-acceleration query) and [`Self::drain_decoded_messages`]
@@ -2318,8 +1080,7 @@ mod platform {
 
             let base_format = match codec {
                 StreamCodec::H264 => {
-                    let Some(parameter_sets) =
-                        self.parameter_sets.parameter_sets(AnnexBCodec::H264)
+                    let Some(parameter_sets) = self.parameter_sets.parameter_sets(NalCodec::H264)
                     else {
                         self.waiting_for_keyframe = true;
                         return Ok(());
@@ -2327,8 +1088,7 @@ mod platform {
                     make_h264_format_description(parameter_sets[0], parameter_sets[1])?
                 }
                 StreamCodec::H265 => {
-                    let Some(parameter_sets) =
-                        self.parameter_sets.parameter_sets(AnnexBCodec::H265)
+                    let Some(parameter_sets) = self.parameter_sets.parameter_sets(NalCodec::H265)
                     else {
                         self.waiting_for_keyframe = true;
                         return Ok(());
@@ -3252,7 +2012,8 @@ mod platform {
                 pixel_format: format!("{}-{range_name}-iosurface", fourcc_string(format)),
                 backend: "videotoolbox-iosurface",
                 native: Some(NativeDecodedVideoFrame {
-                    pixel_buffer: pixel_buffer.clone(),
+                    picture: pixel_buffer.clone(),
+                    format: super::native_picture_format(format),
                     video: native_video,
                 }),
             })
@@ -3321,7 +2082,8 @@ mod platform {
         };
         frame.pixel_format = format!("{}-{range_name}->BGRA->RGBA", fourcc_string(format));
         frame.native = Some(NativeDecodedVideoFrame {
-            pixel_buffer: pixel_buffer.clone(),
+            picture: pixel_buffer.clone(),
+            format: super::native_picture_format(format),
             video: native_video,
         });
         Ok(frame)
@@ -3387,36 +2149,22 @@ mod platform {
         matrix: wire::ColorMatrix,
         session_color: SessionColor,
     ) -> arcen_media::VideoConfiguration {
-        arcen_media::VideoConfiguration {
-            codec: match codec {
+        arcen_deck_core::decode::wire_video_configuration(
+            match codec {
                 StreamCodec::H264 => arcen_media::VideoCodec::H264,
                 StreamCodec::H265 => arcen_media::VideoCodec::H265,
                 StreamCodec::Av1 => arcen_media::VideoCodec::Av1,
             },
-            chroma: match chroma {
-                ChromaSubsampling::Yuv420 => arcen_media::ChromaSubsampling::Yuv420,
-                ChromaSubsampling::Yuv422 => arcen_media::ChromaSubsampling::Yuv422,
-                ChromaSubsampling::Yuv444 => arcen_media::ChromaSubsampling::Yuv444,
-            },
-            bit_depth: match bit_depth {
-                wire::BitDepth::Eight => arcen_media::BitDepth::Eight,
-                wire::BitDepth::Ten => arcen_media::BitDepth::Ten,
-                wire::BitDepth::Twelve => arcen_media::BitDepth::Twelve,
-            },
-            range: if full_range {
-                arcen_media::ColorRange::Full
+            chroma,
+            bit_depth,
+            if full_range {
+                wire::ColorRange::Full
             } else {
-                arcen_media::ColorRange::Limited
+                wire::ColorRange::Limited
             },
-            matrix: match matrix {
-                wire::ColorMatrix::Bt709 => arcen_media::ColorMatrix::Bt709,
-                wire::ColorMatrix::Identity => arcen_media::ColorMatrix::Identity,
-                wire::ColorMatrix::Bt601 => arcen_media::ColorMatrix::Bt601,
-                wire::ColorMatrix::Bt2020Ncl => arcen_media::ColorMatrix::Bt2020Ncl,
-            },
-            primaries: session_color.primaries,
-            transfer: session_color.transfer,
-        }
+            matrix,
+            session_color,
+        )
     }
 
     pub(super) fn actual_native_video_configuration(
@@ -3450,7 +2198,7 @@ mod platform {
         ms.clamp(0, i64::from(u32::MAX)) as u32
     }
 
-    fn summarize_nals(codec: AnnexBCodec, nals: &[&[u8]]) -> String {
+    fn summarize_nals(codec: NalCodec, nals: &[&[u8]]) -> String {
         let parts = nals
             .iter()
             .map(|nal| {
@@ -3626,9 +2374,9 @@ mod platform {
         full_range: bool,
         matrix: wire::ColorMatrix,
     ) -> Result<Option<bool>, String> {
-        let vps = super::build_hevc_vps(profile);
-        let sps = super::build_hevc_sps(profile);
-        let pps = super::build_hevc_pps();
+        let vps = arcen_media::bitstream::synth::build_hevc_vps(profile);
+        let sps = arcen_media::bitstream::synth::build_hevc_sps(profile);
+        let pps = arcen_media::bitstream::synth::build_hevc_pps();
         let format =
             make_hevc_format_description(&vps, &sps, &pps).map_err(|error| error.to_string())?;
         let plan = color_extension_plan(
@@ -3637,8 +2385,12 @@ mod platform {
             arcen_media::TransferCharacteristics::Bt709,
         );
         let format = apply_color_extensions(format, StreamCodec::H265, plan);
-        let attributes = preferred_pixel_format(profile.chroma(), profile.ten_bit(), full_range)
-            .and_then(|format| build_destination_attributes(format, false));
+        let attributes = preferred_pixel_format(
+            super::probe_profile_chroma(profile),
+            profile.ten_bit(),
+            full_range,
+        )
+        .and_then(|format| build_destination_attributes(format, false));
         let session = DecompressionSession::new_with_image_buffer_attributes(
             &format,
             attributes.as_ref(),
@@ -3651,8 +2403,8 @@ mod platform {
     /// Same shape as [`probe_hevc_session`] but for the Baseline H.264
     /// probe backing `supports_h264`.
     fn probe_h264_session() -> Result<Option<bool>, String> {
-        let sps = super::build_h264_sps();
-        let pps = super::build_h264_pps();
+        let sps = arcen_media::bitstream::synth::build_h264_sps();
+        let pps = arcen_media::bitstream::synth::build_h264_pps();
         let format = make_h264_format_description(&sps, &pps).map_err(|error| error.to_string())?;
         let attributes = preferred_pixel_format(ChromaSubsampling::Yuv420, false, false)
             .and_then(|format| build_destination_attributes(format, false));
@@ -3669,8 +2421,8 @@ mod platform {
     pub(super) fn probe_speed_decode_latency_policy() -> Result<(), String> {
         let policy = arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Speed)
             .decode_latency;
-        let h264_sps = super::build_h264_sps();
-        let h264_pps = super::build_h264_pps();
+        let h264_sps = arcen_media::bitstream::synth::build_h264_sps();
+        let h264_pps = arcen_media::bitstream::synth::build_h264_pps();
         let h264_format = make_h264_format_description(&h264_sps, &h264_pps)
             .map_err(|error| error.to_string())?;
         let h264_attributes = preferred_pixel_format(ChromaSubsampling::Yuv420, false, false)
@@ -3688,13 +2440,17 @@ mod platform {
             chroma_format_idc: 1,
             bit_depth: 8,
         };
-        let vps = super::build_hevc_vps(profile);
-        let sps = super::build_hevc_sps(profile);
-        let pps = super::build_hevc_pps();
+        let vps = arcen_media::bitstream::synth::build_hevc_vps(profile);
+        let sps = arcen_media::bitstream::synth::build_hevc_sps(profile);
+        let pps = arcen_media::bitstream::synth::build_hevc_pps();
         let hevc_format =
             make_hevc_format_description(&vps, &sps, &pps).map_err(|error| error.to_string())?;
-        let hevc_attributes = preferred_pixel_format(profile.chroma(), profile.ten_bit(), false)
-            .and_then(|format| build_destination_attributes(format, false));
+        let hevc_attributes = preferred_pixel_format(
+            super::probe_profile_chroma(profile),
+            profile.ten_bit(),
+            false,
+        )
+        .and_then(|format| build_destination_attributes(format, false));
         let hevc = DecompressionSession::new_with_image_buffer_attributes(
             &hevc_format,
             hevc_attributes.as_ref(),
@@ -3806,52 +2562,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_annex_b_nals_with_three_and_four_byte_start_codes() {
-        let bytes = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4,
-        ];
-        let nals = annex_b_nals(&bytes);
-        assert_eq!(
-            nals,
-            vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4][..]]
-        );
-        assert_eq!(nal_kind(AnnexBCodec::H264, nals[0]), NalKind::Sps);
-        assert_eq!(nal_kind(AnnexBCodec::H264, nals[1]), NalKind::Pps);
-        assert_eq!(nal_kind(AnnexBCodec::H264, nals[2]), NalKind::Keyframe);
-    }
-
-    #[test]
     fn speed_decode_latency_policy_does_not_block_real_vt_sessions() {
         platform::probe_speed_decode_latency_policy()
             .expect("Speed decode tuning must not reject H.264 or HEVC sessions");
-    }
-
-    #[test]
-    fn converts_annex_b_nals_to_avcc_length_prefixed_payload() {
-        let nals = vec![&[0x65, 1, 2][..], &[0x41, 3][..]];
-        let avcc = nals_to_avcc(&nals);
-        assert_eq!(avcc, vec![0, 0, 0, 3, 0x65, 1, 2, 0, 0, 0, 2, 0x41, 3]);
-    }
-
-    #[test]
-    fn classifies_hevc_nal_types() {
-        // First header byte = nal_type << 1 (layer/temporal bits zero).
-        assert_eq!(nal_kind(AnnexBCodec::H265, &[32 << 1, 1]), NalKind::Vps);
-        assert_eq!(nal_kind(AnnexBCodec::H265, &[33 << 1, 1]), NalKind::Sps);
-        assert_eq!(nal_kind(AnnexBCodec::H265, &[34 << 1, 1]), NalKind::Pps);
-        // IDR_W_RADL (19) and CRA (21) are keyframes.
-        assert_eq!(
-            nal_kind(AnnexBCodec::H265, &[19 << 1, 1]),
-            NalKind::Keyframe
-        );
-        assert_eq!(
-            nal_kind(AnnexBCodec::H265, &[21 << 1, 1]),
-            NalKind::Keyframe
-        );
-        // TRAIL_R (1) is a plain slice.
-        assert_eq!(nal_kind(AnnexBCodec::H265, &[1 << 1, 1]), NalKind::Slice);
-        // SEI (39) is not a slice.
-        assert_eq!(nal_kind(AnnexBCodec::H265, &[39 << 1, 1]), NalKind::Other);
     }
 
     #[test]
@@ -4322,211 +3035,15 @@ mod tests {
     }
 
     #[test]
-    fn h264_keyframes_receive_one_complete_cached_parameter_set() {
-        let sps = &[0x67, 0x64, 0x00][..];
-        let pps = &[0x68, 0xee][..];
-        let idr = &[0x65, 0x88][..];
-        let mut cache = ParameterSetCache::default();
-        assert!(cache.observe(AnnexBCodec::H264, &[sps, pps]));
-
-        let bare_idr = [idr];
-        let inline_idr = [sps, pps, idr];
-        let injected = prepare_sample_nals(AnnexBCodec::H264, &cache, &bare_idr)
-            .unwrap()
-            .unwrap();
-        assert_eq!(injected, vec![sps, pps, idr]);
-
-        let canonicalized = prepare_sample_nals(AnnexBCodec::H264, &cache, &inline_idr)
-            .unwrap()
-            .unwrap();
-        assert_eq!(canonicalized, vec![sps, pps, idr]);
-
-        // A rebuilt decoder session can reuse the active stream cache.
-        let recovered = prepare_sample_nals(AnnexBCodec::H264, &cache, &bare_idr)
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered, vec![sps, pps, idr]);
-    }
-
-    #[test]
-    fn h264_config_change_and_reset_require_a_complete_new_parameter_set() {
-        let old_sps = &[0x67, 1][..];
-        let old_pps = &[0x68, 1][..];
-        let new_sps = &[0x67, 2][..];
-        let new_pps = &[0x68, 2][..];
-        let idr = &[0x65, 9][..];
-        let mut cache = ParameterSetCache::default();
-        cache.observe(AnnexBCodec::H264, &[old_sps, old_pps]);
-
-        assert!(cache.observe(AnnexBCodec::H264, &[new_sps]));
-        assert!(!cache.is_complete(AnnexBCodec::H264));
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H264, &cache, &[idr]),
-            Err(SamplePreparationError::MissingParameterSets)
-        );
-        cache.observe(AnnexBCodec::H264, &[new_pps]);
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H264, &cache, &[idr])
-                .unwrap()
-                .unwrap(),
-            vec![new_sps, new_pps, idr]
-        );
-
-        cache.reset(AnnexBCodec::H264);
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H264, &cache, &[idr]),
-            Err(SamplePreparationError::MissingParameterSets)
-        );
-    }
-
-    #[test]
-    fn hevc_keyframes_receive_vps_sps_pps_once_and_codec_switch_clears_cache() {
-        let vps = &[32 << 1, 1][..];
-        let sps = &[33 << 1, 1][..];
-        let pps = &[34 << 1, 1][..];
-        let idr = &[19 << 1, 1][..];
-        let mut cache = ParameterSetCache::default();
-        cache.observe(AnnexBCodec::H265, &[vps, sps, pps]);
-
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H265, &cache, &[idr])
-                .unwrap()
-                .unwrap(),
-            vec![vps, sps, pps, idr]
-        );
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H265, &cache, &[vps, sps, pps, idr])
-                .unwrap()
-                .unwrap(),
-            vec![vps, sps, pps, idr]
-        );
-
-        cache.observe(AnnexBCodec::H264, &[]);
-        assert!(!cache.is_complete(AnnexBCodec::H264));
-        assert!(cache.parameter_sets(AnnexBCodec::H265).is_none());
-    }
-
-    #[test]
-    fn non_keyframes_are_not_injected_and_malformed_access_units_fail() {
-        let sps = &[0x67, 1][..];
-        let pps = &[0x68, 1][..];
-        let slice = &[0x41, 7][..];
-        let mut cache = ParameterSetCache::default();
-        cache.observe(AnnexBCodec::H264, &[sps, pps]);
-        assert_eq!(
-            prepare_sample_nals(AnnexBCodec::H264, &cache, &[slice])
-                .unwrap()
-                .unwrap(),
-            vec![slice]
-        );
-
-        assert!(parse_annex_b_access_unit(AnnexBCodec::H264, &[0x65, 1]).is_err());
-        assert!(parse_annex_b_access_unit(AnnexBCodec::H265, &[0, 0, 0, 1, 32 << 1]).is_err());
-        assert!(parse_annex_b_access_unit(AnnexBCodec::H264, &[]).is_err());
-
-        let padded = [0, 0, 0, 0, 1, 0x65, 1, 0, 0];
-        assert_eq!(
-            parse_annex_b_access_unit(AnnexBCodec::H264, &padded).unwrap(),
-            vec![&[0x65, 1][..]]
-        );
-    }
-
-    #[test]
     fn discontinuity_forces_keyframe_gating() {
         let mut decoder = NativeVideoDecoder::new();
         decoder.notify_discontinuity();
         assert!(decoder.wants_keyframe());
     }
 
-    // ---- w3-real-caps: bitstream::BitWriter / exp-Golomb ----
-
-    #[test]
-    fn exp_golomb_ue_matches_known_reference_codes() {
-        // ITU-T H.264/H.265 9.1, Table 9-2: ue(0)="1", ue(1)="010",
-        // ue(2)="011", ue(3)="00100", ue(4)="00101", ue(5)="00110",
-        // ue(6)="00111", ue(7)="0001000".
-        let cases: &[(u32, &str)] = &[
-            (0, "1"),
-            (1, "010"),
-            (2, "011"),
-            (3, "00100"),
-            (4, "00101"),
-            (5, "00110"),
-            (6, "00111"),
-            (7, "0001000"),
-        ];
-        for &(value, expected_bits) in cases {
-            let mut w = bitstream::BitWriter::new();
-            w.write_ue(value);
-            let bit_len = w.bit_len();
-            assert_eq!(bit_len, expected_bits.len(), "ue({value}) bit length");
-            w.write_zeros(((8 - bit_len % 8) % 8) as u32);
-            let bytes = w.into_rbsp();
-            let mut reader = bitstream::BitReader::new(&bytes);
-            let actual: String = (0..bit_len)
-                .map(|_| if reader.read_bit() { '1' } else { '0' })
-                .collect();
-            assert_eq!(actual, expected_bits, "ue({value})");
-        }
-    }
-
-    #[test]
-    fn exp_golomb_se_matches_the_signed_mapping() {
-        // ITU-T H.264/H.265 Table 9-3: se(0)=ue(0), se(1)=ue(1),
-        // se(-1)=ue(2), se(2)=ue(3), se(-2)=ue(4). Compares full bit
-        // content (not just length) against an independently-built ue()
-        // writer for the mapped codeNum.
-        let cases: &[(i32, u32)] = &[(0, 0), (1, 1), (-1, 2), (2, 3), (-2, 4)];
-        for &(value, expected_ue) in cases {
-            let mut actual = bitstream::BitWriter::new();
-            actual.write_se(value);
-            let bit_len = actual.bit_len();
-            let mut expected = bitstream::BitWriter::new();
-            expected.write_ue(expected_ue);
-            assert_eq!(bit_len, expected.bit_len(), "se({value}) bit length");
-
-            let padding = ((8 - bit_len % 8) % 8) as u32;
-            actual.write_zeros(padding);
-            expected.write_zeros(padding);
-            assert_eq!(actual.into_rbsp(), expected.into_rbsp(), "se({value}) bits");
-        }
-    }
-
-    #[test]
-    fn emulation_prevention_escapes_every_start_code_like_run_but_nothing_else() {
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 0]),
-            vec![0, 0, 3, 0]
-        );
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 1]),
-            vec![0, 0, 3, 1]
-        );
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 2]),
-            vec![0, 0, 3, 2]
-        );
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 3]),
-            vec![0, 0, 3, 3]
-        );
-        // 0x04 and above never need escaping.
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 4]),
-            vec![0, 0, 4]
-        );
-        // A run of more than two zeros only re-triggers after the
-        // inserted 0x03 resets the count.
-        assert_eq!(
-            bitstream::escape_emulation_prevention(&[0, 0, 0, 0, 1]),
-            vec![0, 0, 3, 0, 0, 3, 1]
-        );
-    }
-
-    // ---- w3-real-caps: synthetic parameter-set builders ----
-
     #[test]
     fn a_stream_that_is_less_than_its_header_is_caught() {
+        use arcen_media::bitstream::synth::build_hevc_sps;
         let grading_header = VideoStreamKey {
             codec: StreamCodec::H265,
             chroma: ChromaSubsampling::Yuv444,
@@ -4546,121 +3063,6 @@ mod tests {
             bit_depth: 10,
         });
         assert!(stream_contradicting_header(grading_header, &rext).is_none());
-    }
-
-    #[test]
-    fn hevc_nal_headers_match_the_canonical_two_byte_prefixes() {
-        let profile = HevcProbeProfile {
-            chroma_format_idc: 1,
-            bit_depth: 8,
-        };
-        assert_eq!(&build_hevc_vps(profile)[..2], &[0x40, 0x01]);
-        assert_eq!(&build_hevc_sps(profile)[..2], &[0x42, 0x01]);
-        assert_eq!(&build_hevc_pps()[..2], &[0x44, 0x01]);
-    }
-
-    #[test]
-    fn h264_nal_headers_match_the_canonical_sps_pps_prefixes() {
-        assert_eq!(build_h264_sps()[0], 0x67);
-        assert_eq!(build_h264_pps()[0], 0x68);
-    }
-
-    #[test]
-    fn hevc_general_profile_idc_matches_x265_style_profile_selection() {
-        let main = HevcProbeProfile {
-            chroma_format_idc: 1,
-            bit_depth: 8,
-        };
-        let main10 = HevcProbeProfile {
-            chroma_format_idc: 1,
-            bit_depth: 10,
-        };
-        let main12 = HevcProbeProfile {
-            chroma_format_idc: 1,
-            bit_depth: 12,
-        };
-        let yuv444_8 = HevcProbeProfile {
-            chroma_format_idc: 3,
-            bit_depth: 8,
-        };
-        assert_eq!(hevc_general_profile_idc(main), 1);
-        assert_eq!(hevc_general_profile_idc(main10), 2);
-        assert_eq!(hevc_general_profile_idc(main12), 4);
-        assert_eq!(hevc_general_profile_idc(yuv444_8), 4);
-    }
-
-    #[test]
-    fn hevc_sps_round_trips_profile_chroma_and_bit_depth_for_every_probed_profile() {
-        // Independently re-parses (not via the writer) each SPS the real
-        // probe builds, confirming the fields VideoToolbox actually keys
-        // decodability on land where the builder above believes they do.
-        let profiles = [
-            HevcProbeProfile {
-                chroma_format_idc: 1,
-                bit_depth: 8,
-            },
-            HevcProbeProfile {
-                chroma_format_idc: 1,
-                bit_depth: 10,
-            },
-            HevcProbeProfile {
-                chroma_format_idc: 1,
-                bit_depth: 12,
-            },
-            HevcProbeProfile {
-                chroma_format_idc: 3,
-                bit_depth: 8,
-            },
-        ];
-        for profile in profiles {
-            let sps = build_hevc_sps(profile);
-            let rbsp = bitstream::unescape_emulation_prevention(&sps[2..]);
-            let mut r = bitstream::BitReader::new(&rbsp);
-            r.skip(4); // sps_video_parameter_set_id
-            r.skip(3); // sps_max_sub_layers_minus1
-            r.skip(1); // sps_temporal_id_nesting_flag
-            r.skip(3); // general_profile_space + general_tier_flag
-            let general_profile_idc = r.read_bits(5);
-            assert_eq!(
-                general_profile_idc,
-                u32::from(hevc_general_profile_idc(profile)),
-                "{profile:?}"
-            );
-            r.skip(32); // general_profile_compatibility_flag[32]
-            r.skip(4); // progressive/interlaced/non_packed/frame_only source flags
-            match general_profile_idc {
-                4..=10 => r.skip(9 + 34),
-                2 => r.skip(7 + 1 + 35),
-                _ => r.skip(43),
-            }
-            r.skip(1); // general_inbld_flag / reserved
-            r.skip(8); // general_level_idc
-            r.read_ue(); // sps_seq_parameter_set_id
-            let chroma_format_idc = r.read_ue();
-            assert_eq!(
-                chroma_format_idc,
-                u32::from(profile.chroma_format_idc),
-                "{profile:?}"
-            );
-            if profile.chroma_format_idc == 3 {
-                r.skip(1); // separate_colour_plane_flag
-            }
-            assert_eq!(r.read_ue(), u32::from(PROBE_DIMENSION)); // pic_width_in_luma_samples
-            assert_eq!(r.read_ue(), u32::from(PROBE_DIMENSION)); // pic_height_in_luma_samples
-            r.skip(1); // conformance_window_flag
-            let bit_depth_luma_minus8 = r.read_ue();
-            let bit_depth_chroma_minus8 = r.read_ue();
-            assert_eq!(
-                bit_depth_luma_minus8,
-                u32::from(profile.bit_depth - 8),
-                "{profile:?}"
-            );
-            assert_eq!(
-                bit_depth_chroma_minus8,
-                u32::from(profile.bit_depth - 8),
-                "{profile:?}"
-            );
-        }
     }
 
     // ---- w3-real-caps: DecodeCapabilities / probe caching ----
@@ -4822,334 +3224,8 @@ mod tests {
     fn annex_b_codec_maps_h264_and_h265_but_not_av1() {
         // AV1 uses OBU framing, not Annex-B, and has no VPS/SPS/PPS -- it
         // must never reach the Annex-B pipeline.
-        assert_eq!(
-            AnnexBCodec::from_stream_codec(StreamCodec::H264),
-            Some(AnnexBCodec::H264)
-        );
-        assert_eq!(
-            AnnexBCodec::from_stream_codec(StreamCodec::H265),
-            Some(AnnexBCodec::H265)
-        );
-        assert_eq!(AnnexBCodec::from_stream_codec(StreamCodec::Av1), None);
-    }
-
-    #[test]
-    fn parses_a_temporal_delimiter_then_a_sequence_header_obu() {
-        // Hand-computed bytes (see inline comments for the exact bit
-        // layout), independent of any writer: this exercises the OBU
-        // framing layer itself (`av1::parse_obus`), not the
-        // sequence-header field parser exercised by the round-trip tests
-        // below.
-        //
-        // Temporal delimiter: obu_forbidden_bit=0, obu_type=2
-        // (OBU_TEMPORAL_DELIMITER), obu_extension_flag=0,
-        // obu_has_size_field=1, obu_reserved_1bit=0
-        //   -> 0_0010_0_1_0 = 0x12; obu_size = leb128(0) = 0x00 (zero
-        //   payload bytes -- av1-spec: "the temporal delimiter has an
-        //   empty payload").
-        // Sequence header: obu_type=1 (OBU_SEQUENCE_HEADER), otherwise
-        // identical framing bits -> 0_0001_0_1_0 = 0x0A; obu_size =
-        // leb128(1) = 0x01; one payload byte 0xAB (arbitrary content --
-        // this test only checks OBU framing, not field decoding).
-        let bytes = [0x12, 0x00, 0x0A, 0x01, 0xAB];
-        let obus = av1::parse_obus(&bytes).expect("well-formed OBU stream");
-        assert_eq!(obus.len(), 2);
-        assert_eq!(obus[0].obu_type, av1::ObuType::TemporalDelimiter);
-        assert_eq!(obus[0].whole, &bytes[0..2]);
-        assert!(obus[0].payload.is_empty());
-        assert_eq!(obus[1].obu_type, av1::ObuType::SequenceHeader);
-        assert_eq!(obus[1].whole, &bytes[2..5]);
-        assert_eq!(obus[1].payload, &[0xAB]);
-        assert_eq!(
-            av1::summarize(&obus),
-            "obus=[temporal_delimiter:2,seq_header:3]"
-        );
-    }
-
-    #[test]
-    fn last_obu_may_omit_its_size_field_and_fills_the_remainder() {
-        // Frame OBU (type 6) with obu_has_size_field=0: obu_forbidden_bit=0,
-        // obu_type=0110, obu_extension_flag=0, obu_has_size_field=0,
-        // obu_reserved_1bit=0 -> 0_0110_0_0_0 = 0x30. Per av1-isobmff's "AV1
-        // Sample Format", this is only permitted for the last OBU in a
-        // sample, whose payload then fills the rest of the buffer.
-        let bytes = [0x30, 0xAB, 0xCD];
-        let obus = av1::parse_obus(&bytes).expect("well-formed OBU stream");
-        assert_eq!(obus.len(), 1);
-        assert_eq!(obus[0].obu_type, av1::ObuType::Frame);
-        assert_eq!(obus[0].payload, &[0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn parse_obus_rejects_forbidden_bit_and_truncation() {
-        assert!(av1::parse_obus(&[0x80]).is_err(), "obu_forbidden_bit set");
-        assert!(av1::parse_obus(&[]).unwrap().is_empty());
-        // obu_has_size_field=1 but the leb128 byte is missing entirely.
-        assert!(av1::parse_obus(&[0x0A]).is_err());
-        // obu_size (5) claims more payload than the 1 byte that remains.
-        assert!(av1::parse_obus(&[0x0A, 0x05, 0xAB]).is_err());
-    }
-
-    /// Big-endian, MSB-first bit writer mirroring [`av1`]'s private
-    /// `BitReader`, test-only: builds synthetic Sequence Header OBU
-    /// payloads to verify `av1::parse_sequence_header` extracts the exact
-    /// fields that were written. Each test below writes every syntax
-    /// element inline, in the exact order/width given by
-    /// AOMediaCodec/av1-spec `06.bitstream.syntax.md`'s
-    /// `sequence_header_obu()`/`color_config()` (the same tables
-    /// `parse_sequence_header`'s own doc cites), rather than going through
-    /// a shared "spec to bits" helper -- so a bug in one is not masked by
-    /// the same bug in the other.
-    #[derive(Default)]
-    struct TestBitWriter {
-        bytes: Vec<u8>,
-        partial: u8,
-        bit_pos: u8,
-    }
-
-    impl TestBitWriter {
-        fn write_bit(&mut self, bit: bool) {
-            self.partial = (self.partial << 1) | u8::from(bit);
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bytes.push(self.partial);
-                self.partial = 0;
-                self.bit_pos = 0;
-            }
-        }
-
-        /// `f(n)`: writes the low `n_bits` of `value`, most-significant-bit-first.
-        fn f(&mut self, value: u32, n_bits: u32) {
-            for i in (0..n_bits).rev() {
-                self.write_bit((value >> i) & 1 != 0);
-            }
-        }
-
-        /// Zero-pads to the next byte boundary and returns the bytes.
-        fn into_bytes(mut self) -> Vec<u8> {
-            while self.bit_pos != 0 {
-                self.write_bit(false);
-            }
-            self.bytes
-        }
-    }
-
-    #[test]
-    fn parses_a_reduced_still_picture_sequence_header_with_default_color_description() {
-        let mut w = TestBitWriter::default();
-        w.f(0, 3); // seq_profile = 0 (Main)
-        w.f(1, 1); // still_picture = 1
-        w.f(1, 1); // reduced_still_picture_header = 1
-        w.f(4, 5); // seq_level_idx[0] = 4 (seq_tier[0] forced 0)
-                   // reduced_still_picture_header skips timing/operating-point/frame-id fields entirely.
-        w.f(10, 4); // frame_width_bits_minus_1 = 10 (n = 11 bits)
-        w.f(10, 4); // frame_height_bits_minus_1 = 10 (n = 11 bits)
-        w.f(1919, 11); // max_frame_width_minus_1 = 1919 -> width = 1920
-        w.f(1079, 11); // max_frame_height_minus_1 = 1079 -> height = 1080
-                       // frame_id_numbers_present_flag is forced 0 by reduced_still_picture_header (not written).
-        w.f(0, 1); // use_128x128_superblock
-        w.f(0, 1); // enable_filter_intra
-        w.f(0, 1); // enable_intra_edge_filter
-                   // reduced_still_picture_header skips the enable_interintra_compound..order_hint_bits block.
-        w.f(0, 1); // enable_superres
-        w.f(0, 1); // enable_cdef
-        w.f(0, 1); // enable_restoration
-                   // color_config():
-        w.f(0, 1); // high_bitdepth = 0 (8-bit)
-                   // seq_profile != 2, so no twelve_bit read.
-        w.f(0, 1); // mono_chrome = 0 (seq_profile != 1, so this bit is read)
-        w.f(0, 1); // color_description_present_flag = 0 -> CP/TC/MC default to UNSPECIFIED(2)
-                   // Not the BT.709/sRGB/Identity shortcut (primaries default to 2, not 1) -> general branch:
-        w.f(1, 1); // color_range = 1 (value irrelevant to this parser)
-                   // seq_profile == 0 -> subsampling_x = subsampling_y = 1 (not read from the bitstream).
-        w.f(2, 2); // chroma_sample_position = 2 (subsampling_x && subsampling_y are both 1, so this IS read)
-        let payload = w.into_bytes();
-
-        let fields = av1::parse_sequence_header(&payload).expect("valid payload");
-        assert_eq!(fields.seq_profile, 0);
-        assert_eq!(fields.seq_level_idx_0, 4);
-        assert_eq!(fields.seq_tier_0, 0);
-        assert!(!fields.high_bitdepth);
-        assert!(!fields.twelve_bit);
-        assert!(!fields.monochrome);
-        assert_eq!(fields.chroma_subsampling_x, 1);
-        assert_eq!(fields.chroma_subsampling_y, 1);
-        assert_eq!(fields.chroma_sample_position, 2);
-        assert_eq!(fields.max_frame_width, 1920);
-        assert_eq!(fields.max_frame_height, 1080);
-    }
-
-    #[test]
-    fn parses_a_non_reduced_sequence_header_with_two_operating_points_and_explicit_color_description(
-    ) {
-        let mut w = TestBitWriter::default();
-        w.f(1, 3); // seq_profile = 1 (High)
-        w.f(0, 1); // still_picture = 0
-        w.f(0, 1); // reduced_still_picture_header = 0
-        w.f(0, 1); // timing_info_present_flag = 0
-        w.f(0, 1); // initial_display_delay_present_flag = 0
-        w.f(1, 5); // operating_points_cnt_minus_1 = 1 (two operating points)
-                   // operating point 0:
-        w.f(0, 12); // operating_point_idc[0]
-        w.f(8, 5); // seq_level_idx[0] = 8 (> 7, so seq_tier[0] is read)
-        w.f(1, 1); // seq_tier[0] = 1 (High tier)
-                   // decoder_model_info_present_flag is forced 0, so operating_parameters_info() never
-                   // appears; initial_display_delay_present_flag == 0, so nothing more for this point.
-                   // operating point 1:
-        w.f(0, 12); // operating_point_idc[1]
-        w.f(4, 5); // seq_level_idx[1] = 4 (<= 7, seq_tier[1] = 0, not read)
-        w.f(11, 4); // frame_width_bits_minus_1 = 11 (n = 12 bits)
-        w.f(11, 4); // frame_height_bits_minus_1 = 11 (n = 12 bits)
-        w.f(3839, 12); // max_frame_width_minus_1 = 3839 -> width = 3840
-        w.f(2159, 12); // max_frame_height_minus_1 = 2159 -> height = 2160
-        w.f(0, 1); // frame_id_numbers_present_flag = 0 (explicitly read; not reduced)
-        w.f(1, 1); // use_128x128_superblock
-        w.f(1, 1); // enable_filter_intra
-        w.f(0, 1); // enable_intra_edge_filter
-                   // Not reduced -> the full block:
-        w.f(0, 1); // enable_interintra_compound
-        w.f(0, 1); // enable_masked_compound
-        w.f(0, 1); // enable_warped_motion
-        w.f(0, 1); // enable_dual_filter
-        w.f(1, 1); // enable_order_hint = 1
-        w.f(0, 1); // enable_jnt_comp
-        w.f(0, 1); // enable_ref_frame_mvs
-        w.f(1, 1); // seq_choose_screen_content_tools = 1 -> SELECT (2), no explicit bit
-        w.f(1, 1); // seq_choose_integer_mv = 1 -> SELECT, no explicit bit (read because 2 > 0)
-        w.f(2, 3); // order_hint_bits_minus_1 = 2 (enable_order_hint == 1)
-        w.f(1, 1); // enable_superres
-        w.f(1, 1); // enable_cdef
-        w.f(1, 1); // enable_restoration
-                   // color_config():
-        w.f(1, 1); // high_bitdepth = 1
-                   // seq_profile == 1, not 2, so no twelve_bit read even though high_bitdepth is set.
-                   // seq_profile == 1 -> mono_chrome is NOT read (forced 0).
-        w.f(1, 1); // color_description_present_flag = 1
-        w.f(9, 8); // color_primaries = 9 (BT.2020)
-        w.f(16, 8); // transfer_characteristics = 16 (PQ)
-        w.f(9, 8); // matrix_coefficients = 9 (BT.2020 NCL)
-                   // Not the BT.709/sRGB/Identity shortcut (primaries=9) -> general branch:
-        w.f(1, 1); // color_range = 1
-                   // seq_profile == 1 -> subsampling_x = subsampling_y = 0 (not read); both zero -> no
-                   // chroma_sample_position read either.
-        let payload = w.into_bytes();
-
-        let fields = av1::parse_sequence_header(&payload).expect("valid payload");
-        assert_eq!(fields.seq_profile, 1);
-        assert_eq!(fields.seq_level_idx_0, 8);
-        assert_eq!(fields.seq_tier_0, 1);
-        assert!(fields.high_bitdepth);
-        assert!(!fields.twelve_bit);
-        assert!(!fields.monochrome);
-        assert_eq!(fields.chroma_subsampling_x, 0);
-        assert_eq!(fields.chroma_subsampling_y, 0);
-        assert_eq!(fields.chroma_sample_position, 0);
-        assert_eq!(fields.max_frame_width, 3840);
-        assert_eq!(fields.max_frame_height, 2160);
-    }
-
-    #[test]
-    fn parses_a_monochrome_sequence_header() {
-        let mut w = TestBitWriter::default();
-        w.f(0, 3); // seq_profile = 0
-        w.f(1, 1); // still_picture = 1
-        w.f(1, 1); // reduced_still_picture_header = 1
-        w.f(0, 5); // seq_level_idx[0] = 0
-        w.f(5, 4); // frame_width_bits_minus_1 = 5 (n = 6 bits)
-        w.f(5, 4); // frame_height_bits_minus_1 = 5 (n = 6 bits)
-        w.f(63, 6); // max_frame_width_minus_1 = 63 -> width = 64
-        w.f(63, 6); // max_frame_height_minus_1 = 63 -> height = 64
-        w.f(0, 1); // use_128x128_superblock
-        w.f(0, 1); // enable_filter_intra
-        w.f(0, 1); // enable_intra_edge_filter
-        w.f(0, 1); // enable_superres
-        w.f(0, 1); // enable_cdef
-        w.f(0, 1); // enable_restoration
-                   // color_config():
-        w.f(0, 1); // high_bitdepth = 0
-        w.f(1, 1); // mono_chrome = 1 (seq_profile != 1, so this bit is read)
-        w.f(0, 1); // color_description_present_flag = 0
-                   // mono_chrome branch reads exactly one more bit (color_range) then returns:
-        w.f(1, 1); // color_range (value irrelevant to this parser)
-        let payload = w.into_bytes();
-
-        let fields = av1::parse_sequence_header(&payload).expect("valid payload");
-        assert!(fields.monochrome);
-        assert_eq!(fields.chroma_subsampling_x, 1);
-        assert_eq!(fields.chroma_subsampling_y, 1);
-        assert_eq!(fields.chroma_sample_position, 0);
-        assert_eq!(fields.max_frame_width, 64);
-        assert_eq!(fields.max_frame_height, 64);
-    }
-
-    #[test]
-    fn rejects_timing_info_present_flag() {
-        let mut w = TestBitWriter::default();
-        w.f(0, 3); // seq_profile
-        w.f(0, 1); // still_picture
-        w.f(0, 1); // reduced_still_picture_header = 0
-        w.f(1, 1); // timing_info_present_flag = 1
-        let payload = w.into_bytes();
-        let error = av1::parse_sequence_header(&payload).expect_err("must reject timing info");
-        assert!(error.contains("timing_info_present_flag"));
-    }
-
-    #[test]
-    fn parse_sequence_header_rejects_a_truncated_payload() {
-        assert!(av1::parse_sequence_header(&[]).is_err());
-        // Eight bits is nowhere near enough for even the reduced branch.
-        assert!(av1::parse_sequence_header(&[0x00]).is_err());
-    }
-
-    #[test]
-    fn build_av1c_packs_the_header_bytes_exactly_per_the_isobmff_spec() {
-        // AOMediaCodec/av1-isobmff `index.bs` section 2.3.3
-        // (`AV1CodecConfigurationRecord`): marker(1)=1,version(7)=1 ->
-        // 0x81; seq_profile(3)=0,seq_level_idx_0(5)=4 -> 0b000_00100 =
-        // 0x04; seq_tier_0(1)=0,high_bitdepth(1)=0,twelve_bit(1)=0,
-        // monochrome(1)=0,ss_x(1)=1,ss_y(1)=1,csp(2)=0b00 ->
-        // 0b0_0_0_0_1_1_00 = 0x0C; reserved/no-delay byte -> 0x00.
-        let fields = av1::SequenceHeaderFields {
-            seq_profile: 0,
-            seq_level_idx_0: 4,
-            seq_tier_0: 0,
-            high_bitdepth: false,
-            twelve_bit: false,
-            monochrome: false,
-            chroma_subsampling_x: 1,
-            chroma_subsampling_y: 1,
-            chroma_sample_position: 0,
-            max_frame_width: 1920,
-            max_frame_height: 1080,
-        };
-        let sequence_header_obu = [0xAA, 0xBB, 0xCC];
-        let record = av1::build_av1c(&fields, &sequence_header_obu);
-        assert_eq!(record, vec![0x81, 0x04, 0x0C, 0x00, 0xAA, 0xBB, 0xCC]);
-    }
-
-    #[test]
-    fn build_av1c_packs_a_second_field_combination_correctly() {
-        // seq_profile(3)=2,seq_level_idx_0(5)=31 -> 0b010_11111 = 0x5F;
-        // seq_tier_0(1)=1,high_bitdepth(1)=1,twelve_bit(1)=0,
-        // monochrome(1)=1,ss_x(1)=1,ss_y(1)=1,csp(2)=0b11 ->
-        // 0b1_1_0_1_1_1_11 = 0xDF.
-        let fields = av1::SequenceHeaderFields {
-            seq_profile: 2,
-            seq_level_idx_0: 31,
-            seq_tier_0: 1,
-            high_bitdepth: true,
-            twelve_bit: false,
-            monochrome: true,
-            chroma_subsampling_x: 1,
-            chroma_subsampling_y: 1,
-            chroma_sample_position: 3,
-            max_frame_width: 64,
-            max_frame_height: 64,
-        };
-        let sequence_header_obu = [0x01, 0x02];
-        let record = av1::build_av1c(&fields, &sequence_header_obu);
-        assert_eq!(record, vec![0x81, 0x5F, 0xDF, 0x00, 0x01, 0x02]);
-        // configOBUs is the input slice, byte-for-byte, never re-serialised.
-        assert_eq!(&record[4..], &sequence_header_obu);
+        assert_eq!(annex_b_codec(StreamCodec::H264), Some(NalCodec::H264));
+        assert_eq!(annex_b_codec(StreamCodec::H265), Some(NalCodec::H265));
+        assert_eq!(annex_b_codec(StreamCodec::Av1), None);
     }
 }

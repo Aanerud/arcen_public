@@ -378,7 +378,14 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
     config.datagram_send_buffer_size(datagram_buffer);
 
     // Reduce send-path CPU on NICs with GSO support; no-op on unsupported.
-    config.enable_segmentation_offload(true);
+    // `ARCEN_QUIC_SEGMENTATION_OFFLOAD=on|off` overrides (lab A/B knob); a
+    // Windows Deck's lane carrier turns it off (`lane_transport_config`).
+    config.enable_segmentation_offload(segmentation_offload_choice(
+        std::env::var("ARCEN_QUIC_SEGMENTATION_OFFLOAD")
+            .ok()
+            .as_deref(),
+        true,
+    ));
 
     // ACK frequency: request the peer ACK every packet immediately (threshold
     // = 0) with a 5ms max delay. At ~33ms LAN RTT the default 25ms max_ack_delay
@@ -394,6 +401,34 @@ pub fn recommended_transport_config(policy: &BoundedTransportPolicy) -> quinn::T
     config.ack_frequency_config(Some(ack_freq));
 
     config
+}
+
+/// Whether QUIC sends may use segmentation offload (GSO/USO): the
+/// `ARCEN_QUIC_SEGMENTATION_OFFLOAD` override (`on|1|true`, `off|0|false`)
+/// when it is one of those, else `default`.
+fn segmentation_offload_choice(override_token: Option<&str>, default: bool) -> bool {
+    match override_token.map(|token| token.trim().to_ascii_lowercase()) {
+        Some(token) if matches!(token.as_str(), "on" | "1" | "true") => true,
+        Some(token) if matches!(token.as_str(), "off" | "0" | "false") => false,
+        _ => default,
+    }
+}
+
+/// The segmentation-offload default for one end of a lane carrier.
+///
+/// Off for a Deck on Windows: Windows UDP segmentation offload hands the NIC
+/// driver one large datagram to split, and a driver that mis-splits it loses
+/// every segment silently (measured on a Windows Deck behind the virtio
+/// `NetKVM` adapter: 915 of its first 1538 packets lost, and a sign-in
+/// response two packets long never arrived; with offload off, none lost;
+/// `virtio-win/kvm-guest-drivers-windows#1525`). A Deck sends little, so the
+/// offload saves it nothing worth that risk. Pier and other platforms keep it.
+#[must_use]
+pub(crate) const fn segmentation_offload_default(
+    local: arcen_protocol::lanes::LaneEndpoint,
+    windows: bool,
+) -> bool {
+    !(windows && matches!(local, arcen_protocol::lanes::LaneEndpoint::Deck))
 }
 
 /// Smallest send window [`interactive_send_window`] returns.
@@ -497,6 +532,12 @@ pub fn lane_transport_config(
     config.max_concurrent_uni_streams(VarInt::from_u32(limits.max_concurrent_uni_streams));
     config.keep_alive_interval(Some(crate::liveness::LANE_KEEPALIVE_INTERVAL));
     config.max_idle_timeout(Some(lane_idle_timeout()));
+    config.enable_segmentation_offload(segmentation_offload_choice(
+        std::env::var("ARCEN_QUIC_SEGMENTATION_OFFLOAD")
+            .ok()
+            .as_deref(),
+        segmentation_offload_default(local, cfg!(windows)),
+    ));
     config
 }
 
@@ -624,6 +665,28 @@ mod lane_window_tests {
                 "{limits:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod segmentation_offload_tests {
+    use super::{segmentation_offload_choice, segmentation_offload_default};
+    use arcen_protocol::lanes::LaneEndpoint;
+
+    #[test]
+    fn a_windows_deck_sends_without_segmentation_offload() {
+        assert!(!segmentation_offload_default(LaneEndpoint::Deck, true));
+        assert!(segmentation_offload_default(LaneEndpoint::Pier, true));
+        assert!(segmentation_offload_default(LaneEndpoint::Deck, false));
+        assert!(segmentation_offload_default(LaneEndpoint::Pier, false));
+    }
+
+    #[test]
+    fn the_override_wins_only_with_a_known_token() {
+        assert!(segmentation_offload_choice(Some(" ON "), false));
+        assert!(!segmentation_offload_choice(Some("0"), true));
+        assert!(segmentation_offload_choice(Some("auto"), true));
+        assert!(!segmentation_offload_choice(None, false));
     }
 }
 

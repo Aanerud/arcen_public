@@ -1,0 +1,20 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18444
+  },
+  "tls": {
+    "mode": "pem",
+    "certificate": "C:\\ProgramData\\Arcen\\raw-customer.crt",
+    "private_key": "C:\\ProgramData\\Arcen\\raw-customer.key",
+    "minimum_version": "TLS1.3",
+    "expected_sans": [
+      "raw-pier.customer.example"
+    ]
+  },
+  "platform": {
+    "credential_provider": {
+      "secret": "raw-secret"
+    }
+  }
+}

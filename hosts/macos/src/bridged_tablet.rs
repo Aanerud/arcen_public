@@ -30,6 +30,12 @@ pub const PROBING: &str = "still checking whether this Mac can create virtual HI
 pub const HOST_PEN_NOTICE: &str = "Native tablet is active. This Mac's Pier reads the pen \
      itself and posts tablet events with pressure, tilt, barrel buttons and eraser; the \
      tablet maker's driver settings, ExpressKeys and touch are not used.";
+/// Told to a Deck whose tablet has no dedicated reader: this Pier reads the
+/// pen by its own HID report descriptor (Q-16: any tablet works by default).
+pub const GENERIC_PEN_NOTICE: &str = "Native tablet is active. This Mac's Pier reads the pen \
+     from its standard HID reports and posts tablet events with what the tablet reports \
+     (pressure, tilt, buttons, eraser); the maker's driver settings, ExpressKeys and touch \
+     are not used.";
 /// How long after a refused probe the next session may probe again. Short:
 /// the probe is one short-lived child, and a grant given since must be seen
 /// by the very next connection.
@@ -226,73 +232,12 @@ fn availability_from(
     }
 }
 
-/// A device this host agreed to present.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedTablet {
-    pub identity: arcen_usb_bridge::UsbDeviceId,
-    /// Every authorized interface: the guard holds the device to all of
-    /// them.
-    pub report_descriptors: Vec<arcen_usb_bridge::InterfaceReportDescriptor>,
-    pub profile: arcen_usb_bridge::PenTabletProfile,
-    /// The interfaces this host publishes ([`PUBLISH_POLICY`]).
-    pub published: Vec<u8>,
-    /// The interfaces it does not, and why.
-    pub withheld: Vec<(u8, arcen_usb_bridge::PublishRefusal)>,
-    /// The model whose pen this host reads itself ([`host_pen_model`]).
-    pub host_pen: arcen_usb_bridge::IntuosPenModel,
-}
-
-/// The model of `identity` whose pen this host reads itself and turns into
-/// tablet events with pressure: only a model the shared reader knows. Any
-/// other tablet is refused (ADR 0022 §14.2): one Native
-/// tablet way, never a proximity-only half.
-#[must_use]
-pub fn host_pen_model(
-    identity: arcen_usb_bridge::UsbDeviceId,
-) -> Option<arcen_usb_bridge::IntuosPenModel> {
-    arcen_usb_bridge::host_decoded_intuos_model(identity.vendor_id, identity.product_id)
-}
-
-/// The plan entry whose reports are Intuos pen packets: the interface that
-/// declares input report 2 at the pen packet's length.
-#[must_use]
-pub fn host_pen_interface(plan: &[arcen_usb_bridge::BridgedHidDevice]) -> Option<u8> {
-    plan.iter()
-        .find(|device| {
-            arcen_usb_bridge::declared_report_lengths(
-                &device.report_descriptor,
-                arcen_usb_bridge::HidReportKind::Input,
-            )
-            .get(&arcen_usb_bridge::INTUOS5_PEN_REPORT_ID)
-                == Some(&arcen_usb_bridge::INTUOS5_PEN_REPORT_LENGTH)
-        })
-        .map(|device| device.index)
-}
-
-/// The tablet event for one sample this host read, in the same message the
-/// Deck sends in Tablet support, so one injector serves both.
-#[must_use]
-pub fn host_pen_event(
-    sample: &arcen_usb_bridge::HostPenSample,
-) -> arcen_protocol::messages::PenEventMsg {
-    use arcen_protocol::messages::{PenEventMsg, PenToolMsg};
-    PenEventMsg {
-        x: sample.x.clamp(0.0, 1.0),
-        y: sample.y.clamp(0.0, 1.0),
-        pressure: sample.pressure.clamp(0.0, 1.0),
-        tilt_x_degrees: sample.tilt_x_degrees.clamp(-90.0, 90.0),
-        tilt_y_degrees: sample.tilt_y_degrees.clamp(-90.0, 90.0),
-        tool: if sample.eraser {
-            PenToolMsg::Eraser
-        } else {
-            PenToolMsg::Tip
-        },
-        in_proximity: sample.in_proximity,
-        touching: sample.touching,
-        buttons: sample.barrel_buttons,
-        ..PenEventMsg::default()
-    }
-}
+/// A device this host agreed to present (shared, `arcen_input::bridged_pen`).
+pub use arcen_input::bridged_pen::AuthorizedTablet;
+/// The tablet event, the shared pen sample and the host pointer of a pen this
+/// host reads itself, and the panic guard: shared with every Pier that reads
+/// the pen itself (`arcen_input::bridged_pen`).
+pub use arcen_input::bridged_pen::{HostPenPointer, contained, host_pen_event, host_pen_sample};
 
 /// What a macOS Pier publishes of a bridged tablet. An `IOHIDUserDevice` is
 /// system-wide — there is no seat to confine it to, as the Linux Pier does
@@ -315,52 +260,18 @@ pub const PUBLISH_POLICY: arcen_usb_bridge::HidPublishPolicy =
 pub fn authorize(
     device: Option<&arcen_protocol::messages::UsbHardDeviceMsg>,
 ) -> Result<AuthorizedTablet, String> {
-    let device = device.ok_or_else(|| "the Deck did not capture a USB device".to_owned())?;
-    let synthetic = device.vendor_id == arcen_usb_bridge::ARCEN_LAB_VENDOR_ID
-        && device.product_id == arcen_usb_bridge::ARCEN_LAB_PRODUCT_ID;
-    if synthetic && std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() != Some("1") {
-        return Err("the synthetic lab tablet is not enabled on this host".to_owned());
-    }
-    let report_descriptors = device
-        .report_descriptors()
-        .map_err(|error| format!("the Deck's HID report descriptors are malformed: {error}"))?;
-    let profile =
-        arcen_usb_bridge::authorize_hard_usb_tablet(device.device_class, &report_descriptors)
-            .map_err(|denial| format!("the captured USB device was refused: {denial}"))?;
-    let (mut published, mut withheld) = (Vec::new(), Vec::new());
-    for claim in &report_descriptors {
-        match arcen_usb_bridge::publishable(PUBLISH_POLICY, &claim.descriptor) {
-            Ok(()) => published.push(claim.interface),
-            Err(refusal) => withheld.push((claim.interface, refusal)),
-        }
-    }
-    let identity = arcen_usb_bridge::UsbDeviceId {
-        vendor_id: device.vendor_id,
-        product_id: device.product_id,
-        bcd_device: device.bcd_device,
-    };
-    let Some(host_pen) = host_pen_model(identity) else {
-        return Err(format!(
-            "this Mac's Pier reads a tablet's pen itself and does not know this model \
-             ({:04x}:{:04x}) yet; use Tablet support",
-            device.vendor_id, device.product_id
-        ));
-    };
-    if published.is_empty() {
+    let synthetic = std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() == Some("1");
+    let tablet = arcen_input::bridged_pen::authorize(device, PUBLISH_POLICY, synthetic)?;
+    // A generic pen is read even when its interface is withheld (a pen and a
+    // keyboard in one descriptor): nothing of it is published.
+    if tablet.published.is_empty() && tablet.host_pen.generic_interface().is_none() {
         return Err(
             "the captured tablet has no pen or vendor interface this Mac may publish \
              (keyboard, keypad and mouse interfaces are never published on macOS)"
                 .to_owned(),
         );
     }
-    Ok(AuthorizedTablet {
-        identity,
-        host_pen,
-        report_descriptors,
-        profile,
-        published,
-        withheld,
-    })
+    Ok(tablet)
 }
 
 /// The tablet-mode result for a Native tablet request, given what this host
@@ -371,139 +282,19 @@ pub fn authorize(
 /// precise reason rather than the generic one.
 #[must_use]
 pub fn tablet_result(
-    mut result: arcen_protocol::messages::TabletModeResultMsg,
+    result: arcen_protocol::messages::TabletModeResultMsg,
     offer: &Result<(), String>,
     authorization: Option<&Result<AuthorizedTablet, String>>,
 ) -> arcen_protocol::messages::TabletModeResultMsg {
-    use arcen_protocol::messages::{TabletModeMsg, TabletModeReason};
-    if result.requested != TabletModeMsg::UsbTabletBridge {
-        return result;
-    }
-    let reason = |text: String| TabletModeReason::try_from(text).unwrap_or_default();
-    match (offer, authorization) {
-        (Err(why), _) => {
-            if !result.accepted {
-                result.reason = reason(format!("Native tablet (USB bridged) unavailable: {why}"));
-            }
-        }
-        (Ok(()), Some(Err(why))) => {
-            result.accepted = false;
-            if result.active == TabletModeMsg::UsbTabletBridge {
-                result.active = TabletModeMsg::DisabledMouseCompat;
-            }
-            result.reconnect_required = true;
-            result.reason = reason(format!(
-                "Native tablet (USB bridged) refused: {why}. Use Tablet support instead."
-            ));
-        }
-        (Ok(()), Some(Ok(_))) if result.accepted => {
-            result.reason = reason(HOST_PEN_NOTICE.to_owned());
-        }
-        _ => {}
-    }
-    result
-}
-
-/// The shared pen sample (ADR 0023) for one read of a pen this host reads
-/// itself: the reader's device units over the model's whole range, the
-/// tool, and when it was read. The macOS adapter of the one pen position
-/// path; the injector and the position use the same scaling.
-#[must_use]
-pub fn host_pen_sample(
-    sample: &arcen_usb_bridge::HostPenSample,
-    model: arcen_usb_bridge::IntuosPenModel,
-    at: Instant,
-) -> arcen_input::tablet_pointer::PenSample {
-    use arcen_input::tablet_pointer::{AxisRange, PenSample, PenTool};
-    let axis = |maximum: u32| AxisRange {
-        minimum: 0,
-        maximum: i32::try_from(maximum).unwrap_or(i32::MAX),
-    };
-    let unit = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
-    PenSample {
-        tool: sample.in_proximity.then_some(if sample.eraser {
-            PenTool::Eraser
-        } else {
-            PenTool::Pen
-        }),
-        x: unit(sample.device_x),
-        y: unit(sample.device_y),
-        x_range: axis(model.max_x),
-        y_range: axis(model.max_y),
-        at,
-    }
-}
-
-/// The host pointer a pen this host reads itself moves, reported to a Deck
-/// that draws its cursor at host positions (`cursor_position_v1`).
-///
-/// A bridged tablet moves only this host's pointer, so without these
-/// records the person drawing sees no cursor on the Deck. The pen events
-/// this host posts land on the captured display at the samples' own
-/// fractions, so the position is known without reading the pointer back.
-/// Glue only: which source leads and where the pen points are the shared
-/// [`arcen_input::tablet_pointer::PenPointerLead`]'s, echo suppression,
-/// rate and the record the shared
-/// [`arcen_input::host_pointer::HostPointerFeed`]'s.
-#[derive(Debug)]
-pub struct HostPenPointer {
-    lead: arcen_input::tablet_pointer::PenPointerLead,
-    feed: arcen_input::host_pointer::HostPointerFeed,
-}
-
-impl HostPenPointer {
-    /// A reporter for a single captured display of `width` × `height`
-    /// pixels; `None` for a size a record cannot carry.
-    #[must_use]
-    pub fn new(width: usize, height: usize) -> Option<Self> {
-        let width = u16::try_from(width).ok().filter(|width| *width > 0)?;
-        let height = u16::try_from(height).ok().filter(|height| *height > 0)?;
-        let mut lead = arcen_input::tablet_pointer::PenPointerLead::new(
-            arcen_input::tablet_pointer::PenMapping::WholeArea,
-        );
-        let _ = lead.set_desktop_size(u32::from(width), u32::from(height));
-        Some(Self {
-            lead,
-            feed: arcen_input::host_pointer::HostPointerFeed::new(Some(
-                arcen_input::host_pointer::HostPointerLayout::single(
-                    u32::from(width),
-                    u32::from(height),
-                    width,
-                    height,
-                ),
-            )),
-        })
-    }
-
-    /// The pen samples this host just read, in order.
-    pub fn observe(&mut self, samples: &[arcen_input::tablet_pointer::PenSample]) {
-        for sample in samples {
-            if let Some(position) = self.lead.pen(*sample) {
-                self.feed.observe(&position);
-            }
-        }
-    }
-
-    /// When the waiting record may be sent; `None` when none waits.
-    #[must_use]
-    pub fn due_at(&self) -> Option<Instant> {
-        self.feed.due_at()
-    }
-
-    /// The record to send now, if one waits and the rate allows it; it
-    /// counts as sent.
-    pub fn take_record(
-        &mut self,
-        now: Instant,
-    ) -> Option<[u8; arcen_protocol::cursor_position::CURSOR_POSITION_SIZE]> {
-        self.feed.take_record(now)
-    }
-
-    /// Records sent so far.
-    #[must_use]
-    pub const fn reports(&self) -> u64 {
-        self.feed.reports()
-    }
+    arcen_input::bridged_pen::tablet_result(
+        result,
+        offer,
+        authorization,
+        arcen_input::bridged_pen::HostPenNotices {
+            dedicated: HOST_PEN_NOTICE,
+            generic: GENERIC_PEN_NOTICE,
+        },
+    )
 }
 
 /// What a session must send after a Native tablet step: wire frames for the
@@ -602,17 +393,6 @@ pub fn set_console_holder_for_lab_tests(holder: Option<arcen_session::agent_rela
     *CONSOLE_OVERRIDE
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = holder;
-}
-
-/// Runs `step`, turning a panic into an error: a fault in the Native tablet
-/// code ends Native tablet, never the session that streams the desktop.
-///
-/// # Errors
-///
-/// `step`'s own error, or the panic as one.
-pub fn contained<T>(step: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(step))
-        .unwrap_or_else(|_| Err("an internal fault in the Native tablet adapter".to_owned()))
 }
 
 /// Native tablet inside one streaming session: inactive unless the handshake
@@ -881,14 +661,10 @@ impl SessionTablet {
             .attachment
             .take()
             .map(|mut attachment| {
-                let pens = attachment.release_pen(release);
                 // The mode restore goes out before the cancellations and is
                 // left to finish: it touches only the Deck's tablet, never
                 // this host's desktop, so it is sent on a console change too.
-                let (mut frames, keep) =
-                    contained(|| Ok(attachment.restore_pen_mode())).unwrap_or_default();
-                frames.extend(contained(|| Ok(attachment.shutdown(keep))).unwrap_or_default());
-                (frames, pens)
+                contained(|| Ok(attachment.end(release))).unwrap_or_default()
             })
             .unwrap_or_default();
         SessionOutput {
@@ -903,21 +679,7 @@ impl SessionTablet {
     /// gives the tablet back to its own Mac.
     #[cfg_attr(not(feature = "native-tablet"), allow(dead_code))]
     fn ended_notice(&self, reason: &str) -> Option<String> {
-        use arcen_protocol::messages::{TabletModeMsg, TabletModeReason};
-        let mut result = self.result.clone();
-        result.accepted = false;
-        result.active = TabletModeMsg::DisabledMouseCompat;
-        result.reconnect_required = true;
-        let text: String = format!("Native tablet (USB bridged) ended: {reason}")
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
-        let mut text = text;
-        while text.len() > arcen_protocol::messages::MAX_TABLET_MODE_REASON_BYTES {
-            text.pop();
-        }
-        result.reason = TabletModeReason::try_from(text).unwrap_or_default();
-        serde_json::to_string(&result).ok()
+        arcen_input::bridged_pen::ended_notice(&self.result, reason)
     }
 }
 
@@ -925,7 +687,7 @@ impl Drop for SessionTablet {
     fn drop(&mut self) {
         #[cfg(feature = "native-tablet")]
         if let Some(attachment) = self.attachment.take() {
-            let _ = contained(|| Ok(attachment.shutdown(None)));
+            let _ = contained(|| Ok(attachment.shutdown()));
         }
     }
 }
@@ -933,15 +695,12 @@ impl Drop for SessionTablet {
 /// A generation no earlier attachment of this or a previous agent used.
 #[cfg(feature = "native-tablet")]
 fn fresh_generation() -> arcen_usb_bridge::AttachmentGeneration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |elapsed| {
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-        });
-    let counter = arcen_transport::quic::next_attachment_generation().get();
-    let value = std::num::NonZeroU64::new(nanos.wrapping_add(counter) | 1)
-        .unwrap_or(std::num::NonZeroU64::MIN);
-    arcen_usb_bridge::AttachmentGeneration::new(value)
+    arcen_input::bridged_pen::fresh_generation(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+        arcen_transport::quic::next_attachment_generation().get(),
+    )
 }
 
 #[cfg(feature = "native-tablet")]
@@ -950,15 +709,10 @@ pub use attachment::{BridgedTablet, TabletStep};
 #[cfg(feature = "native-tablet")]
 mod attachment {
     use super::AuthorizedTablet;
+    use arcen_input::bridged_pen::{BridgedPenSession, BridgedPenStep};
     use arcen_protocol::messages::PenEventMsg;
-    use arcen_protocol::{
-        UsbUrbSubmitHeader, decode_usb_urb_complete, encode_usb_urb_cancel, encode_usb_urb_submit,
-    };
     use arcen_usb_bridge::hid_device_ipc::HidDeviceFrame;
-    use arcen_usb_bridge::{
-        AttachmentGeneration, HidHostAdapter, HidHostOutput, HidReportKind, HidReportRequest,
-        INTUOS_MODE_SWITCH, IntuosPenReader,
-    };
+    use arcen_usb_bridge::{AttachmentGeneration, HidReportKind, HidReportRequest, HostPenNote};
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -969,58 +723,8 @@ mod attachment {
     /// Frames waiting for the child; a child that falls this far behind ends
     /// the attachment rather than losing a report.
     const CHILD_BACKLOG: usize = 512;
-    /// How often deadlines are checked.
-    const TICK: Duration = Duration::from_millis(100);
     /// How long the child gets to exit after its input closes.
     const CHILD_EXIT: Duration = Duration::from_millis(500);
-    /// Report-request tokens this host uses for its own requests to a pen it
-    /// reads itself. The child numbers its requests from 1, and a child
-    /// request with a token at or above [`HOST_TOKENS`] is refused, so a
-    /// reply is never handed to the wrong side.
-    const HOST_TOKENS: u32 = u32::MAX - 2;
-    /// `GET_REPORT` of the mode the tablet was in before this host switched it.
-    const HOST_PEN_READ_MODE: u32 = u32::MAX - 2;
-    /// `SET_REPORT` of Wacom mode.
-    const HOST_PEN_SET_MODE: u32 = u32::MAX - 1;
-    /// `SET_REPORT` of the mode read before, when the attachment ends.
-    const HOST_PEN_RESTORE_MODE: u32 = u32::MAX;
-    /// Pen events waiting for the session; a session that falls this far
-    /// behind loses the oldest.
-    const PEN_BACKLOG: usize = 256;
-
-    /// Where this host's mode switch of a pen it reads itself stands.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum PenMode {
-        /// Nothing sent yet.
-        Untouched,
-        /// The current mode is being read.
-        Reading,
-        /// Wacom mode is being set; the mode read before, when known.
-        Switching(Option<u8>),
-        /// The tablet accepted Wacom mode.
-        Switched(Option<u8>),
-        /// The tablet refused the switch; nothing to restore.
-        Refused,
-    }
-
-    /// A pen this host reads itself (ADR 0022 §14).
-    struct HostPen {
-        reader: IntuosPenReader,
-        /// The plan index of the pen interface, once published.
-        index: Option<u8>,
-        pending: std::collections::VecDeque<PenEventMsg>,
-        positions: std::collections::VecDeque<arcen_input::tablet_pointer::PenSample>,
-        last: Option<PenEventMsg>,
-        mode: PenMode,
-    }
-
-    /// The mode a `GET_REPORT(Feature 2)` answer names: `[id, mode, ...]`.
-    pub(super) fn read_pen_mode(answer: &[u8]) -> Option<u8> {
-        match answer {
-            [id, mode, ..] if *id == INTUOS_MODE_SWITCH.0 => Some(*mode),
-            _ => None,
-        }
-    }
 
     enum ChildEvent {
         Frame(HidDeviceFrame),
@@ -1036,9 +740,12 @@ mod attachment {
         Ended(String),
     }
 
-    /// One Native tablet attachment: the adapter, the child, the deadlines.
+    /// One Native tablet attachment: the shared host-read attachment
+    /// (`arcen_input::bridged_pen`: enumeration, the pen read here, its mode
+    /// switch), the device-owner child that publishes the other interfaces,
+    /// and the deadlines.
     pub struct BridgedTablet {
-        adapter: HidHostAdapter,
+        pen: BridgedPenSession,
         program: std::path::PathBuf,
         child: Option<Child>,
         to_child: Option<SyncSender<HidDeviceFrame>>,
@@ -1046,14 +753,15 @@ mod attachment {
         ready_by: Option<Instant>,
         tick: tokio::time::Interval,
         devices: usize,
-        host_pen: Option<HostPen>,
+        pens: Vec<PenEventMsg>,
+        positions: Vec<arcen_input::tablet_pointer::PenSample>,
     }
 
     impl std::fmt::Debug for BridgedTablet {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
                 .debug_struct("BridgedTablet")
-                .field("phase", &self.adapter.phase())
+                .field("phase", &self.pen.bridge().phase())
                 .field("devices", &self.devices)
                 .finish_non_exhaustive()
         }
@@ -1071,19 +779,16 @@ mod attachment {
             tablet: &AuthorizedTablet,
             generation: AttachmentGeneration,
         ) -> Result<(Self, Vec<Vec<u8>>), String> {
-            let mut adapter = HidHostAdapter::new(
-                tablet.identity,
-                tablet.report_descriptors.clone(),
+            let (pen, step) = BridgedPenSession::start(
+                tablet,
+                super::PUBLISH_POLICY,
                 generation,
-            )
-            .with_publish_policy(super::PUBLISH_POLICY);
-            let outputs = adapter
-                .start(Instant::now())
-                .map_err(|error| error.to_string())?;
-            let mut tick = tokio::time::interval(TICK);
+                Instant::now(),
+            )?;
+            let mut tick = tokio::time::interval(arcen_input::bridged_pen::BRIDGED_PEN_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut attachment = Self {
-                adapter,
+                pen,
                 program: program.to_path_buf(),
                 child: None,
                 to_child: None,
@@ -1091,21 +796,17 @@ mod attachment {
                 ready_by: None,
                 tick,
                 devices: 0,
-                host_pen: Some(HostPen {
-                    reader: IntuosPenReader::new(tablet.host_pen),
-                    index: None,
-                    pending: std::collections::VecDeque::new(),
-                    positions: std::collections::VecDeque::new(),
-                    last: None,
-                    mode: PenMode::Untouched,
-                }),
+                pens: Vec::new(),
+                positions: Vec::new(),
             };
-            let frames = attachment.apply(outputs)?;
+            let frames = attachment.apply(step)?;
             tracing::info!(
                 target: arcen_telemetry::names::target::HID,
                 generation = generation.get(),
                 vendor_id = tablet.identity.vendor_id,
                 product_id = tablet.identity.product_id,
+                pen_reader = tablet.host_pen.kind(),
+                pen_interface = tablet.pen_interface,
                 interfaces = tablet.report_descriptors.len(),
                 published = ?tablet.published,
                 withheld = ?tablet
@@ -1124,16 +825,8 @@ mod attachment {
         ///
         /// Why the attachment ended.
         pub fn on_deck_frame(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-            let (header, payload) = decode_usb_urb_complete(bytes)
-                .map_err(|error| format!("malformed USB completion: {error:?}"))?;
-            if header.generation != self.adapter.generation() {
-                return Err("a USB completion for another attachment".to_owned());
-            }
-            let outputs = self
-                .adapter
-                .on_completion(header.urb_id, header.status, payload, Instant::now())
-                .map_err(|error| error.to_string())?;
-            self.apply(outputs)
+            let step = self.pen.on_deck_frame(bytes, Instant::now())?;
+            self.apply(step)
         }
 
         /// Waits for the next thing the attachment must act on: a frame from
@@ -1167,41 +860,10 @@ mod attachment {
             Vec<PenEventMsg>,
             Vec<arcen_input::tablet_pointer::PenSample>,
         ) {
-            self.host_pen
-                .as_mut()
-                .map(|pen| {
-                    (
-                        std::mem::take(&mut pen.pending).into(),
-                        std::mem::take(&mut pen.positions).into(),
-                    )
-                })
-                .unwrap_or_default()
-        }
-
-        /// What is still owed to the session when the attachment ends: with
-        /// `release`, the pending events and a proximity exit for a pen left
-        /// in proximity; without, nothing.
-        pub fn release_pen(&mut self, release: bool) -> Vec<PenEventMsg> {
-            let Some(pen) = self.host_pen.as_mut() else {
-                return Vec::new();
-            };
-            let mut pens: Vec<PenEventMsg> = std::mem::take(&mut pen.pending).into();
-            if !release {
-                return Vec::new();
-            }
-            let last = pens.last().or(pen.last.as_ref()).cloned();
-            if let Some(last) = last
-                && last.in_proximity
-            {
-                pens.push(PenEventMsg {
-                    in_proximity: false,
-                    touching: false,
-                    pressure: 0.0,
-                    buttons: 0,
-                    ..last
-                });
-            }
-            pens
+            (
+                std::mem::take(&mut self.pens),
+                std::mem::take(&mut self.positions),
+            )
         }
 
         /// Kills the device owner now (by its pid, through its handle): the
@@ -1214,72 +876,41 @@ mod attachment {
             }
         }
 
-        /// Puts a pen this host switched to Wacom mode back into the mode it
-        /// read before, as the attachment ends while the Deck is still
-        /// there: the frames to send, and the request to leave running (not
-        /// cancelled by [`Self::shutdown`]). Nothing when the mode was never
-        /// switched, was not readable, or was already Wacom mode; the Deck's
-        /// hand-back (a USB reset) restores the power-on mode in any case.
-        pub fn restore_pen_mode(&mut self) -> (Vec<Vec<u8>>, Option<arcen_usb_bridge::UrbId>) {
-            let Some((index, original)) =
-                self.host_pen
-                    .as_ref()
-                    .and_then(|pen| match (pen.index, pen.mode) {
-                        (Some(index), PenMode::Switched(Some(original)))
-                            if original != INTUOS_MODE_SWITCH.1[1] =>
-                        {
-                            Some((index, original))
-                        }
-                        _ => None,
-                    })
-            else {
-                return (Vec::new(), None);
-            };
-            let outputs = self.adapter.request_report(
-                HOST_PEN_RESTORE_MODE,
-                HidReportRequest::Set {
-                    index,
-                    kind: HidReportKind::Feature,
-                    report_id: INTUOS_MODE_SWITCH.0,
-                    data: vec![INTUOS_MODE_SWITCH.0, original],
-                },
-                Instant::now(),
-            );
-            let keep = outputs.iter().find_map(|output| match output {
-                HidHostOutput::Submit(urb) => Some(urb.urb_id),
-                _ => None,
-            });
-            tracing::info!(
-                target: arcen_telemetry::names::target::HID,
-                original,
-                sent = keep.is_some(),
-                "Native tablet: this host puts the pen back into the mode it found"
-            );
-            if keep.is_none() {
-                return (Vec::new(), None);
+        /// Ends the attachment while the Deck is still there: the frames to
+        /// send (the pen's mode put back, then the cancellations) and, with
+        /// `release`, the events still owed to the injector, ending with a
+        /// proximity exit for a pen left in proximity; without, no event.
+        pub fn end(&mut self, release: bool) -> (Vec<Vec<u8>>, Vec<PenEventMsg>) {
+            let mut pens = std::mem::take(&mut self.pens);
+            self.positions.clear();
+            let (frames, owed) = self.pen.end(release, Instant::now());
+            if release {
+                pens.extend(owed);
+            } else {
+                pens.clear();
             }
-            match self.apply(outputs) {
-                Ok(frames) => (frames, keep),
-                Err(_) => (Vec::new(), None),
-            }
+            self.log_end();
+            (frames, pens)
         }
 
-        /// Ends the attachment: the cancellations for the Deck, except for
-        /// `keep` (a mode restore left to finish). Dropping closes the
-        /// child's input, which destroys the devices.
+        /// Ends the attachment without the Deck: the cancellations. Dropping
+        /// closes the child's input, which destroys the devices.
         #[must_use]
-        pub fn shutdown(mut self, keep: Option<arcen_usb_bridge::UrbId>) -> Vec<Vec<u8>> {
-            let outputs = self.adapter.shutdown();
-            let generation = self.adapter.generation();
-            let stats = self.adapter.stats();
-            let (pen_packets, pen_ignored) = self
-                .host_pen
-                .as_ref()
-                .map_or((0, 0), |pen| pen.reader.counts());
+        pub fn shutdown(mut self) -> Vec<Vec<u8>> {
+            let frames = self.pen.shutdown();
+            self.log_end();
+            frames
+        }
+
+        fn log_end(&self) {
+            let bridge = self.pen.bridge();
+            let stats = bridge.stats();
+            let (pen_packets, pen_ignored, pen_dropped) = bridge.pen_counts();
             tracing::info!(
                 target: arcen_telemetry::names::target::HID,
                 pen_packets,
                 pen_ignored,
+                pen_dropped,
                 reports = stats.reports,
                 report_bytes = stats.report_bytes,
                 report_requests = stats.report_requests,
@@ -1288,15 +919,6 @@ mod attachment {
                 devices = self.devices,
                 "Native tablet: attachment ended"
             );
-            outputs
-                .into_iter()
-                .filter_map(|output| match output {
-                    HidHostOutput::Cancel(urb) if Some(urb) != keep => {
-                        Some(encode_usb_urb_cancel(generation, urb).to_vec())
-                    }
-                    _ => None,
-                })
-                .collect()
         }
 
         fn on_tick(&mut self) -> Result<Vec<Vec<u8>>, String> {
@@ -1306,11 +928,8 @@ mod attachment {
             {
                 return Err("the bridged HID devices were not published in time".to_owned());
             }
-            let outputs = self
-                .adapter
-                .poll(Instant::now())
-                .map_err(|error| error.to_string())?;
-            self.apply(outputs)
+            let step = self.pen.poll(Instant::now())?;
+            self.apply(step)
         }
 
         fn on_child_frame(&mut self, frame: HidDeviceFrame) -> Result<Vec<Vec<u8>>, String> {
@@ -1325,38 +944,12 @@ mod attachment {
                         devices,
                         "Native tablet: bridged HID devices published"
                     );
-                    let mut outputs = self
-                        .adapter
-                        .devices_created(Instant::now())
-                        .map_err(|error| error.to_string())?;
-                    // The vendor driver switches the tablet out of HID mouse
-                    // mode at probe; reading the pen here, this host does,
-                    // after reading the mode it is in so it can put it back.
-                    if let Some(pen) = self.host_pen.as_mut()
-                        && let Some(index) = pen.index
-                        && pen.mode == PenMode::Untouched
-                    {
-                        pen.mode = PenMode::Reading;
-                        outputs.extend(self.adapter.request_report(
-                            HOST_PEN_READ_MODE,
-                            HidReportRequest::Get {
-                                index,
-                                kind: HidReportKind::Feature,
-                                report_id: INTUOS_MODE_SWITCH.0,
-                                length: 2,
-                            },
-                            Instant::now(),
-                        ));
-                    }
-                    self.apply(outputs)
+                    let step = self.pen.devices_created(Instant::now())?;
+                    self.apply(step)
                 }
                 HidDeviceFrame::Refused { reason } => Err(reason),
-                HidDeviceFrame::GetReport { token, .. }
-                | HidDeviceFrame::SetReport { token, .. }
-                    if token >= HOST_TOKENS =>
-                {
-                    self.refuse_call(token)
-                }
+                // The shared attachment refuses a token in its own range and
+                // an interface the host reads alone (never the child's).
                 HidDeviceFrame::GetReport {
                     token,
                     index,
@@ -1371,8 +964,8 @@ mod attachment {
                             report_id,
                             length,
                         };
-                        let outputs = self.adapter.request_report(token, request, Instant::now());
-                        self.apply(outputs)
+                        let step = self.pen.device_request(token, request, Instant::now())?;
+                        self.apply(step)
                     }
                     None => self.refuse_call(token),
                 },
@@ -1390,70 +983,12 @@ mod attachment {
                             report_id,
                             data,
                         };
-                        let outputs = self.adapter.request_report(token, request, Instant::now());
-                        self.apply(outputs)
+                        let step = self.pen.device_request(token, request, Instant::now())?;
+                        self.apply(step)
                     }
                     None => self.refuse_call(token),
                 },
                 _ => Err("the device owner broke its contract".to_owned()),
-            }
-        }
-
-        /// The answer to one of this host's own requests to the pen.
-        fn on_host_pen_reply(
-            &mut self,
-            token: u32,
-            result: Result<Vec<u8>, arcen_usb_bridge::HidReportFailure>,
-        ) -> Result<Vec<Vec<u8>>, String> {
-            let Some(pen) = self.host_pen.as_mut() else {
-                return Ok(Vec::new());
-            };
-            match (token, pen.mode, pen.index) {
-                (HOST_PEN_READ_MODE, PenMode::Reading, Some(index)) => {
-                    let original = result.as_deref().ok().and_then(read_pen_mode);
-                    tracing::info!(
-                        target: arcen_telemetry::names::target::HID,
-                        original = ?original,
-                        failure = ?result.as_ref().err(),
-                        "Native tablet: the pen's mode before this host switches it"
-                    );
-                    pen.mode = PenMode::Switching(original);
-                    let (report_id, data) = INTUOS_MODE_SWITCH;
-                    let outputs = self.adapter.request_report(
-                        HOST_PEN_SET_MODE,
-                        HidReportRequest::Set {
-                            index,
-                            kind: HidReportKind::Feature,
-                            report_id,
-                            data: data.to_vec(),
-                        },
-                        Instant::now(),
-                    );
-                    self.apply(outputs)
-                }
-                (HOST_PEN_SET_MODE, PenMode::Switching(original), _) => {
-                    pen.mode = if result.is_ok() {
-                        PenMode::Switched(original)
-                    } else {
-                        PenMode::Refused
-                    };
-                    tracing::info!(
-                        target: arcen_telemetry::names::target::HID,
-                        accepted = result.is_ok(),
-                        failure = ?result.err(),
-                        "Native tablet: this host switched the pen to tablet mode"
-                    );
-                    Ok(Vec::new())
-                }
-                _ => {
-                    tracing::debug!(
-                        target: arcen_telemetry::names::target::HID,
-                        token,
-                        accepted = result.is_ok(),
-                        "Native tablet: an answer to this host's pen request"
-                    );
-                    Ok(Vec::new())
-                }
             }
         }
 
@@ -1466,83 +1001,57 @@ mod attachment {
             Ok(Vec::new())
         }
 
-        fn apply(&mut self, outputs: Vec<HidHostOutput>) -> Result<Vec<Vec<u8>>, String> {
-            let generation = self.adapter.generation();
-            let mut frames = Vec::new();
-            for output in outputs {
-                match output {
-                    HidHostOutput::Submit(urb) => frames.push(
-                        encode_usb_urb_submit(
-                            UsbUrbSubmitHeader {
-                                generation,
-                                urb_id: urb.urb_id,
-                                endpoint: urb.endpoint,
-                                transfer_kind: urb.transfer_kind,
-                                timeout_ms: urb.timeout_ms,
-                                declared_length: urb.declared_length,
-                                setup: urb.setup,
-                            },
-                            &urb.payload,
-                        )
-                        .map_err(|error| format!("encode a USB request: {error:?}"))?,
+        /// Acts on one shared step: the pen's reads are queued for the
+        /// session, the devices to publish go to a new device owner, their
+        /// reports and replies to it; the wire frames are returned.
+        fn apply(&mut self, step: BridgedPenStep) -> Result<Vec<Vec<u8>>, String> {
+            for note in &step.notes {
+                match note {
+                    HostPenNote::ModeRead { original, failure } => tracing::info!(
+                        target: arcen_telemetry::names::target::HID,
+                        original = ?original,
+                        failure = ?failure,
+                        "Native tablet: the pen's mode before this host switches it"
                     ),
-                    HidHostOutput::Cancel(urb) => {
-                        frames.push(encode_usb_urb_cancel(generation, urb).to_vec());
-                    }
-                    HidHostOutput::CreateDevices(plan) => self.publish(plan)?,
-                    HidHostOutput::Report { index, report } => {
-                        if let Some(pen) = self
-                            .host_pen
-                            .as_mut()
-                            .filter(|pen| pen.index == Some(index))
-                        {
-                            // Read here, not handed to the published device:
-                            // one consumer, so a driver that binds it one day
-                            // cannot double the pen.
-                            if let Some(sample) = pen.reader.read(&report) {
-                                let event = super::host_pen_event(&sample);
-                                if pen.pending.len() >= PEN_BACKLOG {
-                                    pen.pending.pop_front();
-                                }
-                                if pen.positions.len() >= PEN_BACKLOG {
-                                    pen.positions.pop_front();
-                                }
-                                pen.last = Some(event.clone());
-                                pen.pending.push_back(event);
-                                pen.positions.push_back(super::host_pen_sample(
-                                    &sample,
-                                    pen.reader.model(),
-                                    Instant::now(),
-                                ));
-                            }
-                            continue;
-                        }
-                        self.to_child(HidDeviceFrame::Report { index, report })?;
-                    }
-                    HidHostOutput::ReportReply { token, result } if token >= HOST_TOKENS => {
-                        frames.extend(self.on_host_pen_reply(token, result)?);
-                    }
-                    HidHostOutput::ReportReply { token, result } => {
-                        let (ok, data) = match result {
-                            Ok(data) => (true, data),
-                            Err(failure) => {
-                                tracing::debug!(
-                                    target: arcen_telemetry::names::target::HID,
-                                    token,
-                                    %failure,
-                                    "Native tablet: a report call failed"
-                                );
-                                (false, Vec::new())
-                            }
-                        };
-                        self.to_child(HidDeviceFrame::ReportReply { token, ok, data })?;
-                    }
+                    HostPenNote::ModeSwitched { accepted, failure } => tracing::info!(
+                        target: arcen_telemetry::names::target::HID,
+                        accepted,
+                        failure = ?failure,
+                        "Native tablet: this host switched the pen to tablet mode"
+                    ),
                 }
+            }
+            self.pens.extend(step.pens);
+            self.positions.extend(step.positions);
+            let mut frames = step.frames;
+            for (index, report) in step.device_reports {
+                self.to_child(HidDeviceFrame::Report { index, report })?;
+            }
+            for (token, result) in step.device_replies {
+                let (ok, data) = match result {
+                    Ok(data) => (true, data),
+                    Err(failure) => {
+                        tracing::debug!(
+                            target: arcen_telemetry::names::target::HID,
+                            token,
+                            %failure,
+                            "Native tablet: a report call failed"
+                        );
+                        (false, Vec::new())
+                    }
+                };
+                self.to_child(HidDeviceFrame::ReportReply { token, ok, data })?;
+            }
+            if let Some(plan) = step.publish {
+                frames.extend(self.publish(plan)?);
             }
             Ok(frames)
         }
 
-        fn publish(&mut self, plan: Vec<arcen_usb_bridge::BridgedHidDevice>) -> Result<(), String> {
+        fn publish(
+            &mut self,
+            plan: Vec<arcen_usb_bridge::BridgedHidDevice>,
+        ) -> Result<Vec<Vec<u8>>, String> {
             for device in &plan {
                 tracing::info!(
                     target: arcen_telemetry::names::target::HID,
@@ -1556,6 +1065,12 @@ mod attachment {
                     "Native tablet: publishing a bridged HID interface"
                 );
             }
+            tracing::info!(
+                target: arcen_telemetry::names::target::HID,
+                pen_interface_index = ?self.pen.bridge().pen_index(),
+                pen_reader = self.pen.bridge().reader_kind(),
+                "Native tablet: this host reads the pen itself and posts tablet events"
+            );
             let mut child = Command::new(&self.program)
                 .args(["hid-injector", "--bridged-usb"])
                 .stdin(Stdio::piped())
@@ -1605,20 +1120,12 @@ mod attachment {
             self.to_child = Some(to_child);
             self.from_child = Some(from_child);
             self.devices = plan.len();
-            if let Some(pen) = self.host_pen.as_mut() {
-                pen.index = super::host_pen_interface(&plan);
-                tracing::info!(
-                    target: arcen_telemetry::names::target::HID,
-                    pen_interface_index = ?pen.index,
-                    "Native tablet: this host reads the pen itself and posts tablet events"
-                );
-            }
             for device in plan {
                 self.to_child(HidDeviceFrame::Create(device))?;
             }
             self.to_child(HidDeviceFrame::Activate)?;
             self.ready_by = Some(Instant::now() + READY_DEADLINE);
-            Ok(())
+            Ok(Vec::new())
         }
 
         fn to_child(&self, frame: HidDeviceFrame) -> Result<(), String> {
@@ -1854,13 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_in_the_adapter_becomes_an_error() {
-        let panicked: Result<(), String> = contained(|| panic!("a bug"));
-        assert!(panicked.unwrap_err().contains("internal fault"));
-        assert_eq!(contained(|| Ok(7)), Ok(7));
-    }
-
-    #[test]
     fn keyboard_and_mouse_interfaces_are_never_published_on_this_host() {
         // The Intuos5's touch (on 0xFF00, also Apple's own vendor page) and
         // boot mouse are authorized (the Deck bridges the whole device) but
@@ -1971,140 +1471,169 @@ mod tests {
         assert!(String::from(notice(&refused).reason).contains(CONSOLE_TO_LOGIN_WINDOW));
     }
 
+    fn generic(vendor_id: u16, descriptor: &[u8]) -> UsbHardDeviceMsg {
+        UsbHardDeviceMsg {
+            vendor_id,
+            product_id: 0x0042,
+            hid_report_descriptors: vec![UsbHidReportDescriptorMsg::new(0, descriptor)],
+            ..intuos5()
+        }
+    }
+
     #[test]
-    fn an_unknown_model_is_refused_with_its_ids_rather_than_half_working() {
+    fn any_tablet_is_read_a_known_model_by_its_dedicated_reader() {
+        use arcen_usb_bridge::HostPenRoute;
+        use arcen_usb_bridge::descriptor_fixtures::{
+            GENERIC_PEN_FIXTURES, HUION_STYLE_PEN, XP_PEN_STYLE_COMPOSITE,
+        };
         let tablet = authorize(Some(&intuos5())).unwrap();
-        assert_eq!(tablet.host_pen.product_id, 0x0317);
+        assert!(
+            matches!(tablet.host_pen, HostPenRoute::Dedicated(model) if model.product_id == 0x0317)
+        );
+        // Every standard pen is read by its own descriptor, whoever made it.
+        for (label, descriptor) in GENERIC_PEN_FIXTURES {
+            let tablet = authorize(Some(&generic(0x256c, descriptor)))
+                .unwrap_or_else(|why| panic!("{label}: {why}"));
+            assert_eq!(tablet.host_pen.generic_interface(), Some(0), "{label}");
+        }
+        let huion = authorize(Some(&generic(0x256c, HUION_STYLE_PEN))).unwrap();
+        assert_eq!(
+            huion.published,
+            vec![0],
+            "a pen-only interface is published"
+        );
+        // A pen that shares its descriptor with a keyboard is still read,
+        // and nothing of it is published.
+        let composite = authorize(Some(&generic(0x28bd, XP_PEN_STYLE_COMPOSITE))).unwrap();
+        assert!(composite.published.is_empty());
+        assert_eq!(composite.host_pen.generic_interface(), Some(0));
+        let accepted = tablet_result(requested_native(true), &Ok(()), Some(&Ok(composite)));
+        assert_eq!(String::from(accepted.reason), GENERIC_PEN_NOTICE);
+        assert!(GENERIC_PEN_NOTICE.len() <= arcen_protocol::messages::MAX_TABLET_MODE_REASON_BYTES);
+    }
+
+    /// A generic pen whose interface also declares a mouse and a keyboard:
+    /// nothing is published (no device owner is started; the program does
+    /// not even exist), the Pier polls the pen interface itself and turns
+    /// its pen reports into tablet events, through the real adapter and the
+    /// Deck's real exporter.
+    #[cfg(feature = "native-tablet")]
+    #[tokio::test]
+    async fn a_generic_pen_sharing_its_interface_with_a_keyboard_is_read_without_publishing() {
+        use arcen_protocol::messages::PenToolMsg;
+        use arcen_usb_bridge::descriptor_fixtures::XP_PEN_STYLE_COMPOSITE;
+        use arcen_usb_bridge::{
+            GENERIC_PEN_IN, GenericPenTablet, SyntheticDevice, UrbSubmission, UsbExporter,
+        };
+        fn holder() -> arcen_session::agent_relay::ConsoleHolder {
+            arcen_session::agent_relay::ConsoleHolder::User(501)
+        }
+        let (device, handle) =
+            SyntheticDevice::emulate(GenericPenTablet::with_descriptor(XP_PEN_STYLE_COMPOSITE))
+                .unwrap();
+        let exporter = UsbExporter::new(Box::new(device))
+            .map_err(|(r, _)| r)
+            .unwrap();
+        let facts = exporter.facts();
+        let claim = UsbHardDeviceMsg {
+            vendor_id: facts.snapshot.id.vendor_id,
+            product_id: facts.snapshot.id.product_id,
+            bcd_device: facts.snapshot.id.bcd_device,
+            device_class: facts.snapshot.device_class,
+            speed: facts.speed,
+            hid_report_descriptors: facts
+                .report_descriptors
+                .iter()
+                .map(|r| UsbHidReportDescriptorMsg::new(r.interface, &r.descriptor))
+                .collect(),
+        };
+        let tablet = authorize(Some(&claim)).unwrap();
+        assert!(tablet.published.is_empty());
+        let (mut session, first) = SessionTablet::start_with(
+            Some(tablet),
+            &requested_native(true),
+            Some(Path::new("/nonexistent/arcen-pier-macos")),
+            ConsoleWatch::for_uid(501),
+            holder,
+        );
+        assert!(session.is_active());
+        let pen_report = |switches: u8, x: u16, pressure: u16| {
+            let mut report = vec![7, switches];
+            report.extend_from_slice(&x.to_le_bytes());
+            report.extend_from_slice(&12_500_u16.to_le_bytes());
+            report.extend_from_slice(&pressure.to_le_bytes());
+            report.extend_from_slice(&[0, 0]);
+            report
+        };
+        let mut frames = first.frames;
+        let mut pens = Vec::new();
+        let mut pushed = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pens.len() < 3 && Instant::now() < deadline {
+            for frame in std::mem::take(&mut frames) {
+                if frame.first() == Some(&(arcen_protocol::FrameType::UsbBridgeUrbSubmit as u8)) {
+                    let (header, payload) = arcen_protocol::decode_usb_urb_submit(&frame).unwrap();
+                    exporter
+                        .submit(
+                            UrbSubmission {
+                                generation: header.generation,
+                                urb_id: header.urb_id,
+                                endpoint: header.endpoint,
+                                transfer_kind: header.transfer_kind,
+                                timeout_ms: header.timeout_ms,
+                                declared_length: header.declared_length,
+                                setup: header.setup,
+                            },
+                            payload,
+                        )
+                        .unwrap();
+                }
+            }
+            if !pushed && handle.held_on(GENERIC_PEN_IN) > 0 {
+                // A mouse report first: never a pen event.
+                handle.push_report_to(GENERIC_PEN_IN, vec![1, 1, 5, 5]);
+                handle.push_report_to(GENERIC_PEN_IN, pen_report(0b1_0000, 10_000, 0));
+                handle.push_report_to(GENERIC_PEN_IN, pen_report(0b1_0001, 20_000, 8_192));
+                handle.push_report_to(GENERIC_PEN_IN, pen_report(0, 20_000, 0));
+                pushed = true;
+            }
+            if let Ok(Some(done)) = exporter.next_completion_within(Duration::from_millis(20)) {
+                let frame = arcen_protocol::encode_usb_urb_complete(
+                    arcen_protocol::UsbUrbCompletionHeader {
+                        generation: done.generation,
+                        urb_id: done.urb_id,
+                        status: done.status,
+                        actual_length: u32::try_from(done.data.len()).unwrap(),
+                    },
+                    &done.data,
+                )
+                .unwrap();
+                let output = session.on_deck_frame(&frame);
+                assert!(output.notice.is_none(), "{:?}", output.notice);
+                frames.extend(output.frames);
+                pens.extend(output.pens);
+            }
+        }
+        assert_eq!(pens.len(), 3, "{pens:?}");
+        assert!(pens[0].in_proximity && !pens[0].touching);
+        assert!(pens[1].touching && (pens[1].pressure - 0.5).abs() < 0.01);
+        assert_eq!(pens[1].tool, PenToolMsg::Tip);
+        assert!((pens[1].x - 0.5).abs() < 0.001);
+        assert!(!pens[2].in_proximity);
+        assert!(pens.iter().all(|pen| pen.validate().is_ok()));
+    }
+
+    #[test]
+    fn only_a_pen_in_a_vendor_format_no_reader_knows_is_refused_and_says_so() {
         let unknown = UsbHardDeviceMsg {
             product_id: 0x0001,
             ..intuos5()
         };
         let refusal = authorize(Some(&unknown)).unwrap_err();
         assert!(refusal.contains("056a:0001") && refusal.contains("Tablet support"));
-        assert!(refusal.len() <= arcen_protocol::messages::MAX_TABLET_MODE_REASON_BYTES);
-    }
-
-    #[test]
-    fn the_pen_interface_is_found_by_its_packet_not_its_number() {
-        let device = |index: u8, interface: u8| arcen_usb_bridge::BridgedHidDevice {
-            index,
-            interface,
-            report_descriptor: arcen_usb_bridge::WacomIntuos5::report_descriptor(interface)
-                .unwrap()
-                .to_vec(),
-            vendor_id: 0x056a,
-            product_id: 0x0317,
-            version: 0x0100,
-            country_code: 0,
-            primary_usage_page: 0,
-            primary_usage: 0,
-            location_id: 0,
-            manufacturer: String::new(),
-            product: String::new(),
-            serial: String::new(),
-            input_endpoint: arcen_usb_bridge::INTUOS5_PEN_IN,
-            input_length: 10,
-        };
-        assert_eq!(host_pen_interface(&[device(0, 1), device(1, 0)]), Some(1));
-        assert_eq!(host_pen_interface(&[device(0, 1), device(1, 2)]), None);
-    }
-
-    #[test]
-    fn the_pointer_a_pen_read_here_moves_goes_through_the_shared_pen_path() {
-        use arcen_protocol::cursor_position::decode_cursor_position;
-        assert!(HostPenPointer::new(0, 1080).is_none());
-        assert!(HostPenPointer::new(70_000, 1080).is_none());
-        let model = arcen_usb_bridge::host_decoded_intuos_model(0x056a, 0x0317).unwrap();
-        let mut pointer = HostPenPointer::new(1920, 1080).unwrap();
-        let start = Instant::now();
-        let read = |x: u32, y: u32, in_proximity| {
-            host_pen_sample(
-                &arcen_usb_bridge::HostPenSample {
-                    x: 0.0,
-                    y: 0.0,
-                    device_x: x,
-                    device_y: y,
-                    pressure: 0.0,
-                    tilt_x_degrees: 0.0,
-                    tilt_y_degrees: 0.0,
-                    eraser: false,
-                    in_proximity,
-                    touching: false,
-                    barrel_buttons: 0,
-                },
-                model,
-                start,
-            )
-        };
-        // The first position is where the pointer rests, not a move.
-        pointer.observe(&[read(16_000, 20_000, true)]);
-        assert_eq!(pointer.due_at(), None);
-        // A pen out of proximity moves nothing.
-        pointer.observe(&[read(model.max_x, model.max_y, false)]);
-        assert_eq!(pointer.due_at(), None);
-        // Several moves in one step: only the newest is reported, at the
-        // shared mapping's pixel.
-        // 32_513 / 65_025 and 10_161 / 40_641 of the tablet, as libinput
-        // and the X server scale it.
-        pointer.observe(&[read(16_000, 20_000, true), read(32_513, 10_161, true)]);
-        let record = decode_cursor_position(&pointer.take_record(start).unwrap()).unwrap();
-        assert!(record.on_stream);
-        assert_eq!((record.space_width, record.space_height), (1920, 1080));
-        assert_eq!((record.x, record.y), (960, 270));
-        assert_eq!(record.sequence, 1);
-        // At most one record per 8.3 ms; the newest waits, then goes.
-        pointer.observe(&[read(model.max_x, 0, true)]);
-        assert!(pointer.take_record(start).is_none());
-        let due = pointer.due_at().unwrap();
-        let record = decode_cursor_position(&pointer.take_record(due).unwrap()).unwrap();
-        assert_eq!((record.x, record.y, record.sequence), (1919, 0, 2));
-        assert_eq!(pointer.reports(), 2);
-        assert_eq!(pointer.due_at(), None);
-    }
-
-    #[cfg(feature = "native-tablet")]
-    #[test]
-    fn the_pen_mode_read_back_is_bounded_and_names_only_report_two() {
-        use super::attachment::read_pen_mode;
-        assert_eq!(read_pen_mode(&[2, 0]), Some(0));
-        assert_eq!(read_pen_mode(&[2, 2, 9]), Some(2));
-        assert_eq!(read_pen_mode(&[3, 0]), None);
-        assert_eq!(read_pen_mode(&[2]), None);
-        assert_eq!(read_pen_mode(&[]), None);
-    }
-
-    #[test]
-    fn a_pen_read_here_becomes_the_same_tablet_event_a_deck_sends() {
-        use arcen_protocol::messages::PenToolMsg;
-        let model = arcen_usb_bridge::host_decoded_intuos_model(0x056a, 0x0317).unwrap();
-        let mut reader = arcen_usb_bridge::IntuosPenReader::new(model);
-        let events: Vec<_> = arcen_usb_bridge::intuos5_scripted_stroke()
-            .iter()
-            .filter_map(|step| reader.read(&step.report.encode()))
-            .map(|sample| host_pen_event(&sample))
-            .collect();
-        assert!(events.iter().all(|event| event.validate().is_ok()));
-        assert!(events.iter().all(|event| event.tool == PenToolMsg::Tip));
-        let pressed = events.iter().filter(|event| event.touching).count();
-        assert!(pressed > 20, "the stroke presses ({pressed})");
-        assert!(events.iter().any(|event| event.pressure > 0.99));
-        assert!(events.iter().any(|event| event.buttons == 1));
-        let last = events.last().unwrap();
-        assert!(!last.in_proximity && !last.touching);
-        let eraser = host_pen_event(&arcen_usb_bridge::HostPenSample {
-            x: 2.0,
-            y: -1.0,
-            device_x: 0,
-            device_y: 0,
-            pressure: 0.5,
-            tilt_x_degrees: 63.0,
-            tilt_y_degrees: -64.0,
-            eraser: true,
-            in_proximity: true,
-            touching: true,
-            barrel_buttons: 0,
-        });
-        assert_eq!(eraser.tool, PenToolMsg::Eraser);
-        assert!(eraser.validate().is_ok(), "clamped into the wire's ranges");
+        assert!(refusal.contains("vendor format"));
+        let result = tablet_result(requested_native(true), &Ok(()), Some(&Err(refusal)));
+        assert!(!result.accepted);
+        assert!(String::from(result.reason).contains("056a:0001"));
     }
 }

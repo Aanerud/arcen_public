@@ -163,6 +163,11 @@ pub struct Config {
     pub variant_pinned: bool,
     /// Exact auth-time request retained for the post-hello consistency echo.
     pub auth_video_request: Option<InitialVideoRequestMsg>,
+    /// `video.lossless_refinement`: exact still image may be offered.
+    pub lossless_refinement: bool,
+    /// What this sign-in's Deck asked for (`AuthResponse.lossless_refine_v1`);
+    /// absent for an older Deck or one whose switch is off.
+    pub deck_refine: Option<arcen_protocol::refine::LosslessRefineCapability>,
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
     /// This sign-in's headless Wayland desktop serves a committed
     /// multi-monitor topology: the record's wide-composition proof is a
@@ -473,6 +478,7 @@ impl Config {
             speed_runtime_shortfall: false,
             gpu_import_verified: self.wayland_gpu_import_verified(),
             wayland_fidelity_args: self.wayland_fidelity_args(),
+            refine: None,
             display: Some(self.display.clone()),
             xauthority: match execution.as_ref() {
                 Some(user) => user.environment.get("XAUTHORITY").map(str::to_string),
@@ -843,6 +849,23 @@ impl Config {
         )
     }
 
+    /// What the qualified compositor does to a seat pen's pressure
+    /// (`arcen_input::compositor_pressure`), resolved against the
+    /// compositor prefix's pressure-curve marker when the seat pen is built;
+    /// linear without a Wayland record.
+    #[must_use]
+    pub fn seat_pen_pressure(&self) -> crate::input::pressure_curve::SeatPenPressurePlan {
+        use crate::input::pressure_curve::SeatPenPressurePlan;
+        if self.desktop_provider != arcen_session::desktop_provider::DesktopProvider::Wayland {
+            return SeatPenPressurePlan::linear();
+        }
+        self.wayland_qualification
+            .as_deref()
+            .map_or(SeatPenPressurePlan::linear(), |host| {
+                SeatPenPressurePlan::compositor(&host.record().host.stack.compositor_version)
+            })
+    }
+
     /// The route to a wide composition a new headless Wayland session
     /// starts with: only when the authenticated request resolved to Grading
     /// or HDR and the host's record proves that preset on this route
@@ -1073,7 +1096,7 @@ impl Config {
         request: &InitialVideoRequestMsg,
     ) -> Result<(), String> {
         let client = arcen_media::video::resolve_client_video_request(request)
-            .map_err(|error| format!("initial video request: {error}"))?;
+            .map_err(|error| error.to_string())?;
         let current = arcen_media::VideoConfiguration {
             codec: arcen_media::VideoCodec::from_token(&self.codec)
                 .ok_or_else(|| format!("configured codec {:?} is invalid", self.codec))?,
@@ -1095,7 +1118,7 @@ impl Config {
                 max_fps: self.fps,
             },
         )
-        .map_err(|error| format!("initial video request: {error}"))?;
+        .map_err(|error| error.to_string())?;
         let resolved = self.wayland_fidelity_fallback(resolved);
         let (resolved, desktop_depth_downgraded) = self.fixed_desktop_depth_fallback(resolved);
         self.desktop_depth_downgraded = desktop_depth_downgraded;
@@ -1259,6 +1282,8 @@ impl Default for Config {
             auth_video_request: None,
             requested_pipeline: None,
             wayland_multi_output: false,
+            lossless_refinement: true,
+            deck_refine: None,
             x11_desktop_depth: arcen_media::video::DesktopDepthPolicy::default(),
             attached_desktop_depth: None,
             desktop_depth_downgraded: false,
@@ -2042,6 +2067,9 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
                     )
                 })?;
     }
+    cfg.lossless_refinement = arcen_session::pier_config::LosslessRefinementSetting::resolve(
+        file.video.lossless_refinement,
+    );
     if let Some(value) = file.video.variant {
         apply_variant(cfg, &value)
             .map_err(|error| format!("Pier config video.variant: {error}"))?;

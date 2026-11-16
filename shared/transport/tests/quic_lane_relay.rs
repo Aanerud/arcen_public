@@ -912,3 +912,134 @@ async fn host_pointer_positions_cross_the_input_lane_renumbered_newest_first() {
         RelayRoute::Dropped(LaneRole::InputCursor)
     );
 }
+
+fn refine_scope() -> arcen_protocol::refine::RefineScope {
+    arcen_protocol::refine::RefineScope {
+        monitor_id: 1,
+        topology_generation: 1,
+        stream_epoch: 1,
+        generation: std::num::NonZeroU32::new(5).unwrap(),
+    }
+}
+
+const REFINE_BLOCKS: u32 = 4096;
+
+fn refine_fence(fence: u64, block: u32) -> Vec<u8> {
+    arcen_protocol::refine::RefineFence {
+        scope: refine_scope(),
+        fence,
+        block_count: REFINE_BLOCKS,
+        invalidated: arcen_protocol::refine::BlockRuns::from_sorted_indices([block]),
+    }
+    .encode()
+}
+
+#[tokio::test]
+async fn a_relayed_attachment_carries_refinement_and_never_loses_a_fence() {
+    use arcen_protocol::refine::RefineFence;
+    let mut session = session().await;
+    attach(&mut session).await;
+    let mut relay = PierLaneRelay::start_with(&session.pier, true);
+    assert!(relay.carries_refinement());
+    // The Deck does not read video yet: the backlog overflows and frames
+    // drop, each preceded by a fence invalidating its own block.
+    let mut sent_blocks = std::collections::BTreeSet::new();
+    let mut dropped = 0;
+    let mut fence = 0_u64;
+    for index in 0..150_u32 {
+        fence += 1;
+        assert_eq!(
+            relay.route_to_deck(SessionRecord::Binary(refine_fence(fence, index))),
+            RelayRoute::Queued(LaneRole::Video)
+        );
+        sent_blocks.insert(index);
+        if relay.route_to_deck(SessionRecord::Binary(video_frame(0, index == 0, 64 * 1024)))
+            == RelayRoute::Dropped(LaneRole::Video)
+        {
+            dropped += 1;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(dropped > 0, "the backlog must overflow");
+    // The Deck starts reading: every fence is immediately followed by a
+    // frame, and the union of what arrived covers every block sent.
+    let mut video = PeerLaneReader::new(&session.deck, LaneRole::Video);
+    let reader = tokio::spawn(async move {
+        let mut received = std::collections::BTreeSet::new();
+        let mut widest = 0;
+        let mut last_fence = 0;
+        let mut previous_was_fence = false;
+        loop {
+            let frame = next_frame(&mut video).await;
+            if frame[0] == FrameType::RefineFence as u8 {
+                assert!(!previous_was_fence, "one merged fence per frame");
+                let decoded = RefineFence::decode(&frame).unwrap();
+                assert!(decoded.fence > last_fence, "fences stay in order");
+                last_fence = decoded.fence;
+                let mut blocks = 0;
+                for (start, length) in decoded.invalidated.runs() {
+                    received.extend(*start..start + length);
+                    blocks += length;
+                }
+                widest = widest.max(blocks);
+                previous_was_fence = true;
+                continue;
+            }
+            assert_eq!(frame[0], FrameType::VideoH264 as u8);
+            previous_was_fence = false;
+            if received.contains(&999) {
+                assert!(widest > 1, "dropped frames' fences arrive merged");
+                return received;
+            }
+        }
+    });
+    // A keyframe ends the resync once the backlog has room; one more
+    // block changes with each attempt.
+    let deadline = Instant::now() + STEP;
+    let mut block = 150_u32;
+    loop {
+        fence += 1;
+        relay.route_to_deck(SessionRecord::Binary(refine_fence(fence, block)));
+        sent_blocks.insert(block);
+        block += 1;
+        if relay.route_to_deck(SessionRecord::Binary(video_frame(0, true, 16)))
+            == RelayRoute::Queued(LaneRole::Video)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "keyframe never admitted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fence += 1;
+    relay.route_to_deck(SessionRecord::Binary(refine_fence(fence, 999)));
+    sent_blocks.insert(999);
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(video_frame(0, false, 16))),
+        RelayRoute::Queued(LaneRole::Video)
+    );
+    let received_blocks = timed(reader).await.unwrap();
+    assert_eq!(received_blocks, sent_blocks, "no invalidation was lost");
+
+    // Tiles and digests go on the refine lane.
+    let tile = vec![FrameType::RefineTiles as u8, 1, 2, 3];
+    assert_eq!(
+        relay.route_to_deck(SessionRecord::Binary(tile.clone())),
+        RelayRoute::Queued(LaneRole::Refine)
+    );
+    let mut refine = PeerLaneReader::new(&session.deck, LaneRole::Refine);
+    assert_eq!(next_frame(&mut refine).await.to_vec(), tile);
+    assert_eq!(relay.stats().refine_dropped, 0);
+
+    // An attachment that does not carry refinement drops its records.
+    let mut plain = PierLaneRelay::start(&session.pier);
+    assert!(!plain.carries_refinement());
+    assert_eq!(
+        plain.route_to_deck(SessionRecord::Binary(refine_fence(1, 1))),
+        RelayRoute::Dropped(LaneRole::Refine)
+    );
+    assert_eq!(
+        plain.route_to_deck(SessionRecord::Binary(tile)),
+        RelayRoute::Dropped(LaneRole::Refine)
+    );
+    assert_eq!(plain.stats().refine_dropped, 2);
+}

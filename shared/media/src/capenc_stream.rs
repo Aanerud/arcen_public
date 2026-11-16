@@ -368,16 +368,36 @@ pub enum CapencRoute {
     /// Any other Linux Xorg streaming path (`NvFBC`, software, RGB10 pipe,
     /// self-test): framed-v1 or raw only.
     XorgOther,
-    /// Linux Wayland: framed-v2, no refinement.
+    /// Linux Wayland: framed-v2 from every composition; lossless
+    /// refinement is accepted, and only the wide Grading/HDR composition
+    /// produces it (the others state why it is off).
     Wayland,
     /// Windows: framed-v1 or raw only.
     Windows,
+    /// Windows FP16 scRGB NVENC streaming (Grading and HDR): framed-v2 and
+    /// lossless refinement.
+    WindowsWide,
+}
+
+impl CapencRoute {
+    /// Whether the route writes framed-v2 records.
+    #[must_use]
+    pub const fn writes_framed_v2(self) -> bool {
+        matches!(self, Self::XorgWide | Self::Wayland | Self::WindowsWide)
+    }
+
+    /// Whether the route accepts `refine=on` (ADR 0016). A route that
+    /// accepts it still refines only a contract the shared plan grants.
+    #[must_use]
+    pub const fn honours_refinement(self) -> bool {
+        matches!(self, Self::XorgWide | Self::Wayland | Self::WindowsWide)
+    }
 }
 
 /// Refuses output arguments the dispatched path cannot honour, before any
 /// capture resource exists: `framed-v2` where the path writes framed-v1 or
 /// raw Annex-B (the parent would misparse every byte), and `refine=on`
-/// anywhere but the Xorg depth-30 path (ADR 0016).
+/// where no composition of the path refines (ADR 0016).
 ///
 /// # Errors
 ///
@@ -387,13 +407,13 @@ pub fn check_output_request(args: &[String], route: CapencRoute) -> Result<(), S
     let refine = args
         .iter()
         .any(|arg| arg == crate::refine::CAPENC_REFINE_ON);
-    if refine && route != CapencRoute::XorgWide {
+    if refine && !route.honours_refinement() {
         return Err(format!(
-            "{} is only honoured by the Xorg depth-30 NVENC path, not {route:?}",
+            "{} is not honoured by the {route:?} path",
             crate::refine::CAPENC_REFINE_ON
         ));
     }
-    if framed_v2 && !matches!(route, CapencRoute::XorgWide | CapencRoute::Wayland) {
+    if framed_v2 && !route.writes_framed_v2() {
         return Err(format!(
             "{FRAMED_OUTPUT_V2} is not written by the {route:?} path"
         ));
@@ -413,15 +433,14 @@ mod route_tests {
                 .collect::<Vec<_>>()
         };
         let v2_refine = args(&["framed-v2", "refine=on"]);
-        assert_eq!(
-            check_output_request(&v2_refine, CapencRoute::XorgWide),
-            Ok(())
-        );
         for route in [
-            CapencRoute::XorgOther,
+            CapencRoute::XorgWide,
             CapencRoute::Wayland,
-            CapencRoute::Windows,
+            CapencRoute::WindowsWide,
         ] {
+            assert_eq!(check_output_request(&v2_refine, route), Ok(()), "{route:?}");
+        }
+        for route in [CapencRoute::XorgOther, CapencRoute::Windows] {
             assert!(
                 check_output_request(&v2_refine, route).is_err(),
                 "{route:?}"

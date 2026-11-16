@@ -6,6 +6,13 @@
   "validation": ["shared-session-test", "shared-session-clippy", "workspace-boundaries"],
   "consumers": [
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate"
+      ]
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
@@ -28,7 +35,7 @@
         },
         {
           "id": "macos-deck-transport",
-          "entry_points": ["clients/macos/src/transport/websocket.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -57,6 +64,7 @@
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
       "contracts": [
+        "auth_throttle",
         "compositor_prefix",
         "deskside",
         "desktop_provider",
@@ -67,6 +75,7 @@
         "pier_config",
         "restore_lease",
         "session_admission",
+        "session_setup",
         "wayland_outputs",
         "wayland_qualification",
         "wayland_session",
@@ -308,6 +317,7 @@
         "local_playback",
         "pier_config",
         "session_admission",
+        "session_setup",
         "zoneinfo"
       ],
       "production_uses": [
@@ -394,6 +404,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "agent_relay",
+        "auth_throttle",
         "deskside",
         "desktop_provider",
         "direct_reconnect",
@@ -401,6 +412,7 @@
         "pier_config",
         "restore_lease",
         "session_admission",
+        "session_setup",
         "setup_budget"
       ],
       "production_uses": [

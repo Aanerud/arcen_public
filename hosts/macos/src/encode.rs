@@ -2127,15 +2127,18 @@ mod tests {
     #[test]
     fn h264_p_slice_is_not_mistaken_for_an_hevc_irap() {
         // `0x21` is an H.264 P-slice (type 1) but reads as HEVC type 16, which
-        // is in the IRAP range. Detection must follow the session's codec, or
-        // every H.264 frame is reported as a keyframe.
+        // is in the IRAP range (its low bit puts it outside the base layer).
+        // `0x28` (an H.264 PPS) reads as a base-layer HEVC IDR. Detection must
+        // follow the session's codec, or H.264 units read as keyframes.
         let p_slice = length_prefixed(&[&[0x21, 0x01, 0x00]]);
         assert!(!is_keyframe(&p_slice, EncoderCodec::H264));
-        assert!(is_keyframe(&p_slice, EncoderCodec::Hevc));
+        let pps = length_prefixed(&[&[0x28, 0x01, 0x00]]);
+        assert!(!is_keyframe(&pps, EncoderCodec::H264));
+        assert!(is_keyframe(&pps, EncoderCodec::Hevc));
     }
 
     #[test]
-    fn zero_length_units_terminate_parsing() {
+    fn a_zero_length_unit_and_a_truncated_tail_emit_nothing() {
         let sample = vec![0, 0, 0, 0, 0x65];
         let mut out = Vec::new();
         append_annex_b(&mut out, &sample);

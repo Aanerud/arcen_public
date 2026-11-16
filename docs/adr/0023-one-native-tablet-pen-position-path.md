@@ -164,3 +164,102 @@ mapping was proven `WholeArea` 34 ms after the reader started.
    a real-tablet or real-browser proof.
 2. A hung or held side switch looks exactly like "pen but no ink".
 3. Event-driven evdev positions beat X polling for perceived latency.
+
+## Amendment 2026-11-15: any tablet by default; Tablet support and Native tablet are different contracts
+
+**Status:** Accepted (2026-11-15). Amends
+[ADR 0022](0022-macos-pier-native-tablet-hid-adapter.md) §14.2 and
+[ADR 0021](0021-bridged-usb-devices-on-their-own-seat.md)'s X11 driver
+requirement.
+
+### Rule: any device by default
+
+Arcen supports any pen tablet by default, to the best of its ability, on
+every Deck and every Pier, as game-streaming clients support any controller
+rather than a list of known ones. A dedicated reader exists only where it
+adds something a device's own description does not say; it is never the
+gate. A refusal names what is genuinely unsafe or genuinely impossible, with
+the device's ids and the alternative; "not a model we know" is not a reason.
+
+| Where | Before | After |
+| --- | --- | --- |
+| macOS Pier, Native tablet | Only `056a:0317` (Intuos5 touch L) was read; every other model refused (ADR 0022 §14.2) | A known model keeps its dedicated reader (`IntuosPenReader`: Wacom mode switch, tool id, eraser end). Any other tablet is read by its pen interface's own HID report descriptor (`arcen_usb_bridge::generic_pen`, chosen by `host_pen_route`). Refused only when its pen speaks a vendor format no reader knows (an Intuos-family packet of an unknown model is one) |
+| macOS Pier, publication | A pen interface that also declared a keyboard or mouse was withheld, so its pen could not be read | Such an interface is polled for the Pier alone (`HidHostAdapter::with_host_read_interface`) and still never published; with nothing publishable no device owner starts |
+| Linux Pier, X11 desktop | The pen had to be served by the kernel `wacom` driver | Any node udev marks as a pen, whichever kernel driver serves it (`hid-generic`, `hid-uclogic`, ...); xf86-input-wacom is still required: it is upstream's X driver for every evdev tablet (`MatchIsTablet`) |
+| Linux Pier, native-seat Wayland | Model-agnostic already (the kernel and libinput bind) | Unchanged |
+| Windows Deck, USB component | "Prepare this tablet" was offered only for a Digitizers-page collection | Any collection that names a pen on the Digitizers page or its vendor mirror `0xFF0D` (`names_pen_digitizer`); still prepared per model and claimed per session |
+
+Refusals kept, each with its reason: a headless Wayland desktop (no seat to
+confine a USB device, `admit_hard_usb_session`); a keyboard interface on an
+X11 desktop (the console keyboard handler would take it); the login window
+and another account's console on a macOS Pier; game controllers and
+non-pen devices (`classify_pen_tablet`).
+
+Native tablet on a **Windows Pier** (implemented for 0.20.0, 2026-11-16).
+ADR 0017 declined the route that needs a virtual USB host controller (a
+kernel driver Arcen would have to sign). The macOS Pier's design is another
+route that needs no driver, and the Windows Pier takes it: it publishes no
+device (`HidPublishPolicy::Nothing`), reads the forwarded pen with this
+amendment's readers (dedicated or generic) and injects the samples through
+the synthetic Windows Ink pen it already owns (`PenInjector`,
+`InjectSyntheticPointerInput`), in its own session only. The attachment is
+one shared implementation for both Piers that read the pen themselves:
+`arcen_usb_bridge::HostPenBridge` (the HID host adapter, the reader, the
+Intuos mode switch and its restore, the proximity release) and
+`arcen_input::bridged_pen` (authorization, the Deck's wording, wire frames,
+the host pointer). The macOS Pier adds only its device-owner child and
+console watch, the Windows Pier only the injection. It is offered whenever
+the session's Windows Ink pen device exists; touch, the tablet's keys and
+the maker's driver settings are not used there, as on a macOS Pier.
+
+### The generic reader
+
+`GenericPenLayout` is parsed from one interface's report descriptor:
+for each input report inside a pen application collection, the bit
+position, size and logical/physical range of X and Y, tip, in range,
+pressure, barrel and secondary barrel, invert and eraser, X/Y tilt and
+twist, on the Digitizers page, Generic Desktop, the Button page (only where
+the Digitizers usage is absent) and the vendor digitizer convention
+(`0xFF0D`, high byte of the usage naming the standard page). Every report
+of that interface then becomes the same `HostPenSample` the dedicated
+reader produces, so the tablet event, the shared pen sample of this ADR and
+the Deck's pen dot are unchanged.
+
+The descriptor and every report come from the Deck and are untrusted: the
+walker has the classifier's bounds (4096 bytes, nesting 32, 256 usages per
+item, global stack 16), fields are at most 32 bits, a report shorter than
+its layout is not read, and every value is clamped into its declared range
+before it becomes an event. Deterministic fuzz tests run random and mutated
+descriptors and reports; authored fixtures cover Huion-, Gaomon-, XP-Pen-,
+Wacom-generic- and Windows-style layouts. A lab emulation of a generic pen
+uses the pid.codes test identity `1209:000F` (in-house testing only, never
+shipped).
+
+### Tablet support and Native tablet are different contracts
+
+- **Tablet support** is the operating systems' own pen stacks on both ends:
+  the Deck takes the pen from its native stack (AppKit tablet events on a
+  Mac; `WM_POINTER` pen, that is Windows Ink, on a PC) and the Pier injects
+  it through its native pen path (CoreGraphics tablet events on macOS, the
+  synthetic pointer pen on Windows, the uinput or libei stylus on Linux).
+  Whatever the Deck's operating system and driver accept works, and
+  handedness, area and pressure mapping are theirs. The Deck does not
+  duplicate them: the Mac's "Tablet Orientation Left-handed" item (which
+  mirrored X and negated X tilt of every sample) and its unused "Force
+  Proportions" state are removed; on Windows the same shared item did
+  nothing and is gone too. A left-handed user sets the tablet's orientation
+  in its driver, as for every other application on that machine.
+- **Native tablet** is USB passthrough of the real device. The host's
+  driver (Linux) or the Pier's reader (macOS) interprets it; the Deck's
+  operating system loses the tablet for the session.
+
+### Consequences
+
+- A tablet nobody at Arcen has held works on a macOS Pier with pressure,
+  tilt, twist, barrel buttons and eraser, as far as its descriptor states
+  them; one in a vendor format gets a clear refusal and keeps Tablet support.
+- X11 hosts accept non-Wacom tablets; how well xf86-input-wacom drives an
+  unknown tablet is its own (it treats an unknown USB tablet as a generic
+  model).
+- The Decks' Native tablet text says "Any pen tablet works; models with a
+  dedicated reader get extra features" and states per host what differs.

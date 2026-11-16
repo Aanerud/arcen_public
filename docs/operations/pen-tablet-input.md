@@ -211,8 +211,9 @@ sudo evtest
 > tablet maker's driver, and Arcen does not install one, ship its own, or
 > pretend to be a tablet maker's device. An application set to Wintab sees no
 > tablet over Arcen and draws with mouse pressure; switch it to Windows Ink.
-> Native tablet (USB bridged), which would let the host's own tablet driver
-> provide Wintab, is not offered on Windows hosts either. Why:
+> Native tablet (USB bridged) on a Windows host arrives as the same Windows
+> Ink pen (the Pier reads the bridged pen itself; no tablet driver binds it),
+> so it does not provide Wintab either. Why:
 > [ADR 0017](../adr/0017-forward-only-pen-input.md).
 
 A Windows Pier gives the session a Windows Ink pen
@@ -415,7 +416,17 @@ pressure, tilt, eraser and barrel buttons for a model the Pier reads itself
 to 1.000, a real tablet not yet measured), buttons and proximity only for
 models Arcen does not know yet
 ([ADR 0022 §14.1](../adr/0022-macos-pier-native-tablet-hid-adapter.md)).
-Windows Piers never offer it ([ADR 0017](../adr/0017-forward-only-pen-input.md)).
+A Windows Pier offers it whenever the session's Windows Ink pen device exists,
+with nothing to enable or install: it reads the pen itself with the same
+readers as a macOS Pier and injects it as a Windows Ink pen, with pressure in
+Windows Ink's 1/1024 steps, tilt, barrel button, eraser and proximity
+(measured on a Windows 11 Pier in Chrome 157 and Firefox 160 with the Deck's
+emulated Intuos5 and generic pen: the ladder 0.1/0.25/0.5/0.75/1.0 reads
+0.1006/0.2500/0.5000/0.7500/1.0000 (Intuos5) and 0.0996/0.2500/0.5000/0.7500/1.0000
+(generic), tilt exact, one `pointerenter`/`pointerleave` per stroke, the eraser
+end as `buttons` 32 and the barrel as `buttons` 2; Windows reports the barrel as
+the pen's second button only while the pen touches;
+[ADR 0023 amendment](../adr/0023-one-native-tablet-pen-position-path.md)).
 Keep the Deck's cursor rendering on **Local**: the Pier reports where the
 host's pointer is and the Deck draws it there. When the session ends the
 helper hands the tablet back to macOS like an unplug and replug. The privileged
@@ -455,9 +466,11 @@ Deck, which forwards them in `client_hello.usb_hard_device`.
    Pier logs `Hard USB bridge up for this X11 desktop only` and `bridged
    tablet nodes verified`; the desktop's `Xorg.log` shows `config/udev:
    Adding input device Wacom …` and `Applying InputClass
-   "arcen-bridged-usb-session"`. Only tablets the kernel `wacom` driver
-   serves, with xf86-input-wacom installed, are taken; others are refused
-   with a reason (Native tablet stops, the session goes on). Preconditions:
+   "arcen-bridged-usb-session"`. Any tablet whose node the kernel shows as a
+   pen is taken, whichever kernel driver serves it, with xf86-input-wacom
+   installed (it is the X driver for every evdev tablet); a tablet without a
+   pen node, or a host without xf86-input-wacom, is refused with a reason
+   (Native tablet stops, the session goes on). Preconditions:
    `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` (installed by the
    installer) and every running X server started after it; otherwise the
    Deck is told "Native tablet is not ready on this host…" and the Pier logs
@@ -560,6 +573,72 @@ smoke prints the `cursor_mode_result` and every host cursor position it
 receives (`cursor-position …`). This proves the bridge and the host driver
 without a person; it does not replace the physical test below.
 
+## 5e. Browsers on a Linux Pier: what pressure and tilt to expect
+
+A drawing page that reads `PointerEvent.pressure`, `tiltX` and `tiltY` sees
+what a local tablet on the same desktop would show. Two browser quirks on an
+Xorg desktop are left as they are, because a local tablet behaves the same
+and correcting them for one browser would break the other.
+
+**X11 (Xorg desktop, xf86-input-libinput).** Measured 2026-11-15 on Rocky 9
+with Tablet support from the macOS Deck, strokes at 0.1, 0.25, 0.33, 0.5,
+0.75 and 1.0 with tilts (30, −20), (0, 0), (−45, 45), (60, −60) and (10, 5):
+
+| Browser | `pointerdown` | `pointermove` |
+| --- | --- | --- |
+| Chrome 155 | pressure **0**, tilt **(0, 0)** in every stroke | pressure exactly as sent; tilt in degrees as sent |
+| Firefox 140 | pressure as sent | pressure exactly as sent; tilt **× 90/64**: 30 → 42, −20 → −28, 45 → 64, 60 → 85, 10 → 14 |
+
+- Chrome's `pointerdown` carries no pressure or tilt because
+  xf86-input-libinput posts a tablet tool's button without valuators
+  (`xf86PostButtonEvent (dev, Relative, button, is_press, 0, 0)` in
+  [`src/xf86libinput.c`](https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput))
+  and Chrome reads the press event's own valuators. The first `pointermove`
+  carries them. A page that draws from `pointermove` (most do) is unaffected;
+  one that sizes its first dab from `pointerdown` starts it at zero.
+- Firefox scales tilt because xf86-input-libinput declares its tilt valuators
+  as ±64° (`TABLET_TILT_AXIS_MAX 64`, same file) and Firefox, through GDK,
+  maps that range onto ±90°. Chrome reports the degrees. Tilt beyond ±64° is
+  clipped by the driver for every application.
+
+Both are properties of the X driver and the browsers, measured with Arcen's
+virtual tablet; a USB tablet on the same driver shows them too. Pre-scaling
+tilt on the Pier would make Chrome wrong instead, so it does not.
+
+**GNOME on Wayland.** Mutter 46 to at least 51.1 multiplies its pressure curve
+by the pressure, so with GNOME's default linear curve every application sees
+the pressure squared (0.5 arrives as 0.245;
+[GNOME/mutter#5077](https://gitlab.gnome.org/GNOME/mutter/-/work_items/5077),
+open). Tilt is exact in Chrome and Firefox.
+
+- **Tablet support** (the Pier's virtual tablet): the Pier writes the inverse
+  of Mutter's curve and of libinput's 1 % contact threshold, so applications
+  see the pressure the Deck sent (0.1/0.25/0.5/0.75/1.0 arrive as
+  0.1005/0.2510/0.4991/0.7500/1.0000; Mutter's curve moves in 1/256 steps).
+- **Native tablet** (the real tablet over USB): its reports reach the
+  compositor unchanged, so the Pier cannot correct them; on a stock GNOME 46+
+  desktop the pressure is squared exactly as for a tablet plugged into that
+  host.
+- **A GNOME prefix with Arcen's lab fix**
+  (`packaging/linux/tools/gnome-prefix/patch-pressure-curve-51.py`, see
+  [the prefix README](../../packaging/linux/tools/gnome-prefix/README.md))
+  applies the curve once. It records the patched library's digest in
+  `share/arcen/mutter-pressure-curve`; while that digest matches, the Pier
+  inverts only libinput's threshold, and a Native tablet's pressure arrives
+  as libinput reports it, as for a local tablet. Measured 2026-11-15 on
+  GNOME 51.1 with that fix, Chrome 155 and Firefox 140 identical:
+
+  | Path | 0.1 | 0.25 | 0.5 | 0.75 | 1.0 |
+  | --- | --- | --- | --- | --- | --- |
+  | Tablet support | 0.1000 | 0.2500 | 0.5000 | 0.7500 | 1.0000 |
+  | Native tablet, emulated Intuos5 (fraction of its range) | 0.0913 | 0.2427 | 0.4953 | 0.7474 | 1.0000 |
+  | Native tablet, emulated generic HID pen | 0.0910 | 0.2425 | 0.4951 | 0.7475 | 1.0000 |
+  | Native tablet on stock GNOME 51.1 (both pens) | 0.0082 | 0.0590 | 0.2446 | 0.5599 | 1.0000 |
+
+  The Native values are libinput's own pressure, which starts at its 1 %
+  contact threshold. A GNOME pressure-curve setting cannot undo Mutter's
+  squaring near zero; do not try.
+
 ## Native tablet: one path
 
 Native tablet means one thing on every Pier: the tablet itself is attached
@@ -579,8 +658,9 @@ one implementation of "where the pen is"
 `"enabled"` in `/etc/arcen/pier.json` (or runs `install-arcen-pier
 --native-tablet`) and restarts the Pier; nothing else enables it (the 0.18
 `ARCEN_USB_HARD_LAB=1` service environment is no longer read). A macOS Pier
-offers it when its signed build holds the virtual-HID entitlement. On the
-Deck, choose **Native tablet (USB bridged)** for the connection.
+offers it when its signed build holds the virtual-HID entitlement. A Windows
+Pier offers it with nothing to enable. On the Deck, choose **Native tablet
+(USB bridged)** for the connection.
 
 **What you see.** While the pen is near the tablet, the Deck draws a small
 white dot with a dark ring where the pen points, on every host, whatever

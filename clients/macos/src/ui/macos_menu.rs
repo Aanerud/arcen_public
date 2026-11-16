@@ -3,57 +3,14 @@
 
 use std::sync::{Mutex, OnceLock};
 
-/// Actions the native macOS menu bar dispatches back into the egui app.
+/// Actions the native macOS menu bar dispatches back into the egui app: the
+/// shared command model (`arcen_deck_core::screens::menu`).
 ///
 /// The menu items live in AppKit and fire on the main thread; each one queues
 /// a command here that `ArcenApp` drains once per frame in `logic()`. This
 /// is what lets the single native menu drive the session (there is no longer a
 /// duplicate in-app menu bar in the viewer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuCommand {
-    /// Quit, from the app menu or Cmd+Q. `from_keyboard` is decided when
-    /// the menu fires: a Cmd+Q in a session is hold-to-quit, a click quits.
-    Quit {
-        from_keyboard: bool,
-    },
-    ToggleHealth,
-    /// Show/hide the compact stream statistics (RTT, loss, fps, codec,
-    /// SDR/HDR, lossless coverage).
-    ToggleStreamStats,
-    /// Show/hide the lossless-tile debug view.
-    ToggleLosslessTiles,
-    Disconnect,
-    ReleaseModifiers,
-    ToggleFullscreen,
-    TogglePointerLock,
-    ToggleTabletMonitor,
-    /// Mirror the tablet X axis and negate tilt-X for left-handed use.
-    ToggleTabletLeftHanded,
-    /// Toggle proportional tablet active-area mapping (state stored; full
-    /// implementation requires physical tablet aspect ratio from device info).
-    ToggleTabletForceProportions,
-    /// Type the clipboard's plain text into the host as keystrokes
-    /// (Control+Option+Command+V).
-    PasteAsKeystrokes,
-    /// Stop a paste being typed (Esc does the same).
-    StopTyping,
-    /// Keyboard mode for this session: physical keys (Control+Command+K).
-    KeyboardPhysical,
-    /// Keyboard mode for this session: characters (Control+Command+U).
-    KeyboardCharacters,
-    /// Show/hide the negotiated-truth session-info panel (w5-negotiated-truth):
-    /// actual codec/chroma/depth/range/matrix, hardware-vs-software encode
-    /// and decode, and any degradation from what settings asked for.
-    ToggleNegotiatedTruth,
-    /// Show/hide the Colour check: what the host serves, what this Mac
-    /// shows, and whether the code values arrive exactly.
-    ToggleColourCheck,
-    /// Cycle which `arcen_media::test_pattern::TestPattern` the live
-    /// pixel-exactness readout (w4-exactness-readout) compares the decoded
-    /// frame against: None -> every pattern in turn -> None.
-    #[cfg(feature = "dev-tools")]
-    CycleTestPattern,
-}
+pub use arcen_deck_core::screens::menu::MenuCommand;
 
 static MENU_COMMANDS: Mutex<Vec<MenuCommand>> = Mutex::new(Vec::new());
 
@@ -101,6 +58,11 @@ mod platform {
     use objc2_foundation::{MainThreadMarker, NSActivityOptions, NSProcessInfo, NSString};
 
     const APP_NAME: &str = "Arcen Deck";
+
+    /// A command's title in the shared command model, as this Mac shows it.
+    fn title(command: MenuCommand) -> &'static str {
+        command.title(arcen_deck_core::screens::wording::DeckPlatform::Mac)
+    }
     const VIEW_MENU_TITLE: &str = "View\u{200B}";
 
     define_class!(
@@ -183,16 +145,6 @@ mod platform {
             #[unsafe(method(arcenToggleTabletMonitor:))]
             fn toggle_tablet_monitor(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::ToggleTabletMonitor);
-            }
-
-            #[unsafe(method(arcenToggleTabletLeftHanded:))]
-            fn toggle_tablet_left_handed(&self, _sender: *mut AnyObject) {
-                push_menu_command(MenuCommand::ToggleTabletLeftHanded);
-            }
-
-            #[unsafe(method(arcenToggleTabletForceProportions:))]
-            fn toggle_tablet_force_proportions(&self, _sender: *mut AnyObject) {
-                push_menu_command(MenuCommand::ToggleTabletForceProportions);
             }
 
             #[unsafe(method(arcenToggleNegotiatedTruth:))]
@@ -389,7 +341,9 @@ mod platform {
         app_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            &format!("Quit {APP_NAME}"),
+            title(MenuCommand::Quit {
+                from_keyboard: false,
+            }),
             sel!(arcenQuit:),
             Some(KeyEquivalent {
                 key: "q",
@@ -405,7 +359,7 @@ mod platform {
         connection_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Disconnect",
+            title(MenuCommand::Disconnect),
             sel!(arcenDisconnect:),
             Some(KeyEquivalent {
                 key: "\u{F70F}",
@@ -415,7 +369,7 @@ mod platform {
         connection_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Release Modifiers",
+            title(MenuCommand::ReleaseModifiers),
             sel!(arcenReleaseModifiers:),
             None,
         ));
@@ -425,7 +379,7 @@ mod platform {
         connection_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Paste as Keystrokes",
+            title(MenuCommand::PasteAsKeystrokes),
             sel!(arcenPasteAsKeystrokes:),
             Some(KeyEquivalent {
                 key: "v",
@@ -439,7 +393,7 @@ mod platform {
         let stop_typing = action_item(
             mtm,
             &menu_target,
-            "Stop Typing",
+            title(MenuCommand::StopTyping),
             sel!(arcenStopTyping:),
             None,
         );
@@ -449,7 +403,7 @@ mod platform {
         let physical = action_item(
             mtm,
             &menu_target,
-            "Keyboard: Physical Keys",
+            title(MenuCommand::KeyboardPhysical),
             sel!(arcenKeyboardPhysical:),
             Some(KeyEquivalent {
                 key: "k",
@@ -461,7 +415,7 @@ mod platform {
         let characters = action_item(
             mtm,
             &menu_target,
-            "Keyboard: Characters",
+            title(MenuCommand::KeyboardCharacters),
             sel!(arcenKeyboardCharacters:),
             Some(KeyEquivalent {
                 key: "u",
@@ -478,7 +432,7 @@ mod platform {
         view_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Show Fullscreen",
+            title(MenuCommand::ToggleFullscreen),
             sel!(arcenToggleFullscreen:),
             Some(KeyEquivalent {
                 key: "f",
@@ -488,22 +442,15 @@ mod platform {
         view_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Pointer Lock",
+            title(MenuCommand::TogglePointerLock),
             sel!(arcenTogglePointerLock:),
             None,
         ));
         view_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Tablet Monitor",
+            title(MenuCommand::ToggleTabletMonitor),
             sel!(arcenToggleTabletMonitor:),
-            None,
-        ));
-        view_menu.addItem(&action_item(
-            mtm,
-            &menu_target,
-            "Tablet Orientation Left-handed",
-            sel!(arcenToggleTabletLeftHanded:),
             None,
         ));
         add_submenu(mtm, &menubar, VIEW_MENU_TITLE, &view_menu);
@@ -516,35 +463,35 @@ mod platform {
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Connection Health",
+            title(MenuCommand::ToggleHealth),
             sel!(arcenToggleHealth:),
             None,
         ));
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Stream Statistics",
+            title(MenuCommand::ToggleStreamStats),
             sel!(arcenToggleStreamStats:),
             None,
         ));
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Lossless Tile View",
+            title(MenuCommand::ToggleLosslessTiles),
             sel!(arcenToggleLosslessTiles:),
             None,
         ));
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Negotiated Truth",
+            title(MenuCommand::ToggleNegotiatedTruth),
             sel!(arcenToggleNegotiatedTruth:),
             None,
         ));
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Colour Check…",
+            title(MenuCommand::ToggleColourCheck),
             sel!(arcenToggleColourCheck:),
             None,
         ));
@@ -552,7 +499,7 @@ mod platform {
         session_menu.addItem(&action_item(
             mtm,
             &menu_target,
-            "Cycle Test Pattern Readout",
+            title(MenuCommand::CycleTestPattern),
             sel!(arcenCycleTestPattern:),
             None,
         ));

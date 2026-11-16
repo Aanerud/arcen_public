@@ -42,8 +42,8 @@ inspection, and `subtle` 2.6.1 for constant-time typed pin comparison. Their
 lockfile entries and release notices require Release/Security review.
 `arcen-transport`'s library-only default dependency graph remains free of the
 optional Quinn/Tokio QUIC graph; product crates explicitly enable QUIC. CI
-tests the opt-in feature and proves product graphs do not enable dormant
-`wss-compat`.
+tests the opt-in feature and proves product graphs do not enable the Piers'
+dormant `wss-compat` (the Decks no longer have the feature).
 
 OpenSSL is a system packaging prerequisite for the Linux SMB certificate
 helper only. It is not linked into Pier, is not invoked by the service, and is

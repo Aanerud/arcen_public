@@ -5,10 +5,14 @@
 //! The portable decisions live in [`arcen_media::video::SharedVideoQueue`]:
 //! bounded buffering, drop-and-IDR recovery, generation barriers and counters.
 //! This module owns only Tokio wakeups and the Linux `capenc` IDR side effect.
+//! Lossless-refinement records that precede an access unit ride beside it
+//! in the shared [`RefineVideoCarry`], so a dropped access unit never drops
+//! its invalidations (ADR 0016 R2).
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use arcen_media::refine::carry::RefineVideoCarry;
 use arcen_media::video::{
     FrameClassification, RoomState, SharedVideoQueue, VideoQueuePush, VideoQueueWaitStats,
 };
@@ -37,9 +41,31 @@ pub const ROOM_WAIT: Duration = Duration::from_millis(500);
 /// (`KEYFRAME_REQUEST_MIN_INTERVAL_S = 1.0`).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// One queued wire frame and the sequence number its refinement records
+/// are filed under.
+struct SeqFrame {
+    seq: u64,
+    bytes: Vec<u8>,
+}
+
+/// Refinement records waiting for their access unit, and the next sequence.
+#[derive(Default)]
+struct RefineLedger {
+    carry: RefineVideoCarry,
+    next_seq: u64,
+}
+
+/// A frame to write on the video lane, preceded by the refinement records
+/// that belong before it (empty unless the session refines).
+pub struct DequeuedFrame {
+    pub refine: Vec<Vec<u8>>,
+    pub frame: Vec<u8>,
+}
+
 /// Bounded, drop-oldest, IDR-on-drop outbound queue for one client.
 pub struct FrameQueue {
-    inner: Mutex<SharedVideoQueue<Vec<u8>>>,
+    inner: Mutex<SharedVideoQueue<SeqFrame>>,
+    refine: Mutex<RefineLedger>,
     notify: Notify,
     /// Signalled whenever the writer takes a frame, for [`Self::wait_for_room`].
     room: Notify,
@@ -56,10 +82,26 @@ impl FrameQueue {
                     .encoded_overflow
                     .keyframe_request_min_interval,
             )),
+            refine: Mutex::new(RefineLedger::default()),
             notify: Notify::new(),
             room: Notify::new(),
             idr,
         }
+    }
+
+    /// Files `refine` under a new sequence number and wraps `data` with it.
+    fn sequence(
+        &self,
+        data: Vec<u8>,
+        refine: Vec<Vec<u8>>,
+    ) -> (SeqFrame, std::sync::MutexGuard<'_, RefineLedger>) {
+        let mut ledger = self.refine.lock().unwrap();
+        ledger.next_seq += 1;
+        let seq = ledger.next_seq;
+        if !refine.is_empty() {
+            ledger.carry.push(seq, refine);
+        }
+        (SeqFrame { seq, bytes: data }, ledger)
     }
 
     /// Bounds how long frames may wait for the writer before
@@ -84,8 +126,9 @@ impl FrameQueue {
         data: Vec<u8>,
         is_keyframe: bool,
         is_recovery_point: bool,
+        refine: Vec<Vec<u8>>,
     ) -> bool {
-        self.enqueue_classified_at(data, is_keyframe, is_recovery_point, Instant::now())
+        self.enqueue_refined_at(data, is_keyframe, is_recovery_point, refine, Instant::now())
     }
 
     fn enqueue_classified_at(
@@ -95,10 +138,24 @@ impl FrameQueue {
         is_recovery_point: bool,
         now: Instant,
     ) -> bool {
+        self.enqueue_refined_at(data, is_keyframe, is_recovery_point, Vec::new(), now)
+    }
+
+    fn enqueue_refined_at(
+        &self,
+        data: Vec<u8>,
+        is_keyframe: bool,
+        is_recovery_point: bool,
+        refine: Vec<Vec<u8>>,
+        now: Instant,
+    ) -> bool {
         let outcome = {
+            // The ledger stays locked until the frame is queued, so a
+            // writer never takes records filed for a frame not yet queued.
+            let (frame, _ledger) = self.sequence(data, refine);
             let mut inner = self.inner.lock().unwrap();
             inner.push(
-                data,
+                frame,
                 FrameClassification::new(is_keyframe, is_recovery_point),
                 now,
             )
@@ -144,11 +201,12 @@ impl FrameQueue {
     /// cannot replace the SPS/PPS/IDR selected by the generation waiter. A
     /// second recovery point is requested for the post-activation prediction
     /// chain; P-frames remain suppressed until it is queued.
-    pub fn pin_generation_recovery(&self, data: Vec<u8>) -> bool {
+    pub fn pin_generation_recovery(&self, data: Vec<u8>, refine: Vec<Vec<u8>>) -> bool {
         let requested_at = Instant::now();
         let outcome = {
+            let (frame, _ledger) = self.sequence(data, refine);
             let mut inner = self.inner.lock().unwrap();
-            inner.pin_generation_recovery(data, requested_at)
+            inner.pin_generation_recovery(frame, requested_at)
         };
         if !outcome.accepted {
             return false;
@@ -177,15 +235,29 @@ impl FrameQueue {
 
     /// Await the next frame to send. Returns `None` once the queue is closed and
     /// drained (writer task should then exit).
+    /// Refinement records are not taken: only paths that never refine
+    /// (multi-monitor muxes, tests) use it.
     pub async fn dequeue(&self) -> Option<Vec<u8>> {
+        self.dequeue_refined().await.map(|dequeued| dequeued.frame)
+    }
+
+    /// Await the next frame to send with the refinement records to write
+    /// before it: its own and those of every frame dropped before it,
+    /// merged (`RefineVideoCarry::take_through`).
+    pub async fn dequeue_refined(&self) -> Option<DequeuedFrame> {
         loop {
             let notified = self.notify.notified();
             let retry_at = {
                 let mut g = self.inner.lock().unwrap();
                 if !g.is_paused() {
-                    if let Some(item) = g.pop_front_with_bytes(Vec::len) {
+                    if let Some(item) = g.pop_front_with_bytes(|frame| frame.bytes.len()) {
+                        drop(g);
                         self.room.notify_waiters();
-                        return Some(item);
+                        let refine = self.refine.lock().unwrap().carry.take_through(item.seq);
+                        return Some(DequeuedFrame {
+                            refine,
+                            frame: item.bytes,
+                        });
                     }
                 }
                 if g.is_closed() {
@@ -247,8 +319,15 @@ impl FrameQueue {
     /// draining first.
     pub(crate) fn close_and_clear(&self) {
         self.inner.lock().unwrap().close_and_clear();
+        self.refine.lock().unwrap().carry.clear();
         self.notify.notify_one();
         self.room.notify_waiters();
+    }
+
+    /// A frame is queued that the video lane's writer has not taken: motion
+    /// is waiting, so refinement waits too (ADR 0016 R6).
+    pub fn has_backlog(&self) -> bool {
+        !self.inner.lock().unwrap().is_empty()
     }
 
     pub fn frames_sent(&self) -> u64 {
@@ -307,6 +386,60 @@ impl FrameQueue {
 mod tests {
     use super::*;
     use crate::media::capenc::test_support::fake_idr;
+
+    /// ADR 0016 R2: whatever the queue drops or suppresses, every
+    /// invalidation reaches the Deck before (or with) the next access unit
+    /// it does send, under increasing fences.
+    #[tokio::test]
+    async fn dropped_access_units_never_lose_their_refinement_invalidations() {
+        use arcen_protocol::refine::{BlockRuns, RefineFence, RefineScope};
+        let (idr, _rx) = fake_idr();
+        let q = FrameQueue::new(idr);
+        let scope = RefineScope {
+            monitor_id: 1,
+            topology_generation: 1,
+            stream_epoch: 1,
+            generation: std::num::NonZeroU32::new(5).unwrap(),
+        };
+        let fence = |number: u64, block: u32| {
+            RefineFence {
+                scope,
+                fence: number,
+                block_count: 1000,
+                invalidated: BlockRuns::from_sorted_indices([block]),
+            }
+            .encode()
+        };
+        let frames = CAPACITY as u64 + 4;
+        for index in 1..=frames {
+            q.enqueue_classified(
+                vec![index as u8],
+                false,
+                false,
+                vec![fence(index, index as u32)],
+            );
+        }
+        // A keyframe ends any suppression the drops started.
+        q.enqueue_classified(vec![0xEE], true, true, vec![fence(frames + 1, 999)]);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last_fence = 0;
+        loop {
+            let dequeued = q.dequeue_refined().await.expect("frame");
+            for record in &dequeued.refine {
+                let fence = RefineFence::decode(record).expect("fence");
+                assert!(fence.fence > last_fence, "fences increase");
+                last_fence = fence.fence;
+                seen.extend(fence.invalidated.indices());
+            }
+            if dequeued.frame == vec![0xEE] {
+                break;
+            }
+        }
+        let expected: std::collections::BTreeSet<u32> =
+            (1..=frames as u32).chain(std::iter::once(999)).collect();
+        assert_eq!(seen, expected);
+        assert!(q.frames_dropped() > 0, "the test must have dropped frames");
+    }
 
     #[tokio::test]
     async fn a_full_queue_makes_the_pump_wait_for_the_writer_instead_of_dropping() {
@@ -470,7 +603,7 @@ mod tests {
         let (idr, mut rx) = fake_idr();
         let q = FrameQueue::new(idr);
         q.begin_generation();
-        assert!(q.pin_generation_recovery(vec![0xAA]));
+        assert!(q.pin_generation_recovery(vec![0xAA], Vec::new()));
         assert!(rx.try_recv().is_ok());
         assert!(
             q.activate_generation(),

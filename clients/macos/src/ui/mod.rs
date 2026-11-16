@@ -18,12 +18,20 @@ pub mod multi_window_session;
 mod option_keys;
 mod paste_keys;
 pub(crate) mod pen_input;
+#[cfg(target_os = "macos")]
+mod refine_overlay;
 pub mod region_runtime;
 mod session_truth;
 mod sharp_cursor;
 pub mod text_input;
 pub mod theme;
 pub mod trusted_pins;
+mod video_layer_status;
+#[cfg(target_os = "macos")]
+mod video_metal_layer;
+/// Off macOS the dedicated Metal layers do not exist; see the module doc.
+#[cfg(not(target_os = "macos"))]
+#[path = "video_layer_unavailable.rs"]
 mod video_metal_layer;
 mod video_render;
 /// Developer-only, default-off (`dev-tools`): see the module docs. Never

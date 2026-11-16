@@ -273,6 +273,19 @@ pub enum HealthState {
     Critical,
 }
 
+impl HealthState {
+    /// The canonical lowercase name every host and Deck logs (`ok`,
+    /// `degraded`, `critical`), the same as the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Degraded => "degraded",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 /// Metric responsible for a health state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

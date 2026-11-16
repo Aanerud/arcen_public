@@ -654,9 +654,10 @@ handshake.
 The following capabilities **cannot be provided by local termination** and
 require the future true USB bridge (see
 ["Future true USB bridge (not implemented)"](#earlier-plan-for-a-true-usb-bridge-now-native-tablet)).
-Windows hosts do not offer that bridge
-([ADR 0017](../adr/0017-forward-only-pen-input.md)), so on Windows they stay
-unavailable, as do more than 1,025 pressure steps and Wintab.
+A Windows host takes Native tablet without attaching the device (it reads
+the pen and injects Windows Ink, ADR 0023 amendment), so on Windows they stay
+unavailable, as do more than 1,025 pressure steps and Wintab
+([ADR 0017](../adr/0017-forward-only-pen-input.md)).
 
 - **Tangential pressure / fingerwheel** (airbrush side-wheel) — a device
   feature not exposed by AppKit `NSEvent`; only accessible via raw HID.
@@ -734,18 +735,26 @@ its pen points (ADR 0023). Each piece has one home:
 | The wire record | `arcen-protocol` `cursor_position` (`CursorPosition`, frame `0x51`, `CursorPositionRelay`) | One position per record on the input/cursor lane; the relay renumbers for a split Pier |
 | Admission | `arcen-usb-bridge` `tablet_claim`, `bridged_device_guard` | Vendor-neutral: a device is a tablet because its report descriptors declare a pen |
 | Bridge engine | `arcen-usb-bridge` `exporter` (Deck side), `hid_host` (macOS Pier) | URB admission, cancellation, the interrupt hold, exactly-once release; a host-side HID driver over the bridge |
+| Deck USB component status | `arcen-usb-bridge` `native_component` (`NativeUsbComponentState`, `NativeComponentFacts`) | Where the Deck's privileged component stands (macOS helper, Windows service) and the one wording both Decks show; Native tablet stays unavailable until `Ready` |
+| Deck ↔ component boundary | `arcen-usb-bridge` `component_ipc` | Bounded length-prefixed frames, the hello (device + report descriptors) and info; URB payloads are `arcen-protocol` frames forwarded verbatim |
+| Component lease | `arcen-usb-bridge` `component_lease` (`LeaseAuthority`, `SessionChange`, `Revocation`), `component_session::SessionRevocation` | The tablet is leased for the console session and user verified at accept; a console disconnect or switch, a remote takeover, a logoff, the authorising Deck's exit or a component stop revokes it (the Deck is told why, transfers are cancelled, the tablet's own driver comes back). A screen lock by the same user keeps the lease |
+| Deck's component client | `arcen-deck-core` `runtime::usb_component::ComponentClient` | One client for both Decks over any local stream; the platform only opens it and proves the peer (macOS: a root peer on the helper socket; Windows: the `ArcenUsbComponent` service's own process on the named pipe, identification-level SQOS) |
+| Settings row | `arcen-deck-core` `DeckServices::{native_usb_component_state, run_native_usb_component_action}` | The Native tablet option's state and its control's action (macOS: register / Login Items; Windows: installer, start service, prepare tablet with one UAC approval) |
 | Desktop isolation (Linux) | `arcen-usb-bridge` `bridge_seat` | The per-port udev rule, the Xorg ignore and per-desktop classes, `PressureRecalibration` off |
-| Pen reader (macOS Pier) | `arcen-usb-bridge` `wacom_intuos_pen` (`IntuosPenReader`, `host_decoded_intuos_model`, `HOST_DECODED_INTUOS_MODELS`) | Reads a known model's pen packets; a new model is a table entry here |
+| Pen readers (macOS and Windows Piers) | `arcen-usb-bridge` `generic_pen` (`GenericPenLayout`, `GenericPenReader`), `wacom_intuos_pen` (`IntuosPenReader`, `HOST_DECODED_INTUOS_MODELS`), `host_pen::host_pen_route` | Any tablet's pen by its own report descriptor; a dedicated reader only where it adds features (a vendor packet format) |
+| Host-read attachment (macOS and Windows Piers) | `arcen-usb-bridge` `host_pen_bridge::HostPenBridge`; `arcen-input` `bridged_pen` (`authorize`, `tablet_result`, `NativeTabletAttachment`, `BridgedPenSession`, `host_pen_event`, `HostPenPointer`) | One attachment for a Pier that reads the pen itself: enumeration over the URB bridge, the pen interface polled for the Pier (published or not; `HidPublishPolicy::Nothing` publishes no device), the Intuos mode switch and its restore, the proximity release on the end, wire frames, the same `PenEventMsg` a Deck sends in Tablet support, and the host pointer the pen moves |
 | Lab emulation | `arcen-usb-bridge` `wacom_intuos5` | An emulated Intuos5 with scripted strokes, for tests and lab proofs |
 
 Platform adapters only read devices and publish: the Linux Pier's
 `hosts/linux/src/usb_bridge/tablet_pointer.rs` (the bridged pen's evdev node,
-X11 and Wayland alike), the macOS Pier's `hosts/macos/src/bridged_tablet.rs`,
-and the Deck's `clients/macos/src/ui/sharp_cursor.rs`. **Extend the shared
+X11 and Wayland alike), the macOS Pier's `hosts/macos/src/bridged_tablet.rs`
+(its device-owner child and console watch), the Windows Pier's
+`negotiate_native_tablet` / `send_native_tablet_output` in
+`hosts/windows/src/session.rs` (Windows Ink injection), and the Deck's `clients/macos/src/ui/sharp_cursor.rs`. **Extend the shared
 modules above; do not add another pen-position, mapping or admission
-mechanism.** A new Pier adds an adapter that produces `PenSample`s; a new
-tablet model on a macOS Pier is an entry in `HOST_DECODED_INTUOS_MODELS`
-with its packet layout.
+mechanism.** A new Pier adds an adapter that produces `PenSample`s; a
+tablet model on a macOS Pier needs nothing when its descriptor states its
+pen, and a dedicated reader only for a vendor packet format.
 
 ## Earlier plan for a true USB bridge (now Native tablet)
 
@@ -771,8 +780,9 @@ requiring all of:
   control/feature/output transfers.
 - **A production-signed Windows virtual USB/HID driver** — a synthetic
   pointer device (this document's Windows backend) cannot present full USB
-  device semantics. Not funded, so Windows hosts do not offer the bridge
-  ([ADR 0017](../adr/0017-forward-only-pen-input.md)).
+  device semantics. Not funded
+  ([ADR 0017](../adr/0017-forward-only-pen-input.md)); a Windows host takes
+  Native tablet by reading the pen itself instead (ADR 0023 amendment).
 - **An explicit low-latency network policy/warning**: USB bridging is
   latency-sensitive in a way local termination is not, and a bridge over a
   lossy or high-latency network needs its own documented warning and
@@ -820,7 +830,8 @@ logs/privacy checklist, plus the outstanding human-physical test gate.
 - [ADR 0012](../adr/0012-hard-usb-on-windows-hosts.md) — the route a true
   USB bridge for Windows hosts would take (not taken).
 - [ADR 0017](../adr/0017-forward-only-pen-input.md) — no Wintab, and no
-  Native tablet on Windows hosts.
+  virtual USB device on Windows hosts (Native tablet there reads the pen,
+  [ADR 0023 amendment](../adr/0023-one-native-tablet-pen-position-path.md)).
 - [ADR 0018](../adr/0018-unified-typed-devices.md) — proposed: typed pen
   as the first class of a capability-announced device model.
 - [`legal/ORIGINS.md`](../../legal/ORIGINS.md) —

@@ -29,6 +29,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keel: KEEL_IDLE_QP_OFF,
     queue: DEFAULT_QUEUE_POLICY,
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
+    present_timing: super::PresentTiming::Vsync,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "10-bit 4:4:4 BT.709 SDR detail, up to 30 fps",
     gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer",

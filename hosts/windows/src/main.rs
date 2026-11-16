@@ -100,6 +100,7 @@ mod clipboard {
     }
 }
 mod config;
+mod console_recovery;
 mod cp_pipe;
 mod cursor_watcher;
 mod deskside;
@@ -117,7 +118,7 @@ mod gpu_probe;
 mod gpu_probe {
     pub fn physical_output_inventory(
         _allowed_adapters: &[String],
-    ) -> Result<crate::multi_monitor_topology::PhysicalOutputInventory, String> {
+    ) -> Result<arcen_outputs::windows_topology::PhysicalOutputInventory, String> {
         Err("Windows GPU probing is unavailable on this platform".to_owned())
     }
 
@@ -128,6 +129,7 @@ mod gpu_probe {
 mod iddcx;
 mod input;
 mod ipc;
+mod keymap_watcher;
 mod latest;
 #[cfg(windows)]
 mod log_maintenance;
@@ -138,8 +140,6 @@ mod microphone_input;
 mod multi_monitor_capenc;
 mod multi_monitor_gate;
 mod multi_monitor_input;
-mod multi_monitor_recovery;
-mod multi_monitor_topology;
 mod netinfo;
 mod nvapi;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -148,7 +148,6 @@ mod nvapi_headless;
 // classification and its unit tests still build everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod nvapi_inventory;
-mod observability;
 mod output_provider;
 #[cfg(windows)]
 mod paths;
@@ -168,7 +167,6 @@ mod paths {
         arcen_data_root().join("agent")
     }
 }
-mod quic;
 mod recovery;
 mod resume;
 #[cfg(windows)]
@@ -194,6 +192,7 @@ mod support_bundle;
 mod timezone;
 mod tls;
 mod tz_map;
+mod window_layout;
 mod windows_session;
 
 use std::sync::Arc;
@@ -204,7 +203,7 @@ use arcen_protocol::messages::{InitialVideoRequestMsg, VideoSelectionIntent};
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
 #[cfg(feature = "wss-compat")]
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 #[cfg(feature = "wss-compat")]
 use tokio_tungstenite::accept_async_with_config;
@@ -213,8 +212,8 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::logging::NET;
+use arcen_session::session_admission::{PreauthAdmission, PreauthRefusal};
 
-const PREAUTH_CAPACITY: usize = 16;
 /// Canonical location of the corresponding source, surfaced in the startup
 /// banner to satisfy AGPL-3.0 section 13: users of this Pier interact with it
 /// over a network rather than running it themselves, so the source offer has to
@@ -393,7 +392,7 @@ pub struct HostConfig {
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
     pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
-    pub encoder: crate::capenc::EncoderSelection,
+    pub encoder: arcen_media::video::EncoderRequest,
     pub audio_enabled: bool,
     pub audio_compressed: bool,
     pub microphone_input_enabled: bool,
@@ -407,6 +406,11 @@ pub struct HostConfig {
     pub deskside: deskside::DesksideConfig,
     pub iddcx: config::WindowsIddCxConfig,
     pub multi_monitor: config::WindowsMultiMonitorConfig,
+    /// `video.lossless_refinement`: exact still image may be offered.
+    pub lossless_refinement: bool,
+    /// The Deck's exact-still-image capability from its `AuthResponse`
+    /// (absent while its setting is off). Per session, never from config.
+    pub deck_refine: Option<arcen_protocol::refine::LosslessRefineCapability>,
 }
 
 impl HostConfig {
@@ -461,7 +465,7 @@ impl HostConfig {
 
     pub(crate) fn apply_software_h264_backend(
         &mut self,
-        active: crate::capenc::EncoderSelection,
+        active: arcen_media::video::EncoderRequest,
     ) -> Result<(), String> {
         self.apply_software_h264_backend_after(active, None)
     }
@@ -472,10 +476,10 @@ impl HostConfig {
     /// `FidelityRefusal` code and names that cause.
     pub(crate) fn apply_software_h264_backend_after(
         &mut self,
-        active: crate::capenc::EncoderSelection,
+        active: arcen_media::video::EncoderRequest,
         cause: Option<arcen_media::video::BackendUnavailableReason>,
     ) -> Result<(), String> {
-        if active != crate::capenc::EncoderSelection::SoftwareH264 {
+        if active != arcen_media::video::EncoderRequest::SoftwareH264 {
             return Ok(());
         }
         if let Some(refusal) = arcen_media::video::coded_fidelity_refusal(
@@ -545,7 +549,7 @@ impl HostConfig {
     pub(crate) fn apply_initial_video_request_for_encoder(
         &mut self,
         request: &InitialVideoRequestMsg,
-        encoder: crate::capenc::EncoderSelection,
+        encoder: arcen_media::video::EncoderRequest,
     ) -> Result<(), String> {
         self.apply_initial_video_request_for_encoder_after(request, encoder, None)
     }
@@ -555,7 +559,7 @@ impl HostConfig {
     pub(crate) fn apply_initial_video_request_for_encoder_after(
         &mut self,
         request: &InitialVideoRequestMsg,
-        encoder: crate::capenc::EncoderSelection,
+        encoder: arcen_media::video::EncoderRequest,
         cause: Option<arcen_media::video::BackendUnavailableReason>,
     ) -> Result<(), String> {
         self.apply_initial_video_request(request)?;
@@ -567,7 +571,7 @@ impl HostConfig {
         request: &InitialVideoRequestMsg,
     ) -> Result<(), String> {
         let client = arcen_media::video::resolve_client_video_request(request)
-            .map_err(|error| format!("initial video request: {error}"))?;
+            .map_err(|error| error.to_string())?;
         let current = arcen_media::VideoConfiguration {
             codec: crate::capenc::media_codec(self.codec),
             chroma: crate::capenc::media_chroma(self.chroma),
@@ -587,7 +591,7 @@ impl HostConfig {
                 max_fps: self.fps,
             },
         )
-        .map_err(|error| format!("initial video request: {error}"))?;
+        .map_err(|error| error.to_string())?;
         let mut resolved = resolved;
         // Every stream above eight bits is captured as WGC FP16 scRGB, linear
         // light the encoder must re-encode. For a Deck that presents `srgb`,
@@ -607,7 +611,7 @@ impl HostConfig {
             client.motion_priority,
             arcen_media::video::ServedPipelineContext {
                 backend: Some(
-                    if self.encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+                    if self.encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
                         arcen_media::video::AcceleratorClass::Software
                     } else {
                         arcen_media::video::AcceleratorClass::Hardware
@@ -640,7 +644,7 @@ pub(crate) struct Args {
     host: String,
     /// Canonical direct-session QUIC UDP port.
     port: u16,
-    tls: tls::TlsFileSource,
+    tls: arcen_transport::host_material::HostTlsSource,
     first_login_timeout: Duration,
     profile: arcen_telemetry::OperationalProfile,
     profile_override: Option<arcen_telemetry::OperationalProfile>,
@@ -668,6 +672,7 @@ enum MaintenanceCommand {
     Capenc,
     RestoreDisplay {
         journal: Option<std::path::PathBuf>,
+        console: bool,
     },
     MigrateDisplayJournal {
         journal: Option<std::path::PathBuf>,
@@ -761,8 +766,10 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
         "capenc" => Ok(Some(MaintenanceCommand::Capenc)),
         "restore-display" => {
             let mut journal = None;
+            let mut console = false;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
+                    "--console" => console = true,
                     "--journal" => {
                         journal = Some(std::path::PathBuf::from(
                             arguments
@@ -773,14 +780,17 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                     "-h" | "--help" => {
                         eprintln!(
                             "USAGE:\n  arcen-pier restore-display \
-                             [--journal <PATH>]"
+                             [--journal <PATH>] [--console]"
                         );
                         std::process::exit(0);
                     }
                     other => return Err(format!("unknown restore-display argument: {other}")),
                 }
             }
-            Ok(Some(MaintenanceCommand::RestoreDisplay { journal }))
+            Ok(Some(MaintenanceCommand::RestoreDisplay {
+                journal,
+                console,
+            }))
         }
         "migrate-display-journal" => {
             let mut journal = None;
@@ -1308,11 +1318,11 @@ fn parse_chroma(value: &str) -> Result<ChromaSubsampling, String> {
     }
 }
 
-fn parse_encoder(value: &str) -> Result<crate::capenc::EncoderSelection, String> {
+fn parse_encoder(value: &str) -> Result<arcen_media::video::EncoderRequest, String> {
     match value.to_ascii_lowercase().as_str() {
-        "auto" => Ok(crate::capenc::EncoderSelection::Auto),
-        "nvenc" => Ok(crate::capenc::EncoderSelection::Nvenc),
-        "software-h264" | "openh264" => Ok(crate::capenc::EncoderSelection::SoftwareH264),
+        "auto" => Ok(arcen_media::video::EncoderRequest::Auto),
+        "nvenc" => Ok(arcen_media::video::EncoderRequest::NativeNvenc),
+        "software-h264" | "openh264" => Ok(arcen_media::video::EncoderRequest::SoftwareH264),
         other => Err(format!(
             "unsupported encoder: {other} (want auto|nvenc|software-h264)"
         )),
@@ -1489,10 +1499,11 @@ where
     let mut codec_pinned = false;
     let mut variant_pinned = false;
     let mut fps = 30u32;
-    let mut encoder = crate::capenc::EncoderSelection::Auto;
+    let mut encoder = arcen_media::video::EncoderRequest::Auto;
     let mut audio_enabled = true;
     let mut audio_compressed = false;
     let mut microphone_input_enabled = false;
+    let mut lossless_refinement = true;
     let mut clipboard_policy = arcen_media::clipboard::ClipboardPolicy::default();
     let mut timezone_redirection = false;
     let mut font_smoothing = font_smoothing::FontSmoothingPolicy::default();
@@ -1645,6 +1656,9 @@ where
         audio_enabled = file.audio.enabled;
         audio_compressed = file.audio.compressed;
         microphone_input_enabled = file.microphone_input.enabled;
+        lossless_refinement = arcen_session::pier_config::LosslessRefinementSetting::resolve(
+            file.video.lossless_refinement,
+        );
         if let Some(value) = file.clipboard.direction {
             clipboard_policy.direction = parse_clipboard_direction(&value)?;
         }
@@ -1873,14 +1887,14 @@ where
             codec_name(codec)
         ));
     }
-    if bit_depth == BitDepth::Twelve && encoder == crate::capenc::EncoderSelection::Nvenc {
+    if bit_depth == BitDepth::Twelve && encoder == arcen_media::video::EncoderRequest::NativeNvenc {
         return Err(
             "video.bit_depth 12 cannot work with --encoder nvenc: NVENC has no 12-bit mode at \
              any subsampling; use the software tier for 12-bit"
                 .to_string(),
         );
     }
-    if encoder == crate::capenc::EncoderSelection::SoftwareH264
+    if encoder == arcen_media::video::EncoderRequest::SoftwareH264
         && (codec != VideoCodec::H264 || chroma != ChromaSubsampling::Yuv420)
     {
         return Err("OpenH264 software encoding requires h264 + yuv420".to_string());
@@ -2012,17 +2026,19 @@ where
         deskside,
         iddcx,
         multi_monitor,
+        lossless_refinement,
+        deck_refine: None,
     };
     #[cfg(not(test))]
     resolve_multi_monitor_adapter_at_startup(&mut config)?;
-    if config.encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+    if config.encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         config.apply_software_h264_backend(config.encoder)?;
     }
 
     Ok(Args {
         host,
         port,
-        tls: tls::TlsFileSource {
+        tls: arcen_transport::host_material::HostTlsSource {
             certificate_path: tls_cert.into(),
             private_key_path: tls_key.into(),
             expected_sans: tls_expected_sans,
@@ -2527,6 +2543,13 @@ fn main() {
                 resolved.global_index,
                 resolved.device_name
             );
+            println!(
+                "{}",
+                arcen_media::refine::operator_status_line(
+                    capenc::REFINE_COMPILED,
+                    args.config.lossless_refinement,
+                )
+            );
             return;
         }
         #[cfg(windows)]
@@ -2663,8 +2686,26 @@ fn main() {
             #[cfg(not(windows))]
             let emitter = LifecycleEmitter::disabled();
             let result = match command {
-                MaintenanceCommand::RestoreDisplay { journal } => {
-                    display::restore_from_journal(journal, &emitter)
+                MaintenanceCommand::RestoreDisplay { journal, console } => {
+                    // Started by the service in the console session: take the
+                    // console's input desktop, and move windows only on the
+                    // user's own desktop, never on the sign-in screen's.
+                    let move_windows = if console {
+                        match console_recovery::attach_input_desktop() {
+                            Ok(desktop) => desktop.eq_ignore_ascii_case("Default"),
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: logging::DISPLAY,
+                                    %error,
+                                    "console display recovery could not attach to the input desktop"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    display::restore_from_journal(journal, &emitter, move_windows)
                 }
                 MaintenanceCommand::MigrateDisplayJournal { journal } => {
                     display::migrate_legacy_journal(journal, &emitter)
@@ -2894,7 +2935,7 @@ fn spawn_compatibility_session(
     emitter: &LifecycleEmitter,
     resume_registry: &Arc<resume::ResumeRegistry>,
     session_shutdown: &watch::Sender<bool>,
-    preauth_slots: &Arc<Semaphore>,
+    preauth_slots: &Arc<PreauthAdmission>,
     sessions: &mut JoinSet<()>,
 ) {
     let acceptor = tls_lifecycle.acceptor();
@@ -2908,14 +2949,15 @@ fn spawn_compatibility_session(
     let emitter = emitter.clone();
     let resume_registry = Arc::clone(resume_registry);
     let session_shutdown = session_shutdown.subscribe();
-    let preauth_permit = match Arc::clone(preauth_slots).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
+    let preauth_permit = match preauth_slots.try_enter(peer.ip()) {
+        Ok(place) => place,
+        Err(refusal) => {
             tracing::warn!(
                 target: NET,
                 %peer,
-                capacity = PREAUTH_CAPACITY,
-                "rejecting dormant compatibility connection: pre-authentication capacity exhausted"
+                capacity = arcen_session::session_admission::PREAUTH_CAPACITY,
+                reason = refusal.as_str(),
+                "rejecting dormant compatibility connection: {refusal}"
             );
             return;
         }
@@ -3097,6 +3139,14 @@ where
         nvidia_headless = ?args.config.multi_monitor.nvidia_headless_enabled,
         "resolved Windows Pier settings"
     );
+    tracing::info!(
+        target: NET,
+        "{}",
+        arcen_media::refine::operator_status_line(
+            capenc::REFINE_COMPILED,
+            args.config.lossless_refinement,
+        )
+    );
     if args.retention_was_clamped {
         tracing::warn!(
             target: NET,
@@ -3115,9 +3165,15 @@ where
             .map_err(|error| format!("tls configuration failed: {error}"))?,
     );
     tls_lifecycle.emit_startup(&emitter);
-    let quic_bind = quic::resolve_bind_addr(&args.host, args.direct_quic_port()).await?;
-    let quic_config = quic::build_quic_server_config(&tls_lifecycle)?;
-    let quic_endpoint = quic::bind_endpoint(quic_bind, quic_config)?;
+    let quic_bind =
+        arcen_transport::quic::resolve_pier_bind_address(&args.host, args.direct_quic_port())
+            .await?;
+    let quic_config = tls_lifecycle
+        .rustls_server_config_for_quic()
+        .map_err(|error| format!("build QUIC rustls config: {error}"))
+        .and_then(arcen_transport::quic::pier_server_config)?;
+    let quic_endpoint = quinn::Endpoint::server(quic_config, quic_bind)
+        .map_err(|error| format!("bind QUIC endpoint: {error}"))?;
     let build = session::windows_build_identity();
     tracing::info!(
         target: NET,
@@ -3156,7 +3212,7 @@ where
     };
     #[cfg(not(feature = "wss-compat"))]
     let compatibility_listener = ();
-    let preauth_slots = Arc::new(Semaphore::new(PREAUTH_CAPACITY));
+    let preauth_slots = Arc::new(PreauthAdmission::default());
     let agent_lease = Arc::new(session::BrokerAgentLease::new(
         args.profile,
         args.config.qos_targets,
@@ -3177,6 +3233,11 @@ where
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
     tls_health_interval.tick().await;
     let topology_debug = WtsTopologyDebugWorker::default();
+    let mut console_display_recovery =
+        console_recovery::ConsoleDisplayRecovery::new(recovery::default_path());
+    console_display_recovery.request(arcen_outputs::display_lease::DisplayLeaseEvent::PierStarted);
+    let mut console_display_recovery_tick = tokio::time::interval(Duration::from_secs(5));
+    console_display_recovery_tick.tick().await;
     on_started();
     diagnostics::spawn_startup_debug_diagnostics(quic_bind);
     topology_debug.request("startup");
@@ -3275,8 +3336,15 @@ where
                     }
                     service::ServiceControlRequest::SessionChange => {
                         topology_debug.request("session_change");
+                        console_display_recovery.request(
+                            arcen_outputs::display_lease::DisplayLeaseEvent::ConsoleChanged,
+                        );
                     }
                 }
+                continue;
+            }
+            _ = console_display_recovery_tick.tick() => {
+                console_display_recovery.tick(!sessions.is_empty());
                 continue;
             }
             _ = tls_health_interval.tick() => {
@@ -3308,9 +3376,25 @@ where
                         remote_validated,
                         "QUIC incoming connection attempt"
                     );
-                    let preauth_permit = match preauth_slots.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
+                    let preauth_permit = match preauth_slots
+                        .try_enter_unproved(peer.ip(), remote_validated)
+                    {
+                        Ok(place) => place,
+                        Err(PreauthRefusal::AddressUnproved) => {
+                            // A stateless Retry: a forged source cannot answer
+                            // it, so it cannot hold another machine's places.
+                            if let Err(error) = incoming.retry() {
+                                error.into_incoming().refuse();
+                            }
+                            continue;
+                        }
+                        Err(refusal) => {
+                            tracing::info!(
+                                target: NET,
+                                %peer,
+                                reason = refusal.as_str(),
+                                "QUIC connection refused before TLS: {refusal}"
+                            );
                             incoming.refuse();
                             continue;
                         }
@@ -3818,7 +3902,7 @@ mod tests {
             arcen_protocol::CLIPBOARD_HEADER_SIZE + arcen_protocol::CHUNK_BYTES
         );
         assert_eq!(
-            PREAUTH_CAPACITY * MAX_INBOUND_MESSAGE,
+            arcen_session::session_admission::PREAUTH_CAPACITY * MAX_INBOUND_MESSAGE,
             16 * (arcen_protocol::CHUNK_BYTES + arcen_protocol::CLIPBOARD_HEADER_SIZE)
         );
     }
@@ -4173,11 +4257,11 @@ mod tests {
         assert!(parse_encoder("media-foundation").is_err());
         assert_eq!(
             parse_encoder("auto").expect("auto"),
-            crate::capenc::EncoderSelection::Auto
+            arcen_media::video::EncoderRequest::Auto
         );
         assert_eq!(
             parse_encoder("openh264").expect("OpenH264 alias"),
-            crate::capenc::EncoderSelection::SoftwareH264
+            arcen_media::video::EncoderRequest::SoftwareH264
         );
     }
 
@@ -4520,7 +4604,7 @@ mod tests {
         software.requested_pipeline = None;
         software.video_selection = VideoSelectionIntent::Exact;
         software
-            .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
+            .apply_software_h264_backend(arcen_media::video::EncoderRequest::SoftwareH264)
             .expect("an exact request may fall back to software");
         assert_eq!(software.bit_depth, BitDepth::Eight);
         assert_eq!(
@@ -4639,7 +4723,7 @@ mod tests {
         .unwrap()
         .config;
         software
-            .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
+            .apply_software_h264_backend(arcen_media::video::EncoderRequest::SoftwareH264)
             .unwrap();
         assert_eq!(software.codec, VideoCodec::H264);
         assert_eq!(software.chroma, ChromaSubsampling::Yuv420);
@@ -4650,7 +4734,7 @@ mod tests {
         pinned.codec = VideoCodec::H265;
         pinned.codec_pinned = true;
         assert!(pinned
-            .apply_software_h264_backend(crate::capenc::EncoderSelection::SoftwareH264)
+            .apply_software_h264_backend(arcen_media::video::EncoderRequest::SoftwareH264)
             .is_err());
     }
 
@@ -4676,7 +4760,7 @@ mod tests {
         let error = software
             .apply_initial_video_request_for_encoder(
                 &request,
-                crate::capenc::EncoderSelection::SoftwareH264,
+                arcen_media::video::EncoderRequest::SoftwareH264,
             )
             .expect_err("Grading requires hardware");
         assert_eq!(
@@ -4707,7 +4791,7 @@ mod tests {
             let error = software
                 .apply_initial_video_request_for_encoder_after(
                     &request,
-                    crate::capenc::EncoderSelection::SoftwareH264,
+                    arcen_media::video::EncoderRequest::SoftwareH264,
                     Some(cause),
                 )
                 .expect_err("Grading still requires hardware");
@@ -4736,7 +4820,7 @@ mod tests {
         software
             .apply_initial_video_request_for_encoder(
                 &request,
-                crate::capenc::EncoderSelection::SoftwareH264,
+                arcen_media::video::EncoderRequest::SoftwareH264,
             )
             .unwrap();
         assert_eq!(software.codec, VideoCodec::H264);
@@ -4759,7 +4843,7 @@ mod tests {
         hardware
             .apply_initial_video_request_for_encoder(
                 &request,
-                crate::capenc::EncoderSelection::Nvenc,
+                arcen_media::video::EncoderRequest::NativeNvenc,
             )
             .unwrap();
         assert_eq!(hardware.codec, VideoCodec::Av1);
@@ -4972,20 +5056,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn preauth_capacity_is_bounded_and_released() {
-        let slots = Arc::new(Semaphore::new(2));
-        let first = slots.clone().try_acquire_owned().unwrap();
-        let second = slots.clone().try_acquire_owned().unwrap();
-        assert!(slots.clone().try_acquire_owned().is_err());
-        drop(first);
-        assert!(slots.clone().try_acquire_owned().is_ok());
-        drop(second);
-    }
-
     #[tokio::test]
     async fn stalled_transport_deadline_releases_permit() {
-        let slots = Arc::new(Semaphore::new(1));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = slots.clone().try_acquire_owned().unwrap();
         let stalled = std::future::pending::<()>();
         assert!(tokio::time::timeout(Duration::from_millis(5), stalled)

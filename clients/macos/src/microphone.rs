@@ -2,166 +2,20 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! macOS AVAudioEngine microphone capture.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use arcen_media::audio::MICROPHONE_V1_FRAME_SAMPLES;
-use tokio::sync::Notify;
 use zeroize::Zeroize;
 
-const CAPTURE_QUEUE_FRAMES: usize = 2;
+use arcen_deck_core::microphone::MicrophoneFrameSink;
+pub use arcen_deck_core::microphone::{CapturedMicrophoneFrame, MicrophoneCaptureError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapturedMicrophoneFrame {
-    pub samples: [i16; MICROPHONE_V1_FRAME_SAMPLES],
-    pub sequence: u32,
-    pub timestamp_ms: u32,
-}
-
-impl CapturedMicrophoneFrame {
-    pub(crate) fn zeroize(&mut self) {
-        self.samples.zeroize();
-    }
-}
-
-impl Drop for CapturedMicrophoneFrame {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MicrophoneCaptureError {
-    UnsupportedPlatform,
-    PermissionDenied,
-    PermissionLost,
-    InputUnavailable,
-    InputRemoved,
-    InvalidCallbackFormat,
-    EngineStartFailed,
-    EngineStopped,
-    ProgressStarved,
-    StartupTimedOut,
-    Cancelled,
-}
-
-struct CaptureQueueState {
-    frames: VecDeque<CapturedMicrophoneFrame>,
-    terminal: Option<Result<(), MicrophoneCaptureError>>,
-}
-
-struct CaptureQueue {
-    state: Mutex<CaptureQueueState>,
-    notify: Notify,
-    captured_frames: AtomicU64,
-    dropped_frames: AtomicU64,
-}
-
-impl CaptureQueue {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(CaptureQueueState {
-                frames: VecDeque::with_capacity(CAPTURE_QUEUE_FRAMES),
-                terminal: None,
-            }),
-            notify: Notify::new(),
-            captured_frames: AtomicU64::new(0),
-            dropped_frames: AtomicU64::new(0),
-        })
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    fn push_drop_oldest(&self, mut frame: CapturedMicrophoneFrame) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.terminal.is_some() {
-            frame.zeroize();
-            return;
-        }
-        self.captured_frames.fetch_add(1, Ordering::Relaxed);
-        if state.frames.len() == CAPTURE_QUEUE_FRAMES {
-            if let Some(mut dropped) = state.frames.pop_front() {
-                dropped.zeroize();
-                self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        state.frames.push_back(frame);
-        drop(state);
-        self.notify.notify_one();
-    }
-
-    fn finish(&self, result: Result<(), MicrophoneCaptureError>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if result.is_err() {
-            for frame in &mut state.frames {
-                frame.zeroize();
-            }
-            state.frames.clear();
-        }
-        if state.terminal.is_none() {
-            state.terminal = Some(result);
-        }
-        drop(state);
-        self.notify.notify_waiters();
-    }
-}
-
-pub struct CapturedMicrophoneReceiver {
-    queue: Arc<CaptureQueue>,
-}
-
-impl CapturedMicrophoneReceiver {
-    pub async fn recv(
-        &mut self,
-    ) -> Result<Option<CapturedMicrophoneFrame>, MicrophoneCaptureError> {
-        loop {
-            let notified = self.queue.notify.notified();
-            {
-                let mut state = self
-                    .queue
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(frame) = state.frames.pop_front() {
-                    return Ok(Some(frame));
-                }
-                if let Some(terminal) = state.terminal {
-                    return terminal.map(|()| None);
-                }
-            }
-            notified.await;
-        }
-    }
-
-    pub(crate) fn take_capture_counters(&self) -> (u64, u64) {
-        (
-            self.queue.captured_frames.swap(0, Ordering::Relaxed),
-            self.queue.dropped_frames.swap(0, Ordering::Relaxed),
-        )
-    }
-}
-
-impl Drop for CapturedMicrophoneReceiver {
-    fn drop(&mut self) {
-        let mut state = self
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for frame in &mut state.frames {
-            frame.zeroize();
-        }
-        state.frames.clear();
-    }
-}
+/// Where capture delivers frames: the session engine's queue
+/// (`arcen_deck_core::runtime::MicrophoneQueue`).
+type CaptureQueue = dyn MicrophoneFrameSink;
 
 pub struct MicrophoneCapture {
     stop: Arc<AtomicBool>,
@@ -169,14 +23,12 @@ pub struct MicrophoneCapture {
 }
 
 impl MicrophoneCapture {
-    pub fn start_with_cancel(
+    /// Starts AVAudioEngine capture into `queue`.
+    pub fn start(
+        queue: Arc<CaptureQueue>,
         stop: Arc<AtomicBool>,
         session_closed: Arc<AtomicBool>,
-    ) -> Result<(Self, CapturedMicrophoneReceiver), MicrophoneCaptureError> {
-        let queue = CaptureQueue::new();
-        let receiver = CapturedMicrophoneReceiver {
-            queue: Arc::clone(&queue),
-        };
+    ) -> Result<Self, MicrophoneCaptureError> {
         let (startup, ready) = std::sync::mpsc::sync_channel(1);
         let thread_stop = Arc::clone(&stop);
         let thread_session_closed = Arc::clone(&session_closed);
@@ -198,13 +50,10 @@ impl MicrophoneCapture {
             }
             match ready.recv_timeout(remaining.min(Duration::from_millis(100))) {
                 Ok(Ok(())) => {
-                    return Ok((
-                        Self {
-                            stop,
-                            thread: Some(thread),
-                        },
-                        receiver,
-                    ));
+                    return Ok(Self {
+                        stop,
+                        thread: Some(thread),
+                    });
                 }
                 Ok(Err(error)) => {
                     stop.store(true, Ordering::Release);
@@ -227,25 +76,16 @@ impl MicrophoneCapture {
             let _ = thread.join();
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        stop: Arc<AtomicBool>,
-        thread: JoinHandle<()>,
-    ) -> (Self, CapturedMicrophoneReceiver) {
-        let queue = CaptureQueue::new();
-        (
-            Self {
-                stop,
-                thread: Some(thread),
-            },
-            CapturedMicrophoneReceiver { queue },
-        )
-    }
 }
 
 fn cancelled(stop: &AtomicBool, session_closed: &AtomicBool) -> bool {
     stop.load(Ordering::Acquire) || session_closed.load(Ordering::Acquire)
+}
+
+impl arcen_deck_core::microphone::MicrophoneStream for MicrophoneCapture {
+    fn stop(&mut self) {
+        MicrophoneCapture::stop(self);
+    }
 }
 
 impl Drop for MicrophoneCapture {
@@ -323,7 +163,7 @@ impl CaptureNormalizer {
                 if cancelled(stop, session_closed) {
                     return;
                 }
-                queue.push_drop_oldest(frame);
+                queue.push(frame);
                 self.frame_len = 0;
             }
         }
@@ -504,7 +344,7 @@ mod native {
                             }
                             normalizer.push(
                                 mono / actual_channels as f32,
-                                &callback_queue,
+                                callback_queue.as_ref(),
                                 &callback_stop,
                                 &callback_session_closed,
                             );
@@ -682,10 +522,8 @@ mod tests {
 
     #[tokio::test]
     async fn normalizer_produces_exact_bounded_frames() {
-        let queue = CaptureQueue::new();
-        let mut receiver = CapturedMicrophoneReceiver {
-            queue: Arc::clone(&queue),
-        };
+        let receiver = arcen_deck_core::runtime::MicrophoneQueue::new();
+        let queue = receiver.clone();
         let mut normalizer = CaptureNormalizer::new(48_000).unwrap();
         emit_frames(&mut normalizer, &queue, 1);
         let frame = receiver.recv().await.unwrap().unwrap();
@@ -695,10 +533,8 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_drops_oldest_and_preserves_capture_clock_gaps() {
-        let queue = CaptureQueue::new();
-        let mut receiver = CapturedMicrophoneReceiver {
-            queue: Arc::clone(&queue),
-        };
+        let receiver = arcen_deck_core::runtime::MicrophoneQueue::new();
+        let queue = receiver.clone();
         let mut normalizer = CaptureNormalizer::new(48_000).unwrap();
         emit_frames(&mut normalizer, &queue, 5);
         let first = receiver.recv().await.unwrap().unwrap();
@@ -711,10 +547,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_capture_failure_discards_audio_and_closes_receiver() {
-        let queue = CaptureQueue::new();
-        let mut receiver = CapturedMicrophoneReceiver {
-            queue: Arc::clone(&queue),
-        };
+        let receiver = arcen_deck_core::runtime::MicrophoneQueue::new();
+        let queue = receiver.clone();
         let mut normalizer = CaptureNormalizer::new(48_000).unwrap();
         emit_frames(&mut normalizer, &queue, 1);
         queue.finish(Err(MicrophoneCaptureError::InputRemoved));
@@ -725,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn owned_frame_zeroizes_original_sample_storage() {
         assert!(std::mem::needs_drop::<CapturedMicrophoneFrame>());
         let mut frame = CapturedMicrophoneFrame {

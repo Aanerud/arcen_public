@@ -119,11 +119,10 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use arcen_transport::cert_marker::{self, OwnershipMarker};
     use arcen_transport::cert_provisioning::{
-        MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRefusal,
-        ProvisioningRequest, plan,
+        MaterialState, ProvisioningAction, ProvisioningRefusal, ProvisioningRequest, plan,
     };
+    use arcen_transport::cert_store::{self, InspectContext, MaterialPaths, PinFiles};
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
     use time::{Duration, OffsetDateTime};
 
@@ -161,14 +160,9 @@ mod imp {
     const SOURCE_OFFER: &str = "Arcen is free software under the GNU AGPL-3.0. It comes with ABSOLUTELY NO WARRANTY. \
          You may redistribute it under the terms of that licence. If you run a modified version \
          that others connect to over a network, you must offer them its corresponding source.";
-    /// Lifetime of a self-signed Pier certificate, in days.
-    ///
-    /// Matches `packaging/linux/new-host-cert.sh` and
-    /// `hosts/windows/scripts/new-host-cert.ps1`. 825 days is the CA/Browser
-    /// Forum maximum that public clients accept, and keeping all three
-    /// generators on one number means an operator sees the same renewal cadence
-    /// whichever produced their certificate.
-    const CERTIFICATE_VALIDITY_DAYS: i64 = 825;
+    /// Lifetime of a self-signed Pier certificate, in days: the shared
+    /// figure every Pier and `hosts/windows/scripts/new-host-cert.ps1` use.
+    const CERTIFICATE_VALIDITY_DAYS: i64 = cert_store::VALIDITY_DAYS;
     const DEFAULT_CONFIG: &str = include_str!("../../pier.json");
     const EVENTLOG_SOURCE_SCRIPT: &str = include_str!("../../host/eventlog-source.ps1");
     /// Shipped with the binary rather than kept only in the repository, so a
@@ -1148,87 +1142,23 @@ mod imp {
     /// The decision itself belongs to `arcen_transport::cert_provisioning`, so
     /// Windows, Linux and macOS answer create/keep/renew/rekey/adopt
     /// identically rather than each installer inventing its own rules.
-    fn inspect_tls(tls: &Path) -> MaterialState {
-        let cert = tls.join("host.crt");
-        let key = tls.join("host.key");
-        let certificate_present = cert.is_file();
-        let key_present = key.is_file();
-        if !certificate_present && !key_present {
-            return MaterialState::absent();
-        }
-
-        let bytes = std::fs::read(&cert).ok();
-        let ownership = bytes.as_ref().map(|bytes| {
-            if !tls.join(MARKER_FILE).exists() {
-                MaterialOwnership::Foreign
-            } else if marker_matches(tls, bytes) {
-                MaterialOwnership::Owned
-            } else {
-                MaterialOwnership::Ambiguous
-            }
-        });
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let (certificate_valid, expiring_or_expired) = bytes
-            .as_ref()
-            .and_then(|bytes| cert_marker::validity_from_pem(bytes))
-            .map_or((false, false), |window| {
-                (
-                    window.is_current(now),
-                    window.is_due_for_renewal(now, RENEW_WITHIN_SECONDS),
-                )
-            });
-
-        MaterialState {
-            certificate_present,
-            key_present,
-            ownership,
-            certificate_valid,
-            expiring_or_expired,
-            stale_staging_present: false,
-            legacy_arcen_self_signed: bytes.as_ref().is_some_and(|bytes| {
-                cert_marker::is_legacy_arcen_self_signed_pem(
-                    bytes,
-                    legacy_arcen_evidence(tls, bytes),
-                )
-            }),
-        }
-    }
-
-    /// Returns whether the ownership marker describes the certificate on disk.
-    fn marker_matches(tls: &Path, certificate_bytes: &[u8]) -> bool {
-        let Ok(recorded) = std::fs::read_to_string(tls.join(MARKER_FILE)) else {
-            return false;
-        };
-        let Ok(marker) = OwnershipMarker::parse(&recorded) else {
-            return false;
-        };
-        let Some(pins) = cert_marker::pins_from_pem(certificate_bytes) else {
-            return false;
-        };
-        marker.matches(&pins.certificate, &pins.spki)
-    }
-
-    fn legacy_arcen_evidence(
-        tls: &Path,
-        certificate_bytes: &[u8],
-    ) -> cert_marker::LegacyArcenEvidence {
-        let companion_pins_match = std::fs::read_to_string(tls.join("host.cert-sha256"))
-            .ok()
-            .zip(std::fs::read_to_string(tls.join("host.spki-sha256")).ok())
-            .is_some_and(|(certificate_pin, spki_pin)| {
-                cert_marker::companion_pins_match_pem(
-                    certificate_bytes,
-                    &certificate_pin,
-                    &spki_pin,
-                )
-            });
-        let machine_sans_match =
-            cert_marker::subject_alt_names_match_pem(certificate_bytes, &subject_alt_names());
-        cert_marker::LegacyArcenEvidence {
-            arcen_tls_directory: true,
-            companion_pins_match,
-            machine_sans_match,
-        }
+    fn inspect_tls(tls: &Path) -> Result<MaterialState, String> {
+        let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+        let machine_sans = subject_alt_names();
+        cert_store::inspect(
+            &MaterialPaths::in_directory(tls),
+            now,
+            InspectContext {
+                stale_staging_present: false,
+                machine_sans: Some(&machine_sans),
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "read {}: {error}",
+                tls.join(cert_store::CERTIFICATE_FILE).display()
+            )
+        })
     }
 
     /// Writes the pin files and ownership marker beside the certificate.
@@ -1240,38 +1170,12 @@ mod imp {
         tls: &Path,
         certificate_pem: &[u8],
     ) -> Result<(), String> {
-        let pins = cert_marker::pins_from_pem(certificate_pem)
-            .ok_or_else(|| "cannot pin the generated certificate".to_string())?;
-        let marker = OwnershipMarker::new(&pins.certificate, &pins.spki)
-            .map_err(|error| format!("ownership marker: {error}"))?;
-        atomic_write(
-            opts,
-            &tls.join("host.cert-sha256"),
-            format!(
-                "sha256 Fingerprint={}\n",
-                cert_marker::colon_hex(&pins.certificate)
-            )
-            .as_bytes(),
-            false,
-        )?;
-        atomic_write(
-            opts,
-            &tls.join("host.spki-sha256"),
-            format!("{}\n", pins.spki).as_bytes(),
-            false,
-        )?;
-        atomic_write(
-            opts,
-            &tls.join(MARKER_FILE),
-            marker.render().as_bytes(),
-            false,
-        )
+        let pins = PinFiles::for_certificate(certificate_pem)?;
+        for (path, contents) in pins.files(&MaterialPaths::in_directory(tls)) {
+            atomic_write(opts, path, contents.as_bytes(), false)?;
+        }
+        Ok(())
     }
-
-    /// Ownership marker name, shared with the Linux helper and the macOS host.
-    const MARKER_FILE: &str = "host.generated-by-arcen";
-    /// How close to expiry counts as due for renewal.
-    const RENEW_WITHIN_SECONDS: i64 = 30 * 24 * 60 * 60;
 
     fn ensure_tls(opts: &Options, tls: &Path) -> Result<(), String> {
         let cert = tls.join("host.crt");
@@ -1286,7 +1190,7 @@ mod imp {
         } else {
             ProvisioningRequest::Ensure
         };
-        let state = inspect_tls(tls);
+        let state = inspect_tls(tls)?;
         let decided = plan(request, state).map_err(|refusal| {
             let hint = if refusal == ProvisioningRefusal::ForeignMaterial {
                 format!(
@@ -1928,6 +1832,8 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use arcen_transport::cert_provisioning::MaterialOwnership;
+
         use super::*;
 
         #[test]
@@ -2172,7 +2078,9 @@ mod imp {
             fs::write(tls.join("host.crt"), certificate.pem()).expect("write cert");
             fs::write(tls.join("host.key"), key.serialize_pem()).expect("write key");
 
-            let state = inspect_tls(&tls);
+            let Ok(state) = inspect_tls(&tls) else {
+                panic!("inspect");
+            };
             let decision = plan(ProvisioningRequest::Ensure, state).expect("adopt");
 
             assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));

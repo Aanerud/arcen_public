@@ -1,0 +1,226 @@
+{
+  "bundle_id": "ARC-NVM5-801P",
+  "component": {
+    "arch": "test",
+    "name": "arcen-deck-test",
+    "os": "test",
+    "version": "0.0.0"
+  },
+  "entries": [
+    {
+      "included_size_bytes": 597,
+      "original_size_bytes": 0,
+      "path": "config/connections.json",
+      "sha256": "d83fd00e300cf60be59e7a43c75ff32d62f9b858405fcb130bf8d7154748dbbe",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 84,
+      "original_size_bytes": 0,
+      "path": "config/settings.json",
+      "sha256": "be62e2bb55ad413fde3c4b0a56c81bcfa393dd301e471de07570b4ef3a814914",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 277,
+      "original_size_bytes": 0,
+      "path": "config/trusted_pins.json",
+      "sha256": "9350fb0a00a9c6ad932c4c408f4f812e2d94699c736e83f793b340e6ecb09f7c",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 243,
+      "original_size_bytes": 0,
+      "path": "crash/arcen-deck-2026-11-15-070000.ips",
+      "sha256": "b10b3fc60171281a4bf54a49c3fea43cee09c41648b329b97d6d00577252c223",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 76,
+      "original_size_bytes": 0,
+      "path": "crash/arcen-deck.exe.4242.dmp",
+      "sha256": "b67987d655b7a1edebbe9473bf934eb2e5c01d08d871e33e665a6138a4764fed",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 0,
+      "original_size_bytes": 0,
+      "path": "deck/about.json",
+      "sha256": "<host-dependent>",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 532,
+      "original_size_bytes": 532,
+      "path": "diagnostics/decode.json",
+      "sha256": "f95c8095256c77f62897c1d8659461a19a2b11e3d5c52585fcf53b41d8a60cef",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 329,
+      "original_size_bytes": 329,
+      "path": "diagnostics/displays.json",
+      "sha256": "28a312bb0119c26710fc69bdf9172a9b1e9a72608c92d7adaf9232a8c624749e",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 48,
+      "original_size_bytes": 48,
+      "path": "diagnostics/native-usb-component.json",
+      "sha256": "38d90d7c4854ddc5033d9f30e7288bfdb610bf2d41a8485e436dfc977ba188d8",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 156,
+      "original_size_bytes": 156,
+      "path": "diagnostics/platform.json",
+      "sha256": "499e00a82b718c9e3736c9547f44e460c84f47d62890945d84d347855fe57a1e",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 788,
+      "original_size_bytes": 0,
+      "path": "logs/arcen-client.log.2026-11-14",
+      "sha256": "39d98c60b8a78c58e9e96ea99f7b55ecada22c7624a8e1852254f98ff1e02ad1",
+      "source": "log",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 407,
+      "original_size_bytes": 0,
+      "path": "logs/arcen-client.log.2026-11-15",
+      "sha256": "ccbe42cb575520ce6d735756087dedca7ebfce0d304fae16619d3cfe583e7550",
+      "source": "log",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 268,
+      "original_size_bytes": 268,
+      "path": "session/last-session.json",
+      "sha256": "67d494ba7588411abad086c170c45dd56e24258194524f5ba6914b5f0bec010f",
+      "source": "runtime_state",
+      "truncation": null
+    }
+  ],
+  "generated_at_unix_seconds": 1794726245,
+  "notices": [
+    {
+      "code": "crash_reports_requested",
+      "kind": "advisory",
+      "source": "crash"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "advisory",
+      "source": "diagnostics/network.json"
+    },
+    {
+      "code": "canonical_log_record_invalid",
+      "kind": "invalid",
+      "source": "logs/arcen-client.log.2026-11-14"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/clipboard"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/credentials"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/typed-text"
+    }
+  ],
+  "redactions": [
+    {
+      "entry_path": "config/connections.json",
+      "key_path": "/connections/0/host",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "config/connections.json",
+      "key_path": "/connections/0/id",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "config/connections.json",
+      "key_path": "/connections/0/password",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/connections.json",
+      "key_path": "/connections/0/settings/remembered_username",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "config/connections.json",
+      "key_path": "/last_selected_connection_id",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "config/trusted_pins.json",
+      "key_path": "/pins",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "crash/arcen-deck-2026-11-15-070000.ips",
+      "key_path": "/body/crashReporterKey",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "crash/arcen-deck-2026-11-15-070000.ips",
+      "key_path": "/body/userName",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "diagnostics/platform.json",
+      "key_path": "/api_key",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-14",
+      "key_path": "/fields/endpoint",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-14",
+      "key_path": "/fields/ssid",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-14",
+      "key_path": "/host",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-14",
+      "key_path": "/peer_addr",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-14",
+      "key_path": "/user",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-client.log.2026-11-15",
+      "key_path": "/user",
+      "reason": "identity_pseudonymized"
+    }
+  ],
+  "schema_version": 1
+}

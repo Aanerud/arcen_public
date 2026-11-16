@@ -6,7 +6,9 @@
 > [ADR 0017](0017-forward-only-pen-input.md) decides that Native tablet is
 > not offered on Windows hosts: the signing pipeline below is not funded,
 > and Tablet support is the Windows pen. This record is kept unchanged as
-> the route to revisit if that changes.
+> the route to revisit if that changes. (2026-11-16: a Windows Pier offers
+> Native tablet without this route, by reading the pen itself; see
+> [ADR 0023](0023-one-native-tablet-pen-position-path.md)'s amendment.)
 
 > Recorded so the mechanism question is answered once and the cost is visible
 > before anyone starts. It touches the driver boundary and the signing and

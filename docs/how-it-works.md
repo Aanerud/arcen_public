@@ -226,13 +226,17 @@ measuring how long a rejection takes. A pin changes only when you change it.
 credential provider that takes part in the real login. Passwords are held in
 memory that is wiped on release and never written to a log.
 
-**The Linux and Windows Piers have no lockout of their own.** Repeated password
-attempts are passed to the operating system, so throttling is whatever
-`pam_faillock` or your Windows account-lockout policy already does. If you
-expose a Pier to a network you do not control, configure that policy — Arcen
-will not do it for you. The macOS Pier (preview) backs off by itself: after
-three failures from one address or for one account it waits, doubling from
-2 seconds up to 5 minutes (shared `arcen_session::auth_throttle`).
+**Every Pier backs off repeated failed sign-ins, the same way.** After three
+failures from one address (an IPv6 address counts as its /64) or for one
+account, the next sign-in is refused without checking the password, and the
+wait doubles from 2 seconds up to 5 minutes. A success clears the address's
+count; an account's failures expire after 15 minutes without another. At most two
+password checks run at once for one address or account, so opening many
+connections does not get more guesses checked. The policy is the shared
+`arcen_session::auth_throttle`, used unchanged by the Linux, Windows and
+macOS Piers. It is a back-off, not a lockout: the operating system's own
+policy (`pam_faillock`, Windows account lockout) still applies underneath,
+and remains the place to set a lockout if you want one.
 
 ### Using your own certificate
 

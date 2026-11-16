@@ -404,6 +404,13 @@ trait DisplayBackend {
     fn restore_owns_driver_state(&self, _snapshot: &Self::Snapshot) -> bool {
         false
     }
+    /// Bring back the snapshot's topology (which displays are active, which
+    /// is primary) when the exact restore could not, letting Windows choose
+    /// modes; `Err` names what still differs. Judged by the shared
+    /// `arcen_outputs::display_lease::verify_restore`.
+    fn restore_topology(&mut self, _snapshot: &Self::Snapshot) -> Result<(), String> {
+        Ok(())
+    }
 
     fn arm_recovery(
         &mut self,
@@ -1180,6 +1187,13 @@ fn restore_with_retry<B: DisplayBackend>(
 /// for the next session, only repeats the refusal. Restoring a mode the
 /// display cannot show is not a safety property, so the display is left as it
 /// is. A mode that is still offered keeps every existing retry and failure.
+///
+/// The mode is the only thing excused. The failed restore may also have left
+/// the session's topology in place (the other displays inactive, the session
+/// display primary), and accepting that stranded the local user on a dark
+/// monitor with every window on a virtual display. The topology is restored
+/// on its own first; if even that fails the restore fails and the journal
+/// stays armed.
 fn original_mode_withdrawn<B: DisplayBackend>(
     backend: &mut B,
     target: &DisplayTarget,
@@ -1191,6 +1205,15 @@ fn original_mode_withdrawn<B: DisplayBackend>(
     }
     let offered = backend.supported_sizes(target).ok()?;
     if offered.is_empty() || offered.contains(&original.size) {
+        return None;
+    }
+    if let Err(error) = backend.restore_topology(snapshot) {
+        tracing::error!(
+            target: DISPLAY,
+            device = %target.device_name,
+            %error,
+            "the original mode was withdrawn and the pre-session topology did not come back"
+        );
         return None;
     }
     backend.current(target).ok()
@@ -1435,6 +1458,8 @@ impl DisplayManager {
 
         let requested = request.size;
         let requested_scale_percent = requested_scale_percent_from_request(request)?;
+        let mut session_windows =
+            crate::window_layout::SessionWindows::capture(&crate::recovery::default_path());
         let mut inner = DisplayTransaction::acquire_observed(
             NativeBackend::new(request, session_log_id, deskside),
             &selector,
@@ -1445,6 +1470,11 @@ impl DisplayManager {
         let report = inner.report().clone();
         if !report.changed {
             lock_restore_state(&self.restore_state).state = RestoreState::Clean;
+            if let Some(session_windows) = session_windows.take() {
+                session_windows.discard();
+            }
+        } else if let Some(session_windows) = session_windows.as_mut() {
+            session_windows.set_session_displays(vec![report.device_name.clone()]);
         }
         #[cfg(windows)]
         if inner.target.vendor_id == 0x10de {
@@ -1507,13 +1537,14 @@ impl DisplayManager {
             inner,
             #[cfg(windows)]
             headless: None,
+            windows: session_windows,
             _permit: permit,
         })
     }
 
     pub fn acquire_multi(
         &self,
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         iddcx: Option<crate::config::WindowsIddCxConfig>,
         session_log_id: arcen_telemetry::CorrelationId,
     ) -> Result<MultiDisplayLease, String> {
@@ -1529,6 +1560,8 @@ impl DisplayManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| "shared Windows display is already in use".to_string())?;
+        let session_windows =
+            crate::window_layout::SessionWindows::capture(&crate::recovery::default_path());
         #[cfg(windows)]
         let inner = {
             let context = arcen_outputs::OutputContext::new(session_log_id);
@@ -1560,10 +1593,11 @@ impl DisplayManager {
             let _ = (plan, iddcx, session_log_id);
             return Err("multi-display transactions are only available on Windows".to_string());
         };
-        Ok(MultiDisplayLease {
+        Ok(MultiDisplayLease::with_windows(
             inner,
-            _permit: permit,
-        })
+            session_windows,
+            permit,
+        ))
     }
 
     pub fn prepare_nvidia_headless_multi(
@@ -1583,6 +1617,8 @@ impl DisplayManager {
         let permit = self.session_slot.clone().try_acquire_owned().map_err(|_| {
             HeadlessProvisionError::Failed("shared Windows display is already in use".into())
         })?;
+        let session_windows =
+            crate::window_layout::SessionWindows::capture(&crate::recovery::default_path());
         #[cfg(windows)]
         let preparation = windows_backend::provision_nvidia_headless_outputs(
             adapter_name,
@@ -1600,6 +1636,7 @@ impl DisplayManager {
             preparation,
             adapter_name: adapter_name.to_string(),
             restore_state: Arc::clone(&self.restore_state),
+            windows: session_windows,
             _permit: permit,
         })
     }
@@ -1672,6 +1709,7 @@ fn recover_pending_journal(path: &std::path::Path) -> Result<(), String> {
                 ?outcome,
                 "restored the display from the pending recovery journal"
             );
+            crate::window_layout::repatriate_pending(path);
             Ok(())
         }
         Ok(outcome) => {
@@ -1763,6 +1801,7 @@ pub struct DisplayLease {
     inner: DisplayTransaction<NativeBackend>,
     #[cfg(windows)]
     headless: Option<windows_backend::HeadlessOutputPreparation>,
+    windows: Option<crate::window_layout::SessionWindows>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -1798,6 +1837,7 @@ pub struct HeadlessPlanningLease {
     preparation: Option<()>,
     adapter_name: String,
     restore_state: Arc<Mutex<RestoreJournal>>,
+    windows: Option<crate::window_layout::SessionWindows>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -1877,17 +1917,22 @@ impl HeadlessPlanningLease {
             policy,
             Some(Arc::clone(&self.restore_state)),
         )?;
+        let mut session_windows = self.windows.take();
+        if let Some(session_windows) = session_windows.as_mut() {
+            session_windows.set_session_displays(vec![inner.report().device_name.clone()]);
+        }
         Ok(DisplayLease {
             inner,
             #[cfg(windows)]
             headless,
+            windows: session_windows,
             _permit: self._permit,
         })
     }
 
     pub fn acquire(
         mut self,
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         session_log_id: arcen_telemetry::CorrelationId,
     ) -> Result<MultiDisplayLease, String> {
         #[cfg(windows)]
@@ -1907,10 +1952,11 @@ impl HeadlessPlanningLease {
             let _ = (plan, session_log_id);
             return Err("NVIDIA headless provisioning is only available on Windows".to_string());
         };
-        Ok(MultiDisplayLease {
+        Ok(MultiDisplayLease::with_windows(
             inner,
-            _permit: self._permit,
-        })
+            self.windows.take(),
+            self._permit,
+        ))
     }
 }
 
@@ -1919,6 +1965,7 @@ pub struct MultiDisplayLease {
     inner: MultiDisplayTransaction,
     #[cfg(not(windows))]
     inner: (),
+    windows: Option<crate::window_layout::SessionWindows>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -1929,6 +1976,36 @@ enum MultiDisplayTransaction {
 }
 
 impl MultiDisplayLease {
+    fn with_windows(
+        #[cfg(windows)] inner: MultiDisplayTransaction,
+        #[cfg(not(windows))] inner: (),
+        mut session_windows: Option<crate::window_layout::SessionWindows>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let mut lease = Self {
+            inner,
+            windows: None,
+            _permit: permit,
+        };
+        if let Some(session_windows) = session_windows.as_mut() {
+            session_windows.set_session_displays(lease.device_names());
+        }
+        lease.windows = session_windows;
+        lease
+    }
+
+    fn device_names(&self) -> Vec<String> {
+        self.applied_plan().map_or_else(
+            || vec![self.report().device_name.clone()],
+            |plan| {
+                plan.monitors
+                    .iter()
+                    .map(|monitor| monitor.device_name.clone())
+                    .collect()
+            },
+        )
+    }
+
     pub fn report(&self) -> &DisplayReport {
         #[cfg(windows)]
         {
@@ -1946,14 +2023,20 @@ impl MultiDisplayLease {
     pub fn restore(&mut self) -> Result<(), String> {
         #[cfg(windows)]
         {
-            match &mut self.inner {
+            let restored = match &mut self.inner {
                 MultiDisplayTransaction::Physical(inner) => {
                     crate::output_provider::block_on(inner.rollback())
                 }
                 MultiDisplayTransaction::IddCx(inner) => {
                     crate::output_provider::block_on(inner.rollback())
                 }
+            };
+            if restored.is_ok() {
+                if let Some(session_windows) = self.windows.take() {
+                    session_windows.repatriate();
+                }
             }
+            restored
         }
         #[cfg(not(windows))]
         {
@@ -1980,7 +2063,7 @@ impl MultiDisplayLease {
         }
     }
 
-    pub fn applied_plan(&self) -> Option<&crate::multi_monitor_topology::WindowsTopologyPlan> {
+    pub fn applied_plan(&self) -> Option<&arcen_outputs::windows_topology::WindowsTopologyPlan> {
         #[cfg(windows)]
         {
             match &self.inner {
@@ -2064,6 +2147,9 @@ impl DisplayLease {
             backend = self.inner.report.restore_backend,
             "display restored after capture and input shutdown"
         );
+        if let Some(session_windows) = self.windows.take() {
+            session_windows.repatriate();
+        }
         Ok(())
     }
 
@@ -2358,7 +2444,7 @@ pub(crate) fn edid_scale_ratio(scale: arcen_media::Scale120) -> Option<f32> {
 }
 
 pub(crate) fn exact_mode_edid_request(
-    monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+    monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
 ) -> crate::edid::EdidRequest {
     crate::edid::EdidRequest {
         width: monitor.mode_width,
@@ -2607,7 +2693,7 @@ mod windows_backend {
     }
 
     pub(super) struct PreparedPhysicalOutput {
-        plan: crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: arcen_outputs::windows_topology::WindowsTopologyPlan,
         session_log_id: arcen_telemetry::CorrelationId,
     }
 
@@ -2765,7 +2851,7 @@ mod windows_backend {
     }
 
     impl arcen_outputs::OutputProvider for PhysicalOutputProvider {
-        type Plan = crate::multi_monitor_topology::WindowsTopologyPlan;
+        type Plan = arcen_outputs::windows_topology::WindowsTopologyPlan;
         type Prepared = PreparedPhysicalOutput;
         type Binding = PhysicalOutputBinding;
         type Evidence = crate::output_provider::WindowsOutputEvidence;
@@ -2942,7 +3028,7 @@ mod windows_backend {
     }
 
     pub(super) struct PreparedIddCxOutput {
-        plan: crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: arcen_outputs::windows_topology::WindowsTopologyPlan,
         request: arcen_iddcx_provider::abi::ApplyRequest,
     }
 
@@ -2967,8 +3053,8 @@ mod windows_backend {
 
         fn wait_for_applied_plan(
             &self,
-            plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
-        ) -> Result<crate::multi_monitor_topology::WindowsTopologyPlan, String> {
+            plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
+        ) -> Result<arcen_outputs::windows_topology::WindowsTopologyPlan, String> {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut last_error = None;
             while Instant::now() < deadline {
@@ -3061,7 +3147,7 @@ mod windows_backend {
     }
 
     impl arcen_outputs::OutputProvider for IddCxOutputProvider {
-        type Plan = crate::multi_monitor_topology::WindowsTopologyPlan;
+        type Plan = arcen_outputs::windows_topology::WindowsTopologyPlan;
         type Prepared = PreparedIddCxOutput;
         type Binding = IddCxOutputBinding;
         type Evidence = crate::output_provider::WindowsOutputEvidence;
@@ -3190,13 +3276,13 @@ mod windows_backend {
     }
 
     impl PhysicalOutputBinding {
-        fn plan(&self) -> &crate::multi_monitor_topology::WindowsTopologyPlan {
+        fn plan(&self) -> &arcen_outputs::windows_topology::WindowsTopologyPlan {
             self.evidence.applied_plan()
         }
 
         fn prepare_exact_modes(
             &mut self,
-            plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+            plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         ) -> Result<(), String> {
             // Only a plan that placed some output at a mode it does not
             // enumerate needs a synthesized timing, and synthesizing one is
@@ -3304,7 +3390,7 @@ mod windows_backend {
 
         fn apply_headless_nvapi_topology(
             &mut self,
-            plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+            plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         ) -> Result<bool, String> {
             if self.headless_entries.is_empty() {
                 return Ok(false);
@@ -3393,7 +3479,7 @@ mod windows_backend {
 
         fn apply(
             &mut self,
-            plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+            plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         ) -> Result<(), String> {
             let mut paths = self.working.paths.clone();
             let mut modes = self.working.modes.clone();
@@ -3641,7 +3727,7 @@ mod windows_backend {
     }
 
     fn empty_multi_display_report(
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
     ) -> Result<DisplayReport, String> {
         let primary = plan.primary();
         Ok(report(
@@ -3697,7 +3783,7 @@ mod windows_backend {
     }
 
     fn multi_display_report(
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         effective_scale_reports: Vec<DisplayScaleReport>,
     ) -> Result<DisplayReport, String> {
         let mut report = empty_multi_display_report(plan)?;
@@ -3709,14 +3795,14 @@ mod windows_backend {
     mod physical_output_binding_tests {
         use super::*;
 
-        fn test_plan() -> crate::multi_monitor_topology::WindowsTopologyPlan {
-            crate::multi_monitor_topology::WindowsTopologyPlan {
+        fn test_plan() -> arcen_outputs::windows_topology::WindowsTopologyPlan {
+            arcen_outputs::windows_topology::WindowsTopologyPlan {
                 generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
                 desktop_x: 0,
                 desktop_y: 0,
                 desktop_width: 1280,
                 desktop_height: 720,
-                monitors: vec![crate::multi_monitor_topology::WindowsMonitorPlan {
+                monitors: vec![arcen_outputs::windows_topology::WindowsMonitorPlan {
                     session_monitor_id: arcen_media::SessionMonitorId::new(1).expect("monitor id"),
                     client_display_id: "test-display".to_string(),
                     adapter_luid: crate::nvapi::AdapterLuid::default(),
@@ -3801,7 +3887,7 @@ mod windows_backend {
     }
 
     fn monitor_center_point(
-        monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+        monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
     ) -> Result<POINT, String> {
         let half_width = i32::try_from(monitor.width / 2)
             .map_err(|_| format!("monitor {} width exceeds i32", monitor.device_name))?;
@@ -4057,7 +4143,7 @@ mod windows_backend {
     }
 
     fn apply_monitor_dpi_scale(
-        monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+        monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
     ) -> Result<Option<AppliedDpiScale>, String> {
         let rect = DesktopRect {
             left: monitor.x,
@@ -4174,7 +4260,7 @@ mod windows_backend {
     }
 
     fn effective_scale_report(
-        monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+        monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
     ) -> Result<DisplayScaleReport, String> {
         let point = monitor_center_point(monitor)?;
         let hmonitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
@@ -4217,7 +4303,7 @@ mod windows_backend {
     }
 
     pub(super) fn effective_scale_reports(
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
     ) -> Vec<DisplayScaleReport> {
         plan.monitors
             .iter()
@@ -4269,7 +4355,7 @@ mod windows_backend {
     }
 
     fn wait_for_multi_display_plan(
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
@@ -4286,7 +4372,7 @@ mod windows_backend {
     }
 
     fn verify_multi_display_plan(
-        plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
     ) -> Result<(), String> {
         let allowed_adapters = plan
             .monitors
@@ -4374,6 +4460,77 @@ mod windows_backend {
             Ok(())
         } else {
             Err("restored display topology does not match the original snapshot".to_string())
+        }
+    }
+
+    /// The CCD topology as the shared display-lease policy sees it: one state
+    /// per target (adapter LUID + target id), active when any path to it is
+    /// active, primary when its source sits at (0, 0). Inactive paths name
+    /// only targets Windows reports available, so a stale path is no display.
+    pub(super) fn ccd_display_states(
+        topology: &TopologySnapshot,
+    ) -> Vec<arcen_outputs::display_lease::DisplayState> {
+        use arcen_outputs::display_lease::{DesktopArea, DisplayOrigin, DisplayState};
+        let mut states: Vec<DisplayState> = Vec::new();
+        for path in &topology.paths {
+            let key = format!(
+                "{:08x}{:08x}:{}",
+                path.targetInfo.adapterId.HighPart as u32,
+                path.targetInfo.adapterId.LowPart,
+                path.targetInfo.id
+            );
+            let active = path.flags & PATH_ACTIVE_FLAG != 0;
+            if !active && !path.targetInfo.targetAvailable.as_bool() {
+                continue;
+            }
+            // SAFETY: topologies are queried with QDC_VIRTUAL_MODE_AWARE, so
+            // the union carries the bitfield encoding.
+            let source_mode = active
+                .then(|| {
+                    virtual_source_mode_index(unsafe {
+                        path.sourceInfo.Anonymous.Anonymous._bitfield
+                    })
+                })
+                .flatten()
+                .and_then(|index| topology.modes.get(index))
+                .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+                // SAFETY: the info type says this union holds a source mode.
+                .map(|mode| unsafe { mode.Anonymous.sourceMode });
+            let area = source_mode.map_or(DesktopArea::new(0, 0, 0, 0), |mode| {
+                DesktopArea::new(mode.position.x, mode.position.y, mode.width, mode.height)
+            });
+            let state = DisplayState {
+                key: key.clone(),
+                origin: DisplayOrigin::Foreign,
+                active: source_mode.is_some(),
+                primary: source_mode.is_some() && area.x == 0 && area.y == 0,
+                area,
+                refresh_hz: 0,
+            };
+            match states.iter_mut().find(|existing| existing.key == key) {
+                Some(existing) if !existing.active && state.active => *existing = state,
+                Some(_) => {}
+                None => states.push(state),
+            }
+        }
+        states
+    }
+
+    /// Whether the live topology is the pre-session one again (active set and
+    /// primary), judged by the shared `verify_restore`.
+    pub(super) fn verify_topology_restored(original: &TopologySnapshot) -> Result<(), String> {
+        let current = query_all_topology()?;
+        let verdict = arcen_outputs::display_lease::verify_restore(
+            &ccd_display_states(original),
+            &ccd_display_states(&current),
+        );
+        if verdict.topology_restored() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the pre-session display topology is not back: {:?}",
+                verdict.divergences
+            ))
         }
     }
 
@@ -5060,6 +5217,47 @@ mod windows_backend {
 
         fn restore_owns_driver_state(&self, snapshot: &Self::Snapshot) -> bool {
             snapshot.nvapi.is_some() || self.nvapi_active.is_some() || self.vmware_active
+        }
+
+        fn restore_topology(&mut self, snapshot: &Self::Snapshot) -> Result<(), String> {
+            if verify_topology_restored(&snapshot.topology).is_ok() {
+                return Ok(());
+            }
+            let flags = SET_DISPLAY_CONFIG_FLAGS(
+                SDC_APPLY.0
+                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0
+                    | SDC_ALLOW_CHANGES.0
+                    | SDC_VIRTUAL_MODE_AWARE.0,
+            );
+            // SAFETY: both slices contain initialized values returned by QueryDisplayConfig
+            // and remain valid for the duration of this synchronous call.
+            let rc = unsafe {
+                SetDisplayConfig(
+                    Some(&snapshot.topology.paths),
+                    Some(&snapshot.topology.modes),
+                    flags,
+                )
+            };
+            self.dxgi.invalidate();
+            if rc != 0 {
+                return Err(format!(
+                    "SetDisplayConfig topology restore allowing mode changes returned {rc}"
+                ));
+            }
+            let deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
+            loop {
+                match verify_topology_restored(&snapshot.topology) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target: DISPLAY,
+                            "pre-session display topology restored with the modes Windows chose"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) if Instant::now() >= deadline => return Err(error),
+                    Err(_) => std::thread::sleep(MODE_SETTLE_POLL),
+                }
+            }
         }
 
         fn arm_recovery(
@@ -8112,6 +8310,7 @@ mod windows_backend {
 pub fn restore_from_journal(
     path: Option<std::path::PathBuf>,
     emitter: &crate::LifecycleEmitter,
+    move_windows: bool,
 ) -> Result<(), String> {
     crate::input::initialize_process_dpi_awareness();
     let path = path.unwrap_or_else(crate::recovery::default_path);
@@ -8119,6 +8318,11 @@ pub fn restore_from_journal(
     match windows_backend::restore_from_path(&path) {
         Ok(outcome) => {
             emit_cli_restore_outcome(emitter, correlation_id, outcome);
+            if move_windows {
+                crate::window_layout::repatriate_pending(&path);
+            } else {
+                crate::window_layout::discard_pending(&path);
+            }
             Ok(())
         }
         Err(error) => {
@@ -8132,6 +8336,7 @@ pub fn restore_from_journal(
 pub fn restore_from_journal(
     _path: Option<std::path::PathBuf>,
     _emitter: &crate::LifecycleEmitter,
+    _move_windows: bool,
 ) -> Result<(), String> {
     Err("display recovery is only available on Windows".to_string())
 }
@@ -8144,7 +8349,7 @@ pub fn migrate_legacy_journal(
     crate::input::initialize_process_dpi_awareness();
     let path = path.unwrap_or_else(crate::recovery::default_path);
     windows_backend::migrate_legacy_from_path(&path)?;
-    restore_from_journal(Some(path), emitter)
+    restore_from_journal(Some(path), emitter, true)
 }
 
 #[cfg(not(windows))]
@@ -8166,7 +8371,11 @@ pub fn run_restore_watchdog(
     crate::input::initialize_process_dpi_awareness();
     match windows_backend::watchdog(parent_handle, ready_handle, &path) {
         Ok(outcome) => {
+            let restored = !matches!(outcome, windows_backend::RestoreOutcome::AlreadyClean);
             emit_watchdog_restore_outcome(emitter, correlation_id, outcome);
+            if restored {
+                crate::window_layout::repatriate_pending(&path);
+            }
             Ok(())
         }
 
@@ -8477,7 +8686,7 @@ mod tests {
             ..Default::default()
         };
         let color = arcen_media::display_color::DisplayColor::from_msg(&color_msg);
-        let monitor = crate::multi_monitor_topology::WindowsMonitorPlan {
+        let monitor = arcen_outputs::windows_topology::WindowsMonitorPlan {
             session_monitor_id: arcen_media::SessionMonitorId::new(1).expect("monitor"),
             client_display_id: "display".to_owned(),
             adapter_luid: crate::nvapi::AdapterLuid {
@@ -8715,9 +8924,9 @@ mod tests {
             for (output, monitor) in outputs.iter_mut().zip(monitors) {
                 output.ccd_output_kind = monitor.output_kind;
             }
-            let inventory = crate::multi_monitor_topology::PhysicalOutputInventory::new(outputs)
+            let inventory = arcen_outputs::windows_topology::PhysicalOutputInventory::new(outputs)
                 .expect("probe inventory");
-            let plan = crate::multi_monitor_topology::plan_topology(
+            let plan = arcen_outputs::windows_topology::plan_topology(
                 &topology(monitors),
                 TopologyGeneration::new(1).expect("generation"),
                 &inventory,
@@ -8983,7 +9192,7 @@ mod tests {
                 .collect(),
         )
         .expect("requested topology");
-        let plan = crate::multi_monitor_topology::plan_topology(
+        let plan = arcen_outputs::windows_topology::plan_topology(
             &requested,
             TopologyGeneration::new(1).expect("generation"),
             &inventory,
@@ -10005,6 +10214,7 @@ mod tests {
         record_before_mode_apply: bool,
         bound_mode_preparation_needed: bool,
         bound_mode_preparations: VecDeque<Result<bool, String>>,
+        topology_restores: VecDeque<Result<(), String>>,
     }
 
     impl FakeBackend {
@@ -10028,6 +10238,7 @@ mod tests {
                 record_before_mode_apply: false,
                 bound_mode_preparation_needed: false,
                 bound_mode_preparations: VecDeque::new(),
+                topology_restores: VecDeque::new(),
             }
         }
 
@@ -10160,6 +10371,10 @@ mod tests {
                 self.current = restored;
             }
             result
+        }
+
+        fn restore_topology(&mut self, _snapshot: &Self::Snapshot) -> Result<(), String> {
+            self.topology_restores.pop_front().unwrap_or(Ok(()))
         }
 
         fn arm_recovery(
@@ -11218,6 +11433,30 @@ mod tests {
         assert!(
             calls.contains(&Call::Disarm),
             "the recovery journal must be disarmed"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_mode_does_not_excuse_a_topology_left_isolated() {
+        let mut backend = FakeBackend::new(size(800, 600));
+        backend.supported = vec![size(1920, 1080)];
+        backend.restores = VecDeque::from([
+            Err("SetDisplayConfig restore returned 87".to_string()),
+            Err("SetDisplayConfig restore returned 87".to_string()),
+            Err("SetDisplayConfig restore returned 87".to_string()),
+        ]);
+        backend.topology_restores = VecDeque::from([
+            Err("monitor is inactive".to_string()),
+            Err("monitor is inactive".to_string()),
+            Err("monitor is inactive".to_string()),
+        ]);
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction = DisplayTransaction::acquire(backend, 0, size(1920, 1080)).unwrap();
+
+        assert!(transaction.restore().is_err());
+        assert!(
+            !calls.lock().unwrap().contains(&Call::Disarm),
+            "the recovery journal must stay armed"
         );
     }
 

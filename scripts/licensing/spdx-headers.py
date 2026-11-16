@@ -56,6 +56,9 @@ SKIP = [
     "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface0.bin",
     "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface1.bin",
     "shared/usb-bridge/fixtures/wacom-intuos5-touch-l/report-interface2.bin",
+    # Arcen-generated H.264/H.265 test streams; annotated in REUSE.toml.
+    "shared/media/tests/data/bitstream/*.264",
+    "shared/media/tests/data/bitstream/*.265",
     # Derived from the vendored MIT nv-codec-headers header; MIT in-file.
     "hosts/capenc/src/nvenc_sys/guid.rs",
     "hosts/capenc/src/nvenc_sys/version.rs",

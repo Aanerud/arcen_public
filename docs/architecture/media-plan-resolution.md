@@ -100,6 +100,17 @@ and native resource ownership stay in `arcen-capenc`.
 The Deck places its requested colour axes, FPS ceiling, codec-selection intent,
 and measured decode capabilities in `AuthResponse.initial_video`, alongside the
 display request. The concrete plan is established before `server_hello`.
+
+Every Pier resolves the request in one order (`arcen_session::session_setup`):
+it checks the credentials first, then resolves the request, and only then
+answers `auth_result`. A request the host cannot serve is answered with
+`success=false`, `session_setup_failed=true` and a message led by
+`video_request_refused: `, so the Deck shows "the host refused the requested
+video: …" instead of an authentication failure, the auth throttle does not
+count it, and a peer without credentials learns nothing about what the host
+can encode. Decks also read the uncoded "Video request rejected: …" of older
+Piers this way.
+
 Capenc argv, codec,
 chroma, dimensions, fps, cursor authority, capabilities, every video header,
 and the later `quality_settings` consistency echo are derived from that plan.

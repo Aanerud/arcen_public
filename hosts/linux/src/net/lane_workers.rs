@@ -71,6 +71,22 @@ pub(super) struct LaneWriters<S> {
     pub(super) clipboard_notices: ControlSender,
     pub(super) input_slot: LaneSenderSlot,
     pub(super) bulk_slot: LaneSenderSlot,
+    /// Exact still image: capenc's refine-lane records and their lane's
+    /// budget. `None` unless the refine lane was granted.
+    pub(super) refine: Option<RefineLane>,
+}
+
+/// What the refine lane's writer needs (ADR 0016).
+pub(super) struct RefineLane {
+    /// capenc's tiles and digests.
+    pub(super) records: mpsc::Receiver<Vec<u8>>,
+    /// Asks capenc to start over when the lane is lost.
+    pub(super) control: IdrRequester,
+    /// Bytes written and the link budget's hold (R6).
+    pub(super) meter: Arc<arcen_transport::RefineLaneMeter>,
+    /// The single monitor's video queue: refinement waits while it holds a
+    /// frame.
+    pub(super) video: Arc<crate::session::client::FrameQueue>,
 }
 
 /// Spawns one task per writing role and returns a supervisor that resolves
@@ -97,9 +113,16 @@ where
         clipboard_notices,
         input_slot,
         bulk_slot,
+        refine,
     } = writers;
     let span = tracing::Span::current();
-    let tasks = vec![
+    let refine_task = refine.map(|refine| {
+        tokio::spawn(tracing::Instrument::instrument(
+            refine_lane_writer(lanes.clone(), refine),
+            span.clone(),
+        ))
+    });
+    let mut tasks = vec![
         tokio::spawn(tracing::Instrument::instrument(
             control_lane_writer(
                 control_sink,
@@ -130,6 +153,7 @@ where
             span,
         )),
     ];
+    tasks.extend(refine_task);
     tokio::spawn(async move {
         let mut guard = AbortOnDrop(tasks);
         let (result, _, _) = futures_util::future::select_all(guard.0.iter_mut()).await;
@@ -281,12 +305,34 @@ async fn video_lane_writer(
     };
     info!(target: SESSION, "video runs on its own lane");
     loop {
-        let Some(frame) = video.dequeue().await else {
+        let Some(dequeued) = video.dequeue_refined().await else {
             writer.finish();
             debug!(target: NET, "video lane writer ended");
             return SessionEndReason::WriterEnded;
         };
         let started = Instant::now();
+        // Refinement fences and barriers go out immediately before the
+        // access unit they describe, on the same ordered lane (ADR 0016).
+        for record in dequeued.refine {
+            match tokio::time::timeout(write_timeout, writer.send(Bytes::from(record))).await {
+                Ok(Ok(LaneWriteOutcome::Reopened { request_keyframe })) => {
+                    info!(target: NET, "video lane reopened after a failure");
+                    if request_keyframe {
+                        request_full_frame_idr(&idrs);
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(terminal)) => {
+                    warn!(target: NET, reason = %terminal, "video lane ended");
+                    return SessionEndReason::TransportError;
+                }
+                Err(_) => {
+                    warn!(target: NET, "video lane send timed out");
+                    return SessionEndReason::WriterEnded;
+                }
+            }
+        }
+        let frame = dequeued.frame;
         match tokio::time::timeout(write_timeout, writer.send(Bytes::from(frame))).await {
             Ok(Ok(LaneWriteOutcome::Reopened { request_keyframe })) => {
                 info!(target: NET, "video lane reopened after a failure");
@@ -307,6 +353,63 @@ async fn video_lane_writer(
         let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         write_wait_micros.fetch_add(micros, Ordering::Relaxed);
     }
+}
+
+/// Exact still image (ADR 0016): capenc's tiles and digests on the refine
+/// lane, the lowest-priority lane, opened with the first record. Waits only
+/// for its own lane; a refine lane that cannot be opened or ends stops
+/// refinement for the attachment and never ends it. A replaced lane loses
+/// what was queued on it, so capenc starts a new generation (the Deck
+/// clears on the same loss).
+async fn refine_lane_writer(lanes: LaneConnection, refine: RefineLane) -> SessionEndReason {
+    use arcen_media::capenc_control::CapencControlCommand;
+    let RefineLane {
+        records: mut queue,
+        control,
+        meter,
+        video,
+    } = refine;
+    let mut writer: Option<LocalLaneWriter> = None;
+    while let Some(record) = queue.recv().await {
+        if writer.is_none() {
+            match LocalLaneWriter::open(&lanes, LaneRole::Refine).await {
+                Ok(opened) => {
+                    info!(target: SESSION, "exact still image runs on its own lane");
+                    writer = Some(opened);
+                }
+                Err(terminal) => {
+                    warn!(target: NET, reason = %terminal, "refine lane could not be opened; exact still image stops");
+                    control.request_refine(CapencControlCommand::RefinePause);
+                    break;
+                }
+            }
+        }
+        let Some(open) = writer.as_mut() else {
+            continue;
+        };
+        // Motion first, and never while the link budget holds refinement.
+        arcen_transport::quic::wait_for_refine_turn(&meter, || video.has_backlog()).await;
+        let bytes = record.len() as u64;
+        let sent = open.send(Bytes::from(record)).await;
+        if sent.is_ok() {
+            meter.note_written(bytes);
+        }
+        match sent {
+            Ok(LaneWriteOutcome::Reopened { .. }) => {
+                info!(target: NET, "refine lane reopened after a failure; refinement starts over");
+                while queue.try_recv().is_ok() {}
+                control.request_refine(CapencControlCommand::RefineReset);
+            }
+            Ok(_) => {}
+            Err(terminal) => {
+                warn!(target: NET, reason = %terminal, "refine lane ended; exact still image stops");
+                control.request_refine(CapencControlCommand::RefinePause);
+                break;
+            }
+        }
+    }
+    // Refinement never ends an attachment.
+    std::future::pending().await
 }
 
 /// Audio on its own lane. Never waits: a full audio queue drops the frame
@@ -1354,6 +1457,7 @@ mod tests {
             clipboard_notices: control_tx.clone(),
             input_slot: LaneSenderSlot::new(LaneRole::InputCursor),
             bulk_slot: LaneSenderSlot::new(LaneRole::BulkAux),
+            refine: None,
         });
         Running {
             writers,

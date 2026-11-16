@@ -236,7 +236,12 @@ impl Display for HostInitialVideoError {
 
 impl std::error::Error for HostInitialVideoError {}
 
-fn client_can_decode(
+/// Whether a client that advertised `capabilities` can decode `video`: its
+/// codec, chroma, depth, range and matrix. The one rule a Pier applies to a
+/// request and a Deck applies before it makes one, so a Deck never asks for
+/// what its own decoder would refuse.
+#[must_use]
+pub fn client_can_decode(
     video: VideoConfiguration,
     capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg,
 ) -> bool {

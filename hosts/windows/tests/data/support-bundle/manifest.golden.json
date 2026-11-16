@@ -1,0 +1,108 @@
+{
+  "bundle_id": "ARC-WH64-AV6C",
+  "component": {
+    "arch": "<arch>",
+    "name": "arcen-pier-windows",
+    "os": "windows",
+    "version": "<version>"
+  },
+  "entries": [
+    {
+      "included_size_bytes": 291,
+      "original_size_bytes": 0,
+      "path": "config/pier.json",
+      "sha256": "240b6f32eb2c36fa88c08f81c49c97cca8085b5fddc250aaa6036d3acce175d1",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 1250,
+      "original_size_bytes": 0,
+      "path": "logs/arcen-pier.log",
+      "sha256": "c69d9f507b19cc4edd9dd09146e35f5dac800625751f4c1628a86de80d245054",
+      "source": "log",
+      "truncation": null
+    }
+  ],
+  "generated_at_unix_seconds": 1794726245,
+  "notices": [
+    {
+      "code": "certificate_excluded",
+      "kind": "omitted",
+      "source": "config/tls/cert"
+    },
+    {
+      "code": "certificate_excluded",
+      "kind": "omitted",
+      "source": "config/tls/certificate"
+    },
+    {
+      "code": "private_key_excluded",
+      "kind": "omitted",
+      "source": "config/tls/key"
+    },
+    {
+      "code": "private_key_excluded",
+      "kind": "omitted",
+      "source": "config/tls/private_key"
+    },
+    {
+      "code": "crash_reports_not_requested",
+      "kind": "omitted",
+      "source": "crash"
+    },
+    {
+      "code": "driver_query_unavailable",
+      "kind": "unavailable",
+      "source": "diagnostics/nvidia-driver"
+    },
+    {
+      "code": "canonical_log_record_invalid",
+      "kind": "invalid",
+      "source": "logs/arcen-pier.log"
+    }
+  ],
+  "redactions": [
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/platform/credential_provider",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/certificate",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/expected_sans",
+      "reason": "sensitive_key"
+    },
+    {
+      "entry_path": "config/pier.json",
+      "key_path": "/tls/private_key",
+      "reason": "private_key_policy"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/fields/ssid",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/host",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/peer_addr",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier.log",
+      "key_path": "/user",
+      "reason": "identity_pseudonymized"
+    }
+  ],
+  "schema_version": 1
+}

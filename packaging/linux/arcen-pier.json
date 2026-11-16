@@ -20,6 +20,7 @@
     "color_policy": "default-off",
     "fps": 60,
     "encoder": "auto",
+    "lossless_refinement": "enabled",
     "qp_map": {
       "auto": "on",
       "speed": "on"

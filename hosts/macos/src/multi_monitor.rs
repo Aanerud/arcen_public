@@ -9,12 +9,12 @@
 //! monitor-id validity, media rosters and wire validation stay in the shared
 //! crates.
 
+use arcen_outputs::admission::{AdmissionGates, OfferEncoder, OfferPolicy, offer_max_monitors};
 use arcen_protocol::messages::{
-    AppliedMonitorDescriptorMsg, AppliedMonitorMediaPlanMsg, AppliedMonitorTopologyMsg,
-    AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg, AuthRequest,
-    AuthRequestMultiMonitorOfferError, ClientDisplayId, MultiMonitorCarrierMsg,
-    MultiMonitorValidationError, RequestedMonitorDescriptorMsg, RotationMsg, ServerMultiMonitorMsg,
-    TopologyBackendKindMsg,
+    AdvertisedMultiMonitorOffer, AppliedMonitorDescriptorMsg, AppliedMonitorMediaPlanMsg,
+    AppliedMonitorTopologyMsg, AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg,
+    ClientDisplayId, MultiMonitorCarrierMsg, MultiMonitorValidationError,
+    RequestedMonitorDescriptorMsg, RotationMsg, ServerMultiMonitorMsg, TopologyBackendKindMsg,
 };
 
 use crate::displays::DisplaySnapshot;
@@ -226,24 +226,26 @@ pub fn build_offer_with_reason(
     if !crate::virtual_display::VirtualDisplay::is_supported() {
         return Err(MultiMonitorOfferWithheld::VirtualDisplayUnavailable);
     }
-    if !may_advertise_multi_monitor(
-        config,
-        displays.len(),
-        CAN_CAPTURE_MULTIPLE_DISPLAYS,
-        REGION_INPUT_ROUTING_AVAILABLE,
-        true,
-    ) {
-        return Err(MultiMonitorOfferWithheld::CaptureUnavailable);
-    }
-    let protocol_ceiling = u8::try_from(arcen_media::MAX_MULTI_MONITOR_COUNT)
-        .map_err(|_| MultiMonitorOfferWithheld::CaptureUnavailable)?;
-    let capture_ceiling = u8::try_from(crate::multi_capture::MAX_CAPTURED_DISPLAYS)
-        .map_err(|_| MultiMonitorOfferWithheld::CaptureUnavailable)?;
-    let max_monitors = config
-        .max_monitors
-        .unwrap_or(protocol_ceiling)
-        .min(protocol_ceiling)
-        .min(capture_ceiling);
+    // The checks above name this Pier's own reasons; the shared policy
+    // decides the rest. Any refusal it returns here is a capture limit.
+    let max_monitors = offer_max_monitors(&OfferPolicy {
+        gates: AdmissionGates {
+            carrier_ready: true,
+            operator_enabled: config.advertise_enabled,
+            inventory_available: may_advertise_multi_monitor(
+                config,
+                displays.len(),
+                CAN_CAPTURE_MULTIPLE_DISPLAYS,
+                REGION_INPUT_ROUTING_AVAILABLE,
+                true,
+            ),
+            offer_advertised: false,
+        },
+        encoder: OfferEncoder::Native,
+        host_capacity: Some(crate::multi_capture::MAX_CAPTURED_DISPLAYS),
+        operator_ceiling: config.max_monitors,
+    })
+    .map_err(|_| MultiMonitorOfferWithheld::CaptureUnavailable)?;
     AuthMultiMonitorOfferMsg::new(
         max_monitors,
         SUPPORTED_ROTATIONS.to_vec(),
@@ -288,33 +290,14 @@ fn validate_request(
     offer: &AuthMultiMonitorOfferMsg,
     request: &AuthMultiMonitorRequestMsg,
 ) -> Result<MultiMonitorCarrierMsg, MacOsMultiMonitorError> {
-    let wrapper = offer_wrapper(offer);
-    let advertised = wrapper
-        .required_multi_monitor_v1_offer()
-        .map_err(|error| match error {
-            AuthRequestMultiMonitorOfferError::Missing => MacOsMultiMonitorError::NotAdvertised,
-            AuthRequestMultiMonitorOfferError::Invalid(error) => {
-                MacOsMultiMonitorError::Offer(error)
-            }
-        })?;
+    let advertised =
+        AdvertisedMultiMonitorOffer::from_offer(offer).map_err(MacOsMultiMonitorError::Offer)?;
     advertised
         .validate_request(request)
         .map_err(MacOsMultiMonitorError::Offer)?;
     advertised
         .select_carrier(request, &OFFERED_CARRIERS)
         .map_err(MacOsMultiMonitorError::Offer)
-}
-
-fn offer_wrapper(offer: &AuthMultiMonitorOfferMsg) -> AuthRequest {
-    AuthRequest {
-        msg_type: String::new(),
-        auth_methods: Vec::new(),
-        challenge: String::new(),
-        salt: String::new(),
-        auth_mode: None,
-        disclaimer: None,
-        multi_monitor_v1: Some(offer.clone()),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

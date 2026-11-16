@@ -175,6 +175,110 @@ pub fn any_display_is_hdr<'a>(displays: impl IntoIterator<Item = &'a DisplayColo
         .any(|display| DisplayColor::from_msg(display).is_hdr())
 }
 
+/// What Windows states about one display: `IDXGIOutput6::GetDesc1` and
+/// the SDR white level (`DisplayConfigGetDeviceInfo`,
+/// `DISPLAYCONFIG_SDR_WHITE_LEVEL`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WindowsOutputColor {
+    /// The output's colour space is `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`:
+    /// "Use HDR" is on for this display.
+    pub hdr_enabled: bool,
+    /// CIE 1931 xy chromaticities of the panel's red, green and blue
+    /// primaries, as DXGI states them.
+    pub primaries: [[f32; 2]; 3],
+    /// `MinLuminance` in nits.
+    pub min_luminance: f32,
+    /// `MaxLuminance` in nits.
+    pub max_luminance: f32,
+    /// `MaxFullFrameLuminance` in nits.
+    pub max_full_frame_luminance: f32,
+    /// The SDR white level in nits, when the OS reported one.
+    pub sdr_white_nits: Option<f32>,
+}
+
+/// The SDR white level in nits from `DISPLAYCONFIG_SDR_WHITE_LEVEL::SDRWhiteLevel`,
+/// which counts thousandths of 80 nits.
+#[must_use]
+pub fn windows_sdr_white_nits(sdr_white_level: u32) -> Option<f32> {
+    #[allow(clippy::cast_precision_loss, reason = "a white level is small")]
+    let nits = sdr_white_level as f32 * 80.0 / 1000.0;
+    (40.0..=PQ_PEAK_NITS).contains(&nits).then_some(nits)
+}
+
+/// The widest standard gamut whose primaries are nearest the panel's.
+fn nearest_gamut(primaries: [[f32; 2]; 3]) -> DisplayGamutMsg {
+    const REFERENCES: [(DisplayGamutMsg, [[f32; 2]; 3]); 3] = [
+        (
+            DisplayGamutMsg::Srgb,
+            [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]],
+        ),
+        (
+            DisplayGamutMsg::DisplayP3,
+            [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]],
+        ),
+        (
+            DisplayGamutMsg::Bt2020,
+            [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
+        ),
+    ];
+    let valid = primaries
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite() && *value > 0.0 && *value < 1.0);
+    if !valid {
+        return DisplayGamutMsg::Srgb;
+    }
+    let distance = |reference: &[[f32; 2]; 3]| -> f32 {
+        primaries
+            .iter()
+            .zip(reference)
+            .map(|(stated, reference)| {
+                (stated[0] - reference[0]).powi(2) + (stated[1] - reference[1]).powi(2)
+            })
+            .sum()
+    };
+    REFERENCES
+        .iter()
+        .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
+        .map_or(DisplayGamutMsg::Srgb, |(gamut, _)| *gamut)
+}
+
+impl WindowsOutputColor {
+    /// The display's colour facts for the hello, by the same rule as every
+    /// Deck: an HDR display's headroom is `MaxLuminance` ÷ the SDR white
+    /// level, and its luminance is sent as stated. A display with "Use HDR"
+    /// off is SDR (headroom 1.0) whatever its panel could do, because that
+    /// is what Windows will composite; luminance is then not sent, as the
+    /// macOS Deck sends none for an SDR display. Headroom that cannot be
+    /// derived is left unknown (0.0), never invented.
+    #[must_use]
+    pub fn to_msg(self) -> DisplayColorMsg {
+        let gamut = nearest_gamut(self.primaries);
+        if !self.hdr_enabled {
+            return DisplayColorMsg {
+                gamut,
+                hdr_headroom: 1.0,
+                ..DisplayColorMsg::default()
+            };
+        }
+        let nits = |value: f32| {
+            (value.is_finite() && value > 0.0 && value <= PQ_PEAK_NITS).then_some(value)
+        };
+        let peak = nits(self.max_luminance);
+        let headroom = match (peak, self.sdr_white_nits) {
+            (Some(peak), Some(white)) if white > 0.0 => (peak / white).clamp(1.0, 100.0),
+            _ => 0.0,
+        };
+        DisplayColorMsg {
+            gamut,
+            hdr_headroom: headroom,
+            peak_nits: peak,
+            max_frame_average_nits: nits(self.max_full_frame_luminance),
+            min_nits: nits(self.min_luminance),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +374,74 @@ mod tests {
         assert!(!any_display_is_hdr([&sdr, &sdr]));
         assert!(any_display_is_hdr([&sdr, &xdr]));
         assert!(!any_display_is_hdr(std::iter::empty()));
+    }
+
+    const SRGB_PANEL: [[f32; 2]; 3] = [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]];
+    const P3_PANEL: [[f32; 2]; 3] = [[0.677, 0.318], [0.272, 0.684], [0.150, 0.059]];
+
+    #[test]
+    fn a_windows_hdr_display_has_the_headroom_of_its_peak_over_sdr_white() {
+        let facts = WindowsOutputColor {
+            hdr_enabled: true,
+            primaries: P3_PANEL,
+            min_luminance: 0.05,
+            max_luminance: 1000.0,
+            max_full_frame_luminance: 600.0,
+            sdr_white_nits: windows_sdr_white_nits(2500),
+        };
+        let msg = facts.to_msg();
+        assert_eq!(msg.gamut, DisplayGamutMsg::DisplayP3);
+        assert!((msg.hdr_headroom - 5.0).abs() < 1e-4);
+        assert_eq!(msg.peak_nits, Some(1000.0));
+        assert_eq!(msg.max_frame_average_nits, Some(600.0));
+        assert_eq!(msg.min_nits, Some(0.05));
+        let color = DisplayColor::from_msg(&msg);
+        assert!(color.is_hdr());
+        assert_eq!(
+            color.hdr_luminance().map(|luminance| luminance.peak),
+            Some(Luminance::Measured(1000.0))
+        );
+    }
+
+    #[test]
+    fn a_windows_display_with_use_hdr_off_is_sdr_and_sends_no_luminance() {
+        let facts = WindowsOutputColor {
+            hdr_enabled: false,
+            primaries: SRGB_PANEL,
+            min_luminance: 0.5,
+            max_luminance: 270.0,
+            max_full_frame_luminance: 270.0,
+            sdr_white_nits: windows_sdr_white_nits(1000),
+        };
+        let msg = facts.to_msg();
+        assert_eq!(msg.gamut, DisplayGamutMsg::Srgb);
+        assert!((msg.hdr_headroom - 1.0).abs() < f32::EPSILON);
+        assert_eq!((msg.peak_nits, msg.min_nits), (None, None));
+        assert!(!any_display_is_hdr([&msg]));
+    }
+
+    #[test]
+    fn windows_facts_that_cannot_be_read_stay_unknown() {
+        let msg = WindowsOutputColor {
+            hdr_enabled: true,
+            primaries: [[0.0; 2]; 3],
+            max_luminance: f32::NAN,
+            sdr_white_nits: None,
+            ..WindowsOutputColor::default()
+        }
+        .to_msg();
+        assert_eq!(msg.gamut, DisplayGamutMsg::Srgb);
+        assert!(
+            msg.hdr_headroom.abs() < f32::EPSILON,
+            "unknown, not invented"
+        );
+        assert!(!any_display_is_hdr([&msg]));
+        assert_eq!(windows_sdr_white_nits(1000), Some(80.0));
+        assert_eq!(windows_sdr_white_nits(0), None);
+        let wide = WindowsOutputColor {
+            primaries: [[0.70, 0.29], [0.18, 0.79], [0.13, 0.05]],
+            ..WindowsOutputColor::default()
+        };
+        assert_eq!(wide.to_msg().gamut, DisplayGamutMsg::Bt2020);
     }
 }

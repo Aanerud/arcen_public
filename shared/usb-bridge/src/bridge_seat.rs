@@ -600,15 +600,16 @@ impl BridgedInputNode {
     }
 }
 
-/// Whether a dedicated Xorg desktop can use this tablet: one of its pen
-/// nodes is served by the kernel `wacom` driver, and xf86-input-wacom (the
-/// driver [`xorg_session_bridge_class`] names) is installed.
+/// Whether a dedicated Xorg desktop can use this tablet: one of its nodes is
+/// a pen (udev's `ID_INPUT_TABLET`), whichever kernel driver serves it
+/// (`wacom`, `hid-generic`, `hid-uclogic`, ...), and xf86-input-wacom (the
+/// driver [`xorg_session_bridge_class`] names) is installed. That X driver
+/// takes any evdev pen, not only Wacom's (it has a generic model for
+/// tablets it does not know), so the kernel driver is no gate (Q-16: any
+/// tablet works by default).
 #[must_use]
 pub fn x11_hotplug_capable(nodes: &[BridgedInputNode], wacom_x_driver: bool) -> bool {
-    wacom_x_driver
-        && nodes
-            .iter()
-            .any(|node| node.role == BridgedNodeRole::Pen && node.kernel_driver == "wacom")
+    wacom_x_driver && nodes.iter().any(|node| node.role == BridgedNodeRole::Pen)
 }
 
 /// Whether a report descriptor has an input field the kernel's `hid-input`
@@ -1160,14 +1161,20 @@ mod tests {
     }
 
     #[test]
-    fn an_x11_desktop_takes_a_tablet_whose_pen_the_kernel_wacom_driver_serves() {
+    fn an_x11_desktop_takes_any_pen_whichever_kernel_driver_serves_it() {
         let pen = node(9, BridgedNodeRole::Pen, "wacom");
         let pad = node(10, BridgedNodeRole::Pad, "wacom");
         assert!(x11_hotplug_capable(&[pen.clone(), pad.clone()], true));
         assert!(!x11_hotplug_capable(&[pen], false));
         assert!(!x11_hotplug_capable(&[pad], true));
+        for driver in ["hid-generic", "hid-uclogic", "hid-multitouch"] {
+            assert!(x11_hotplug_capable(
+                &[node(9, BridgedNodeRole::Pen, driver)],
+                true
+            ));
+        }
         assert!(!x11_hotplug_capable(
-            &[node(9, BridgedNodeRole::Pen, "hid-generic")],
+            &[node(9, BridgedNodeRole::Other, "hid-generic")],
             true
         ));
     }

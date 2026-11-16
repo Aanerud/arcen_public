@@ -1,0 +1,97 @@
+{
+  "bundle_id": "ARC-WH64-AV6C",
+  "component": {
+    "arch": "<arch>",
+    "name": "arcen-deck-windows",
+    "os": "windows",
+    "version": "<version>"
+  },
+  "entries": [
+    {
+      "included_size_bytes": 0,
+      "original_size_bytes": 0,
+      "path": "deck/about.json",
+      "sha256": "<version-dependent>",
+      "source": "diagnostics",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 3,
+      "original_size_bytes": 3,
+      "path": "diagnostics/displays.json",
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "source": "diagnostics",
+      "truncation": null
+    }
+  ],
+  "generated_at_unix_seconds": 1794726245,
+  "notices": [
+    {
+      "code": "source_not_found",
+      "kind": "unavailable",
+      "source": "config/connections.json"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "unavailable",
+      "source": "config/settings.json"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "unavailable",
+      "source": "config/trusted_pins.json"
+    },
+    {
+      "code": "crash_reports_not_requested",
+      "kind": "omitted",
+      "source": "crash"
+    },
+    {
+      "code": "diagnostic_unavailable",
+      "kind": "unavailable",
+      "source": "diagnostics/decode.json"
+    },
+    {
+      "code": "service_not_installed",
+      "kind": "advisory",
+      "source": "diagnostics/native-usb-component.json"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "advisory",
+      "source": "diagnostics/network.json"
+    },
+    {
+      "code": "diagnostic_unavailable",
+      "kind": "unavailable",
+      "source": "diagnostics/platform.json"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "unavailable",
+      "source": "logs"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/clipboard"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/credentials"
+    },
+    {
+      "code": "sensitive_runtime_excluded",
+      "kind": "omitted",
+      "source": "runtime/typed-text"
+    },
+    {
+      "code": "source_not_found",
+      "kind": "advisory",
+      "source": "session/last-session.json"
+    }
+  ],
+  "redactions": [],
+  "schema_version": 1
+}

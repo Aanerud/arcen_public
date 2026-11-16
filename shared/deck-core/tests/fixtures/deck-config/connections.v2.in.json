@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "future_top_level": "kept",
+  "last_selected_connection_id": "studio-a",
+  "legacy_username_fallback": "AD\\fallback.user",
+  "connections": [
+    {
+      "id": "studio-a",
+      "kind": "direct_machine",
+      "name": "Studio A",
+      "host": "pier-a.example.internal",
+      "port": 18444,
+      "transport": "quic",
+      "security_mode": "medium",
+      "future_entry_field": [1, 2, 3],
+      "settings": {
+        "version": 1,
+        "remembered_username": "AD\\artist.user",
+        "tablet_mode_requested": "wacom_usb_bridge",
+        "displays_mode": "single_primary",
+        "keyboard_shortcuts": "swap_command_control",
+        "left_option_altgr": true,
+        "keyboard_mode": "characters",
+        "future_setting": "kept"
+      }
+    },
+    {
+      "id": "lab-b",
+      "name": "Lab B",
+      "host": "203.0.113.20",
+      "port": 18444,
+      "transport": "quic",
+      "settings": {
+        "version": 1,
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination"
+      }
+    },
+    {
+      "id": "unparsed",
+      "name": "Future transport",
+      "host": "pier-c.example.internal",
+      "transport": "carrier-pigeon"
+    }
+  ]
+}

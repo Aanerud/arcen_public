@@ -1,9 +1,10 @@
 # Arcen
 
-Arcen streams a real desktop from a host computer, the **Pier**, to a Mac,
-the **Deck**, over one encrypted QUIC connection on **UDP 18444**. The host
-can run Linux, Windows or macOS; your applications stay there, and you see
-and work on them from your Mac with its own keyboard, cursor and pen tablet.
+Arcen streams a real desktop from a host computer, the **Pier**, to a Mac
+or a Windows PC, the **Deck**, over one encrypted QUIC connection on
+**UDP 18444**. The host can run Linux, Windows or macOS; your applications
+stay there, and you see and work on them from your Deck with its own
+keyboard, cursor and pen tablet.
 Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 
 ## Quick start: try it in 10 minutes
@@ -12,9 +13,9 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 
 | You need | Why |
 | --- | --- |
-| A Mac with **macOS 12 or later** | It runs Arcen Deck, the client. There are two apps: **Arcen Deck** for Apple silicon, **Arcen Deck Intel** for Intel Macs. |
+| A Mac with **macOS 12 or later**, or a PC with **Windows 11 x64** | It runs Arcen Deck, the client. On a Mac there are two apps: **Arcen Deck** for Apple silicon, **Arcen Deck Intel** for Intel Macs. On Windows it is one MSI. |
 | A host with a desktop (next table) | It runs Arcen Pier, which captures that desktop and encodes it. |
-| **UDP 18444** from the Mac to the host, on a LAN or VPN | The only port Arcen uses. The installers open it on the host's firewall where they recognise it. |
+| **UDP 18444** from the Deck to the host, on a LAN or VPN | The only port Arcen uses. The installers open it on the host's firewall where they recognise it. |
 | An ordinary **user account on the host** | You sign in with it; Arcen keeps no user list of its own. |
 
 | Host | Requirements |
@@ -27,25 +28,26 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 ### Steps
 
 1. **Download** from [Releases](https://github.com/Aanerud/arcen_public/releases):
-   the Deck for your Mac — `Arcen-Deck-0.19.0-macOS.zip` on Apple silicon,
-   `Arcen-Deck-Intel-0.19.0-macOS.zip` on an Intel Mac (Apple menu → About
-   This Mac shows which) — and the Pier installer for your host. Check them
+   the Deck — `Arcen-Deck-0.20.0-macOS.zip` on an Apple silicon Mac,
+   `Arcen-Deck-Intel-0.20.0-macOS.zip` on an Intel Mac (Apple menu → About
+   This Mac shows which), `Arcen-Deck-0.20.0-windows-x64.msi` on Windows 11 —
+   and the Pier installer for your host. Check them
    against the release's `SHA256SUMS.txt`:
    `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`.
 2. **Install the Pier on the host** (one command; it creates the service, a
    TLS identity and the firewall opening, and starts the Pier):
    - Linux, as root:
      ```sh
-     chmod +x install-arcen-pier-0.19.0-linux-x86_64
-     sudo ./install-arcen-pier-0.19.0-linux-x86_64
+     chmod +x install-arcen-pier-0.20.0-linux-x86_64
+     sudo ./install-arcen-pier-0.20.0-linux-x86_64
      ```
      `--check` first shows what it found and would do, and changes nothing.
    - Windows, in **PowerShell as Administrator**, then **reboot** (Windows
      loads Arcen's sign-in provider only at boot):
      ```powershell
-     .\install-arcen-pier-0.19.0-windows-x64.exe
+     .\install-arcen-pier-0.20.0-windows-x64.exe
      ```
-   - macOS: open `ArcenPier-0.19.0.pkg` in **Installer.app** on that Mac
+   - macOS: open `ArcenPier-0.20.0.pkg` in **Installer.app** on that Mac
      (not the `installer` command), then, signed in as the account that will
      be served, approve **Screen & System Audio Recording** and
      **Accessibility** for **Arcen Agent Helper**, and **System Audio
@@ -58,15 +60,18 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
    next step: Linux `/etc/arcen/host.spki-sha256`, Windows
    `C:\ProgramData\Arcen\tls\host.spki-sha256`, macOS
    `/Library/Application Support/Arcen/tls/host.spki-sha256`.
-5. **Install the Deck:** unzip it and drag **Arcen Deck** (or **Arcen Deck
-   Intel**) to Applications, then open it.
+5. **Install the Deck.** Mac: unzip it and drag **Arcen Deck** (or **Arcen
+   Deck Intel**) to Applications, then open it. Windows: open the MSI. It is
+   unsigned, so SmartScreen says "Windows protected your PC": choose
+   **More info**, then **Run anyway** (or tick **Unblock** in the file's
+   Properties first). Then start **Arcen Deck** from the Start menu.
 6. **Connect:** add the host by address (for example `203.0.113.10` or
    `pier.example.internal`; the port is 18444). The first time, the Deck
    shows the host's fingerprint: if it matches step 4, choose **Trust and
    Remember**. Sign in with your account on the host.
 
 **What you should see:** the host's desktop fills the Deck's window or screen,
-your Mac's cursor moves on it, and typing reaches the host. The stream
+your Deck's cursor moves on it, and typing reaches the host. The stream
 starts in the Auto preset.
 
 **If it doesn't connect:** use **Test connection** in the Deck, or run on the
@@ -82,13 +87,15 @@ password and says what to fix. Then see
 
 ## Optional extras
 
-- **Native tablet:** use the pen tablet on your Mac's desk as if it were
-  plugged into the host, with the host's own tablet driver. The Deck needs
+- **Native tablet:** use the pen tablet on your desk as if it were
+  plugged into the host, with the host's own tablet driver. A Mac Deck needs
   **macOS 13 or later** (on Intel Macs it has not been tested with a real
-  tablet). On a Linux host it is off until you enable it, which restarts the
+  tablet); a Windows Deck needs the optional
+  `Arcen-USB-Component-0.20.0-windows-x64.msi`. Linux, macOS and Windows
+  hosts offer it. On a Linux host it is off until you enable it, which restarts the
   running Pier:
   ```sh
-  sudo ./install-arcen-pier-0.19.0-linux-x86_64 --native-tablet --restart
+  sudo ./install-arcen-pier-0.20.0-linux-x86_64 --native-tablet --restart
   ```
   On an X11 host, also restart the display manager once while nobody is
   signed in at the console (`sudo systemctl restart gdm`), or reboot.
@@ -98,21 +105,23 @@ password and says what to fix. Then see
   [User guide: pen](docs/user-guide.md).
 - **Presets:** Auto, Speed (60 fps), Grading (10-bit) and HDR, each its own
   pipeline. [Presets and pipelines](docs/features.md#streaming-presets-and-independent-pipelines).
-- **Several displays:** the host can give each of your Mac's displays its own.
+- **Several displays:** with **Match my layout** the host gives each of your
+  Deck's displays (up to four) its own, on a Mac or a Windows PC.
   [Features](docs/features.md#what-a-session-carries).
 - **Audio and microphone**, **clipboard** both ways, and your Mac keyboard
   mapped the way the host expects. [User guide](docs/user-guide.md).
 
-## Status (0.19.0)
+## Status (0.20.0)
 
 | Platform | State |
 | --- | --- |
 | Linux Pier, X11 | Works: Auto, Speed, Grading; HDR served as Grading unless the desktop is declared PQ; Native tablet |
 | Linux Pier, GNOME Wayland | Works where the installer's qualification proves it: Auto, Speed, Grading and HDR on GNOME 50+; Native tablet on native-seat desktops |
-| Windows Pier | Works: Auto, Speed, Grading, HDR, several displays; Tablet support (Windows Ink); no Native tablet |
+| Windows Pier | Works: Auto, Speed, Grading, HDR, several displays; Tablet support (Windows Ink); Native tablet with no driver (the Pier reads the pen and injects it as Windows Ink) |
 | macOS Pier | Preview: Auto, Speed, Grading, HDR with headroom; Native tablet with pressure for the Wacom Intuos5 touch L |
 | macOS Deck | Works: Apple silicon and Intel apps (macOS 12+), signed and notarised; Native tablet on macOS 13+ (Intel untested with a real tablet) |
-| Linux or Windows Deck | Does not exist yet: [help wanted](docs/project.md#where-help-is-wanted) |
+| Windows Deck | New: Windows 11 x64, unsigned MSI; Auto, Speed, and Grading/HDR where the GPU decodes HEVC 4:4:4 ten-bit; several displays (Match my layout); Tablet support (Windows Ink); Native tablet with the optional USB component |
+| Linux Deck | Does not exist yet: [help wanted](docs/project.md#where-help-is-wanted) |
 
 What each host does in detail, and what was tested on real hardware, is in
 [Features and status](docs/features.md#what-works-today). Changes are in the

@@ -24,6 +24,12 @@
 //! turned back on after, so what is typed is what was sent. Keys the
 //! kernel or logind act on (power, sleep, `SysRq`) are never borrowed. The
 //! text is never logged.
+//!
+//! The same connection tells the Deck what the session's active layout
+//! types at each printable key position (`host_keymap`, source
+//! [`X11_KEYMAP_SOURCE`]), at attach and whenever the layout changes, so a
+//! Deck sends the characters a different host layout would type
+//! differently as committed text.
 
 use std::time::{Duration, Instant};
 
@@ -62,6 +68,13 @@ const BORROW_SETTLE: Duration = Duration::from_millis(150);
 const BORROW_RETURN_AFTER: Duration = Duration::from_secs(2);
 /// How often the watcher looks for borrowed keys to give back.
 const RETURN_TICK: Duration = Duration::from_millis(500);
+/// The watcher reads the layout every this many ticks.
+const LAYOUT_TICKS: u32 = 2;
+/// `HostKeymapMsg::source` of an Xorg session's layout.
+pub const X11_KEYMAP_SOURCE: &str = "x11_core_keymap";
+/// The root window property naming the XKB rules, model, layouts, variants
+/// and options the server's keymap was built from.
+const XKB_RULES_NAMES: &[u8] = b"_XKB_RULES_NAMES";
 
 /// The X keysym naming `character` (`xkb_utf32_to_keysym`'s rule for
 /// Latin-1 and Unicode keysyms); `None` for control characters.
@@ -218,6 +231,129 @@ impl CoreKeymap {
     pub const fn per_keycode(&self) -> usize {
         self.per_keycode
     }
+
+    /// What the key with evdev code `evdev` types in `group` (0 or 1),
+    /// unmodified and with Shift, by the core protocol's rules: a second
+    /// group without symbols repeats the first, and a level without a
+    /// symbol repeats the one before it (a letter's upper case for Shift).
+    /// A dead key or a symbol without a character types `None`; a key the
+    /// group maps nothing to is not described.
+    #[must_use]
+    pub fn chars_at(&self, evdev: u16, group: u8) -> Option<(Option<String>, Option<String>)> {
+        let syms = self.syms_of_evdev(evdev)?;
+        let group = if group == 1
+            && Self::sym(syms, 1, 0) == NO_SYMBOL
+            && Self::sym(syms, 1, 1) == NO_SYMBOL
+        {
+            0
+        } else {
+            group
+        };
+        let base = Self::sym(syms, group, 0);
+        if base == NO_SYMBOL {
+            return None;
+        }
+        let base = keysym_to_char(base);
+        let shift = match Self::sym(syms, group, 1) {
+            NO_SYMBOL => base.map(|character| {
+                let mut upper = character.to_uppercase();
+                match (upper.next(), upper.next()) {
+                    (Some(single), None) => single,
+                    _ => character,
+                }
+            }),
+            shifted => keysym_to_char(shifted),
+        };
+        Some((base.map(String::from), shift.map(String::from)))
+    }
+}
+
+/// The layouts an `_XKB_RULES_NAMES` value names, in group order
+/// (`layout(variant)` when a variant is set).
+#[must_use]
+pub fn xkb_rules_layouts(value: &[u8]) -> Vec<String> {
+    let fields: Vec<&[u8]> = value.split(|byte| *byte == 0).collect();
+    let text = |index: usize| {
+        fields
+            .get(index)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .unwrap_or_default()
+    };
+    let (layouts, variants) = (text(2), text(3));
+    let variants: Vec<&str> = variants.split(',').collect();
+    layouts
+        .split(',')
+        .enumerate()
+        .filter(|(_, layout)| !layout.is_empty())
+        .map(
+            |(index, layout)| match variants.get(index).map(|v| v.trim()) {
+                Some(variant) if !variant.is_empty() => format!("{}({variant})", layout.trim()),
+                _ => layout.trim().to_owned(),
+            },
+        )
+        .collect()
+}
+
+/// The Deck's view of an Xorg session's layout: the active group's
+/// characters per position. The core mapping describes two groups; a third
+/// or fourth active group is named but not described.
+#[must_use]
+pub fn host_keymap(
+    keymap: &CoreKeymap,
+    layouts: Vec<String>,
+    group: u8,
+    generation: u64,
+) -> arcen_protocol::messages::HostKeymapMsg {
+    let active_layout = layouts.get(usize::from(group)).cloned();
+    super::keymap::host_keymap_msg(
+        X11_KEYMAP_SOURCE,
+        generation,
+        layouts,
+        active_layout,
+        |evdev| {
+            if group > 1 {
+                return None;
+            }
+            keymap.chars_at(evdev, group)
+        },
+    )
+}
+
+/// Sends `host_keymap` notices: once at attach and whenever what the
+/// session's layout types changes.
+struct LayoutNotices {
+    sender: tokio::sync::mpsc::Sender<String>,
+    notices: arcen_input::text::host_layout::HostKeymapNotices,
+}
+
+impl LayoutNotices {
+    /// Sends `notice` (its generation set here) when it differs from the
+    /// last one offered. A notice nobody reads (a Deck that types no
+    /// committed text never takes the receiver) is dropped, not retried.
+    fn offer(&mut self, notice: arcen_protocol::messages::HostKeymapMsg) {
+        let Some(notice) = self.notices.offer(notice) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(&notice) else {
+            return;
+        };
+        if self.sender.try_send(json).is_ok() {
+            tracing::info!(
+                target: "input",
+                generation = notice.generation,
+                layouts = ?notice.layouts,
+                active_layout = ?notice.active_layout,
+                positions = notice.keys.len(),
+                "session keyboard layout read"
+            );
+        } else {
+            tracing::debug!(
+                target: "input",
+                generation = notice.generation,
+                "layout notice dropped: nobody reads it"
+            );
+        }
+    }
 }
 
 /// How one character is typed.
@@ -332,18 +468,31 @@ impl std::fmt::Debug for X11Text {
 
 impl X11Text {
     /// Connects to `display` (see [`Session::connect`]) and starts the
-    /// watcher.
+    /// watcher, which also sends the session's layout to `notices` now and
+    /// whenever it changes.
     ///
     /// # Errors
     ///
     /// When the display cannot be reached or refuses the connection.
-    pub fn connect(display: &str, xauthority: Option<&std::path::Path>) -> Result<Self, String> {
+    pub fn connect(
+        display: &str,
+        xauthority: Option<&std::path::Path>,
+        notices: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<Self, String> {
         use std::sync::{Arc, Condvar, Mutex};
         let session = Arc::new(Mutex::new(Session::connect(display, xauthority)?));
+        let mut layout = LayoutNotices {
+            sender: notices,
+            notices: arcen_input::text::host_layout::HostKeymapNotices::default(),
+        };
+        if let Ok(session) = session.lock() {
+            session.offer_layout(&mut layout);
+        }
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let watcher = {
             let session = Arc::clone(&session);
             let stop = Arc::clone(&stop);
+            let mut ticks = 0_u32;
             std::thread::Builder::new()
                 .name("arcen-x11-text-return".into())
                 .spawn(move || loop {
@@ -361,6 +510,10 @@ impl X11Text {
                     // keys are never given back in the middle of one.
                     if let Ok(mut session) = session.lock() {
                         session.return_borrowed(Instant::now(), false);
+                        ticks = ticks.wrapping_add(1);
+                        if ticks % LAYOUT_TICKS == 0 {
+                            session.offer_layout(&mut layout);
+                        }
                     }
                 })
                 .map_err(|error| format!("committed-text watcher: {error}"))?
@@ -470,6 +623,42 @@ impl Session {
             reply.keysyms_per_keycode,
             reply.keysyms,
         ))
+    }
+
+    /// The layouts the server's keymap was built from (`_XKB_RULES_NAMES`);
+    /// empty when the server does not say.
+    fn layouts(&self) -> Vec<String> {
+        use x11rb::protocol::xproto::AtomEnum;
+        let Ok(Ok(atom)) = self
+            .connection
+            .intern_atom(true, XKB_RULES_NAMES)
+            .map(|cookie| cookie.reply())
+        else {
+            return Vec::new();
+        };
+        if atom.atom == x11rb::NONE {
+            return Vec::new();
+        }
+        self.connection
+            .get_property(false, self.root, atom.atom, AtomEnum::STRING, 0, 1024)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| xkb_rules_layouts(&reply.value))
+            .unwrap_or_default()
+    }
+
+    /// Reads the session's layout and offers it to `notices`.
+    fn offer_layout(&self, notices: &mut LayoutNotices) {
+        let read = self.keymap().and_then(|keymap| {
+            let (group, _) = self.state()?;
+            Ok(host_keymap(&keymap, self.layouts(), group, 0))
+        });
+        match read {
+            Ok(notice) => notices.offer(notice),
+            Err(error) => {
+                tracing::debug!(target: "input", %error, "session keyboard layout not read");
+            }
+        }
     }
 
     /// The core state: the active group and whether Caps Lock is on.
@@ -731,6 +920,91 @@ mod tests {
             shift: map.modifier_key(KEYSYM_SHIFT_L),
             altgr: map.modifier_key(KEYSYM_ISO_LEVEL3_SHIFT),
         }
+    }
+
+    #[test]
+    fn the_layout_notice_describes_the_active_groups_printable_keys() {
+        let mut keysyms = vec![NO_SYMBOL; 248 * usize::from(PER)];
+        let k = &mut keysyms;
+        // A: a/A in both groups. Apostrophe (keycode 48): ' " in group 1
+        // (us), æ Æ in group 2 (no). 2 (keycode 11): no second group.
+        // Grave (49): a dead key in group 2. Q (24): only a lower case.
+        set(k, PER, 38, &[0x61, 0x41, 0x61, 0x41]);
+        set(k, PER, 48, &[0x27, 0x22, 0xe6, 0xc6]);
+        set(k, PER, 11, &[0x32, 0x40]);
+        set(k, PER, 49, &[0x60, 0x7e, 0xfe50, 0x7e]);
+        set(k, PER, 24, &[0x71]);
+        let map = CoreKeymap::new(8, PER, keysyms);
+        let layouts =
+            xkb_rules_layouts(b"evdev\0pc105\0us,no\0,nodeadkeys\0grp:alt_shift_toggle\0");
+        assert_eq!(layouts, ["us", "no(nodeadkeys)"]);
+
+        let chars = |notice: &arcen_protocol::messages::HostKeymapMsg, qt_key: u32| {
+            notice
+                .keys
+                .iter()
+                .find(|key| key.qt_key == qt_key)
+                .map(|key| (key.base.clone(), key.shift.clone()))
+        };
+        let pair = |base: &str, shift: &str| Some((Some(base.to_owned()), Some(shift.to_owned())));
+
+        let us = host_keymap(&map, layouts.clone(), 0, 3);
+        assert_eq!(us.source, X11_KEYMAP_SOURCE);
+        assert_eq!(us.generation, 3);
+        assert_eq!(us.active_layout.as_deref(), Some("us"));
+        assert_eq!(chars(&us, 0x27), pair("'", "\""));
+        assert_eq!(chars(&us, 0x41), pair("a", "A"));
+        assert_eq!(chars(&us, 0x51), pair("q", "Q"));
+        assert_eq!(chars(&us, 0x32), pair("2", "@"));
+        // A key the layout maps nothing to is not described.
+        assert_eq!(chars(&us, 0x5A), None);
+
+        let no = host_keymap(&map, layouts, 1, 4);
+        assert_eq!(no.active_layout.as_deref(), Some("no(nodeadkeys)"));
+        assert_eq!(chars(&no, 0x27), pair("æ", "Æ"));
+        // No second group on that key: the first group's symbols.
+        assert_eq!(chars(&no, 0x32), pair("2", "@"));
+        // A dead key types no character.
+        assert_eq!(chars(&no, 0x60), Some((None, Some("~".to_owned()))));
+
+        // A third group is named but not described by the core mapping.
+        let third = host_keymap(&map, vec!["us".into(), "no".into(), "de".into()], 2, 5);
+        assert_eq!(third.active_layout.as_deref(), Some("de"));
+        assert!(third.keys.is_empty());
+    }
+
+    #[test]
+    fn a_layout_notice_is_sent_only_when_the_layout_changes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let mut notices = LayoutNotices {
+            sender,
+            notices: arcen_input::text::host_layout::HostKeymapNotices::default(),
+        };
+        let map = keymap(false);
+        notices.offer(host_keymap(&map, vec!["us".into()], 0, 0));
+        notices.offer(host_keymap(&map, vec!["us".into()], 0, 0));
+        notices.offer(host_keymap(&map, vec!["gb".into()], 0, 0));
+        let generations: Vec<u64> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|json| {
+                serde_json::from_str::<arcen_protocol::messages::HostKeymapMsg>(&json)
+                    .unwrap()
+                    .generation
+            })
+            .collect();
+        assert_eq!(generations, [1, 2]);
+
+        // Nobody reads: the full channel is not retried every look.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut unread = LayoutNotices {
+            sender,
+            notices: arcen_input::text::host_layout::HostKeymapNotices::default(),
+        };
+        unread.offer(host_keymap(&map, vec!["us".into()], 0, 0));
+        unread.offer(host_keymap(&map, vec!["gb".into()], 0, 0));
+        for _ in 0..3 {
+            unread.offer(host_keymap(&map, vec!["gb".into()], 0, 0));
+        }
+        assert_eq!(unread.notices.generation(), 2);
     }
 
     #[test]

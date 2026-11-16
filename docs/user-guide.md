@@ -225,9 +225,69 @@ For the best match, use a reference preset on your Mac's display (System
 Settings › Displays › Preset) or a calibrated display, and turn off True
 Tone and automatic brightness.
 
+### Exact still image
+
+<!-- source: docs/adr/0016-lossless-refinement.md; shared/media/src/refine/mod.rs; shared/media/src/refine/scrgb.rs; shared/media/src/refine/ycbcr.rs; hosts/capenc/src/win_refine.rs; hosts/macos/src/refine.rs; clients/macos/src/ui/app.rs (Settings › Streaming) -->
+
+The video stream is compressed: very good, but not the host's exact pixels.
+**Exact still image** closes that gap for a picture that stops moving. When
+part of the screen has been still for a moment, the host sends those exact
+pixels again, losslessly, and the Deck paints them over the video and
+checks them against the host's own checksum. Think of it as the host
+sending a lossless screenshot of what stopped moving, piece by piece.
+
+- **On by default.** Turn it off or on in **Settings › Streaming › Exact
+  still image**, next to the colour settings. It applies from the next
+  connection. When it is off, the Deck does not ask for it and nothing
+  extra is sent.
+- **The host allows it unless turned off.** An administrator can switch it
+  off with `video.lossless_refinement: "disabled"` (see the
+  [configuration reference](operations/config-reference.md)).
+- **Grading and HDR only.** Auto and Speed never use it. In HDR the exact
+  picture is the host's HDR (PQ) code values, shown with HDR on as usual.
+- **Which hosts.** On this release, one display:
+
+  | Host | Exact still image |
+  | --- | --- |
+  | Linux, X11 desktop at ten-bit (depth 30) | Grading and HDR |
+  | Linux, Wayland desktop on a GNOME that serves Grading and HDR (GNOME 50 or later; see the [administration guide](operations/pier-administration.md)) | Grading and HDR |
+  | Linux, Wayland on GNOME 49 or earlier | not available (no Grading or HDR there) |
+  | Windows | Grading and HDR |
+  | macOS | Grading and HDR (verified to level 2; needs a Deck of this release) |
+
+  Other hosts and other sessions stream exactly as before, and Stream
+  Statistics says why it is off.
+- **See what you got** in **Stream Statistics**: *Exact: 100% of picture
+  verified* means every pixel you see was checked to be the host's own. A
+  lower number means part of the screen is still changing (a clock, a
+  blinking caret) and stays video there. *Level 3* means the check was made
+  on the picture actually drawn, not only on what arrived. A macOS host
+  sends its picture in the video's own colour codes, which the Deck turns
+  into colour exactly as it does the video, so its check ends at *level 2*
+  (the codes held on the graphics card). When it is off, the line says
+  why.
+- **Bandwidth and time.** It sends only the parts of the screen that are
+  still, at up to half of what the connection has to spare (measured once
+  a second, and paused whenever the video needs the link, the connection
+  loses packets or its queue grows), and a part that moves again simply
+  stays video; motion is not slowed by it, and the video's own bitrate is
+  not lowered for it. Once the
+  picture is still it costs nothing more. How long the exact picture takes
+  depends on how much detail it has. Measured over a fast local network:
+
+  | Still picture | Sent once | Exact and verified after |
+  | --- | --- | --- |
+  | 1080p, windows, text and colour ramps | 0.3 MB | under 1 second |
+  | 1080p, full-screen photograph | 2.5 MB | about 2.5 seconds |
+  | 4K, windows, text and colour ramps | 0.9 MB | under 2 seconds |
+  | 4K, full-screen photograph | 10 MB | about 6.5 seconds |
+
+  The picture fills in progressively; *Exact: arriving, N% of picture*
+  shows how far it has got.
+
 ## 5. Pen and tablet
 
-<!-- source: clients/macos/src/ui/app.rs (tablet_mode_label, tablet_mode_description, Settings › Input › Tablet, set_tablet_mode_requested); clients/macos/src/ui/macos_menu.rs (View › Tablet Monitor, Tablet Orientation Left-handed); shared/input/src/negotiation.rs and hosts/windows/src/session.rs (refusal texts); docs/adr/0017-forward-only-pen-input.md; docs/adr/0018-unified-typed-devices.md; docs/operations/pen-tablet-input.md; README.md (Pen and tablet) -->
+<!-- source: clients/macos/src/ui/app.rs (tablet_mode_label, tablet_mode_description, Settings › Input › Tablet, set_tablet_mode_requested); clients/macos/src/ui/macos_menu.rs (View › Tablet Monitor); shared/input/src/negotiation.rs and hosts/windows/src/session.rs (refusal texts); docs/adr/0017-forward-only-pen-input.md; docs/adr/0018-unified-typed-devices.md; docs/operations/pen-tablet-input.md; README.md (Pen and tablet) -->
 
 Any pen tablet works, whoever made it. Choose the mode in **Settings ›
 Input › Tablet**. The choice is saved with the connection you have
@@ -259,8 +319,9 @@ What the host makes of the pen:
 | Mac (preview) | The tablet events a Mac tablet driver posts: proximity, pressure, tilt, rotation, eraser, barrel buttons. At the Mac sign-in window the pen is a plain pointer. |
 
 **View › Tablet Monitor** shows what the Deck sees from your pen and whether
-the host accepted it as a pen. **View › Tablet Orientation Left-handed**
-mirrors the tablet for left-handed use.
+the host accepted it as a pen. Left-handed use, the tablet's area and its
+pressure curve are set in the tablet maker's settings on your Mac, as for
+every other application; Arcen follows them.
 
 ### Native tablet (USB bridged): LAN only, where the host offers it
 
@@ -283,23 +344,28 @@ Where it is offered:
   mapping. A Wayland desktop on several displays does not move the Deck's
   cursor with the pen. GNOME hides its own pointer while the pen is near
   the tablet; the Deck then shows a small round mark where the pen is.
-- **Mac hosts**: with pressure for a tablet model the host knows (the Wacom
-  Intuos5 touch L today); other models get buttons and proximity only.
-- **Windows hosts do not offer it**, by decision: it would need a signed
-  kernel driver the project does not fund ([ADR 0017](adr/0017-forward-only-pen-input.md)).
+- **Mac hosts**: any tablet that reports a standard pen, with pressure,
+  tilt, buttons and eraser as far as the tablet reports them; models with a
+  dedicated reader (the Wacom Intuos5 touch L today) get more. A tablet
+  whose pen speaks only its maker's own format is refused with a reason.
+- **Windows hosts**: the same as Mac hosts, with nothing installed on the
+  host: the Pier reads the pen itself and gives it to Windows as a Windows
+  Ink pen, so set drawing applications to Windows Ink (pressure in Windows
+  Ink's 1/1024 steps).
 - A host that cannot take it says why ("Native tablet is not enabled on this
-  host…", "…is not offered on Windows hosts…", "…is unavailable on this
-  host…"), and you keep ordinary mouse control. Choose **Tablet support**
+  host…", "…is unavailable on this host…"), and you keep ordinary mouse control. Choose **Tablet support**
   instead, or ask the host's administrator.
 
 When you disconnect, the helper hands the tablet back to the Mac as if you
 had unplugged it and plugged it in again, so Mac applications and the
 tablet maker's driver get it back.
 
-If you do use it, it needs macOS 13 or later and the Arcen USB helper (on
-Intel Macs it has not been tried with a real tablet yet).
-**Settings › Input › Tablet** installs the helper, and you approve it once in
-System Settings › General › Login Items. The Deck itself never runs with
+If you do use it, it needs macOS 13 or later and the Arcen USB component, a
+small helper (on Intel Macs it has not been tried with a real tablet yet).
+**Settings › Input › Tablet** installs it (**Install component…** beside
+Native tablet), and you approve it once in System Settings › General › Login
+Items. The button beside Native tablet always says where the component
+stands. The Deck itself never runs with
 extra privileges. Keep cursor rendering on **Local** (the connection dialog recommends it):
 the host's own driver
 moves the host's pointer, and the Deck draws the pen's pointer where the host
@@ -622,7 +688,7 @@ and says what to do. Then look for what you see below. Anything marked
 | The pen acts as a mouse | The tablet mode is Mouse compatibility, the host is a Linux Wayland desktop without a pen seat, or the application uses Wintab. | **Settings › Input › Tablet › Tablet support**; on Windows, set the application to Windows Ink. |
 | A web page on a Mac host says *Pointer type: Mouse*, pressure 0.50 | The page is open in Safari. Safari on macOS reports every pen as a mouse, including one plugged straight into that Mac: WebKit takes no pen data from macOS. | Use Chrome on the host (it reports pen, pressure, tilt and rotation), or a native drawing application. |
 | "Native tablet is not enabled on this host…" | The host's administrator has not turned Native tablet on (`usb.native_tablet`). | Choose **Tablet support**, or ask the administrator to enable it. |
-| "Native tablet (USB bridged) is not offered on Windows hosts…" or "…is unavailable on this host…" | The host cannot take a bridged tablet. | Choose **Tablet support**. |
+| "Native tablet (USB bridged) unavailable…" or "…refused…" | The host cannot take a bridged tablet, or reads no pen from this one; the reason says which. | Choose **Tablet support**. |
 | Wrong characters, `z` and `y` swapped, `æøå` as punctuation | The host's keyboard layout differs from your Mac's. | **Connection › Keyboard: Characters** (⌃⌘U), or match the layouts. |
 | "This host cannot type text sent from the Deck…" | The host cannot type characters (the Mac host, or a host older than 0.18.0). | Use physical keys; ask about updating the host. |
 | Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Modifiers**. |

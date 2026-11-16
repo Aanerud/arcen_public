@@ -65,7 +65,6 @@ pub(crate) struct PenRoute {
     pub(crate) secondary_targets: Vec<(isize, SessionMonitorId, ViewSize)>,
     pub(crate) primary_viewport: Option<RegionViewport>,
     pub(crate) monitor_viewports: Vec<(SessionMonitorId, RegionViewport)>,
-    pub(crate) left_handed: bool,
 }
 
 /// Session state pen forwarding depends on, refreshed by the UI.
@@ -385,17 +384,13 @@ impl PenInput {
                 self.mapper.on_proximity(proximity, view, metadata)
             }
         };
-        let Some(mut event) = mapped else {
+        let Some(event) = mapped else {
             tracing::debug!(
                 target: crate::logging::target::INPUT,
                 "native tablet sample produced no valid pen event after mapping"
             );
             return;
         };
-        if self.route.left_handed {
-            event.x = 1.0 - event.x;
-            event.tilt_x_degrees = -event.tilt_x_degrees;
-        }
         let region_viewport = match monitor_id {
             Some(monitor_id) => self
                 .route

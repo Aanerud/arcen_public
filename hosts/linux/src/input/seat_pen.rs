@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use arcen_input::compositor_pressure::{CompositorPressure, SeatPenPressure};
 use arcen_input::seat_pen::{
     is_desktop_seat, is_mutter_rules_override, is_rule_file, mutter_rules_without_vkms_ignore,
     DesktopPen, NativeSeat, MUTTER_RULES_FILE, PRODUCT, RASTER, RESOLUTION_PER_MM, UDEV_RULE_DIR,
@@ -77,6 +78,9 @@ pub struct SeatPen {
     native: Mutex<Option<NativeKms>>,
     /// Whether this is a native seat (stays true after the release).
     native_mode: bool,
+    /// What the compositor does to the device's pressure, inverted so its
+    /// applications see the Deck's pressure.
+    pressure: SeatPenPressure,
 }
 
 /// What a native seat changed on the host, so [`Drop`] undoes exactly that.
@@ -159,7 +163,7 @@ impl SeatPen {
     ///
     /// When any step fails; whatever was set up is undone, and the desktop
     /// gets no lab pen.
-    pub fn create(uid: u32) -> Result<Arc<Self>, String> {
+    pub fn create(uid: u32, compositor: CompositorPressure) -> Result<Arc<Self>, String> {
         if uid == 0 {
             return Err("the seat pen is never granted to root".into());
         }
@@ -173,6 +177,7 @@ impl SeatPen {
             device: Mutex::new(None),
             native: Mutex::new(None),
             native_mode: false,
+            pressure: SeatPenPressure::new(pen::PRESSURE_MAX, compositor),
         };
         pen.install_rule()?;
         let mut device = build(&pen.pen).map_err(|error| format!("seat pen: {error}"))?;
@@ -231,7 +236,10 @@ impl SeatPen {
     /// # Errors
     ///
     /// Why the seat cannot be had; whatever was set up is undone.
-    pub fn create_native(uid: u32) -> Result<Arc<Self>, NativeSeatError> {
+    pub fn create_native(
+        uid: u32,
+        compositor: CompositorPressure,
+    ) -> Result<Arc<Self>, NativeSeatError> {
         if uid == 0 {
             return Err(NativeSeatError::setup(
                 "the native seat is never given to root",
@@ -259,6 +267,7 @@ impl SeatPen {
             device: Mutex::new(None),
             native: Mutex::new(Some(NativeKms::default())),
             native_mode: true,
+            pressure: SeatPenPressure::new(pen::PRESSURE_MAX, compositor),
         };
         // Any failure from here drops `pen`, which undoes what was done.
         let vkms = pen
@@ -281,6 +290,7 @@ impl SeatPen {
             pen = %pen.node.as_deref().unwrap_or(Path::new("")).display(),
             display_manager = facts.display_manager_active,
             uid,
+            pressure = ?compositor,
             "this desktop runs its compositor natively on its own seat"
         );
         Ok(Arc::new(pen))
@@ -427,7 +437,13 @@ impl SeatPen {
     pub fn pen_event(&self, message: &PenEventMsg) -> Result<(), InputError> {
         let mut guard = self.device_lock();
         let pen = guard.as_mut().ok_or(InputError::PenUnavailable)?;
-        let axes = pen::PenAxes::from_event(message, RASTER, RASTER, pen::SEAT_PEN_CONTACT_FLOOR);
+        let mut axes =
+            pen::PenAxes::from_event(message, RASTER, RASTER, pen::SEAT_PEN_CONTACT_FLOOR);
+        axes.pressure = arcen_input::virtual_device::contact_pressure(
+            self.pressure.device_value(message.pressure),
+            message.in_proximity && message.touching,
+            pen::SEAT_PEN_CONTACT_FLOOR,
+        );
         if pen
             .proximity_timeout
             .needs_prelude(pen.state.tool.is_some(), message.in_proximity)

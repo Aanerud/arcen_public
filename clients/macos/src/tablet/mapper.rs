@@ -195,7 +195,7 @@ impl TabletMapper {
 
         let pressure = normalize_pressure(sample.pressure);
         let tilt_x_degrees = tilt_to_degrees(sample.tilt_x);
-        let tilt_y_degrees = tilt_to_degrees(sample.tilt_y);
+        let tilt_y_degrees = appkit_tilt_y_to_degrees(sample.tilt_y);
         let rotation_degrees = normalize_rotation(sample.rotation_degrees);
         // The tip button bit is contact, not a barrel button; pressure > 0 is
         // an additional signal some drivers only expose through pressure.
@@ -288,6 +288,19 @@ fn normalize_pressure(raw: f32) -> f32 {
 fn tilt_to_degrees(raw: f32) -> f32 {
     if raw.is_finite() {
         arcen_input::pen_axes::tilt_unit_to_degrees(f64::from(raw))
+    } else {
+        raw
+    }
+}
+
+/// `-[NSEvent tilt].y` as wire degrees: tablet drivers report it positive
+/// away from the user, the wire (W3C `tiltY`) toward the user, so it is
+/// reversed (`arcen_input::pen_axes::appkit_tilt_y_degrees`; Chromium and Qt
+/// reverse it the same way). Non-finite input is passed through so
+/// validation rejects it.
+fn appkit_tilt_y_to_degrees(raw: f32) -> f32 {
+    if raw.is_finite() {
+        arcen_input::pen_axes::appkit_tilt_y_degrees(f64::from(raw))
     } else {
         raw
     }
@@ -591,6 +604,14 @@ mod tests {
         assert_eq!(tilt_to_degrees(-1.0), -90.0);
         assert_eq!(tilt_to_degrees(1.0), 90.0);
         assert_eq!(tilt_to_degrees(0.0), 0.0);
+    }
+
+    #[test]
+    fn appkit_tilt_y_toward_the_top_is_negative_wire_tilt() {
+        assert_eq!(appkit_tilt_y_to_degrees(0.5), -45.0);
+        assert_eq!(appkit_tilt_y_to_degrees(-1.0), 90.0);
+        assert_eq!(appkit_tilt_y_to_degrees(0.0), 0.0);
+        assert!(appkit_tilt_y_to_degrees(f32::NAN).is_nan());
     }
 
     #[test]

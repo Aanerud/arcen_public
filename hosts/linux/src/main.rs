@@ -126,6 +126,13 @@ fn main() -> ExitCode {
                 if let Some(line) = arcen_pier_linux::usb_bridge::native_tablet_status() {
                     println!("{line}");
                 }
+                println!(
+                    "{}",
+                    arcen_media::refine::operator_status_line(
+                        arcen_pier_linux::media::capenc::REFINE_COMPILED,
+                        config.lossless_refinement,
+                    )
+                );
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -176,6 +183,7 @@ fn main() -> ExitCode {
         audio = config.audio_enabled,
         audio_compressed = config.audio_compressed,
         microphone_input = config.microphone_input_enabled,
+        lossless_refinement = config.lossless_refinement,
         "arcen-host starting"
     );
     if logging_options.retention_was_clamped {

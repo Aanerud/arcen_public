@@ -769,6 +769,9 @@ pub struct AuthenticatedLauncher {
     /// How a desktop this sign-in creates gets its seat
     /// (`wayland.session_mode`).
     desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan,
+    /// What the desktop's compositor does to its seat pen's pressure,
+    /// resolved when the seat pen is built.
+    seat_pen_pressure: crate::input::pressure_curve::SeatPenPressurePlan,
     x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
     provider: arcen_session::desktop_provider::DesktopProvider,
     audio: AgentAudioArguments,
@@ -880,6 +883,18 @@ impl AuthenticatedLauncher {
         self.desktop_seat_plan = plan;
     }
 
+    /// What the compositor of a Wayland desktop this sign-in creates does
+    /// to its seat pen's pressure (from the qualified compositor version and
+    /// its prefix's pressure-curve marker), so the pen writes the pressure
+    /// its applications see as sent. Must be called before
+    /// [`AuthenticatedLauncher::open`].
+    pub(crate) fn set_seat_pen_pressure(
+        &mut self,
+        pressure: crate::input::pressure_curve::SeatPenPressurePlan,
+    ) {
+        self.seat_pen_pressure = pressure;
+    }
+
     /// Creates a dedicated Xorg desktop at `depth` (a headless Wayland
     /// desktop ignores it). Must be called before
     /// [`AuthenticatedLauncher::open`] to take effect; a reattachment keeps
@@ -989,6 +1004,7 @@ impl AuthenticatedLauncher {
                 desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan::Headless {
                     fallback: None,
                 },
+                seat_pen_pressure: crate::input::pressure_curve::SeatPenPressurePlan::linear(),
                 x11_desktop_depth: None,
                 provider: config.provider,
                 audio: config.audio.clone(),
@@ -1022,12 +1038,13 @@ impl AuthenticatedLauncher {
         }
         if let DesktopSeatPlan::Native { required } = plan {
             let uid = self.identity.uid;
+            let pressure = self.seat_pen_pressure.clone();
             #[allow(
                 clippy::disallowed_methods,
                 reason = "awaited to completion, never under a timeout; the seat build is bounded (udevadm settle --timeout, SEAT_TIMEOUT polls)"
             )]
             let created = tokio::task::spawn_blocking(move || {
-                crate::input::seat_pen::SeatPen::create_native(uid)
+                crate::input::seat_pen::SeatPen::create_native(uid, pressure.resolve())
             })
             .await;
             match created {
@@ -1112,8 +1129,11 @@ impl AuthenticatedLauncher {
             native_pen
         } else if self.lab_seat_pen {
             let uid = self.identity.uid;
-            match tokio::task::spawn_blocking(move || crate::input::seat_pen::SeatPen::create(uid))
-                .await
+            let pressure = self.seat_pen_pressure.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::input::seat_pen::SeatPen::create(uid, pressure.resolve())
+            })
+            .await
             {
                 Ok(Ok(pen)) => Some(pen),
                 Ok(Err(error)) => {

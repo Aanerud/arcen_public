@@ -55,6 +55,11 @@ ARTEFACTS: dict[str, list[str]] = {
         "arcen-pier-windows",
         "arcen-credential-provider",
         "arcen-pier-windows-installer",
+        # The Windows Deck MSI and the optional USB component MSI
+        # (packaging/windows-deck/build.ps1).
+        "arcen-deck-windows",
+        "arcen-usb-service",
+        "arcen-usb-prepare",
     ],
 }
 
@@ -65,7 +70,9 @@ ARTEFACTS: dict[str, list[str]] = {
 # `--features wayland-provider` and its default `native-tablet`; see
 # packaging/linux/installer/README.md; the Deck embeds the USB helper by
 # default, which turns on `native-tablet`, and builds the helper with its
-# IOUSBHost backend; see packaging/macos/build-deck-app.sh).
+# IOUSBHost backend; see packaging/macos/build-deck-app.sh). The Windows Deck,
+# its USB service and prepare tool are built with their default features
+# (packaging/windows-deck/build.ps1); add them here if that changes.
 RELEASE_FEATURES: dict[str, list[str]] = {
     "aarch64-apple-darwin": [
         "arcen-deck-macos/native-tablet",
@@ -112,6 +119,8 @@ def cargo_metadata(target: str) -> dict:
         cwd=REPO,
         capture_output=True,
         text=True,
+        # cargo writes UTF-8; Windows' default code page cannot decode it.
+        encoding="utf-8",
         check=False,
     )
     if result.returncode != 0:

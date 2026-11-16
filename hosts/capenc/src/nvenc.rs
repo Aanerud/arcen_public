@@ -63,8 +63,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -478,6 +478,36 @@ pub struct Encoder {
     last_conversion_ms: f64,
     last_mirror_ms: f64,
     last_stage_timing: StageTiming,
+    /// Exact still image on the GPU conversion path: the newest FP16
+    /// capture kept on the GPU and one bounded readback of it at a time
+    /// (ADR 0016). `None` unless the session refines.
+    refine_readback: Option<RefineReadback>,
+}
+
+/// The GPU path's exact-still-image readback: a GPU copy of every new FP16
+/// capture (`latest`), and at most one CPU readback of it in flight
+/// (`staging`), mapped without waiting so neither capture nor encode ever
+/// stalls on it.
+struct RefineReadback {
+    latest: ID3D11Texture2D,
+    staging: ID3D11Texture2D,
+    /// `latest` holds a capture `staging` has not been given yet.
+    latest_newer: bool,
+    /// A copy into `staging` is in flight.
+    in_flight: bool,
+}
+
+/// What [`Encoder::poll_refine_readback`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefineReadbackPoll {
+    /// Nothing to do, or not allowed to start one now.
+    Idle,
+    /// A readback of the newest capture started.
+    Started,
+    /// The readback in flight is not done yet.
+    Pending,
+    /// The readback landed and was observed.
+    Landed,
 }
 
 #[derive(Clone, Copy)]
@@ -2645,7 +2675,145 @@ impl Encoder {
             staged_capture: StagedCapture::default(),
             last_mirror_ms: 0.0,
             last_stage_timing: StageTiming::default(),
+            refine_readback: None,
         })
+    }
+
+    /// The R′G′B′ code transform this session's FP16 conversion applies
+    /// before its matrix: the exact-still-image source's codes (ADR 0016
+    /// §1). `None` for an eight-bit session.
+    pub(crate) fn refine_codes(&self) -> Option<arcen_media::refine::scrgb::ScrgbCodes> {
+        use arcen_media::refine::scrgb::ScrgbCodes;
+        self.wide_transform.map(|transform| match transform {
+            WideScrgbTransform::Sdr(transform) => ScrgbCodes::Sdr(transform),
+            WideScrgbTransform::Pq(transform) => ScrgbCodes::Pq(transform),
+        })
+    }
+
+    /// Prepares the GPU path's exact-still-image readback (two FP16
+    /// textures of the capture's size). The CPU path needs none: its
+    /// staging texture is already mapped for every capture.
+    pub(crate) unsafe fn enable_refine_readback(&mut self) -> Result<(), String> {
+        if self.wide_gpu.is_none() || self.refine_readback.is_some() {
+            return Ok(());
+        }
+        let device = self
+            .context
+            .GetDevice()
+            .map_err(|e| format!("refine readback device: {e:?}"))?;
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut latest: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut latest))
+            .map_err(|e| format!("CreateTexture2D(refine latest): {e:?}"))?;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut staging))
+            .map_err(|e| format!("CreateTexture2D(refine staging): {e:?}"))?;
+        self.refine_readback = Some(RefineReadback {
+            latest: latest.ok_or_else(|| "refine latest texture null".to_string())?,
+            staging: staging.ok_or_else(|| "refine staging texture null".to_string())?,
+            latest_newer: false,
+            in_flight: false,
+        });
+        Ok(())
+    }
+
+    /// Whether the GPU path holds a capture its exact-still-image readback
+    /// has not started on yet.
+    pub(crate) fn refine_readback_behind(&self) -> bool {
+        self.refine_readback
+            .as_ref()
+            .is_some_and(|readback| readback.latest_newer)
+    }
+
+    /// Advances the GPU path's readback by one step, never waiting: lands
+    /// a finished copy into `observe` (the mapped FP16 frame and its row
+    /// pitch), or, when `may_start` and a newer capture exists, starts the
+    /// next copy. With `wait` the copy started is also mapped at once
+    /// (the synchronous fallback for a capture without trustworthy dirty
+    /// regions).
+    pub(crate) unsafe fn poll_refine_readback(
+        &mut self,
+        may_start: bool,
+        wait: bool,
+        observe: &mut dyn FnMut(&[u8], usize),
+    ) -> Result<RefineReadbackPoll, String> {
+        let height = self.height as usize;
+        let context = self.context.clone();
+        let Some(readback) = self.refine_readback.as_mut() else {
+            return Ok(RefineReadbackPoll::Idle);
+        };
+        let mut started = false;
+        if !readback.in_flight {
+            if !(may_start && readback.latest_newer) {
+                return Ok(RefineReadbackPoll::Idle);
+            }
+            let src: ID3D11Resource = readback
+                .latest
+                .cast()
+                .map_err(|e| format!("cast refine latest: {e:?}"))?;
+            let dst: ID3D11Resource = readback
+                .staging
+                .cast()
+                .map_err(|e| format!("cast refine staging: {e:?}"))?;
+            context.CopyResource(&dst, &src);
+            readback.latest_newer = false;
+            readback.in_flight = true;
+            started = true;
+            if !wait {
+                return Ok(RefineReadbackPoll::Started);
+            }
+        }
+        let staging: ID3D11Resource = readback
+            .staging
+            .cast()
+            .map_err(|e| format!("cast refine staging: {e:?}"))?;
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let flags = if wait {
+            0
+        } else {
+            D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32
+        };
+        match context.Map(&staging, 0, D3D11_MAP_READ, flags, Some(&mut mapped)) {
+            Ok(()) => {}
+            Err(error)
+                if error.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING =>
+            {
+                return Ok(if started {
+                    RefineReadbackPoll::Started
+                } else {
+                    RefineReadbackPoll::Pending
+                });
+            }
+            Err(error) => {
+                readback.in_flight = false;
+                readback.latest_newer = true;
+                return Err(format!("Map(refine staging): {error:?}"));
+            }
+        }
+        let pitch = mapped.RowPitch as usize;
+        let bytes = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * height);
+        observe(bytes, pitch);
+        context.Unmap(&staging, 0);
+        readback.in_flight = false;
+        Ok(RefineReadbackPoll::Landed)
     }
 
     /// The chroma subsampling and bit depth this session was created for —
@@ -2704,6 +2872,11 @@ impl Encoder {
     }
 
     /// Reconfigures NVENC's average/max bitrate and VBV without forcing an IDR.
+    /// The encoder's current average bitrate target.
+    pub fn average_bitrate_bps(&self) -> u64 {
+        u64::from(self.reconfig_config.rcParams.averageBitRate)
+    }
+
     pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<(), String> {
         let bitrate = u32::try_from(bps).unwrap_or(u32::MAX).max(1);
         let vbv = vbv_bits_for_frames(bitrate, self.frame_rate, self.vbv_buffer_frames);
@@ -3073,6 +3246,19 @@ impl Encoder {
             };
             let convert_started = Instant::now();
             converter.convert(&self.context, acquired, texture)?;
+            if let Some(readback) = self.refine_readback.as_mut() {
+                // A GPU-to-GPU copy of the FP16 capture for exact still
+                // image; the CPU sees it only through the bounded readback.
+                let refine_src: ID3D11Resource = acquired
+                    .cast()
+                    .map_err(|e| format!("cast refine source: {e:?}"))?;
+                let refine_dst: ID3D11Resource = readback
+                    .latest
+                    .cast()
+                    .map_err(|e| format!("cast refine latest: {e:?}"))?;
+                self.context.CopyResource(&refine_dst, &refine_src);
+                readback.latest_newer = true;
+            }
             let latest_dst: ID3D11Resource = latest
                 .cast()
                 .map_err(|e| format!("cast wide latest: {e:?}"))?;
@@ -3148,6 +3334,18 @@ impl Encoder {
     /// stale desktop presented as a fresh capture. That is refused explicitly
     /// rather than tolerated.
     pub unsafe fn convert_and_publish_staging(&mut self) -> Result<(), String> {
+        self.convert_and_publish_staging_observed(&mut |_, _| {})
+    }
+
+    /// [`Self::convert_and_publish_staging`], handing a wide (FP16) frame to
+    /// `observe` (the mapped bytes and their row pitch) after it was
+    /// converted and before the staging texture is unmapped: the exact
+    /// still image source of the CPU path, synchronous with the frame about
+    /// to be encoded.
+    pub unsafe fn convert_and_publish_staging_observed(
+        &mut self,
+        observe: &mut dyn FnMut(&[u8], usize),
+    ) -> Result<(), String> {
         if self.format == PixelFormat::Bgra8 || self.wide_gpu.is_some() {
             return Ok(());
         }
@@ -3202,6 +3400,9 @@ impl Encoder {
             // frame some efficiency; feeding the tracker half-floats would
             // cost it correctness.
             let publish_result = self.publish_scrgb(bgra_bytes, src_stride);
+            if publish_result.is_ok() {
+                observe(bgra_bytes, src_stride);
+            }
             self.context.Unmap(&dst, 0);
             self.last_stage_timing = StageTiming {
                 copy_ms: self.last_copy_ms,

@@ -450,6 +450,7 @@ pub fn build_pipeline_specs(
                         // request is served as Auto before this; see
                         // `Config::wayland_multi_output`).
                         wayland_fidelity_args: Vec::new(),
+                        refine: None,
                         display: display.clone(),
                         xauthority: xauthority.clone(),
                         execution: execution.clone(),
@@ -471,6 +472,7 @@ pub fn build_pipeline_specs(
                     // request is served as Auto before this; see
                     // `Config::wayland_multi_output`).
                     wayland_fidelity_args: Vec::new(),
+                    refine: None,
                     display,
                     xauthority,
                     execution,
@@ -971,6 +973,7 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             display: None,
             xauthority: None,
             execution: None,

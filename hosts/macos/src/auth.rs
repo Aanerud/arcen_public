@@ -280,9 +280,7 @@ impl std::fmt::Display for AuthFailure {
                 "this Mac's screen belongs to another account; sign in as the person at the \
                  console, or switch to your account at the machine first"
             }
-            Self::TooManyAttempts => {
-                "too many failed sign-ins; wait a few minutes before trying again"
-            }
+            Self::TooManyAttempts => arcen_session::auth_throttle::THROTTLED_MESSAGE,
             Self::HostBusy => "another session is already using this Mac",
         })
     }

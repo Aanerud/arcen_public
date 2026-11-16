@@ -528,6 +528,8 @@ mod harness {
             speed_runtime_shortfall: false,
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
+            // A probe harness: no exact still image.
+            refine: None,
             display: None,
             xauthority: None,
             execution: Some(launcher.execution()),

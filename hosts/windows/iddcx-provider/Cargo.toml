@@ -11,5 +11,8 @@ license.workspace = true
 authors.workspace = true
 description = "Pure contracts and planning for the first-party Arcen Windows IddCx provider"
 
+[dependencies]
+arcen-outputs.workspace = true
+
 [lints]
 workspace = true

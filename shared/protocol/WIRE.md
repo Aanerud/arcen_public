@@ -1049,23 +1049,40 @@ by its `u32` length. A lane endpoint that meets the legacy
 code `0x41524C01` and a readable reason. No product sends any of this yet;
 `PROTOCOL_VERSION` moves to 5 when products switch.
 
-### Lossless refinement v1 (DRAFT — not live, ADR 0016)
+### Exact still image — lossless refinement v1 (protocol v5, additive, capability-gated; ADR 0016)
 
-Nothing below is negotiated by a release build. The records and the
-capability are modelled in `arcen_protocol::refine`; products send none of
-them yet. All binary headers are big-endian; `monitor_id`,
-`topology_generation` and `stream_epoch` mean what they mean in the region
-video v1 header. Every record carries a nonzero `refine_generation`.
+Live from the first slice: a Linux Pier serving an Xorg depth-30 Grading or
+HDR session to one monitor, and the macOS Deck. The records and the
+capability are `arcen_protocol::refine`. All binary headers are big-endian;
+`monitor_id`, `topology_generation` and `stream_epoch` mean what they mean in
+the region video v1 header (they name the refinement scope; legacy
+single-monitor video frames keep their own header). Every record carries a
+nonzero `refine_generation`.
 
-**Capability (additive, serde-default).** `ClientHelloMsg.lossless_refine_v1`
-(`{domains: ["rgb"], codecs: ["delta-zstd1"]}`, omitted when absent).
-`ServerHelloMsg.lossless_refine` (`{state, reason?, domain, bit_depth,
-transfer, primaries, range, codec, still_ms, max_mbps}`) per session, plus a
-per-monitor state in later slices. A Pier lists the `refine` lane role (7) in
-`lane_attachment.roles` **only** for a Deck that sent the capability: an older
-Deck's grant validator refuses an unknown role token and a role list as long
-as its own role table. `RefineFence`/`RefineBarrier` are sent on the video
-lane only when `refine` was granted.
+**Capability (additive, serde-default).** `AuthResponse.lossless_refine_v1`
+(`{domains: ["rgb", "ycbcr"], codecs: ["delta-zstd1"]}`; a Deck that lists
+only `rgb` is never sent Y′CbCr tiles): sent at authentication
+because the Pier starts its encoder before the hellos, and only while the
+Deck's user switch (**Exact still image**) is on; omitted otherwise and by
+older Decks. `ServerHelloMsg.lossless_refine` (`{state: "on"|"off", reason?,
+domain?, bit_depth?, codec?, still_ms?, max_mbps?}`) is sent only to a Deck
+that asked; `reason` is a stable token (`operator_off`, `eight_bit`,
+`not_444`, `zero_copy_capture`, `ycbcr_source_not_yet`, `deck_unsupported`,
+`deck_eight_bit_fallback`, `multi_monitor`, `not_compiled`); an unknown
+`state` reads as off. A Pier lists the `refine` lane role (7) in
+`lane_attachment.roles` **only** when the shared plan is on for a Deck that
+asked: an older Deck's grant validator refuses an unknown role token and a
+role list as long as its own role table. `RefineFence`/`RefineBarrier` are
+sent on the video lane only when `refine` was granted, and a Deck processes
+refinement records only for a connection that asked and whose Pier offered
+it.
+
+**Forwarding rule.** A Pier writes a fence or barrier immediately before the
+access unit it describes. When its send queue drops or suppresses access
+units, their records are not dropped: before the next access unit it sends,
+it writes the newest barrier among them (if any) and one fence with the
+union of their invalidations under the newest fence number
+(`arcen_media::refine::carry`).
 
 | Type | Name | Lane | Purpose |
 |---|---|---|---|
@@ -1086,7 +1103,9 @@ non-empty runs of invalidated block indices, all `< block_count`.
 `RefineBarrier` (`0x0D`): prefix (with the **new** generation), `reason u8`
 (1 start, 2 recovery, 3 geometry, 4 contract, 5 reset request, 6 re-enable),
 contract `domain u8` (1 rgb, 2 ycbcr), `depth u8`, `transfer u8`,
-`primaries u8`, `matrix u8`, `range u8`, `chroma u8` (2 = 4:4:4),
+`primaries u8`, `matrix u8` (H.273 `matrix_coefficients` of Y′CbCr codes:
+1 BT.709, 6 BT.601, 9 BT.2020 NCL; 0 for rgb), `range u8` (0 limited,
+1 full), `chroma u8` (2 = 4:4:4),
 `source_width u32`, `source_height u32` — 40 bytes.
 
 `RefineTiles` (`0x0B`): prefix, `valid_from_fence u64`, `domain u8`,
@@ -1099,7 +1118,8 @@ before any allocation.
 
 `delta-zstd1` payload: one Zstandard frame whose declared content size is
 exactly `width × height × 6`, window ≤ 128 KiB, no dictionary, no skippable
-frame, no trailing bytes. Content: for each plane (R′, G′, B′) the residual
+frame, no trailing bytes. Content: for each plane (R′, G′, B′; Y′, Cb, Cr
+for a `ycbcr` tile) the residual
 of each code against its left neighbour (the pixel above for a row's first
 pixel, zero for the tile's first), modulo `2^depth`, zigzag-folded; written
 as `width × height` low bytes then `width × height` high bytes, plane by
@@ -1115,8 +1135,11 @@ current identity with another source size is refused.
 digest v1, ADR 0016 R4, XXH3-128 little-endian), `covered_count u32`,
 `run_count u32`, runs as in `RefineFence`.
 
-Control (session JSON, draft): Deck → Pier `refine_reset {monitor_id,
-stream_epoch, reason}` and `refine_control {monitor_id, enabled}`.
+Control (session JSON, control lane, only after a `refine` grant): Deck →
+Pier `refine_reset {monitor_id, stream_epoch, reason}` (start a new
+generation) and `refine_control {monitor_id, enabled}` (stop or resume tiles
+for a monitor, for example when the Deck falls back to eight-bit
+presentation).
 
 ## Auth
 
@@ -1136,6 +1159,22 @@ legacy `common/session_fsm.py` contract.
 ---
 
 ## Changelog
+
+- **2026-11-13 — Y′CbCr tiles in use (values only, no format change)** —
+  A macOS Pier refines its `xf44` Grading and HDR captures in the `ycbcr`
+  domain (2), already defined: barriers carry the codes' matrix and range,
+  tiles and digests carry planes Y′, Cb, Cr. The macOS Deck advertises
+  `ycbcr` beside `rgb`, composites such tiles only over a picture with the
+  same matrix and range, and verifies them to level 2 (the rendered pixel
+  is the matrix of the code). A Deck that lists only `rgb` gets
+  `deck_unsupported`. No version bump.
+- **2026-11-13 — exact still image live (additive, capability-gated)** —
+  `AuthResponse.lossless_refine_v1` (Deck → Pier, replaces the drafted
+  `ClientHelloMsg` placement: the encoder starts before the hellos) and
+  `ServerHelloMsg.lossless_refine`; the `refine` lane, records `0x0A`–`0x0D`
+  and `refine_reset`/`refine_control` are now sent between a Linux Pier and
+  the macOS Deck when both sides switch it on. Older peers omit or ignore
+  every field and never see the role or the records. No version bump.
 
 - **2026-11-09 — lossless refinement v1 (DRAFT, not live)** — Records
   `0x0A`–`0x0D`, the `refine` lane role and the `lossless_refine_v1`

@@ -308,6 +308,30 @@
       ]
     },
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "audio",
+        "crate",
+        "display_color",
+        "refine",
+        "video"
+      ],
+      "forwarded_features": {
+        "runtime": [
+          "audio-opus",
+          "refine-zstd-decode"
+        ]
+      },
+      "production_uses": [
+        {
+          "id": "deck-present-timing",
+          "symbol": "operational_present_timing",
+          "reason": "Every Deck presents a frame when the served pipeline's shared PresentTiming says (Auto newest without tearing, Speed may tear, Grading and HDR on the refresh); the shared media worker derives it once for both Decks."
+        }
+      ]
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
@@ -326,6 +350,8 @@
         "hevc_sps",
         "multi_monitor",
         "presentation",
+        "refine",
+        "refine::compositor",
         "region",
         "region_frame",
         "test_pattern",
@@ -334,16 +360,23 @@
         "video::convert",
         "video::pipeline",
         "video::plan",
+        "video::present",
         "video::preset",
         "video::variant"
       ],
-      "features": ["audio-opus"],
+      "features": ["audio-opus",
+        "refine-zstd-decode"],
       "production_uses": [
         {
           "id": "streaming-preset-contract",
           "gate": 7,
           "symbol": "StreamingPreset",
           "reason": "The Deck's preset UI must read the shared trade-off contract instead of restating marketing strings or frame-rate promises."
+        },
+        {
+          "id": "macos-present-timing",
+          "symbol": "PresentTiming",
+          "reason": "The eight-bit Metal layer maps the shared timing onto present-on-arrival and displaySyncEnabled instead of a local preset rule."
         }
       ],
       "paths": [
@@ -366,6 +399,7 @@
           "id": "macos-deck-apple-silicon-10bit",
           "entry_points": [
             "clients/macos/src/ui/video_metal_layer.rs",
+            "clients/macos/src/ui/refine_overlay.rs",
             "clients/macos/src/ui/video_render.rs",
             "clients/macos/src/pipeline/video_decoder.rs",
             "clients/macos/src/ui/media_worker.rs"
@@ -397,6 +431,7 @@
           "id": "macos-deck-intel-10bit",
           "entry_points": [
             "clients/macos/src/ui/video_metal_layer.rs",
+            "clients/macos/src/ui/refine_overlay.rs",
             "clients/macos/src/ui/video_render.rs",
             "clients/macos/src/pipeline/video_decoder.rs",
             "clients/macos/src/ui/media_worker.rs"
@@ -477,7 +512,7 @@
         },
         {
           "id": "macos-deck-transport",
-          "entry_points": ["clients/macos/src/transport/websocket.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
           "owner": "macOS Client"
@@ -498,6 +533,7 @@
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
       "contracts": [
+        "annexb",
         "audio",
         "audio::microphone",
         "audio::opus",
@@ -829,6 +865,11 @@
         "video::wire_frame"
       ],
       "features": ["audio-opus"],
+      "forwarded_features": {
+        "lossless-refine": [
+          "refine-zstd-encode"
+        ]
+      },
       "production_uses": [
         {
           "id": "display-colour",
@@ -958,6 +999,7 @@
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
       "contracts": [
+        "annexb",
         "audio",
         "audio::microphone",
         "audio::opus",
@@ -1132,7 +1174,6 @@
         {
           "id": "windows-multi-monitor",
           "entry_points": [
-            "hosts/windows/src/multi_monitor_topology.rs",
             "hosts/windows/src/multi_monitor_capenc.rs",
             "hosts/windows/src/iddcx.rs",
             "hosts/windows/src/multi_monitor_gate.rs",
@@ -1191,6 +1232,77 @@
           "build_profiles": ["windows-pier-installer"],
           "validation": ["windows-pier-installer-build"],
           "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "normal",
+      "contracts": ["annexb", "audio", "audio::capture_normalizer", "audio::playback_queue", "bitstream", "clipboard", "clipboard::image", "crate", "display_color", "refine", "refine::compositor", "refine::hub", "video", "video::present"],
+      "features": ["refine-zstd-decode"],
+      "production_uses": [
+        {
+          "id": "windows-present-timing",
+          "symbol": "PresentTiming",
+          "reason": "The presenters map the shared timing onto the DXGI sync interval and ALLOW_TEARING instead of a local Speed rule or tearing switch."
+        }
+      ],
+      "paths": [
+        {
+          "id": "windows-deck-decode",
+          "entry_points": ["clients/windows/src/decode/backend.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-session",
+          "entry_points": ["clients/windows/src/present/compose.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-platform",
+          "entry_points": ["clients/windows/src/platform/mod.rs", "clients/windows/src/audio/mod.rs", "clients/windows/src/clipboard/mod.rs", "clients/windows/src/display/mod.rs", "clients/windows/src/logging/mod.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "dev",
+      "contracts": ["refine::pier", "refine::zstd_encode"],
+      "features": ["refine-zstd-decode", "refine-zstd-encode"],
+      "paths": [
+        {
+          "id": "windows-deck-present-test",
+          "entry_points": ["clients/windows/src/present/hub_e2e.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-test"],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "source",
+      "contracts": ["crate"],
+      "includes": [
+        "shared/media/tests/data/bitstream/nvenc-h264-high-640x360.264",
+        "shared/media/tests/data/bitstream/nvenc-hevc-main-640x360.265",
+        "shared/media/tests/data/bitstream/nvenc-hevc-main10-640x360.265",
+        "shared/media/tests/data/bitstream/nvenc-hevc-rext444-10-640x360.265"
+      ],
+      "paths": [
+        {
+          "id": "windows-deck-decode",
+          "entry_points": ["clients/windows/src/decode/probe.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test"],
+          "owner": "Windows Client"
         }
       ]
     }

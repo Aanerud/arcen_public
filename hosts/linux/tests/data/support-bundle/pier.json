@@ -1,0 +1,19 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18444
+  },
+  "tls": {
+    "mode": "pem",
+    "cert": "/etc/arcen/raw-customer.crt",
+    "key": "/etc/arcen/raw-customer.key",
+    "minimum_version": "TLS1.3",
+    "expected_sans": [
+      "raw-pier.customer.example"
+    ]
+  },
+  "auth": {
+    "pam_service": "login",
+    "password": "raw-secret"
+  }
+}

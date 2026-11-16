@@ -13,18 +13,25 @@
 //! so whenever AppKit reapplies that rect the next UI pass sets the sharp one
 //! again; the two differ only in sharpness, never in size or hotspot.
 
+#[cfg(target_os = "macos")]
 use arcen_media::cursor::PresentedCursor;
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2::AllocAnyThread;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{NSBitmapImageRep, NSCursor, NSDeviceRGBColorSpace, NSImage};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSSize};
 
 /// A host cursor drawn at the backing scale.
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub(crate) struct SharpCursor {
     cursor: Retained<NSCursor>,
 }
 
+#[cfg(target_os = "macos")]
 impl SharpCursor {
     /// The sharp form of `image` shown at `points_per_pixel` points per
     /// stream pixel on a display of `backing_scale`. `None` (winit's 1x
@@ -178,6 +185,7 @@ impl LeadCursor {
     }
 }
 
+#[cfg(target_os = "macos")]
 thread_local! {
     static TRANSPARENT: Option<SharpCursor> = SharpCursor::new(
         &PresentedCursor {
@@ -214,6 +222,7 @@ pub(crate) struct MacPointer {
 
 /// Reads [`MacPointer`] (main thread only; `None` elsewhere). Tests never
 /// read AppKit (`ArcenApp::mac_pointer`).
+#[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn probe_mac_pointer() -> Option<MacPointer> {
     use objc2_app_kit::{NSApplication, NSEvent, NSWindow};
@@ -286,6 +295,7 @@ pub(crate) const fn lead_cursor_want(
 }
 
 /// Applies `change` to the application's cursor (main thread only).
+#[cfg(target_os = "macos")]
 pub(crate) fn apply_lead_cursor(change: LeadCursorChange) {
     if objc2_foundation::MainThreadMarker::new().is_none() {
         return;
@@ -377,3 +387,32 @@ mod tests {
         assert_eq!((size.width, size.height), (128.0, 80.0));
     }
 }
+
+/// Off macOS there is no AppKit cursor: no `SharpCursor` value can exist,
+/// so every path that would show one is unreachable.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) enum SharpCursor {}
+
+#[cfg(not(target_os = "macos"))]
+impl SharpCursor {
+    pub(crate) fn for_image(
+        _image: &arcen_media::cursor::CursorImage,
+        _points_per_pixel: f32,
+        _backing_scale: f32,
+    ) -> Option<Self> {
+        None
+    }
+
+    pub(crate) fn show(&self) {
+        match *self {}
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn probe_mac_pointer() -> Option<MacPointer> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn apply_lead_cursor(_change: LeadCursorChange) {}

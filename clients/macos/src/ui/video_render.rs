@@ -38,7 +38,7 @@
 //! conversion on the CPU before the frame ever reaches this module -- see
 //! `copy_biplanar_to_rgba`/`copy_locked_pixels` there). This module uploads
 //! that buffer as a single `Rgba8Uint` "plane" and selects the shader's
-//! passthrough mode (`ShaderMode::PackedRgba`): no matrix, no bit-depth
+//! passthrough mode (`MODE_PACKED_RGBA`): no matrix, no bit-depth
 //! recovery, because there is no higher-fidelity data to recover it from.
 //! That upload is a real, unconditional replacement of the old CPU
 //! `ColorImage` path -- there is no dual path here, and no feature flag.
@@ -409,36 +409,15 @@ use crate::pipeline::video_decoder::DecodedVideoFrame;
 // Negotiated colour contract
 // ============================================================================
 
-/// The four negotiated axes that determine how a decoded plane must be
-/// converted to RGB: chroma layout, coded sample range, coded bit depth, and
-/// matrix coefficients. Mirrors `arcen_media::VideoConfiguration`'s own
-/// axes (deliberately: this is meant to be built directly from whatever the
-/// client already resolved for the wire request -- see
-/// `effective_color_fidelity_variant` in `app.rs` -- rather than inventing a
-/// parallel vocabulary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VideoColorContract {
-    pub chroma: arcen_media::ChromaSubsampling,
-    pub range: arcen_media::ColorRange,
-    pub depth: arcen_media::BitDepth,
-    pub matrix: arcen_media::ColorMatrix,
-    /// Colour primaries -- unused by [`VideoUniform::from_contract`] (the
-    /// YCbCr/GBR -> RGB math only needs `matrix`), but is what
-    /// [`reference_colorspace_for`] keys the presentation `CAMetalLayer`'s
-    /// working colour space on (see the module doc's "Unblocked 2026-08-14"
-    /// section).
-    pub primaries: arcen_media::ColorPrimaries,
-    /// Transfer characteristics -- like `primaries`, unused by the
-    /// YCbCr -> RGB math, and like it a presentation-surface input rather
-    /// than a conversion one. This is the *only* axis that separates HDR
-    /// from SDR: `Pq` means the coded values are absolute-luminance PQ
-    /// (HDR10), `Bt709` means they are an SDR curve. Depth does not carry
-    /// this information -- 4:4:4 10-bit BT.709 ("Grading Reference") is a
-    /// real, useful, and entirely SDR configuration -- so anything keying
-    /// HDR behaviour off `depth` would light up EDR for a grading session
-    /// and tone-map it wrongly. See [`presentation_colorspace_for`].
-    pub transfer: arcen_media::TransferCharacteristics,
-}
+// The negotiated colour contract and the presenters' conversion uniform
+// are `arcen_media::video::present`'s, shared with every Deck: the WGSL
+// shader here, the dedicated Metal layer and the Windows Deck's HLSL read
+// the same twelve scalars, tested against the same CPU references
+// (ADR 0016 R1). `primaries` keys the presentation layer's working colour
+// space ([`reference_colorspace_for`]); `transfer` is the only axis that
+// separates HDR from SDR ([`presentation_colorspace_for`]).
+pub use arcen_media::video::present::VideoColorContract;
+pub(crate) use arcen_media::video::present::VideoUniform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetalLayerCandidate<'a> {
@@ -484,324 +463,6 @@ fn select_root_presentation_layer(
     selected
         .map(RootPresentationLayerSelection::Sublayer)
         .ok_or(ColorspaceOutcome::NoMetalSublayer)
-}
-
-impl Default for VideoColorContract {
-    /// The legacy contract: BT.709, limited range, eight-bit, 4:2:0 --
-    /// `arcen_media::VideoConfiguration::legacy_h264()`'s own axes.
-    fn default() -> Self {
-        Self {
-            chroma: arcen_media::ChromaSubsampling::Yuv420,
-            range: arcen_media::ColorRange::Limited,
-            depth: arcen_media::BitDepth::Eight,
-            matrix: arcen_media::ColorMatrix::Bt709,
-            primaries: arcen_media::ColorPrimaries::Bt709,
-            transfer: arcen_media::TransferCharacteristics::Bt709,
-        }
-    }
-}
-
-impl From<arcen_media::VideoConfiguration> for VideoColorContract {
-    fn from(configuration: arcen_media::VideoConfiguration) -> Self {
-        Self {
-            chroma: configuration.chroma,
-            range: configuration.range,
-            depth: configuration.bit_depth,
-            matrix: configuration.matrix,
-            primaries: configuration.primaries,
-            transfer: configuration.transfer,
-        }
-    }
-}
-
-/// Luma coefficients `(Kr, Kb)` for a matrix (`Kg = 1 - Kr - Kb`).
-///
-/// Mirrors `arcen_media::video::convert::luma_weights`, which is private to
-/// that crate (not `pub`), so it cannot be called from here directly. These
-/// are the plain ITU-R BT.709/601/2020 constants, not anything
-/// Arcen-specific, so duplicating them here (with this doc as the
-/// cross-reference to the single real source of truth) is low-risk; if that
-/// crate ever grows a public accessor this should call it instead.
-const fn luma_weights(matrix: arcen_media::ColorMatrix) -> (f32, f32) {
-    match matrix {
-        arcen_media::ColorMatrix::Identity | arcen_media::ColorMatrix::Bt709 => (0.2126, 0.0722),
-        arcen_media::ColorMatrix::Bt601 => (0.299, 0.114),
-        arcen_media::ColorMatrix::Bt2020Ncl => (0.2627, 0.0593),
-    }
-}
-
-// ============================================================================
-// Shader uniform
-// ============================================================================
-
-/// Selects which branch `fs_main` (in `video_render.wgsl`) takes. Keep the
-/// discriminants in sync with the `MODE_*` constants there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-enum ShaderMode {
-    /// BT.709/601/2020 NCL YCbCr -> RGB.
-    Matrix = 0,
-    /// ITU-T H.273 identity/GBR: plane0 -> G, chroma-plane Cb-slot -> B,
-    /// chroma-plane Cr-slot -> R, no matrix.
-    IdentityGbr = 1,
-    /// Already-decoded RGB (today's only reachable source); no conversion.
-    PackedRgba = 2,
-}
-
-/// The `VideoUniform` uniform buffer's contents, field-for-field matching
-/// `struct VideoUniform` in `video_render.wgsl`. See [`Self::to_bytes`] for
-/// the byte layout this must produce.
-///
-/// `pub(crate)` (not `pub`, and not private): reused directly by
-/// `video_metal_layer::MetalVideoUniform` (`w4-dedicated-metal-layer`'s
-/// dedicated `CAMetalLayer` path) so the two shaders' shared
-/// offset/span/matrix maths can never silently diverge -- see that
-/// struct's own doc for why calling [`Self::from_contract`] directly, not
-/// re-deriving the formula, is load-bearing.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct VideoUniform {
-    luma_offset: f32,
-    luma_span_inv: f32,
-    chroma_center: f32,
-    chroma_span_inv: f32,
-    kr: f32,
-    kb: f32,
-    kg_inv: f32,
-    mode: u32,
-    luma_width: f32,
-    luma_height: f32,
-    chroma_width: f32,
-    chroma_height: f32,
-}
-
-impl VideoUniform {
-    /// The uniform for [`RawVideoPayload::PackedRgba8`]: already-decoded
-    /// RGB, no conversion at all (`ShaderMode::PackedRgba`). The
-    /// range/matrix fields are unused by that branch and set to identity-
-    /// safe values purely so this struct never carries a NaN/Inf-producing
-    /// combination regardless of mode.
-    fn passthrough(width: u32, height: u32) -> Self {
-        Self {
-            luma_offset: 0.0,
-            luma_span_inv: 1.0,
-            chroma_center: 0.0,
-            chroma_span_inv: 1.0,
-            kr: 0.0,
-            kb: 0.0,
-            kg_inv: 1.0,
-            mode: ShaderMode::PackedRgba as u32,
-            luma_width: width as f32,
-            luma_height: height as f32,
-            chroma_width: width as f32,
-            chroma_height: height as f32,
-        }
-    }
-
-    /// Derives the uniform for a negotiated [`VideoColorContract`] plus the
-    /// luma/chroma plane pixel dimensions, exactly mirroring
-    /// `arcen_media::video::convert::ColorTransform::new`'s own
-    /// scale/offset/centre derivation (see the field docs on
-    /// `struct VideoUniform` in `video_render.wgsl` for the formulas this
-    /// feeds). `pub(crate)`: see `struct VideoUniform`'s own doc for why
-    /// `video_metal_layer::MetalVideoUniform` calls this directly.
-    pub(crate) fn from_contract(
-        contract: VideoColorContract,
-        luma_size: (u32, u32),
-        chroma_size: (u32, u32),
-    ) -> Self {
-        let depth = contract.depth;
-        let (luma_lo, luma_hi) = contract.range.luma_bounds(depth);
-        let (chroma_lo, chroma_hi) = contract.range.chroma_bounds(depth);
-        let luma_offset = f32::from(luma_lo);
-        let luma_span = f32::from(luma_hi - luma_lo);
-        let chroma_span = f32::from(chroma_hi - chroma_lo);
-        // Full-range chroma centring uses the ITU convention
-        // `1 << (depth.bits() - 1)` (e.g. 512 at ten bits), *not* the
-        // arithmetic mean of `chroma_bounds()` (`(0 + 1023) / 2 = 511.5`,
-        // which integer-truncates to 511) -- see `ColorTransform::new`'s own
-        // `Full => (..., 1 << (depth.bits() - 1))` arm. Limited range's
-        // bounds are always symmetric around it exactly (16 + 240 = 256),
-        // so the mean is exact there.
-        let chroma_center = match contract.range {
-            arcen_media::ColorRange::Limited => f32::from(chroma_lo + chroma_hi) / 2.0,
-            arcen_media::ColorRange::Full => (1u32 << (u32::from(depth.bits()) - 1)) as f32,
-        };
-        let (kr, kb) = luma_weights(contract.matrix);
-        let kg = 1.0 - kr - kb;
-        let mode = if contract.matrix.is_identity() {
-            ShaderMode::IdentityGbr
-        } else {
-            ShaderMode::Matrix
-        };
-        Self {
-            luma_offset,
-            luma_span_inv: 1.0 / luma_span,
-            chroma_center,
-            chroma_span_inv: 1.0 / chroma_span,
-            kr,
-            kb,
-            kg_inv: 1.0 / kg,
-            mode: mode as u32,
-            luma_width: luma_size.0 as f32,
-            luma_height: luma_size.1 as f32,
-            chroma_width: chroma_size.0 as f32,
-            chroma_height: chroma_size.1 as f32,
-        }
-    }
-
-    /// Byte layout matching `struct VideoUniform` in `video_render.wgsl`
-    /// field-for-field: twelve plain 4-byte `f32`/`u32` scalars in
-    /// declaration order. WGSL's `uniform` address space only forces
-    /// 16-byte alignment on vector/struct/array *members*, none of which
-    /// appear here, so this needs no padding between fields -- just a
-    /// 48-byte (already a multiple of 16) total, built by hand rather than
-    /// via a `#[repr(C)]`/`Pod` derive so this file needs no `bytemuck`
-    /// dependency (not a direct dependency of this crate). `pub(crate)`:
-    /// `video_metal_layer::MetalVideoUniform::to_bytes` appends its own
-    /// Metal-only field after calling this directly.
-    pub(crate) fn to_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(48);
-        bytes.extend_from_slice(&self.luma_offset.to_le_bytes());
-        bytes.extend_from_slice(&self.luma_span_inv.to_le_bytes());
-        bytes.extend_from_slice(&self.chroma_center.to_le_bytes());
-        bytes.extend_from_slice(&self.chroma_span_inv.to_le_bytes());
-        bytes.extend_from_slice(&self.kr.to_le_bytes());
-        bytes.extend_from_slice(&self.kb.to_le_bytes());
-        bytes.extend_from_slice(&self.kg_inv.to_le_bytes());
-        bytes.extend_from_slice(&self.mode.to_le_bytes());
-        bytes.extend_from_slice(&self.luma_width.to_le_bytes());
-        bytes.extend_from_slice(&self.luma_height.to_le_bytes());
-        bytes.extend_from_slice(&self.chroma_width.to_le_bytes());
-        bytes.extend_from_slice(&self.chroma_height.to_le_bytes());
-        debug_assert_eq!(bytes.len(), 48);
-        bytes
-    }
-
-    /// CPU reference for the shaders' chroma reconstruction
-    /// (`chroma_codes` in `video_render.wgsl` and `video_metal_layer.metal`):
-    /// a luma-guided fit over the four nearest centre-sited chroma samples,
-    /// blended towards the pixel's own block sample by the fit's r^2; the
-    /// exact fetch for 4:4:4. `luma(x, y)` returns the luma code at a luma
-    /// texel and `chroma(x, y)` the `(Cb, Cr)` codes at a chroma texel.
-    #[cfg(test)]
-    pub(crate) fn chroma_reference_codes(
-        &self,
-        uv: [f32; 2],
-        pixel_luma: f32,
-        luma: impl Fn(u32, u32) -> f32,
-        chroma: impl Fn(u32, u32) -> [f32; 2],
-    ) -> [f32; 2] {
-        const EPSILON: f32 = 3.0e-4;
-        let luma_size = [self.luma_width, self.luma_height];
-        let chroma_size = [self.chroma_width, self.chroma_height];
-        let exact = [
-            (uv[0] * chroma_size[0]) as i64,
-            (uv[1] * chroma_size[1]) as i64,
-        ];
-        let own = chroma(exact[0] as u32, exact[1] as u32);
-        let full = [
-            chroma_size[0] >= luma_size[0],
-            chroma_size[1] >= luma_size[1],
-        ];
-        if full[0] && full[1] {
-            return own;
-        }
-        let ratio = [
-            (luma_size[0] / chroma_size[0]).round() as i64,
-            (luma_size[1] / chroma_size[1]).round() as i64,
-        ];
-        let mut c0 = [0_i64; 2];
-        let mut c1 = [0_i64; 2];
-        let mut weight = [0.0_f32; 2];
-        for axis in 0..2 {
-            let last = chroma_size[axis] as i64 - 1;
-            if full[axis] {
-                c0[axis] = exact[axis].clamp(0, last);
-                c1[axis] = c0[axis];
-            } else {
-                let position = uv[axis] * chroma_size[axis] - 0.5;
-                let base = position.floor();
-                weight[axis] = position - base;
-                c0[axis] = (base as i64).clamp(0, last);
-                c1[axis] = (base as i64 + 1).clamp(0, last);
-            }
-        }
-        let normalise = |code: f32| (code - self.luma_offset) * self.luma_span_inv;
-        let block_mean = |cx: i64, cy: i64| {
-            let mut sum = 0.0;
-            for dy in 0..ratio[1] {
-                for dx in 0..ratio[0] {
-                    let x = (cx * ratio[0] + dx).clamp(0, luma_size[0] as i64 - 1);
-                    let y = (cy * ratio[1] + dy).clamp(0, luma_size[1] as i64 - 1);
-                    sum += luma(x as u32, y as u32);
-                }
-            }
-            normalise(sum / (ratio[0] * ratio[1]) as f32)
-        };
-        let taps = [
-            ((c0[0], c0[1]), (1.0 - weight[0]) * (1.0 - weight[1])),
-            ((c1[0], c0[1]), weight[0] * (1.0 - weight[1])),
-            ((c0[0], c1[1]), (1.0 - weight[0]) * weight[1]),
-            ((c1[0], c1[1]), weight[0] * weight[1]),
-        ];
-        let samples: Vec<(f32, f32, [f32; 2])> = taps
-            .iter()
-            .map(|&((x, y), w)| (w, block_mean(x, y), chroma(x as u32, y as u32)))
-            .collect();
-        let mean_luma: f32 = samples.iter().map(|(w, y, _)| w * y).sum();
-        let luma_variance: f32 = samples
-            .iter()
-            .map(|(w, y, _)| w * (y - mean_luma) * (y - mean_luma))
-            .sum();
-        let luma_here = normalise(pixel_luma);
-        let mut out = [0.0; 2];
-        for channel in 0..2 {
-            let mean: f32 = samples.iter().map(|(w, _, c)| w * c[channel]).sum();
-            let variance: f32 = samples
-                .iter()
-                .map(|(w, _, c)| w * (c[channel] - mean) * (c[channel] - mean))
-                .sum();
-            let covariance: f32 = samples
-                .iter()
-                .map(|(w, y, c)| w * (y - mean_luma) * (c[channel] - mean))
-                .sum();
-            let low = samples
-                .iter()
-                .map(|s| s.2[channel])
-                .fold(f32::INFINITY, f32::min);
-            let high = samples
-                .iter()
-                .map(|s| s.2[channel])
-                .fold(f32::NEG_INFINITY, f32::max);
-            let slope = covariance / (luma_variance + EPSILON);
-            let fitted = (mean + slope * (luma_here - mean_luma)).clamp(low, high);
-            let denominator = luma_variance * variance;
-            let confidence = if denominator > 0.0 {
-                (covariance * covariance / denominator.max(1.0e-12)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            out[channel] = own[channel] + (fitted - own[channel]) * confidence;
-        }
-        out
-    }
-
-    /// CPU reference for the shaders' YCbCr/GBR -> RGB step, from codes.
-    #[cfg(test)]
-    pub(crate) fn reference_rgb(&self, luma_code: f32, cb_code: f32, cr_code: f32) -> [f32; 3] {
-        let clamp = |v: f32| v.clamp(0.0, 1.0);
-        if self.mode == ShaderMode::IdentityGbr as u32 {
-            let scale = |code: f32| clamp((code - self.luma_offset) * self.luma_span_inv);
-            return [scale(cr_code), scale(luma_code), scale(cb_code)];
-        }
-        let luma_norm = (luma_code - self.luma_offset) * self.luma_span_inv;
-        let blue_diff = (cb_code - self.chroma_center) * self.chroma_span_inv;
-        let red_diff = (cr_code - self.chroma_center) * self.chroma_span_inv;
-        let red = luma_norm + 2.0 * (1.0 - self.kr) * red_diff;
-        let blue = luma_norm + 2.0 * (1.0 - self.kb) * blue_diff;
-        let green = (luma_norm - self.kr * red - self.kb * blue) * self.kg_inv;
-        [clamp(red), clamp(green), clamp(blue)]
-    }
 }
 
 // ============================================================================
@@ -899,7 +560,7 @@ struct PlaneUpload {
 
 impl PlaneUpload {
     /// A 1x1 placeholder for the bind group slot a given mode does not use
-    /// (`plane1` under `ShaderMode::PackedRgba`): the bind group layout is
+    /// (`plane1` under `MODE_PACKED_RGBA`): the bind group layout is
     /// shared across every mode, so every mode must bind *something* there.
     fn dummy_rg16() -> Self {
         Self {
@@ -1890,6 +1551,7 @@ impl ColorspaceApplication {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Finds the root viewport's `NSWindow` by title (mirroring
 /// `crate::ui::multi_window_runtime::window_display_id`'s own
 /// window-by-title loop exactly -- a plain `for` over `app.windows()`,
@@ -1917,6 +1579,7 @@ pub(crate) fn find_root_window(
     None
 }
 
+#[cfg(target_os = "macos")]
 /// Reaches the root viewport's content view's `CAMetalLayer`, and tags its
 /// `colorspace`. See the module doc's "Unblocked 2026-08-14" section for
 /// exactly why each step below is safe and how it was verified against the
@@ -1981,6 +1644,7 @@ fn apply_reference_colorspace(colorspace: ReferenceColorSpace) -> ColorspaceOutc
     ColorspaceOutcome::Applied
 }
 
+#[cfg(target_os = "macos")]
 /// The wgpu/egui presentation `CAMetalLayer` of the root window (never a
 /// dedicated video layer), or why it cannot be reached yet.
 fn root_presentation_layer(
@@ -2090,6 +1754,7 @@ fn root_presentation_layer(
     Ok(metal_layer)
 }
 
+#[cfg(target_os = "macos")]
 /// Refresh period of the screen currently showing the root window, from
 /// `NSScreen.maximumFramesPerSecond` (macOS 12+, the Deck's minimum). `None`
 /// off the main thread, before the window exists, or for a screen that
@@ -2104,6 +1769,7 @@ pub(crate) fn root_display_refresh_period() -> Option<std::time::Duration> {
         .map(|rate| std::time::Duration::from_secs(1) / rate)
 }
 
+#[cfg(target_os = "macos")]
 /// Makes the root window's presentation layer wait for display refresh
 /// (`true`) or present immediately (`false`). Returns whether the layer now
 /// has that setting.
@@ -2137,17 +1803,25 @@ pub(crate) fn set_root_display_sync(enabled: bool) -> bool {
     applied.as_bool() == enabled
 }
 
+/// No AppKit layer to tag off macOS; the wgpu surface keeps its default.
+#[cfg(not(target_os = "macos"))]
+fn apply_reference_colorspace(_colorspace: ReferenceColorSpace) -> ColorspaceOutcome {
+    ColorspaceOutcome::NoRootWindow
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn root_display_refresh_period() -> Option<std::time::Duration> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_root_display_sync(_enabled: bool) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn assert_f32_near(actual: f32, expected: f32, context: &str) {
-        let tolerance = expected.abs().max(1.0) * f32::EPSILON;
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "{context}: expected {expected}, got {actual}"
-        );
-    }
 
     fn contract(
         chroma: arcen_media::ChromaSubsampling,
@@ -2230,229 +1904,6 @@ mod tests {
             ),
             Err(ColorspaceOutcome::AmbiguousMetalSublayers)
         );
-    }
-
-    // ---- VideoUniform::from_contract: range bounds at each depth --------
-
-    #[test]
-    fn bt709_limited_eight_bit_matches_classic_16_235_240_bounds() {
-        let c = contract(
-            arcen_media::ChromaSubsampling::Yuv420,
-            arcen_media::ColorRange::Limited,
-            arcen_media::BitDepth::Eight,
-            arcen_media::ColorMatrix::Bt709,
-        );
-        let u = VideoUniform::from_contract(c, (1920, 1080), (960, 540));
-        assert_eq!(u.luma_offset, 16.0);
-        assert_f32_near(1.0 / u.luma_span_inv, 219.0, "235 - 16");
-        assert_eq!(u.chroma_center, 128.0, "(16 + 240) / 2");
-        assert_f32_near(1.0 / u.chroma_span_inv, 224.0, "240 - 16");
-        assert_eq!(u.mode, ShaderMode::Matrix as u32);
-    }
-
-    #[test]
-    fn limited_range_bounds_scale_linearly_with_depth() {
-        let eight = contract(
-            arcen_media::ChromaSubsampling::Yuv444,
-            arcen_media::ColorRange::Limited,
-            arcen_media::BitDepth::Eight,
-            arcen_media::ColorMatrix::Bt709,
-        );
-        let ten = contract(
-            arcen_media::ChromaSubsampling::Yuv444,
-            arcen_media::ColorRange::Limited,
-            arcen_media::BitDepth::Ten,
-            arcen_media::ColorMatrix::Bt709,
-        );
-        let u8_bit = VideoUniform::from_contract(eight, (100, 100), (100, 100));
-        let u10_bit = VideoUniform::from_contract(ten, (100, 100), (100, 100));
-        assert_eq!(u10_bit.luma_offset, u8_bit.luma_offset * 4.0, "16<<2 = 64");
-        assert_eq!(
-            1.0 / u10_bit.luma_span_inv,
-            (1.0 / u8_bit.luma_span_inv) * 4.0,
-            "219<<2"
-        );
-        assert_eq!(u10_bit.chroma_center, u8_bit.chroma_center * 4.0);
-        assert_eq!(
-            1.0 / u10_bit.chroma_span_inv,
-            (1.0 / u8_bit.chroma_span_inv) * 4.0
-        );
-    }
-
-    #[test]
-    fn full_range_chroma_centre_is_the_itu_midpoint_not_the_bounds_average() {
-        let ten_bit_full = contract(
-            arcen_media::ChromaSubsampling::Yuv444,
-            arcen_media::ColorRange::Full,
-            arcen_media::BitDepth::Ten,
-            arcen_media::ColorMatrix::Bt709,
-        );
-        let u = VideoUniform::from_contract(ten_bit_full, (100, 100), (100, 100));
-        // The naive mean of `chroma_bounds()` (0, 1023) is 511.5 -- the ITU
-        // convention this must use instead is `1 << (10 - 1) = 512`.
-        assert_eq!(u.chroma_center, 512.0);
-        assert_eq!(1.0 / u.chroma_span_inv, 1023.0, "max_code at ten bits");
-        assert_eq!(u.luma_offset, 0.0);
-        assert_eq!(1.0 / u.luma_span_inv, 1023.0);
-    }
-
-    #[test]
-    fn twelve_bit_full_range_uses_the_4095_code_space() {
-        let c = contract(
-            arcen_media::ChromaSubsampling::Yuv444,
-            arcen_media::ColorRange::Full,
-            arcen_media::BitDepth::Twelve,
-            arcen_media::ColorMatrix::Bt2020Ncl,
-        );
-        let u = VideoUniform::from_contract(c, (100, 100), (100, 100));
-        assert_f32_near(
-            1.0 / u.luma_span_inv,
-            4095.0,
-            "full-range twelve-bit luma span",
-        );
-        assert_eq!(u.chroma_center, 2048.0, "1 << 11");
-    }
-
-    // ---- matrix coefficients ---------------------------------------------
-
-    #[test]
-    fn matrix_coefficients_match_the_itu_r_constants_per_matrix() {
-        let bt709 = VideoUniform::from_contract(
-            contract(
-                arcen_media::ChromaSubsampling::Yuv444,
-                arcen_media::ColorRange::Full,
-                arcen_media::BitDepth::Eight,
-                arcen_media::ColorMatrix::Bt709,
-            ),
-            (10, 10),
-            (10, 10),
-        );
-        assert!((bt709.kr - 0.2126).abs() < 1e-6);
-        assert!((bt709.kb - 0.0722).abs() < 1e-6);
-
-        let bt601 = VideoUniform::from_contract(
-            contract(
-                arcen_media::ChromaSubsampling::Yuv444,
-                arcen_media::ColorRange::Full,
-                arcen_media::BitDepth::Eight,
-                arcen_media::ColorMatrix::Bt601,
-            ),
-            (10, 10),
-            (10, 10),
-        );
-        assert!((bt601.kr - 0.299).abs() < 1e-6);
-        assert!((bt601.kb - 0.114).abs() < 1e-6);
-
-        let bt2020 = VideoUniform::from_contract(
-            contract(
-                arcen_media::ChromaSubsampling::Yuv444,
-                arcen_media::ColorRange::Full,
-                arcen_media::BitDepth::Eight,
-                arcen_media::ColorMatrix::Bt2020Ncl,
-            ),
-            (10, 10),
-            (10, 10),
-        );
-        assert!((bt2020.kr - 0.2627).abs() < 1e-6);
-        assert!((bt2020.kb - 0.0593).abs() < 1e-6);
-
-        // Kg = 1 - Kr - Kb for BT.709: 1 - 0.2126 - 0.0722 = 0.7152.
-        assert!((1.0 / bt709.kg_inv - 0.7152).abs() < 1e-6);
-    }
-
-    // ---- identity/GBR branch selection -----------------------------------
-
-    #[test]
-    fn identity_matrix_selects_the_gbr_branch_and_uses_only_luma_scaling() {
-        let identity = contract(
-            arcen_media::ChromaSubsampling::Yuv444,
-            arcen_media::ColorRange::Full,
-            arcen_media::BitDepth::Ten,
-            arcen_media::ColorMatrix::Identity,
-        );
-        let u = VideoUniform::from_contract(identity, (100, 100), (100, 100));
-        assert_eq!(u.mode, ShaderMode::IdentityGbr as u32);
-        // Kr/Kb are meaningless for identity but must still be finite/safe.
-        assert!(u.kg_inv.is_finite() && u.kg_inv != 0.0);
-    }
-
-    #[test]
-    fn non_identity_matrices_select_the_matrix_branch() {
-        for matrix in [
-            arcen_media::ColorMatrix::Bt709,
-            arcen_media::ColorMatrix::Bt601,
-            arcen_media::ColorMatrix::Bt2020Ncl,
-        ] {
-            let c = contract(
-                arcen_media::ChromaSubsampling::Yuv444,
-                arcen_media::ColorRange::Full,
-                arcen_media::BitDepth::Eight,
-                matrix,
-            );
-            let u = VideoUniform::from_contract(c, (10, 10), (10, 10));
-            assert_eq!(u.mode, ShaderMode::Matrix as u32, "{matrix:?}");
-        }
-    }
-
-    #[test]
-    fn packed_rgba_passthrough_always_selects_the_passthrough_mode() {
-        let u = VideoUniform::passthrough(1920, 1080);
-        assert_eq!(u.mode, ShaderMode::PackedRgba as u32);
-        assert_eq!(u.luma_width, 1920.0);
-        assert_eq!(u.luma_height, 1080.0);
-        assert_eq!(u.chroma_width, 1920.0);
-        assert_eq!(u.chroma_height, 1080.0);
-    }
-
-    // ---- chroma/luma plane dimensions carried through --------------------
-
-    #[test]
-    fn subsampled_chroma_dimensions_are_carried_through_independently_of_luma() {
-        let c = contract(
-            arcen_media::ChromaSubsampling::Yuv420,
-            arcen_media::ColorRange::Limited,
-            arcen_media::BitDepth::Eight,
-            arcen_media::ColorMatrix::Bt709,
-        );
-        let u = VideoUniform::from_contract(c, (1920, 1080), (960, 540));
-        assert_eq!(u.luma_width, 1920.0);
-        assert_eq!(u.luma_height, 1080.0);
-        assert_eq!(u.chroma_width, 960.0);
-        assert_eq!(u.chroma_height, 540.0);
-    }
-
-    // ---- uniform byte layout ----------------------------------------------
-
-    #[test]
-    fn to_bytes_is_48_bytes_and_round_trips_every_field_in_declaration_order() {
-        let u = VideoUniform::from_contract(
-            contract(
-                arcen_media::ChromaSubsampling::Yuv444,
-                arcen_media::ColorRange::Full,
-                arcen_media::BitDepth::Ten,
-                arcen_media::ColorMatrix::Bt2020Ncl,
-            ),
-            (3840, 2160),
-            (3840, 2160),
-        );
-        let bytes = u.to_bytes();
-        assert_eq!(bytes.len(), 48);
-        let f32_at = |index: usize| -> f32 {
-            f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
-        };
-        assert_eq!(f32_at(0), u.luma_offset);
-        assert_eq!(f32_at(1), u.luma_span_inv);
-        assert_eq!(f32_at(2), u.chroma_center);
-        assert_eq!(f32_at(3), u.chroma_span_inv);
-        assert_eq!(f32_at(4), u.kr);
-        assert_eq!(f32_at(5), u.kb);
-        assert_eq!(f32_at(6), u.kg_inv);
-        let mode = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
-        assert_eq!(mode, u.mode);
-        assert_eq!(f32_at(8), u.luma_width);
-        assert_eq!(f32_at(9), u.luma_height);
-        assert_eq!(f32_at(10), u.chroma_width);
-        assert_eq!(f32_at(11), u.chroma_height);
     }
 
     // ---- plane descriptor construction -------------------------------------
@@ -2554,7 +2005,10 @@ mod tests {
             *remote.payload,
             RawVideoPayload::PackedRgba8 { .. }
         ));
-        assert_eq!(remote.payload.uniform().mode, ShaderMode::PackedRgba as u32);
+        assert_eq!(
+            remote.payload.uniform().mode,
+            arcen_media::video::present::MODE_PACKED_RGBA
+        );
     }
 
     #[test]
@@ -2590,7 +2044,7 @@ mod tests {
         assert_eq!(remote.size(), (4, 4));
         assert_eq!(
             remote.payload.uniform().mode,
-            ShaderMode::IdentityGbr as u32
+            arcen_media::video::present::MODE_IDENTITY_GBR
         );
     }
 
@@ -2877,119 +2331,6 @@ mod tests {
             Some(ColorspaceOutcome::Applied)
         );
         assert!(!state.needs_attempt(ReferenceColorSpace::Srgb));
-    }
-
-    // ---- chroma reconstruction (4:2:0 / 4:2:2) -----------------------------
-
-    fn uniform_for(chroma: arcen_media::ChromaSubsampling, luma: (u32, u32)) -> VideoUniform {
-        let chroma_size = match chroma {
-            arcen_media::ChromaSubsampling::Yuv420 => (luma.0 / 2, luma.1 / 2),
-            arcen_media::ChromaSubsampling::Yuv422 => (luma.0 / 2, luma.1),
-            arcen_media::ChromaSubsampling::Yuv444 => luma,
-        };
-        VideoUniform::from_contract(
-            contract(
-                chroma,
-                arcen_media::ColorRange::Limited,
-                arcen_media::BitDepth::Eight,
-                arcen_media::ColorMatrix::Bt709,
-            ),
-            luma,
-            chroma_size,
-        )
-    }
-
-    fn pixel_uv(x: u32, y: u32, luma: (u32, u32)) -> [f32; 2] {
-        [
-            (x as f32 + 0.5) / luma.0 as f32,
-            (y as f32 + 0.5) / luma.1 as f32,
-        ]
-    }
-
-    /// A two-colour edge: a dark background (luma 30, neutral chroma) meets
-    /// a bright coloured stroke (luma 200, Cb 60) inside a 2x2 block, so the
-    /// block that straddles the edge carries their average chroma.
-    #[test]
-    fn a_two_colour_edge_is_rebuilt_at_the_luma_edge() {
-        let size = (8, 2);
-        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv420, size);
-        // Luma columns 0..=2 dark, 3..=7 bright: the edge falls inside
-        // chroma block 1 (luma columns 2 and 3).
-        let luma = |x: u32, _y: u32| if x <= 2 { 30.0 } else { 200.0 };
-        let chroma = |x: u32, _y: u32| match x {
-            0 => [128.0, 128.0],
-            1 => [94.0, 128.0], // half dark (128), half stroke (60)
-            _ => [60.0, 128.0],
-        };
-        let cb: Vec<f32> = (0..8)
-            .map(|x| u.chroma_reference_codes(pixel_uv(x, 0, size), luma(x, 0), luma, chroma)[0])
-            .collect();
-        // Nearest repeated 94 over columns 2 and 3: the dark pixel turned
-        // blue-ish and the stroke pixel lost colour. The fit restores both.
-        assert!(
-            (cb[2] - 128.0).abs() < 4.0,
-            "dark pixel keeps neutral chroma: {cb:?}"
-        );
-        assert!(
-            (cb[3] - 60.0).abs() < 4.0,
-            "stroke pixel keeps its colour: {cb:?}"
-        );
-        assert_eq!(cb[0], 128.0);
-        assert_eq!(cb[7], 60.0);
-    }
-
-    #[test]
-    fn chroma_unrelated_to_luma_keeps_each_blocks_own_sample() {
-        // Flat luma: the fit explains nothing, so every pixel keeps exactly
-        // the sample its block transmitted, as the nearest fetch did.
-        let size = (4, 4);
-        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv420, size);
-        let luma = |_x: u32, _y: u32| 100.0;
-        let chroma = |x: u32, y: u32| [(x * 50 + y * 7) as f32, 128.0];
-        for y in 0..4 {
-            for x in 0..4 {
-                assert_eq!(
-                    u.chroma_reference_codes(pixel_uv(x, y, size), 100.0, luma, chroma),
-                    chroma(x / 2, y / 2)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn four_four_four_chroma_keeps_the_exact_texel() {
-        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv444, (4, 4));
-        let luma = |x: u32, _y: u32| (x * 60) as f32;
-        for y in 0..4 {
-            for x in 0..4 {
-                let chroma = |cx: u32, cy: u32| [(cx * 10 + cy) as f32, 0.0];
-                assert_eq!(
-                    u.chroma_reference_codes(pixel_uv(x, y, (4, 4)), luma(x, y), luma, chroma)[0],
-                    (x * 10 + y) as f32
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn four_two_two_fits_along_rows_only() {
-        let size = (8, 2);
-        let u = uniform_for(arcen_media::ChromaSubsampling::Yuv422, size);
-        let luma = |x: u32, _y: u32| if x <= 2 { 30.0 } else { 200.0 };
-        let chroma = |x: u32, y: u32| match x {
-            0 => [128.0, 100.0 + y as f32],
-            1 => [94.0, 100.0 + y as f32],
-            _ => [60.0, 100.0 + y as f32],
-        };
-        for y in 0..2 {
-            let codes = u.chroma_reference_codes(pixel_uv(3, y, size), 200.0, luma, chroma);
-            assert!((codes[0] - 60.0).abs() < 4.0);
-            assert_eq!(
-                codes[1],
-                100.0 + y as f32,
-                "rows keep their own exact sample"
-            );
-        }
     }
 
     #[test]

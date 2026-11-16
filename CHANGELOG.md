@@ -6,6 +6,310 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-11-16
+
+**The Windows Deck.** Arcen Deck now runs on **Windows 11 x64** as well as
+on the Mac. Both Decks are built on one shared Deck core, so they have the
+same screens and wording, the same four presets, sign-in, trust on first
+use, reconnect, Stream Statistics and support bundle; the Windows Deck adds
+only what Windows decides: its window, a D3D11 hardware decoder, a
+DirectComposition presenter, input, audio and clipboard
+([ADR 0024](docs/adr/0024-windows-deck.md)). It connects to Linux (X11 and
+GNOME Wayland) and macOS Piers, with keyboard, mouse, pen, clipboard both
+ways, host audio and microphone.
+
+Also new on every Deck and Pier: presentation timing per preset, a
+fullscreen picture that is pixel for pixel, exact pen pressure, Native
+tablet on the Windows Pier with no driver, the host's keyboard layout from
+every Pier, sign-in throttling and pre-sign-in limits
+on every Pier, one TLS path for every Pier, private support bundles, and a
+Windows host that gets its displays and windows back when a session ends.
+
+0.20.0 speaks protocol v5, like 0.17.0 to 0.19.0, and every addition is
+negotiated: 0.19.0 Decks and Piers keep working with 0.20.0, without the new
+features. 0.19.1 was not published; its changes (Exact still image on by
+default) are listed under [0.19.1] below and ship in 0.20.0.
+
+### The Windows Deck
+
+- **Two MSIs.** `Arcen-Deck-0.20.0-windows-x64.msi` installs the Deck for
+  all users in `C:\Program Files\Arcen\Deck` with a Start-menu shortcut;
+  the Deck itself never runs elevated. `Arcen-USB-Component-0.20.0-windows-x64.msi`
+  is **optional** and needed only for Native tablet: a small LocalSystem
+  service that binds Windows' own WinUSB driver to the chosen tablet for
+  the length of a session, with a driver catalog signed by a certificate
+  made on that PC for that purpose (its key is destroyed after signing),
+  and gives the tablet its own driver back afterwards. There is no Arcen
+  kernel driver. Uninstalling the component removes every driver package
+  and certificate it created, or rolls back and says what is left
+  ([packaging](packaging/windows-deck/README.md)).
+- **Unsigned.** Arcen has no code-signing certificate. A downloaded MSI
+  opens Microsoft Defender SmartScreen's "Windows protected your PC":
+  choose **More info**, then **Run anyway**, or tick **Unblock** in the
+  file's Properties first. The elevation prompt says "Publisher: Unknown".
+  A PC with Smart App Control in enforcement mode blocks unsigned
+  installers outright; turn it off to install Arcen.
+- **Video.** Auto and Speed decode H.264 and HEVC 4:2:0 eight-bit on the
+  GPU. Grading and HDR (HEVC 4:4:4 ten-bit) need the range-extension
+  decoder on the GPU that drives the window's monitor; the Deck probes it
+  with a real keyframe and tells the host what it can decode. Without it
+  Settings greys Grading and HDR out with the GPU and the missing profile
+  ("NVIDIA GRID V100D-16Q decodes HEVC Main and Main 10, but not 4:4:4")
+  and the Deck never asks for them. HDR turns on PQ/BT.2020
+  output only when the host returns PQ. The Deck uses its own D3D11 video
+  decoder: no FFmpeg, no Media Foundation decoder.
+- **Input.** Keys by physical position with the PC keyboard's own shortcut
+  policy (Ctrl, Windows, Alt and AltGr pass through), committed text from
+  the input method, Ctrl+Alt+End for Ctrl+Alt+Del, mouse and wheel.
+  **Tablet support** takes the pen from Windows Ink (pressure, tilt,
+  barrel, eraser) with no host driver; **Native tablet** (with the USB
+  component) attaches any USB pen tablet to a Linux, macOS or Windows host.
+- **Fullscreen** draws nothing over the video. The connection bar opens
+  when the pointer reaches the top edge of the screen, or with
+  **Ctrl+Alt+Home**, and closes with Esc.
+- **Displays, as on the Mac.** The same Settings › Displays: **Match my
+  layout** gives each of up to four displays its own fullscreen window,
+  arranged as on the PC, on a host that offers it (otherwise the Deck
+  offers **Primary display only** and remembers it for that connection,
+  or, for a desktop started without the layout, reconnecting to it or
+  starting fresh); **Primary display only** goes fullscreen on the
+  primary display at its own size; **Windowed** asks the host to resize
+  its desktop to the window once it settles, so fullscreen on any monitor
+  is pixel for pixel too. Per display, **Full resolution** streams a
+  scaled monitor's own pixels and **Require 4:4:4** asks for full colour;
+  Remote UI scale and the per-connection Displays choice work as on the
+  Mac. One shared implementation decides all of it for both Decks.
+- **Files.** Settings, saved connections and trusted fingerprints in
+  `%APPDATA%\Arcen\Deck`; logs and crash dumps (minidumps only) in
+  `%LOCALAPPDATA%\Arcen\Deck`. No password is stored. Uninstalling keeps
+  them, as on the Mac.
+
+### Added
+
+- **Presentation timing per preset, on both Decks.** When a decoded frame
+  is shown is now part of the pipeline contract
+  (`arcen_media::video::PresentTiming`), not of the platform: **Auto**
+  shows each frame at once without tearing (the newest frame wins at the
+  next refresh), **Speed** at once and may tear where the display path
+  allows it, **Grading** and **HDR** wait for the refresh so every frame is
+  shown whole. Measured in the lab against a Linux Pier, frame hand-off to
+  display ([details](docs/architecture/deck-presentation-timing.md)):
+  - Windows Deck, 60 Hz composed desktop, Auto: about **12–13 ms**, from
+    about 26–27 ms.
+  - macOS Deck, 120 Hz panel, fullscreen: Auto about **7–10 ms** and Speed
+    about **4–7 ms**, from about 13 ms; windowed about 17–22 ms.
+- **Fullscreen is pixel for pixel.** In fullscreen nothing is drawn over
+  the video in any preset, on either Deck, and with the default Displays
+  mode the stream is the monitor's own pixel size, so one Deck pixel is
+  one host pixel. The Windows Deck's connection bar appears only on
+  demand (above); the macOS Deck uses the system menu bar.
+- **The host's keyboard layout, from every Pier.** The Linux, Windows and
+  macOS Piers all tell the Deck which layout the session uses, and again
+  whenever it changes (`host_keymap`, one shared implementation). With
+  the Deck's Automatic setting, a character the host's layout types by key
+  goes as that key and any other (for example `æ` on a US layout) as
+  text, from the first key of the session.
+- **Automatic reconnect on the Windows Deck.** After a network loss the
+  Windows Deck shows "Lost connection, attempting to reconnect" over the
+  last picture and resumes the same desktop without a new sign-in, as the
+  macOS Deck does. Restarting the Deck within the host's reconnect window
+  resumes the desktop too. The reconnect flow is now shared code
+  (`arcen_deck_core::reconnect_flow`), used by both Decks.
+- **Support bundles that keep your details private.** Every Pier and both
+  Decks collect support bundles through one shared collector. User names,
+  host names and IP addresses, also inside free log text, are replaced by
+  codes that are consistent within one bundle (`anon:…`) and differ
+  between bundles. Crash reports are **off by default** ("Include crash
+  reports"), because a crash report can hold a fragment of what the Deck
+  was doing, such as a password being typed. A bundle comes with a
+  public summary (bundle ID, archive SHA-256, product, OS, preset,
+  counts) that contains no address, host name, path or name, for a public
+  problem report. On a Deck: Settings › Logs › Create support bundle….
+- **Windows Pier: the host's displays and windows come back after a
+  session.** When a session ends (Disconnect, lease expiry, the Deck or the
+  agent dying), the Pier removes only the displays and modes Arcen created,
+  checks that the host's own topology is back, and moves the windows the
+  session gathered on its display back to where they were (or to the
+  primary display; off-screen windows always to the primary). A session
+  that is only interrupted keeps its display for the reconnect lease, so a
+  resumed session finds the same layout. If the Pier was stopped
+  uncleanly, it restores at service start or at the next console change
+  while no session is live.
+
+### Changed
+
+- **Exact pen pressure on every Pier.**
+  - Linux, GNOME Wayland (Mutter 46 and later): seat pen pressure arrives
+    as the Deck sent it; the Pier undoes Mutter's squared pressure curve,
+    and stops doing so only for a Mutter build proven to carry the
+    upstream fix (a marker that matches the library and compositor
+    version).
+  - macOS Pier: pressure is posted as the nearest of the window server's
+    255 steps instead of the step below, and tilt Y points the way tablet
+    drivers report it (it was reversed).
+  - Windows Deck: Tablet support delivers Windows Ink's pressure
+    unchanged, in its 1/1024 steps.
+- **Failed sign-ins are throttled on every Pier.** The Linux and Windows
+  Piers now use the macOS Pier's back-off through one shared adapter: a
+  password the operating system refuses slows the next attempt from that
+  source and for that account; at most two attempts per key are checked
+  at a time; IPv6 sources count by /64; `DOMAIN\user` and `user@realm`
+  count as one account; a backing-off key is never evicted to make room;
+  a user name or password containing a NUL is refused before it is
+  checked. A throttled Deck is told so.
+- **Limits before sign-in on every Pier.** Sixteen connections may wait
+  at sign-in, at most two from one address (IPv6 by /64); a third from
+  the same address is refused before TLS. A connection whose address QUIC
+  has not yet proven must answer a stateless Retry before it holds a
+  second place or once half the places are taken, so forged addresses
+  cannot fill them. Shared deadlines: 15 s for each handshake message,
+  60 s for a person to type a password (Linux and Windows had 30 s), 30 s
+  for the operating system's password check. The macOS Pier now
+  handshakes connections side by side, so one silent peer no longer
+  delays every other Deck.
+- **One TLS path for every Pier.** Reading, validating, serving, reloading
+  and pinning the host's TLS material is shared (`arcen_transport`); only
+  the file-system checks the operating system decides stay in each Pier.
+  The macOS Pier now checks its TLS files' ownership, permissions and
+  validity period like the others (it read them unchecked). File names,
+  pin files and fingerprints are unchanged.
+- **An unservable video request is refused after the password, with its
+  reason, on every Pier.** Each Pier checks the credentials first, then the
+  requested video, and answers once. A request it cannot serve (for
+  example Grading on a PC whose GPU cannot decode HEVC 4:4:4 ten-bit) is
+  reported as "the host refused the requested video: …" in the host's own
+  words, instead of "authentication failed", and a macOS Pier no longer
+  closes the connection without a reason. A refused request does not
+  count as a failed sign-in. A Deck started with `--connect` shows the
+  error on Home.
+- **A Deck never asks for what its own decoder cannot decode.** Both Decks
+  follow one shared rule, from their decoder probe (D3D11 on Windows,
+  VideoToolbox on the Mac): Grading and HDR are greyed out in Settings with
+  the exact reason, naming the GPU and the profile it lacks, and a
+  connection whose saved preset the decoder cannot decode asks for Auto
+  instead. Auto and Speed offer the host only the codecs the probe proved;
+  Settings says why AV1 or HEVC is missing ("AV1 is not available: <GPU>
+  has no AV1 decoder.").
+- **Support bundles remove the account name from home folders.** In every
+  Pier and Deck log, a home folder's account name becomes the bundle's
+  user pseudonym: Windows `C:\Users\<name>\…` (including
+  `%LOCALAPPDATA%\Arcen\Deck\Logs`), with backslashes or forward slashes,
+  macOS `/Users/<name>/…` and Linux `/home/<name>/…`.
+- **Native tablet takes any pen tablet.** A Linux X11 Pier takes any USB
+  pen digitizer, whichever kernel driver binds it; a macOS Pier reads any
+  standard HID pen itself (models with a dedicated reader, such as the
+  Intuos5 touch L, get extra features).
+- **Native tablet on the Windows Pier, with no driver.** A Windows Pier now
+  accepts Native tablet from any Deck: it attaches nothing to Windows, reads
+  the bridged pen itself with the same readers as a macOS Pier (the Intuos
+  family and any standard HID pen) and injects it as a Windows Ink pen, the
+  pen Tablet support uses: pressure in Windows Ink's 1/1024 steps, tilt,
+  barrel button, eraser and proximity. Chrome and Firefox on the Windows 11
+  lab Pier read the 0.1/0.25/0.5/0.75/1.0 ladder as
+  0.1006/0.2500/0.5000/0.7500/1.0000 from an emulated Intuos5 and
+  0.0996/0.2500/0.5000/0.7500/1.0000 from the generic pen, tilt exact. Both
+  Piers that read the pen themselves share one implementation
+  (`arcen_input::bridged_pen`, `arcen_usb_bridge::HostPenBridge`); the
+  refusal that said a kernel driver was needed is gone
+  ([ADR 0023 amendment](docs/adr/0023-one-native-tablet-pen-position-path.md)).
+- **Tablet support follows the Deck's own pen settings.** Handedness and
+  mapping come from the tablet driver on the Mac or Windows Ink on the PC;
+  the Deck's View › Tablet Orientation menu is gone.
+- **A Linux Pier says why it refuses host cursor rendering** in a ten-bit
+  session, and the first key typed in a GNOME Wayland session is no longer
+  lost.
+
+### Security and supply chain
+
+- `rustls` 0.23.46, with upstream's fixes for GHSA-h2v8-394m-p7vv,
+  GHSA-c8m5-c952-6cm4, GHSA-w44r-93j7-qv28 and GHSA-vp88-798v-h67f.
+
+### Removed
+
+- **The Deck's dormant WSS (TCP) transport.** Shipped Decks have connected
+  over QUIC only since the first public release (0.9.8); the
+  WebSocket-over-TCP connector, its `wss-compat` build feature and the WSS
+  choice on the Add connection screen of such a build are now gone from the
+  macOS Deck and the shared Deck core, so the Windows Deck never has them. A connection an older Deck saved as WSS
+  opens over QUIC: port 18443 becomes 18444, and its name, settings and
+  remembered username are kept.
+
+### Known limits
+
+- **macOS Pier, pen leaving proximity:** when the pen lifts out of range,
+  browsers on a macOS host get the last `pointerup` and a hover move but
+  no `pointerleave`. Linux Piers deliver it.
+- **Pens with Windows Ink turned off.** On the Windows Deck, Tablet support
+  reads the pen through Windows Ink. A tablet whose driver has Windows Ink
+  turned off reaches Windows as a mouse, so the host gets no pressure or
+  tilt; turn Windows Ink on in the tablet's settings, or use Native tablet.
+- **Grading after a macOS host's sign-in screen:** when the macOS Deck
+  follows a macOS Pier from its login window into the signed-in desktop
+  with the Grading preset, the session can be presented in eight bits
+  instead of ten; Stream Statistics shows the wide-colour warning.
+- **A Linux Pier that is killed** (not stopped) may leave the session's
+  private desktop running until the next sign-in or idle clean-up. This
+  case has not been tested yet.
+- **macOS Pier after installing or upgrading the package:** it can refuse
+  every session at the login window because it "could not mute its own
+  speakers", until the Mac is restarted. Restart the Mac after installing
+  or upgrading the macOS Pier.
+- **macOS Pier, a few failures after a successful sign-in** (several
+  displays not admitted, the display or the capture failing to start)
+  still close the connection without telling the Deck why.
+- **Windows Deck to a Windows Pier** works over the same protocol but is
+  not yet part of the lab qualification, which covered Linux X11, GNOME
+  Wayland and macOS Piers.
+
+## [0.19.1] — not published (included in 0.20.0)
+
+**Exact still image, on by default.** When part of the picture stops
+moving, the Pier sends those exact pixels again, losslessly, and the
+macOS Deck paints them over the video and checks them against the Pier's
+own digest, so a still picture becomes the host's exact pixels rather than
+the codec's approximation ([ADR 0016](docs/adr/0016-lossless-refinement.md),
+[user guide](docs/user-guide.md#exact-still-image)).
+
+- **Where it engages:** Grading and HDR sessions (HEVC 4:4:4 ten-bit), one
+  display, in the stream's own code values — BT.709/sRGB SDR codes for
+  Grading, PQ/BT.2020 codes for HDR (verified on the Deck's HDR PQ/EDR
+  presenter too):
+
+  | Host | Exact still image |
+  | --- | --- |
+  | Linux, X11 desktop at depth 30 | Grading and HDR |
+  | Linux, Wayland on a compositor with wide screen sharing (GNOME 50 or later, for example the side-by-side GNOME 51 prefix) | Grading and HDR (the wide capture's host read-back is the source) |
+  | Windows | Grading and HDR (the FP16 capture is the source; the broker relays the refine lane) |
+  | macOS | Grading and HDR (the `xf44` surface VideoToolbox encodes is the source, refined as Y′CbCr 4:4:4 codes and verified to level 2) |
+
+  Auto and Speed, Wayland on GNOME 49 (no wide screen sharing) and every
+  other session stream exactly as before, and Stream Statistics says why it
+  is off. The Deck paints tiles only over a picture in their own coding
+  domain (PQ never over SDR; Y′CbCr codes only through their own matrix and
+  range). The macOS host needs a Deck of this release, which accepts
+  Y′CbCr tiles; an older Deck is told why it is off.
+- **Switches:** the Pier's `video.lossless_refinement` now defaults to
+  `enabled` (`"disabled"` turns it off; `validate-config` prints the
+  resolved state on Linux and Windows), and the Deck's **Settings › Streaming › Exact still
+  image** is on by default. Both must agree; a Deck with it off asks for
+  nothing and nothing extra is sent.
+- **What it costs:** only spare bandwidth while the picture is still: up to
+  half of what the connection has to spare, measured each second from the
+  QUIC path, and paused whenever video waits, the path loses packets or its
+  queue grows; a part that moves again stays video, and motion is not
+  slowed. The video's rate controller no longer lowers the video bitrate
+  for queueing that refinement itself causes: refinement pauses for a
+  second first, and only queueing that stays is answered (loss always is).
+  Before the first path sample the session's video bitrate is the limit. Measured over a local network: a 1080p desktop
+  of windows, text and colour ramps is exact and verified in under a
+  second, a 4K full-screen photograph in about 6.5 seconds.
+- **Proof on the Deck:** Stream Statistics shows *Exact: 100% of picture
+  verified (level 3)* once every pixel drawn was checked against the
+  host's digest; Lossless Tile View tints refined blocks amber and verified
+  ones green.
+- It runs on its own QUIC lane (`refine`), granted only to a Deck that asks
+  for it; older Decks and Piers are unaffected.
+
 ## [0.19.0] — 2026-11-12
 
 **Native tablet ships, proven with a real Wacom Intuos5 on Linux X11, Linux
@@ -2494,7 +2798,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/Aanerud/arcen_public/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Aanerud/arcen_public/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Aanerud/arcen_public/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/Aanerud/arcen_public/releases/tag/v0.17.0

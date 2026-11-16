@@ -1633,6 +1633,11 @@ impl Encoder {
         })
     }
 
+    /// The current average bitrate target.
+    pub fn average_bitrate_bps(&self) -> u64 {
+        u64::from(self.reconfig_config.rcParams.averageBitRate)
+    }
+
     /// Reconfigures NVENC's nominal frame rate, preserving the current bitrate.
     pub fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), String> {
         self.frame_rate = fps.max(1);

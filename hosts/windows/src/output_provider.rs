@@ -34,7 +34,7 @@ use arcen_outputs::{
 
 use crate::display::DisplayReport;
 use crate::logging::DISPLAY;
-use crate::multi_monitor_topology::WindowsTopologyPlan;
+use arcen_outputs::windows_topology::WindowsTopologyPlan;
 
 /// What the physical CCD/NVAPI provider promises about the desktop it
 /// produces.
@@ -295,8 +295,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::display::{DesktopRect, DisplaySize};
-    use crate::multi_monitor_topology::WindowsMonitorPlan;
     use crate::nvapi::AdapterLuid;
+    use arcen_outputs::windows_topology::WindowsMonitorPlan;
 
     const MAX_REGIONS: usize = MAX_MULTI_MONITOR_COUNT;
 

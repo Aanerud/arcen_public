@@ -1,6 +1,6 @@
 # Arcen Pier administration guide
 
-Audience: sysadmins operating large Linux and Windows Pier deployments (the macOS Pier is a preview; see its notes where they appear). This guide describes the direct QUIC Pier to macOS Deck product scope. A Windows Deck and a Linux Deck do not exist, and there is no accounts portal or licensing service.
+Audience: sysadmins operating large Linux and Windows Pier deployments (the macOS Pier is a preview; see its notes where they appear). This guide describes the direct QUIC Pier to Deck product scope (macOS Deck and, since 0.20.0, Windows Deck). A Linux Deck does not exist, and there is no accounts portal or licensing service.
 
 Verification note: every command, path, config key, default, and failure string below is tied to source files in this repository. Items marked **target state** describe operations the installer does not support yet.
 
@@ -11,11 +11,11 @@ Arcen has two active operator surfaces today:
 | Surface | Active product | What it does |
 | --- | --- | --- |
 | Host | Arcen Pier on Linux and Windows (macOS as a preview) | Listens on direct QUIC UDP 18444, authenticates a user, mutates or owns a desktop, launches a user-session agent, captures and encodes the display, forwards audio and clipboard policy, and injects input. |
-| Client | Arcen Deck on macOS | Connects directly to one Pier over QUIC, authenticates, decodes media, renders the desktop, and forwards input. |
+| Client | Arcen Deck on macOS and Windows 11 | Connects directly to one Pier over QUIC, authenticates, decodes media, renders the desktop, and forwards input. |
 
 Installing Pier changes the blast radius of the workstation. Linux Pier runs as root, uses PAM, creates a dedicated Xorg session or a GNOME Wayland session per sign-in, starts user-context helpers, and can inject input through uinput. Windows Pier runs as LocalSystem, uses `LogonUserW`, can drive an additive Credential Provider at LogonUI for first login, mutates display topology under a recovery journal, launches a user-session agent on `winsta0\default`, and injects input with `SendInput`.
 
-QUIC datagrams, federated identity, MFA, a Windows Deck, a Linux Deck, and web account management are not part of this repository. (Each session already runs on isolated QUIC lanes; see [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md).) The macOS Pier ships as a signed, notarised preview package and its logged-in Aqua path can serve a real Deck, but cold-boot LoginWindow operation and two-display multi-monitor qualification are not production procedures, and it has not completed Release/Security review.
+QUIC datagrams, federated identity, MFA, a Linux Deck, and web account management are not part of this repository. (Each session already runs on isolated QUIC lanes; see [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md).) The macOS Pier ships as a signed, notarised preview package and its logged-in Aqua path can serve a real Deck, but cold-boot LoginWindow operation and two-display multi-monitor qualification are not production procedures, and it has not completed Release/Security review.
 
 ## 2. Installation
 
@@ -493,14 +493,15 @@ Arcen session:
 **1. Build the prefix in a container that matches the host.** No development
 package is installed on the host. The lab recipe is in
 `packaging/linux/tools/gnome-prefix/`. It pins versions, applies two
-GNOME/mutter merge requests as lab patches and records them in
-`PROVENANCE.md` inside the prefix.
+GNOME/mutter merge requests and Arcen's fix for GNOME/mutter#5077 (squared
+tablet pressure) as lab patches and records them in `PROVENANCE.md` inside the
+prefix.
 
 ```sh
 cd packaging/linux/tools/gnome-prefix
 podman build -t localhost/arcen-gnome-build:el10 -f Containerfile .
 mkdir -p /opt/arcen-build/gnome-src /opt/arcen-gnome/51
-cp build-prefix.sh patch-headless-seat-51.py /opt/arcen-build/gnome-src/
+cp build-prefix.sh patch-headless-seat-51.py patch-pressure-curve-51.py /opt/arcen-build/gnome-src/
 podman run --rm -v /opt/arcen-build/gnome-src:/src:Z \
   -v /opt/arcen-gnome/51:/opt/arcen-gnome/51:Z \
   localhost/arcen-gnome-build:el10 bash /src/build-prefix.sh
@@ -527,7 +528,13 @@ semanage fcontext -a -e /usr /opt/arcen-gnome/51
 restorecon -RF /opt/arcen-gnome/51
 ldd /opt/arcen-gnome/51/bin/gnome-shell | grep 'not found'   # must print nothing
 /opt/arcen-gnome/51/bin/gnome-shell --version
+bash packaging/linux/tools/gnome-prefix/write-pressure-marker.sh /opt/arcen-gnome/51
 ```
+
+`write-pressure-marker.sh` records that the prefix's Mutter applies the tablet
+pressure curve once, with its library's SHA-256. While that digest matches,
+the Pier's Tablet support stops compensating for Mutter's squared pressure;
+if the library is replaced, it compensates again by itself.
 
 `finish-prefix.sh` links in the system's typelibs and GIO modules (dconf,
 gvfs) that the prefix does not build, so the newer GLib in the prefix finds
@@ -786,6 +793,20 @@ compatibility; tightening that is a follow-up.
 
 The Deck side, the pairing with Local cursor rendering, and the verification
 steps are in [the pen and tablet guide](pen-tablet-input.md#5c-native-tablet-usb-bridged-with-any-tablet).
+
+**On a Windows Pier there is nothing to enable or install.** The Pier
+attaches no device to Windows and installs no driver: it reads the bridged
+pen's reports itself, with the same shared readers as a macOS Pier (the
+Intuos family by a dedicated reader, any standard HID pen by its own report
+descriptor), and injects each sample through the session's synthetic Windows
+Ink pen, the device Tablet support uses. It offers Native tablet exactly when
+that pen device exists (Windows 10 version 1809 or later) and ignores
+`usb.native_tablet`. The pen reaches only the signed-in session it serves:
+Windows delivers synthetic pointer input to the calling session's input
+desktop, a locked session's secure desktop refuses it, and the Pier ends the
+attachment when the session locks or disconnects. The tablet's touch,
+ExpressKeys and its maker's driver settings are not used; applications must
+use Windows Ink (not Wintab), as with Tablet support.
 
 ### Windows
 
@@ -1525,7 +1546,7 @@ Preserve `%ProgramData%\Arcen\tls` and logs unless the host is being decommissio
 | Credential Provider | Additive provider for remote first login and unlock. It must be signed for production. It does not disable Microsoft's password provider. Autologon must remain disabled. |
 | Session agent | Runs in the authenticated user session. It handles clipboard APIs and per-session capture/control IPC. LocalSystem brokers TLS/auth and relays bounded frames. |
 | TLS keys | Operator-managed PEM. Windows refuses private keys without restrictive DACL. Linux requires root-owned restrictive files. Self-signed certificates issued by either installer are valid for 825 days; ordinary installer upgrades reissue only positively classified unmarked legacy-Arcen pairs over the existing key, preserving SANs, and leave operator self-signed or CA-issued material alone. Same-key renewal uses the host-cert helpers (`new-host-cert.ps1 -Renew`, `arcen-pier new-host-cert --renew`, or `arcen-new-host-cert --renew`); installer `--force` is a trust-changing key replacement. |
-| Password attempts | **The Linux and Windows Piers apply no lockout, backoff, or attempt limit of their own** (the macOS Pier preview backs off per address and per account, shared `arcen_session::auth_throttle`). Each connection presents one credential to PAM or `LogonUserW`, and throttling is entirely whatever the operating system already enforces. On Linux configure `pam_faillock`; on Windows configure the account-lockout policy. A Pier reachable from a network you do not control, on a host with a permissive PAM stack, is an unthrottled password oracle against a real OS account. |
+| Password attempts | Every Pier (Linux, Windows, macOS) applies the shared `arcen_session::auth_throttle` back-off: three free failures per source address (IPv6 by /64) and per account name (case- and `DOMAIN\`/`@realm`-insensitive), then a refusal without checking the password, with a wait doubling from 2 s to 5 min; a success clears the address's count, an account's failures expire after 15 min without another; at most two checks in flight per address or account; state is per Pier process and in memory (up to 65,536 keys; a key that is backing off is never dropped to make room, so a flood that fills the table delays new sign-ins instead). Only a credential or account the OS refused counts (PAM `authenticate`/`acct_mgmt`, `LogonUserW`); a verifier timeout or outage does not. The Deck is told "too many failed sign-ins; wait a few minutes before trying again", and the Pier logs `SESSION_AUTH_FAIL` with `reason_class=too_many_attempts`. The back-off also lets anyone who can reach the port delay one account's sign-in by failing on purpose; it is not a lockout. Configure `pam_faillock` (Linux) or the account-lockout policy (Windows) for one. The Deck has 15 s to send each handshake message and 60 s to answer the sign-in prompt on every Pier (10 min when a disclaimer is shown); the OS has 30 s to check the password, after which the attempt fails without counting against anyone. At most 16 connections wait at the prompt at once on Linux and Windows (on macOS, one per agent sign-in slot, three), and at most two of them from one source address (IPv6 by /64); a third connection from that address is refused before TLS. On macOS the TLS handshakes themselves take those limits (16 at once, two per address, side by side) before a Deck reaches one of the three slots. Because a UDP source address can be forged, every Pier first sends a QUIC Retry (one extra round trip, which a forger cannot answer) to a connection from an address that already holds a place, and to every new connection once half the places are held. |
 | Logs and support bundles | Sensitive operational data. Bundles pseudonymize selected identities but are not anonymous. Protect them in storage and transit. |
 | Known gaps | SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; Linux Wayland serves Speed, Grading and HDR only where qualification proves them (see [Which desktop a Linux Pier serves](#which-desktop-a-linux-pier-serves)); ERR-366 `overall_state` unreliable. |
 

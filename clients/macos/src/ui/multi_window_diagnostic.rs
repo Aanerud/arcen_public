@@ -341,10 +341,10 @@ mod macos {
     use crate::pipeline::synthetic_multi_monitor::synthetic_frame;
     use crate::pipeline::video_decoder::DecodedVideoFrame;
     use crate::ui::multi_window_runtime::{
-        evaluate_viewport_bind, monitor_index_in, viewport_builder_for, window_display_id,
-        window_title_for, ActiveDisplayInfo, MonitorResolutionError, MultiWindowAbortReason,
-        MultiWindowEnterAttempt, MultiWindowEnterPoll, MultiWindowPlan, ViewportBindEvaluation,
-        ViewportBindObservation,
+        build_plan, evaluate_viewport_bind, monitor_index_in, viewport_builder_for,
+        window_display_id, window_title_for, ActiveDisplayInfo, MonitorResolutionError,
+        MultiWindowAbortReason, MultiWindowEnterAttempt, MultiWindowEnterPoll, MultiWindowPlan,
+        ViewportBindEvaluation, ViewportBindObservation,
     };
 
     use super::{WindowDiagnosticError, WindowDiagnosticReport};
@@ -396,7 +396,7 @@ mod macos {
         /// The exact `CGDirectDisplayID` the root viewport's `NativeOptions`
         /// was built to target -- confirmation must observe this same id,
         /// never a different (even same-sized) one.
-        root_expected_cg_display_id: u32,
+        root_expected_display_id: u32,
         /// This frame's live active display list, refreshed once per
         /// `logic()` call and read again by `ui()`'s root hard-failure check
         /// (a disappearing assigned display) so both callbacks agree on the
@@ -428,7 +428,7 @@ mod macos {
         fn abort(&mut self, ctx: &egui::Context, error: WindowDiagnosticError) {
             self.finished = true;
             *self.report.lock().expect("diagnostic report mutex") = Some(Err(error));
-            for viewport_id in self.plan.viewport_ids() {
+            for viewport_id in self.plan.windows() {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -448,7 +448,7 @@ mod macos {
         fn expected_paint_plan(&self) -> Vec<(egui::ViewportId, SessionMonitorId)> {
             let mut expected = vec![(egui::ViewportId::ROOT, self.monitor_ids[0])];
             for assignment in self.plan.assignments() {
-                expected.push((assignment.viewport_id, assignment.session_monitor_id));
+                expected.push((assignment.window, assignment.session_monitor_id));
             }
             expected
         }
@@ -479,7 +479,7 @@ mod macos {
 
             for assignment in self.plan.assignments().to_vec() {
                 let monitor_id = assignment.session_monitor_id;
-                let viewport_id = assignment.viewport_id;
+                let viewport_id = assignment.window;
                 // Snapshot exactly the frame this monitor id currently
                 // routes to *before* opening the viewport, and move that
                 // same snapshot into the closure below -- the closure's own
@@ -562,15 +562,15 @@ mod macos {
             let root_target_still_active = self
                 .active_displays_this_frame
                 .iter()
-                .any(|display| display.cg_display_id == self.root_expected_cg_display_id);
+                .any(|display| display.display_id == self.root_expected_display_id);
             let root_evaluation = evaluate_viewport_bind(
                 root_observation,
-                self.root_expected_cg_display_id,
+                self.root_expected_display_id,
                 root_target_still_active,
             );
             if let ViewportBindEvaluation::HardFailure(kind) = root_evaluation {
                 let reason = MultiWindowAbortReason {
-                    viewport_id: egui::ViewportId::ROOT,
+                    window: egui::ViewportId::ROOT,
                     kind,
                 };
                 self.abort(ui.ctx(), WindowDiagnosticError::Aborted(reason));
@@ -619,7 +619,7 @@ mod macos {
                     let is_confirmed = if index == 0 {
                         root_confirmed
                     } else {
-                        let viewport_id = self.plan.assignments()[index - 1].viewport_id;
+                        let viewport_id = self.plan.assignments()[index - 1].window;
                         !unconfirmed_viewports.contains(&viewport_id)
                     };
                     if is_confirmed {
@@ -638,7 +638,7 @@ mod macos {
                         unconfirmed_session_monitor_ids: unconfirmed_ids,
                         isolation_verified,
                     }));
-                for viewport_id in self.plan.viewport_ids() {
+                for viewport_id in self.plan.windows() {
                     ui.ctx()
                         .send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
                 }
@@ -671,7 +671,11 @@ mod macos {
             .collect();
         let generation =
             TopologyGeneration::new(1).unwrap_or_else(|_| unreachable!("1 is nonzero"));
-        let mut router = MonitorFrameRouter::new(generation, &monitor_ids)
+        let mut router =
+            MonitorFrameRouter::<crate::pipeline::video_decoder::NativeVideoDecoder>::new(
+                generation,
+                &monitor_ids,
+            )
             .map_err(WindowDiagnosticError::Router)?;
         for &monitor_id in &monitor_ids {
             router
@@ -692,26 +696,25 @@ mod macos {
         // mechanism against actually attached hardware rather than any
         // invented id (task 5's "no cross-routing" proof still holds
         // regardless of how many real displays are exercised).
-        let cg_display_ids: Vec<u32> = active_displays[..monitor_count]
+        let display_ids: Vec<u32> = active_displays[..monitor_count]
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
-        let plan = MultiWindowPlan::build(&monitor_ids, &cg_display_ids)
-            .map_err(WindowDiagnosticError::Plan)?;
+        let plan = build_plan(&monitor_ids, &display_ids).map_err(WindowDiagnosticError::Plan)?;
 
         // The root viewport must explicitly target the primary display too
         // (never an unpinned/default window that could land anywhere) so
         // its confirmation can use the exact same identity check every
         // additional window uses.
-        let root_cg_display_id = cg_display_ids[0];
+        let root_display_id = display_ids[0];
         let root_window_title = window_title_for(monitor_ids[0]);
         let live_active_display_ids: Vec<u32> = active_displays
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
-        let root_monitor_index = monitor_index_in(&live_active_display_ids, root_cg_display_id)
+        let root_monitor_index = monitor_index_in(&live_active_display_ids, root_display_id)
             .ok_or(WindowDiagnosticError::MonitorResolution(
-                MonitorResolutionError::DisplayNotActive(root_cg_display_id),
+                MonitorResolutionError::DisplayNotActive(root_display_id),
             ))?;
 
         let report_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -747,7 +750,7 @@ mod macos {
                     attempt,
                     root_fullscreen_requested: false,
                     root_window_title,
-                    root_expected_cg_display_id: root_cg_display_id,
+                    root_expected_display_id: root_display_id,
                     active_displays_this_frame: Vec::new(),
                     paint_acks: Vec::new(),
                     finished: false,
@@ -774,7 +777,7 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::ui::multi_window_runtime::MonitorWindowAssignment;
+        use crate::ui::multi_window_runtime::viewport_id_for;
 
         fn viewport_info(fullscreen: bool, inner_rect_known: bool) -> egui::ViewportInfo {
             let mut info = egui::ViewportInfo {
@@ -824,8 +827,8 @@ mod macos {
                 evaluate_viewport_bind(swapped, 10, true),
                 ViewportBindEvaluation::HardFailure(
                     crate::ui::multi_window_runtime::HardFailureKind::WrongDisplay {
-                        expected_cg_display_id: 10,
-                        observed_cg_display_id: 20,
+                        expected_display_id: 10,
+                        observed_display_id: 20,
                     }
                 )
             );
@@ -866,7 +869,7 @@ mod macos {
                 evaluate_viewport_bind(observation, 10, false),
                 ViewportBindEvaluation::HardFailure(
                     crate::ui::multi_window_runtime::HardFailureKind::DisplayDisappeared {
-                        cg_display_id: 10
+                        display_id: 10
                     }
                 )
             );
@@ -876,7 +879,7 @@ mod macos {
         fn verify_paint_isolation_accepts_correctly_claimed_and_painted_acks() {
             let expected = vec![
                 (egui::ViewportId::ROOT, sid(1)),
-                (MonitorWindowAssignment::viewport_id_for(sid(2)), sid(2)),
+                (viewport_id_for(sid(2)), sid(2)),
             ];
             let acks = vec![
                 super::super::ViewportPaintAck {
@@ -887,7 +890,7 @@ mod macos {
                     )),
                 },
                 super::super::ViewportPaintAck {
-                    viewport_id: MonitorWindowAssignment::viewport_id_for(sid(2)),
+                    viewport_id: viewport_id_for(sid(2)),
                     claimed_monitor_id: sid(2),
                     painted_tag: crate::pipeline::synthetic_multi_monitor::monitor_pixel_tag(sid(
                         2,
@@ -905,7 +908,7 @@ mod macos {
             // against the plan's own expected mapping, not merely by
             // checking pairwise tag distinctness.
             let root_id = egui::ViewportId::ROOT;
-            let secondary_id = MonitorWindowAssignment::viewport_id_for(sid(2));
+            let secondary_id = viewport_id_for(sid(2));
             let expected = vec![(root_id, sid(1)), (secondary_id, sid(2))];
             let acks = vec![
                 super::super::ViewportPaintAck {

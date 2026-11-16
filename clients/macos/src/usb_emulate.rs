@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Lab-only emulated Hard USB device (`--usb-emulate wacom-intuos5`).
+//! Lab-only emulated Hard USB device (`--usb-emulate wacom-intuos5|generic-pen`).
 //!
 //! Instead of asking the privileged helper to capture a physical tablet, the
 //! Deck feeds an emulated Wacom Intuos5 (`arcen_usb_bridge::WacomIntuos5`,
@@ -12,6 +12,10 @@
 //! one report per host poll, so a host-side check can assert the pen's
 //! position, pressure, proximity and buttons with no pen in hand.
 //!
+//! `generic-pen` is a tablet no host has a dedicated reader or driver for
+//! (`arcen_usb_bridge::GenericPenTablet`, the pid.codes test PID): it needs
+//! no mode switch, and proves the "any tablet" path (Q-16) end to end.
+//!
 //! Compiled only with the `usb-emulate-lab` feature, which no packaging
 //! script enables, and active only when a CLI smoke asks for it.
 
@@ -19,10 +23,12 @@ use arcen_protocol::messages::{UsbHardDeviceMsg, UsbHidReportDescriptorMsg};
 use arcen_protocol::{encode_usb_urb_complete, UsbUrbCompletionHeader, UsbUrbSubmitHeader};
 use arcen_usb_bridge::{
     intuos5_landing_stroke, intuos5_realistic_stroke, intuos5_resting_stroke,
-    intuos5_scripted_stroke, with_upper_switch_held, AttachmentGeneration, ExportedCompletion,
-    Intuos5PenReport, ReleaseReason, ScriptedReport, SyntheticDevice, SyntheticHandle, UrbId,
-    UrbStatus, UrbSubmission, UsbExporter, WacomIntuos5, INTUOS5_PEN_IN, RESTING_HOLD,
-    SCRIPTED_MINIMUM_INTERVAL,
+    intuos5_scripted_stroke, with_upper_switch_held, AttachmentGeneration, CapturedUsbDevice,
+    ExportedCompletion, GenericPenState, GenericPenTablet, Intuos5PenReport, Intuos5PenState,
+    ReleaseReason, ScriptedReport, SyntheticDevice, SyntheticHandle, UrbId, UrbStatus,
+    UrbSubmission, UsbExporter, WacomIntuos5, GENERIC_PEN_IN, GENERIC_PEN_MAX_PRESSURE,
+    INTUOS5_GRIP_PEN_TOOL_ID, INTUOS5_MAX_PRESSURE, INTUOS5_PEN_IN, RESTING_HOLD,
+    SCRIPTED_HOVER_DISTANCE, SCRIPTED_MINIMUM_INTERVAL, SCRIPTED_PEN_SERIAL,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -42,6 +48,9 @@ pub enum EmulatedDevice {
     /// Wacom Intuos5 touch L (`056a:0317`; the Linux `wacom` driver names
     /// it "Intuos Pro L").
     WacomIntuos5,
+    /// A standard HID pen no host has a dedicated reader for
+    /// (`1209:000f`, the pid.codes test PID).
+    GenericPen,
 }
 
 impl EmulatedDevice {
@@ -53,8 +62,9 @@ impl EmulatedDevice {
     pub fn parse(name: &str) -> Result<Self, String> {
         match name {
             "wacom-intuos5" => Ok(Self::WacomIntuos5),
+            "generic-pen" => Ok(Self::GenericPen),
             other => Err(format!(
-                "invalid --usb-emulate '{other}'; accepted values: wacom-intuos5"
+                "invalid --usb-emulate '{other}'; accepted values: wacom-intuos5, generic-pen"
             )),
         }
     }
@@ -63,6 +73,7 @@ impl EmulatedDevice {
     pub const fn name(self) -> &'static str {
         match self {
             Self::WacomIntuos5 => "wacom-intuos5",
+            Self::GenericPen => "generic-pen",
         }
     }
 }
@@ -111,11 +122,117 @@ pub enum StrokeScript {
     /// `Realistic` with the upper barrel button held in every packet
     /// (`arcen_usb_bridge::with_upper_switch_held`).
     UpperHeld,
+    /// The pressure ladder: stroke `n` holds [`LADDER_LEVELS`]`[(n - 1) % 5]`
+    /// of the device's pressure range, tilted (30, −20), on its own row, so a
+    /// page can read the pressure an application sees per level. Also for
+    /// `generic-pen`.
+    Ladder,
+    /// `Scripted` with the Grip Pen's eraser end in proximity
+    /// ([`INTUOS5_GRIP_ERASER_TOOL_ID`]), so a page can see the eraser
+    /// arrive as one.
+    Eraser,
+    /// `Scripted` with the lower barrel button held while the pen touches,
+    /// so a host that reports the barrel only in contact (Windows Ink: the
+    /// pen's secondary button) shows it too.
+    Barrel,
+}
+
+/// The tool id of the Intuos5 Grip Pen's eraser end (the pen's own id with
+/// the eraser bit, `0x0008`, set).
+pub const INTUOS5_GRIP_ERASER_TOOL_ID: u32 = 0x080a;
+
+/// Pressure levels of [`StrokeScript::Ladder`], as fractions of the range.
+pub const LADDER_LEVELS: [f64; 5] = [0.1, 0.25, 0.5, 0.75, 1.0];
+/// Tilt of every ladder sample, in the drivers' degree units.
+const LADDER_TILT: (i8, i8) = (30, -20);
+/// Moves per ladder stroke, all at the stroke's level.
+const LADDER_MOVES: u32 = 12;
+
+/// `fraction` of `maximum`, rounded.
+fn ladder_pressure(stroke: usize, maximum: u16) -> u16 {
+    let level = LADDER_LEVELS[stroke.saturating_sub(1) % LADDER_LEVELS.len()];
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pressure = (level * f64::from(maximum)).round() as u16;
+    pressure.min(maximum)
+}
+
+/// Row of ladder stroke `stroke` (0-based within a cycle of five).
+fn ladder_row(stroke: usize) -> u32 {
+    u32::try_from(stroke.saturating_sub(1) % LADDER_LEVELS.len()).unwrap_or(0)
+}
+
+/// Intuos5 ladder stroke `stroke` (1-based).
+fn intuos5_ladder_stroke(stroke: usize) -> Vec<ScriptedReport> {
+    let pressure = ladder_pressure(stroke, INTUOS5_MAX_PRESSURE);
+    let y = 8_000 + 6_000 * ladder_row(stroke);
+    let state = |x: u32, pressure: u16, distance: u8| Intuos5PenState {
+        x,
+        y,
+        pressure,
+        distance,
+        tilt_x: LADDER_TILT.0,
+        tilt_y: LADDER_TILT.1,
+        ..Intuos5PenState::default()
+    };
+    let step = |phase, state| ScriptedReport {
+        phase,
+        report: Intuos5PenReport::Pen(state),
+    };
+    let mut script = vec![ScriptedReport {
+        phase: "proximity-in",
+        report: Intuos5PenReport::Enter {
+            tool_id: INTUOS5_GRIP_PEN_TOOL_ID,
+            serial: SCRIPTED_PEN_SERIAL,
+        },
+    }];
+    script.extend((0..3).map(|_| step("hover", state(16_000, 0, SCRIPTED_HOVER_DISTANCE))));
+    script.extend(
+        (0..=LADDER_MOVES).map(|index| step("ladder", state(16_000 + 2_000 * index, pressure, 0))),
+    );
+    let end = 16_000 + 2_000 * LADDER_MOVES;
+    script.extend((0..2).map(|_| step("hover", state(end, 0, SCRIPTED_HOVER_DISTANCE))));
+    script.push(ScriptedReport {
+        phase: "proximity-out",
+        report: Intuos5PenReport::Exit,
+    });
+    script
+}
+
+/// Generic pen ladder stroke `stroke` (1-based).
+fn generic_pen_ladder_stroke(stroke: usize) -> Vec<(&'static str, GenericPenState)> {
+    let pressure = ladder_pressure(stroke, GENERIC_PEN_MAX_PRESSURE);
+    let y = u16::try_from(6_000 + 4_000 * ladder_row(stroke)).unwrap_or(6_000);
+    let state = |x: u16, pressure: u16, tip: bool| GenericPenState {
+        x,
+        y,
+        pressure,
+        tilt_x: LADDER_TILT.0,
+        tilt_y: LADDER_TILT.1,
+        tip,
+        in_range: true,
+        ..GenericPenState::default()
+    };
+    let mut script = Vec::new();
+    script.extend((0..5).map(|_| ("hover", state(12_000, 0, false))));
+    script.extend(
+        (0..=u16::try_from(LADDER_MOVES).unwrap_or(12))
+            .map(|index| ("ladder", state(12_000 + 2_000 * index, pressure, true))),
+    );
+    script.extend((0..3).map(|_| ("hover", state(36_000, 0, false))));
+    script.push((
+        "leave",
+        GenericPenState {
+            x: 36_000,
+            y,
+            ..GenericPenState::default()
+        },
+    ));
+    script
 }
 
 impl StrokeScript {
     /// Parses `scripted`, `landing`, `alternate`, `realistic`, `tilted`,
-    /// `rest`, `hover-rest` or `upper-held`.
+    /// `rest`, `hover-rest`, `upper-held`, `ladder`, `eraser` or `barrel`.
     ///
     /// # Errors
     ///
@@ -130,8 +247,11 @@ impl StrokeScript {
             "rest" => Ok(Self::Rest),
             "hover-rest" => Ok(Self::HoverRest),
             "upper-held" => Ok(Self::UpperHeld),
+            "ladder" => Ok(Self::Ladder),
+            "eraser" => Ok(Self::Eraser),
+            "barrel" => Ok(Self::Barrel),
             other => Err(format!(
-                "invalid --usb-emulate-stroke '{other}'; accepted values: scripted, landing, alternate, realistic, tilted, rest, hover-rest, upper-held"
+                "invalid --usb-emulate-stroke '{other}'; accepted values: scripted, landing, alternate, realistic, tilted, rest, hover-rest, upper-held, ladder, eraser, barrel"
             )),
         }
     }
@@ -147,6 +267,25 @@ impl StrokeScript {
             Self::Rest => intuos5_resting_stroke(true),
             Self::HoverRest => intuos5_resting_stroke(false),
             Self::UpperHeld => with_upper_switch_held(intuos5_realistic_stroke()),
+            Self::Ladder => intuos5_ladder_stroke(stroke),
+            Self::Eraser => intuos5_scripted_stroke()
+                .into_iter()
+                .map(|mut step| {
+                    if let Intuos5PenReport::Enter { tool_id, .. } = &mut step.report {
+                        *tool_id = INTUOS5_GRIP_ERASER_TOOL_ID;
+                    }
+                    step
+                })
+                .collect(),
+            Self::Barrel => intuos5_scripted_stroke()
+                .into_iter()
+                .map(|mut step| {
+                    if let Intuos5PenReport::Pen(state) = &mut step.report {
+                        state.stylus |= state.pressure > 0;
+                    }
+                    step
+                })
+                .collect(),
         }
     }
 
@@ -236,10 +375,20 @@ impl EmulatedResponder {
     ///
     /// Returns a message when the shared policy refuses the device.
     pub fn start(device: EmulatedDevice, playback: Playback) -> Result<Self, String> {
-        let EmulatedDevice::WacomIntuos5 = device;
-        let (emulated, handle) = SyntheticDevice::emulate(WacomIntuos5::new())
-            .map_err(|error| format!("emulated {}: {error:?}", device.name()))?;
-        let exporter = UsbExporter::new(Box::new(emulated)).map_err(|(refusal, _)| {
+        let failed = |error| format!("emulated {}: {error:?}", device.name());
+        let (emulated, handle): (Box<dyn CapturedUsbDevice>, Handle) = match device {
+            EmulatedDevice::WacomIntuos5 => {
+                let (emulated, handle) =
+                    SyntheticDevice::emulate(WacomIntuos5::new()).map_err(failed)?;
+                (Box::new(emulated), Handle::Intuos(handle))
+            }
+            EmulatedDevice::GenericPen => {
+                let (emulated, handle) =
+                    SyntheticDevice::emulate(GenericPenTablet::default()).map_err(failed)?;
+                (Box::new(emulated), Handle::Generic(handle))
+            }
+        };
+        let exporter = UsbExporter::new(emulated).map_err(|(refusal, _)| {
             format!(
                 "emulated {} refused by the shared policy: {refusal}",
                 device.name()
@@ -437,7 +586,62 @@ fn wait_until(stop: &AtomicBool, timeout: Duration, ready: impl Fn() -> bool) ->
     false
 }
 
-fn play(handle: &SyntheticHandle<WacomIntuos5>, playback: Playback, stop: &AtomicBool) {
+/// The emulated device the player feeds.
+enum Handle {
+    Intuos(SyntheticHandle<WacomIntuos5>),
+    Generic(SyntheticHandle<GenericPenTablet>),
+}
+
+impl Handle {
+    /// Whether the host prepared the pen as its driver does (the Intuos
+    /// family's Wacom mode; a generic pen needs nothing).
+    fn host_prepared(&self) -> bool {
+        match self {
+            Self::Intuos(handle) => handle.inspect(WacomIntuos5::wacom_mode),
+            Self::Generic(_) => true,
+        }
+    }
+
+    fn polled(&self) -> bool {
+        match self {
+            Self::Intuos(handle) => handle.held_on(INTUOS5_PEN_IN) > 0,
+            Self::Generic(handle) => handle.held_on(GENERIC_PEN_IN) > 0,
+        }
+    }
+
+    fn deliver(&self, report: Vec<u8>) -> bool {
+        match self {
+            Self::Intuos(handle) => {
+                handle.deliver_when_polled(INTUOS5_PEN_IN, report, POLL_TIMEOUT)
+            }
+            Self::Generic(handle) => {
+                handle.deliver_when_polled(GENERIC_PEN_IN, report, POLL_TIMEOUT)
+            }
+        }
+    }
+
+    /// Stroke `stroke` of `script`: the Intuos scripts, or the generic pen's
+    /// ladder or its one scripted stroke (for every other `script`).
+    fn steps(&self, script: StrokeScript, stroke: usize) -> Vec<(&'static str, Vec<u8>)> {
+        match self {
+            Self::Intuos(_) => script
+                .script(stroke)
+                .into_iter()
+                .map(|step| (step.phase, step.report.encode().to_vec()))
+                .collect(),
+            Self::Generic(_) if script == StrokeScript::Ladder => generic_pen_ladder_stroke(stroke)
+                .into_iter()
+                .map(|(phase, state)| (phase, state.encode().to_vec()))
+                .collect(),
+            Self::Generic(_) => arcen_usb_bridge::generic_pen_scripted_stroke()
+                .into_iter()
+                .map(|step| (step.phase, step.state.encode().to_vec()))
+                .collect(),
+        }
+    }
+}
+
+fn play(handle: &Handle, playback: Playback, stop: &AtomicBool) {
     set_status(PlaybackStatus::WaitingForHost);
     match play_strokes(handle, playback, stop) {
         Ok(reports) => {
@@ -463,23 +667,15 @@ fn play(handle: &SyntheticHandle<WacomIntuos5>, playback: Playback, stop: &Atomi
     }
 }
 
-fn play_strokes(
-    handle: &SyntheticHandle<WacomIntuos5>,
-    playback: Playback,
-    stop: &AtomicBool,
-) -> Result<usize, String> {
-    if !wait_until(stop, HOST_READY_TIMEOUT, || {
-        handle.inspect(WacomIntuos5::wacom_mode)
-    }) {
+fn play_strokes(handle: &Handle, playback: Playback, stop: &AtomicBool) -> Result<usize, String> {
+    if !wait_until(stop, HOST_READY_TIMEOUT, || handle.host_prepared()) {
         return Err("the host never switched the tablet into Wacom mode".to_owned());
     }
     tracing::info!(
         target: crate::logging::target::USB,
-        "host switched the emulated tablet into Wacom mode"
+        "host prepared the emulated tablet"
     );
-    if !wait_until(stop, HOST_READY_TIMEOUT, || {
-        handle.held_on(INTUOS5_PEN_IN) > 0
-    }) {
+    if !wait_until(stop, HOST_READY_TIMEOUT, || handle.polled()) {
         return Err(
             "the host never polled the pen endpoint (nobody opened the pen device)".to_owned(),
         );
@@ -496,19 +692,14 @@ fn play_strokes(
     for stroke in 1..=playback.strokes {
         set_status(PlaybackStatus::Playing { stroke });
         let started = Instant::now();
-        let script = playback.stroke.script(stroke);
-        for step in &script {
+        let script = handle.steps(playback.stroke, stroke);
+        for (phase, report) in &script {
             if stop.load(Ordering::Acquire) {
                 return Err(format!("stopped during stroke {stroke}"));
             }
-            if !handle.deliver_when_polled(
-                INTUOS5_PEN_IN,
-                step.report.encode().to_vec(),
-                POLL_TIMEOUT,
-            ) {
+            if !handle.deliver(report.clone()) {
                 return Err(format!(
-                    "stroke {stroke}: the host stopped polling the pen at phase {}",
-                    step.phase
+                    "stroke {stroke}: the host stopped polling the pen at phase {phase}"
                 ));
             }
             reports += 1;
@@ -563,6 +754,68 @@ fn tilted(mut script: Vec<ScriptedReport>) -> Vec<ScriptedReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_barrel_stroke_holds_the_lower_button_while_touching() {
+        assert_eq!(StrokeScript::parse("barrel"), Ok(StrokeScript::Barrel));
+        let model = arcen_usb_bridge::host_decoded_intuos_model(0x056a, 0x0317).unwrap();
+        let mut reader = arcen_usb_bridge::IntuosPenReader::new(model);
+        let samples: Vec<_> = StrokeScript::Barrel
+            .script(1)
+            .iter()
+            .filter_map(|step| reader.read(&step.report.encode()))
+            .collect();
+        let pressing: Vec<_> = samples.iter().filter(|sample| sample.touching).collect();
+        assert!(!pressing.is_empty());
+        assert!(pressing.iter().all(|sample| sample.barrel_buttons == 1));
+    }
+
+    #[test]
+    fn the_eraser_stroke_enters_with_the_eraser_end() {
+        assert_eq!(StrokeScript::parse("eraser"), Ok(StrokeScript::Eraser));
+        let model = arcen_usb_bridge::host_decoded_intuos_model(0x056a, 0x0317).unwrap();
+        let mut reader = arcen_usb_bridge::IntuosPenReader::new(model);
+        let samples: Vec<_> = StrokeScript::Eraser
+            .script(1)
+            .iter()
+            .filter_map(|step| reader.read(&step.report.encode()))
+            .collect();
+        assert!(samples.iter().any(|sample| sample.touching));
+        assert!(samples
+            .iter()
+            .all(|sample| sample.eraser || !sample.in_proximity));
+    }
+
+    #[test]
+    fn the_ladder_holds_one_level_per_stroke_on_both_emulated_pens() {
+        assert_eq!(StrokeScript::parse("ladder"), Ok(StrokeScript::Ladder));
+        for (stroke, level) in (1..=10).zip(LADDER_LEVELS.iter().cycle()) {
+            let intuos: Vec<u16> = intuos5_ladder_stroke(stroke)
+                .iter()
+                .filter(|step| step.phase == "ladder")
+                .map(|step| match step.report {
+                    Intuos5PenReport::Pen(state) => state.pressure,
+                    _ => 0,
+                })
+                .collect();
+            let generic: Vec<u16> = generic_pen_ladder_stroke(stroke)
+                .iter()
+                .filter(|(phase, state)| *phase == "ladder" && state.tip)
+                .map(|(_, state)| state.pressure)
+                .collect();
+            for (pressures, maximum) in [
+                (intuos, INTUOS5_MAX_PRESSURE),
+                (generic, GENERIC_PEN_MAX_PRESSURE),
+            ] {
+                assert_eq!(pressures.len(), 13, "stroke {stroke}");
+                let expected = (level * f64::from(maximum)).round();
+                assert!(
+                    pressures.iter().all(|p| f64::from(*p) == expected),
+                    "stroke {stroke}: {pressures:?} != {expected}"
+                );
+            }
+        }
+    }
     use arcen_protocol::decode_usb_urb_complete;
     use arcen_usb_bridge::{EndpointAddress, SetupPacket, TransferKind};
     use std::num::{NonZeroU32, NonZeroU64};
@@ -570,6 +823,9 @@ mod tests {
     fn generation() -> AttachmentGeneration {
         AttachmentGeneration::new(NonZeroU64::MIN)
     }
+
+    /// The playback status is process-wide: tests that play take turns.
+    static PLAYING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn header(
         urb: u32,
@@ -604,9 +860,12 @@ mod tests {
             EmulatedDevice::parse("wacom-intuos5"),
             Ok(EmulatedDevice::WacomIntuos5)
         );
-        assert!(EmulatedDevice::parse("gamepad")
-            .unwrap_err()
-            .contains("wacom-intuos5"));
+        assert_eq!(
+            EmulatedDevice::parse("generic-pen"),
+            Ok(EmulatedDevice::GenericPen)
+        );
+        let refused = EmulatedDevice::parse("gamepad").unwrap_err();
+        assert!(refused.contains("wacom-intuos5") && refused.contains("generic-pen"));
     }
 
     /// The two branches' new strokes live side by side: every name parses
@@ -646,12 +905,55 @@ mod tests {
         assert!(tilts.iter().any(|(_, y)| *y > 10) && tilts.iter().any(|(_, y)| *y < -10));
     }
 
+    /// The generic pen needs no mode switch: its stroke plays as soon as the
+    /// host polls its endpoint.
+    #[tokio::test]
+    async fn the_emulated_generic_pen_plays_once_polled_without_a_mode_switch() {
+        let _turn = PLAYING.lock().await;
+        let mut responder = EmulatedResponder::start(
+            EmulatedDevice::GenericPen,
+            Playback {
+                strokes: 1,
+                lead_in: Duration::ZERO,
+                gap: Duration::ZERO,
+                stroke: StrokeScript::Scripted,
+            },
+        )
+        .unwrap();
+        let device = responder.device();
+        assert_eq!((device.vendor_id, device.product_id), (0x1209, 0x000f));
+        assert_eq!(device.hid_report_descriptors.len(), 1);
+        let script = arcen_usb_bridge::generic_pen_scripted_stroke();
+        for (index, step) in script.iter().enumerate() {
+            let urb = 10 + u32::try_from(index).unwrap();
+            responder
+                .submit(header(urb, 0x81, TransferKind::Interrupt, 16, None), &[])
+                .unwrap();
+            let (done, data) = next(&mut responder).await;
+            assert_eq!(done.urb_id.get(), urb);
+            assert_eq!(data, step.state.encode(), "{}", step.phase);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(status(), PlaybackStatus::Done { .. }) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            status(),
+            PlaybackStatus::Done {
+                strokes: 1,
+                reports: script.len()
+            }
+        );
+        responder.shutdown().await;
+    }
+
     /// The hello carries the emulated Wacom's identity and the report
     /// descriptors of all three interfaces; control requests are answered
     /// from the descriptors; the mode switch is acknowledged and echoed; and
     /// the scripted stroke arrives on the pen endpoint once the host polls.
     #[tokio::test]
     async fn the_emulated_wacom_answers_like_a_captured_one_and_plays_its_stroke() {
+        let _turn = PLAYING.lock().await;
         let mut responder = EmulatedResponder::start(
             EmulatedDevice::WacomIntuos5,
             Playback {

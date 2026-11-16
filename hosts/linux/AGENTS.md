@@ -93,6 +93,15 @@ NVIDIA GPU and driver on the build/test host.
   out, and never tell a user to sign out for it.
 - Never emit `KEY_SYSRQ` from a kernel virtual keyboard
   (`input/keymap.rs::kernel_safe_key`).
+- The Xorg session's layout reaches a Deck that types committed text as a
+  `host_keymap` notice (source `x11_core_keymap`), as on Wayland: the
+  committed-text connection (`input/x11_text.rs`) reads the core keyboard
+  mapping, the active group and `_XKB_RULES_NAMES`, at attach and every
+  second, and sends a notice only when what the layout types changed. Both
+  providers build it with `input/keymap.rs::host_keymap_msg`, a thin
+  evdev wrapper over the shared `arcen_input::text::host_layout` builder
+  every Pier uses (positions, validation, `HostKeymapNotices`); main-block
+  evdev codes come from the shared `set1_position` table.
 
 ## Native tablet: one path
 
@@ -156,6 +165,11 @@ NVIDIA GPU and driver on the build/test host.
 - Every desktop, on either provider, holds a logind `sleep:idle` block
   inhibitor in the launcher (`session::sleep_inhibitor`) for its whole
   life. Deck keys must never map to host power, sleep, suspend or wake keys.
+- The input probe also creates the session's keyboard (`MutterSessions::prime_keyboard`,
+  a `KEY_RESERVED` press Mutter turns into no event): Mutter 42+ creates a
+  `RemoteDesktop` keyboard only at its first key press, and a headless or
+  native seat has no other, so without it every session's first key reached
+  applications as a lone release. Keep it ahead of readiness.
 - Readiness is outputs + stream + input target + a real frame
   (`arcen_session::wayland_session`), never a socket or a running process.
 - The capture hand-off is `arcen_media::video::capture_handoff`; do not add
@@ -190,6 +204,19 @@ NVIDIA GPU and driver on the build/test host.
   and raw HID are refused for every Wayland session
   (`arcen_usb_bridge::admit_hard_usb_session`): a headless compositor opens
   no input devices, so a bridged device would reach `seat0`.
+- A seat pen's pressure is written so applications see the Deck's pressure:
+  the compositor's libinput normalises from its 1 % lower threshold and
+  Mutter 46+ multiplies its curve by the pressure (squares it with GNOME's
+  default curve, GNOME/mutter#5077). The shared
+  `arcen_input::compositor_pressure::SeatPenPressure`, chosen from the
+  qualified compositor version, inverts both; never write a seat pen's
+  pressure linearly. A prefix whose Mutter carries the lab fix
+  (`patch-pressure-curve-51.py`) says so in
+  `share/arcen/mutter-pressure-curve`, bound to the library's SHA-256;
+  `input::pressure_curve::SeatPenPressurePlan::resolve` reads it each time a
+  seat pen is built and then inverts libinput's threshold only. Never turn the
+  inverse off by version or configuration alone: a restored stock library
+  must bring it back by itself.
 - Committed text into a Wayland session is typed only where the session
   proves it: the agent reads its compositor's keymap as a Wayland client
   (request `wl_keyboard` only after the seat advertises the keyboard

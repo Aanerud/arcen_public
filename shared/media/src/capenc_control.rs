@@ -18,6 +18,19 @@ pub enum CapencControlCommand {
     Bitrate { bps: u64 },
     /// Apply a new capture/encode frame-rate cap live.
     Framerate { fps: u32 },
+    /// Lossless refinement: the Deck asked to start over (`refine_reset`);
+    /// the producer starts a new generation behind a barrier.
+    RefineReset,
+    /// Lossless refinement: the Deck turned it off for the monitor
+    /// (`refine_control`, `enabled: false`); fences continue, tiles stop.
+    RefinePause,
+    /// Lossless refinement: the Deck turned it on again; a new generation.
+    RefineResume,
+    /// Lossless refinement: the rate the Pier's link budget allows
+    /// (`arcen_media::refine::budget::RefineLinkBudget`, ADR 0016 R6). It
+    /// replaces the video-target floor from then on; `hold` freezes the
+    /// bucket and cancels queued tiles until the next `REFINE-RATE`.
+    RefineRate { bps: u64, hold: bool },
 }
 
 impl CapencControlCommand {
@@ -30,6 +43,11 @@ impl CapencControlCommand {
             Self::Stop => "STOP".to_owned(),
             Self::Bitrate { bps } => format!("BITRATE {bps}"),
             Self::Framerate { fps } => format!("FRAMERATE {fps}"),
+            Self::RefineReset => "REFINE-RESET".to_owned(),
+            Self::RefinePause => "REFINE-PAUSE".to_owned(),
+            Self::RefineResume => "REFINE-RESUME".to_owned(),
+            Self::RefineRate { bps, hold: false } => format!("REFINE-RATE {bps}"),
+            Self::RefineRate { bps, hold: true } => format!("REFINE-RATE {bps} HOLD"),
         }
     }
 
@@ -53,6 +71,7 @@ pub enum CapencControlParseError {
     MissingFramerate,
     InvalidFramerate(String),
     ZeroFramerate,
+    InvalidRefineRate(String),
 }
 
 impl Display for CapencControlParseError {
@@ -66,6 +85,10 @@ impl Display for CapencControlParseError {
             Self::MissingFramerate => formatter.write_str("FRAMERATE requires an fps value"),
             Self::InvalidFramerate(value) => write!(formatter, "invalid FRAMERATE value {value:?}"),
             Self::ZeroFramerate => formatter.write_str("FRAMERATE must be non-zero"),
+            Self::InvalidRefineRate(line) => write!(
+                formatter,
+                "REFINE-RATE takes bits per second and an optional HOLD: {line:?}"
+            ),
         }
     }
 }
@@ -92,6 +115,31 @@ impl FromStr for CapencControlCommand {
         }
         if command.eq_ignore_ascii_case("STOP") {
             return Ok(Self::Stop);
+        }
+        if command.eq_ignore_ascii_case("REFINE-RESET") {
+            return Ok(Self::RefineReset);
+        }
+        if command.eq_ignore_ascii_case("REFINE-PAUSE") {
+            return Ok(Self::RefinePause);
+        }
+        if command.eq_ignore_ascii_case("REFINE-RESUME") {
+            return Ok(Self::RefineResume);
+        }
+        if command.eq_ignore_ascii_case("REFINE-RATE") {
+            let invalid = || CapencControlParseError::InvalidRefineRate(trimmed.to_owned());
+            let bps = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(invalid)?;
+            let hold = match parts.next() {
+                None => false,
+                Some(flag) if flag.eq_ignore_ascii_case("HOLD") => true,
+                Some(_) => return Err(invalid()),
+            };
+            if parts.next().is_some() {
+                return Err(invalid());
+            }
+            return Ok(Self::RefineRate { bps, hold });
         }
         if command.eq_ignore_ascii_case("FRAMERATE") {
             let Some(value) = parts.next() else {
@@ -146,6 +194,29 @@ mod tests {
             "FRAMERATE 24".parse(),
             Ok(CapencControlCommand::Framerate { fps: 24 })
         );
+        for command in [
+            CapencControlCommand::RefineReset,
+            CapencControlCommand::RefinePause,
+            CapencControlCommand::RefineResume,
+            CapencControlCommand::RefineRate {
+                bps: 12_000_000,
+                hold: false,
+            },
+            CapencControlCommand::RefineRate { bps: 0, hold: true },
+        ] {
+            assert_eq!(command.as_line().parse(), Ok(command));
+        }
+        for refused in [
+            "REFINE-RATE",
+            "REFINE-RATE x",
+            "REFINE-RATE 1 SOON",
+            "REFINE-RATE 1 HOLD 2",
+        ] {
+            assert!(matches!(
+                refused.parse::<CapencControlCommand>(),
+                Err(CapencControlParseError::InvalidRefineRate(_))
+            ));
+        }
     }
 
     #[test]

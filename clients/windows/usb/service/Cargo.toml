@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-usb-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcen USB component service for the Windows Deck (LocalSystem; WinUSB capture for Native tablet)."
+
+# A privileged process: no UI, transport, media, GPU or async runtime crate
+# (scripts/ci/check-workspace-boundaries.sh checks the whole graph).
+[dependencies]
+arcen-protocol.workspace = true
+arcen-usb-bridge.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Devices_Usb",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[features]
+default = []
+# Lab only: `console --emulate` serves an emulated Intuos5 instead of
+# claiming a tablet. No installer enables it.
+lab-emulate = []
+
+[lints]
+workspace = true

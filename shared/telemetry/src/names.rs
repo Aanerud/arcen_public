@@ -51,6 +51,25 @@ pub mod field {
     pub const TRANSPORT: &str = "transport";
 }
 
+/// Exact still image (lossless refinement, ADR 0016): one vocabulary for
+/// the Pier and the Deck. Emitted on [`target::MEDIA`].
+pub mod refine {
+    /// The session's refinement plan was decided: `state` (`on`/`off`),
+    /// `reason` when off, `domain`, `bit_depth`, `still_ms`, `max_mbps`.
+    pub const PLAN: &str = "video.refine.plan";
+    /// A periodic summary: records, tiles, blocks, wire bytes, coverage,
+    /// verification level, digest matches and mismatches, drops.
+    pub const WINDOW: &str = "video.refine.window";
+    /// The Deck verified a still picture: `coverage_permille`, `level`,
+    /// `since_still_ms` (time from the last change to the verdict).
+    pub const VERIFIED: &str = "video.refine.verified";
+    /// The Pier's refinement budget changed (ADR 0016 R6): `rate_bps`,
+    /// `source` (`floor` before a path sample, `residual` after), `hold`
+    /// (a suspension's reason, or none), `delivered_bps`,
+    /// `interactive_bps`, `holds`, `backoffs`, `video_deferrals`.
+    pub const BUDGET: &str = "video.refine.budget";
+}
+
 /// Canonical component values.
 pub mod component {
     /// macOS Deck client.

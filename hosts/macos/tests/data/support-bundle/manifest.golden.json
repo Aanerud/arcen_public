@@ -1,0 +1,73 @@
+{
+  "bundle_id": "ARC-WH64-AV6C",
+  "component": {
+    "arch": "<arch>",
+    "name": "arcen-pier-macos",
+    "os": "macos",
+    "version": "<version>"
+  },
+  "entries": [
+    {
+      "included_size_bytes": 232,
+      "original_size_bytes": 232,
+      "path": "config/pier.json",
+      "sha256": "d05441ea4d8f983722dbb7a6ffc60c659c5954cb2e3a20069f303810460d3687",
+      "source": "configuration",
+      "truncation": null
+    },
+    {
+      "included_size_bytes": 1246,
+      "original_size_bytes": 757,
+      "path": "logs/arcen-pier-macos.jsonl",
+      "sha256": "2fbcc5e5c83e4dd3894467e4f85e6cc55d0761c5368be19300ad73e7c124bb4e",
+      "source": "log",
+      "truncation": null
+    }
+  ],
+  "generated_at_unix_seconds": 1794726245,
+  "notices": [
+    {
+      "code": "certificate_excluded",
+      "kind": "omitted",
+      "source": "config/tls/cert"
+    },
+    {
+      "code": "private_key_excluded",
+      "kind": "omitted",
+      "source": "config/tls/key"
+    },
+    {
+      "code": "crash_reports_not_requested",
+      "kind": "omitted",
+      "source": "crash"
+    },
+    {
+      "code": "canonical_log_record_invalid",
+      "kind": "invalid",
+      "source": "logs/arcen-pier-macos.jsonl"
+    }
+  ],
+  "redactions": [
+    {
+      "entry_path": "logs/arcen-pier-macos.jsonl",
+      "key_path": "/fields/ssid",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier-macos.jsonl",
+      "key_path": "/host",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier-macos.jsonl",
+      "key_path": "/peer_addr",
+      "reason": "identity_pseudonymized"
+    },
+    {
+      "entry_path": "logs/arcen-pier-macos.jsonl",
+      "key_path": "/user",
+      "reason": "identity_pseudonymized"
+    }
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "last_selected_connection_id": "studio-wss",
+  "connections": [
+    {
+      "id": "studio-wss",
+      "kind": "direct_machine",
+      "name": "Studio over WSS",
+      "host": "pier-a.example.internal",
+      "port": 18443,
+      "transport": "wss",
+      "security_mode": "high",
+      "future_entry_field": {"kept": true},
+      "settings": {
+        "version": 1,
+        "remembered_username": "AD\\artist.user",
+        "tablet_mode_requested": "wacom_usb_bridge",
+        "displays_mode": "single_primary",
+        "keyboard_shortcuts": "swap_command_control",
+        "left_option_altgr": true,
+        "future_setting": "kept"
+      }
+    },
+    {
+      "name": "WSS without an id or a port",
+      "host": "203.0.113.30",
+      "transport": "wss"
+    },
+    {
+      "id": "proxied-wss",
+      "name": "WSS on its own port",
+      "host": "pier-b.example.internal",
+      "port": 443,
+      "transport": "wss",
+      "settings": {
+        "version": 1,
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination"
+      }
+    },
+    {
+      "id": "already-quic",
+      "name": "Already QUIC",
+      "host": "203.0.113.40",
+      "port": 18443,
+      "transport": "quic"
+    },
+    {
+      "id": "cleartext-ws",
+      "name": "Cleartext WebSocket",
+      "host": "pier-c.example.internal",
+      "port": 18443,
+      "transport": "ws"
+    }
+  ]
+}

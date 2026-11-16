@@ -27,6 +27,9 @@ use super::input::CompositorInput;
 use super::{InputCommand, ReadyStream, INITIAL_OUTPUT_GENERATION};
 use crate::logging::target;
 
+/// `KEY_RESERVED`: the evdev code that names no key.
+const KEY_RESERVED: u32 = 0;
+
 const SCREEN_CAST: &str = "org.gnome.Mutter.ScreenCast";
 const SCREEN_CAST_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const SCREEN_CAST_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
@@ -956,11 +959,12 @@ impl MutterSessions {
     }
 
     /// Proves the input target: an absolute pointer motion to the centre of
-    /// the first stream is accepted.
+    /// the first stream is accepted. The session's keyboard is then created
+    /// ([`Self::prime_keyboard`]).
     ///
     /// # Errors
     ///
-    /// [`MutterError`] when `RemoteDesktop` refuses it.
+    /// [`MutterError`] when `RemoteDesktop` refuses the motion.
     pub async fn probe_input(&self) -> Result<RemoteDesktopEvidence, MutterError> {
         let first = self.streams.first().ok_or(MutterError::Parameters)?;
         self.notify(&InputCommand::PointerAbsolute {
@@ -970,12 +974,41 @@ impl MutterSessions {
             y: f64::from(first.stream.height) / 2.0,
         })
         .await?;
+        if let Err(error) = self.prime_keyboard().await {
+            tracing::warn!(
+                target: target::INPUT,
+                %error,
+                "the session keyboard was not created ahead of the first key; that key may be lost"
+            );
+        }
         Ok(RemoteDesktopEvidence {
             device_types: self.device_types,
             started: true,
             linked_to_screencast: true,
             absolute_pointer_accepted: true,
         })
+    }
+
+    /// Has Mutter create the session's virtual keyboard now, before any key.
+    ///
+    /// Mutter 42 and later create a `RemoteDesktop` session's keyboard at
+    /// its first key press (`ensure_virtual_device`). A headless or native
+    /// seat has no other keyboard, so its Wayland seat had no keyboard
+    /// capability until then: applications bound `wl_keyboard` only after
+    /// that press had gone to nobody, and the first key of every session
+    /// reached the host as a lone release. A press of `KEY_RESERVED` (0)
+    /// creates the keyboard, and Mutter emits no event for it: a code that
+    /// is not a key is refused after the device exists (logged once by
+    /// Mutter as an invalid virtual key).
+    ///
+    /// # Errors
+    ///
+    /// [`MutterError`] when `RemoteDesktop` refuses the call.
+    pub async fn prime_keyboard(&self) -> Result<(), MutterError> {
+        self.remote_desktop
+            .call::<_, _, ()>("NotifyKeyboardKeycode", &(KEY_RESERVED, true))
+            .await?;
+        Ok(())
     }
 
     fn absolute_target(&self, connector: &str) -> Result<AbsoluteTarget, MutterError> {

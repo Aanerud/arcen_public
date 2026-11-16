@@ -24,10 +24,10 @@ mod iousbhost;
 mod registry;
 
 use arcen_secure_dir::{DirPolicy, TrustedDir};
-use capture::{speed_code, Backend, PhysicalDevice};
+use capture::{Backend, PhysicalDevice};
 use frame::{
-    encode_hello, encode_info, read_frame, write_frame, TAG_CANCEL, TAG_COMPLETE, TAG_ERROR,
-    TAG_HELLO, TAG_INFO, TAG_SUBMIT,
+    encode_error, encode_hello, encode_info, read_frame, write_frame, ComponentHello, TAG_CANCEL,
+    TAG_COMPLETE, TAG_ERROR, TAG_HELLO, TAG_INFO, TAG_SUBMIT,
 };
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -315,7 +315,7 @@ fn serve(socket_path: &Path, allowed_uid: u32, backend: Backend) -> Result<(), S
         }
         if let Err(error) = handle_client(&stream, backend) {
             eprintln!("arcen-usb-helper: session ended: {error}");
-            let _ = write_frame(&mut &stream, TAG_ERROR, error.as_bytes());
+            let _ = write_frame(&mut &stream, TAG_ERROR, &encode_error(&error));
         }
         eprintln!("arcen-usb-helper: device released, awaiting next client");
     }
@@ -364,19 +364,18 @@ fn handle_client(stream: &UnixStream, backend: Backend) -> Result<(), String> {
             .map_err(|error| format!("clone socket: {error}"))?,
     );
 
-    let descriptors: Vec<(u8, &[u8])> = identity
-        .report_descriptors
-        .iter()
-        .map(|entry| (entry.interface, entry.descriptor.as_slice()))
-        .collect();
-    let hello = encode_hello(
-        identity.vendor_id,
-        identity.product_id,
-        identity.bcd_device,
-        identity.device_class,
-        speed_code(identity.speed),
-        &descriptors,
-    )?;
+    let hello = encode_hello(&ComponentHello {
+        vendor_id: identity.vendor_id,
+        product_id: identity.product_id,
+        bcd_device: identity.bcd_device,
+        device_class: identity.device_class,
+        speed: identity.speed,
+        report_descriptors: identity
+            .report_descriptors
+            .iter()
+            .map(|entry| (entry.interface, entry.descriptor.clone()))
+            .collect(),
+    })?;
     write_frame(&mut writer, TAG_HELLO, &hello).map_err(|error| {
         format!("send handshake with the tablet's HID report descriptors: {error}")
     })?;

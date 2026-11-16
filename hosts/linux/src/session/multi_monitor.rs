@@ -35,18 +35,17 @@ use arcen_media::{
     TopologyGeneration,
 };
 use arcen_outputs::admission::{
-    admit_regions, AdmissionGates, AdmissionOutcome, DegradeReason, GateClosed,
-    RegionAdmissionPolicy,
+    admit_regions, offer_max_monitors, AdmissionGates, AdmissionOutcome, DegradeReason, GateClosed,
+    OfferEncoder, OfferPolicy, RegionAdmissionPolicy,
 };
 use arcen_outputs::applied::{
     assemble_applied_regions, AppliedRegion, AppliedRegionAssembler, OriginTranslation,
 };
 use arcen_protocol::messages::{
     AdvertisedMultiMonitorOffer, AppliedMonitorDescriptorMsg, AppliedMonitorMediaPlanMsg,
-    AppliedMonitorTopologyMsg, AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg, AuthRequest,
-    AuthRequestMultiMonitorOfferError, ClientDisplayId, ClientDisplayIdError,
-    MultiMonitorCarrierMsg, MultiMonitorValidationError, RotationMsg, ServerMultiMonitorMsg,
-    TopologyBackendKindMsg,
+    AppliedMonitorTopologyMsg, AuthMultiMonitorOfferMsg, AuthMultiMonitorRequestMsg,
+    ClientDisplayId, ClientDisplayIdError, MultiMonitorCarrierMsg, MultiMonitorValidationError,
+    RotationMsg, ServerMultiMonitorMsg, TopologyBackendKindMsg,
 };
 use thiserror::Error;
 
@@ -89,9 +88,9 @@ pub struct MultiMonitorGate {
     /// Configured/discovered NVIDIA head inventory. `None`/empty means no
     /// heads are available to plan against regardless of `advertise_enabled`.
     pub inventory: Option<HeadInventory>,
-    /// This host's configured `video.encoder` policy. `Auto` (the type
-    /// default) and `WindowsMediaFoundation` withhold the offer outright
-    /// ([`build_offer`]); `NativeNvenc` and `SoftwareH264` are otherwise
+    /// This host's resolved `video.encoder` policy. `Auto` (the type
+    /// default), `WindowsMediaFoundation` and `SoftwareAv1` withhold the offer
+    /// outright ([`build_offer`]); `NativeNvenc` and `SoftwareH264` are otherwise
     /// admitted, with `SoftwareH264` additionally re-checked against the
     /// planned topology's exact geometry at admission time (see
     /// [`LinuxRegionAdmission::check_media_policy`]).
@@ -383,25 +382,30 @@ fn advertised_capability(inventory: &HeadInventory) -> Option<(u8, Vec<RotationM
 }
 
 /// Builds this host's pre-auth `multi_monitor_v1` offer for `AuthRequest`, or
-/// `None` when any gate is closed: operator gate disabled/no heads discovered
-/// or configured, the carrier gate is not yet open, or the configured
-/// `video.encoder` policy is not one this offer can ever honor
-/// (`Auto`/`WindowsMediaFoundation` — see [`MultiMonitorGate::encoder`]).
-/// Withholding the offer itself (rather than only rejecting admission later)
-/// means an incompatible-encoder host never advertises a capability it
-/// cannot deliver, so a client never even attempts to request it.
+/// `None` when the shared offer policy ([`offer_max_monitors`]) withholds it:
+/// the carrier gate is not yet open, the operator gate is disabled, no heads
+/// or proven virtual outputs are available, or the resolved encoder
+/// ([`MultiMonitorGate::encoder`]) is not one multi-monitor admission plans
+/// (`Auto`, `WindowsMediaFoundation`, `SoftwareAv1`). Withholding the offer
+/// itself (rather than only rejecting admission later) means an
+/// incompatible-encoder host never advertises a capability it cannot
+/// deliver, so a client never even attempts to request it.
 #[must_use]
 pub fn build_offer(gate: &MultiMonitorGate) -> Option<AuthMultiMonitorOfferMsg> {
-    if !MULTI_MONITOR_CARRIER_READY || !gate.advertise_enabled {
-        return None;
-    }
-    if matches!(
-        gate.encoder,
-        EncoderSelection::Auto | EncoderSelection::WindowsMediaFoundation
-    ) {
-        return None;
-    }
-    let (max_monitors, supported_rotations) = gate.advertised()?;
+    let advertised = gate.advertised();
+    let max_monitors = offer_max_monitors(&OfferPolicy {
+        gates: AdmissionGates {
+            carrier_ready: MULTI_MONITOR_CARRIER_READY,
+            operator_enabled: gate.advertise_enabled,
+            inventory_available: advertised.is_some(),
+            offer_advertised: false,
+        },
+        encoder: OfferEncoder::Resolved(gate.encoder),
+        host_capacity: advertised.as_ref().map(|(max, _)| usize::from(*max)),
+        operator_ceiling: None,
+    })
+    .ok()?;
+    let (_, supported_rotations) = advertised?;
     AuthMultiMonitorOfferMsg::new(max_monitors, supported_rotations, OFFERED_CARRIERS.to_vec()).ok()
 }
 
@@ -437,22 +441,21 @@ pub fn admit_requested_topology(
 
 /// This host's implementation of the shared multi-region admission steps.
 ///
-/// Holds the `AuthRequest` wrapper for this connection's offer so the
-/// advertised-offer evidence is derived once, then borrowed by both the offer
-/// and carrier steps.
+/// Borrows this connection's offer; the offer and carrier steps both take
+/// their evidence from it (`AdvertisedMultiMonitorOffer::from_offer`).
 struct LinuxRegionAdmission<'a> {
     gate: &'a MultiMonitorGate,
     inventory: Option<&'a HeadInventory>,
     /// `Some` exactly when this host advertised an offer on this connection.
-    offer: Option<AuthRequest>,
+    offer: Option<&'a AuthMultiMonitorOfferMsg>,
 }
 
 impl<'a> LinuxRegionAdmission<'a> {
-    fn new(gate: &'a MultiMonitorGate, offer: Option<&AuthMultiMonitorOfferMsg>) -> Self {
+    fn new(gate: &'a MultiMonitorGate, offer: Option<&'a AuthMultiMonitorOfferMsg>) -> Self {
         Self {
             gate,
             inventory: gate.usable_inventory(),
-            offer: offer.map(offer_wrapper),
+            offer,
         }
     }
 
@@ -465,26 +468,15 @@ impl<'a> LinuxRegionAdmission<'a> {
         }
     }
 
-    /// The only public way to obtain `AdvertisedMultiMonitorOffer` evidence is
-    /// through `AuthRequest::required_multi_monitor_v1_offer()`; the stored
-    /// wrapper always carries `Some(offer)`, and the shared `offer_advertised`
-    /// gate already refused a connection without one, so neither `None` here
-    /// nor `Missing` below actually triggers (kept as typed, non-panicking
-    /// fallbacks rather than an `unreachable!()` in case that invariant ever
-    /// changes upstream).
+    /// The offer's evidence. The shared `offer_advertised` gate already
+    /// refused a connection without an offer, so `None` here is a typed,
+    /// non-panicking fallback.
     fn advertised(&self) -> Result<AdvertisedMultiMonitorOffer<'_>, MultiMonitorDegradeReason> {
-        let Some(wrapper) = self.offer.as_ref() else {
+        let Some(offer) = self.offer else {
             return Err(MultiMonitorDegradeReason::NotAdvertised);
         };
-        match wrapper.required_multi_monitor_v1_offer() {
-            Ok(advertised) => Ok(advertised),
-            Err(AuthRequestMultiMonitorOfferError::Missing) => {
-                Err(MultiMonitorDegradeReason::NotAdvertised)
-            }
-            Err(AuthRequestMultiMonitorOfferError::Invalid(error)) => {
-                Err(MultiMonitorDegradeReason::ExceedsAdvertisedOffer(error))
-            }
-        }
+        AdvertisedMultiMonitorOffer::from_offer(offer)
+            .map_err(MultiMonitorDegradeReason::ExceedsAdvertisedOffer)
     }
 }
 
@@ -568,25 +560,6 @@ impl RegionAdmissionPolicy for LinuxRegionAdmission<'_> {
     ) -> Result<(), MultiMonitorDegradeReason> {
         validate_uniform_exact_encoder_policy(plan, self.gate.encoder)
             .map_err(MultiMonitorDegradeReason::EncoderPolicyRejected)
-    }
-}
-
-/// Wraps a validated pre-auth offer in the minimal [`AuthRequest`] shape
-/// needed to obtain the shared protocol crate's
-/// [`AdvertisedMultiMonitorOffer`] evidence type (the only public
-/// constructor for it), mirroring the exact `AuthRequest` this host already
-/// sent to the client for this connection (see
-/// `net::server::build_auth_request`) without re-deriving the shared
-/// crate's own max-monitors/rotation/carrier validation here.
-fn offer_wrapper(offer: &AuthMultiMonitorOfferMsg) -> AuthRequest {
-    AuthRequest {
-        msg_type: String::new(),
-        auth_methods: Vec::new(),
-        challenge: String::new(),
-        salt: String::new(),
-        auth_mode: None,
-        disclaimer: None,
-        multi_monitor_v1: Some(offer.clone()),
     }
 }
 
@@ -895,6 +868,14 @@ mod tests {
     fn offer_is_withheld_when_the_encoder_policy_is_windows_media_foundation() {
         // The Windows-only backend is never valid on this Linux host.
         let gate = enabled_gate_with_encoder(2, EncoderSelection::WindowsMediaFoundation);
+        assert!(build_offer(&gate).is_none());
+    }
+
+    #[test]
+    fn offer_is_withheld_when_the_encoder_policy_is_software_av1() {
+        // Admission (`validate_uniform_exact_encoder_policy`) refuses AV1, so
+        // the offer must not promise it.
+        let gate = enabled_gate_with_encoder(2, EncoderSelection::SoftwareAv1);
         assert!(build_offer(&gate).is_none());
     }
 

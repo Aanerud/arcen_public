@@ -234,7 +234,19 @@ pub struct RateHints {
     /// and the queue it builds drains on its own; on its own interval it is
     /// not evidence that the path is filling.
     pub keyframe_bytes: u64,
+    /// Exact still image sent on its own lane in this interval and pauses
+    /// for the next one
+    /// (`arcen_media::refine::budget::RefineRateDecision::refine_active`).
+    /// Queueing in such an interval may be refinement's own: the controller
+    /// does not cut for delay then, and the next interval, with refinement
+    /// idle, decides. Loss always counts.
+    pub refine_active: bool,
 }
+
+/// Consecutive intervals a delay cut may wait for refinement to yield. A
+/// refinement budget that pauses as it should never needs the second; the
+/// bound keeps real congestion from waiting on one that does not.
+pub const MAX_REFINE_DEFERRALS: u32 = 2;
 
 /// The loss a controller acted on: measured over at least
 /// [`RateControlPolicy::min_loss_sample_packets`] sent packets, possibly
@@ -352,6 +364,8 @@ pub struct RateController {
     /// packets: neither clear nor congested until the pool is judged.
     loss_unresolved: bool,
     bitrate_bound: bool,
+    refine_deferrals: u32,
+    last_refine_deferral: Option<RateChangeReason>,
 }
 
 /// Delivered share of the target at which a stream counts as spending it.
@@ -389,7 +403,16 @@ impl RateController {
             interval_loss: None,
             loss_unresolved: false,
             bitrate_bound: false,
+            refine_deferrals: 0,
+            last_refine_deferral: None,
         }
+    }
+
+    /// The delay signal the last interval did not act on because
+    /// refinement was sending in it (see [`RateHints::refine_active`]).
+    #[must_use]
+    pub const fn last_refine_deferral(&self) -> Option<RateChangeReason> {
+        self.last_refine_deferral
     }
 
     /// The loss evidence the last interval acted on; `None` while a quiet
@@ -455,8 +478,26 @@ impl RateController {
         let previous = self.target_bps;
         self.note_spend(sample, previous);
         let mut reason = None;
-        if let Some(event) = self.congestion_event(sample, hints) {
+        self.last_refine_deferral = None;
+        let event = self.congestion_event(sample, hints);
+        let deferred = event.filter(|event| {
+            hints.refine_active
+                && matches!(
+                    event.reason,
+                    RateChangeReason::QueueDelay | RateChangeReason::FrameWait
+                )
+                && self.refine_deferrals < MAX_REFINE_DEFERRALS
+        });
+        if let Some(event) = deferred {
+            // Queueing while refinement sends: refinement pauses first, and
+            // the next interval says whether the queue was the path's.
+            self.refine_deferrals += 1;
+            self.last_refine_deferral = Some(event.reason);
+        } else if let Some(event) = event {
             if let Some(target) = self.cooldown_cut_target(sample, previous, event) {
+                // Only a cut ends the deferral run: an event the cut
+                // cooldown suppresses has not answered the queue yet.
+                self.refine_deferrals = 0;
                 self.remember_knee(previous);
                 self.target_bps = target;
                 self.hold = self.knee_hold_intervals();
@@ -468,6 +509,7 @@ impl RateController {
                 reason = Some(event.reason);
             }
         } else if self.path_is_clear(sample) {
+            self.refine_deferrals = 0;
             self.knee_age = self.knee_age.saturating_add(sample.elapsed);
             if self.hold > 0 && previous != self.policy.floor_bps {
                 self.hold -= 1;
@@ -2032,6 +2074,7 @@ mod tests {
     fn a_keyframe_spike_alone_does_not_cut() {
         let keyframe = RateHints {
             keyframe_bytes: 180_000,
+            ..RateHints::default()
         };
         let mut rate = grading_controller();
         let spike = rate.observe_with(sample(1.4, 2, path(146, 33, 0, 0)), keyframe);
@@ -2052,6 +2095,7 @@ mod tests {
     fn a_keyframe_spike_that_persists_still_cuts() {
         let keyframe = RateHints {
             keyframe_bytes: 180_000,
+            ..RateHints::default()
         };
         let mut rate = grading_controller();
         let _ = rate.observe_with(sample(4.6, 2, path(146, 33, 0, 0)), keyframe);
@@ -2142,5 +2186,68 @@ mod tests {
             probed,
             "a quiet loss-free stream keeps probing while pooling"
         );
+    }
+
+    #[test]
+    fn delay_while_refinement_sends_waits_for_refinement_but_not_forever() {
+        let refining = RateHints {
+            refine_active: true,
+            ..RateHints::default()
+        };
+        let queued = sample(4.0, 2, path(80, 33, 0, 0));
+        let mut rate = RateController::new(RateControlPolicy::for_bounds(START, CEILING));
+        for _ in 0..MAX_REFINE_DEFERRALS {
+            assert_eq!(rate.observe_with(queued, refining), None);
+            assert_eq!(
+                rate.last_refine_deferral(),
+                Some(RateChangeReason::QueueDelay)
+            );
+            assert_eq!(rate.target_bps(), START);
+        }
+        // A refinement budget that never yields cannot hold the video up.
+        let cut = rate.observe_with(queued, refining).expect("cut");
+        assert_eq!(cut.reason, RateChangeReason::QueueDelay);
+        assert_eq!(rate.last_refine_deferral(), None);
+        // Loss is never deferred.
+        let mut lossy = RateController::new(RateControlPolicy::for_bounds(START, CEILING));
+        let lost = sample(4.0, 2, path_with_packets(40, 33, 3, 30, 600));
+        let cut = lossy.observe_with(lost, refining).expect("loss cut");
+        assert_eq!(cut.reason, RateChangeReason::LossOrCongestion);
+    }
+
+    #[test]
+    fn a_cooldown_suppressed_event_does_not_restart_the_deferrals() {
+        let refining = RateHints {
+            refine_active: true,
+            ..RateHints::default()
+        };
+        let mut rate = RateController::new(RateControlPolicy::for_bounds(START, CEILING));
+        let queued = sample(4.0, 2, path(60, 33, 0, 0));
+        // A cut starts the cooldown.
+        let _ = rate.observe(queued);
+        let first = rate.observe(queued).expect("first cut");
+        // Deferred twice, then the cooldown suppresses a non-severe event:
+        // the next refining interval may not be deferred again.
+        let mut cuts = vec![first.target_bps];
+        for _ in 0..8 {
+            if let Some(change) = rate.observe_with(queued, refining) {
+                if change.target_bps < change.previous_bps {
+                    cuts.push(change.target_bps);
+                }
+            }
+        }
+        let mut plain = RateController::new(RateControlPolicy::for_bounds(START, CEILING));
+        let _ = plain.observe(queued);
+        let mut plain_cuts = vec![plain.observe(queued).expect("first cut").target_bps];
+        for _ in 0..8 {
+            if let Some(change) = plain.observe(queued) {
+                if change.target_bps < change.previous_bps {
+                    plain_cuts.push(change.target_bps);
+                }
+            }
+        }
+        // The deferrals fall inside the cooldown, so the video is cut as
+        // often as without refinement.
+        assert_eq!(cuts, plain_cuts);
     }
 }

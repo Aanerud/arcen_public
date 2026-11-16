@@ -15,6 +15,7 @@
 //!
 //! See `docs/adr/0011-macos-privileged-usb-helper.md`.
 
+use arcen_usb_bridge::{DeckPlatform, NativeComponentAction, NativeUsbComponentState};
 use objc2_foundation::NSString;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
@@ -50,25 +51,25 @@ pub enum HelperInstallState {
 }
 
 impl HelperInstallState {
+    /// The shared component state this registration status means. Every word
+    /// the Deck shows about the helper comes from there, so the macOS and
+    /// Windows Decks say the same thing for the same state.
+    #[must_use]
+    pub const fn component_state(self) -> NativeUsbComponentState {
+        match self {
+            Self::Enabled => NativeUsbComponentState::Ready,
+            Self::RequiresApproval => NativeUsbComponentState::AwaitingApproval,
+            Self::NotRegistered | Self::NotFound => NativeUsbComponentState::NotInstalled,
+            Self::UnsupportedOs => NativeUsbComponentState::UnsupportedOs,
+            Self::Unknown(_) => NativeUsbComponentState::Unknown,
+        }
+    }
+
     /// Human-readable guidance, so the UI never has to invent wording for a
     /// state it did not expect.
     #[must_use]
-    pub const fn guidance(self) -> &'static str {
-        match self {
-            Self::Enabled => "The Arcen USB helper is installed and approved.",
-            Self::RequiresApproval => {
-                "Approve the Arcen USB helper in System Settings > General > Login Items, \
-                 then reconnect."
-            }
-            Self::NotRegistered | Self::NotFound => {
-                "Native tablet mode needs the Arcen USB helper. Installing it asks for an \
-                 administrator approval once."
-            }
-            Self::UnsupportedOs => {
-                "Native tablet requires macOS 13 or later. Use Tablet support on this Mac."
-            }
-            Self::Unknown(_) => "The Arcen USB helper is in an unrecognised state.",
-        }
+    pub fn guidance(self) -> String {
+        self.component_state().guidance(DeckPlatform::MacOs)
     }
 
     /// Whether Hard USB can be attempted without further user action.
@@ -82,14 +83,8 @@ impl HelperInstallState {
     /// Short enough to live on the option's own row: the row states where the
     /// helper stands, and the description below explains why it is needed.
     #[must_use]
-    pub const fn action_label(self) -> &'static str {
-        match self {
-            Self::Enabled => "Helper installed",
-            Self::RequiresApproval => "Approve helper…",
-            Self::NotRegistered | Self::NotFound => "Install helper…",
-            Self::UnsupportedOs => "Requires macOS 13",
-            Self::Unknown(_) => "Check helper…",
-        }
+    pub fn action_label(self) -> &'static str {
+        self.component_state().action_label(DeckPlatform::MacOs)
     }
 
     /// What clicking that control must do.
@@ -98,12 +93,15 @@ impl HelperInstallState {
     /// it for a daemon that has simply never been registered, so the only
     /// useful response is the same one `NotRegistered` gets.
     #[must_use]
-    pub const fn action(self) -> HelperAction {
-        match self {
-            Self::Enabled => HelperAction::Recheck,
-            Self::RequiresApproval => HelperAction::Approve,
-            Self::NotRegistered | Self::NotFound => HelperAction::Install,
-            Self::UnsupportedOs | Self::Unknown(_) => HelperAction::Recheck,
+    pub fn action(self) -> HelperAction {
+        match self.component_state().action() {
+            NativeComponentAction::Install => HelperAction::Install,
+            NativeComponentAction::Approve => HelperAction::Approve,
+            // A launchd daemon starts itself once approved, and macOS needs no
+            // per-tablet preparation, so neither maps to a different step.
+            NativeComponentAction::Start
+            | NativeComponentAction::Prepare
+            | NativeComponentAction::Recheck => HelperAction::Recheck,
         }
     }
 }
@@ -269,6 +267,26 @@ mod tests {
                 !state.is_ready(),
                 "{state:?} must not be treated as ready for Hard USB"
             );
+        }
+    }
+
+    #[test]
+    fn the_deck_shows_the_shared_component_wording() {
+        for state in [
+            HelperInstallState::Enabled,
+            HelperInstallState::RequiresApproval,
+            HelperInstallState::NotRegistered,
+            HelperInstallState::NotFound,
+            HelperInstallState::UnsupportedOs,
+            HelperInstallState::Unknown(9),
+        ] {
+            let shared = state.component_state();
+            assert_eq!(state.guidance(), shared.guidance(DeckPlatform::MacOs));
+            assert_eq!(
+                state.action_label(),
+                shared.action_label(DeckPlatform::MacOs)
+            );
+            assert_eq!(state.is_ready(), shared.is_ready(), "{state:?}");
         }
     }
 

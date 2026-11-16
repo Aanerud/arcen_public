@@ -364,6 +364,9 @@ struct PlannedInterface {
     input_length: u16,
     country_code: u8,
     report_descriptor: Vec<u8>,
+    /// Whether it becomes a published HID device; a host-read interface
+    /// the publish policy withholds is polled for the host alone.
+    published: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -383,6 +386,7 @@ pub struct HidHostAdapter {
     guard: BridgedDeviceGuard,
     policy: HidPublishPolicy,
     withheld: Vec<(u8, PublishRefusal)>,
+    host_read: Option<u8>,
     phase: HidHostPhase,
     started: Option<Instant>,
     next_urb: u32,
@@ -418,6 +422,7 @@ impl HidHostAdapter {
             generation,
             policy: HidPublishPolicy::AllAuthorized,
             withheld: Vec::new(),
+            host_read: None,
             phase: HidHostPhase::Idle,
             started: None,
             next_urb: 0,
@@ -440,11 +445,35 @@ impl HidHostAdapter {
 
     /// Publishes only the interfaces `policy` allows (default: every
     /// authorized one). Withheld interfaces are enumerated with the device
-    /// but get no HID device and are never polled.
+    /// but get no HID device and are never polled, except the host-read one
+    /// ([`Self::with_host_read_interface`]).
     #[must_use]
     pub const fn with_publish_policy(mut self, policy: HidPublishPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Polls USB interface `interface` for the host itself even when the
+    /// publish policy withholds it: its reports arrive as
+    /// [`HidHostOutput::Report`] at [`Self::host_read_index`] and never
+    /// reach a published device. A host that reads a pen itself uses this
+    /// for a pen interface that also declares, say, a keyboard collection
+    /// (ADR 0023 amendment, 2026-11-15): nothing it declares is published.
+    #[must_use]
+    pub const fn with_host_read_interface(mut self, interface: u8) -> Self {
+        self.host_read = Some(interface);
+        self
+    }
+
+    /// The report index of the host-read interface, once the device is
+    /// planned: after the published devices when it is not one of them.
+    #[must_use]
+    pub fn host_read_index(&self) -> Option<u8> {
+        let number = self.host_read?;
+        self.interfaces
+            .iter()
+            .position(|interface| interface.number == number)
+            .and_then(|index| u8::try_from(index).ok())
     }
 
     /// Authorized interfaces the publish policy withheld, and why.
@@ -971,10 +1000,16 @@ impl HidHostAdapter {
                     "interface {number} was not authorized"
                 )));
             };
-            if let Err(refusal) = crate::publishable(self.policy, &claim.descriptor) {
-                self.withheld.push((number, refusal));
-                continue;
-            }
+            let published = match crate::publishable(self.policy, &claim.descriptor) {
+                Ok(()) => true,
+                Err(refusal) => {
+                    self.withheld.push((number, refusal));
+                    if self.host_read != Some(number) {
+                        continue;
+                    }
+                    false
+                }
+            };
             let Some(endpoint) = interface
                 .endpoints
                 .iter()
@@ -997,8 +1032,12 @@ impl HidHostAdapter {
                 input_length: u16::try_from(length).unwrap_or(u16::MAX),
                 country_code: countries.get(&number).copied().unwrap_or(0),
                 report_descriptor: claim.descriptor.clone(),
+                published,
             });
         }
+        // Published devices first, so their plan index is their position;
+        // a host-read interface that is not published follows them.
+        interfaces.sort_by_key(|interface| !interface.published);
         if interfaces.is_empty() && !self.withheld.is_empty() {
             return Err(HidHostError::NothingPublishable);
         }
@@ -1223,6 +1262,7 @@ impl HidHostAdapter {
         self.interfaces
             .iter()
             .enumerate()
+            .filter(|(_, interface)| interface.published)
             .map(|(index, interface)| {
                 let (primary_usage_page, primary_usage) =
                     parse_report_descriptor(&interface.report_descriptor)

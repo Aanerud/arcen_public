@@ -40,10 +40,12 @@ use arcen_protocol::messages::{
     TabletModeResultMsg,
 };
 
-/// How long a client has to answer the credential prompt.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the whole application handshake may occupy the one session slot.
-const APPLICATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a client has to answer the credential prompt: the same for every
+/// Pier.
+const AUTH_TIMEOUT: Duration = arcen_session::session_admission::AUTH_RESPONSE_TIMEOUT;
+/// How long the whole application handshake may take: the sign-in prompt plus
+/// the shared per-message bound for the hello and settings around it.
+use arcen_session::session_admission::APPLICATION_HANDSHAKE_TIMEOUT;
 
 /// What the Pier told the Deck about itself.
 #[allow(clippy::struct_excessive_bools)]
@@ -144,6 +146,9 @@ pub struct SessionPolicy {
     pub serving_uid: Option<u32>,
     /// This process serves the login window rather than a user's desktop.
     pub login_window: bool,
+    /// `video.lossless_refinement`: the administrator's exact-still-image
+    /// switch (on unless turned off).
+    pub lossless_refinement: bool,
 }
 
 impl SessionPolicy {
@@ -164,6 +169,9 @@ impl SessionPolicy {
             encoder: encoder_capabilities(),
             serving_uid: None,
             login_window: false,
+            lossless_refinement: arcen_session::pier_config::LosslessRefinementSetting::resolve(
+                config.video.lossless_refinement,
+            ),
         })
     }
 }
@@ -180,6 +188,7 @@ impl Default for SessionPolicy {
             encoder: encoder_capabilities(),
             serving_uid: None,
             login_window: false,
+            lossless_refinement: true,
         }
     }
 }
@@ -203,6 +212,9 @@ pub struct Handshake {
     pub display_id: u32,
     /// The raw `client_hello` the Deck replied with.
     pub client_hello: String,
+    /// The Deck types committed text and this host types it, so the Deck is
+    /// told this session's keyboard layout (`host_keymap`).
+    pub host_keymap: bool,
     /// What audio this session will carry, resolved from host policy and the
     /// Deck's advertised output capability.
     ///
@@ -295,6 +307,9 @@ pub struct Handshake {
     pub input_mode_results: crate::stream::InputModeResults,
     /// The Deck time-zone identifier supplied with the authenticated request.
     pub authenticated_timezone: Option<String>,
+    /// Exact still image: the shared plan the hello stated, which the
+    /// stream carries out (ADR 0016).
+    pub refine: arcen_media::refine::RefinePlan,
 }
 
 /// The desktop size the Deck asked to be sent.
@@ -543,6 +558,9 @@ pub enum HandshakeError {
     MultiMonitor(String),
     /// The client's auth-time video request was invalid.
     VideoRequest(String),
+    /// The credentials were accepted and the Deck was told why the session
+    /// cannot start.
+    SetupRefused(arcen_session::session_setup::SetupRefusal),
     /// No measured encoder can serve even the compatibility stream.
     EncoderUnavailable(String),
 }
@@ -563,6 +581,7 @@ impl std::fmt::Display for HandshakeError {
             Self::Rejected(failure) => write!(formatter, "authentication refused: {failure}"),
             Self::MultiMonitor(detail) => write!(formatter, "multi-monitor refused: {detail}"),
             Self::VideoRequest(detail) => write!(formatter, "video request refused: {detail}"),
+            Self::SetupRefused(refusal) => write!(formatter, "session setup refused: {refusal}"),
             Self::EncoderUnavailable(detail) => write!(formatter, "encoder unavailable: {detail}"),
         }
     }
@@ -856,7 +875,57 @@ pub fn server_hello_json_for(
         None,
         None,
         (capabilities.width, capabilities.height),
+        None,
     )
+}
+
+/// Exact still image (ADR 0016): the shared plan for a session of `plan`.
+/// Grading and HDR are captured as `ScreenCaptureKit` `xf44`, ten-bit
+/// Y′CbCr 4:4:4 full range, and refined in that Y′CbCr domain
+/// ([`crate::refine`]); Auto and Speed are eight-bit and several displays
+/// are never refined. A Deck that did not ask (`deck` is `None`) is
+/// `deck_unsupported`.
+#[must_use]
+pub fn lossless_refine_plan(
+    deck: Option<&arcen_protocol::refine::LosslessRefineCapability>,
+    plan: &arcen_media::session_plan::ResolvedVideoPlan,
+    multi_monitor: bool,
+    operator_enabled: bool,
+) -> arcen_media::refine::RefinePlan {
+    use arcen_media::refine::CaptureRefineFacts;
+    use arcen_media::session_plan::{PlanBitDepth, PlanChroma};
+    let transfer = arcen_media::TransferCharacteristics::from_token(plan.transfer)
+        .unwrap_or(arcen_media::TransferCharacteristics::Bt709);
+    arcen_media::refine::plan_for_capture(
+        crate::refine::COMPILED,
+        operator_enabled,
+        deck,
+        CaptureRefineFacts {
+            depth: match plan.bit_depth {
+                PlanBitDepth::Eight => arcen_media::BitDepth::Eight,
+                PlanBitDepth::Ten => arcen_media::BitDepth::Ten,
+            },
+            chroma: match plan.chroma {
+                PlanChroma::Yuv420 => arcen_media::ChromaSubsampling::Yuv420,
+                PlanChroma::Yuv444 => arcen_media::ChromaSubsampling::Yuv444,
+            },
+            transfer,
+            primaries: arcen_media::ColorPrimaries::from_token(plan.primaries)
+                .unwrap_or(arcen_media::ColorPrimaries::Bt709),
+            source: crate::refine::source_kind(transfer),
+            single_monitor: !multi_monitor,
+        },
+    )
+}
+
+/// The hello's `lossless_refine` for a Deck that asked; `None` when it did
+/// not (an older Deck never sees the field).
+#[must_use]
+pub fn lossless_refine_status(
+    deck: Option<&arcen_protocol::refine::LosslessRefineCapability>,
+    refine: &arcen_media::refine::RefinePlan,
+) -> Option<arcen_protocol::refine::LosslessRefineStatusMsg> {
+    deck.map(|_| refine.hello_status())
 }
 
 /// Builds the `server_hello`, optionally attaching the applied multi-monitor
@@ -870,6 +939,7 @@ pub fn server_hello_json_for_multi(
     active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     multi_monitor: Option<&crate::multi_monitor::MacOsMultiMonitorPlan>,
     picture: (u32, u32),
+    lossless_refine: Option<arcen_protocol::refine::LosslessRefineStatusMsg>,
 ) -> String {
     use arcen_protocol::messages::{
         InputCapabilitiesMsg, InputCapabilityAvailability, SERVER_HELLO, ServerColorCaps,
@@ -1056,6 +1126,7 @@ pub fn server_hello_json_for_multi(
         // rejects a hello that names a different transport than the one it
         // dialled.
         negotiated_transport: Some(arcen_transport::CAPABILITY_TRANSPORT_QUIC.to_owned()),
+        lossless_refine,
     }
     .with_build_identity(crate::build_identity());
 
@@ -1075,54 +1146,23 @@ pub fn server_hello_json_for_multi(
 
 /// Failed sign-ins, per source address and per account, shared by every
 /// session this process serves.
-static AUTH_THROTTLE: std::sync::LazyLock<
-    std::sync::Mutex<arcen_session::auth_throttle::AuthThrottle>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(arcen_session::auth_throttle::AuthThrottle::new(
-        arcen_session::auth_throttle::AuthThrottlePolicy::default(),
-    ))
-});
-static AUTH_THROTTLE_EPOCH: std::sync::LazyLock<std::time::Instant> =
-    std::sync::LazyLock::new(std::time::Instant::now);
+static AUTH_THROTTLE: std::sync::LazyLock<arcen_session::auth_throttle::HostAuthThrottle> =
+    std::sync::LazyLock::new(arcen_session::auth_throttle::HostAuthThrottle::default);
 
-fn throttle_keys(
-    peer: Option<std::net::IpAddr>,
-    username: &str,
-) -> Vec<arcen_session::auth_throttle::ThrottleKey> {
-    let mut keys = vec![arcen_session::auth_throttle::ThrottleKey::account(username)];
-    if let Some(peer) = peer {
-        keys.push(arcen_session::auth_throttle::ThrottleKey::Source(
-            peer.to_string(),
-        ));
-    }
-    keys
-}
-
-fn throttle_retry_after(keys: &[arcen_session::auth_throttle::ThrottleKey]) -> Option<Duration> {
-    let now = AUTH_THROTTLE_EPOCH.elapsed();
-    AUTH_THROTTLE
-        .lock()
-        .ok()
-        .and_then(|throttle| throttle.retry_after(keys, now))
-}
-
-fn throttle_record(
-    keys: &[arcen_session::auth_throttle::ThrottleKey],
+/// What the throttle learns from a sign-in. Only a credential or account the
+/// directory refused counts; a host that could not start PAM has not learned
+/// anything about the person asking.
+const fn throttle_outcome(
     checked: &Result<crate::auth::Authenticated, crate::auth::AuthFailure>,
-) {
-    let now = AUTH_THROTTLE_EPOCH.elapsed();
-    let Ok(mut throttle) = AUTH_THROTTLE.lock() else {
-        return;
-    };
+) -> arcen_session::auth_throttle::AttemptOutcome {
+    use arcen_session::auth_throttle::AttemptOutcome;
     match checked {
-        Ok(_) => throttle.record_success(keys),
-        // Only a credential the directory refused counts. A host that could
-        // not start PAM has not learned anything about the person asking.
+        Ok(_) => AttemptOutcome::Accepted,
         Err(
             crate::auth::AuthFailure::InvalidCredentials
             | crate::auth::AuthFailure::AccountNotPermitted,
-        ) => throttle.record_failure(keys, now),
-        Err(_) => {}
+        ) => AttemptOutcome::Refused,
+        Err(_) => AttemptOutcome::Undecided,
     }
 }
 
@@ -1299,8 +1339,11 @@ async fn perform_application_handshake(
         cursor_mode,
         authenticated_timezone,
         admission,
+        deck_refine,
+        admitted_video,
     ) = authenticate(
         socket,
+        &advertised,
         advertised.multi_monitor_v1.clone(),
         policy.serving_uid,
         peer,
@@ -1389,7 +1432,7 @@ async fn perform_application_handshake(
             "HDR desktop proof"
         );
     }
-    let resolved_video = resolve_initial_video(initial_video.as_ref(), &advertised, hdr_output)?;
+    let resolved_video = plan_initial_video(admitted_video, &advertised, hdr_output);
     let plan = resolved_video.plan;
     // Resolved before the hello is built, because the hello states the codec
     // the Deck is about to receive. Reporting the host's capability there
@@ -1425,6 +1468,23 @@ async fn perform_application_handshake(
     )
     .await;
 
+    let refine = lossless_refine_plan(
+        deck_refine.as_ref(),
+        &plan,
+        multi_monitor.is_some(),
+        policy.lossless_refinement,
+    );
+    tracing::info!(
+        target: arcen_telemetry::names::target::MEDIA,
+        state = if refine.is_on() { "on" } else { "off" },
+        reason = match refine {
+            arcen_media::refine::RefinePlan::Off(reason) => reason.token(),
+            arcen_media::refine::RefinePlan::On { .. } => "",
+        },
+        deck_asked = deck_refine.is_some(),
+        "{}",
+        arcen_telemetry::names::refine::PLAN
+    );
     net::send_json(
         socket,
         server_hello_json_for_multi(
@@ -1435,6 +1495,7 @@ async fn perform_application_handshake(
             active_pipeline.clone(),
             multi_monitor.as_ref(),
             (capture_width, capture_height),
+            lossless_refine_status(deck_refine.as_ref(), &refine),
         ),
     )
     .await
@@ -1522,6 +1583,7 @@ async fn perform_application_handshake(
         active_pipeline,
         user,
         display_id,
+        host_keymap: tells_host_keymap(&advertised, client_hello.as_ref()),
         advertised,
         client_hello: reply,
         plan,
@@ -1541,7 +1603,21 @@ async fn perform_application_handshake(
         admission,
         login_window: policy.login_window,
         authenticated_timezone,
+        refine,
     })
+}
+
+/// Whether a session tells the Deck its keyboard layout: the host types
+/// committed text and the Deck said it sends it (and so reads the notice).
+#[must_use]
+pub fn tells_host_keymap(
+    advertised: &AdvertisedCapabilities,
+    client_hello: Option<&arcen_protocol::messages::ClientHelloMsg>,
+) -> bool {
+    advertised.text_input
+        && client_hello.is_some_and(|hello| {
+            arcen_protocol::messages::supports_text_commit_v1(hello.input_capabilities)
+        })
 }
 
 /// Settles the cursor and tablet modes of a session from the Deck's hello,
@@ -1894,16 +1970,29 @@ fn requests_pq(video: &arcen_protocol::messages::InitialVideoRequestMsg) -> bool
     })
 }
 
-/// Resolves the auth-time video request through the shared media policy.
-#[allow(clippy::too_many_lines)]
-fn resolve_initial_video(
+/// The auth-time video request checked against this host: everything about
+/// it that can be refused, decided before the Deck is answered
+/// (`arcen_session::session_setup`).
+#[derive(Debug, Clone, Copy)]
+struct AdmittedInitialVideo {
+    /// What the Deck asked for and what this host resolved it to; `None`
+    /// when the Deck stated no request.
+    request: Option<(
+        arcen_media::video::ResolvedClientVideoRequest,
+        arcen_media::video::ResolvedHostInitialVideo,
+    )>,
+    codec: crate::encode::EncoderCodec,
+}
+
+/// Checks the auth-time video request through the shared media policy.
+///
+/// Every refusal of a request happens here, and nothing here depends on the
+/// virtual display the session will create, so the Pier can answer
+/// `auth_result` with the reason before it arranges anything.
+fn admit_initial_video(
     video: Option<&arcen_protocol::messages::InitialVideoRequestMsg>,
     capabilities: &AdvertisedCapabilities,
-    hdr_output: bool,
-) -> Result<ResolvedInitialVideo, HandshakeError> {
-    use arcen_media::session_plan::{
-        ClientVideoRequest, HostVideoCapabilities, SelectionIntent, resolve_video_plan,
-    };
+) -> Result<AdmittedInitialVideo, HandshakeError> {
     use arcen_media::video::{
         HostInitialVideoPolicy, resolve_client_video_request,
         resolve_host_initial_video_with_supported_codecs,
@@ -1914,17 +2003,13 @@ fn resolve_initial_video(
     };
 
     let Some(video) = video else {
-        return Ok(ResolvedInitialVideo {
-            plan: arcen_media::session_plan::ResolvedVideoPlan::standard(None),
+        return Ok(AdmittedInitialVideo {
+            request: None,
             codec: if capabilities.hevc {
                 crate::encode::EncoderCodec::Hevc
             } else {
                 crate::encode::EncoderCodec::H264
             },
-            fps: 60,
-            motion_priority: arcen_media::video::MotionPriority::Detail,
-            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
-            active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Speed),
         });
     };
 
@@ -1972,6 +2057,45 @@ fn resolve_initial_video(
         },
     )
     .map_err(|error| HandshakeError::VideoRequest(error.to_string()))?;
+    let codec = match host_resolved.video.codec {
+        VideoCodec::H264 => crate::encode::EncoderCodec::H264,
+        VideoCodec::H265 => crate::encode::EncoderCodec::Hevc,
+        VideoCodec::Av1 | VideoCodec::Jpeg | VideoCodec::Vp9 => {
+            return Err(HandshakeError::VideoRequest(format!(
+                "macOS VideoToolbox cannot serve {}",
+                host_resolved.video.codec.token()
+            )));
+        }
+    };
+    Ok(AdmittedInitialVideo {
+        request: Some((client, host_resolved)),
+        codec,
+    })
+}
+
+/// Plans an admitted request on the display the session arranged; whether
+/// that display proved HDR (`hdr_output`) changes the plan, never whether the
+/// request is served.
+fn plan_initial_video(
+    admitted: AdmittedInitialVideo,
+    capabilities: &AdvertisedCapabilities,
+    hdr_output: bool,
+) -> ResolvedInitialVideo {
+    use arcen_media::TransferCharacteristics;
+    use arcen_media::session_plan::{
+        ClientVideoRequest, HostVideoCapabilities, SelectionIntent, resolve_video_plan,
+    };
+
+    let Some((client, host_resolved)) = admitted.request else {
+        return ResolvedInitialVideo {
+            plan: arcen_media::session_plan::ResolvedVideoPlan::standard(None),
+            codec: admitted.codec,
+            fps: 60,
+            motion_priority: arcen_media::video::MotionPriority::Detail,
+            requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
+            active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Speed),
+        };
+    };
     let intent = match client.selection {
         arcen_protocol::messages::VideoSelectionIntent::Exact => SelectionIntent::Exact,
         arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance => {
@@ -2031,23 +2155,28 @@ fn resolve_initial_video(
         .map_or(client.motion_priority, |pipeline| {
             arcen_media::video::pipeline_contract(pipeline).priority
         });
-    Ok(ResolvedInitialVideo {
+    ResolvedInitialVideo {
         plan,
-        codec: match host_resolved.video.codec {
-            VideoCodec::H264 => crate::encode::EncoderCodec::H264,
-            VideoCodec::H265 => crate::encode::EncoderCodec::Hevc,
-            VideoCodec::Av1 | VideoCodec::Jpeg | VideoCodec::Vp9 => {
-                return Err(HandshakeError::VideoRequest(format!(
-                    "macOS VideoToolbox cannot serve {}",
-                    host_resolved.video.codec.token()
-                )));
-            }
-        },
+        codec: admitted.codec,
         fps: host_resolved.max_fps,
         motion_priority,
         requested_pipeline: host_resolved.pipeline,
         active_pipeline: Some(served_pipeline),
-    })
+    }
+}
+
+/// Admits and plans the auth-time video request in one step.
+#[cfg(test)]
+fn resolve_initial_video(
+    video: Option<&arcen_protocol::messages::InitialVideoRequestMsg>,
+    capabilities: &AdvertisedCapabilities,
+    hdr_output: bool,
+) -> Result<ResolvedInitialVideo, HandshakeError> {
+    Ok(plan_initial_video(
+        admit_initial_video(video, capabilities)?,
+        capabilities,
+        hdr_output,
+    ))
 }
 
 /// Extracts the credentials a client supplied, if the method is one this host
@@ -2077,6 +2206,7 @@ fn credentials_from(response: &arcen_protocol::messages::AuthResponse) -> Option
 /// JSON, because the field names are not guessable.
 async fn authenticate(
     socket: &mut PierSocket,
+    capabilities: &AdvertisedCapabilities,
     multi_monitor_v1: Option<arcen_protocol::messages::AuthMultiMonitorOfferMsg>,
     serving_uid: Option<u32>,
     peer: Option<std::net::IpAddr>,
@@ -2091,6 +2221,8 @@ async fn authenticate(
         arcen_protocol::messages::CursorMode,
         Option<String>,
         Option<AdmissionGuard>,
+        Option<arcen_protocol::refine::LosslessRefineCapability>,
+        AdmittedInitialVideo,
     ),
     HandshakeError,
 > {
@@ -2138,31 +2270,72 @@ async fn authenticate(
     }
 
     let outcome = match credentials_from(&response) {
-        Some((username, credential)) => {
-            let keys = throttle_keys(peer, username);
-            if let Some(wait) = throttle_retry_after(&keys) {
+        Some((username, credential)) => match AUTH_THROTTLE.begin(peer, username) {
+            Err(refusal) => {
                 tracing::warn!(
                     target: arcen_telemetry::names::target::AUTH,
                     peer = ?peer,
-                    retry_after_secs = wait.as_secs(),
+                    retry_after_secs = refusal.retry_after.as_secs(),
                     "sign-in refused without checking the password: too many recent failures"
                 );
                 Err(crate::auth::AuthFailure::TooManyAttempts)
-            } else {
+            }
+            Ok(attempt) => {
                 let username = username.to_owned();
                 let credential = Zeroizing::new(credential.to_owned());
-                let checked = authenticate_credentials(username, credential).await;
-                throttle_record(&keys, &checked);
+                let checked = tokio::time::timeout(
+                    arcen_session::session_admission::CREDENTIAL_CHECK_TIMEOUT,
+                    authenticate_credentials(username, credential),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        target: arcen_telemetry::names::target::AUTH,
+                        peer = ?peer,
+                        "the password check did not finish in time"
+                    );
+                    Err(crate::auth::AuthFailure::PolicyUnavailable)
+                });
+                attempt.finish(throttle_outcome(&checked));
                 checked
             }
-        }
+        },
         None => Err(crate::auth::AuthFailure::InvalidCredentials),
     };
     let outcome =
         outcome.and_then(|authenticated| admit_serving_account(authenticated, serving_uid));
+    // The video request, only once the account is proved and before the Deck
+    // is answered (`arcen_session::session_setup`): a request this host cannot
+    // serve is refused with its reason, is not a failed sign-in, and takes no
+    // session slot.
+    let outcome = match outcome {
+        Ok(authenticated) => {
+            match admit_initial_video(response.initial_video.as_ref(), capabilities) {
+                Ok(video) => Ok((authenticated, video)),
+                Err(error) => {
+                    let refusal =
+                        arcen_session::session_setup::SetupRefusal::video_request(match error {
+                            HandshakeError::VideoRequest(detail) => detail,
+                            other => other.to_string(),
+                        });
+                    let result = serde_json::to_string(&AuthResult::session_setup_refused(
+                        refusal.message(),
+                    ))
+                    .map_err(|error| {
+                        HandshakeError::Transport(format!("encode auth_result: {error}"))
+                    })?;
+                    net::send_json(socket, result)
+                        .await
+                        .map_err(HandshakeError::Transport)?;
+                    return Err(HandshakeError::SetupRefused(refusal));
+                }
+            }
+        }
+        Err(failure) => Err(failure),
+    };
     // The slot, only now that the account is proved and servable.
-    let outcome = outcome.and_then(|authenticated| match admission {
-        None => Ok((authenticated, None)),
+    let outcome = outcome.and_then(|(authenticated, video)| match admission {
+        None => Ok((authenticated, None, video)),
         Some(runtime) => match runtime.admit_new() {
             Ok(lease) => Ok((
                 authenticated,
@@ -2170,6 +2343,7 @@ async fn authenticate(
                     runtime: std::sync::Arc::clone(runtime),
                     lease: Some(lease),
                 }),
+                video,
             )),
             Err(_) => Err(crate::auth::AuthFailure::HostBusy),
         },
@@ -2201,7 +2375,7 @@ async fn authenticate(
         // credentials, so it is carried out of here rather than re-read later:
         // the hello the Deck is told and the capture the host starts must come
         // from one decision.
-        Ok((authenticated, admission)) => Ok((
+        Ok((authenticated, admission, video)) => Ok((
             authenticated.user,
             response.initial_video.take(),
             response.multi_monitor_v1.take(),
@@ -2214,6 +2388,8 @@ async fn authenticate(
             response.cursor_preference,
             response.timezone.take(),
             admission,
+            response.lossless_refine_v1.take(),
+            video,
         )),
         Err(failure) => Err(HandshakeError::Rejected(failure)),
     }
@@ -2432,10 +2608,82 @@ mod tests {
             None,
             None,
             (1280, 720),
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("hello parses");
         assert_eq!(parsed["screen_width"], 1280);
         assert_eq!(parsed["screen_height"], 720);
+    }
+
+    #[test]
+    fn exact_still_image_runs_for_grading_and_hdr_in_ycbcr_and_says_why_not_otherwise() {
+        use arcen_media::session_plan::{PlanBitDepth, PlanChroma, ResolvedVideoPlan};
+        let deck = arcen_protocol::refine::LosslessRefineCapability {
+            domains: vec!["rgb".into(), "ycbcr".into()],
+            codecs: vec!["delta-zstd1".into()],
+        };
+        let rgb_only = arcen_protocol::refine::LosslessRefineCapability {
+            domains: vec!["rgb".into()],
+            codecs: vec!["delta-zstd1".into()],
+        };
+        let auto = ResolvedVideoPlan::standard(None);
+        let grading = ResolvedVideoPlan {
+            bit_depth: PlanBitDepth::Ten,
+            chroma: PlanChroma::Yuv444,
+            ..auto
+        };
+        let hdr = ResolvedVideoPlan {
+            transfer: "pq",
+            primaries: "bt2020",
+            ..grading
+        };
+        let plan = |deck, plan: &ResolvedVideoPlan, multi, operator| {
+            lossless_refine_plan(Some(deck), plan, multi, operator)
+        };
+        if crate::refine::COMPILED {
+            for wide in [&grading, &hdr] {
+                let on = plan(&deck, wide, false, true);
+                let status = lossless_refine_status(Some(&deck), &on).expect("asked");
+                assert!(status.is_on(), "{wide:?}");
+                assert_eq!(status.domain.as_deref(), Some("ycbcr"));
+                assert_eq!(status.bit_depth, Some(10));
+            }
+            let arcen_media::refine::RefinePlan::On { contract, .. } =
+                plan(&deck, &hdr, false, true)
+            else {
+                panic!("HDR is refined");
+            };
+            assert_eq!(contract.matrix, arcen_media::ColorMatrix::Bt2020Ncl);
+        }
+        let reason = |refine: arcen_media::refine::RefinePlan| {
+            let status = lossless_refine_status(Some(&deck), &refine).expect("asked");
+            assert!(!status.is_on());
+            status.reason.expect("a reason")
+        };
+        assert_eq!(reason(plan(&deck, &auto, false, true)), "eight_bit");
+        assert_eq!(reason(plan(&deck, &grading, true, true)), "multi_monitor");
+        if crate::refine::COMPILED {
+            assert_eq!(reason(plan(&deck, &grading, false, false)), "operator_off");
+            assert_eq!(
+                reason(plan(&rgb_only, &grading, false, true)),
+                "deck_unsupported"
+            );
+        }
+        let on = plan(&deck, &grading, false, true);
+        assert!(lossless_refine_status(None, &on).is_none());
+        let off = plan(&deck, &grading, false, false);
+        let json = server_hello_json_for_multi(
+            &capabilities(),
+            "alice",
+            grading,
+            crate::encode::EncoderCodec::H264,
+            None,
+            None,
+            (1280, 720),
+            lossless_refine_status(Some(&deck), &off),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("hello parses");
+        assert_eq!(parsed["lossless_refine"]["state"], "off");
     }
 
     #[test]
@@ -2889,6 +3137,7 @@ mod tests {
                 resolved.active_pipeline,
                 None,
                 (1920, 1080),
+                None,
             ))
             .expect("hello");
         assert_eq!(
@@ -2960,6 +3209,7 @@ mod tests {
                     resolved.active_pipeline,
                     None,
                     (1920, 1080),
+                    None,
                 ))
                 .expect("hello");
             assert_eq!(hello.color_caps.active_transfer, transfer);
@@ -3510,8 +3760,120 @@ mod tests {
         assert_eq!(advertised, enforced);
     }
 
+    /// One credential check runs at a time (`AUTHENTICATION_SLOT`); tests that
+    /// sign in take turns rather than see each other as a busy host.
+    static SIGN_IN_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Signs `username` in with `password` and a Grading request this Deck
+    /// cannot decode, over a real framed socket; returns the `auth_result`.
+    async fn sign_in_with_undecodable_grading(
+        username: &str,
+        password: &str,
+    ) -> (
+        arcen_protocol::messages::AuthResult,
+        Result<(), HandshakeError>,
+    ) {
+        use arcen_protocol::messages::{
+            AuthResponse, AuthResult, ClientVideoCapabilitiesMsg, InitialVideoRequestMsg,
+            QualitySettings, VideoSelectionIntent,
+        };
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (pier_end, deck_end) = tokio::net::UnixStream::pair().expect("socket pair");
+        let mut pier = net::framed(net::PierStream::Relayed(pier_end)).await;
+        let mut deck =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(deck_end, Role::Client, None).await;
+        let mut response = AuthResponse::pam(username, password);
+        response.initial_video = Some(InitialVideoRequestMsg {
+            quality: QualitySettings {
+                msg_type: "quality_settings".to_owned(),
+                video_selection: VideoSelectionIntent::ColorFidelity,
+                codec: "h265".to_owned(),
+                chroma: "yuv444".to_owned(),
+                bit_depth: "10".to_owned(),
+                ..Default::default()
+            },
+            capabilities: ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                main10: true,
+                ..Default::default()
+            },
+            pipeline: None,
+        });
+        let deck_side = async {
+            let _request = deck.next().await.expect("auth_request").expect("frame");
+            deck.send(Message::Text(
+                serde_json::to_string(&response).expect("encode"),
+            ))
+            .await
+            .expect("send auth_response");
+            let Message::Text(result) = deck.next().await.expect("auth_result").expect("frame")
+            else {
+                panic!("auth_result is text");
+            };
+            serde_json::from_str::<AuthResult>(&result).expect("auth_result parses")
+        };
+        let capabilities = capabilities();
+        let pier_side = authenticate(&mut pier, &capabilities, None, None, None, None);
+        let (result, outcome) = tokio::join!(deck_side, pier_side);
+        (result, outcome.map(|_| ()))
+    }
+
+    #[tokio::test]
+    async fn an_unservable_video_request_is_refused_with_its_reason_after_the_password() {
+        let _turn = SIGN_IN_TESTS.lock().await;
+        let (result, outcome) =
+            sign_in_with_undecodable_grading("refusal-reason-test", "valid").await;
+        assert!(!result.success);
+        assert!(result.session_setup_failed, "{result:?}");
+        assert!(
+            result.message.starts_with("video_request_refused: ")
+                && result.message.contains("yuv444"),
+            "{}",
+            result.message
+        );
+        assert!(matches!(
+            outcome,
+            Err(HandshakeError::SetupRefused(
+                arcen_session::session_setup::SetupRefusal::VideoRequest(_)
+            ))
+        ));
+
+        // Without the password the Deck learns nothing about the request.
+        let (result, outcome) =
+            sign_in_with_undecodable_grading("refusal-reason-test", "wrong").await;
+        assert!(!result.success);
+        assert!(!result.session_setup_failed);
+        assert!(!result.message.contains("yuv444"), "{}", result.message);
+        assert!(matches!(outcome, Err(HandshakeError::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn a_refused_video_request_is_not_a_failed_sign_in() {
+        use arcen_session::auth_throttle::THROTTLED_MESSAGE;
+        let _turn = SIGN_IN_TESTS.lock().await;
+        // Far more refusals than the throttle's free failures: none counts.
+        for _ in 0..8 {
+            let (result, _) =
+                sign_in_with_undecodable_grading("refusal-throttle-test", "valid").await;
+            assert!(result.session_setup_failed, "{}", result.message);
+        }
+        // Wrong passwords still do, whatever the request.
+        let mut throttled = false;
+        for _ in 0..8 {
+            let (result, _) =
+                sign_in_with_undecodable_grading("refusal-throttle-wrong", "wrong").await;
+            assert!(!result.session_setup_failed);
+            throttled |= result.message == THROTTLED_MESSAGE;
+        }
+        assert!(throttled, "wrong passwords must still be throttled");
+    }
+
     #[tokio::test]
     async fn authentication_uses_supervised_blocking_worker() {
+        let _turn = SIGN_IN_TESTS.lock().await;
         let authenticated = super::authenticate_credentials(
             "alice".to_owned(),
             zeroize::Zeroizing::new("valid".to_owned()),

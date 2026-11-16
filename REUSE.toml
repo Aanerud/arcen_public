@@ -50,6 +50,18 @@ precedence = "closest"
 SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
 SPDX-License-Identifier = "AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception"
 
+# Arcen-generated H.264/H.265 test streams: encoded by Arcen's own encoders
+# from Arcen's own synthetic test pictures (provenance in the directory's
+# README.md). Lab recordings that show third-party desktops are never added.
+[[annotations]]
+path = [
+    "shared/media/tests/data/bitstream/*.264",
+    "shared/media/tests/data/bitstream/*.265",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 TUTTIFRUTTI AS"
+SPDX-License-Identifier = "AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception"
+
 # The notices file quotes other projects' licence texts, including their own
 # SPDX lines; those describe the quoted components, not this file.
 [[annotations]]

@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-deck-macos"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -24,13 +24,13 @@ path = "src/lib.rs"
 # `experimental_raw_hid` wire capability with the host before it will start.
 # This is a raw-input passthrough quarantined behind this feature — it is not
 # USB bridging (no USB transport/enumeration is involved).
-experimental-raw-hid = []
+experimental-raw-hid = ["arcen-deck-core/experimental-raw-hid"]
 # Native tablet: connects to the privileged `arcen-usb-helper` (embedded and
 # registered with SMAppService), which captures whichever attached device
 # classifies as a pen tablet, or (with ARCEN_USB_HARD_SYNTHETIC=1) answers as
 # an independently authored synthetic USB tablet. `build-deck-app.sh` turns
 # it on whenever it embeds the helper, which release builds always do.
-native-tablet = ["dep:rusb", "dep:objc2-service-management"]
+native-tablet = ["arcen-deck-core/native-tablet", "dep:rusb", "dep:objc2-service-management"]
 # Lab-only: `--usb-emulate wacom-intuos5` on the CLI smokes feeds an emulated
 # Wacom Intuos5 (real descriptors, scripted pen strokes) through the shared
 # USB exporter into the Hard USB negotiation instead of the privileged
@@ -47,27 +47,17 @@ usb-emulate-lab = ["native-tablet"]
 # Even when compiled in, the lab additionally refuses to run without an
 # explicit runtime opt-in (`ARCEN_ENABLE_VIRTUAL_MONITOR_LAB=1`), and it is
 # entirely parallel to the production session/fullscreen paths.
-dev-tools = []
-# Dormant source compatibility only. Release/package builds must not enable
-# this feature; shipped Deck binaries connect over QUIC exclusively.
-wss-compat = [
-    "arcen-protocol/wss-compat",
-    "arcen-transport/wss-compat",
-    "rustls/tls12",
-    "tokio-tungstenite/connect",
-    "tokio-tungstenite/handshake",
-    "tokio-tungstenite/rustls-tls-native-roots",
-]
+dev-tools = ["arcen-deck-core/dev-tools"]
 
 [[bin]]
 name = "arcen-deck"
 path = "src/main.rs"
 
 [dependencies]
+arcen-deck-core = { workspace = true, features = ["egui", "runtime"] }
 arcen-input.workspace = true
-arcen-media = { workspace = true, features = ["audio-opus"] }
+arcen-media = { workspace = true, features = ["audio-opus", "refine-zstd-decode"] }
 arcen-protocol = { path = "../../shared/protocol", default-features = false }
-arcen-observability.workspace = true
 arcen-session.workspace = true
 arcen-telemetry.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
@@ -88,7 +78,6 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { version = "0.24", default-features = false }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
@@ -110,8 +99,8 @@ apple-cf = "0.9.3"
 block2 = "0.6.2"
 core-graphics = "0.25.0"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSCell", "NSCursor", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSDate", "NSObject", "NSTimeZone", "NSGeometry", "NSValue"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSBitmapImageRep", "NSCell", "NSCursor", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSSavePanel", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSString", "NSProcessInfo", "NSDate", "NSObject", "NSTimeZone", "NSGeometry", "NSURL", "NSValue"] }
 # w4-dedicated-metal-layer: the dedicated 10-bit `CAMetalLayer` video path
 # (`src/ui/video_metal_layer.rs`). Pinned to the exact versions/feature
 # style `wgpu-hal` 29.0.4 itself already resolves for `objc2-metal`/

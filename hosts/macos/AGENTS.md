@@ -130,6 +130,29 @@ separate AppKit app's global monitor. A locked screen delivers to
 `loginwindow`, so that is global-monitor evidence, not a window drawing; the
 window path is the loopback run above.
 
+**The session's layout (`host_keymap`).** A Deck that types committed text
+is told what the current input source types at each printable position
+(the shared `arcen_input::text::host_layout` notice), at attach and on every
+change, so its Automatic typing sends `æ` as text to a host whose layout
+puts `'` there. Text Input Sources must run on a main thread and the agent's
+belongs to its runtime, so the session starts `keymap-watch`, a child of
+this executable that observes the input source on its own main thread
+(`kTISNotifySelectedKeyboardInputSourceChanged` plus a read every second,
+`UCKeyTranslate` per position) and writes one JSON notice per change; it
+exits when its input closes (`input/layout.rs`). `probe-keymap` prints the
+notice this Mac would send. Measured on the lab Pier: `gb(mac)`, 48
+positions, generation 1.
+
+**Pen axes AppKit reads differently.** Tablet drivers report AppKit tilt Y
+positive away from the user (Chromium and Qt reverse it), and the window
+server keeps a mouse event's pressure in 8 bits, truncating
+`kCGMouseEventPressure`. The pen path posts through the shared
+`pen_axes::appkit_tilt_y_unit` and `appkit_mouse_pressure` (the middle of
+the nearest of 255 steps): measured in Chrome, the 0.1/0.25/0.5/0.75/1.0
+ladder reads 0.1020/0.2510/0.5020/0.7490/1.0 and tilt arrives as sent (it
+read 0.0980/0.2471/0.4980/0.7490 with tilt Y reversed before). 1/255 is
+the OS's resolution for what applications read.
+
 **Committed text.** A Deck's `text_commit` (input method, Characters mode,
 Paste as Keystrokes) is typed as Unicode key events: a key-down and key-up
 whose `CGEventKeyboardSetUnicodeString` carries at most 20 UTF-16 units
@@ -503,10 +526,17 @@ whatever its Tip Switch says.
 
 ## Native tablet: one path
 
-One Native tablet way on this host: the Pier reads a known model's pen
-itself (`arcen_usb_bridge::IntuosPenReader`). An unknown model is refused in
-`bridged_tablet::authorize` with its ids (ADR 0022 §14.2);
-there is no proximity-only fallback and no vendor-driver detection. Where the
+One Native tablet way on this host: the Pier reads the pen itself, and any
+tablet works by default (ADR 0023 amendment 2026-11-15). A known model
+keeps its dedicated reader (`arcen_usb_bridge::IntuosPenReader`, with the
+Wacom mode switch); any other tablet is read by its pen interface's own
+report descriptor (`arcen_usb_bridge::generic_pen`, chosen by
+`host_pen_route` in `bridged_tablet::authorize`). Only a pen in a vendor
+format no reader knows is refused, with its ids. A pen interface that also
+declares a keyboard or mouse is read by the Pier alone
+(`HidHostAdapter::with_host_read_interface`) and never published; with
+nothing publishable no `hid-injector` child starts.
+There is no proximity-only fallback and no vendor-driver detection. Where the
 pen points is the shared path of
 [ADR 0023](../../docs/adr/0023-one-native-tablet-pen-position-path.md):
 `bridged_tablet::host_pen_sample` is the adapter (device units →
@@ -526,9 +556,10 @@ tablet and the existing `hid-injector` child, started as
 `hid-injector --bridged-usb`, presents one `IOHIDUserDevice` per HID
 interface. `bridged_tablet.rs` is the session side, `input/bridged_hid.rs`
 the child. Since 0.19.0 release Piers carry it and offer it when signed
-`--with-virtual-hid` (the entitlement is the gate). A known model (Intuos5
-touch L) is read by the Pier and posted as CoreGraphics tablet events with
-pressure (ADR 0022 §14.1); other models get buttons and proximity only.
+`--with-virtual-hid` (the entitlement is the gate). Every tablet's pen is
+read by the Pier and posted as CoreGraphics tablet events with pressure: a
+known model (Intuos5 touch L) by its dedicated reader (ADR 0022 §14.1), any
+other by the generic reader (ADR 0023 amendment 2026-11-15).
 `probe-bridged-hid` writes the Wacom mode switch, so it is built
 only with `--features lab-bridged-hid-probe`.
 

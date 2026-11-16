@@ -14,25 +14,10 @@ use objc2_foundation::MainThreadMarker;
 
 use crate::protocol::messages::{ScrollPhaseMsg, SwipeDirectionMsg};
 
-const CAPACITY: usize = 128;
+/// The shared gesture sample (`arcen_input`), the same shape on both Decks.
+pub use arcen_input::GestureSample;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum GestureSample {
-    Magnify {
-        scale_delta: f64,
-        phase: ScrollPhaseMsg,
-    },
-    Rotate {
-        degrees_delta: f64,
-        phase: ScrollPhaseMsg,
-    },
-    SmartZoom,
-    Swipe {
-        direction: SwipeDirectionMsg,
-        fingers: u8,
-        phase: ScrollPhaseMsg,
-    },
-}
+const CAPACITY: usize = 128;
 
 #[derive(Default)]
 struct GestureQueue {

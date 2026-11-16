@@ -28,10 +28,19 @@
 //!   the applied origin translation, and the "publish the negotiated bitrate
 //!   budget verbatim" rule that both hosts hand-wrote when assembling their
 //!   applied multi-region capability.
+//! - [`display_lease`]: what a session leaves behind — when its display
+//!   changes are returned, which displays are removed or restored (never a
+//!   display Arcen did not create), and which windows move back to a
+//!   display the local user can see.
 //! - [`virtual_topology`]: placement of a requested topology onto virtual
 //!   outputs a compositor creates on demand (no head inventory).
 //! - [`ui_scale`]: the desktop UI scale for one virtual output, decided from
 //!   the client display's facts among the scales the compositor supports.
+//! - [`windows_topology`] and [`windows_recovery`]: the Windows Pier's
+//!   physical multi-monitor planner (requested topology onto a probed output
+//!   inventory, keyed by adapter LUID and CCD target id) and the versioned
+//!   full-topology recovery model. The Pier keeps only the CCD, NVAPI and
+//!   `IddCx` calls that enumerate and apply.
 //! - [`xorg_gpu`]: which PCI GPU a dedicated NVIDIA Xorg `Device` section
 //!   names (`BusID`), decided from host-reported PCI facts, so a template
 //!   never carries one machine's GPU address to another.
@@ -58,6 +67,7 @@
 pub mod admission;
 pub mod applied;
 pub mod atomic_start;
+pub mod display_lease;
 pub mod edid;
 pub mod fairness;
 pub mod nvidia_heads;
@@ -65,6 +75,8 @@ pub mod provider;
 pub mod ui_scale;
 pub mod virtual_topology;
 pub mod windows_multi_monitor;
+pub mod windows_recovery;
+pub mod windows_topology;
 pub mod xorg_gpu;
 pub mod xorg_screen;
 
@@ -73,7 +85,8 @@ mod block_on;
 
 pub use admission::{
     AdmissionGates, AdmissionOutcome, AdmissionRejection, AdmissionStage, CarrierMismatch,
-    DegradeReason, GateClosed, RegionAdmissionPolicy, admit, admit_regions, select_carrier,
+    DegradeReason, GateClosed, OfferEncoder, OfferPolicy, OfferWithheld, RegionAdmissionPolicy,
+    admit, admit_regions, offer_max_monitors, select_carrier,
 };
 pub use applied::{
     AppliedRegion, AppliedRegionAssembler, OriginTranslation, OriginTranslationOverflow,
@@ -81,8 +94,9 @@ pub use applied::{
 };
 pub use atomic_start::{AtomicStartFailure, RollbackFailure, start_all_or_rollback};
 pub use edid::{
-    DetailedTiming, EDID_HDR10_LEN, EdidRequest, HDR10_MAX_TMDS_CHARACTER_RATE_MHZ,
-    cvt_reduced_blanking, generate, generate_hdr10, hdr10_link_fits, hdr10_refresh_hz, validate,
+    DetailedTiming, EDID_HDR10_LEN, EDID_MANUFACTURER_ID, EdidRequest,
+    HDR10_MAX_TMDS_CHARACTER_RATE_MHZ, MONITOR_NAME, cvt_reduced_blanking, generate,
+    generate_hdr10, generate_named, hdr10_link_fits, hdr10_refresh_hz, validate,
 };
 pub use fairness::{FairRoster, RosterError, ServiceOrder};
 pub use nvidia_heads::{
